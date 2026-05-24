@@ -15,19 +15,35 @@ use crate::types::{ChatRequest, ChatResponse, Role, Usage};
 /// Default OpenAI API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
-/// Trim a trailing `/` and one optional `/v1` segment off an
-/// OpenAI-style base URL so the caller can append `/v1/<endpoint>`
-/// safely. Tolerates both conventions found in the wild:
+/// Build the full URL for an OpenAI-style endpoint. Tolerates the
+/// conventions found in the wild:
 ///   * `https://api.openai.com`           (OpenAI's own docs)
 ///   * `https://openrouter.ai/api/v1`     (OpenRouter's docs)
 ///   * `http://localhost:11434/v1`        (Ollama's openai-compat path)
+///   * `https://api.z.ai/api/coding/paas/v4` (Z.AI)
 ///
 /// Without this, half the providers produce `…/v1/v1/…` 404s the
 /// first time consolidation runs.
 #[must_use]
-pub fn normalize_openai_base(url: &str) -> String {
-    let s = url.trim_end_matches('/');
-    s.strip_suffix("/v1").unwrap_or(s).to_string()
+pub fn normalize_openai_base(base: &str, endpoint: &str) -> String {
+    let s = base.trim_end_matches('/');
+
+    if s.ends_with(&format!("/{endpoint}")) {
+        return s.to_string();
+    }
+
+    if last_segment_is_version(s) {
+        return format!("{s}/{endpoint}");
+    }
+
+    format!("{s}/v1/{endpoint}")
+}
+
+fn last_segment_is_version(url: &str) -> bool {
+    url.split('/').next_back().is_some_and(|seg| {
+        let digits = seg.strip_prefix('v').unwrap_or("");
+        !digits.is_empty() && digits.len() <= 2 && digits.chars().all(|c| c.is_ascii_digit())
+    })
 }
 
 /// OpenAI Chat Completions-backed provider.
@@ -211,10 +227,7 @@ impl OpenAiProvider {
     }
 
     async fn post<B: Serialize>(&self, body: &B) -> LlmResult<OpenAiResponse> {
-        let url = format!(
-            "{}/v1/chat/completions",
-            normalize_openai_base(&self.base_url)
-        );
+        let url = normalize_openai_base(&self.base_url, "chat/completions");
         debug!(url, "POST openai");
         let resp = self
             .client
@@ -249,32 +262,69 @@ mod tests {
     use super::normalize_openai_base;
 
     #[test]
-    fn normalize_strips_trailing_slash_and_v1() {
-        // The three conventions found in the wild.
+    fn normalize_openai_base_chat_completions() {
+        let ep = "chat/completions";
+
         assert_eq!(
-            normalize_openai_base("https://api.openai.com"),
-            "https://api.openai.com"
+            normalize_openai_base("https://api.openai.com", ep),
+            "https://api.openai.com/v1/chat/completions"
         );
         assert_eq!(
-            normalize_openai_base("https://api.openai.com/"),
-            "https://api.openai.com"
+            normalize_openai_base("https://api.openai.com/", ep),
+            "https://api.openai.com/v1/chat/completions"
         );
-        // OpenRouter's docs / ai-memory's OpenRouter env entry.
         assert_eq!(
-            normalize_openai_base("https://openrouter.ai/api/v1"),
-            "https://openrouter.ai/api"
+            normalize_openai_base("https://openrouter.ai/api/v1", ep),
+            "https://openrouter.ai/api/v1/chat/completions"
         );
-        // Ollama's openai-compat path (`docker logs` shows it
-        // canonically advertised this way).
         assert_eq!(
-            normalize_openai_base("http://localhost:11434/v1"),
-            "http://localhost:11434"
+            normalize_openai_base("http://localhost:11434/v1", ep),
+            "http://localhost:11434/v1/chat/completions"
         );
-        // Don't accidentally strip a `/v1` that's part of a longer
-        // segment (e.g. `/v123/`).
+        // /v123 must not be treated as a version segment.
         assert_eq!(
-            normalize_openai_base("https://example.com/v123"),
-            "https://example.com/v123"
+            normalize_openai_base("https://example.com/v123", ep),
+            "https://example.com/v123/v1/chat/completions"
+        );
+        // Z.AI-style: non-v1 version segment in the path.
+        assert_eq!(
+            normalize_openai_base("https://api.z.ai/api/coding/paas/v4", ep),
+            "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        );
+        // Full endpoint URL already provided (Z.AI or GitHub Copilot style).
+        assert_eq!(
+            normalize_openai_base("https://api.z.ai/api/coding/paas/v4/chat/completions", ep),
+            "https://api.z.ai/api/coding/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            normalize_openai_base("https://api.githubcopilot.com/chat/completions", ep),
+            "https://api.githubcopilot.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_embeddings() {
+        let ep = "embeddings";
+
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com", ep),
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            normalize_openai_base("https://openrouter.ai/api/v1", ep),
+            "https://openrouter.ai/api/v1/embeddings"
+        );
+        assert_eq!(
+            normalize_openai_base("http://localhost:11434/v1", ep),
+            "http://localhost:11434/v1/embeddings"
+        );
+        assert_eq!(
+            normalize_openai_base("https://example.com/v123", ep),
+            "https://example.com/v123/v1/embeddings"
+        );
+        assert_eq!(
+            normalize_openai_base("https://api.z.ai/api/coding/paas/v4", ep),
+            "https://api.z.ai/api/coding/paas/v4/embeddings"
         );
     }
 }

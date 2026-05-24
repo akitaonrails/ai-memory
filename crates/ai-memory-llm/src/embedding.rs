@@ -114,7 +114,7 @@ impl Embedder for OpenAiEmbedder {
     }
 
     async fn embed(&self, text: &str) -> LlmResult<Vec<f32>> {
-        let url = format!("{}/v1/embeddings", normalize_openai_base(&self.base_url));
+        let url = normalize_openai_base(&self.base_url, "embeddings");
         debug!(url, model = %self.model, "POST openai/embeddings");
         let req = OpenAiEmbeddingRequest {
             input: text,
@@ -222,7 +222,7 @@ impl Embedder for VoyageEmbedder {
     }
 
     async fn embed(&self, text: &str) -> LlmResult<Vec<f32>> {
-        let url = format!("{}/v1/embeddings", normalize_openai_base(&self.base_url));
+        let url = normalize_openai_base(&self.base_url, "embeddings");
         let req = VoyageRequest {
             input: [text],
             model: &self.model,
