@@ -14,6 +14,10 @@
 //! - `GET /search?q=…`                    → FTS5 hit list
 //! - `GET /static/*`                      → embedded CSS + logos
 //!
+//! The companion `api_router` exposes the same read-only data as JSON
+//! for custom frontends. It intentionally does not expose write/admin
+//! operations.
+//!
 //! Theme follows `prefers-color-scheme` via the included Tailwind
 //! stylesheet; no JS toggle, no cookie.
 
@@ -36,4 +40,14 @@ pub use state::WebState;
 pub fn router(reader: ReaderPool, wiki: Wiki) -> Router {
     let state = Arc::new(WebState::new(reader, wiki));
     routes::build(state)
+}
+
+/// Build the read-only JSON API router for third-party web UIs.
+///
+/// The host should `nest("/api/v1", api_router(...))` alongside `/web`
+/// so custom frontends can browse memory without reading SQLite or wiki
+/// files directly.
+pub fn api_router(reader: ReaderPool, wiki: Wiki) -> Router {
+    let state = Arc::new(WebState::new(reader, wiki));
+    routes::build_api(state)
 }

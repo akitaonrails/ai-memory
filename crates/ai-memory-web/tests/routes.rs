@@ -5,10 +5,11 @@
 
 use ai_memory_core::{NewPage, PagePath, Tier};
 use ai_memory_store::Store;
-use ai_memory_web::router;
+use ai_memory_web::{api_router, router};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
+use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -271,4 +272,273 @@ async fn smoke_page_not_found_returns_404() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn api_projects_returns_project_stats() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, proj, "foo.md", "Foo Page", "Hello world"))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/projects")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json[0]["workspace_name"], "default");
+    assert_eq!(json[0]["project_name"], "scratch");
+    assert_eq!(json[0]["page_count"], 1);
+}
+
+#[tokio::test]
+async fn api_pages_returns_latest_pages_only() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "foo.md", "# First\n\nOld"))
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "foo.md", "# Second\n\nNew"))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/pages")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+    assert_eq!(json[0]["path"], "foo.md");
+    assert_eq!(json[0]["title"], "Second");
+}
+
+#[tokio::test]
+async fn api_page_returns_markdown_and_metadata() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "foo.md", "# Foo\n\nHello world"))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/pages/foo.md")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["workspace"], "default");
+    assert_eq!(json["project"], "scratch");
+    assert_eq!(json["path"], "foo.md");
+    assert_eq!(json["title"], "Foo");
+    assert_eq!(json["frontmatter"]["kind"], "fact");
+    assert!(
+        json["body_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("Hello world")
+    );
+}
+
+#[tokio::test]
+async fn api_search_can_scope_to_project() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let scratch = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            ws,
+            scratch,
+            "foo.md",
+            "Scratch Page",
+            "shared_unique_term",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            ws,
+            other,
+            "bar.md",
+            "Other Page",
+            "shared_unique_term",
+        ))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=shared_unique_term&workspace=default&project=scratch&limit=1")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+    assert_eq!(json[0]["project"], "scratch");
+    assert_eq!(json[0]["title"], "Scratch Page");
+}
+
+#[tokio::test]
+async fn api_routes_do_not_accept_writes() {
+    let (_tmp, store, wiki) = setup().await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/projects")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn api_search_rejects_partial_scope() {
+    let (_tmp, store, wiki) = setup().await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=anything&workspace=default")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["error"],
+        "workspace and project must be provided together"
+    );
+}
+
+#[tokio::test]
+async fn api_project_routes_return_404_for_missing_project() {
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/projects/missing/pages")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn api_recent_and_briefing_return_project_data() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, proj, "foo.md", "Foo Page", "Hello world"))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let recent_req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/recent?limit=1")
+        .body(Body::empty())
+        .unwrap();
+    let recent_resp = app.clone().oneshot(recent_req).await.unwrap();
+    assert_eq!(recent_resp.status(), StatusCode::OK);
+
+    let briefing_req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/briefing?limit=1")
+        .body(Body::empty())
+        .unwrap();
+    let briefing_resp = app.oneshot(briefing_req).await.unwrap();
+    assert_eq!(briefing_resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(briefing_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["counts"]["pages_latest"], 1);
+    assert_eq!(json["recent_pages"][0]["path"], "foo.md");
 }

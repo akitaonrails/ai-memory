@@ -703,10 +703,17 @@ pub struct ServeArgs {
     pub project: String,
     /// Mount the read-only wiki browser at /web. Off by default. When
     /// enabled, anyone who can reach the MCP endpoint can also browse
-    /// the wiki — keep the bind loopback-only or front with a reverse
-    /// proxy that handles its own auth if you expose it.
+    /// the wiki and the read-only frontend API under /api/v1 — keep
+    /// the bind loopback-only or front with a reverse proxy that
+    /// handles its own auth if you expose it.
     #[arg(long)]
     pub enable_web: bool,
+    /// Serve this static directory at /web instead of the built-in UI.
+    ///
+    /// The read-only /api/v1 frontend API is still mounted when
+    /// --enable-web is set.
+    #[arg(long)]
+    pub web_ui_dir: Option<PathBuf>,
     /// Run the HTTP transport in stateful (session) mode: the server
     /// issues an `Mcp-Session-Id` on `initialize` and requires it on
     /// every later request, with SSE-framed responses. Off by default —

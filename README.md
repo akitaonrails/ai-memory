@@ -288,7 +288,30 @@ Useful entry points:
 - Run `ai-memory bootstrap` once when adopting ai-memory in an existing
   project with months of history.
 - Start the server with `--enable-web` and visit `/web` for a read-only
-  browser view of the markdown wiki.
+  browser view of the markdown wiki. `--enable-web` also mounts a
+  read-only JSON frontend API at `/api/v1` (workspaces, projects, pages,
+  recent, briefing, search) so custom web UIs can read the memory without
+  opening SQLite or wiki files directly:
+
+  ```text
+  GET  /api/v1/workspaces
+  GET  /api/v1/projects?workspace=...
+  GET  /api/v1/workspaces/{workspace}/projects/{project}/pages
+  GET  /api/v1/workspaces/{workspace}/projects/{project}/pages/{path}
+  GET  /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=...
+  GET  /api/v1/workspaces/{workspace}/projects/{project}/briefing?limit=...
+  GET  /api/v1/search?q=...&workspace=...&project=...&limit=...
+  POST /api/v1/search   { "q": "...", "scopes": [{ "workspace": "...", "project": "..." }] }
+  ```
+
+  To serve your own static frontend instead of the built-in UI, point
+  `--web-ui-dir` at the frontend's build output (same-origin with
+  `/api/v1`, `/mcp`, `/admin/*`, so the existing auth applies):
+
+  ```bash
+  ai-memory serve --transport http --bind 127.0.0.1:49374 \
+    --enable-web --web-ui-dir ../ai-memory-ui/dist
+  ```
 
 Install the routing snippet once so agents proactively call the right
 MCP tool for those prompts:

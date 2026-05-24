@@ -7,6 +7,7 @@ use axum::routing::get;
 
 use crate::state::WebState;
 
+mod api;
 mod index;
 mod page;
 mod project;
@@ -24,4 +25,9 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route("/static/logo.png", get(statics::logo_light))
         .route("/static/logo-dark.png", get(statics::logo_dark))
         .with_state(state)
+}
+
+/// Build the read-only JSON API router from a shared [`WebState`].
+pub(crate) fn build_api(state: Arc<WebState>) -> Router {
+    api::build(state)
 }

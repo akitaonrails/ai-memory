@@ -95,6 +95,7 @@ schemars = "1"
 axum = "0.8"
 # Direct dep so tests can use `Router::oneshot` via `ServiceExt`.
 tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
 
 # Backup / restore archive format.
 tar = "0.4"
