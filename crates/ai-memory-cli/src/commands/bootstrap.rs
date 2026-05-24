@@ -11,7 +11,10 @@
 //! - `AI_MEMORY_SERVER_URL` — base URL of the running server.
 //! - `AI_MEMORY_AUTH_TOKEN` — bearer token if the server has auth enabled.
 
-use ai_memory_consolidate::{BootstrapOutcome, collect_sources, discover_repo_root};
+use ai_memory_consolidate::{
+    BootstrapOutcome, BootstrapSource, SourceCounts, collect_sources, discover_repo_root,
+    prune_to_budget,
+};
 use anyhow::{Context, Result};
 use tracing::info;
 
@@ -85,6 +88,20 @@ pub async fn run(_config: &Config, args: BootstrapArgs) -> Result<()> {
     )?;
     info!(sources = sources.len(), "collected sources from repo");
 
+    // ---- short-circuit when --dry-run -----------------------------
+    // The previous flow POSTed the full source bundle to the server
+    // even in dry-run mode, which (a) defeated the purpose of the
+    // local preview and (b) exploded with 413 on repos large enough
+    // to exceed the server's 10 MB body limit. We now compute the
+    // dry-run summary entirely client-side and skip the round-trip.
+    if args.dry_run {
+        let outcome = local_dry_run(sources, args.max_input_tokens);
+        print_human_report(&outcome, &args.workspace, &project);
+        let report = serde_json::to_string_pretty(&outcome)?;
+        println!("\n--- machine-readable ---\n{report}");
+        return Ok(());
+    }
+
     // ---- POST to server -------------------------------------------
     let body = serde_json::json!({
         "workspace": args.workspace,
@@ -100,6 +117,27 @@ pub async fn run(_config: &Config, args: BootstrapArgs) -> Result<()> {
     let report = serde_json::to_string_pretty(&outcome)?;
     println!("\n--- machine-readable ---\n{report}");
     Ok(())
+}
+
+/// Build a `BootstrapOutcome` entirely client-side: mirrors what the
+/// server would compute under `dry_run = true` (prune to budget, count
+/// kinds, estimate tokens) without making the HTTP request. Used to
+/// short-circuit the network round-trip when the user only wants a
+/// preview of what would be sent.
+fn local_dry_run(sources: Vec<BootstrapSource>, max_input_tokens: usize) -> BootstrapOutcome {
+    let collected = sources.len();
+    let (kept, dropped, est_tokens) = prune_to_budget(sources, max_input_tokens);
+    let kept_counts = SourceCounts::from_sources(&kept);
+    BootstrapOutcome {
+        sources_collected: collected,
+        sources_sent: kept.len(),
+        sources_dropped: dropped,
+        sources_by_kind: kept_counts,
+        estimated_input_tokens: est_tokens,
+        pages_written: Vec::new(),
+        rationale: "(dry-run; LLM not invoked, no network round-trip)".to_string(),
+        dry_run: true,
+    }
 }
 
 /// Render the bootstrap outcome as a human-friendly summary. Lists
@@ -193,4 +231,66 @@ fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str
          lifecycle hooks will automatically capture your actual workflow,\n  \
          and consolidation will refine the wiki over time."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_dry_run;
+    use ai_memory_consolidate::{BootstrapSource, SourceKind};
+
+    fn source(kind: SourceKind, label: &str, body_len: usize) -> BootstrapSource {
+        BootstrapSource {
+            kind,
+            label: label.to_string(),
+            text: "x".repeat(body_len),
+        }
+    }
+
+    #[test]
+    fn local_dry_run_marks_outcome_as_dry_run() {
+        let outcome = local_dry_run(vec![], 150_000);
+        assert!(outcome.dry_run);
+        assert_eq!(outcome.sources_collected, 0);
+        assert_eq!(outcome.sources_sent, 0);
+        assert!(outcome.pages_written.is_empty());
+        assert!(outcome.rationale.contains("dry-run"));
+    }
+
+    #[test]
+    fn local_dry_run_tallies_kinds() {
+        let sources = vec![
+            source(SourceKind::Readme, "README", 200),
+            source(SourceKind::GitCommit, "feat: x", 100),
+            source(SourceKind::GitCommit, "fix: y", 100),
+            source(SourceKind::DocFile, "docs/a.md", 300),
+        ];
+        let outcome = local_dry_run(sources, 150_000);
+        assert_eq!(outcome.sources_collected, 4);
+        assert_eq!(outcome.sources_sent, 4);
+        assert_eq!(outcome.sources_dropped, 0);
+        assert_eq!(outcome.sources_by_kind.readme, 1);
+        assert_eq!(outcome.sources_by_kind.git_commits, 2);
+        assert_eq!(outcome.sources_by_kind.doc_files, 1);
+        assert!(outcome.estimated_input_tokens > 0);
+    }
+
+    #[test]
+    fn local_dry_run_drops_to_fit_tight_budget() {
+        // Fabricate ~30 commits, each ~1 KB of text → ~7.5 K tokens total
+        // (chars/4). Budget of 2 K tokens (minus ~1 K scaffolding reserve
+        // → effective ~1 K) forces aggressive drops.
+        let sources: Vec<_> = (0..30)
+            .map(|i| source(SourceKind::GitCommit, &format!("commit {i}"), 1000))
+            .collect();
+        let outcome = local_dry_run(sources, 2_000);
+        assert!(
+            outcome.sources_dropped > 0,
+            "should drop at least one source under tight budget"
+        );
+        assert_eq!(
+            outcome.sources_collected,
+            outcome.sources_sent + outcome.sources_dropped
+        );
+        assert!(outcome.dry_run);
+    }
 }

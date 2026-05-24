@@ -719,7 +719,13 @@ fn collect_project_rules(repo_path: &Path) -> Result<Vec<BootstrapSource>, Boots
 
 /// Drop lower-priority sources until estimated tokens fit under the
 /// budget. Returns (kept, dropped_count, estimated_total_tokens).
-fn prune_to_budget(
+/// Drop lowest-priority sources until the total estimated tokens fit
+/// under `budget`. Returns `(kept, dropped_count, kept_estimated_tokens)`.
+///
+/// Exposed so CLI dry-runs can reproduce the server's budget pass
+/// without making the HTTP round-trip (which the bug fix for #N
+/// short-circuits when `--dry-run` is set).
+pub fn prune_to_budget(
     mut sources: Vec<BootstrapSource>,
     budget: usize,
 ) -> (Vec<BootstrapSource>, usize, usize) {
