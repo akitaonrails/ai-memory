@@ -200,9 +200,51 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         apply_change(change, name, url)?;
     }
 
-    // --purge-data + Docker hint land in the next task.
-    let _ = config;
+    let mut purge_refused = false;
+    if args.purge_data {
+        let siblings = crate::process_guard::sibling_processes();
+        if !siblings.is_empty() {
+            eprintln!(
+                "{}",
+                crate::process_guard::busy_message("purge data", &siblings)
+            );
+            eprintln!("wiring was removed, but data was NOT purged (process alive).");
+            purge_refused = true;
+        } else {
+            for sub in ["wiki", "db", "raw"] {
+                let path = config.data_dir.join(sub);
+                if path.exists() {
+                    std::fs::remove_dir_all(&path)
+                        .with_context(|| format!("removing {}", path.display()))?;
+                    std::fs::create_dir_all(&path)
+                        .with_context(|| format!("recreating {}", path.display()))?;
+                    println!("✓ purged {}", path.display());
+                }
+            }
+        }
+    }
+
+    print_docker_hint(args.purge_data && !purge_refused);
+
+    if purge_refused {
+        anyhow::bail!("uninstall completed wiring removal but could not purge data");
+    }
     Ok(())
+}
+
+/// Print the manual Docker teardown steps (never executed). When the
+/// data was purged locally, note that; otherwise remind how to wipe it.
+fn print_docker_hint(data_purged: bool) {
+    println!();
+    println!("Wiring removed. ai-memory's server + data live in its container/volume —");
+    println!("tear those down manually:");
+    println!("  docker compose -f docker/docker-compose.yml down -v");
+    println!("  docker volume rm ai-memory-data   # if you used the default volume");
+    println!("  rm -f bin/ai-memory               # the wrapper script, if installed");
+    if !data_purged {
+        println!();
+        println!("Local data dir was left intact. To wipe it: `ai-memory reset --confirm` (or re-run with --purge-data).");
+    }
 }
 
 /// Remove the `<!-- ai-memory:start -->`…`<!-- ai-memory:end -->`
