@@ -6,22 +6,140 @@
 //!
 //! Design: docs/superpowers/specs/2026-05-24-uninstall-command-design.md
 
-use anyhow::Result;
+use std::path::PathBuf;
+use anyhow::{Context, Result};
 use ai_memory_core::{MARKER_END, MARKER_START};
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
+use crate::commands::{install_hooks, install_mcp};
 use crate::cli::McpClient;
 use crate::cli::UninstallArgs;
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_MCP_URL};
+
+/// One file the uninstall will touch, plus what it will do to it.
+#[derive(Debug)]
+enum PlannedChange {
+    /// JSON/TOML rewrite removing the listed items (events or server names).
+    Rewrite { path: PathBuf, removed: Vec<String> },
+    /// Whole-file delete (OpenCode plugin).
+    DeleteFile { path: PathBuf },
+}
+
+/// Build the full removal plan by reading each existing config file and
+/// running the matching pure stripper. Missing files / no-matches
+/// produce no entry. `name`/`url` identify the MCP server.
+fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
+    let mut plan = Vec::new();
+    let want = |k: crate::cli::UninstallOnly| args.only.is_none() || args.only == Some(k);
+    let name = "ai-memory";
+    let url = DEFAULT_MCP_URL;
+
+    // ---- Hooks (JSON configs) ----
+    if want(crate::cli::UninstallOnly::Hooks) {
+        let hook_files = [
+            install_hooks::claude_settings_path()?,
+            install_hooks::codex_hooks_path()?,
+            install_hooks::cursor_hooks_path()?,
+            install_hooks::gemini_settings_path()?,
+        ];
+        for path in hook_files {
+            if !path.exists() {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let removal = strip_ai_memory_hooks(&content)?;
+            if !removal.removed_events.is_empty() {
+                plan.push(PlannedChange::Rewrite {
+                    path,
+                    removed: removal.removed_events,
+                });
+            }
+        }
+        let plugin = install_hooks::opencode_plugin_path()?;
+        if plugin.exists() {
+            plan.push(PlannedChange::DeleteFile { path: plugin });
+        }
+    }
+
+    // ---- MCP (per client) ----
+    if want(crate::cli::UninstallOnly::Mcp) {
+        use crate::cli::McpClient::*;
+        for client in [ClaudeCode, Codex, OpenCode, Cursor, ClaudeDesktop, GeminiCli, Openclaw] {
+            let Ok(path) = install_mcp::mcp_config_path(client) else {
+                continue;
+            };
+            if !path.exists() {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let (_new, removed) = if matches!(client, Codex) {
+                strip_mcp_toml(&content, name, url)?
+            } else {
+                strip_mcp_json(&content, client, name, url)?
+            };
+            if !removed.is_empty() {
+                plan.push(PlannedChange::Rewrite { path, removed });
+            }
+        }
+    }
+
+    // ---- Instructions (cwd CLAUDE.md / AGENTS.md) ----
+    if want(crate::cli::UninstallOnly::Instructions) {
+        let cwd = std::env::current_dir().context("getting CWD for instruction removal")?;
+        for name_md in ["CLAUDE.md", "AGENTS.md"] {
+            let path = cwd.join(name_md);
+            if !path.exists() {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let (_new, found) = strip_instructions_block(&content);
+            if found {
+                plan.push(PlannedChange::Rewrite {
+                    path,
+                    removed: vec!["instruction block".to_string()],
+                });
+            }
+        }
+    }
+
+    Ok(plan)
+}
+
+/// Print the plan, one line per file, mirroring `reset`'s dry-run style.
+fn print_plan(plan: &[PlannedChange]) {
+    if plan.is_empty() {
+        println!("Nothing to remove. ai-memory wiring not found.");
+        return;
+    }
+    for change in plan {
+        match change {
+            PlannedChange::Rewrite { path, removed } => {
+                println!("would remove {} from {}", removed.join(", "), path.display());
+            }
+            PlannedChange::DeleteFile { path } => {
+                println!("would delete {}", path.display());
+            }
+        }
+    }
+}
 
 /// Run the `uninstall` subcommand.
 ///
 /// # Errors
 /// Returns an error if a config file is malformed or a removal write
 /// fails. Absent files / nothing-to-remove are not errors.
-pub fn run(_config: &Config, _args: UninstallArgs) -> anyhow::Result<()> {
-    // Implemented in later tasks (build plan, dry-run, apply, purge).
-    println!("uninstall: not yet implemented");
+pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
+    let plan = build_plan(&args)?;
+    print_plan(&plan);
+    if !args.apply {
+        println!("(dry-run; pass --apply to remove)");
+        return Ok(());
+    }
+    // --apply path lands in the next task.
+    let _ = config;
     Ok(())
 }
 
@@ -30,8 +148,6 @@ pub fn run(_config: &Config, _args: UninstallArgs) -> anyhow::Result<()> {
 /// content and whether a block was found. Inverse of
 /// `install_instructions::merge_instructions_block`: an install
 /// followed by an uninstall round-trips to the original file.
-// used by the orchestrator in a later task
-#[allow(dead_code)]
 fn strip_instructions_block(content: &str) -> (String, bool) {
     let Some(start) = content.find(MARKER_START) else {
         return (content.to_string(), false);
@@ -61,15 +177,14 @@ fn strip_instructions_block(content: &str) -> (String, bool) {
 /// into the command (render_shared.rs); the `AI_MEMORY_HOOK_URL=`
 /// prefix is unconditional, so it is the reliable signature —
 /// independent of auth, --server-url, --hooks-dir, --host-prefix.
-// used by the hook stripper / orchestrator in later tasks
-#[allow(dead_code)]
 fn hook_command_is_ours(command: &str) -> bool {
     command.contains("AI_MEMORY_HOOK_URL=")
 }
 
 /// Result of stripping ai-memory entries from a hooks JSON file.
-#[allow(dead_code)]
 struct HookRemoval {
+    // Used by the apply path in the next task; plan building reads only removed_events.
+    #[allow(dead_code)]
     new_content: String,
     removed_events: Vec<String>,
 }
@@ -98,7 +213,6 @@ fn hook_entry_is_ours(entry: &serde_json::Value) -> bool {
 /// event). Prunes an event key when emptied and the `hooks` object
 /// when emptied. Detection is by signature, so stale event keys
 /// outside the current vocabulary are caught too.
-#[allow(dead_code)]
 fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
     let mut removed_events = Vec::new();
     let new_content = mutate_json(content, |root| {
@@ -132,7 +246,6 @@ fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
 
 /// Where the servers object lives in each JSON client's config.
 /// (Codex is TOML — handled separately in Task 5.)
-#[allow(dead_code)]
 fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
     match client {
         McpClient::ClaudeCode
@@ -148,7 +261,6 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
 /// True when an MCP server entry is ai-memory's: keyed by the expected
 /// name, OR its url/httpUrl equals the endpoint, OR it is a
 /// `mcp-remote` stdio shim whose args contain the endpoint.
-#[allow(dead_code)]
 fn mcp_entry_is_ours(
     key: &str,
     entry: &serde_json::Value,
@@ -176,7 +288,6 @@ fn mcp_entry_is_ours(
 /// Remove ai-memory's MCP server from a JSON client config. Returns
 /// the new content and the names removed. Prunes the (possibly nested)
 /// servers object and its parents if they empty.
-#[allow(dead_code)]
 fn strip_mcp_json(
     content: &str,
     client: McpClient,
@@ -222,7 +333,6 @@ fn strip_mcp_json(
 
 /// Remove ai-memory's Codex MCP table by name or `url`. Returns new
 /// content and removed names. Preserves comments + other tables.
-#[allow(dead_code)]
 fn strip_mcp_toml(content: &str, name: &str, url: &str) -> Result<(String, Vec<String>)> {
     let mut removed = Vec::new();
     let new_content = mutate_toml(content, |doc| {
