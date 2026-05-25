@@ -204,6 +204,21 @@ pub struct ProjectSummary {
     pub last_updated: Option<String>,
 }
 
+/// One row per workspace with aggregate stats.
+/// Returned by [`ReaderPool::list_workspaces_with_stats`].
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceSummary {
+    /// Name of the workspace.
+    pub workspace_name: String,
+    /// Number of projects in this workspace.
+    pub project_count: u64,
+    /// Number of `is_latest = 1` pages across the workspace.
+    pub page_count: u64,
+    /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
+    /// the workspace has no pages yet.
+    pub last_updated: Option<String>,
+}
+
 /// Page summary for tree-view rendering (no body).
 /// Returned by [`ReaderPool::list_pages`].
 #[derive(Debug, Clone, Serialize)]
@@ -1278,7 +1293,15 @@ impl ReaderPool {
             // `kind = "rule"` — see consolidator.rs::slugify_for_rule.
             let mut rules_stmt = conn.prepare_cached(
                 "SELECT path, title, \
-                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'fact') AS kind, \
+                        COALESCE( \
+                            json_extract(frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ) AS kind, \
                         updated_at \
                  FROM pages \
                   WHERE is_latest = 1 AND path GLOB '_rules/*' \
@@ -1306,7 +1329,15 @@ impl ReaderPool {
 
             let mut recent_stmt = conn.prepare_cached(
                 "SELECT path, title, \
-                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'fact') AS kind, \
+                        COALESCE( \
+                            json_extract(frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ) AS kind, \
                         updated_at \
                  FROM pages \
                  WHERE is_latest = 1 \
@@ -1402,7 +1433,15 @@ impl ReaderPool {
 
             let mut rules_stmt = conn.prepare_cached(
                 "SELECT path, title, \
-                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'fact') AS kind, \
+                        COALESCE( \
+                            json_extract(frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ) AS kind, \
                         updated_at \
                  FROM pages \
                   WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_rules/*' \
@@ -1430,7 +1469,15 @@ impl ReaderPool {
 
             let mut recent_stmt = conn.prepare_cached(
                 "SELECT path, title, \
-                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'fact') AS kind, \
+                        COALESCE( \
+                            json_extract(frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ) AS kind, \
                         updated_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
@@ -1457,6 +1504,256 @@ impl ReaderPool {
         .await
     }
 
+    /// Return the latest open handoff for the workspace, aggregating
+    /// across all of its projects (no project filter).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_open_handoff_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> StoreResult<Option<Handoff>> {
+        self.with_conn(move |conn| {
+            let row_opt = conn
+                .query_row(
+                    "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
+                            cwd, summary, open_questions, next_steps, files_touched, state, \
+                            created_at, accepted_by, accepted_at, accepted_by_session \
+                     FROM handoffs \
+                     WHERE workspace_id = ?1 AND state = 'open' \
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![workspace_id.as_bytes()],
+                    row_to_handoff,
+                )
+                .optional()?;
+            row_opt.transpose()
+        })
+        .await
+    }
+
+    /// Look up a project name by id within a workspace.
+    ///
+    /// Returns `None` when no matching project exists.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn project_name_by_id(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<String>> {
+        self.with_conn(move |conn| {
+            let row_opt = conn
+                .query_row(
+                    "SELECT name FROM projects WHERE id = ?1 AND workspace_id = ?2",
+                    params![project_id.as_bytes(), workspace_id.as_bytes()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(row_opt)
+        })
+        .await
+    }
+
+    /// Build a [`BriefingSnapshot`] aggregated across all projects in a
+    /// workspace.
+    ///
+    /// Mirrors [`ReaderPool::briefing_for_project`] but scopes every query
+    /// to the workspace only (no `project_id` filter).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn briefing_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        recent_pages_limit: usize,
+    ) -> StoreResult<BriefingSnapshot> {
+        let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        self.with_conn(move |conn| {
+            let now_us = jiff::Timestamp::now().as_microsecond();
+            let day_us: i64 = 86_400 * 1_000_000;
+            let cutoff_7d = now_us - 7 * day_us;
+            let cutoff_30d = now_us - 30 * day_us;
+
+            let counts = StatusCounts {
+                pages_latest: count_workspace(
+                    conn,
+                    "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND is_latest = 1",
+                    workspace_id,
+                )?,
+                pages_all: count_workspace(
+                    conn,
+                    "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1",
+                    workspace_id,
+                )?,
+                sessions: count_workspace(
+                    conn,
+                    "SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1",
+                    workspace_id,
+                )?,
+                observations: count_workspace(
+                    conn,
+                    "SELECT COUNT(*) FROM observations WHERE workspace_id = ?1",
+                    workspace_id,
+                )?,
+            };
+
+            let activity_7d = window_activity_workspace(conn, 7, cutoff_7d, workspace_id)?;
+            let activity_30d = window_activity_workspace(conn, 30, cutoff_30d, workspace_id)?;
+
+            let last_observation_at: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(created_at) FROM observations WHERE workspace_id = ?1",
+                    params![workspace_id.as_bytes()],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten();
+            let last_observation_at = last_observation_at
+                .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
+                .map(|ts| ts.to_string());
+
+            let pending_handoff_count = count_workspace(
+                conn,
+                "SELECT COUNT(*) FROM handoffs WHERE workspace_id = ?1 AND state = 'open'",
+                workspace_id,
+            )?;
+
+            let mut rules_stmt = conn.prepare_cached(
+                "SELECT path, title, \
+                        COALESCE( \
+                            json_extract(frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ) AS kind, \
+                        updated_at \
+                 FROM pages \
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_rules/*' \
+                  ORDER BY updated_at DESC",
+            )?;
+            let rules: Vec<BriefingPage> = rules_stmt
+                .query_map(params![workspace_id.as_bytes()], briefing_page_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut slots_stmt = conn.prepare_cached(
+                "SELECT path, title, \
+                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'slot') AS kind, \
+                        updated_at \
+                 FROM pages \
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*' \
+                  ORDER BY path ASC",
+            )?;
+            let slots: Vec<BriefingPage> = slots_stmt
+                .query_map(params![workspace_id.as_bytes()], briefing_page_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut recent_stmt = conn.prepare_cached(
+                "SELECT path, title, \
+                        COALESCE( \
+                            json_extract(frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ) AS kind, \
+                        updated_at \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND is_latest = 1 \
+                 ORDER BY updated_at DESC \
+                 LIMIT ?2",
+            )?;
+            let recent_pages: Vec<BriefingPage> = recent_stmt
+                .query_map(params![workspace_id.as_bytes(), recent_limit], briefing_page_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(BriefingSnapshot {
+                counts,
+                activity_7d,
+                activity_30d,
+                last_observation_at,
+                pending_handoff_count,
+                rules,
+                slots,
+                recent_pages,
+            })
+        })
+        .await
+    }
+
+    /// Compute basic memory-health counters for a workspace.
+    ///
+    /// Returns `(stale, duplicates, orphans)`:
+    /// - `stale`: latest episodic pages not updated within `STALE_DAYS` (30).
+    /// - `duplicates`: extra latest pages that share a title.
+    /// - `orphans`: latest pages with no inbound or outbound links.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn memory_health_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> StoreResult<(u64, u64, u64)> {
+        self.with_conn(move |conn| {
+            let now_us = jiff::Timestamp::now().as_microsecond();
+            let cutoff_30d = now_us - 30 * 86_400 * 1_000_000;
+
+            let stale: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pages \
+                     WHERE workspace_id = ?1 AND is_latest = 1 \
+                       AND tier = 'episodic' AND updated_at < ?2",
+                    params![workspace_id.as_bytes(), cutoff_30d],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+
+            let duplicates: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(c - 1), 0) FROM ( \
+                        SELECT COUNT(*) c FROM pages \
+                        WHERE workspace_id = ?1 AND is_latest = 1 \
+                        GROUP BY title HAVING c > 1 \
+                     )",
+                    params![workspace_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+
+            let orphans: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pages p \
+                     WHERE p.workspace_id = ?1 AND p.is_latest = 1 \
+                       AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id) \
+                       AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)",
+                    params![workspace_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+
+            Ok((
+                u64::try_from(stale).unwrap_or(0),
+                u64::try_from(duplicates).unwrap_or(0),
+                u64::try_from(orphans).unwrap_or(0),
+            ))
+        })
+        .await
+    }
+
     /// Look up a page's workspace and project names by page id.
     ///
     /// # Errors
@@ -1466,7 +1763,15 @@ impl ReaderPool {
             let row_opt = conn
                 .query_row(
                     "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
-                            COALESCE(json_extract(pg.frontmatter_json, '$.kind'), 'fact'), \
+                            COALESCE( \
+                                json_extract(pg.frontmatter_json, '$.kind'), \
+                                CASE \
+                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
+                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                    ELSE 'fact' \
+                                END \
+                            ), \
                             pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                             sp.path AS supersedes_path \
                      FROM pages pg \
@@ -1497,7 +1802,15 @@ impl ReaderPool {
             let row_opt = conn
                 .query_row(
                     "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
-                            COALESCE(json_extract(pg.frontmatter_json, '$.kind'), 'fact'), \
+                            COALESCE( \
+                                json_extract(pg.frontmatter_json, '$.kind'), \
+                                CASE \
+                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
+                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                    ELSE 'fact' \
+                                END \
+                            ), \
                             pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                             sp.path AS supersedes_path \
                      FROM pages pg \
@@ -1523,7 +1836,28 @@ impl ReaderPool {
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn list_projects_with_stats(&self) -> StoreResult<Vec<ProjectSummary>> {
-        self.with_conn(|conn| {
+        self.list_projects_with_stats_filtered(None).await
+    }
+
+    /// Return one row per project within one workspace.
+    ///
+    /// Only `is_latest = 1` pages are counted.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_projects_with_stats_for_workspace(
+        &self,
+        workspace: String,
+    ) -> StoreResult<Vec<ProjectSummary>> {
+        self.list_projects_with_stats_filtered(Some(workspace))
+            .await
+    }
+
+    async fn list_projects_with_stats_filtered(
+        &self,
+        workspace: Option<String>,
+    ) -> StoreResult<Vec<ProjectSummary>> {
+        self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT w.name AS workspace_name, \
                         p.name AS project_name, \
@@ -1532,10 +1866,11 @@ impl ReaderPool {
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
                  LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
+                 WHERE (?1 IS NULL OR w.name = ?1) \
                  GROUP BY w.id, p.id \
                  ORDER BY last_updated_us DESC NULLS LAST",
             )?;
-            let rows = stmt.query_map([], |row| {
+            let rows = stmt.query_map(params![workspace], |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;
                 let page_count: i64 = row.get(2)?;
@@ -1561,6 +1896,53 @@ impl ReaderPool {
         .await
     }
 
+    /// Return one row per workspace with project/page-count and
+    /// last-updated aggregates. Used by custom frontends that need a
+    /// workspace chooser before narrowing into projects.
+    ///
+    /// Only `is_latest = 1` pages are counted.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_workspaces_with_stats(&self) -> StoreResult<Vec<WorkspaceSummary>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT w.name AS workspace_name, \
+                        COUNT(DISTINCT p.id) AS project_count, \
+                        COUNT(pg.id) AS page_count, \
+                        MAX(pg.updated_at) AS last_updated_us \
+                 FROM workspaces w \
+                 LEFT JOIN projects p ON p.workspace_id = w.id \
+                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
+                 GROUP BY w.id \
+                 ORDER BY w.name ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let workspace_name: String = row.get(0)?;
+                let project_count: i64 = row.get(1)?;
+                let page_count: i64 = row.get(2)?;
+                let last_updated_us: Option<i64> = row.get(3)?;
+                Ok((workspace_name, project_count, page_count, last_updated_us))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                let (workspace_name, project_count, page_count, last_updated_us) = r?;
+                let last_updated = last_updated_us
+                    .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
+                    .map(|ts| ts.to_string());
+                #[allow(clippy::cast_sign_loss)]
+                out.push(WorkspaceSummary {
+                    workspace_name,
+                    project_count: project_count.max(0) as u64,
+                    page_count: page_count.max(0) as u64,
+                    last_updated,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// All `is_latest = 1` pages under a given (workspace, project),
     /// ordered by path ascending. Used by the web UI tree view.
     ///
@@ -1576,7 +1958,15 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT pg.path, pg.title, \
-                        COALESCE(json_extract(pg.frontmatter_json, '$.kind'), 'fact') AS kind, \
+                        COALESCE( \
+                            json_extract(pg.frontmatter_json, '$.kind'), \
+                            CASE \
+                                WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
+                                WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                ELSE 'fact' \
+                            END \
+                        ) AS kind, \
                         pg.tier, pg.updated_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
@@ -1630,7 +2020,15 @@ impl ReaderPool {
             let row_opt = conn
                 .query_row(
                     "SELECT w.name, p.name, w.id, p.id, pg.path, pg.title, \
-                            COALESCE(json_extract(pg.frontmatter_json, '$.kind'), 'fact'), \
+                            COALESCE( \
+                                json_extract(pg.frontmatter_json, '$.kind'), \
+                                CASE \
+                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
+                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                    ELSE 'fact' \
+                                END \
+                            ), \
                             pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                             sp.path AS supersedes_path \
                      FROM pages pg \
@@ -2228,6 +2626,13 @@ fn count_project(
     Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
 }
 
+fn count_workspace(conn: &Connection, sql: &str, workspace_id: WorkspaceId) -> StoreResult<u64> {
+    let n: Option<i64> = conn
+        .query_row(sql, params![workspace_id.as_bytes()], |row| row.get(0))
+        .optional()?;
+    Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+}
+
 fn normalize_fts_query(query: &str) -> String {
     // Delegates to prepare_fts5_query: neutralises `word:` column syntax and
     // quotes tokens so `-` / `*` are not FTS5 operators.
@@ -2282,6 +2687,34 @@ fn window_activity_project(
         )?,
         pages_updated: count_since(
             "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND updated_at > ?3",
+        )?,
+    })
+}
+
+fn window_activity_workspace(
+    conn: &Connection,
+    days: u32,
+    cutoff_us: i64,
+    workspace_id: WorkspaceId,
+) -> StoreResult<ActivityWindow> {
+    let count_since = |sql: &str| -> StoreResult<u64> {
+        let n: Option<i64> = conn
+            .query_row(sql, params![workspace_id.as_bytes(), cutoff_us], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+    };
+    Ok(ActivityWindow {
+        days,
+        sessions: count_since(
+            "SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1 AND started_at > ?2",
+        )?,
+        observations: count_since(
+            "SELECT COUNT(*) FROM observations WHERE workspace_id = ?1 AND created_at > ?2",
+        )?,
+        pages_updated: count_since(
+            "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND is_latest = 1 AND updated_at > ?2",
         )?,
     })
 }

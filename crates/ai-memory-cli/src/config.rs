@@ -353,7 +353,13 @@ impl Config {
             provider,
             model,
             auth: self.provider_auth(provider, None),
-            base_url: self.llm_base_url.clone(),
+            // base_url falls back to the runtime env (LLM_BASE_URL), mirroring
+            // how auth is sourced — otherwise openai-compat is only
+            // configurable via config.toml even though the key comes from env.
+            base_url: self
+                .llm_base_url
+                .clone()
+                .or_else(|| self.runtime_env.llm_base_url.clone()),
         }))
     }
 

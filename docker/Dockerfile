@@ -10,7 +10,7 @@
 FROM rust:1.95-slim-bookworm AS builder
 WORKDIR /work
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pkg-config build-essential curl \
+ && apt-get install -y --no-install-recommends pkg-config build-essential curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock rust-toolchain.toml deny.toml ./
 COPY crates ./crates
@@ -24,7 +24,7 @@ COPY evals ./evals
 COPY docs ./docs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/work/target \
-    cargo build --release -p ai-memory-cli \
+    TAILWIND_SKIP=1 cargo build --release -p ai-memory-cli \
  && cp target/release/ai-memory /usr/local/bin/ai-memory
 
 FROM debian:bookworm-slim

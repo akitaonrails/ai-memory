@@ -739,6 +739,9 @@ pub struct WritePageArgs {
     /// in the body, or the path stem.
     #[arg(long)]
     pub title: Option<String>,
+    /// Semantic kind: fact | rule | decision | gotcha (stored in frontmatter)
+    #[arg(long)]
+    pub kind: Option<String>,
     /// Repeatable tag to add to the frontmatter `tags` array.
     #[arg(long, short = 't')]
     pub tag: Vec<String>,

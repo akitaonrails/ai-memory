@@ -313,6 +313,10 @@ Useful entry points:
     --enable-web --web-ui-dir ../ai-memory-ui/dist
   ```
 
+  A reference implementation — a SolidJS knowledge browser with
+  screenshots and e2e tests — lives at
+  [djalmajr/ai-memory-ui](https://github.com/djalmajr/ai-memory-ui).
+
 Install the routing snippet once so agents proactively call the right
 MCP tool for those prompts:
 

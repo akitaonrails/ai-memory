@@ -3,7 +3,7 @@
 //! Spins up a `Store` + `Wiki` in a tempdir, seeds two pages, builds
 //! the router, and exercises each route via `tower::ServiceExt::oneshot`.
 
-use ai_memory_core::{NewPage, PagePath, Tier};
+use ai_memory_core::{AgentKind, NewHandoff, NewPage, PagePath, Tier};
 use ai_memory_store::Store;
 use ai_memory_web::{api_router, router};
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -311,6 +311,130 @@ async fn api_projects_returns_project_stats() {
 }
 
 #[tokio::test]
+async fn api_workspaces_returns_workspace_stats() {
+    let (_tmp, store, wiki) = setup().await;
+    let default_ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let practice_ws = store
+        .writer
+        .get_or_create_workspace("practice")
+        .await
+        .unwrap();
+    let scratch = store
+        .writer
+        .get_or_create_project(default_ws, "scratch", None)
+        .await
+        .unwrap();
+    let testing = store
+        .writer
+        .get_or_create_project(practice_ws, "unit-testing", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            default_ws,
+            scratch,
+            "foo.md",
+            "Foo Page",
+            "Hello world",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            practice_ws,
+            testing,
+            "patterns.md",
+            "Testing Patterns",
+            "Shared testing notes",
+        ))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 2);
+    assert_eq!(json[0]["workspace_name"], "default");
+    assert_eq!(json[0]["project_count"], 1);
+    assert_eq!(json[0]["page_count"], 1);
+    assert_eq!(json[1]["workspace_name"], "practice");
+}
+
+#[tokio::test]
+async fn api_projects_can_filter_by_workspace() {
+    let (_tmp, store, wiki) = setup().await;
+    let default_ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let practice_ws = store
+        .writer
+        .get_or_create_workspace("practice")
+        .await
+        .unwrap();
+    let scratch = store
+        .writer
+        .get_or_create_project(default_ws, "scratch", None)
+        .await
+        .unwrap();
+    let testing = store
+        .writer
+        .get_or_create_project(practice_ws, "unit-testing", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            default_ws, scratch, "foo.md", "Foo Page", "default",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            practice_ws,
+            testing,
+            "patterns.md",
+            "Testing Patterns",
+            "practice",
+        ))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/projects?workspace=practice")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+    assert_eq!(json[0]["workspace_name"], "practice");
+    assert_eq!(json[0]["project_name"], "unit-testing");
+}
+
+#[tokio::test]
 async fn api_pages_returns_latest_pages_only() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
@@ -345,6 +469,89 @@ async fn api_pages_returns_latest_pages_only() {
     assert_eq!(json.as_array().unwrap().len(), 1);
     assert_eq!(json[0]["path"], "foo.md");
     assert_eq!(json[0]["title"], "Second");
+}
+
+#[tokio::test]
+async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    // Page WITHOUT a `kind` in its frontmatter, sitting under `decisions/`.
+    // The reader must derive `kind = "decision"` from the path.
+    store
+        .writer
+        .upsert_page(NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("decisions/adr-x.md").unwrap(),
+            title: "ADR X".to_owned(),
+            body: "A decision".to_owned(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // Page WITH an explicit `kind = "rule"` in its frontmatter, sitting at
+    // a path that would otherwise derive `fact`. The explicit kind must win.
+    store
+        .writer
+        .upsert_page(NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/anything.md").unwrap(),
+            title: "Explicit Rule".to_owned(),
+            body: "An explicit rule".to_owned(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({"kind": "rule"}),
+            pinned: false,
+            links: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/pages")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let pages = json.as_array().unwrap();
+
+    let decision = pages
+        .iter()
+        .find(|p| p["path"] == "decisions/adr-x.md")
+        .expect("decisions/adr-x.md present");
+    assert_eq!(
+        decision["kind"], "decision",
+        "kind derived from `decisions/` path when frontmatter has none"
+    );
+
+    let rule = pages
+        .iter()
+        .find(|p| p["path"] == "notes/anything.md")
+        .expect("notes/anything.md present");
+    assert_eq!(
+        rule["kind"], "rule",
+        "explicit frontmatter kind wins over path derivation"
+    );
 }
 
 #[tokio::test]
@@ -448,6 +655,158 @@ async fn api_search_can_scope_to_project() {
 }
 
 #[tokio::test]
+async fn api_search_can_read_from_multiple_scopes() {
+    let (_tmp, store, wiki) = setup().await;
+    let client_ws = store
+        .writer
+        .get_or_create_workspace("client-a")
+        .await
+        .unwrap();
+    let practice_ws = store
+        .writer
+        .get_or_create_workspace("practice")
+        .await
+        .unwrap();
+    let product = store
+        .writer
+        .get_or_create_project(client_ws, "product", None)
+        .await
+        .unwrap();
+    let unit_testing = store
+        .writer
+        .get_or_create_project(practice_ws, "unit-testing", None)
+        .await
+        .unwrap();
+    let unrelated = store
+        .writer
+        .get_or_create_project(client_ws, "unrelated", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            client_ws,
+            product,
+            "product.md",
+            "Product Rules",
+            "shared_scope_token belongs to the product",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            practice_ws,
+            unit_testing,
+            "patterns.md",
+            "Testing Patterns",
+            "shared_scope_token belongs to practice",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            client_ws,
+            unrelated,
+            "hidden.md",
+            "Hidden Page",
+            "shared_scope_token must not appear",
+        ))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=shared_scope_token&scope=client-a/product&scope=practice/unit-testing")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let hits = json.as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().any(|hit| hit["project"] == "product"));
+    assert!(hits.iter().any(|hit| hit["project"] == "unit-testing"));
+    assert!(!hits.iter().any(|hit| hit["project"] == "unrelated"));
+}
+
+#[tokio::test]
+async fn api_search_post_accepts_multi_scope_body() {
+    let (_tmp, store, wiki) = setup().await;
+    let client_ws = store
+        .writer
+        .get_or_create_workspace("client-a")
+        .await
+        .unwrap();
+    let practice_ws = store
+        .writer
+        .get_or_create_workspace("practice")
+        .await
+        .unwrap();
+    let product = store
+        .writer
+        .get_or_create_project(client_ws, "product", None)
+        .await
+        .unwrap();
+    let unit_testing = store
+        .writer
+        .get_or_create_project(practice_ws, "unit-testing", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            client_ws,
+            product,
+            "product.md",
+            "Product Rules",
+            "post_scope_token belongs to the product",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            practice_ws,
+            unit_testing,
+            "patterns.md",
+            "Testing Patterns",
+            "post_scope_token belongs to practice",
+        ))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let body = serde_json::json!({
+        "q": "post_scope_token",
+        "limit": 10,
+        "scopes": [
+            {"workspace": "client-a", "project": "product"},
+            {"workspace": "practice", "project": "unit-testing"}
+        ]
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/search")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn api_routes_do_not_accept_writes() {
     let (_tmp, store, wiki) = setup().await;
 
@@ -480,6 +839,47 @@ async fn api_search_rejects_partial_scope() {
     assert_eq!(
         json["error"],
         "workspace and project must be provided together"
+    );
+}
+
+#[tokio::test]
+async fn api_search_rejects_malformed_scope_param() {
+    let (_tmp, store, wiki) = setup().await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=anything&scope=missing-project")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "scope must use the workspace/project format");
+}
+
+#[tokio::test]
+async fn api_search_rejects_ambiguous_scope_inputs() {
+    let (_tmp, store, wiki) = setup().await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=anything&workspace=default&project=scratch&scope=default/scratch")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["error"],
+        "scopes cannot be combined with workspace/project"
     );
 }
 
@@ -541,4 +941,200 @@ async fn api_recent_and_briefing_return_project_data() {
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["counts"]["pages_latest"], 1);
     assert_eq!(json["recent_pages"][0]["path"], "foo.md");
+}
+
+#[tokio::test]
+async fn api_workspace_extras_returns_aggregated_overview() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, proj, "foo.md", "Foo Page", "Hello world"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, proj, "bar.md", "Bar Page", "Second page"))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/extras?limit=10")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json.get("handoff").is_some(), "missing handoff key");
+    assert!(json["handoff"].is_null(), "expected null handoff");
+    assert!(json.get("briefing").is_some(), "missing briefing key");
+    assert_eq!(json["briefing"]["counts"]["pages_latest"], 2);
+
+    let health = &json["health"];
+    assert!(health.is_object(), "missing health object");
+    assert!(health.get("stale").is_some(), "missing health.stale");
+    assert!(
+        health.get("duplicates").is_some(),
+        "missing health.duplicates"
+    );
+    assert!(
+        health.get("contradictions").is_some(),
+        "missing health.contradictions"
+    );
+    assert!(health.get("orphans").is_some(), "missing health.orphans");
+    assert_eq!(health["contradictions"], 0);
+}
+
+#[tokio::test]
+async fn api_workspace_extras_aggregates_briefing_and_health() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let alpha = store
+        .writer
+        .get_or_create_project(ws, "alpha", None)
+        .await
+        .unwrap();
+    let beta = store
+        .writer
+        .get_or_create_project(ws, "beta", None)
+        .await
+        .unwrap();
+
+    // One normal page + one _rules/ page in each project, so we prove
+    // the extras endpoint aggregates across the whole workspace.
+    store
+        .writer
+        .upsert_page(new_page(ws, alpha, "intro.md", "Alpha Intro", "alpha body"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            ws,
+            alpha,
+            "_rules/style.md",
+            "Alpha Style Rule",
+            "always do X",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, beta, "intro.md", "Beta Intro", "beta body"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            ws,
+            beta,
+            "_rules/naming.md",
+            "Beta Naming Rule",
+            "name things well",
+        ))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/extras?limit=10")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    // 4 pages total across both projects in the workspace.
+    assert_eq!(json["briefing"]["counts"]["pages_latest"], 4);
+
+    // rules aggregates the _rules/ pages from BOTH projects.
+    let rules = json["briefing"]["rules"].as_array().expect("rules array");
+    assert_eq!(rules.len(), 2, "expected both _rules pages: {rules:?}");
+    let rule_paths: Vec<&str> = rules
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    assert!(rule_paths.contains(&"_rules/style.md"));
+    assert!(rule_paths.contains(&"_rules/naming.md"));
+
+    // Health: no contradictions, every page is an orphan (new_page uses
+    // empty links), so orphans == total page count.
+    assert_eq!(json["health"]["contradictions"], 0);
+    assert_eq!(json["health"]["orphans"], 4);
+}
+
+#[tokio::test]
+async fn api_workspace_extras_includes_open_handoff() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "handoff_summary_marker".into(),
+            open_questions: vec!["open_question_marker".into()],
+            next_steps: vec!["next_step_marker".into()],
+            files_touched: vec![],
+        })
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/extras")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    let handoff = &json["handoff"];
+    assert!(!handoff.is_null(), "expected a non-null handoff: {json}");
+    assert_eq!(handoff["summary"], "handoff_summary_marker");
+    assert_eq!(handoff["open_questions"][0], "open_question_marker");
+    assert_eq!(handoff["next_steps"][0], "next_step_marker");
+    assert_eq!(handoff["project"], "scratch");
+    assert_eq!(handoff["agent"], "claude-code");
 }

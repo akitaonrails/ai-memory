@@ -579,12 +579,9 @@ fn mount_web_router(
         let dir = dir.to_path_buf();
         let index = dir.join("index.html");
         info!(dir = %dir.display(), "custom web UI mounted at /web");
-        return router
-            .route(
-                "/web/",
-                axum::routing::get(|| async { axum::response::Redirect::permanent("/web") }),
-            )
-            .nest_service("/web", ServeDir::new(dir).fallback(ServeFile::new(index)));
+        // ServeDir already answers /web and /web/ (SPA fallback to index.html);
+        // an explicit /web/ route here would conflict with the nest_service.
+        return router.nest_service("/web", ServeDir::new(dir).fallback(ServeFile::new(index)));
     }
 
     let web_router = ai_memory_web::router(reader, wiki);

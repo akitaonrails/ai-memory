@@ -1406,6 +1406,11 @@ struct WritePageAdminRequest {
     /// Optional title; derived from first H1 or path stem when absent.
     #[serde(default)]
     title: Option<String>,
+    /// Semantic kind (`fact`, `rule`, `decision`, `gotcha`). Stored in
+    /// the page frontmatter; the reader falls back to a path-derived
+    /// kind when absent.
+    #[serde(default)]
+    kind: Option<String>,
     /// Tier name (`working`, `episodic`, `semantic`, `procedural`).
     #[serde(default = "default_write_tier")]
     tier: String,
@@ -1455,6 +1460,12 @@ async fn handle_write_page(
     let mut fm = serde_json::Map::new();
     if let Some(title) = &req.title {
         fm.insert("title".into(), serde_json::Value::String(title.clone()));
+    }
+    if let Some(kind) = req.kind.as_deref() {
+        let kind = kind.trim();
+        if !kind.is_empty() {
+            fm.insert("kind".into(), serde_json::Value::String(kind.to_string()));
+        }
     }
     if !req.tags.is_empty() {
         fm.insert(

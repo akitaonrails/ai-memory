@@ -1,5 +1,6 @@
 //! [`AiMemoryServer`] — the MCP server skeleton + tool router.
 
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use ai_memory_core::{
     ActiveProject, AgentKind, NewHandoff, PageId, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider};
-use ai_memory_store::{DecayParams, ReaderPool, WriterHandle};
+use ai_memory_store::{DecayParams, PageHit, ReaderPool, WriterHandle};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -119,6 +120,16 @@ pub struct AiMemoryServer {
     tool_router: ToolRouter<Self>,
 }
 
+const MAX_QUERY_SCOPES: usize = 25;
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct MemoryScopeArg {
+    /// Project to read inside the workspace.
+    project: String,
+    /// Workspace to read.
+    workspace: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct QueryArgs {
     /// FTS5 query expression (e.g. `"karpathy wiki"` or `quick OR slow`).
@@ -132,6 +143,15 @@ struct QueryArgs {
     /// one shared server fields several projects at once.
     #[serde(default)]
     project: Option<String>,
+    /// Workspace to search together with `project`. Omit to use the
+    /// current/default workspace resolution chain.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Explicit multi-project scopes to search. Use this when a task
+    /// needs context from a client project plus shared practice/project
+    /// knowledge. Cannot be combined with `workspace`/`project`.
+    #[serde(default)]
+    scopes: Vec<MemoryScopeArg>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -143,6 +163,10 @@ struct RecentArgs {
     /// working in (resolved from recent hook activity).
     #[serde(default)]
     project: Option<String>,
+    /// Workspace to read together with `project`. Omit to use the
+    /// current/default workspace resolution chain.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -151,6 +175,10 @@ struct StatusArgs {
     /// currently working in (resolved from recent hook activity).
     #[serde(default)]
     project: Option<String>,
+    /// Workspace to report together with `project`. Omit to use the
+    /// current/default workspace resolution chain.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,6 +272,10 @@ struct BriefingArgs {
     /// working in (resolved from recent hook activity).
     #[serde(default)]
     project: Option<String>,
+    /// Workspace to brief together with `project`. Omit to use the
+    /// current/default workspace resolution chain.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -261,6 +293,10 @@ struct ExploreArgs {
     /// working in (resolved from recent hook activity).
     #[serde(default)]
     project: Option<String>,
+    /// Workspace to explore together with `project`. Omit to use the
+    /// current/default workspace resolution chain.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -362,6 +398,119 @@ impl AiMemoryServer {
             .unwrap_or((self.workspace_id, self.project_id))
     }
 
+    async fn effective_ids_for_read_args(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        match (
+            trimmed_opt(explicit_workspace),
+            trimmed_opt(explicit_project),
+        ) {
+            (Some(workspace), Some(project)) => self.lookup_ids(workspace, project).await,
+            (Some(_), None) => Err(McpError::internal_error(
+                "workspace and project must be provided together",
+                None,
+            )),
+            (None, project) => Ok(self.effective_ids(project).await),
+        }
+    }
+
+    async fn lookup_ids(
+        &self,
+        workspace: &str,
+        project: &str,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        let workspace_id = self
+            .reader
+            .find_workspace(workspace.to_owned())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| {
+                McpError::internal_error(format!("workspace '{workspace}' not found"), None)
+            })?;
+        let project_id = self
+            .reader
+            .find_project(workspace_id, project.to_owned())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .ok_or_else(|| {
+                McpError::internal_error(format!("project '{project}' not found"), None)
+            })?;
+        Ok((workspace_id, project_id))
+    }
+
+    async fn resolve_query_scopes(
+        &self,
+        scopes: &[MemoryScopeArg],
+    ) -> Result<Vec<(WorkspaceId, ProjectId)>, McpError> {
+        if scopes.len() > MAX_QUERY_SCOPES {
+            return Err(McpError::internal_error(
+                format!("at most {MAX_QUERY_SCOPES} scopes are allowed"),
+                None,
+            ));
+        }
+        let mut seen = HashSet::new();
+        let mut resolved = Vec::new();
+        for scope in scopes {
+            let workspace = trimmed_opt(Some(&scope.workspace))
+                .ok_or_else(|| McpError::internal_error("scope workspace cannot be empty", None))?;
+            let project = trimmed_opt(Some(&scope.project))
+                .ok_or_else(|| McpError::internal_error("scope project cannot be empty", None))?;
+            let ids = self.lookup_ids(workspace, project).await?;
+            if seen.insert(ids) {
+                resolved.push(ids);
+            }
+        }
+        Ok(resolved)
+    }
+
+    async fn embed_query(&self, query: &str) -> Option<Vec<f32>> {
+        let Some(embedder) = &self.embedder else {
+            return None;
+        };
+        match embedder.embed(query).await {
+            Ok(qv) => Some(qv),
+            Err(e) => {
+                tracing::warn!(
+                    provider = embedder.provider(),
+                    model = embedder.model(),
+                    error = %e,
+                    "embedder failed; degrading memory_query to BM25-only"
+                );
+                None
+            }
+        }
+    }
+
+    async fn search_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: &str,
+        query_vec: Option<&[f32]>,
+        limit: usize,
+    ) -> ai_memory_store::StoreResult<Vec<PageHit>> {
+        if let (Some(embedder), Some(qv)) = (&self.embedder, query_vec) {
+            return self
+                .reader
+                .hybrid_search(
+                    workspace_id,
+                    project_id,
+                    query.to_owned(),
+                    Some(qv.to_vec()),
+                    embedder.provider().to_string(),
+                    embedder.model().to_string(),
+                    embedder.dim(),
+                    limit,
+                )
+                .await;
+        }
+        self.reader
+            .search_pages_for_project(workspace_id, project_id, query.to_owned(), limit)
+            .await
+    }
+
     /// Override the retention-sweep parameters (typically populated
     /// from the user's config.toml `[decay]` table).
     #[must_use]
@@ -432,66 +581,66 @@ impl AiMemoryServer {
         Parameters(args): Parameters<QueryArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        if !args.scopes.is_empty()
+            && (args
+                .workspace
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+                || args
+                    .project
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty()))
+        {
+            return Err(McpError::internal_error(
+                "scopes cannot be combined with workspace/project",
+                None,
+            ));
+        }
+
         let query = args.query.clone();
-        // Hybrid path: try to embed the query; if it fails (provider
-        // outage, cold-start timeout, billing, etc.) degrade to BM25
-        // instead of erroring the whole query — losing semantic
-        // re-ranking is acceptable, denying the user any search isn't.
-        let hits = if let Some(embedder) = &self.embedder {
-            match embedder.embed_query(&args.query).await {
-                Ok(qv) => {
-                    self.reader
-                        .hybrid_search(
-                            ws,
-                            proj,
-                            query.clone(),
-                            Some(qv),
-                            embedder.provider().to_string(),
-                            embedder.model().to_string(),
-                            embedder.dim(),
-                            limit,
-                        )
-                        .await
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        provider = embedder.provider(),
-                        model = embedder.model(),
-                        error = %e,
-                        "embedder failed; degrading memory_query to BM25-only"
-                    );
-                    self.reader
-                        .hybrid_search(
-                            ws,
-                            proj,
-                            query.clone(),
-                            None,
-                            String::new(),
-                            String::new(),
-                            0,
-                            limit,
-                        )
-                        .await
+        let query_vec = self.embed_query(&args.query).await;
+        let hits = if args.scopes.is_empty() {
+            let (ws, proj) = self
+                .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+                .await?;
+            self.search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
+                .await
+        } else {
+            let scopes = self.resolve_query_scopes(&args.scopes).await?;
+            let mut hits_by_id: HashMap<PageId, PageHit> = HashMap::new();
+            for (ws, proj) in scopes {
+                let hits = self
+                    .search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                for hit in hits {
+                    hits_by_id
+                        .entry(hit.id)
+                        .and_modify(|existing| {
+                            if hit.rank < existing.rank {
+                                *existing = hit.clone();
+                            }
+                        })
+                        .or_insert(hit);
                 }
             }
-        } else {
-            self.reader
-                .hybrid_search(
-                    ws,
-                    proj,
-                    query.clone(),
-                    None,
-                    String::new(),
-                    String::new(),
-                    0,
-                    limit,
-                )
-                .await
+            let mut hits: Vec<PageHit> = hits_by_id.into_values().collect();
+            hits.sort_by(|a, b| {
+                a.rank
+                    .partial_cmp(&b.rank)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            hits.truncate(limit);
+            Ok(hits)
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
-        let raw_hits = if hits.is_empty() {
+        // Raw-observation fallback only applies to a single resolved
+        // project; for multi-scope queries there is no single (ws, proj).
+        let raw_hits = if hits.is_empty() && args.scopes.is_empty() {
+            let (ws, proj) = self
+                .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+                .await?;
             self.reader
                 .search_observations_for_project(ws, proj, query, limit)
                 .await
@@ -515,7 +664,9 @@ impl AiMemoryServer {
         Parameters(args): Parameters<RecentArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        let (ws, proj) = self
+            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
         let hits = self
             .reader
             .recent_pages_for_project(ws, proj, limit)
@@ -782,7 +933,9 @@ impl AiMemoryServer {
         &self,
         Parameters(args): Parameters<StatusArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        let (ws, proj) = self
+            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
         let counts = self
             .reader
             .status_counts_for_project(ws, proj)
@@ -806,7 +959,9 @@ impl AiMemoryServer {
         Parameters(args): Parameters<BriefingArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.recent_pages_limit.unwrap_or(10);
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        let (ws, proj) = self
+            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
         let snapshot = self
             .reader
             .briefing_for_project(ws, proj, limit)
@@ -834,7 +989,9 @@ impl AiMemoryServer {
         Parameters(args): Parameters<ExploreArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.recent_pages_limit.unwrap_or(10);
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        let (ws, proj) = self
+            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
         let snapshot = self
             .reader
             .briefing_for_project(ws, proj, limit)
@@ -954,6 +1111,10 @@ fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let s = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![Content::text(s)]))
+}
+
+fn trimmed_opt(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// Description of how long it's been since the last observation.
@@ -1205,6 +1366,8 @@ mod tests {
                 query: "karpathy".into(),
                 limit: Some(5),
                 project: None,
+                scopes: Vec::new(),
+                workspace: None,
             }))
             .await
             .unwrap();
@@ -1251,6 +1414,8 @@ mod tests {
                 query: "quokka".into(),
                 limit: Some(5),
                 project: None,
+                scopes: Vec::new(),
+                workspace: None,
             }))
             .await
             .unwrap();
@@ -1270,10 +1435,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_query_can_target_explicit_workspace_project() {
+        let (_tmp, store, server, _ws, _pj) = setup_server().await;
+        let practice_ws = store
+            .writer
+            .get_or_create_workspace("practice")
+            .await
+            .unwrap();
+        let testing = store
+            .writer
+            .get_or_create_project(practice_ws, "unit-testing", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: practice_ws,
+                project_id: testing,
+                path: PagePath::new("patterns.md").unwrap(),
+                title: "Testing Patterns".into(),
+                body: "workspace_specific_token belongs to practice".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .memory_query(Parameters(QueryArgs {
+                query: "workspace_specific_token".into(),
+                limit: Some(5),
+                project: Some("unit-testing".into()),
+                scopes: Vec::new(),
+                workspace: Some("practice".into()),
+            }))
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(text.contains("patterns.md"), "expected hit; got {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_query_can_search_multiple_scopes() {
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        let product = store
+            .writer
+            .get_or_create_project(ws, "product", None)
+            .await
+            .unwrap();
+        let hidden = store
+            .writer
+            .get_or_create_project(ws, "hidden", None)
+            .await
+            .unwrap();
+        let practice_ws = store
+            .writer
+            .get_or_create_workspace("practice")
+            .await
+            .unwrap();
+        let testing = store
+            .writer
+            .get_or_create_project(practice_ws, "unit-testing", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: product,
+                path: PagePath::new("product.md").unwrap(),
+                title: "Product Rules".into(),
+                body: "multi_scope_token belongs to product".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: practice_ws,
+                project_id: testing,
+                path: PagePath::new("patterns.md").unwrap(),
+                title: "Testing Patterns".into(),
+                body: "multi_scope_token belongs to practice".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: hidden,
+                path: PagePath::new("hidden.md").unwrap(),
+                title: "Hidden".into(),
+                body: "multi_scope_token must not be returned".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .memory_query(Parameters(QueryArgs {
+                query: "multi_scope_token".into(),
+                limit: Some(10),
+                project: None,
+                scopes: vec![
+                    MemoryScopeArg {
+                        project: "product".into(),
+                        workspace: "default".into(),
+                    },
+                    MemoryScopeArg {
+                        project: "unit-testing".into(),
+                        workspace: "practice".into(),
+                    },
+                ],
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(text.contains("product.md"), "expected product hit: {text}");
+        assert!(
+            text.contains("patterns.md"),
+            "expected practice hit: {text}"
+        );
+        assert!(!text.contains("hidden.md"), "unexpected hidden hit: {text}");
+    }
+
+    #[tokio::test]
     async fn memory_status_returns_counts() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
-            .memory_status(Parameters(StatusArgs { project: None }))
+            .memory_status(Parameters(StatusArgs {
+                project: None,
+                workspace: None,
+            }))
             .await
             .unwrap();
         let text = result
@@ -1292,6 +1610,7 @@ mod tests {
             .memory_briefing(Parameters(BriefingArgs {
                 recent_pages_limit: Some(5),
                 project: None,
+                workspace: None,
             }))
             .await
             .unwrap();
@@ -1336,6 +1655,7 @@ mod tests {
                 focus: None,
                 recent_pages_limit: Some(5),
                 project: None,
+                workspace: None,
             }))
             .await
             .unwrap();
@@ -1395,6 +1715,7 @@ mod tests {
             .memory_recent(Parameters(RecentArgs {
                 limit: Some(5),
                 project: None,
+                workspace: None,
             }))
             .await
             .unwrap();
@@ -1449,6 +1770,7 @@ mod tests {
             .memory_recent(Parameters(RecentArgs {
                 limit: Some(5),
                 project: None,
+                workspace: None,
             }))
             .await
             .unwrap();
@@ -1493,6 +1815,7 @@ mod tests {
             .memory_briefing(Parameters(BriefingArgs {
                 recent_pages_limit: Some(5),
                 project: None,
+                workspace: None,
             }))
             .await
             .unwrap();
@@ -1652,6 +1975,8 @@ mod tests {
                 query: "Karpathy".into(),
                 limit: Some(99_999),
                 project: None,
+                scopes: Vec::new(),
+                workspace: None,
             }))
             .await
             .expect("oversized limit should be clamped, not refused");
@@ -1677,6 +2002,8 @@ mod tests {
                 query: "\"unbalanced".into(),
                 limit: Some(10),
                 project: None,
+                scopes: Vec::new(),
+                workspace: None,
             }))
             .await;
         // Either a tidy 0-hit Ok (FTS5 is occasionally lenient) or

@@ -21,6 +21,8 @@ struct WritePageBody {
     body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
     tier: String,
     tags: Vec<String>,
     pinned: bool,
@@ -63,6 +65,7 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
             path: args.path.clone(),
             body: body_text,
             title: args.title,
+            kind: args.kind,
             tier: args.tier,
             tags: args.tag,
             pinned: args.pinned,
