@@ -142,7 +142,15 @@ fn print_plan(plan: &[PlannedChange]) {
 
 /// Re-run the matching stripper inside `apply_atomic` so the actual
 /// write is atomic + backed up. The stripper is chosen by filename.
-fn apply_change(change: &PlannedChange, name: &str, url: &str) -> anyhow::Result<()> {
+/// `only` gates which strippers run in the JSON `else` branch so that
+/// `--only hooks` does not accidentally strip `mcpServers` from a
+/// shared file (e.g. `~/.gemini/settings.json`).
+fn apply_change(
+    change: &PlannedChange,
+    name: &str,
+    url: &str,
+    only: Option<crate::cli::UninstallOnly>,
+) -> anyhow::Result<()> {
     match change {
         PlannedChange::DeleteFile { path } => {
             std::fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))?;
@@ -152,20 +160,31 @@ fn apply_change(change: &PlannedChange, name: &str, url: &str) -> anyhow::Result
             let file = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
             let outcome = apply_atomic(path, |existing| {
                 if file == "CLAUDE.md" || file == "AGENTS.md" {
+                    // build_plan only puts these in the plan under
+                    // Instructions; no gating needed here.
                     Ok(strip_instructions_block(existing).0)
                 } else if file == "config.toml" {
+                    // build_plan only puts config.toml in the plan under
+                    // Mcp; no gating needed here.
                     Ok(strip_mcp_toml(existing, name, url)?.0)
                 } else {
-                    // hooks settings/hooks.json OR an mcpServers JSON file:
-                    // run BOTH strippers; each is a no-op if its key is absent.
-                    let after_hooks = strip_ai_memory_hooks(existing)?.new_content;
-                    let mut out = after_hooks;
-                    for client in [
-                        crate::cli::McpClient::ClaudeCode,
-                        crate::cli::McpClient::OpenCode,
-                        crate::cli::McpClient::Openclaw,
-                    ] {
-                        out = strip_mcp_json(&out, client, name, url)?.0;
+                    // hooks settings/hooks.json OR a shared file with both
+                    // hooks and mcpServers (e.g. ~/.gemini/settings.json).
+                    // Gate each stripper on the --only filter so that
+                    // `--only hooks` never strips mcpServers and vice-versa.
+                    use crate::cli::UninstallOnly;
+                    let mut out = existing.to_string();
+                    if only.is_none() || only == Some(UninstallOnly::Hooks) {
+                        out = strip_ai_memory_hooks(&out)?.new_content;
+                    }
+                    if only.is_none() || only == Some(UninstallOnly::Mcp) {
+                        for client in [
+                            crate::cli::McpClient::ClaudeCode,
+                            crate::cli::McpClient::OpenCode,
+                            crate::cli::McpClient::Openclaw,
+                        ] {
+                            out = strip_mcp_json(&out, client, name, url)?.0;
+                        }
                     }
                     Ok(out)
                 }
@@ -208,7 +227,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     }
 
     for change in &plan {
-        apply_change(change, name, url)?;
+        apply_change(change, name, url, args.only)?;
     }
 
     let mut purge_refused = false;

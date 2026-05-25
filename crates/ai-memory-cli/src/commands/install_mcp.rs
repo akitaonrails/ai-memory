@@ -67,8 +67,6 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
 /// # Errors
 /// Returns an error for `Pi` (no MCP config), for Claude Desktop on
 /// unsupported OSes, or when `$HOME` can't be resolved.
-// used by uninstall in a later task
-#[allow(dead_code)]
 pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> {
     use crate::cli::McpClient;
     let home = dirs::home_dir().context("could not locate $HOME for config-file auto-detect")?;
