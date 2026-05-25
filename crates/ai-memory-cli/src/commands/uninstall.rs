@@ -11,6 +11,19 @@ use ai_memory_core::{MARKER_END, MARKER_START};
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
 use crate::cli::McpClient;
+use crate::cli::UninstallArgs;
+use crate::config::Config;
+
+/// Run the `uninstall` subcommand.
+///
+/// # Errors
+/// Returns an error if a config file is malformed or a removal write
+/// fails. Absent files / nothing-to-remove are not errors.
+pub fn run(_config: &Config, _args: UninstallArgs) -> anyhow::Result<()> {
+    // Implemented in later tasks (build plan, dry-run, apply, purge).
+    println!("uninstall: not yet implemented");
+    Ok(())
+}
 
 /// Remove the `<!-- ai-memory:start -->`…`<!-- ai-memory:end -->`
 /// block (inclusive) from a CLAUDE.md / AGENTS.md. Returns the new

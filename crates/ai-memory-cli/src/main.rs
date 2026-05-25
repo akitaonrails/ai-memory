@@ -61,5 +61,6 @@ async fn main() -> Result<()> {
         Command::Reorg(args) => commands::reorg::run(&config, args).await,
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
+        Command::Uninstall(args) => commands::uninstall::run(&config, args),
     }
 }

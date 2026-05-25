@@ -92,6 +92,37 @@ pub enum Command {
     /// Useful after renaming the project's directory on disk so the hook
     /// router keeps writing into the same logical project.
     RenameProject(RenameProjectArgs),
+    /// Remove ai-memory's wiring (hooks, MCP, instructions) from all
+    /// detected agents. Dry-run unless `--apply`.
+    Uninstall(UninstallArgs),
+}
+
+/// Which concern `uninstall` should touch. Omitted = all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum UninstallOnly {
+    Hooks,
+    Mcp,
+    Instructions,
+}
+
+/// Arguments for `uninstall`.
+#[derive(Debug, Args)]
+pub struct UninstallArgs {
+    /// Actually modify files. Without it, prints the removal plan and
+    /// exits (dry-run), mirroring `reset` without `--confirm`.
+    #[arg(long)]
+    pub apply: bool,
+    /// After removing the wiring, wipe wiki/, db/, raw/ via the reset
+    /// path (refuses if another ai-memory process is alive). Only
+    /// meaningful with `--apply`.
+    #[arg(long)]
+    pub purge_data: bool,
+    /// Limit to one concern. Omitted = hooks + mcp + instructions.
+    #[arg(long, value_enum)]
+    pub only: Option<UninstallOnly>,
+    /// Skip the interactive confirmation when a TTY is attached.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 /// Arguments for `reorg`.
