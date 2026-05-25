@@ -61,15 +61,18 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the user-config file for this client. Honours
-/// `--config-file` when provided, else uses the canonical default
-/// per client.
-fn resolve_config_file(args: &InstallMcpArgs) -> Result<PathBuf> {
-    if let Some(p) = &args.config_file {
-        return Ok(p.clone());
-    }
+/// Default MCP config-file path for a client (ignores any
+/// `--config-file` override). Shared by install and uninstall.
+///
+/// # Errors
+/// Returns an error for `Pi` (no MCP config), for Claude Desktop on
+/// unsupported OSes, or when `$HOME` can't be resolved.
+// used by uninstall in a later task
+#[allow(dead_code)]
+pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> {
+    use crate::cli::McpClient;
     let home = dirs::home_dir().context("could not locate $HOME for config-file auto-detect")?;
-    Ok(match args.client {
+    Ok(match client {
         // Claude Code reads MCP-server registrations from `~/.claude.json`
         // (the same file `claude mcp add`/`claude mcp list` operate on).
         // `~/.claude/settings.json` is a separate file for hooks /
@@ -114,6 +117,16 @@ fn resolve_config_file(args: &InstallMcpArgs) -> Result<PathBuf> {
             .join("antigravity-cli")
             .join("mcp_config.json"),
     })
+}
+
+/// Resolve the user-config file for this client. Honours
+/// `--config-file` when provided, else uses the canonical default
+/// per client.
+fn resolve_config_file(args: &InstallMcpArgs) -> Result<PathBuf> {
+    if let Some(p) = &args.config_file {
+        return Ok(p.clone());
+    }
+    mcp_config_path(args.client)
 }
 
 /// Mutate the resolved client config file in place. Idempotent —

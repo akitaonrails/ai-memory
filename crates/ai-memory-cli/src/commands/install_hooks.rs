@@ -29,6 +29,48 @@ use crate::commands::render_shared::{
 };
 use crate::config::Config;
 
+/// `~/.claude/settings.json` — Claude Code hooks live under `hooks`.
+pub(crate) fn claude_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .context("could not locate $HOME for ~/.claude/settings.json")?
+        .join(".claude")
+        .join("settings.json"))
+}
+
+/// `~/.codex/hooks.json`.
+pub(crate) fn codex_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .context("could not locate $HOME for ~/.codex/hooks.json")?
+        .join(".codex")
+        .join("hooks.json"))
+}
+
+/// `~/.cursor/hooks.json`.
+pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .context("could not locate $HOME for ~/.cursor/hooks.json")?
+        .join(".cursor")
+        .join("hooks.json"))
+}
+
+/// `~/.gemini/settings.json`.
+pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .context("could not locate $HOME for ~/.gemini/settings.json")?
+        .join(".gemini")
+        .join("settings.json"))
+}
+
+/// `~/.config/opencode/plugins/ai-memory.ts` — OpenCode's plugin file.
+pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .context("could not locate $HOME for ~/.config/opencode")?
+        .join(".config")
+        .join("opencode")
+        .join("plugins")
+        .join("ai-memory.ts"))
+}
+
 /// Run the `install-hooks` subcommand.
 ///
 /// # Errors
@@ -107,10 +149,7 @@ fn apply_to_claude_code_settings(
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
-        None => dirs::home_dir()
-            .context("could not locate $HOME for ~/.claude/settings.json")?
-            .join(".claude")
-            .join("settings.json"),
+        None => claude_settings_path()?,
     };
     let staged = stage_hook_scripts(hooks_dir, "claude-code")?;
     let command_dir = staged_command_dir(&staged, "claude-code");
@@ -181,10 +220,7 @@ fn apply_to_codex_settings(
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
-        None => dirs::home_dir()
-            .context("could not locate $HOME for ~/.codex/hooks.json")?
-            .join(".codex")
-            .join("hooks.json"),
+        None => codex_hooks_path()?,
     };
     let staged = stage_hook_scripts(hooks_dir, "codex")?;
     let command_dir = staged_command_dir(&staged, "codex");
@@ -276,10 +312,7 @@ fn apply_to_cursor_settings(
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
-        None => dirs::home_dir()
-            .context("could not locate $HOME for ~/.cursor/hooks.json")?
-            .join(".cursor")
-            .join("hooks.json"),
+        None => cursor_hooks_path()?,
     };
     let staged = stage_hook_scripts(hooks_dir, "cursor")?;
     let command_dir = staged_command_dir(&staged, "cursor");
@@ -352,10 +385,7 @@ fn apply_to_gemini_settings(
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
-        None => dirs::home_dir()
-            .context("could not locate $HOME for ~/.gemini/settings.json")?
-            .join(".gemini")
-            .join("settings.json"),
+        None => gemini_settings_path()?,
     };
     let staged = stage_hook_scripts(hooks_dir, "gemini-cli")?;
     let command_dir = staged_command_dir(&staged, "gemini-cli");
@@ -485,12 +515,7 @@ fn apply_to_opencode_plugin(
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
-        None => dirs::home_dir()
-            .context("could not locate $HOME for ~/.config/opencode/plugins")?
-            .join(".config")
-            .join("opencode")
-            .join("plugins")
-            .join("ai-memory.ts"),
+        None => opencode_plugin_path()?,
     };
     let body = build_opencode_plugin(server_url, auth_token);
 
