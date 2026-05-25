@@ -9,6 +9,7 @@
 use anyhow::Result;
 use ai_memory_core::{MARKER_END, MARKER_START};
 use crate::commands::apply_shared::mutate_json;
+use crate::commands::apply_shared::mutate_toml;
 use crate::cli::McpClient;
 
 /// Remove the `<!-- ai-memory:start -->`…`<!-- ai-memory:end -->`
@@ -206,6 +207,33 @@ fn strip_mcp_json(
     Ok((new_content, removed))
 }
 
+/// Remove ai-memory's Codex MCP table by name or `url`. Returns new
+/// content and removed names. Preserves comments + other tables.
+#[allow(dead_code)]
+fn strip_mcp_toml(content: &str, name: &str, url: &str) -> Result<(String, Vec<String>)> {
+    let mut removed = Vec::new();
+    let new_content = mutate_toml(content, |doc| {
+        let Some(servers) = doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut()) else {
+            return Ok(());
+        };
+        let keys: Vec<String> = servers.iter().map(|(k, _)| k.to_string()).collect();
+        for k in keys {
+            let matches_url = servers
+                .get(&k)
+                .and_then(|item| item.as_table())
+                .and_then(|t| t.get("url"))
+                .and_then(|u| u.as_str())
+                == Some(url);
+            if k == name || matches_url {
+                servers.remove(&k);
+                removed.push(k);
+            }
+        }
+        Ok(())
+    })?;
+    Ok((new_content, removed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +394,31 @@ mod tests {
     fn strip_mcp_no_match_is_noop() {
         let content = r#"{"mcpServers":{"other":{"url":"http://x"}}}"#;
         let (_out, removed) = strip_mcp_json(content, McpClient::ClaudeCode, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn strip_mcp_toml_by_name_keeps_comments_and_tables() {
+        let content = "# my codex config\n[other]\nkeep = true\n\n[mcp_servers.ai-memory]\nurl = \"http://127.0.0.1:49374/mcp\"\n";
+        let (out, removed) = strip_mcp_toml(content, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        assert!(out.contains("# my codex config"));
+        assert!(out.contains("[other]"));
+        assert!(!out.contains("[mcp_servers.ai-memory]"));
+    }
+
+    #[test]
+    fn strip_mcp_toml_by_url_under_custom_name() {
+        let content = "[mcp_servers.custom]\nurl = \"http://127.0.0.1:49374/mcp\"\n";
+        let (out, removed) = strip_mcp_toml(content, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+        assert_eq!(removed, vec!["custom".to_string()]);
+        assert!(!out.contains("custom"));
+    }
+
+    #[test]
+    fn strip_mcp_toml_no_match_is_noop() {
+        let content = "[mcp_servers.other]\nurl = \"http://x\"\n";
+        let (_out, removed) = strip_mcp_toml(content, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
         assert!(removed.is_empty());
     }
 }
