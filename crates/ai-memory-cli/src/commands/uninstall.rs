@@ -6,7 +6,9 @@
 //!
 //! Design: docs/superpowers/specs/2026-05-24-uninstall-command-design.md
 
+use anyhow::Result;
 use ai_memory_core::{MARKER_END, MARKER_START};
+use crate::commands::apply_shared::mutate_json;
 
 /// Remove the `<!-- ai-memory:start -->`…`<!-- ai-memory:end -->`
 /// block (inclusive) from a CLAUDE.md / AGENTS.md. Returns the new
@@ -48,6 +50,69 @@ fn strip_instructions_block(content: &str) -> (String, bool) {
 #[allow(dead_code)]
 fn hook_command_is_ours(command: &str) -> bool {
     command.contains("AI_MEMORY_HOOK_URL=")
+}
+
+/// Result of stripping ai-memory entries from a hooks JSON file.
+#[allow(dead_code)]
+struct HookRemoval {
+    new_content: String,
+    removed_events: Vec<String>,
+}
+
+/// An entry (one element of an event's array) is ai-memory's when its
+/// command carries the signature — at the entry level (Flat shape) or
+/// inside its nested `hooks` array (Nested shape).
+fn hook_entry_is_ours(entry: &serde_json::Value) -> bool {
+    if let Some(cmd) = entry.get("command").and_then(|c| c.as_str())
+        && hook_command_is_ours(cmd)
+    {
+        return true;
+    }
+    if let Some(inner) = entry.get("hooks").and_then(|h| h.as_array()) {
+        return inner.iter().any(|h| {
+            h.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(hook_command_is_ours)
+        });
+    }
+    false
+}
+
+/// Remove ai-memory hook entries from a settings/hooks JSON document.
+/// Preserves third-party entries (including siblings under the same
+/// event). Prunes an event key when emptied and the `hooks` object
+/// when emptied. Detection is by signature, so stale event keys
+/// outside the current vocabulary are caught too.
+#[allow(dead_code)]
+fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+            return Ok(());
+        };
+        let events: Vec<String> = hooks.keys().cloned().collect();
+        for event in events {
+            let Some(arr) = hooks.get_mut(&event).and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            let before = arr.len();
+            arr.retain(|entry| !hook_entry_is_ours(entry));
+            if arr.len() != before {
+                removed_events.push(event.clone());
+            }
+            if arr.is_empty() {
+                hooks.remove(&event);
+            }
+        }
+        if hooks.is_empty() {
+            root.remove("hooks");
+        }
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
 }
 
 #[cfg(test)]
@@ -101,5 +166,73 @@ mod tests {
         // A user's own hook that happens to be named stop.sh — no prefix.
         assert!(!hook_command_is_ours("/usr/local/bin/my-stop.sh"));
         assert!(!hook_command_is_ours("/opt/tools/hooks/session-start.sh"));
+    }
+
+    #[test]
+    fn strip_hooks_nested_removes_ours_keeps_third_party() {
+        let content = r#"{
+      "hooks": {
+        "SessionStart": [
+          {"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/session-start.sh"}]}
+        ],
+        "Notification": [
+          {"matcher":"","hooks":[{"type":"command","command":"/usr/bin/notify.sh"}]}
+        ]
+      }
+    }"#;
+        let out = strip_ai_memory_hooks(content).unwrap();
+        assert_eq!(out.removed_events, vec!["SessionStart".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert!(v["hooks"].get("SessionStart").is_none(), "our event pruned");
+        assert!(v["hooks"].get("Notification").is_some(), "third-party kept");
+    }
+
+    #[test]
+    fn strip_hooks_flat_cursor_shape() {
+        let content = r#"{
+      "version": 1,
+      "hooks": {
+        "stop": [
+          {"type":"command","command":"AI_MEMORY_HOOK_URL=http://h /x/stop.sh","matcher":""}
+        ]
+      }
+    }"#;
+        let out = strip_ai_memory_hooks(content).unwrap();
+        assert_eq!(out.removed_events, vec!["stop".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert!(v["hooks"].get("stop").is_none());
+        assert_eq!(v["version"], 1, "sibling top-level key preserved");
+    }
+
+    #[test]
+    fn strip_hooks_prunes_emptied_hooks_object() {
+        let content = r#"{"hooks":{"Stop":[{"type":"command","command":"AI_MEMORY_HOOK_URL=x /a/stop.sh"}]}}"#;
+        let out = strip_ai_memory_hooks(content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert!(v.get("hooks").is_none(), "emptied hooks object removed");
+    }
+
+    #[test]
+    fn strip_hooks_preserves_third_party_with_generic_basename() {
+        let content = r#"{
+      "hooks": {
+        "Stop": [
+          {"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=x /a/stop.sh"}]},
+          {"matcher":"","hooks":[{"type":"command","command":"/home/u/scripts/stop.sh"}]}
+        ]
+      }
+    }"#;
+        let out = strip_ai_memory_hooks(content).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        let arr = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "only ours removed");
+        assert!(arr[0]["hooks"][0]["command"].as_str().unwrap().contains("/home/u/scripts/stop.sh"));
+    }
+
+    #[test]
+    fn strip_hooks_no_hooks_key_is_noop() {
+        let content = r#"{"unrelated":true}"#;
+        let out = strip_ai_memory_hooks(content).unwrap();
+        assert!(out.removed_events.is_empty());
     }
 }
