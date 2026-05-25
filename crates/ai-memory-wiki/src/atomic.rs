@@ -50,7 +50,14 @@ fn inode_of(path: &Path) -> std::io::Result<u64> {
     Ok(std::fs::metadata(path)?.ino())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn inode_of(path: &Path) -> std::io::Result<u64> {
+    let file = std::fs::File::open(path)?;
+    let info = winapi_util::file::information(&file)?;
+    Ok(info.file_index())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn inode_of(_path: &Path) -> std::io::Result<u64> {
     Ok(0)
 }
@@ -79,6 +86,14 @@ mod tests {
         write_atomic(&target, b"first").unwrap();
         write_atomic(&target, b"second").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"second");
+    }
+
+    #[test]
+    fn inode_is_nonzero_on_all_platforms() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("page.md");
+        let ino = write_atomic(&target, b"hello").unwrap();
+        assert_ne!(ino, 0, "inode should be nonzero on all supported platforms");
     }
 
     #[test]

@@ -1165,7 +1165,14 @@ mod tests {
                 open_questions: vec!["what max channel size?".into()],
                 next_steps: vec!["finish supersession path".into()],
                 files_touched: vec!["crates/ai-memory-store/src/writer.rs".into()],
-                cwd: Some("/tmp/aim".into()),
+                cwd: Some(
+                    if cfg!(windows) {
+                        r"C:\tmp\aim"
+                    } else {
+                        "/tmp/aim"
+                    }
+                    .into(),
+                ),
             }))
             .await
             .unwrap();
@@ -1180,7 +1187,14 @@ mod tests {
         // Accepting with matching cwd returns the handoff.
         let accept = server
             .memory_handoff_accept(Parameters(HandoffAcceptArgs {
-                cwd: Some("/tmp/aim".into()),
+                cwd: Some(
+                    if cfg!(windows) {
+                        r"C:\tmp\aim"
+                    } else {
+                        "/tmp/aim"
+                    }
+                    .into(),
+                ),
             }))
             .await
             .unwrap();

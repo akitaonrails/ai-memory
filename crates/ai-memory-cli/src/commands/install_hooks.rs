@@ -27,6 +27,12 @@ use crate::commands::render_shared::{
 };
 use crate::config::Config;
 
+/// Platform-appropriate extension for hook scripts: `.ps1` on
+/// Windows, `.sh` everywhere else.
+fn hook_script_ext() -> &'static str {
+    if cfg!(windows) { "ps1" } else { "sh" }
+}
+
 /// Run the `install-hooks` subcommand.
 ///
 /// # Errors
@@ -939,7 +945,7 @@ fn render_agent(
     for entry in std::fs::read_dir(hooks_dir)? {
         let entry = entry?;
         let p = entry.path();
-        if p.is_file() && p.extension().is_some_and(|e| e == "sh") {
+        if p.is_file() && p.extension().is_some_and(|e| e == hook_script_ext()) {
             println!("- {}", p.display());
         }
     }
@@ -991,7 +997,7 @@ fn stage_hook_scripts(source_dir: &Path, agent_label: &str) -> Result<PathBuf> {
     if let Ok(entries) = fs::read_dir(&dest_root) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file() && p.extension().is_some_and(|e| e == "sh") {
+            if p.is_file() && p.extension().is_some_and(|e| e == hook_script_ext()) {
                 fs::remove_file(&p).ok();
             }
         }
@@ -1003,7 +1009,7 @@ fn stage_hook_scripts(source_dir: &Path, agent_label: &str) -> Result<PathBuf> {
     {
         let entry = entry?;
         let from = entry.path();
-        if !from.is_file() || from.extension().and_then(|s| s.to_str()) != Some("sh") {
+        if !from.is_file() || from.extension().and_then(|s| s.to_str()) != Some(hook_script_ext()) {
             continue;
         }
         let to = dest_root.join(from.file_name().context("bad source file name")?);
@@ -1035,8 +1041,13 @@ fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<Path
         // OMP/OpenClaw have no shell hook scripts → no script dir needed. Return a
         // sentinel that's never touched; the caller's apply path
         // short-circuits before any filesystem use.
-        AgentChoice::Omp => return Ok(PathBuf::from("/dev/null")),
-        AgentChoice::Openclaw => return Ok(PathBuf::from("/dev/null")),
+        AgentChoice::Omp | AgentChoice::Openclaw => {
+            return Ok(PathBuf::from(if cfg!(windows) {
+                "NUL"
+            } else {
+                "/dev/null"
+            }));
+        }
     };
     if let Some(p) = explicit {
         let path = p.join(sub);
@@ -1084,7 +1095,8 @@ fn render_claude_code(hooks_dir: &Path, server_url: &str, auth_token: Option<&st
     // that exists only on the host's filesystem — bailing would
     // sabotage the docker-only flow `setup-agent` enables.
     for (_, script) in super::render_shared::CLAUDE_CODE_EVENTS {
-        let abs = hooks_dir.join(script);
+        let actual = super::render_shared::platform_script_name(script);
+        let abs = hooks_dir.join(actual);
         if !abs.exists() {
             eprintln!(
                 "# warning: {} not present on this filesystem. \

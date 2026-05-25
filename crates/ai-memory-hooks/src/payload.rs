@@ -312,15 +312,16 @@ mod tests {
             event: "session-start".into(),
             agent: Some("claude-code".into()),
         };
+        let cwd_val = if cfg!(windows) { r"C:\tmp\x" } else { "/tmp/x" };
         let raw = serde_json::json!({
             "session_id": "abc-123",
-            "cwd": "/tmp/x",
+            "cwd": cwd_val,
             "model": "claude-sonnet-4-6"
         });
         let env = HookEnvelope::from_query_and_body(q, raw);
         assert_eq!(env.event, HookEvent::SessionStart);
         assert_eq!(env.session_id.as_deref(), Some("abc-123"));
-        assert_eq!(env.cwd.as_deref(), Some("/tmp/x"));
+        assert_eq!(env.cwd.as_deref(), Some(cwd_val));
         assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-6"));
     }
 

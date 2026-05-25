@@ -87,7 +87,11 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             workspace_id: ws,
             project_id: scratch,
             agent_kind: AgentKind::ClaudeCode,
-            cwd: Some(std::path::PathBuf::from("/home/user/alpha-repo")),
+            cwd: Some(if cfg!(windows) {
+                std::path::PathBuf::from(r"C:\Users\user\alpha-repo")
+            } else {
+                std::path::PathBuf::from("/home/user/alpha-repo")
+            }),
         })
         .await
         .unwrap();
@@ -113,7 +117,11 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             workspace_id: ws,
             project_id: scratch,
             agent_kind: AgentKind::ClaudeCode,
-            cwd: Some(std::path::PathBuf::from("/home/user/beta-repo")),
+            cwd: Some(if cfg!(windows) {
+                std::path::PathBuf::from(r"C:\Users\user\beta-repo")
+            } else {
+                std::path::PathBuf::from("/home/user/beta-repo")
+            }),
         })
         .await
         .unwrap();

@@ -377,6 +377,7 @@ fn page_path_relative_to(root: &Path, abs: &Path) -> Option<PagePath> {
 mod tests {
     use super::*;
     use ai_memory_store::Store;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     async fn setup() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId) {
@@ -396,15 +397,22 @@ mod tests {
         (tmp, store, wiki, ws, proj)
     }
 
+    fn test_wiki_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\data\wiki")
+        } else {
+            PathBuf::from("/data/wiki")
+        }
+    }
+
     /// `extract_project_ids` must parse a valid `<ws>/<proj>/<path>` triplet.
     #[test]
     fn extract_project_ids_valid_path() {
-        let wiki_root = Path::new("/data/wiki");
+        let wiki_root = test_wiki_root();
         let ws_id = WorkspaceId::new();
         let proj_id = ProjectId::new();
-        let event_path =
-            std::path::PathBuf::from(format!("/data/wiki/{}/{}/decisions/foo.md", ws_id, proj_id));
-        let result = extract_project_ids(wiki_root, &event_path);
+        let event_path = wiki_root.join(format!("{ws_id}/{proj_id}/decisions/foo.md"));
+        let result = extract_project_ids(&wiki_root, &event_path);
         assert!(
             result.is_some(),
             "must extract IDs from valid namespaced path"
@@ -418,10 +426,10 @@ mod tests {
     /// `extract_project_ids` must return `None` when the first segment is not a UUID.
     #[test]
     fn extract_project_ids_garbage_first_segment() {
-        let wiki_root = Path::new("/data/wiki");
-        let event_path = Path::new("/data/wiki/not-a-uuid/some-proj/foo.md");
+        let wiki_root = test_wiki_root();
+        let event_path = wiki_root.join("not-a-uuid/some-proj/foo.md");
         assert!(
-            extract_project_ids(wiki_root, event_path).is_none(),
+            extract_project_ids(&wiki_root, &event_path).is_none(),
             "garbage first segment must return None"
         );
     }
@@ -429,10 +437,10 @@ mod tests {
     /// `extract_project_ids` must return `None` for flat (non-namespaced) paths.
     #[test]
     fn extract_project_ids_flat_path_returns_none() {
-        let wiki_root = Path::new("/data/wiki");
-        let event_path = Path::new("/data/wiki/foo.md");
+        let wiki_root = test_wiki_root();
+        let event_path = wiki_root.join("foo.md");
         assert!(
-            extract_project_ids(wiki_root, event_path).is_none(),
+            extract_project_ids(&wiki_root, &event_path).is_none(),
             "flat path with no namespace must return None"
         );
     }
@@ -440,12 +448,11 @@ mod tests {
     /// `extract_project_ids` must return `None` when the second segment is not a valid UUID.
     #[test]
     fn extract_rejects_garbage_in_project_segment() {
-        let wiki_root = Path::new("/tmp/wiki");
+        let wiki_root = test_wiki_root();
         let ws = WorkspaceId::new().to_string();
-        let event_path =
-            std::path::PathBuf::from(format!("/tmp/wiki/{ws}/not-a-uuid/decisions/foo.md"));
+        let event_path = wiki_root.join(format!("{ws}/not-a-uuid/decisions/foo.md"));
         assert!(
-            extract_project_ids(wiki_root, &event_path).is_none(),
+            extract_project_ids(&wiki_root, &event_path).is_none(),
             "garbage project segment must return None"
         );
     }
@@ -454,13 +461,13 @@ mod tests {
     /// after the two UUID segments (would produce an empty `PagePath`).
     #[test]
     fn extract_rejects_empty_page_path() {
-        let wiki_root = Path::new("/tmp/wiki");
+        let wiki_root = test_wiki_root();
         let ws = WorkspaceId::new().to_string();
         let proj = ProjectId::new().to_string();
         // Just the project dir itself with no page path beneath.
-        let event_path = std::path::PathBuf::from(format!("/tmp/wiki/{ws}/{proj}"));
+        let event_path = wiki_root.join(format!("{ws}/{proj}"));
         assert!(
-            extract_project_ids(wiki_root, &event_path).is_none(),
+            extract_project_ids(&wiki_root, &event_path).is_none(),
             "missing page path must return None"
         );
     }

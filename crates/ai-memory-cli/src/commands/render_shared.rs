@@ -37,6 +37,17 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 7] = [
     ("SessionEnd", "session-end.sh"),
 ];
 
+/// Return the platform-appropriate script filename. On Windows the
+/// hook runner invokes PowerShell `.ps1` scripts; everywhere else
+/// POSIX `.sh` scripts.
+pub(crate) fn platform_script_name(sh_name: &str) -> String {
+    if cfg!(windows) {
+        sh_name.replace(".sh", ".ps1")
+    } else {
+        sh_name.to_string()
+    }
+}
+
 /// Format an `Authorization: Bearer <token>` header value, or `None`
 /// when no token is supplied. Used by every MCP client renderer in
 /// `install-mcp` and every hook-config renderer that wants to
@@ -212,7 +223,8 @@ fn build_hook_payload(
 ) -> serde_json::Value {
     let mut hooks_block = serde_json::Map::new();
     for (event, script) in events {
-        let abs = emit_root.join(script);
+        let actual_script = platform_script_name(script);
+        let abs = emit_root.join(&actual_script);
 
         // Claude Code's hook schema (per
         // https://code.claude.com/docs/en/hooks):
@@ -223,7 +235,6 @@ fn build_hook_payload(
         //   ]
         //
         // We INLINE env vars into the command string itself
-        // (`AI_MEMORY_HOOK_URL=... AI_MEMORY_AUTH_TOKEN=... /path`)
         // rather than passing them through an `env` field on the
         // hook entry. Reasons:
         //   1. CC doesn't appear to honour an `env` field at this
@@ -232,15 +243,35 @@ fn build_hook_payload(
         //      127.0.0.1 default, so POSTs go nowhere.
         //   2. Inlining the env into the command string is
         //      portable across any shell-style hook runner — POSIX
-        //      `VAR=val command` syntax is universally honoured.
+        //      `VAR=val command` syntax is universally honoured;
+        //      on Windows we use `$env:VAR='val'; & powershell …`.
         //   3. The hook scripts already read those env vars (see
         //      `hooks/claude-code/session-start.sh` etc.), so no
         //      script changes are required.
-        let mut prefix = format!("AI_MEMORY_HOOK_URL={} ", shell_quote(server_url));
-        if let Some(t) = auth_token {
-            prefix.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(t)));
-        }
-        let command = format!("{prefix}{}", abs.to_string_lossy());
+        let command = if cfg!(windows) {
+            let mut parts = Vec::new();
+            parts.push(format!(
+                "$env:AI_MEMORY_HOOK_URL='{}'",
+                server_url.replace('\'', "''")
+            ));
+            if let Some(t) = auth_token {
+                parts.push(format!(
+                    "$env:AI_MEMORY_AUTH_TOKEN='{}'",
+                    t.replace('\'', "''")
+                ));
+            }
+            parts.push(format!(
+                "& powershell -NoProfile -File '{}'",
+                abs.to_string_lossy().replace('\'', "''")
+            ));
+            parts.join("; ")
+        } else {
+            let mut prefix = format!("AI_MEMORY_HOOK_URL={} ", shell_quote(server_url));
+            if let Some(t) = auth_token {
+                prefix.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(t)));
+            }
+            format!("{prefix}{}", abs.to_string_lossy())
+        };
 
         // Empty matcher = fire on every event of this kind. Right
         // for ai-memory's capture hooks (every prompt, every tool
@@ -294,7 +325,11 @@ mod tests {
 
     #[test]
     fn claude_code_payload_has_seven_events() {
-        let root = PathBuf::from("/host/hooks/claude-code");
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\host\hooks\claude-code")
+        } else {
+            PathBuf::from("/host/hooks/claude-code")
+        };
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
         let hooks = v.get("hooks").and_then(|h| h.as_object()).unwrap();
         assert_eq!(hooks.len(), 7);
@@ -305,7 +340,11 @@ mod tests {
 
     #[test]
     fn claude_code_payload_embeds_auth_token_when_provided() {
-        let root = PathBuf::from("/host/hooks/claude-code");
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\host\hooks\claude-code")
+        } else {
+            PathBuf::from("/host/hooks/claude-code")
+        };
         let v = build_claude_code_payload(&root, "http://localhost:49374", Some("tok"));
         // Env vars are inlined into the command string so CC's
         // hook runner sees them regardless of whether it honours
@@ -316,11 +355,11 @@ mod tests {
             .and_then(|s| s.as_str())
             .unwrap();
         assert!(
-            command.contains("AI_MEMORY_AUTH_TOKEN=tok"),
+            command.contains("AI_MEMORY_AUTH_TOKEN") && command.contains("tok"),
             "command should inline the auth token; got: {command}"
         );
         assert!(
-            command.contains("AI_MEMORY_HOOK_URL=http://localhost:49374"),
+            command.contains("AI_MEMORY_HOOK_URL") && command.contains("http://localhost:49374"),
             "command should inline the hook URL; got: {command}"
         );
     }
@@ -336,7 +375,11 @@ mod tests {
     fn cursor_payload_uses_flat_shape() {
         // Flat shape: no inner `hooks: [...]` array; each event
         // maps to an array of {type, command, matcher} entries.
-        let root = PathBuf::from("/host/hooks/cursor");
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\host\hooks\cursor")
+        } else {
+            PathBuf::from("/host/hooks/cursor")
+        };
         let v = build_profile_payload(
             &CURSOR_PROFILE,
             &root,
@@ -366,7 +409,10 @@ mod tests {
             .get("command")
             .and_then(|c| c.as_str())
             .unwrap();
-        assert!(cmd.contains("AI_MEMORY_AUTH_TOKEN=tok"));
+        assert!(
+            cmd.contains("AI_MEMORY_AUTH_TOKEN") && cmd.contains("tok"),
+            "command should inline the auth token; got: {cmd}"
+        );
         // Events are camelCase, not PascalCase.
         let events: Vec<&str> = v
             .pointer("/hooks")
@@ -386,7 +432,11 @@ mod tests {
         // Same nested shape as Claude Code, but DIFFERENT event
         // names (BeforeTool / AfterTool / PreCompress; no
         // UserPromptSubmit, no Stop).
-        let root = PathBuf::from("/host/hooks/gemini-cli");
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\host\hooks\gemini-cli")
+        } else {
+            PathBuf::from("/host/hooks/gemini-cli")
+        };
         let v = build_profile_payload(
             &GEMINI_PROFILE,
             &root,
@@ -441,7 +491,11 @@ mod tests {
 
     #[test]
     fn claude_code_payload_uses_matcher_plus_inner_hooks_shape() {
-        let root = PathBuf::from("/host/hooks/claude-code");
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\host\hooks\claude-code")
+        } else {
+            PathBuf::from("/host/hooks/claude-code")
+        };
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
         for (event, _) in CLAUDE_CODE_EVENTS {
             let outer = v
@@ -469,32 +523,63 @@ mod tests {
 
     #[test]
     fn claude_code_payload_omits_auth_token_when_absent() {
-        let root = PathBuf::from("/host/hooks/claude-code");
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\host\hooks\claude-code")
+        } else {
+            PathBuf::from("/host/hooks/claude-code")
+        };
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
         let command = v
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
-        assert!(command.contains("AI_MEMORY_HOOK_URL="));
+        assert!(command.contains("AI_MEMORY_HOOK_URL"));
         assert!(
-            !command.contains("AI_MEMORY_AUTH_TOKEN="),
+            !command.contains("AI_MEMORY_AUTH_TOKEN"),
             "no token expected in command: {command}"
         );
     }
 
     #[test]
     fn claude_code_payload_emits_absolute_paths() {
-        let root = PathBuf::from("/home/user/.ai-memory/hooks/claude-code");
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\user\.ai-memory\hooks\claude-code")
+        } else {
+            PathBuf::from("/home/user/.ai-memory/hooks/claude-code")
+        };
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
         let cmd = v
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
-        // The command now has the env prefix + the absolute path,
-        // joined by a single space.
+        let script_name = platform_script_name("session-start.sh");
+        let expected_path = root.join(&script_name).to_string_lossy().to_string();
         assert!(
-            cmd.ends_with("/home/user/.ai-memory/hooks/claude-code/session-start.sh"),
-            "command should end with the absolute script path: {cmd}"
+            cmd.contains(&expected_path),
+            "command should contain the absolute script path: {cmd}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn claude_code_payload_emits_powershell_commands_on_windows() {
+        let root = PathBuf::from(r"C:\Users\user\.ai-memory\hooks\claude-code");
+        let v = build_claude_code_payload(&root, "http://localhost:49374", Some("tok"));
+        let cmd = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
+            .unwrap();
+        assert!(
+            cmd.contains("$env:AI_MEMORY_HOOK_URL="),
+            "Windows command should use $env: syntax; got: {cmd}"
+        );
+        assert!(
+            cmd.contains("powershell"),
+            "Windows command should invoke powershell; got: {cmd}"
+        );
+        assert!(
+            cmd.contains(".ps1"),
+            "Windows command should reference .ps1 script; got: {cmd}"
         );
     }
 }

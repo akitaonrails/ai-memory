@@ -20,6 +20,14 @@ use sha2::{Digest, Sha256};
 const TAILWIND_VERSION: &str = "3.4.17";
 const TAILWIND_LINUX_X64_SHA256: &str =
     "7d24f7fa191d2193b78cd5f5a42a6093e14409521908529f42d80b11fde1f1d4";
+const TAILWIND_LINUX_ARM64_SHA256: &str =
+    "69b1378b8133192d7d2feb12a116fa12d035594f58db3eff215879e4ad8cf39b";
+const TAILWIND_MACOS_X64_SHA256: &str =
+    "6cbdad74be776c087ffa5e9a057512c54898f9fe8828d3362212dfe32fc933a3";
+const TAILWIND_MACOS_ARM64_SHA256: &str =
+    "a1d0c7985759accca0bf12e51ac1dcbf0f6cf2fffb62e6e0f62d091c477a10a3";
+const TAILWIND_WINDOWS_X64_SHA256: &str =
+    "67f1c5e3f5a03406a7bf5badf5ada09b79f3ae78ec43450c15f7e983068da346";
 
 fn main() {
     // Re-run triggers.
@@ -131,6 +139,10 @@ fn tailwind_slug() -> &'static str {
 fn expected_tailwind_sha256() -> &'static str {
     match tailwind_slug() {
         "tailwindcss-linux-x64" => TAILWIND_LINUX_X64_SHA256,
+        "tailwindcss-linux-arm64" => TAILWIND_LINUX_ARM64_SHA256,
+        "tailwindcss-macos-x64" => TAILWIND_MACOS_X64_SHA256,
+        "tailwindcss-macos-arm64" => TAILWIND_MACOS_ARM64_SHA256,
+        "tailwindcss-windows-x64.exe" => TAILWIND_WINDOWS_X64_SHA256,
         other => panic!(
             "No pinned Tailwind SHA-256 for {other}. Set TAILWIND_SKIP=1 and provide static/tailwind.css manually."
         ),
@@ -180,12 +192,14 @@ fn download_tailwind(out_dir: &Path) -> PathBuf {
     let url = tailwind_url();
     eprintln!("cargo:warning=Downloading Tailwind CSS CLI v{TAILWIND_VERSION} from {url}");
 
-    // Try curl first, then wget.
-    let success = try_download_curl(&url, &dest) || try_download_wget(&url, &dest);
+    // Try curl first, then wget, then PowerShell (Windows fallback).
+    let success = try_download_curl(&url, &dest)
+        || try_download_wget(&url, &dest)
+        || try_download_powershell(&url, &dest);
 
     if !success {
         panic!(
-            "Could not download Tailwind CSS CLI — curl and wget both failed.\n\
+            "Could not download Tailwind CSS CLI — curl, wget, and PowerShell all failed.\n\
              Either install curl or wget, OR set TAILWIND_SKIP=1 and place a compiled \
              tailwind.css in crates/ai-memory-web/static/tailwind.css."
         );
@@ -220,6 +234,22 @@ fn try_download_wget(url: &str, dest: &Path) -> bool {
         .args(["--quiet", "--output-document"])
         .arg(dest)
         .arg(url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn try_download_powershell(url: &str, dest: &Path) -> bool {
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Invoke-WebRequest -Uri '{}' -OutFile '{}'",
+                url,
+                dest.display()
+            ),
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
