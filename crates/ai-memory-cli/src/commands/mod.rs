@@ -28,6 +28,7 @@ pub mod search;
 pub mod serve;
 pub mod setup_agent;
 pub mod status;
+pub mod uninstall;
 pub mod write_page;
 
 /// Resolve the effective project name for a client command.
