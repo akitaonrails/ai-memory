@@ -39,6 +39,17 @@ fn strip_instructions_block(content: &str) -> (String, bool) {
     (format!("{head}{tail}"), true)
 }
 
+/// True when a hook command string was written by ai-memory. Install
+/// inlines `AI_MEMORY_HOOK_URL=<url> [AI_MEMORY_AUTH_TOKEN=…] <path>`
+/// into the command (render_shared.rs); the `AI_MEMORY_HOOK_URL=`
+/// prefix is unconditional, so it is the reliable signature —
+/// independent of auth, --server-url, --hooks-dir, --host-prefix.
+// used by the hook stripper / orchestrator in later tasks
+#[allow(dead_code)]
+fn hook_command_is_ours(command: &str) -> bool {
+    command.contains("AI_MEMORY_HOOK_URL=")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +82,24 @@ mod tests {
         let (stripped, found) = strip_instructions_block(content);
         assert!(!found);
         assert_eq!(stripped, content);
+    }
+
+    #[test]
+    fn hook_signature_matches_no_auth_default() {
+        let cmd = "AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /home/u/.local/share/ai-memory/hooks/claude-code/stop.sh";
+        assert!(hook_command_is_ours(cmd));
+    }
+
+    #[test]
+    fn hook_signature_matches_with_auth_and_custom_prefix() {
+        let cmd = "AI_MEMORY_HOOK_URL=http://lan:49374 AI_MEMORY_AUTH_TOKEN=abc /etc/custom/session-start.sh";
+        assert!(hook_command_is_ours(cmd));
+    }
+
+    #[test]
+    fn hook_signature_rejects_third_party_with_generic_name() {
+        // A user's own hook that happens to be named stop.sh — no prefix.
+        assert!(!hook_command_is_ours("/usr/local/bin/my-stop.sh"));
+        assert!(!hook_command_is_ours("/opt/tools/hooks/session-start.sh"));
     }
 }
