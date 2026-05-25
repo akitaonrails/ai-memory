@@ -7,10 +7,12 @@
 //! Design: docs/superpowers/specs/2026-05-24-uninstall-command-design.md
 
 use std::path::PathBuf;
+use std::io::IsTerminal;
 use anyhow::{Context, Result};
 use ai_memory_core::{MARKER_END, MARKER_START};
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
+use crate::commands::apply_shared::apply_atomic;
 use crate::commands::{install_hooks, install_mcp};
 use crate::cli::McpClient;
 use crate::cli::UninstallArgs;
@@ -126,19 +128,79 @@ fn print_plan(plan: &[PlannedChange]) {
     }
 }
 
+/// Re-run the matching stripper inside `apply_atomic` so the actual
+/// write is atomic + backed up. The stripper is chosen by filename.
+fn apply_change(change: &PlannedChange, name: &str, url: &str) -> anyhow::Result<()> {
+    match change {
+        PlannedChange::DeleteFile { path } => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("deleting {}", path.display()))?;
+            println!("✓ deleted {}", path.display());
+        }
+        PlannedChange::Rewrite { path, .. } => {
+            let file = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            let outcome = apply_atomic(path, |existing| {
+                if file == "CLAUDE.md" || file == "AGENTS.md" {
+                    Ok(strip_instructions_block(existing).0)
+                } else if file == "config.toml" {
+                    Ok(strip_mcp_toml(existing, name, url)?.0)
+                } else {
+                    // hooks settings/hooks.json OR an mcpServers JSON file:
+                    // run BOTH strippers; each is a no-op if its key is absent.
+                    let after_hooks = strip_ai_memory_hooks(existing)?.new_content;
+                    let mut out = after_hooks;
+                    for client in [
+                        crate::cli::McpClient::ClaudeCode,
+                        crate::cli::McpClient::OpenCode,
+                        crate::cli::McpClient::Openclaw,
+                    ] {
+                        out = strip_mcp_json(&out, client, name, url)?.0;
+                    }
+                    Ok(out)
+                }
+            })?;
+            println!("✓ {} {}", outcome.verb(), path.display());
+        }
+    }
+    Ok(())
+}
+
 /// Run the `uninstall` subcommand.
 ///
 /// # Errors
 /// Returns an error if a config file is malformed or a removal write
 /// fails. Absent files / nothing-to-remove are not errors.
 pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
+    let name = "ai-memory";
+    let url = crate::config::DEFAULT_MCP_URL;
+
     let plan = build_plan(&args)?;
     print_plan(&plan);
     if !args.apply {
         println!("(dry-run; pass --apply to remove)");
         return Ok(());
     }
-    // --apply path lands in the next task.
+    if plan.is_empty() && !args.purge_data {
+        return Ok(());
+    }
+
+    if std::io::stdin().is_terminal() && !args.yes {
+        eprint!("Proceed with removal? [y/N] ");
+        use std::io::Write as _;
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("aborted.");
+            return Ok(());
+        }
+    }
+
+    for change in &plan {
+        apply_change(change, name, url)?;
+    }
+
+    // --purge-data + Docker hint land in the next task.
     let _ = config;
     Ok(())
 }
@@ -183,8 +245,6 @@ fn hook_command_is_ours(command: &str) -> bool {
 
 /// Result of stripping ai-memory entries from a hooks JSON file.
 struct HookRemoval {
-    // Used by the apply path in the next task; plan building reads only removed_events.
-    #[allow(dead_code)]
     new_content: String,
     removed_events: Vec<String>,
 }
