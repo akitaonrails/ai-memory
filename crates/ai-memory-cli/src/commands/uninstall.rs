@@ -9,6 +9,7 @@
 use anyhow::Result;
 use ai_memory_core::{MARKER_END, MARKER_START};
 use crate::commands::apply_shared::mutate_json;
+use crate::cli::McpClient;
 
 /// Remove the `<!-- ai-memory:start -->`…`<!-- ai-memory:end -->`
 /// block (inclusive) from a CLAUDE.md / AGENTS.md. Returns the new
@@ -113,6 +114,96 @@ fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
         new_content,
         removed_events,
     })
+}
+
+/// Where the servers object lives in each JSON client's config.
+/// (Codex is TOML — handled separately in Task 5.)
+#[allow(dead_code)]
+fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
+    match client {
+        McpClient::ClaudeCode
+        | McpClient::ClaudeDesktop
+        | McpClient::Cursor
+        | McpClient::GeminiCli => Some(&["mcpServers"]),
+        McpClient::OpenCode => Some(&["mcp"]),
+        McpClient::Openclaw => Some(&["mcp", "servers"]),
+        McpClient::Codex | McpClient::Pi => None,
+    }
+}
+
+/// True when an MCP server entry is ai-memory's: keyed by the expected
+/// name, OR its url/httpUrl equals the endpoint, OR it is a
+/// `mcp-remote` stdio shim whose args contain the endpoint.
+#[allow(dead_code)]
+fn mcp_entry_is_ours(
+    key: &str,
+    entry: &serde_json::Value,
+    name: &str,
+    url: &str,
+) -> bool {
+    if key == name {
+        return true;
+    }
+    for field in ["url", "httpUrl"] {
+        if entry.get(field).and_then(|v| v.as_str()) == Some(url) {
+            return true;
+        }
+    }
+    if let Some(args) = entry.get("args").and_then(|a| a.as_array()) {
+        let has_remote = args.iter().any(|a| a.as_str() == Some("mcp-remote"));
+        let has_url = args.iter().any(|a| a.as_str() == Some(url));
+        if has_remote && has_url {
+            return true;
+        }
+    }
+    false
+}
+
+/// Remove ai-memory's MCP server from a JSON client config. Returns
+/// the new content and the names removed. Prunes the (possibly nested)
+/// servers object and its parents if they empty.
+#[allow(dead_code)]
+fn strip_mcp_json(
+    content: &str,
+    client: McpClient,
+    name: &str,
+    url: &str,
+) -> Result<(String, Vec<String>)> {
+    let Some(path) = mcp_servers_path(client) else {
+        return Ok((content.to_string(), Vec::new()));
+    };
+    let mut removed = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let mut cursor: &mut serde_json::Map<String, serde_json::Value> = root;
+        for (depth, key) in path.iter().enumerate() {
+            let is_last = depth == path.len() - 1;
+            if is_last {
+                let Some(servers) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
+                    return Ok(());
+                };
+                let keys: Vec<String> = servers.keys().cloned().collect();
+                for k in keys {
+                    let ours = servers
+                        .get(&k)
+                        .is_some_and(|e| mcp_entry_is_ours(&k, e, name, url));
+                    if ours {
+                        servers.remove(&k);
+                        removed.push(k);
+                    }
+                }
+                if servers.is_empty() {
+                    cursor.remove(*key);
+                }
+            } else {
+                let Some(next) = cursor.get_mut(*key).and_then(|v| v.as_object_mut()) else {
+                    return Ok(());
+                };
+                cursor = next;
+            }
+        }
+        Ok(())
+    })?;
+    Ok((new_content, removed))
 }
 
 #[cfg(test)]
@@ -234,5 +325,47 @@ mod tests {
         let content = r#"{"unrelated":true}"#;
         let out = strip_ai_memory_hooks(content).unwrap();
         assert!(out.removed_events.is_empty());
+    }
+
+    #[test]
+    fn strip_mcp_claude_by_name_keeps_others() {
+        let content = r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp"},"other":{"url":"http://x"}}}"#;
+        let (out, removed) = strip_mcp_json(content, McpClient::ClaudeCode, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcpServers"].get("ai-memory").is_none());
+        assert!(v["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn strip_mcp_by_endpoint_under_custom_name() {
+        let content = r#"{"mcpServers":{"my-mem":{"url":"http://127.0.0.1:49374/mcp"}}}"#;
+        let (out, removed) = strip_mcp_json(content, McpClient::ClaudeCode, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+        assert_eq!(removed, vec!["my-mem".to_string()], "matched by endpoint, not name");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("mcpServers").is_none(), "emptied servers object pruned");
+    }
+
+    #[test]
+    fn strip_mcp_claude_desktop_mcp_remote_args() {
+        let content = r#"{"mcpServers":{"weird-name":{"command":"npx","args":["-y","mcp-remote","http://127.0.0.1:49374/mcp"]}}}"#;
+        let (_out, removed) = strip_mcp_json(content, McpClient::ClaudeDesktop, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+        assert_eq!(removed, vec!["weird-name".to_string()]);
+    }
+
+    #[test]
+    fn strip_mcp_openclaw_nested_servers() {
+        let content = r#"{"mcp":{"servers":{"ai-memory":{"url":"http://127.0.0.1:49374/mcp"}}}}"#;
+        let (out, removed) = strip_mcp_json(content, McpClient::Openclaw, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcp"].get("servers").is_none());
+    }
+
+    #[test]
+    fn strip_mcp_no_match_is_noop() {
+        let content = r#"{"mcpServers":{"other":{"url":"http://x"}}}"#;
+        let (_out, removed) = strip_mcp_json(content, McpClient::ClaudeCode, "ai-memory", "http://127.0.0.1:49374/mcp").unwrap();
+        assert!(removed.is_empty());
     }
 }
