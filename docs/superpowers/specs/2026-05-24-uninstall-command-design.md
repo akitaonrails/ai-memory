@@ -65,8 +65,13 @@ ai-memory uninstall [--apply] [--purge-data] [--only <kind>]
 | `--apply` | off | Execute the plan. Each touched file is rewritten via `apply_atomic` (tmp+rename+fsync) with a `.bak-<unix-ts>` backup. |
 | `--purge-data` | off | After the wiring removal, wipe `wiki/`, `db/`, `raw/` through the `reset` path. Only meaningful with `--apply`. |
 | `--only <kind>` | all | Limit to one concern: `hooks` \| `mcp` \| `instructions`. Omitted = all three. |
-| `--config-file <PATH>` | auto | Override a config path (testing / non-standard setups). |
 | `--yes` | off | Skip the single interactive confirmation when a TTY is attached. |
+
+There is **no `--config-file` flag**. With the default "remove from all agents
+at once", a single path override cannot disambiguate which agent's many config
+files it applies to (Claude's `settings.json`, Codex's `hooks.json`, …). Path
+override exists only as a **function parameter** on each `plan_removal(...)`
+(see §5), used by tests — not exposed on the CLI.
 
 ### Why `--only` instead of `--agent`
 
@@ -98,47 +103,65 @@ Hook JSON is **not** a flat key. Per `render_shared.rs`:
 - `HookShape::Flat` (Cursor):
   `"<event>": [ { "type":"command","command":"…","matcher":"" } ]`
 
-Removal therefore operates **inside the array**: find the entry whose command
-matches the ai-memory signature, remove that entry, and prune the event key
-only if its array becomes empty. It never blindly deletes an event key.
+Removal therefore operates **inside the array**, and the `command` lives at a
+different depth per shape:
 
-**Signature** (composite — path prefix alone is unreliable because
-`install-hooks --hooks-dir` and `setup-agent --host-prefix` let the user choose
-the directory): an entry is ai-memory's when its `command`'s **basename** is
-one of the 7 known scripts (`session-start.sh`, `user-prompt-submit.sh`,
+- Nested: `["<Event>"][i].hooks[j].command`
+- Flat: `["<event>"][i].command`
+
+Find the entry whose `command` matches the ai-memory signature, remove that
+entry (the innermost `hooks[j]` object for Nested; the array element for Flat),
+and prune the event key only if its array becomes empty. It never blindly
+deletes an event key.
+
+**Signature — primary signal: the `command` string contains the literal
+`AI_MEMORY_HOOK_URL=`.** Install **inlines** the env vars into the command
+string rather than a JSON `env` field (verified at `render_shared.rs:225-243`;
+Claude Code does not honour an `env` field at this level). The rendered command
+is `AI_MEMORY_HOOK_URL=<url> [AI_MEMORY_AUTH_TOKEN=<t> ] <abs-path>/<script>.sh`,
+and the `AI_MEMORY_HOOK_URL=` prefix is written **unconditionally**
+(`render_shared.rs:239`, before the auth-token branch). So this signal is
+present even in the **no-auth default** (invariant #13) and is independent of
+`--server-url`, `--hooks-dir`, and `--host-prefix`. There is **no** JSON `env`
+block to match — an earlier draft of this spec wrongly relied on one.
+
+The 7 known script basenames (`session-start.sh`, `user-prompt-submit.sh`,
 `pre-tool-use.sh`, `post-tool-use.sh`, `pre-compact.sh`, `stop.sh`,
-`session-end.sh`) **AND** at least one corroborating signal holds:
-
-- the entry's `env` block contains an `AI_MEMORY_*` key (e.g.
-  `AI_MEMORY_AUTH_TOKEN`), or
-- the `command`/`env` references the ai-memory server URL or
-  `AI_MEMORY_HOOK_URL`, or
-- the command path's parent layout is `<dir>/<agent>/<script>.sh` matching
-  the staged hooks layout.
-
-Basename-only is **not** sufficient (a third-party hook could coincidentally
-be named `stop.sh` → false-positive removal). An entry matching the basename
-but no corroborating signal is treated as **user-modified**: preserved and
-reported as skipped.
+`session-end.sh`) are a **secondary corroboration**, not the primary key —
+basename-only would risk a false positive on a coincidentally-named third-party
+`stop.sh`. An entry whose `command` lacks the `AI_MEMORY_HOOK_URL=` prefix is
+treated as **not ours** (user-modified or third-party): preserved and reported
+as skipped.
 
 **Stale events:** an entry carrying the ai-memory signature is removed **even
 if its event name is outside the agent's current vocabulary** (e.g. a Codex
 `SessionEnd` left by an older install — Codex's current vocab has no
 `SessionEnd`; see `install_hooks.rs` stale-key cleanup). Detection is by
-signature, not by the current event list.
+signature, not by the current event list. Note that install already proactively
+removes such stale keys, so uninstall may never encounter one — but the
+signature rule covers it if it does.
 
 ### 4.2 MCP — matched by endpoint, not just name
 
 `install-mcp` writes `mcpServers.<name>` (default `ai-memory`, overridable via
 `--name`). Removal must not assume the default name. An MCP server entry is
-ai-memory's when its `url` equals the ai-memory `server_url` **or** its
-`args` invoke `mcp-remote` against that URL. This is name-independent and
-survives a custom `--name` install.
+ai-memory's when **either**:
+
+- it carries a `"url"` field equal to the ai-memory `server_url` (HTTP-transport
+  clients: Claude Code, Cursor, Gemini CLI, Openclaw; Codex's `config.toml`
+  uses `[mcp_servers.<name>]` with `url = "…"`), **or**
+- it is a stdio shim — `"command": "npx"` with an `"args"` array that contains
+  both `"mcp-remote"` and the ai-memory `server_url` as elements (Claude
+  Desktop). Matching scans the variadic `args` array for the URL element; extra
+  `--header` args (when auth is set) do not affect the match.
+
+This is name-independent and survives a custom `--name` install.
 
 Per-client location nuances (settings.json `mcpServers`, Codex `config.toml`
 `[mcp_servers]`, Cursor `~/.cursor/mcp.json`, OpenCode `opencode.json`,
 Claude Desktop via `mcp-remote`) are resolved by the same per-`McpClient`
-path logic the install path already encodes.
+path logic the install path already encodes. `Pi` is MCP-unsupported (install
+bails); for uninstall it is a **silent no-op**, never a bail (§6).
 
 ### 4.3 Instructions — marker block
 
@@ -154,6 +177,13 @@ OpenCode's hooks are a **plugin file**: `install_hooks.rs` writes
 `~/.config/opencode/plugins/ai-memory.ts`. Removal is a **file delete** of
 that exact path (a `RemovalAction` of kind `PluginFile`), not a JSON-key edit.
 OpenCode's MCP entry (in `opencode.json`) is handled by §4.2.
+
+The plugin file is deleted **unconditionally** if present — hand-edits to it
+are not detected. This is symmetric with install, which **overwrites** the
+plugin unconditionally (`install_hooks.rs:314`: "Overwrite unconditionally —
+the schema is versioned"). Hashing the file against the rendered template to
+skip user-edited copies would be inconsistent with install and is YAGNI for
+v1.
 
 ## 5. Architecture
 
@@ -192,7 +222,11 @@ struct RemovalAction {
 
 1. **Collect.** Loop `AgentChoice` (hooks + instructions) and `McpClient`
    (MCP); call each module's `plan_removal`; gather `RemovalAction`s. Missing
-   config / absent key = no action (not an error).
+   config / absent key = no action (not an error). Agents with no relevant
+   surface produce **no actions and never bail**: `Openclaw` has no hooks
+   (install prints and mutates nothing), and `Pi` has no MCP (install bails) —
+   for uninstall both are silent no-ops, so iterating the full enums adds no
+   confusing errors, just absent entries.
 2. **Present.** Print the plan grouped by file, one line per action, marking
    `remove` vs `skipped (user-modified)`. Format mirrors `reset.rs`
    (one-per-line + a trailing hint). Without `--apply`, **stop here**, exit 0.
@@ -205,6 +239,16 @@ struct RemovalAction {
    that parent key but **never delete the user's config file**. For TOML,
    remove the leaf key/table only; leave an emptied parent table header in
    place (cosmetic, syntactically valid).
+
+   **Asymmetry with install (intentional).** Install writes each event with
+   `hooks.insert(event, value)` — it **overwrites the whole event key**, so it
+   cannot preserve a pre-existing third-party hook under that event. Uninstall
+   does the opposite: it removes only the *matching* array entry and preserves
+   any sibling third-party entry. The two are deliberately not mirror images —
+   install can't know what's third-party; uninstall must try to preserve it.
+   Entry-level removal is therefore the safe choice even though, in the common
+   case (no manual post-install edits), the event array holds only ai-memory's
+   entry and the whole key is pruned anyway.
 5. **Purge data (optional).** Only if `--purge-data` and `--apply`. Runs
    **after** wiring. Reuses `commands::reset`: `process_guard::sibling_processes()`
    refuses with `busy_message` if any `ai-memory` is alive, else
@@ -231,8 +275,12 @@ struct RemovalAction {
 Unit tests per `plan_removal` and for the orchestrator:
 
 - **Detects** an ai-memory hook entry (nested shape) and (flat shape, Cursor).
-- **Preserves** a third-party hook sharing a generic basename (`stop.sh`) but
-  lacking any ai-memory signal → reported skipped, not removed.
+- **Detects the no-auth default**: a hook whose command is
+  `AI_MEMORY_HOOK_URL=<url> <path>/stop.sh` (no `AI_MEMORY_AUTH_TOKEN`) is still
+  matched via the unconditional `AI_MEMORY_HOOK_URL=` prefix.
+- **Preserves** a third-party hook sharing a generic basename (`stop.sh`) whose
+  command lacks the `AI_MEMORY_HOOK_URL=` prefix → not removed (not reported as
+  ours at all).
 - **Removes** an ai-memory hook entry whose event is outside the current
   vocabulary (stale `SessionEnd` for Codex).
 - **Prunes** an event key only when its array empties; leaves sibling
