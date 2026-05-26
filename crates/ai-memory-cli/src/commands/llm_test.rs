@@ -24,7 +24,12 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         model: args.model,
         api_key,
         base_url: args.base_url.or_else(|| config.llm_test_base_url()),
-        token_path: None,
+        token_path: match provider {
+            ProviderChoice::OpenAiOAuth | ProviderChoice::GitHubCopilot => {
+                Some(config.data_dir.join("oauth_token.json"))
+            }
+            _ => None,
+        },
     };
     let client = build_provider(provider_config).context("building LLM provider")?;
     info!(
@@ -55,6 +60,8 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::Openai => Self::OpenAi,
             LlmProviderChoice::Gemini => Self::Gemini,
             LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
+            LlmProviderChoice::OpenaiOauth => Self::OpenAiOAuth,
+            LlmProviderChoice::Copilot => Self::GitHubCopilot,
         }
     }
 }

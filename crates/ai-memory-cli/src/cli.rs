@@ -476,6 +476,11 @@ pub enum LlmProviderChoice {
     Gemini,
     /// OpenAI-compatible local (Ollama, vLLM, LM Studio).
     OpenaiCompat,
+    /// OpenAI OAuth 2.0 (ChatGPT subscription, no API key needed).
+    #[value(name = "openai-oauth")]
+    OpenaiOauth,
+    /// GitHub Copilot (device-flow token, no API key needed).
+    Copilot,
 }
 
 /// Arguments for `embed`.
