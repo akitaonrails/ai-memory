@@ -2,6 +2,7 @@
 
 > Date: 2026-05-25 · Branch: `feat/uninstall-command`
 > Follow-on to [`2026-05-24-uninstall-command-design.md`](2026-05-24-uninstall-command-design.md).
+> Revised after subagent design review (see "Review resolutions" at the end).
 
 ## Problem
 
@@ -16,20 +17,22 @@ Two issues surfaced while exercising `ai-memory uninstall --purge-data`:
 
 2. **Duplicated wipe logic.** The data-wipe primitive — the subdir list
    `["wiki","db","raw"]` plus the `remove_dir_all` + `create_dir_all` loop —
-   exists in both `commands/reset.rs` and `commands/uninstall.rs`. It was
-   duplicated when `--purge-data` landed (commit `3e3d44a`). The subdir list
-   is a semantic contract ("what constitutes ai-memory data"); having it in
-   two places risks drift on a destructive operation (e.g. a future 4th subdir
-   updated in `reset` but not `uninstall`).
+   exists in both `commands/reset.rs` and `commands/uninstall.rs`. `reset` is
+   the original (commit `5e29909`, M1-D); `uninstall` **copied** it when
+   `--purge-data` landed (commit `3e3d44a`). The subdir list is a semantic
+   contract ("what constitutes ai-memory data for a wipe"); having it in two
+   places risks drift on a destructive operation.
 
 ## Goals
 
 - `uninstall --purge-data` dry-run previews the data wipe, mirroring `reset`'s
   per-subdir style.
-- The wipe primitive lives in exactly one place, shared by `reset` and
-  `uninstall`, without coupling their divergent orchestration.
-- No regression to `reset` (which currently has **zero tests**).
-- Coverage on touched/new code: domain (pure logic) ≥ 90%, rest ≥ 80%.
+- The `reset`↔`uninstall` wipe primitive lives in exactly one place, shared by
+  both, without coupling their divergent orchestration (guard, output).
+- No behavioral regression to `reset` (which currently has **zero tests**),
+  and no loss of `uninstall`'s per-path error context.
+- Coverage on touched/new code across this branch: critical logic ≥ 90%,
+  rest ≥ 80% (line coverage, local inspection — see Coverage).
 
 ## Non-goals
 
@@ -39,48 +42,64 @@ Two issues surfaced while exercising `ai-memory uninstall --purge-data`:
   routing the wipe through the shared helper.
 - No unification of `reset`'s "would remove" wording with `uninstall`'s
   "would purge" / "✓ purged" — each command keeps its own phrasing.
+- **No unification with `init`/`restore`.** Those declare *different* subdir
+  sets on purpose (`init` = `wiki,raw,db,models`; `restore` = `wiki,db`); the
+  shared helper is scoped to the `reset`↔`uninstall` set `wiki,db,raw` only.
+- The `remove_dir_all` → `create_dir_all` sequence is **not atomic** (a crash
+  between the two leaves a deleted-but-not-recreated subdir). This is
+  pre-existing behavior shared by `reset` and `restore`; making it atomic is
+  out of scope.
 
 ## Design
 
 ### 1. New module `commands/data_purge.rs` (mute helper)
 
-Single home for the knowledge "which subdirs are data, and how to wipe one".
-**No logging, no printing, no process check** — callers own output and the
-process guard. Sits alongside the existing shared command helpers
-(`apply_shared.rs`, `render_shared.rs`, `purge_project.rs`).
+Single home for the `reset`↔`uninstall` knowledge "which subdirs are wiped,
+and how to wipe one". **No logging, no printing, no process check** — callers
+own output and the live-process guard. Returns `anyhow::Result` with per-path
+context so callers keep meaningful error messages. Sits alongside the existing
+shared command helpers (`apply_shared.rs`, `render_shared.rs`,
+`purge_project.rs`); it stays **CLI-local** (not in `ai-memory-core`) because
+the wiped set is operation-specific, not a single domain-wide constant.
 
 ```rust
 //! Shared data-dir wipe primitive used by `reset` and `uninstall --purge-data`.
 //! Mute by design: returns the affected paths; callers own logging/printing
-//! and the live-process guard (invariant #9).
+//! and the live-process guard (invariant #9). The remove+recreate is not
+//! atomic — pre-existing, matches reset/restore.
 
 use std::path::{Path, PathBuf};
+use anyhow::Context;
 
-/// The subdirectories that constitute ai-memory's local state.
-/// `logs/` is intentionally excluded and never wiped.
-pub(crate) const DATA_SUBDIRS: &[&str] = &["wiki", "db", "raw"];
+/// The subdirectories wiped by `reset` / `uninstall --purge-data`.
+/// `logs/` and `models/` are intentionally excluded and never wiped.
+/// NOTE: this is the reset/uninstall set only — `init` and `restore` declare
+/// their own (different) sets by design; do not converge them here.
+pub(crate) const WIPE_SUBDIRS: &[&str] = &["wiki", "db", "raw"];
 
-/// Paths that WOULD be purged (existing data subdirs), for dry-run preview.
+/// Paths that WOULD be purged (existing wipe subdirs), for dry-run preview.
 pub(crate) fn purge_preview(data_dir: &Path) -> Vec<PathBuf> {
-    DATA_SUBDIRS
+    WIPE_SUBDIRS
         .iter()
         .map(|s| data_dir.join(s))
         .filter(|p| p.exists())
         .collect()
 }
 
-/// Wipe each existing data subdir (remove + recreate empty). Returns the
+/// Wipe each existing wipe-subdir (remove + recreate empty). Returns the
 /// paths actually purged (the subset that existed). Missing subdirs are
-/// skipped, not errors.
-pub(crate) fn purge_data_dirs(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// skipped, not errors. Carries per-path context on failure.
+pub(crate) fn purge_data_dirs(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut purged = Vec::new();
-    for sub in DATA_SUBDIRS {
+    for sub in WIPE_SUBDIRS {
         let path = data_dir.join(sub);
         if !path.exists() {
             continue;
         }
-        std::fs::remove_dir_all(&path)?;
-        std::fs::create_dir_all(&path)?;
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("removing {}", path.display()))?;
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("recreating {}", path.display()))?;
         purged.push(path);
     }
     Ok(purged)
@@ -94,7 +113,9 @@ Registered with `mod data_purge;` in `commands/mod.rs`.
 - Remove the local `const SUBDIRS`.
 - Dry-run branch: `for p in data_purge::purge_preview(&config.data_dir) { println!("would remove {}", p.display()); }` then keep `(dry-run; pass --confirm to wipe)`.
 - Apply branch: `for p in data_purge::purge_data_dirs(&config.data_dir)? { tracing::info!(path = %p.display(), "reset"); }` then keep `tracing::info!("reset complete")`.
-- The `bail!` process guard at the top is **unchanged**.
+- The `bail!` process guard at the top is **unchanged**. (`reset::run` already
+  returns `anyhow::Result`, so the helper's `anyhow::Result` slots in; reset
+  *gains* per-path error context it lacked.)
 
 ### 3. `uninstall.rs` — fix the dry-run gap + use the helper
 
@@ -107,8 +128,7 @@ Registered with `mod data_purge;` in `commands/mod.rs`.
       }
   }
   ```
-  This makes the data wipe visible in the dry-run output.
-- **Apply.** Replace the inline wipe loop with:
+- **Apply.** Replace the inline wipe loop (with its own `with_context`) with:
   ```rust
   } else {
       for p in data_purge::purge_data_dirs(&config.data_dir)? {
@@ -116,7 +136,8 @@ Registered with `mod data_purge;` in `commands/mod.rs`.
       }
   }
   ```
-  The sibling-process guard, `purge_refused` flag, and end-of-run `bail!` are
+  The per-path error context is preserved (now inside the helper). The
+  sibling-process guard, `purge_refused` flag, and end-of-run `bail!` are
   **unchanged** — the "remove wiring, then skip purge if a process is alive"
   behavior is preserved.
 
@@ -149,40 +170,94 @@ purge lines cover *data*. Technically correct; left as-is for simplicity.
      and **nothing is deleted**.
    - apply (`--confirm`): asserts `wiki`/`db`/`raw` end empty (dirs remain,
      files gone), `logs/` untouched, absent subdir skipped without error.
-   - guard: with a live sibling process, `reset` bails (refusal path).
+   - **The process-guard refusal path is NOT characterized here.**
+     `process_guard::sibling_processes()` inspects the live OS process table
+     via `sysinfo` with no injection seam; testing the refusal deterministically
+     would require spawning a real long-lived `ai-memory` process (flaky) or
+     refactoring `process_guard` (forbidden by rule #6). The guard is untouched
+     by this refactor, so a refactor-invariance test of it adds nothing.
 2. **Unit test `data_purge`** (fails: module absent) → create helper → green:
    - `purge_data_dirs`: seed `wiki`/`db`/`raw` + `logs/` → returns the 3 paths,
      those dirs emptied, `logs/` intact; missing subdir skipped (not returned,
      no error).
    - `purge_preview`: returns only existing subdirs.
+   - missing `data_dir` entirely: `purge_preview` → empty; `purge_data_dirs`
+     → `Ok(vec![])`, creates nothing.
 3. **Refactor** `reset.rs` and `uninstall.rs` to use the helper → step 1 + 2
    tests stay green.
 4. **Integration test `uninstall --purge-data` dry-run** (fails) → implement
    preview → green: stdout contains `would purge …/wiki|db|raw` AND the seeded
    files still exist on disk afterward.
 
+Symlinked subdirs are out of scope; behavior matches existing `reset`
+(pre-existing) and is not tested.
+
 ### Coverage
 
-- Tool: **`cargo llvm-cov`** (`cargo install cargo-llvm-cov`; add to the
-  CI-parity command list in docs).
-- Targets for touched/new code on this branch:
-  - **Domain (pure logic) ≥ 90%**: `data_purge` (helper, const, preview),
-    `uninstall`'s `strip_*` functions, `build_plan`.
-  - **Rest ≥ 80%**: `reset::run`, `uninstall::run`, dispatch, print paths.
-- Measure with `cargo llvm-cov --lcov` and inspect per-file coverage for the
-  files this change touches; add tests until thresholds are met.
+- Tool: **`cargo llvm-cov`** (`cargo install cargo-llvm-cov`). It is a
+  **local inspection, not a CI gate** (CI runs fmt/clippy/test/deny/audit
+  only); documented under a "Coverage (local)" note, NOT the "CI parity" list.
+- Metric: **line coverage** via `cargo llvm-cov --lcov` (or `--summary-only`),
+  inspected per file for the files this branch touches.
+- Targets for touched/new code across the whole branch (per the maintainer's
+  requirement — this includes already-committed uninstall code):
+  - **Critical logic ≥ 90%** (criticality, not purity): `data_purge`
+    (helper, const, preview) and `uninstall`'s pure `strip_*` /
+    `*_is_ours` functions.
+  - **Rest ≥ 80%**: `reset::run`, `uninstall::run`, `build_plan` (it does
+    filesystem IO — orchestration, not pure), dispatch, print paths.
+- Add tests until thresholds are met for the touched files.
 
 ## Project-rule checks
 
 - **Invariant #9 (live-process guard before destructive op):** preserved —
-  guard stays in each caller; the mute helper performs no guard itself.
+  the guard stays in each caller; the mute helper performs no guard itself.
+- **Invariant #10 (atomic file writes: tmp + rename + fsync):** **N/A here.**
+  #10 governs *file-content* writes (config files, wiki pages, via
+  `apply_shared`); this is a *directory-tree wipe*. There is no meaningful
+  atomic rmdir+mkdir primitive, and `reset` (reset.rs:42-43) and `restore`
+  (restore.rs:56,60) already use raw `remove_dir_all`. The wipe is
+  intentionally non-atomic and matches existing behavior.
+- **Invariant #16 (CLI is a thin HTTP client):** unaffected — `reset` and
+  `--purge-data` are listed #16 exceptions (server-stopped lifecycle ops); the
+  helper is local-FS by design and not reachable from any server-backed command.
 - **Workflow rule #5 (test before implementation):** honored via the
   characterization-first then TDD order above.
 - **Workflow rule #6 (no refactor outside the milestone):** touching
-  `reset.rs` is in-scope because the duplication was *introduced by this
-  feature*; consolidating it finishes the feature cleanly. Change to `reset`
-  is mechanical and pinned by new characterization tests.
+  `reset.rs` is in-scope because *this feature* created the drift (uninstall
+  copied reset's wipe in `3e3d44a`); consolidating both call sites onto one
+  primitive is the minimal way to remove that risk. `reset` is the original and
+  is touched deliberately, pinned by the characterization tests written first.
 - **CLAUDE.md gate (rule #3):** `cargo fmt --all -- --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace` all green before commit.
-```
+
+## Out-of-scope findings (logged, not addressed here)
+
+- **`models/` is created but never wiped.** `init.rs:13` creates
+  `wiki,raw,db,models`, but `reset`/`--purge-data` wipe only `wiki,db,raw` —
+  `models/` survives a reset (like `logs/`). Likely intentional (downloaded
+  embedding models), but undocumented. Candidate for a separate issue;
+  not changed here.
+
+## Review resolutions (subagent critique → disposition)
+
+- **H1 (helper would drop uninstall's `with_context`):** accepted — helper
+  returns `anyhow::Result` with per-path context (reset *gains* context).
+- **H2 (#10 not addressed):** accepted — explicit N/A note added.
+- **H3 (guard test infeasible):** accepted — guard refusal removed from the
+  characterization set with rationale.
+- **M1 (coverage scope/metric):** partially — kept the whole-branch scope (a
+  maintainer requirement, not scope creep); specified line coverage + local
+  (non-CI) inspection.
+- **M2 (`build_plan` is not "pure"):** accepted — moved to the ≥80% bucket;
+  90% bucket reframed as "critical logic", not "pure".
+- **M3 (reset-rationale inverted):** accepted — corrected (reset is the
+  original; uninstall copied it).
+- **M4 (move const to core?):** rejected as stated — the grep found *four*
+  divergent sets (`init` adds `models`, `restore` is `wiki,db` only), so the
+  sets legitimately differ; helper stays CLI-local and scoped to the
+  reset↔uninstall set. Surfaced the `models/` discrepancy as an out-of-scope
+  finding.
+- **M5 / L1 / L2 / L4:** accepted — #16 note, missing-`data_dir` test,
+  symlink sentence, and llvm-cov placed under "local, not CI-gated".
