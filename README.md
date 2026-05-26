@@ -288,6 +288,10 @@ Recommended defaults:
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `gemini` | `gemini-2.5-flash` | Google-hosted option with a generous free tier. |
 | `openai-compat` | no default | OpenRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `openai-oauth` | `gpt-4o` | ChatGPT Plus/Team subscription — no API key needed. |
+| `copilot` | `gpt-4o` | GitHub Copilot subscription — no API key needed. |
+
+For subscription-based providers, authenticate first with `ai-memory auth login openai` or `ai-memory auth login copilot`. See [Authentication](docs/usage.md#authentication-openai-oauth-and-github-copilot).
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when
