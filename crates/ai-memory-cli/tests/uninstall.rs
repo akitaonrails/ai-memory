@@ -210,3 +210,49 @@ fn uninstall_dry_run_previews_purge() {
         assert!(p.join("f.txt").exists(), "{sub} must be untouched");
     }
 }
+
+/// Best-effort, NOT in the default run (sysinfo reads the real process table;
+/// no injection seam). Spawns a real sibling `ai-memory` process and asserts
+/// `--purge-data` refuses up front, leaving the wiring intact. Run with:
+/// `cargo test -p ai-memory-cli --test uninstall -- --ignored`.
+#[test]
+#[ignore]
+fn purge_data_refuses_when_sibling_alive() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let claude = home.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let settings = claude.join("settings.json");
+    let original = r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=x /a/stop.sh"}]}]}}"#;
+    std::fs::write(&settings, original).unwrap();
+
+    // Long-lived sibling `ai-memory` process.
+    let mut serve = Command::new(bin())
+        .arg("serve")
+        .env("HOME", home.path())
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    let out = Command::new(bin())
+        .args(["uninstall", "--apply", "--yes", "--purge-data"])
+        .env("HOME", home.path())
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .output()
+        .unwrap();
+
+    serve.kill().ok();
+    serve.wait().ok();
+
+    assert!(
+        !out.status.success(),
+        "should refuse while a sibling is alive"
+    );
+    // All-or-nothing: wiring must be untouched.
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        original,
+        "no wiring should be removed when the purge is refused up front"
+    );
+}
