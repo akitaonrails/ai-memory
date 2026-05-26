@@ -325,9 +325,10 @@ impl Config {
             Some(s) => s.to_string(),
             None => match provider {
                 ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
-                ProviderChoice::OpenAi | ProviderChoice::OpenAiOAuth => "gpt-4o-mini".to_string(),
+                ProviderChoice::OpenAi
+                | ProviderChoice::OpenAiOAuth
+                | ProviderChoice::GitHubCopilot => "gpt-4o-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
-                ProviderChoice::GitHubCopilot => "gpt-4o-mini".to_string(),
                 ProviderChoice::OpenAiCompat => {
                     return Err(LlmError::NotConfigured(
                         "AI_MEMORY_LLM_MODEL must be set explicitly for openai-compat \
