@@ -95,14 +95,17 @@ pub enum Command {
     /// Remove ai-memory's wiring (hooks, MCP, instructions) from all
     /// detected agents. Dry-run unless `--apply`.
     Uninstall(UninstallArgs),
-    /// Manage OpenAI OAuth 2.0 authentication (ChatGPT subscription).
+    /// Manage OAuth authentication for LLM providers.
     ///
-    /// `login`  — open browser, complete PKCE flow, save token to
-    ///            `<data_dir>/oauth_token.json`.
-    /// `logout` — delete the saved token.
+    /// OpenAI (ChatGPT subscription):
+    ///   `login openai`          — open browser, complete PKCE flow, save token to
+    ///                      `<data_dir>/oauth_token.json`.
+    ///   `logout openai`         — delete the saved OpenAI OAuth token.
     ///
-    /// After logging in, set `AI_MEMORY_LLM_PROVIDER=openai-oauth` to have
-    /// the server use your ChatGPT subscription instead of an API key.
+    /// GitHub Copilot:
+    ///   `login copilot`  — run device flow, save token to
+    ///                      `<data_dir>/copilot_token.json`.
+    ///   `logout copilot` — delete the saved Copilot token.
     Auth(AuthArgs),
 }
 
@@ -703,13 +706,45 @@ pub struct AuthArgs {
     pub subcommand: AuthSubcommand,
 }
 
+/// Provider for `auth login` / `auth logout`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum AuthProvider {
+    /// OpenAI ChatGPT subscription — browser PKCE flow.
+    /// Sets `AI_MEMORY_LLM_PROVIDER=openai-oauth` after login.
+    #[value(name = "openai", alias = "openai-oauth")]
+    OpenAi,
+    /// GitHub Copilot subscription — RFC 8628 device flow.
+    /// Sets `AI_MEMORY_LLM_PROVIDER=copilot` after login.
+    Copilot,
+}
+
+/// Arguments for `auth login`.
+#[derive(Debug, Args)]
+pub struct AuthLoginArgs {
+    /// Provider to authenticate with.
+    pub provider: AuthProvider,
+}
+
+/// Arguments for `auth logout`.
+#[derive(Debug, Args)]
+pub struct AuthLogoutArgs {
+    /// Provider to log out from.
+    pub provider: AuthProvider,
+}
+
 /// Subcommands for `auth`.
 #[derive(Debug, Subcommand)]
 pub enum AuthSubcommand {
-    /// Open browser, complete PKCE flow, and save the OAuth token.
-    Login,
-    /// Delete the saved OAuth token (effective logout).
-    Logout,
+    /// Authenticate with a provider and save the token.
+    ///
+    /// `auth login openai`   — browser PKCE flow; token → oauth_token.json["openai"].
+    /// `auth login copilot`  — device flow;       token → oauth_token.json["github-copilot"].
+    Login(AuthLoginArgs),
+    /// Remove the saved token for a provider.
+    ///
+    /// `auth logout openai`  — clears oauth_token.json["openai"].
+    /// `auth logout copilot` — clears oauth_token.json["github-copilot"].
+    Logout(AuthLogoutArgs),
 }
 
 #[cfg(test)]

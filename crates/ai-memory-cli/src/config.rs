@@ -52,7 +52,7 @@ pub struct Config {
     pub server_url: String,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
     pub log_level: String,
-    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`).
+    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `copilot`).
     pub llm_provider: Option<String>,
     /// Optional LLM model override.
     pub llm_model: Option<String>,
@@ -313,10 +313,11 @@ impl Config {
             "gemini" | "google" => ProviderChoice::Gemini,
             "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
             "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+            "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::GitHubCopilot,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat|openai-oauth"
+                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot"
                 )));
             }
         };
@@ -326,6 +327,7 @@ impl Config {
                 ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
                 ProviderChoice::OpenAi | ProviderChoice::OpenAiOAuth => "gpt-4o-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
+                ProviderChoice::GitHubCopilot => "gpt-5.4-mini".to_string(),
                 ProviderChoice::OpenAiCompat => {
                     return Err(LlmError::NotConfigured(
                         "AI_MEMORY_LLM_MODEL must be set explicitly for openai-compat \
@@ -335,10 +337,11 @@ impl Config {
                 }
             },
         };
-        let token_path = if provider == ProviderChoice::OpenAiOAuth {
-            Some(self.data_dir.join("oauth_token.json"))
-        } else {
-            None
+        let token_path = match provider {
+            ProviderChoice::OpenAiOAuth | ProviderChoice::GitHubCopilot => {
+                Some(self.data_dir.join("oauth_token.json"))
+            }
+            _ => None,
         };
         Ok(Some(ProviderConfig {
             provider,
@@ -425,8 +428,8 @@ impl Config {
             ProviderChoice::OpenAi => self.runtime_env.openai_api_key.clone(),
             ProviderChoice::Gemini => self.runtime_env.gemini_api_key.clone(),
             ProviderChoice::OpenAiCompat => self.runtime_env.llm_api_key.clone(),
-            // OAuth token is loaded from disk by `OpenAiOAuthProvider`; no API key needed.
-            ProviderChoice::OpenAiOAuth => None,
+            // OAuth / device-flow tokens are loaded from disk; no API key needed.
+            ProviderChoice::OpenAiOAuth | ProviderChoice::GitHubCopilot => None,
         }
     }
 

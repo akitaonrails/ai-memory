@@ -1,12 +1,16 @@
-//! `ai-memory auth login` / `auth logout` — OpenAI OAuth 2.0 PKCE flow.
+//! `ai-memory auth` — OAuth authentication for LLM providers.
 //!
-//! `login` opens the user's browser to `auth.openai.com`, listens on
-//! `127.0.0.1:1455` for the redirect, exchanges the authorization code for
-//! tokens, and writes them to `<data_dir>/oauth_token.json` (mode 0600).
+//! OpenAI (`login openai` / `logout openai`):
+//!   Opens the user's browser to `auth.openai.com`, listens on
+//!   `127.0.0.1:1455` for the redirect, exchanges the authorization code for
+//!   tokens, and writes them to `<data_dir>/oauth_token.json` (mode 0600).
 //!
-//! `logout` deletes the token file.
+//! GitHub Copilot (`login copilot` / `login copilot`):
+//!   Runs the RFC 8628 device flow — displays a short code, polls GitHub
+//!   until the user approves, and writes the GitHub OAuth token to
+//!   `<data_dir>/oauth_token.json` (mode 0600).
 //!
-//! Both commands are pre-server local operations (same exception class as
+//! All subcommands are pre-server local operations (same exception class as
 //! `init`, `generate-auth-token`) per CLAUDE.md rule 16.
 
 use std::path::Path;
@@ -26,9 +30,11 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tracing::info;
 
+use ai_memory_llm::copilot::{COPILOT_CLIENT_ID, COPILOT_SCOPE, CopilotToken};
 use ai_memory_llm::openai_oauth::{CODEX_CLIENT_ID, OAUTH_SCOPES, OAuthToken, TOKEN_URL};
+use ai_memory_llm::token_store::TokenFile;
 
-use crate::cli::AuthSubcommand;
+use crate::cli::{AuthLoginArgs, AuthLogoutArgs, AuthProvider, AuthSubcommand};
 use crate::config::Config;
 
 type CallbackState = Arc<Mutex<Option<oneshot::Sender<Result<(String, String), String>>>>>;
@@ -62,16 +68,22 @@ struct CallbackParams {
     error_description: Option<String>,
 }
 
-
 /// Dispatch `auth login` or `auth logout`.
 ///
 /// # Errors
 /// Propagates IO, HTTP, or OAuth protocol errors.
 pub async fn run(config: &Config, sub: AuthSubcommand) -> Result<()> {
+    // Both providers share one file; only the key inside changes.
     let token_path = config.data_dir.join("oauth_token.json");
     match sub {
-        AuthSubcommand::Login => run_login(&token_path).await,
-        AuthSubcommand::Logout => run_logout(&token_path),
+        AuthSubcommand::Login(AuthLoginArgs { provider }) => match provider {
+            AuthProvider::OpenAi => run_login(&token_path).await,
+            AuthProvider::Copilot => run_copilot_login(&token_path).await,
+        },
+        AuthSubcommand::Logout(AuthLogoutArgs { provider }) => match provider {
+            AuthProvider::OpenAi => run_logout_openai(&token_path),
+            AuthProvider::Copilot => run_logout_copilot(&token_path),
+        },
     }
 }
 
@@ -161,14 +173,16 @@ async fn run_login(token_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_logout(token_path: &Path) -> Result<()> {
-    if token_path.exists() {
-        std::fs::remove_file(token_path)
-            .with_context(|| format!("remove token file {}", token_path.display()))?;
-        println!("Logged out. Token file removed.");
-    } else {
-        println!("Not logged in (no token file found).");
+fn run_logout_openai(token_path: &Path) -> Result<()> {
+    let mut file =
+        TokenFile::load(token_path).map_err(|e| anyhow::anyhow!("load token file: {e}"))?;
+    if file.openai.is_none() {
+        println!("Not logged in to OpenAI (no token found).");
+        return Ok(());
     }
+    file.openai = None;
+    clear_or_delete(&file, token_path)?;
+    println!("Logged out from OpenAI. Token removed.");
     Ok(())
 }
 
@@ -276,7 +290,164 @@ async fn exchange_code(code: &str, redirect_uri: &str, code_verifier: &str) -> R
         expires_at: now + r.expires_in,
         token_type: r.token_type,
         scope: r.scope.unwrap_or_else(|| OAUTH_SCOPES.to_string()),
+        account_id: None,
     })
+}
+
+async fn run_copilot_login(token_path: &Path) -> Result<()> {
+    let client = reqwest::Client::new();
+
+    #[derive(Serialize)]
+    struct DeviceCodeReq<'a> {
+        client_id: &'a str,
+        scope: &'a str,
+    }
+
+    #[derive(Deserialize)]
+    struct DeviceCodeResp {
+        device_code: String,
+        user_code: String,
+        verification_uri: String,
+        expires_in: u64,
+        interval: u64,
+    }
+
+    let device_resp = client
+        .post("https://github.com/login/device/code")
+        .header("Accept", "application/json")
+        .json(&DeviceCodeReq {
+            client_id: COPILOT_CLIENT_ID,
+            scope: COPILOT_SCOPE,
+        })
+        .send()
+        .await
+        .context("POST GitHub device code")?;
+
+    if !device_resp.status().is_success() {
+        let text = device_resp.text().await.unwrap_or_default();
+        bail!("device code request failed: {text}");
+    }
+
+    let device: DeviceCodeResp = device_resp
+        .json()
+        .await
+        .context("parse device code response")?;
+
+    println!("\nVisit this URL to authenticate with GitHub:");
+    println!("  {}", device.verification_uri);
+    println!("\nEnter code: {}", device.user_code);
+    println!("\nWaiting for you to authorize in the browser...");
+
+    // Best-effort browser open — fall through silently on failure.
+    let _ = open::that(&device.verification_uri);
+
+    #[derive(Serialize)]
+    struct TokenPollReq<'a> {
+        client_id: &'a str,
+        device_code: &'a str,
+        grant_type: &'a str,
+    }
+
+    #[derive(Deserialize)]
+    struct TokenPollResp {
+        access_token: Option<String>,
+        error: Option<String>,
+        error_description: Option<String>,
+    }
+
+    let mut poll_interval = device.interval;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(device.expires_in);
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(poll_interval)).await;
+
+        if std::time::Instant::now() > deadline {
+            bail!("device code expired before authorization was granted");
+        }
+
+        let poll_resp = client
+            .post("https://github.com/login/oauth/access_token")
+            .header("Accept", "application/json")
+            .json(&TokenPollReq {
+                client_id: COPILOT_CLIENT_ID,
+                device_code: &device.device_code,
+                grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+            })
+            .send()
+            .await
+            .context("POST GitHub device token poll")?;
+
+        let poll: TokenPollResp = poll_resp
+            .json()
+            .await
+            .context("parse device token poll response")?;
+
+        if let Some(token) = poll.access_token {
+            let copilot_token = CopilotToken {
+                github_token: token,
+            };
+            copilot_token
+                .save(token_path)
+                .map_err(|e| anyhow::anyhow!("save copilot token: {e}"))?;
+            println!(
+                "\nAuthentication successful. Copilot token saved to {}",
+                token_path.display()
+            );
+            println!("Set AI_MEMORY_LLM_PROVIDER=copilot to use your GitHub Copilot subscription.");
+            return Ok(());
+        }
+
+        match poll.error.as_deref() {
+            Some("authorization_pending") => {
+                // Normal — keep polling at the current interval.
+            }
+            Some("slow_down") => {
+                // Server asked us to back off — add 5 s and keep going.
+                poll_interval += 5;
+            }
+            Some("expired_token") => {
+                bail!("device code expired — run `ai-memory auth login copilot` to try again");
+            }
+            Some("access_denied") => {
+                bail!("authorization was denied by the user");
+            }
+            Some(err) => {
+                let desc = poll
+                    .error_description
+                    .unwrap_or_else(|| "(no description)".into());
+                bail!("OAuth error from GitHub: {err}: {desc}");
+            }
+            None => {
+                bail!("unexpected empty response from GitHub token endpoint");
+            }
+        }
+    }
+}
+
+fn run_logout_copilot(token_path: &Path) -> Result<()> {
+    let mut file =
+        TokenFile::load(token_path).map_err(|e| anyhow::anyhow!("load token file: {e}"))?;
+    if file.copilot.is_none() {
+        println!("Not logged in to GitHub Copilot (no token found).");
+        return Ok(());
+    }
+    file.copilot = None;
+    clear_or_delete(&file, token_path)?;
+    println!("Logged out from GitHub Copilot. Token removed.");
+    Ok(())
+}
+
+fn clear_or_delete(file: &TokenFile, path: &Path) -> Result<()> {
+    if file.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove token file {}", path.display()))?;
+        }
+    } else {
+        file.save(path)
+            .map_err(|e| anyhow::anyhow!("save token file: {e}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
