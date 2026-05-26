@@ -42,6 +42,14 @@ pub enum LlmError {
     /// Operation exhausted its retry budget.
     #[error("retries exhausted: {0}")]
     RetriesExhausted(String),
+
+    /// OAuth session expired or token file missing.
+    ///
+    /// The inner string includes a remediation hint (e.g. "run `ai-memory
+    /// auth login`"). Surfaces through the MCP call site so the agent sees
+    /// a clear message instead of a cryptic 401.
+    #[error("auth expired: {0}")]
+    AuthExpired(String),
 }
 
 impl From<serde_json::Error> for LlmError {

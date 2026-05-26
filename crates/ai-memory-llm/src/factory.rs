@@ -14,22 +14,28 @@ use crate::OpenAiProvider;
 use crate::embedding::{Embedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
+use crate::openai_oauth::OpenAiOAuthProvider;
 use crate::provider::LlmProvider;
 
-/// Four providers ship in v1.
+/// LLM provider selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderChoice {
     /// Anthropic Messages API.
     Anthropic,
-    /// OpenAI Chat Completions.
+    /// OpenAI Chat Completions (static API key).
     OpenAi,
     /// Google Gemini (Generative Language API).
     Gemini,
     /// OpenAI-compatible (Ollama / vLLM / LM Studio).
     OpenAiCompat,
+    /// OpenAI Chat Completions authenticated via OAuth 2.0 PKCE (ChatGPT
+    /// subscription). Token is loaded from `token_path` in `ProviderConfig`;
+    /// refresh is on-demand before each request. Run `ai-memory auth login`
+    /// to obtain the initial token.
+    OpenAiOAuth,
 }
 
-/// All settings needed to construct one of the three providers.
+/// All settings needed to construct one of the providers.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
     /// Provider selection.
@@ -40,6 +46,9 @@ pub struct ProviderConfig {
     pub api_key: Option<SecretString>,
     /// Base URL override (required for OpenAI-compat).
     pub base_url: Option<String>,
+    /// Path to the OAuth token file. Required for `OpenAiOAuth`; ignored
+    /// by all other providers.
+    pub token_path: Option<std::path::PathBuf>,
 }
 
 /// Embedding providers available to ai-memory.
@@ -162,6 +171,17 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(OpenAiCompatProvider::new(
                 base,
                 config.api_key,
+                config.model,
+            )?))
+        }
+        ProviderChoice::OpenAiOAuth => {
+            let token_path = config.token_path.ok_or_else(|| {
+                LlmError::NotConfigured(
+                    "openai-oauth requires a token_path (run `ai-memory auth login`)".into(),
+                )
+            })?;
+            Ok(Arc::new(OpenAiOAuthProvider::new(
+                token_path,
                 config.model,
             )?))
         }

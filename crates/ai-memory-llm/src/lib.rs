@@ -30,6 +30,7 @@ pub mod gemini;
 pub mod google;
 pub mod openai;
 pub mod openai_compat;
+pub mod openai_oauth;
 pub mod provider;
 pub mod types;
 
@@ -46,5 +47,6 @@ pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use openai::OpenAiProvider;
 pub use openai_compat::OpenAiCompatProvider;
+pub use openai_oauth::{OAuthToken, OpenAiOAuthProvider};
 pub use provider::{LlmProvider, complete_structured};
 pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, Usage};

@@ -344,6 +344,7 @@ impl From<ResolvedConfig> for ProviderConfig {
             model: r.model,
             api_key: r.api_key,
             base_url: r.base_url,
+            token_path: None,
         }
     }
 }
