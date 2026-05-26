@@ -1138,3 +1138,215 @@ async fn api_workspace_extras_includes_open_handoff() {
     assert_eq!(handoff["project"], "scratch");
     assert_eq!(handoff["agent"], "claude-code");
 }
+
+#[tokio::test]
+async fn api_project_extras_aggregates_handoff_briefing_health() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    // Another project that must NOT bleed into the scratch extras.
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(new_page(ws, proj, "alpha.md", "Alpha", "body"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, other, "beta.md", "Beta", "body"))
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "scratch_handoff_marker".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+        })
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/extras")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+
+    // Handoff is the scratch one, scoped to the project.
+    assert_eq!(json["handoff"]["summary"], "scratch_handoff_marker");
+    assert_eq!(json["handoff"]["project"], "scratch");
+
+    // Briefing + health count only the scratch page, not other/beta.md.
+    assert_eq!(json["briefing"]["counts"]["pages_latest"], 1);
+    let orphans = json["health"]["orphan_pages"].as_array().expect("orphan_pages");
+    let orphan_paths: Vec<&str> = orphans.iter().filter_map(|p| p["path"].as_str()).collect();
+    assert_eq!(orphan_paths, vec!["alpha.md"], "scoped to scratch only: {json}");
+}
+
+#[tokio::test]
+async fn api_workspace_extras_health_detail_lists_pages() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    // All three pages are orphans (no links). Two share a title → duplicates.
+    store
+        .writer
+        .upsert_page(new_page(ws, proj, "alpha.md", "Alpha", "body"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, proj, "dup-a.md", "SharedTitle", "body a"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, proj, "dup-b.md", "SharedTitle", "body b"))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/extras")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let health = &json["health"];
+
+    let orphans = health["orphan_pages"].as_array().expect("orphan_pages array");
+    let orphan_paths: Vec<&str> = orphans.iter().filter_map(|p| p["path"].as_str()).collect();
+    assert!(
+        orphan_paths.contains(&"alpha.md"),
+        "orphan list should include the unlinked page: {health}"
+    );
+    assert_eq!(orphans.len(), 3, "all three pages are orphans");
+
+    let dups = health["duplicate_pages"].as_array().expect("duplicate_pages array");
+    let dup_paths: Vec<&str> = dups.iter().filter_map(|p| p["path"].as_str()).collect();
+    assert!(dup_paths.contains(&"dup-a.md") && dup_paths.contains(&"dup-b.md"));
+    assert!(dups.iter().all(|p| p["title"] == "SharedTitle"));
+    assert!(
+        health["stale_pages"].as_array().expect("stale_pages array").is_empty(),
+        "freshly-written pages are not stale"
+    );
+}
+
+#[tokio::test]
+async fn api_page_returns_resolved_links_and_backlinks() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    // Target page first so the source's link resolves on write.
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "decisions/target.md",
+        "# Target\n\nThe canonical decision.",
+    ))
+    .await
+    .unwrap();
+    // Source links to the target via a wikilink (resolves to decisions/target.md).
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "notes/source.md",
+        "# Source\n\nSee [[decisions/target]] for the rationale.",
+    ))
+    .await
+    .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+
+    // Source page exposes the outgoing link, no back-links.
+    let src_req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/pages/notes/source.md")
+        .body(Body::empty())
+        .unwrap();
+    let src_resp = app.clone().oneshot(src_req).await.unwrap();
+    assert_eq!(src_resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(src_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let src: Value = serde_json::from_slice(&body).unwrap();
+    let links = src["links"].as_array().expect("links array");
+    assert_eq!(links.len(), 1, "source has one outgoing link: {src}");
+    assert_eq!(links[0]["path"], "decisions/target.md");
+    // `wiki_req` writes an explicit `kind: fact` frontmatter, which the
+    // resolver surfaces verbatim on the related-page row.
+    assert_eq!(links[0]["kind"], "fact");
+    assert!(
+        src["backlinks"].as_array().expect("backlinks array").is_empty(),
+        "source has no back-links"
+    );
+
+    // Target page exposes the incoming back-link, no outgoing links.
+    let tgt_req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/pages/decisions/target.md")
+        .body(Body::empty())
+        .unwrap();
+    let tgt_resp = app.oneshot(tgt_req).await.unwrap();
+    assert_eq!(tgt_resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(tgt_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tgt: Value = serde_json::from_slice(&body).unwrap();
+    let backlinks = tgt["backlinks"].as_array().expect("backlinks array");
+    assert_eq!(backlinks.len(), 1, "target has one back-link: {tgt}");
+    assert_eq!(backlinks[0]["path"], "notes/source.md");
+    assert!(
+        tgt["links"].as_array().expect("links array").is_empty(),
+        "target has no outgoing links"
+    );
+}

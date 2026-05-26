@@ -265,6 +265,58 @@ pub struct PageMeta {
     pub supersedes: Option<String>,
 }
 
+/// A page related to another through the link graph — used by the
+/// page-view "references / referenced by" panel. Body is omitted; just
+/// enough to render a clickable row.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedPage {
+    /// Relative wiki path of the related page.
+    pub path: String,
+    /// Title of the related page.
+    pub title: String,
+    /// Semantic kind of the related page.
+    pub kind: String,
+}
+
+/// Resolved outgoing links and incoming back-links for one page.
+/// Returned by [`ReaderPool::page_links`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PageLinks {
+    /// Latest pages this page references (resolved outgoing links).
+    pub links: Vec<RelatedPage>,
+    /// Latest pages that reference this page (incoming back-links).
+    pub backlinks: Vec<RelatedPage>,
+}
+
+/// One page flagged by a workspace health check, with enough identity to
+/// render a clickable drill-down row across projects.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthPage {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name within the workspace.
+    pub project: String,
+    /// Relative wiki path.
+    pub path: String,
+    /// Page title.
+    pub title: String,
+    /// Semantic kind.
+    pub kind: String,
+}
+
+/// Drill-down lists backing the workspace "memory health" counters.
+/// Each list is capped; the headline counts stay authoritative.
+/// Returned by [`ReaderPool::health_detail_for_workspace`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HealthDetail {
+    /// Episodic latest pages untouched for over 30 days.
+    pub stale: Vec<HealthPage>,
+    /// Latest pages sharing a title with at least one other page.
+    pub duplicates: Vec<HealthPage>,
+    /// Latest pages with no incoming or outgoing links.
+    pub orphans: Vec<HealthPage>,
+}
+
 /// Cheap, cloneable read-only connection pool handle.
 #[derive(Clone)]
 pub struct ReaderPool {
@@ -1705,16 +1757,50 @@ impl ReaderPool {
         &self,
         workspace_id: WorkspaceId,
     ) -> StoreResult<(u64, u64, u64)> {
+        self.memory_health_scoped(workspace_id, None).await
+    }
+
+    /// Per-project variant of [`ReaderPool::memory_health_for_workspace`]:
+    /// the same stale / duplicate / orphan counters, confined to one project.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn memory_health_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<(u64, u64, u64)> {
+        self.memory_health_scoped(workspace_id, Some(project_id))
+            .await
+    }
+
+    async fn memory_health_scoped(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: Option<ProjectId>,
+    ) -> StoreResult<(u64, u64, u64)> {
         self.with_conn(move |conn| {
             let now_us = jiff::Timestamp::now().as_microsecond();
             let cutoff_30d = now_us - 30 * 86_400 * 1_000_000;
+            let proj = project_id.map(|p| Value::Blob(p.as_bytes().to_vec()));
+            let ws = || Value::Blob(workspace_id.as_bytes().to_vec());
+            // Optional project filter, anonymous-`?` style. The orphan query
+            // aliases pages as `p`, so it needs its own qualified clause.
+            let clause = if proj.is_some() { " AND project_id = ?" } else { "" };
+            let clause_p = if proj.is_some() { " AND p.project_id = ?" } else { "" };
 
             let stale: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM pages \
-                     WHERE workspace_id = ?1 AND is_latest = 1 \
-                       AND tier = 'episodic' AND updated_at < ?2",
-                    params![workspace_id.as_bytes(), cutoff_30d],
+                    &format!(
+                        "SELECT COUNT(*) FROM pages \
+                         WHERE workspace_id = ? AND is_latest = 1 \
+                           AND tier = 'episodic' AND updated_at < ?{clause}"
+                    ),
+                    params_from_iter(
+                        [ws(), Value::Integer(cutoff_30d)]
+                            .into_iter()
+                            .chain(proj.clone()),
+                    ),
                     |row| row.get(0),
                 )
                 .optional()?
@@ -1722,12 +1808,14 @@ impl ReaderPool {
 
             let duplicates: i64 = conn
                 .query_row(
-                    "SELECT COALESCE(SUM(c - 1), 0) FROM ( \
-                        SELECT COUNT(*) c FROM pages \
-                        WHERE workspace_id = ?1 AND is_latest = 1 \
-                        GROUP BY title HAVING c > 1 \
-                     )",
-                    params![workspace_id.as_bytes()],
+                    &format!(
+                        "SELECT COALESCE(SUM(c - 1), 0) FROM ( \
+                            SELECT COUNT(*) c FROM pages \
+                            WHERE workspace_id = ? AND is_latest = 1{clause} \
+                            GROUP BY title HAVING c > 1 \
+                         )"
+                    ),
+                    params_from_iter(std::iter::once(ws()).chain(proj.clone())),
                     |row| row.get(0),
                 )
                 .optional()?
@@ -1735,11 +1823,13 @@ impl ReaderPool {
 
             let orphans: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM pages p \
-                     WHERE p.workspace_id = ?1 AND p.is_latest = 1 \
-                       AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id) \
-                       AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)",
-                    params![workspace_id.as_bytes()],
+                    &format!(
+                        "SELECT COUNT(*) FROM pages p \
+                         WHERE p.workspace_id = ? AND p.is_latest = 1{clause_p} \
+                           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = p.id) \
+                           AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = p.id)"
+                    ),
+                    params_from_iter(std::iter::once(ws()).chain(proj.clone())),
                     |row| row.get(0),
                 )
                 .optional()?
@@ -1750,6 +1840,136 @@ impl ReaderPool {
                 u64::try_from(duplicates).unwrap_or(0),
                 u64::try_from(orphans).unwrap_or(0),
             ))
+        })
+        .await
+    }
+
+    /// Drill-down lists behind [`ReaderPool::memory_health_for_workspace`]'s
+    /// counters: the actual stale / duplicate / orphan pages, each capped at
+    /// `limit`. Definitions mirror the counters exactly so the lists explain
+    /// the headline numbers.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn health_detail_for_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: usize,
+    ) -> StoreResult<HealthDetail> {
+        self.health_detail_scoped(workspace_id, None, limit).await
+    }
+
+    /// Per-project variant of [`ReaderPool::health_detail_for_workspace`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn health_detail_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<HealthDetail> {
+        self.health_detail_scoped(workspace_id, Some(project_id), limit)
+            .await
+    }
+
+    async fn health_detail_scoped(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: Option<ProjectId>,
+        limit: usize,
+    ) -> StoreResult<HealthDetail> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.with_conn(move |conn| {
+            let now_us = jiff::Timestamp::now().as_microsecond();
+            let cutoff_30d = now_us - 30 * 86_400 * 1_000_000;
+            let proj = project_id.map(|p| Value::Blob(p.as_bytes().to_vec()));
+            let ws = || Value::Blob(workspace_id.as_bytes().to_vec());
+            let clause = if proj.is_some() { " AND pg.project_id = ?" } else { "" };
+            let inner_clause = if proj.is_some() { " AND project_id = ?" } else { "" };
+
+            // Shared SELECT prefix: identity + path-inferred `kind`.
+            let select = "SELECT w.name, p.name, pg.path, pg.title, \
+                          COALESCE( \
+                              json_extract(pg.frontmatter_json, '$.kind'), \
+                              CASE \
+                                  WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                  WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
+                                  WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                  ELSE 'fact' \
+                              END \
+                          ) \
+                   FROM pages pg \
+                   JOIN projects p ON p.id = pg.project_id \
+                   JOIN workspaces w ON w.id = pg.workspace_id ";
+
+            // Params follow placeholder order: ws, cutoff, [proj], limit.
+            let stale_sql = format!(
+                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1 \
+                   AND pg.tier = 'episodic' AND pg.updated_at < ?{clause} \
+                 ORDER BY pg.updated_at ASC LIMIT ?"
+            );
+            let mut stale_stmt = conn.prepare(&stale_sql)?;
+            let stale = stale_stmt
+                .query_map(
+                    params_from_iter(
+                        [ws(), Value::Integer(cutoff_30d)]
+                            .into_iter()
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(limit))),
+                    ),
+                    health_page_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Params: ws, [proj], ws(inner), [proj(inner)], limit.
+            let dup_sql = format!(
+                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                   AND pg.title IN ( \
+                       SELECT title FROM pages \
+                       WHERE workspace_id = ? AND is_latest = 1{inner_clause} \
+                       GROUP BY title HAVING COUNT(*) > 1 \
+                   ) \
+                 ORDER BY pg.title, p.name LIMIT ?"
+            );
+            let mut dup_stmt = conn.prepare(&dup_sql)?;
+            let duplicates = dup_stmt
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(ws())
+                            .chain(proj.clone())
+                            .chain(std::iter::once(ws()))
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(limit))),
+                    ),
+                    health_page_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Params: ws, [proj], limit.
+            let orphan_sql = format!(
+                "{select} WHERE pg.workspace_id = ? AND pg.is_latest = 1{clause} \
+                   AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_page_id = pg.id) \
+                   AND NOT EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = pg.id) \
+                 ORDER BY pg.updated_at DESC LIMIT ?"
+            );
+            let mut orphan_stmt = conn.prepare(&orphan_sql)?;
+            let orphans = orphan_stmt
+                .query_map(
+                    params_from_iter(
+                        std::iter::once(ws())
+                            .chain(proj.clone())
+                            .chain(std::iter::once(Value::Integer(limit))),
+                    ),
+                    health_page_from_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(HealthDetail {
+                stale,
+                duplicates,
+                orphans,
+            })
         })
         .await
     }
@@ -1824,6 +2044,91 @@ impl ReaderPool {
                 )
                 .optional()?;
             row_opt.transpose()
+        })
+        .await
+    }
+
+    /// Resolve the outgoing links and incoming back-links for the latest
+    /// version of a page identified by `(workspace_id, project_id, path)`.
+    ///
+    /// Both ends are constrained to `is_latest = 1`, so superseded versions
+    /// never leak into the link panel. Returns empty lists when the page is
+    /// missing or has no links.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_links(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: String,
+    ) -> StoreResult<PageLinks> {
+        self.with_conn(move |conn| {
+            let id_opt: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT id FROM pages \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                       AND is_latest = 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(id_bytes) = id_opt else {
+                return Ok(PageLinks::default());
+            };
+
+            // Outgoing: latest pages this page links to. Incoming: latest
+            // pages that link here. Both reuse the path-inference `kind`
+            // fallback so untagged pages still classify.
+            let outgoing = "SELECT DISTINCT pg.path, pg.title, \
+                            COALESCE( \
+                                json_extract(pg.frontmatter_json, '$.kind'), \
+                                CASE \
+                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
+                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                    ELSE 'fact' \
+                                END \
+                            ) \
+                     FROM links l \
+                     JOIN pages pg ON pg.id = l.to_page_id \
+                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1 \
+                     ORDER BY pg.path";
+            let incoming = "SELECT DISTINCT pg.path, pg.title, \
+                            COALESCE( \
+                                json_extract(pg.frontmatter_json, '$.kind'), \
+                                CASE \
+                                    WHEN pg.path LIKE '\\_rules/%' ESCAPE '\\' THEN 'rule' \
+                                    WHEN pg.path LIKE 'decisions/%' THEN 'decision' \
+                                    WHEN pg.path LIKE 'gotchas/%' THEN 'gotcha' \
+                                    ELSE 'fact' \
+                                END \
+                            ) \
+                     FROM links l \
+                     JOIN pages pg ON pg.id = l.from_page_id \
+                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1 \
+                     ORDER BY pg.path";
+
+            let collect = |sql: &str| -> StoreResult<Vec<RelatedPage>> {
+                let mut stmt = conn.prepare(sql)?;
+                let rows = stmt.query_map(params![id_bytes], |row| {
+                    Ok(RelatedPage {
+                        path: row.get(0)?,
+                        title: row.get(1)?,
+                        kind: row.get(2)?,
+                    })
+                })?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r?);
+                }
+                Ok(out)
+            };
+
+            Ok(PageLinks {
+                links: collect(outgoing)?,
+                backlinks: collect(incoming)?,
+            })
         })
         .await
     }
@@ -2254,6 +2559,17 @@ impl ReaderPool {
         })
         .await
     }
+}
+
+/// Map a `(workspace, project, path, title, kind)` row to a [`HealthPage`].
+fn health_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPage> {
+    Ok(HealthPage {
+        workspace: row.get(0)?,
+        project: row.get(1)?,
+        path: row.get(2)?,
+        title: row.get(3)?,
+        kind: row.get(4)?,
+    })
 }
 
 fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<PageMeta>> {

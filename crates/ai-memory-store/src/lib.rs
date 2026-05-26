@@ -27,8 +27,9 @@ pub use error::{StoreError, StoreResult};
 pub use ops::{EmbeddingWrite, PurgeSummary, ReorgSummary};
 pub use reader::{
     ActivityWindow, BriefingPage, BriefingSnapshot, DecayCandidate, DerivedIndexStatus,
-    EmbeddingTripleCount, ObservationHit, PageHit, PageHitWithMeta, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, StatusCounts, StoredEmbedding, WorkspaceSummary, f32_vec_to_bytes,
+    EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit, PageHit, PageHitWithMeta,
+    PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, RelatedPage, StatusCounts,
+    StoredEmbedding, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use writer::WriterHandle;
 

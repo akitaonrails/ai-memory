@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ai_memory_core::{PageId, PagePath, ProjectId, WorkspaceId};
-use ai_memory_store::{BriefingSnapshot, PageHit};
+use ai_memory_store::{BriefingSnapshot, HealthPage, PageHit, RelatedPage};
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -41,6 +41,10 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route(
             "/workspaces/{workspace}/extras",
             axum::routing::get(extras_handler),
+        )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/extras",
+            axum::routing::get(project_extras_handler),
         )
         .with_state(state)
 }
@@ -106,11 +110,19 @@ async fn page_handler(
         .read_page(meta.workspace_id, meta.project_id, &page_path)
         .map_err(|_| not_found("page file not found"))?;
 
+    let links = state
+        .reader
+        .page_links(meta.workspace_id, meta.project_id, meta.path.clone())
+        .await
+        .map_err(internal_error)?;
+
     Ok(Json(ApiPage {
+        backlinks: links.backlinks,
         body_markdown: markdown.body,
         created_at: meta.created_at,
         frontmatter: markdown.frontmatter,
         kind: meta.kind,
+        links: links.links,
         path: meta.path,
         pinned: meta.pinned,
         project: meta.project_name,
@@ -141,6 +153,14 @@ async fn search_post_handler(
     search_with_request(&state, request).await
 }
 
+// NOTE (deferred): vector/semantic search. `ReaderPool::hybrid_search` already
+// RRF-fuses FTS5 + cosine over stored embeddings + link-graph expansion, but it
+// needs a query embedding — and `WebState` is read-only (reader + wiki), with no
+// embedder. Wiring true semantic search means injecting an embedding client into
+// `WebState` (touching `lib.rs`/`serve.rs`/`Cargo.toml`) and confirming the
+// embedding provider (Ollama) is reachable from the deployment. Until then this
+// handler stays FTS5-only. Link-graph "related pages" already ship via the
+// page-view `links`/`backlinks` (`ReaderPool::page_links`).
 async fn search_with_request(
     state: &WebState,
     request: SearchRequest,
@@ -343,12 +363,77 @@ async fn extras_handler(
         .memory_health_for_workspace(workspace_id)
         .await
         .map_err(internal_error)?;
+    let detail = state
+        .reader
+        .health_detail_for_workspace(workspace_id, query.limit.clamp(1, 100))
+        .await
+        .map_err(internal_error)?;
     let health = ApiHealth {
         stale,
         duplicates,
         contradictions: 0,
         orphans,
         audited_at: None,
+        stale_pages: detail.stale,
+        duplicate_pages: detail.duplicates,
+        orphan_pages: detail.orphans,
+    };
+
+    Ok(Json(ApiWorkspaceExtras {
+        handoff,
+        briefing,
+        health,
+    })
+    .into_response())
+}
+
+async fn project_extras_handler(
+    State(state): State<Arc<WebState>>,
+    Path((workspace, project)): Path<(String, String)>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Response, Response> {
+    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let limit = query.limit.clamp(1, 100);
+
+    let handoff = state
+        .reader
+        .latest_open_handoff(workspace_id, project_id, None)
+        .await
+        .map_err(internal_error)?
+        .map(|h| ApiHandoff {
+            agent: h.from_agent.as_str().to_owned(),
+            at: h.created_at.to_string(),
+            project: project.clone(),
+            summary: h.summary,
+            open_questions: h.open_questions,
+            next_steps: h.next_steps,
+        });
+
+    let briefing = state
+        .reader
+        .briefing_for_project(workspace_id, project_id, limit)
+        .await
+        .map_err(internal_error)?;
+
+    let (stale, duplicates, orphans) = state
+        .reader
+        .memory_health_for_project(workspace_id, project_id)
+        .await
+        .map_err(internal_error)?;
+    let detail = state
+        .reader
+        .health_detail_for_project(workspace_id, project_id, limit)
+        .await
+        .map_err(internal_error)?;
+    let health = ApiHealth {
+        stale,
+        duplicates,
+        contradictions: 0,
+        orphans,
+        audited_at: None,
+        stale_pages: detail.stale,
+        duplicate_pages: detail.duplicates,
+        orphan_pages: detail.orphans,
     };
 
     Ok(Json(ApiWorkspaceExtras {
@@ -544,6 +629,10 @@ struct ApiPage {
     supersedes: Option<String>,
     frontmatter: serde_json::Value,
     body_markdown: String,
+    /// Latest pages this page references (resolved outgoing links).
+    links: Vec<RelatedPage>,
+    /// Latest pages that reference this page (incoming back-links).
+    backlinks: Vec<RelatedPage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -581,6 +670,10 @@ struct ApiHealth {
     contradictions: u64,
     orphans: u64,
     audited_at: Option<String>,
+    /// Capped drill-down lists explaining each counter.
+    stale_pages: Vec<HealthPage>,
+    duplicate_pages: Vec<HealthPage>,
+    orphan_pages: Vec<HealthPage>,
 }
 
 #[derive(Debug, Serialize)]
