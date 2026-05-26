@@ -1,7 +1,7 @@
 //! OpenAI OAuth 2.0 PKCE provider.
 //!
 //! Authenticates via an OAuth access token (obtained through `ai-memory
-//! auth login`) instead of a static API key. The token is refreshed
+//! auth login openai`) instead of a static API key. The token is refreshed
 //! on-demand when `expires_at - 60s` is in the past; the refreshed token
 //! is immediately flushed to disk so the next process startup doesn't need
 //! another browser round-trip.
@@ -26,7 +26,7 @@ use crate::types::{ChatRequest, ChatResponse};
 /// OpenAI OAuth 2.0 token endpoint.
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-/// Authorization endpoint (used by `ai-memory auth login`, not this crate).
+/// Authorization endpoint (used by `ai-memory auth login openai`, not this crate).
 pub const AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
 
 /// OpenAI public client ID shared by Codex CLI and OpenCode.
@@ -136,12 +136,12 @@ impl OpenAiOAuthProvider {
     ///
     /// # Errors
     /// - `LlmError::AuthExpired` when the token file doesn't exist (user
-    ///   must run `ai-memory auth login` first).
+    ///   must run `ai-memory auth login openai` first).
     /// - Propagates IO / parse errors from [`OAuthToken::load`].
     pub fn new(token_path: PathBuf, model: impl Into<String>) -> LlmResult<Self> {
         let token = OAuthToken::load(&token_path)?.ok_or_else(|| {
             LlmError::AuthExpired(
-                "no OAuth token found — run `ai-memory auth login` to authenticate".into(),
+                "no OAuth token found — run `ai-memory auth login openai` to authenticate".into(),
             )
         })?;
         let client = reqwest::Client::builder()
@@ -239,7 +239,7 @@ async fn exchange_refresh_token(
         let body_text = resp.text().await.unwrap_or_default();
         return Err(LlmError::AuthExpired(format!(
             "token refresh failed ({status}): {body_text}. \
-             Run `ai-memory auth login` to re-authenticate."
+             Run `ai-memory auth login openai` to re-authenticate."
         )));
     }
 

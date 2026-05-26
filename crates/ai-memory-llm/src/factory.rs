@@ -9,6 +9,7 @@ use secrecy::SecretString;
 
 use crate::AnthropicProvider;
 use crate::GeminiProvider;
+use crate::GitHubCopilotProvider;
 use crate::OpenAiCompatProvider;
 use crate::OpenAiProvider;
 use crate::embedding::{Embedder, OpenAiEmbedder, VoyageEmbedder};
@@ -30,9 +31,13 @@ pub enum ProviderChoice {
     OpenAiCompat,
     /// OpenAI Chat Completions authenticated via OAuth 2.0 PKCE (ChatGPT
     /// subscription). Token is loaded from `token_path` in `ProviderConfig`;
-    /// refresh is on-demand before each request. Run `ai-memory auth login`
+    /// refresh is on-demand before each request. Run `ai-memory auth login openai`
     /// to obtain the initial token.
     OpenAiOAuth,
+    /// GitHub Copilot Chat Completions via `api.githubcopilot.com`.
+    /// Authenticates with a GitHub OAuth token obtained through the device
+    /// flow. Run `ai-memory auth login copilot` to obtain the initial token.
+    GitHubCopilot,
 }
 
 /// All settings needed to construct one of the providers.
@@ -177,10 +182,21 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         ProviderChoice::OpenAiOAuth => {
             let token_path = config.token_path.ok_or_else(|| {
                 LlmError::NotConfigured(
-                    "openai-oauth requires a token_path (run `ai-memory auth login`)".into(),
+                    "openai-oauth requires a token_path (run `ai-memory auth login openai`)".into(),
                 )
             })?;
             Ok(Arc::new(OpenAiOAuthProvider::new(
+                token_path,
+                config.model,
+            )?))
+        }
+        ProviderChoice::GitHubCopilot => {
+            let token_path = config.token_path.ok_or_else(|| {
+                LlmError::NotConfigured(
+                    "copilot requires a token_path (run `ai-memory auth login copilot`)".into(),
+                )
+            })?;
+            Ok(Arc::new(GitHubCopilotProvider::new(
                 token_path,
                 config.model,
             )?))

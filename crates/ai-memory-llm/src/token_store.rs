@@ -61,7 +61,7 @@ impl TokenFile {
         }
         let bytes = std::fs::read(path)
             .map_err(|e| LlmError::AuthExpired(format!("read token file: {e}")))?;
-        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| LlmError::AuthExpired(format!("parse token file: {e}")))?;
 
         serde_json::from_value(value)

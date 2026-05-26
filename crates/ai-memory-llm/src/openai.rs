@@ -343,7 +343,7 @@ impl OpenAiProvider {
 /// and re-introduce the 400 this function exists to prevent. Callers
 /// that need looser schemas should use the `Compat` dialect (which
 /// skips this normalisation entirely) or a non-strict path.
-fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
+pub(crate) fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             // OpenAI's structured-output subset rejects any sibling
@@ -406,7 +406,7 @@ fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
 /// family and made it mandatory across the gpt-5 line. Sending the legacy
 /// `max_tokens` to these models returns a 400 with
 /// `Unsupported parameter: 'max_tokens'`.
-fn model_requires_max_completion_tokens(model: &str) -> bool {
+pub(crate) fn model_requires_max_completion_tokens(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
 }
@@ -420,7 +420,7 @@ fn model_requires_max_completion_tokens(model: &str) -> bool {
 /// model. Only the default (1) is supported.` Omitting the field
 /// entirely lets the API apply its own default and unblocks those
 /// models without forcing every call site to be model-aware.
-fn model_requires_default_temperature(model: &str) -> bool {
+pub(crate) fn model_requires_default_temperature(model: &str) -> bool {
     // Same family as `max_completion_tokens` — keep aligned: any future
     // family that adopts the new rename also tends to lock temperature.
     model_requires_max_completion_tokens(model)
@@ -441,7 +441,7 @@ fn model_requires_default_temperature(model: &str) -> bool {
 /// common case (gpt-4o family at 16384), not to paper over every
 /// model. Reasoning models in the gpt-5 / o-series have much larger
 /// caps (128K+), so we leave their requests untouched.
-fn max_output_tokens_for(model: &str) -> u32 {
+pub(crate) fn max_output_tokens_for(model: &str) -> u32 {
     if model_requires_max_completion_tokens(model) {
         // gpt-5 / o-series: documented at 128K output. Leave the
         // caller's value alone — they know what they're asking for.
