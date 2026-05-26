@@ -180,3 +180,33 @@ fn uninstall_purge_data_apply_wipes() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("✓ purged"), "stdout was: {stdout}");
 }
+
+#[test]
+fn uninstall_dry_run_previews_purge() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+
+    let out = Command::new(bin())
+        .args(["uninstall", "--purge-data"]) // dry-run: no --apply
+        .env("HOME", home.path())
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("would purge"), "stdout was: {stdout}");
+    for sub in ["wiki", "db", "raw"] {
+        let p = data.path().join(sub);
+        assert!(
+            stdout.contains(&p.display().to_string()),
+            "missing {sub} in: {stdout}"
+        );
+        // Dry-run must not delete.
+        assert!(p.join("f.txt").exists(), "{sub} must be untouched");
+    }
+}

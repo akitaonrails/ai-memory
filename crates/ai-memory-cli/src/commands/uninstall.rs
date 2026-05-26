@@ -206,6 +206,11 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
 
     let plan = build_plan(&args)?;
     print_plan(&plan);
+    if args.purge_data {
+        for path in data_purge::purge_preview(&config.data_dir) {
+            println!("would purge {}", path.display());
+        }
+    }
     if !args.apply {
         println!("(dry-run; pass --apply to remove)");
         return Ok(());
