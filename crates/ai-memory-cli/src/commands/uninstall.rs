@@ -384,6 +384,17 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw => Some(&["mcp", "servers"]),
         McpClient::Codex | McpClient::Pi => None,
+        // Antigravity is wired up differently from every other client:
+        // its hooks live in a top-level `"ai-memory"` named group
+        // (not `hooks.<Event>` arrays keyed by the `AI_MEMORY_HOOK_URL=`
+        // command signature) and its MCP entry uses `serverUrl` instead
+        // of `url`/`httpUrl`. The generic strippers in this module don't
+        // cover that shape, so `uninstall` deliberately does NOT touch
+        // Antigravity yet — it is also absent from `build_plan`'s scan
+        // lists, so this arm is never reached in the happy path. Tracked
+        // as a follow-up (see PR notes / issue). `None` here just keeps
+        // the match exhaustive.
+        McpClient::AntigravityCli => None,
     }
 }
 
