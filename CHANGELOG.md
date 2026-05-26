@@ -103,6 +103,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wipes wiki/db/raw via the reset guard. `--only hooks|mcp|instructions` to
   narrow. Docker/volume teardown is printed as a hint, not executed.
 
+### Changed
+- `ai-memory uninstall --purge-data` now previews the `wiki/`/`db/`/`raw/`
+  wipe in dry-run (mirroring `reset`) and refuses **up front** if an
+  `ai-memory` process is alive (all-or-nothing) instead of removing the
+  wiring and then skipping the purge. The data wipe is now shared with
+  `reset` via a single internal helper.
+
 ## [0.1.3] - 2026-05-24
 
 ### Added
