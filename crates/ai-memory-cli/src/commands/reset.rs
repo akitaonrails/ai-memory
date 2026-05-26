@@ -7,10 +7,9 @@
 use anyhow::{Result, bail};
 
 use crate::cli::ResetArgs;
+use crate::commands::data_purge;
 use crate::config::Config;
 use crate::process_guard::{busy_message, sibling_processes};
-
-const SUBDIRS: &[&str] = &["wiki", "db", "raw"];
 
 /// Run the `reset` subcommand.
 ///
@@ -24,23 +23,14 @@ pub fn run(config: &Config, args: ResetArgs) -> Result<()> {
     }
 
     if !args.confirm {
-        for sub in SUBDIRS {
-            let path = config.data_dir.join(sub);
-            if path.exists() {
-                println!("would remove {}", path.display());
-            }
+        for path in data_purge::purge_preview(&config.data_dir) {
+            println!("would remove {}", path.display());
         }
         println!("(dry-run; pass --confirm to wipe)");
         return Ok(());
     }
 
-    for sub in SUBDIRS {
-        let path = config.data_dir.join(sub);
-        if !path.exists() {
-            continue;
-        }
-        std::fs::remove_dir_all(&path)?;
-        std::fs::create_dir_all(&path)?;
+    for path in data_purge::purge_data_dirs(&config.data_dir)? {
         tracing::info!(path = %path.display(), "reset");
     }
     tracing::info!("reset complete");
