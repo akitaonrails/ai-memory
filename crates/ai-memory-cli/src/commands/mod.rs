@@ -8,6 +8,7 @@ pub mod apply_shared;
 pub mod backup;
 pub mod bootstrap;
 pub mod commit;
+pub mod data_purge;
 pub mod embed;
 pub mod forget_sweep;
 pub mod generate_auth_token;
