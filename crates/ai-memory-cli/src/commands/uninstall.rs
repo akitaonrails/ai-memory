@@ -11,7 +11,7 @@ use crate::cli::UninstallArgs;
 use crate::commands::apply_shared::apply_atomic;
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
-use crate::commands::{install_hooks, install_mcp};
+use crate::commands::{data_purge, install_hooks, install_mcp};
 use crate::config::{Config, DEFAULT_MCP_URL};
 use ai_memory_core::{MARKER_END, MARKER_START};
 use anyhow::{Context, Result};
@@ -214,6 +214,17 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // All-or-nothing: when we're going to purge data, refuse before touching
+    // anything if an ai-memory process is alive (matches reset's guard-at-top).
+    // Wiring-only uninstall stays unguarded — it edits agent config files the
+    // server never touches.
+    if args.purge_data {
+        let siblings = crate::process_guard::sibling_processes();
+        if !siblings.is_empty() {
+            anyhow::bail!(crate::process_guard::busy_message("purge data", &siblings));
+        }
+    }
+
     if std::io::stdin().is_terminal() && !args.yes {
         eprint!("Proceed with removal? [y/N] ");
         use std::io::Write as _;
@@ -230,35 +241,14 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         apply_change(change, name, url, args.only)?;
     }
 
-    let mut purge_refused = false;
     if args.purge_data {
-        let siblings = crate::process_guard::sibling_processes();
-        if !siblings.is_empty() {
-            eprintln!(
-                "{}",
-                crate::process_guard::busy_message("purge data", &siblings)
-            );
-            eprintln!("wiring was removed, but data was NOT purged (process alive).");
-            purge_refused = true;
-        } else {
-            for sub in ["wiki", "db", "raw"] {
-                let path = config.data_dir.join(sub);
-                if path.exists() {
-                    std::fs::remove_dir_all(&path)
-                        .with_context(|| format!("removing {}", path.display()))?;
-                    std::fs::create_dir_all(&path)
-                        .with_context(|| format!("recreating {}", path.display()))?;
-                    println!("✓ purged {}", path.display());
-                }
-            }
+        for path in data_purge::purge_data_dirs(&config.data_dir)? {
+            println!("✓ purged {}", path.display());
         }
     }
 
-    print_docker_hint(args.purge_data && !purge_refused);
+    print_docker_hint(args.purge_data);
 
-    if purge_refused {
-        anyhow::bail!("uninstall completed wiring removal but could not purge data");
-    }
     Ok(())
 }
 

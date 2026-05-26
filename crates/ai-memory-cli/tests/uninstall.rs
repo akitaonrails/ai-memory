@@ -145,3 +145,38 @@ fn uninstall_dry_run_changes_nothing() {
     let after = std::fs::read_to_string(claude.join("settings.json")).unwrap();
     assert_eq!(after, original, "dry-run must not modify the file");
 }
+
+#[test]
+fn uninstall_purge_data_apply_wipes() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+    std::fs::create_dir_all(data.path().join("logs")).unwrap();
+    std::fs::write(data.path().join("logs/app.log"), b"l").unwrap();
+
+    let out = Command::new(bin())
+        .args(["uninstall", "--apply", "--yes", "--purge-data"])
+        .env("HOME", home.path())
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for sub in ["wiki", "db", "raw"] {
+        assert!(data.path().join(sub).is_dir(), "{sub} dir should remain");
+        assert!(
+            !data.path().join(sub).join("f.txt").exists(),
+            "{sub} emptied"
+        );
+    }
+    assert!(data.path().join("logs/app.log").exists(), "logs preserved");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("✓ purged"), "stdout was: {stdout}");
+}
