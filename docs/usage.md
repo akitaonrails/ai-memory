@@ -137,6 +137,36 @@ docker cp ai-memory:/data/wiki ./my-ai-memory-wiki
 docker exec ai-memory git -C /data/wiki log --oneline
 ```
 
+## Authentication (OpenAI OAuth and GitHub Copilot)
+
+Use `ai-memory auth` to authenticate with subscription-based providers
+that do not require an API key.
+
+```bash
+# OpenAI via ChatGPT subscription
+ai-memory auth login openai    # opens browser for PKCE flow
+ai-memory auth logout openai
+
+# GitHub Copilot subscription
+ai-memory auth login copilot   # shows device code; visit URL + enter code
+ai-memory auth logout copilot
+```
+
+Both tokens land in `<data_dir>/oauth_token.json` (mode 0600) under
+separate keys (`"openai"` and `"github-copilot"`). The format is
+compatible with OpenCode so a single login works for both tools.
+
+After logging in, set the provider when starting the server:
+
+```bash
+AI_MEMORY_LLM_PROVIDER=openai-oauth ai-memory serve --transport http …
+AI_MEMORY_LLM_PROVIDER=copilot      ai-memory serve --transport http …
+```
+
+GitHub Copilot routes all model families through one endpoint — set
+`AI_MEMORY_LLM_MODEL` to any of: `gpt-4.1`, `gpt-4o`, `claude-sonnet-4`,
+`claude-3.7-sonnet`, `gemini-2.5-pro`, `o4-mini`, etc.
+
 ## Rules vs facts
 
 Durable project rules belong in the agent's rules file, not only in the
