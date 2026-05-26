@@ -31,6 +31,9 @@ Two issues surfaced while exercising `ai-memory uninstall --purge-data`:
   both, without coupling their divergent orchestration (guard, output).
 - No behavioral regression to `reset` (which currently has **zero tests**),
   and no loss of `uninstall`'s per-path error context.
+- `uninstall --purge-data` is **all-or-nothing**: if another `ai-memory`
+  process is alive it refuses *up front*, before removing any wiring — no
+  half-done state. Matches `reset`'s guard-at-top.
 - Coverage on touched/new code across this branch: critical logic ≥ 90%,
   rest ≥ 80% (line coverage, local inspection — see Coverage).
 
@@ -38,8 +41,9 @@ Two issues surfaced while exercising `ai-memory uninstall --purge-data`:
 
 - No change to `reset`'s public behavior, flags, guard semantics, or output
   wording.
-- No change to `uninstall`'s guard/refusal flow or `--apply` behavior beyond
-  routing the wipe through the shared helper.
+- `uninstall` *without* `--purge-data` stays **unguarded**: wiring removal is
+  safe while the server runs (it only edits agent config files the server
+  never touches), so it does not require the server stopped.
 - No unification of `reset`'s "would remove" wording with `uninstall`'s
   "would purge" / "✓ purged" — each command keeps its own phrasing.
 - **No unification with `init`/`restore`.** Those declare *different* subdir
@@ -128,18 +132,33 @@ Registered with `mod data_purge;` in `commands/mod.rs`.
       }
   }
   ```
-- **Apply.** Replace the inline wipe loop (with its own `with_context`) with:
+- **Up-front guard (option B / all-or-nothing).** After the dry-run early
+  return and before applying any wiring change, when `args.purge_data`:
   ```rust
-  } else {
+  if args.purge_data {
+      let siblings = sibling_processes();
+      if !siblings.is_empty() {
+          bail!(busy_message("purge data", &siblings));   // nothing removed yet
+      }
+  }
+  ```
+  This refuses the whole command before touching anything if a process is
+  alive, matching `reset`'s guard-at-top. The TOCTOU window between this check
+  and the wipe is the same as `reset`'s and is accepted.
+- **Apply wiring, then purge** (guard already passed — no per-purge refusal):
+  ```rust
+  for change in &plan { apply_change(change, name, url, args.only)?; }
+  if args.purge_data {
       for p in data_purge::purge_data_dirs(&config.data_dir)? {
           println!("✓ purged {}", p.display());
       }
   }
   ```
-  The per-path error context is preserved (now inside the helper). The
-  sibling-process guard, `purge_refused` flag, and end-of-run `bail!` are
-  **unchanged** — the "remove wiring, then skip purge if a process is alive"
-  behavior is preserved.
+  The per-path error context is preserved (now inside the helper). The old
+  **mid-flow** `sibling_processes()` check, the `purge_refused` flag, the two
+  `eprintln!` warnings, and the end-of-run conditional `bail!` are **removed** —
+  the up-front guard replaces them. `print_docker_hint(args.purge_data)` is
+  still called (no longer gated on `purge_refused`).
 
 ### Output ordering
 
@@ -188,6 +207,14 @@ purge lines cover *data*. Technically correct; left as-is for simplicity.
 4. **Integration test `uninstall --purge-data` dry-run** (fails) → implement
    preview → green: stdout contains `would purge …/wiki|db|raw` AND the seeded
    files still exist on disk afterward.
+5. **Option-B guard (best-effort, `#[ignore]`).** With `--purge-data --apply`
+   and a live sibling `ai-memory` process, the command bails and **no wiring is
+   removed** (all-or-nothing). Like H3 this cannot be tested deterministically
+   (`sysinfo` reads the live process table, no injection seam, and rule #6
+   forbids refactoring `process_guard`); described as an `#[ignore]`d
+   integration test that spawns a real sibling, plus manual verification. The
+   happy path (no sibling) is covered by the existing round-trip + the new
+   dry-run test.
 
 Symlinked subdirs are out of scope; behavior matches existing `reset`
 (pre-existing) and is not tested.
@@ -210,8 +237,10 @@ Symlinked subdirs are out of scope; behavior matches existing `reset`
 
 ## Project-rule checks
 
-- **Invariant #9 (live-process guard before destructive op):** preserved —
-  the guard stays in each caller; the mute helper performs no guard itself.
+- **Invariant #9 (live-process guard before destructive op):** preserved and
+  strengthened — for `uninstall --purge-data` the guard now runs **up front**
+  (all-or-nothing), matching `reset`. The mute helper performs no guard itself;
+  each caller owns it.
 - **Invariant #10 (atomic file writes: tmp + rename + fsync):** **N/A here.**
   #10 governs *file-content* writes (config files, wiki pages, via
   `apply_shared`); this is a *directory-tree wipe*. There is no meaningful
@@ -239,6 +268,19 @@ Symlinked subdirs are out of scope; behavior matches existing `reset`
   `models/` survives a reset (like `logs/`). Likely intentional (downloaded
   embedding models), but undocumented. Candidate for a separate issue;
   not changed here.
+
+## Behavior change adopted (post-review, maintainer request)
+
+- **Option B — all-or-nothing `--purge-data`.** The previous behavior removed
+  the wiring, then *skipped* the data purge (with a warning + non-zero exit) if
+  an `ai-memory` process was alive, leaving a half-done state. The guard now
+  moves to the **top** of the apply path: `uninstall --purge-data` refuses
+  before removing anything if a process is alive. Wiring-only `uninstall`
+  (no `--purge-data`) stays unguarded, since editing agent config files is safe
+  while the server runs. This makes `uninstall` (disconnect integration) and
+  `reset` (wipe data) consistent in their guard discipline, and clarifies the
+  mental model: `uninstall` removes integration (keeps data unless
+  `--purge-data`); `reset` wipes data (keeps integration).
 
 ## Review resolutions (subagent critique → disposition)
 
