@@ -34,7 +34,7 @@ Two issues surfaced while exercising `ai-memory uninstall --purge-data`:
 - `uninstall --purge-data` is **all-or-nothing**: if another `ai-memory`
   process is alive it refuses *up front*, before removing any wiring — no
   half-done state. Matches `reset`'s guard-at-top.
-- Coverage on touched/new code across this branch: critical logic ≥ 90%,
+- Coverage on the **changed lines** (diff vs `main`): critical logic ≥ 90%,
   rest ≥ 80% (line coverage, local inspection — see Coverage).
 
 ## Non-goals
@@ -207,7 +207,12 @@ purge lines cover *data*. Technically correct; left as-is for simplicity.
 4. **Integration test `uninstall --purge-data` dry-run** (fails) → implement
    preview → green: stdout contains `would purge …/wiki|db|raw` AND the seeded
    files still exist on disk afterward.
-5. **Option-B guard (best-effort, `#[ignore]`).** With `--purge-data --apply`
+5. **Integration test `uninstall --purge-data --apply --yes` happy path**
+   (temp HOME + temp data dir, no sibling): asserts `wiki`/`db`/`raw` emptied,
+   `logs/` intact, `✓ purged` printed. Covers the new apply-side lines for the
+   changed-line coverage target. (Small flake risk if another test spawns
+   `ai-memory` concurrently and trips the guard; serialize/retry if it surfaces.)
+6. **Option-B guard (best-effort, `#[ignore]`).** With `--purge-data --apply`
    and a live sibling `ai-memory` process, the command bails and **no wiring is
    removed** (all-or-nothing). Like H3 this cannot be tested deterministically
    (`sysinfo` reads the live process table, no injection seam, and rule #6
@@ -221,19 +226,23 @@ Symlinked subdirs are out of scope; behavior matches existing `reset`
 
 ### Coverage
 
-- Tool: **`cargo llvm-cov`** (`cargo install cargo-llvm-cov`). It is a
-  **local inspection, not a CI gate** (CI runs fmt/clippy/test/deny/audit
-  only); documented under a "Coverage (local)" note, NOT the "CI parity" list.
-- Metric: **line coverage** via `cargo llvm-cov --lcov` (or `--summary-only`),
-  inspected per file for the files this branch touches.
-- Targets for touched/new code across the whole branch (per the maintainer's
-  requirement — this includes already-committed uninstall code):
-  - **Critical logic ≥ 90%** (criticality, not purity): `data_purge`
-    (helper, const, preview) and `uninstall`'s pure `strip_*` /
-    `*_is_ours` functions.
-  - **Rest ≥ 80%**: `reset::run`, `uninstall::run`, `build_plan` (it does
-    filesystem IO — orchestration, not pure), dispatch, print paths.
-- Add tests until thresholds are met for the touched files.
+- **Scope: only the lines changed/added on this branch (the diff vs `main`),
+  not whole files.** Pre-existing untouched code (e.g. the already-committed
+  `strip_*` / `build_plan`) is out of scope.
+- Tool: **`cargo llvm-cov`** for the report + **`diff-cover`** against `main`
+  for the changed-line numbers. Local inspection, not a CI gate (CI runs
+  fmt/clippy/test/deny/audit only).
+  - `cargo llvm-cov --cobertura --output-path target/cov.xml -p ai-memory-cli`
+  - `diff-cover target/cov.xml --compare-branch main`
+- Targets on the changed lines (line coverage):
+  - **Critical logic ≥ 90%**: the new `data_purge` helper (covered ~100% by its
+    own unit tests).
+  - **Rest ≥ 80%**: changed lines in `reset::run` (reset characterization
+    tests) and `uninstall::run` (dry-run preview test + apply+purge happy-path
+    test).
+- **Lone accepted gap:** the option-B `bail!` line in `uninstall` is only
+  reached by the `#[ignore]` sibling test (sysinfo, per H3); it is the single
+  uncovered changed line.
 
 ## Project-rule checks
 
@@ -289,9 +298,10 @@ Symlinked subdirs are out of scope; behavior matches existing `reset`
 - **H2 (#10 not addressed):** accepted — explicit N/A note added.
 - **H3 (guard test infeasible):** accepted — guard refusal removed from the
   characterization set with rationale.
-- **M1 (coverage scope/metric):** partially — kept the whole-branch scope (a
-  maintainer requirement, not scope creep); specified line coverage + local
-  (non-CI) inspection.
+- **M1 (coverage scope/metric):** the maintainer later scoped coverage to the
+  **changed lines only** (diff vs `main`) — which resolves the reviewer's
+  "whole-file / already-committed" concern. Measured with `cargo llvm-cov`
+  cobertura + `diff-cover`, line coverage, local (non-CI).
 - **M2 (`build_plan` is not "pure"):** accepted — moved to the ≥80% bucket;
   90% bucket reframed as "critical logic", not "pure".
 - **M3 (reset-rationale inverted):** accepted — corrected (reset is the

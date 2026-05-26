@@ -398,11 +398,58 @@ This removes the `purge_refused` flag, the mid-flow `sibling_processes()` check,
 Run: `cargo test -p ai-memory-cli --test uninstall`
 Expected: the existing tests pass (none use `--purge-data`, so the apply rewrite must not regress them).
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Append the apply+purge happy-path test (covers the new apply lines)**
+
+At the end of `crates/ai-memory-cli/tests/uninstall.rs`:
+
+```rust
+#[test]
+fn uninstall_purge_data_apply_wipes() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+    std::fs::create_dir_all(data.path().join("logs")).unwrap();
+    std::fs::write(data.path().join("logs/app.log"), b"l").unwrap();
+
+    let out = Command::new(bin())
+        .args(["uninstall", "--apply", "--yes", "--purge-data"])
+        .env("HOME", home.path())
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for sub in ["wiki", "db", "raw"] {
+        assert!(data.path().join(sub).is_dir(), "{sub} dir should remain");
+        assert!(!data.path().join(sub).join("f.txt").exists(), "{sub} emptied");
+    }
+    assert!(data.path().join("logs/app.log").exists(), "logs preserved");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("✓ purged"), "stdout was: {stdout}");
+}
+```
+
+> Note: relies on no concurrent sibling `ai-memory` process tripping the guard.
+> If this flakes under parallel test load, serialize it (e.g. a file lock) or
+> add a short retry; do not weaken the assertions.
+
+- [ ] **Step 5: Run — must PASS**
+
+Run: `cargo test -p ai-memory-cli --test uninstall uninstall_purge_data_apply_wipes`
+Expected: PASS (data wiped, logs kept, `✓ purged` printed).
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add crates/ai-memory-cli/src/commands/uninstall.rs
-git commit -m "feat(uninstall): all-or-nothing --purge-data guard + shared wipe"
+git add crates/ai-memory-cli/src/commands/uninstall.rs crates/ai-memory-cli/tests/uninstall.rs
+git commit -m "feat(uninstall): all-or-nothing --purge-data guard + shared wipe; apply test"
 ```
 
 ---
@@ -569,15 +616,20 @@ git commit -m "test(uninstall): ignored best-effort guard-refusal test"
 **Files:**
 - Modify: `CHANGELOG.md`
 
-- [ ] **Step 1: Install + run coverage**
+- [ ] **Step 1: Install tooling + measure CHANGED-LINE coverage (diff vs main)**
 
 ```bash
 cargo install cargo-llvm-cov   # one-time; pulls llvm-tools-preview if needed
-cargo llvm-cov --summary-only -p ai-memory-cli 2>/dev/null \
-  | grep -E "data_purge.rs|reset.rs|uninstall.rs"
+pipx install diff_cover || pip install --user diff-cover   # one-time
+cargo llvm-cov --cobertura --output-path target/cov.xml -p ai-memory-cli
+diff-cover target/cov.xml --compare-branch main
 ```
 
-Expected: per-file **line** coverage — `data_purge.rs` ≥ 90% (critical logic), `reset.rs`/`uninstall.rs` ≥ 80%. If any touched file is below target, add a focused test (e.g. an extra `data_purge` edge case, or an `uninstall --only` dry-run preview assertion) until it clears, then re-run.
+Expected: on the **changed lines only**, `data_purge` (critical logic) ≥ 90%
+(its unit tests cover ~100%), and changed lines in `reset::run` / `uninstall::run`
+≥ 80%. The single expected miss is the option-B `bail!` line in `uninstall`
+(only the `#[ignore]` sibling test reaches it). If anything else changed is
+uncovered, add a focused test until it clears, then re-run.
 
 - [ ] **Step 2: Add CHANGELOG entry**
 
@@ -613,7 +665,7 @@ git commit -m "docs(changelog): uninstall dry-run purge preview + all-or-nothing
 
 ## Self-review
 
-- **Spec coverage:** dry-run preview → Task 5; shared mute helper (`WIPE_SUBDIRS`/`purge_preview`/`purge_data_dirs`, `anyhow::Result` + context) → Task 2; `reset` uses it, wording/tracing kept → Task 3; `uninstall` uses it + option B up-front guard, `purge_refused` removed → Task 4; characterization-first for untested `reset` → Task 1; coverage 90/80 line, local → Task 7; `#[ignore]` guard test per H3 → Task 6; CHANGELOG → Task 7. All spec sections map to a task.
+- **Spec coverage:** dry-run preview → Task 5; shared mute helper (`WIPE_SUBDIRS`/`purge_preview`/`purge_data_dirs`, `anyhow::Result` + context) → Task 2; `reset` uses it, wording/tracing kept → Task 3; `uninstall` uses it + option B up-front guard, `purge_refused` removed → Task 4; characterization-first for untested `reset` → Task 1; apply+purge happy-path test (covers new apply lines) → Task 4; changed-line coverage 90/80 via `diff-cover` vs main, local → Task 7; `#[ignore]` guard test per H3 → Task 6; CHANGELOG → Task 7. All spec sections map to a task.
 - **Placeholder scan:** no TBD/TODO; every code step shows full code; the only `todo!()` is the intentional TDD red state in Task 2 Step 2, made green in Step 4.
 - **Type consistency:** `WIPE_SUBDIRS`, `purge_preview(&Path) -> Vec<PathBuf>`, `purge_data_dirs(&Path) -> anyhow::Result<Vec<PathBuf>>` used identically in Tasks 2/3/4/5; `ResetArgs { confirm }` and `Config { data_dir, ..Default }` match the real signatures; `print_docker_hint(bool)` call updated to drop `purge_refused`.
 ```
