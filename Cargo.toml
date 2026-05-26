@@ -83,6 +83,7 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 refinery = { version = "0.8", features = ["rusqlite"] }
 sha2 = "0.10"
 parking_lot = "0.12"
+open = "5"
 
 # Filesystem watcher + process inspection.
 notify = "8"
