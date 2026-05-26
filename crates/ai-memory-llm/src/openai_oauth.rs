@@ -42,8 +42,7 @@ pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// OAuth scopes required for Chat Completions access via a ChatGPT
 /// subscription. `offline_access` is critical — without it no refresh token
 /// is issued and the user must re-authenticate every hour.
-pub const OAUTH_SCOPES: &str =
-    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+pub const OAUTH_SCOPES: &str = "openid profile email offline_access";
 
 /// Persisted OAuth token state written to `<data_dir>/oauth_token.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +59,8 @@ pub struct OAuthToken {
     pub token_type: String,
     /// Scopes granted by the authorization server.
     pub scope: String,
+    /// OpenAI account UUID, preserved from the token file when present.
+    pub account_id: Option<String>,
 }
 
 impl OAuthToken {
@@ -73,54 +74,44 @@ impl OAuthToken {
         now + 60 >= self.expires_at
     }
 
-    /// Load from the token file. Returns `None` when the file doesn't exist.
+    /// Load from the unified token store. Returns `None` when no OpenAI OAuth
+    /// token is saved.
     ///
     /// # Errors
     /// `LlmError::AuthExpired` if the file exists but cannot be parsed.
     pub fn load(path: &std::path::Path) -> LlmResult<Option<Self>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(path)
-            .map_err(|e| LlmError::AuthExpired(format!("read token file: {e}")))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| LlmError::AuthExpired(format!("parse token file: {e}")))
-            .map(Some)
+        let entry = match crate::token_store::TokenFile::load(path)?.openai {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        Ok(Some(Self {
+            access_token: entry.access,
+            refresh_token: entry.refresh,
+            // OAuthEntry.expires is milliseconds; OAuthToken.expires_at is seconds.
+            expires_at: entry.expires / 1000,
+            token_type: "Bearer".into(),
+            scope: OAUTH_SCOPES.into(),
+            account_id: entry.account_id,
+        }))
     }
 
-    /// Atomically write to disk (tmp → rename) with mode 0600.
+    /// Persist into the unified token store (reads-then-writes to preserve
+    /// tokens for other providers stored in the same file).
     ///
     /// # Errors
     /// Propagates IO errors as `LlmError::AuthExpired`.
     pub fn save(&self, path: &std::path::Path) -> LlmResult<()> {
-        use std::io::Write as _;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| LlmError::AuthExpired(format!("create token dir: {e}")))?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        let json = serde_json::to_vec_pretty(self).map_err(LlmError::from)?;
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)
-                .map_err(|e| LlmError::AuthExpired(format!("open tmp token file: {e}")))?;
-            // Set 0600 before writing so data never lands world-readable.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                f.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .map_err(|e| LlmError::AuthExpired(format!("chmod token file: {e}")))?;
-            }
-            f.write_all(&json)
-                .map_err(|e| LlmError::AuthExpired(format!("write token file: {e}")))?;
-            f.sync_all()
-                .map_err(|e| LlmError::AuthExpired(format!("fsync token file: {e}")))?;
-        }
-        std::fs::rename(&tmp, path)
-            .map_err(|e| LlmError::AuthExpired(format!("rename token file: {e}")))
+        use crate::token_store::OAuthEntry;
+        let mut file = crate::token_store::TokenFile::load(path)?;
+        file.openai = Some(OAuthEntry {
+            kind: "oauth".into(),
+            access: self.access_token.clone(),
+            refresh: self.refresh_token.clone(),
+            // OAuthToken.expires_at is seconds; OAuthEntry.expires is milliseconds.
+            expires: self.expires_at.saturating_mul(1000),
+            account_id: self.account_id.clone(),
+        });
+        file.save(path)
     }
 }
 
@@ -264,6 +255,7 @@ async fn exchange_refresh_token(
         expires_at: now + r.expires_in,
         token_type: r.token_type,
         scope: r.scope.unwrap_or_else(|| OAUTH_SCOPES.to_string()),
+        account_id: None,
     })
 }
 
@@ -279,6 +271,7 @@ mod tests {
             expires_at: 1, // far in the past
             token_type: "Bearer".into(),
             scope: OAUTH_SCOPES.into(),
+            account_id: None,
         };
         assert!(t.needs_refresh());
     }
@@ -289,13 +282,14 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
-            + 7200; // 2 hours from now
+            + 7200;
         let t = OAuthToken {
             access_token: "tok".into(),
             refresh_token: "ref".into(),
             expires_at: far_future,
             token_type: "Bearer".into(),
             scope: OAUTH_SCOPES.into(),
+            account_id: None,
         };
         assert!(!t.needs_refresh());
     }
@@ -315,12 +309,38 @@ mod tests {
             expires_at: far_future,
             token_type: "Bearer".into(),
             scope: OAUTH_SCOPES.into(),
+            account_id: None,
         };
         token.save(&path).unwrap();
         let loaded = OAuthToken::load(&path).unwrap().unwrap();
         assert_eq!(loaded.access_token, "access123");
         assert_eq!(loaded.refresh_token, "refresh456");
         assert_eq!(loaded.expires_at, far_future);
+    }
+
+    #[test]
+    fn account_id_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth_token.json");
+        let far_future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + 3600;
+        let token = OAuthToken {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at: far_future,
+            token_type: "Bearer".into(),
+            scope: OAUTH_SCOPES.into(),
+            account_id: Some("874e5e7e-0bf7-4736-8266-3d100e3dd9c9".into()),
+        };
+        token.save(&path).unwrap();
+        let loaded = OAuthToken::load(&path).unwrap().unwrap();
+        assert_eq!(
+            loaded.account_id.as_deref(),
+            Some("874e5e7e-0bf7-4736-8266-3d100e3dd9c9")
+        );
     }
 
     #[test]
@@ -347,6 +367,7 @@ mod tests {
             expires_at: far_future,
             token_type: "Bearer".into(),
             scope: OAUTH_SCOPES.into(),
+            account_id: None,
         };
         token.save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
