@@ -95,6 +95,15 @@ pub enum Command {
     /// Remove ai-memory's wiring (hooks, MCP, instructions) from all
     /// detected agents. Dry-run unless `--apply`.
     Uninstall(UninstallArgs),
+    /// Manage OpenAI OAuth 2.0 authentication (ChatGPT subscription).
+    ///
+    /// `login`  — open browser, complete PKCE flow, save token to
+    ///            `<data_dir>/oauth_token.json`.
+    /// `logout` — delete the saved token.
+    ///
+    /// After logging in, set `AI_MEMORY_LLM_PROVIDER=openai-oauth` to have
+    /// the server use your ChatGPT subscription instead of an API key.
+    Auth(AuthArgs),
 }
 
 /// Which concern `uninstall` should touch. Omitted = all three.
@@ -684,6 +693,23 @@ pub struct WritePageArgs {
     /// Project name within the workspace (auto-created if absent).
     #[arg(long, default_value_t = crate::config::DEFAULT_PROJECT.to_string())]
     pub project: String,
+}
+
+/// Arguments for `auth`.
+#[derive(Debug, Args)]
+pub struct AuthArgs {
+    /// Action to perform.
+    #[command(subcommand)]
+    pub subcommand: AuthSubcommand,
+}
+
+/// Subcommands for `auth`.
+#[derive(Debug, Subcommand)]
+pub enum AuthSubcommand {
+    /// Open browser, complete PKCE flow, and save the OAuth token.
+    Login,
+    /// Delete the saved OAuth token (effective logout).
+    Logout,
 }
 
 #[cfg(test)]

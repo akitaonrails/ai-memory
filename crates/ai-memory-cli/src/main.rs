@@ -21,7 +21,7 @@ mod http_client;
 mod logging;
 mod process_guard;
 
-use cli::{Cli, Command};
+use cli::{AuthArgs, Cli, Command};
 use config::Config;
 
 #[tokio::main]
@@ -62,5 +62,6 @@ async fn main() -> Result<()> {
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
         Command::Uninstall(args) => commands::uninstall::run(&config, args),
+        Command::Auth(AuthArgs { subcommand }) => commands::auth::run(&config, subcommand).await,
     }
 }

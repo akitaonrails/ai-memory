@@ -312,10 +312,11 @@ impl Config {
             "openai" => ProviderChoice::OpenAi,
             "gemini" | "google" => ProviderChoice::Gemini,
             "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
+            "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat"
+                     anthropic|openai|gemini|openai-compat|openai-oauth"
                 )));
             }
         };
@@ -323,7 +324,7 @@ impl Config {
             Some(s) => s.to_string(),
             None => match provider {
                 ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
-                ProviderChoice::OpenAi => "gpt-4o-mini".to_string(),
+                ProviderChoice::OpenAi | ProviderChoice::OpenAiOAuth => "gpt-4o-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
                 ProviderChoice::OpenAiCompat => {
                     return Err(LlmError::NotConfigured(
@@ -334,11 +335,17 @@ impl Config {
                 }
             },
         };
+        let token_path = if provider == ProviderChoice::OpenAiOAuth {
+            Some(self.data_dir.join("oauth_token.json"))
+        } else {
+            None
+        };
         Ok(Some(ProviderConfig {
             provider,
             model,
             api_key: self.provider_api_key(provider),
             base_url: self.llm_base_url.clone(),
+            token_path,
         }))
     }
 
@@ -418,6 +425,8 @@ impl Config {
             ProviderChoice::OpenAi => self.runtime_env.openai_api_key.clone(),
             ProviderChoice::Gemini => self.runtime_env.gemini_api_key.clone(),
             ProviderChoice::OpenAiCompat => self.runtime_env.llm_api_key.clone(),
+            // OAuth token is loaded from disk by `OpenAiOAuthProvider`; no API key needed.
+            ProviderChoice::OpenAiOAuth => None,
         }
     }
 

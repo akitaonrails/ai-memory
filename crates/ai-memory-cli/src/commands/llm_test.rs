@@ -24,6 +24,7 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         model: args.model,
         api_key,
         base_url: args.base_url.or_else(|| config.llm_test_base_url()),
+        token_path: None,
     };
     let client = build_provider(provider_config).context("building LLM provider")?;
     info!(
