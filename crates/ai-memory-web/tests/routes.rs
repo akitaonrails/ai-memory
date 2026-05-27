@@ -1073,10 +1073,7 @@ async fn api_workspace_overview_aggregates_briefing_and_health() {
     // rules aggregates the _rules/ pages from BOTH projects.
     let rules = json["briefing"]["rules"].as_array().expect("rules array");
     assert_eq!(rules.len(), 2, "expected both _rules pages: {rules:?}");
-    let rule_paths: Vec<&str> = rules
-        .iter()
-        .map(|r| r["path"].as_str().unwrap())
-        .collect();
+    let rule_paths: Vec<&str> = rules.iter().map(|r| r["path"].as_str().unwrap()).collect();
     assert!(rule_paths.contains(&"_rules/style.md"));
     assert!(rule_paths.contains(&"_rules/naming.md"));
 
@@ -1206,9 +1203,15 @@ async fn api_project_overview_aggregates_handoff_briefing_health() {
 
     // Briefing + health count only the scratch page, not other/beta.md.
     assert_eq!(json["briefing"]["counts"]["pages_latest"], 1);
-    let orphans = json["health"]["orphan_pages"].as_array().expect("orphan_pages");
+    let orphans = json["health"]["orphan_pages"]
+        .as_array()
+        .expect("orphan_pages");
     let orphan_paths: Vec<&str> = orphans.iter().filter_map(|p| p["path"].as_str()).collect();
-    assert_eq!(orphan_paths, vec!["alpha.md"], "scoped to scratch only: {json}");
+    assert_eq!(
+        orphan_paths,
+        vec!["alpha.md"],
+        "scoped to scratch only: {json}"
+    );
 }
 
 #[tokio::test]
@@ -1256,7 +1259,9 @@ async fn api_workspace_overview_health_detail_lists_pages() {
     let json: Value = serde_json::from_slice(&body).unwrap();
     let health = &json["health"];
 
-    let orphans = health["orphan_pages"].as_array().expect("orphan_pages array");
+    let orphans = health["orphan_pages"]
+        .as_array()
+        .expect("orphan_pages array");
     let orphan_paths: Vec<&str> = orphans.iter().filter_map(|p| p["path"].as_str()).collect();
     assert!(
         orphan_paths.contains(&"alpha.md"),
@@ -1264,12 +1269,17 @@ async fn api_workspace_overview_health_detail_lists_pages() {
     );
     assert_eq!(orphans.len(), 3, "all three pages are orphans");
 
-    let dups = health["duplicate_pages"].as_array().expect("duplicate_pages array");
+    let dups = health["duplicate_pages"]
+        .as_array()
+        .expect("duplicate_pages array");
     let dup_paths: Vec<&str> = dups.iter().filter_map(|p| p["path"].as_str()).collect();
     assert!(dup_paths.contains(&"dup-a.md") && dup_paths.contains(&"dup-b.md"));
     assert!(dups.iter().all(|p| p["title"] == "SharedTitle"));
     assert!(
-        health["stale_pages"].as_array().expect("stale_pages array").is_empty(),
+        health["stale_pages"]
+            .as_array()
+            .expect("stale_pages array")
+            .is_empty(),
         "freshly-written pages are not stale"
     );
 }
@@ -1327,7 +1337,10 @@ async fn api_page_returns_resolved_links_and_backlinks() {
     // resolver surfaces verbatim on the related-page row.
     assert_eq!(links[0]["kind"], "fact");
     assert!(
-        src["backlinks"].as_array().expect("backlinks array").is_empty(),
+        src["backlinks"]
+            .as_array()
+            .expect("backlinks array")
+            .is_empty(),
         "source has no back-links"
     );
 

@@ -1725,7 +1725,10 @@ impl ReaderPool {
                  LIMIT ?2",
             )?;
             let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(params![workspace_id.as_bytes(), recent_limit], briefing_page_from_row)?
+                .query_map(
+                    params![workspace_id.as_bytes(), recent_limit],
+                    briefing_page_from_row,
+                )?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1786,8 +1789,16 @@ impl ReaderPool {
             let ws = || Value::Blob(workspace_id.as_bytes().to_vec());
             // Optional project filter, anonymous-`?` style. The orphan query
             // aliases pages as `p`, so it needs its own qualified clause.
-            let clause = if proj.is_some() { " AND project_id = ?" } else { "" };
-            let clause_p = if proj.is_some() { " AND p.project_id = ?" } else { "" };
+            let clause = if proj.is_some() {
+                " AND project_id = ?"
+            } else {
+                ""
+            };
+            let clause_p = if proj.is_some() {
+                " AND p.project_id = ?"
+            } else {
+                ""
+            };
 
             let stale: i64 = conn
                 .query_row(
@@ -1885,8 +1896,16 @@ impl ReaderPool {
             let cutoff_30d = now_us - 30 * 86_400 * 1_000_000;
             let proj = project_id.map(|p| Value::Blob(p.as_bytes().to_vec()));
             let ws = || Value::Blob(workspace_id.as_bytes().to_vec());
-            let clause = if proj.is_some() { " AND pg.project_id = ?" } else { "" };
-            let inner_clause = if proj.is_some() { " AND project_id = ?" } else { "" };
+            let clause = if proj.is_some() {
+                " AND pg.project_id = ?"
+            } else {
+                ""
+            };
+            let inner_clause = if proj.is_some() {
+                " AND project_id = ?"
+            } else {
+                ""
+            };
 
             // Shared SELECT prefix: identity + path-inferred `kind`.
             let select = "SELECT w.name, p.name, pg.path, pg.title, \
