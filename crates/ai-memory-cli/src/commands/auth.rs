@@ -189,7 +189,8 @@ fn run_logout_openai(token_path: &Path) -> Result<()> {
 fn build_auth_url(redirect_uri: &str, code_challenge: &str, state: &str) -> String {
     format!(
         "{AUTH_URL}?client_id={}&redirect_uri={}&response_type=code\
-         &scope={}&code_challenge={}&code_challenge_method=S256&state={}",
+         &scope={}&code_challenge={}&code_challenge_method=S256&state={}\
+         &id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=opencode",
         percent_encode(CODEX_CLIENT_ID),
         percent_encode(redirect_uri),
         percent_encode(OAUTH_SCOPES),
