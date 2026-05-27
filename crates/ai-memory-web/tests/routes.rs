@@ -1363,3 +1363,95 @@ async fn api_page_returns_resolved_links_and_backlinks() {
         "target has no outgoing links"
     );
 }
+
+#[tokio::test]
+async fn api_page_returns_404_for_missing_page() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    // workspace/project existem, mas a página não → 404 (não 500)
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/workspaces/default/projects/scratch/pages/does/not/exist.md")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "page not found");
+}
+
+#[tokio::test]
+async fn api_search_empty_query_returns_empty_array() {
+    let (_tmp, store, wiki) = setup().await;
+
+    // q só com espaços (%20) → termo vazio após trim → 200 com [] (sem tocar o FTS)
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=%20%20")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json.as_array().expect("array").is_empty(),
+        "empty query yields no hits: {json}"
+    );
+}
+
+#[tokio::test]
+async fn api_search_rejects_non_integer_limit() {
+    let (_tmp, store, wiki) = setup().await;
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=anything&limit=abc")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "limit must be an integer");
+}
+
+#[tokio::test]
+async fn api_search_rejects_invalid_percent_encoding() {
+    let (_tmp, store, wiki) = setup().await;
+
+    // %zz não é hex válido → o decoder manual da querystring rejeita com 400
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=%zz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "invalid percent-encoding in query");
+}
