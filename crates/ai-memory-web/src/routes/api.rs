@@ -39,12 +39,12 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             axum::routing::get(briefing_handler),
         )
         .route(
-            "/workspaces/{workspace}/extras",
-            axum::routing::get(extras_handler),
+            "/workspaces/{workspace}/overview",
+            axum::routing::get(overview_handler),
         )
         .route(
-            "/workspaces/{workspace}/projects/{project}/extras",
-            axum::routing::get(project_extras_handler),
+            "/workspaces/{workspace}/projects/{project}/overview",
+            axum::routing::get(project_overview_handler),
         )
         .with_state(state)
 }
@@ -315,7 +315,7 @@ async fn briefing_handler(
     Ok(Json(briefing).into_response())
 }
 
-async fn extras_handler(
+async fn overview_handler(
     State(state): State<Arc<WebState>>,
     Path(workspace): Path<String>,
     Query(query): Query<LimitQuery>,
@@ -379,7 +379,7 @@ async fn extras_handler(
         orphan_pages: detail.orphans,
     };
 
-    Ok(Json(ApiWorkspaceExtras {
+    Ok(Json(ApiOverview {
         handoff,
         briefing,
         health,
@@ -387,7 +387,7 @@ async fn extras_handler(
     .into_response())
 }
 
-async fn project_extras_handler(
+async fn project_overview_handler(
     State(state): State<Arc<WebState>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
@@ -436,7 +436,7 @@ async fn project_extras_handler(
         orphan_pages: detail.orphans,
     };
 
-    Ok(Json(ApiWorkspaceExtras {
+    Ok(Json(ApiOverview {
         handoff,
         briefing,
         health,
@@ -647,7 +647,7 @@ struct ApiSearchHit {
 }
 
 #[derive(Debug, Serialize)]
-struct ApiWorkspaceExtras {
+struct ApiOverview {
     handoff: Option<ApiHandoff>,
     briefing: BriefingSnapshot,
     health: ApiHealth,

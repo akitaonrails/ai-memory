@@ -944,7 +944,7 @@ async fn api_recent_and_briefing_return_project_data() {
 }
 
 #[tokio::test]
-async fn api_workspace_extras_returns_aggregated_overview() {
+async fn api_workspace_overview_returns_aggregated_overview() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -969,7 +969,7 @@ async fn api_workspace_extras_returns_aggregated_overview() {
 
     let app = api_router(store.reader.clone(), wiki.clone());
     let req = Request::builder()
-        .uri("/workspaces/default/extras?limit=10")
+        .uri("/workspaces/default/overview?limit=10")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1001,7 +1001,7 @@ async fn api_workspace_extras_returns_aggregated_overview() {
 }
 
 #[tokio::test]
-async fn api_workspace_extras_aggregates_briefing_and_health() {
+async fn api_workspace_overview_aggregates_briefing_and_health() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -1020,7 +1020,7 @@ async fn api_workspace_extras_aggregates_briefing_and_health() {
         .unwrap();
 
     // One normal page + one _rules/ page in each project, so we prove
-    // the extras endpoint aggregates across the whole workspace.
+    // the overview endpoint aggregates across the whole workspace.
     store
         .writer
         .upsert_page(new_page(ws, alpha, "intro.md", "Alpha Intro", "alpha body"))
@@ -1056,7 +1056,7 @@ async fn api_workspace_extras_aggregates_briefing_and_health() {
 
     let app = api_router(store.reader.clone(), wiki.clone());
     let req = Request::builder()
-        .uri("/workspaces/default/extras?limit=10")
+        .uri("/workspaces/default/overview?limit=10")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1087,7 +1087,7 @@ async fn api_workspace_extras_aggregates_briefing_and_health() {
 }
 
 #[tokio::test]
-async fn api_workspace_extras_includes_open_handoff() {
+async fn api_workspace_overview_includes_open_handoff() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -1119,7 +1119,7 @@ async fn api_workspace_extras_includes_open_handoff() {
 
     let app = api_router(store.reader.clone(), wiki.clone());
     let req = Request::builder()
-        .uri("/workspaces/default/extras")
+        .uri("/workspaces/default/overview")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1140,7 +1140,7 @@ async fn api_workspace_extras_includes_open_handoff() {
 }
 
 #[tokio::test]
-async fn api_project_extras_aggregates_handoff_briefing_health() {
+async fn api_project_overview_aggregates_handoff_briefing_health() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -1152,7 +1152,7 @@ async fn api_project_extras_aggregates_handoff_briefing_health() {
         .get_or_create_project(ws, "scratch", None)
         .await
         .unwrap();
-    // Another project that must NOT bleed into the scratch extras.
+    // Another project that must NOT bleed into the scratch overview.
     let other = store
         .writer
         .get_or_create_project(ws, "other", None)
@@ -1189,7 +1189,7 @@ async fn api_project_extras_aggregates_handoff_briefing_health() {
 
     let app = api_router(store.reader.clone(), wiki.clone());
     let req = Request::builder()
-        .uri("/workspaces/default/projects/scratch/extras")
+        .uri("/workspaces/default/projects/scratch/overview")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -1212,7 +1212,7 @@ async fn api_project_extras_aggregates_handoff_briefing_health() {
 }
 
 #[tokio::test]
-async fn api_workspace_extras_health_detail_lists_pages() {
+async fn api_workspace_overview_health_detail_lists_pages() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -1244,7 +1244,7 @@ async fn api_workspace_extras_health_detail_lists_pages() {
 
     let app = api_router(store.reader.clone(), wiki.clone());
     let req = Request::builder()
-        .uri("/workspaces/default/extras")
+        .uri("/workspaces/default/overview")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
