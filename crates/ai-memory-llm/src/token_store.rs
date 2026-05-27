@@ -103,7 +103,6 @@ impl TokenFile {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

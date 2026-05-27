@@ -59,7 +59,9 @@ impl CopilotToken {
     pub fn load(path: &std::path::Path) -> LlmResult<Option<Self>> {
         Ok(crate::token_store::TokenFile::load(path)?
             .copilot
-            .map(|e| Self { github_token: e.access }))
+            .map(|e| Self {
+                github_token: e.access,
+            }))
     }
 
     /// Persist into the unified token store (reads-then-writes to preserve
@@ -134,7 +136,10 @@ impl GitHubCopilotProvider {
     ) -> CopilotRequest<'a> {
         let mut messages = Vec::new();
         if let Some(sys) = request.system.as_deref() {
-            messages.push(CopilotMsg { role: "system", content: sys });
+            messages.push(CopilotMsg {
+                role: "system",
+                content: sys,
+            });
         }
         for m in &request.messages {
             messages.push(CopilotMsg {
@@ -175,7 +180,10 @@ impl GitHubCopilotProvider {
             .post(&url)
             .bearer_auth(&self.github_token)
             .header("content-type", "application/json")
-            .header("Editor-Version", concat!("ai-memory/", env!("CARGO_PKG_VERSION")))
+            .header(
+                "Editor-Version",
+                concat!("ai-memory/", env!("CARGO_PKG_VERSION")),
+            )
             .header(
                 "Editor-Plugin-Version",
                 concat!("ai-memory/", env!("CARGO_PKG_VERSION")),
@@ -344,7 +352,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("copilot_token.json");
-        let token = CopilotToken { github_token: "gho_test".into() };
+        let token = CopilotToken {
+            github_token: "gho_test".into(),
+        };
         token.save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "copilot token file must be mode 0600");
