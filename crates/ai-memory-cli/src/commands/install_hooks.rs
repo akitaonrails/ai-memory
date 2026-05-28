@@ -25,8 +25,8 @@ use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
 use crate::commands::render_shared::{
     CURSOR_PROFILE, GEMINI_PROFILE, build_antigravity_payload, build_claude_code_payload,
-    build_codex_payload, build_profile_payload, hook_script_for_current_platform,
-    ts_string_literal,
+    build_codex_payload, build_profile_payload, hook_script_for_claude_code,
+    hook_script_for_current_platform, ts_string_literal,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -1481,7 +1481,7 @@ fn render_claude_code(hooks_dir: &Path, server_url: &str, auth_token: Option<&st
     // that exists only on the host's filesystem — bailing would
     // sabotage the docker-only flow `setup-agent` enables.
     for (_, script) in super::render_shared::CLAUDE_CODE_EVENTS {
-        let script = hook_script_for_current_platform(script);
+        let script = hook_script_for_claude_code(script);
         let abs = hooks_dir.join(script.as_ref());
         if !abs.exists() {
             eprintln!(

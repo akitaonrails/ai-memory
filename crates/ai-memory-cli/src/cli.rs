@@ -517,6 +517,8 @@ pub struct CommitArgs {
 pub enum LlmProviderChoice {
     /// Anthropic Messages API.
     Anthropic,
+    /// Anthropic Messages API using a Claude subscription OAuth token.
+    AnthropicOauth,
     /// OpenAI Chat Completions.
     Openai,
     /// Google Gemini (Generative Language API).
@@ -890,5 +892,27 @@ mod tests {
         assert!(matches!(login.provider, AuthProviderChoice::Copilot));
         assert_eq!(login.github_token.as_deref(), Some("ghu-test"));
         assert_eq!(login.client_id.as_deref(), Some("Iv1.test"));
+    }
+
+    #[test]
+    fn llm_test_anthropic_oauth_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "llm-test",
+            "--provider",
+            "anthropic-oauth",
+            "--model",
+            "claude-sonnet-4-6",
+            "--prompt",
+            "ping",
+        ])
+        .unwrap();
+
+        let Command::LlmTest(args) = cli.command else {
+            panic!("expected llm-test command");
+        };
+        assert!(matches!(args.provider, LlmProviderChoice::AnthropicOauth));
+        assert_eq!(args.model, "claude-sonnet-4-6");
+        assert_eq!(args.prompt, "ping");
     }
 }

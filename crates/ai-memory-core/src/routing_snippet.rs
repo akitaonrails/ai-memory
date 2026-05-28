@@ -30,10 +30,23 @@ pub const SNIPPET_BODY: &str = r#"
 ## Long-term memory (ai-memory)
 
 This project uses [ai-memory](https://github.com/akitaonrails/ai-memory)
-for cross-session continuity. **Lifecycle hooks already capture every
-prompt + tool call automatically.** You never need to manually write
-routine notes; the SessionStart hook auto-fetches pending handoffs, and
-on session end ai-memory writes a session-summary page and a handoff.
+for cross-session continuity.
+
+**Default to the current project — always.** Every ai-memory tool
+auto-scopes to the project resolved from your session's working
+directory. **Do NOT pass `project` or `cwd` arguments unless the user
+explicitly references a *different* project by name** (e.g. "what did we
+decide in the `other-app` project?"). Phrases like "this project",
+"here", "we", "our work", "where did we leave off" all mean the *current*
+project — call the tool with no scoping args. If the user asks about a
+handoff and the SessionStart auto-fetched block is already in your
+context, just answer from it; do not re-call the tool to "find it again"
+in another project.
+
+**Lifecycle hooks already capture every prompt + tool call
+automatically.** You never need to manually write routine notes; the
+SessionStart hook auto-fetches pending handoffs, and on session end
+ai-memory writes a session-summary page and a handoff.
 LLM consolidation (compiling observations into topical wiki pages) runs
 on PreCompact, on demand via `memory_consolidate`, and at session end
 only when the server sets `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`. Only

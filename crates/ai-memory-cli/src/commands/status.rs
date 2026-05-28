@@ -4,6 +4,7 @@
 //! server; renders the response as human text or JSON. Never opens
 //! the store directly — the server is the source of truth.
 
+use ai_memory_llm::{ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,9 @@ struct Report {
     /// Derived-index diagnostics.
     #[serde(default)]
     derived: Derived,
+    /// Passive process-scoped provider health.
+    #[serde(default)]
+    providers: ProviderHealthSnapshot,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -83,6 +87,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                     "observations": report.counts.observations,
                 },
                 "derived": report.derived,
+                "providers": report.providers,
                 "client": { "server_url": ep.url, "auth": ep.auth_token.is_some() },
             }))?
         );
@@ -115,6 +120,113 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             report.derived.unresolved_links_from_latest_pages,
             report.derived.stale_links_from_latest_pages
         );
+        println!("  providers:");
+        println!(
+            "    llm:       {}",
+            provider_health_line(&report.providers.llm)
+        );
+        println!(
+            "    embedding: {}",
+            provider_health_line(&report.providers.embedding)
+        );
+        if report.providers.llm.status == ProviderHealthStatus::Error
+            && let Some(hint) = &report.providers.llm.retry_hint
+        {
+            println!("    retry:     {hint}");
+        }
     }
     Ok(())
+}
+
+fn provider_health_line(role: &ProviderRoleHealthSnapshot) -> String {
+    match role.status {
+        ProviderHealthStatus::Disabled => "disabled".to_string(),
+        ProviderHealthStatus::Unknown => {
+            format!("{} unknown (no calls yet)", provider_label(role))
+        }
+        ProviderHealthStatus::Ok => {
+            let when = role
+                .last_call_at
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unknown time".to_string());
+            format!("{} ok (last call: {when})", provider_label(role))
+        }
+        ProviderHealthStatus::Error => {
+            let detail = error_detail(role);
+            format!("{} error ({detail})", provider_label(role))
+        }
+    }
+}
+
+fn provider_label(role: &ProviderRoleHealthSnapshot) -> String {
+    match (&role.provider, &role.model, role.dim) {
+        (Some(provider), Some(model), Some(dim)) => format!("{provider}/{model} ({dim}d)"),
+        (Some(provider), Some(model), None) => format!("{provider}/{model}"),
+        (Some(provider), None, _) => provider.clone(),
+        _ => "provider".to_string(),
+    }
+}
+
+fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
+    let mut parts = Vec::new();
+    if let Some(status) = role.last_error_status {
+        parts.push(format!("status {status}"));
+    }
+    if let Some(message) = &role.last_error_message
+        && !message.is_empty()
+    {
+        parts.push(message.clone());
+    }
+    if let Some(when) = &role.last_error_at {
+        parts.push(format!("last error: {when}"));
+    }
+    if parts.is_empty() {
+        "last call failed".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jiff::Timestamp;
+
+    #[test]
+    fn provider_health_line_renders_unknown_and_disabled() {
+        assert_eq!(
+            provider_health_line(&ProviderRoleHealthSnapshot::default()),
+            "disabled"
+        );
+
+        let role = ProviderRoleHealthSnapshot {
+            status: ProviderHealthStatus::Unknown,
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5.5".to_string()),
+            ..ProviderRoleHealthSnapshot::default()
+        };
+        assert_eq!(
+            provider_health_line(&role),
+            "openai/gpt-5.5 unknown (no calls yet)"
+        );
+    }
+
+    #[test]
+    fn provider_health_line_renders_error_details() {
+        let when = "2026-05-28T12:00:00Z".parse::<Timestamp>().unwrap();
+        let role = ProviderRoleHealthSnapshot {
+            status: ProviderHealthStatus::Error,
+            provider: Some("anthropic-oauth".to_string()),
+            model: Some("claude-sonnet-4-6".to_string()),
+            last_error_at: Some(when),
+            last_error_status: Some(401),
+            last_error_message: Some("bad token".to_string()),
+            ..ProviderRoleHealthSnapshot::default()
+        };
+
+        assert!(provider_health_line(&role).contains("anthropic-oauth/claude-sonnet-4-6 error"));
+        assert!(provider_health_line(&role).contains("status 401"));
+        assert!(provider_health_line(&role).contains("bad token"));
+    }
 }

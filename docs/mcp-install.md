@@ -23,7 +23,9 @@ Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, OpenClaw, OpenCo
 OMP have automatic capture integrations (shell/PowerShell hooks for
 Claude Code / Codex / Cursor / Gemini CLI / Antigravity CLI, TypeScript plugin/extension
 files for OpenClaw / OpenCode / OMP) and are covered in the
-[main README](../README.md#quick-start).
+[main README](../README.md#quick-start). On native Windows, Claude Code uses
+Git Bash `.sh` hooks rather than the PowerShell default used by other
+script-hook agents.
 
 Claude Desktop is **MCP-only** here: it exposes long-term memory to its
 LLM via ai-memory's MCP tools (`memory_query`, `memory_recent`,

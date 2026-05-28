@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-28
+### Added
+- `ai-memory status` / `status --json` now includes passive process-scoped LLM
+  and embedding provider health based on the last real provider call, without
+  active probing or token spend ([#46]).
+
+### Changed
+- Agent-facing prompts (`MEMORY_INSTRUCTIONS`, the `CLAUDE.md`/`AGENTS.md`
+  routing snippet, and the per-tool `project`/`cwd` arg docstrings) now lead
+  with a clear "default to the current project — do not pass `project` or
+  `cwd` args unless the user names a *different* project" rule, plus a
+  reminder that the SessionStart auto-fetched handoff block already covers the
+  current project. Reduces cross-agent friction where a fresh agent surfaced
+  the wrong project's handoff because the LLM over-eagerly passed scoping
+  args. Doc-only, no behaviour change.
+
+### Fixed
+- Claude Code hook installs on native Windows now render Git Bash-compatible
+  `bash -c` commands that keep the POSIX `.sh` hook scripts and convert
+  drive-letter paths to Git Bash paths, matching Claude Code's actual hook
+  runner instead of emitting PowerShell commands ([#45]).
+- `ai-memory llm-test --provider anthropic-oauth` now parses and maps to the
+  Anthropic OAuth provider instead of being rejected by clap ([#43]).
+
 ## [0.5.1] - 2026-05-27
 ### Changed
 - Docker release publishing now builds Linux x86_64 and aarch64 artifacts once,
@@ -338,7 +362,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.5.2
 [0.5.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.5.0
 [0.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.4.0
 [0.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.3.2

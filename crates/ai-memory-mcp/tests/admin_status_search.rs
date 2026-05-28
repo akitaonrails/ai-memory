@@ -23,6 +23,7 @@ async fn make_admin_state(tmp: &TempDir) -> (AdminState, Store) {
         wiki,
         llm: None,
         embedder: None,
+        provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
         data_dir: tmp.path().to_path_buf(),
         db_path,

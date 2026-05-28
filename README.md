@@ -21,7 +21,7 @@
 | Linux | Supported | Primary Docker/server target and CI platform. Published Docker images support `linux/amd64` and `linux/arm64`. Native Arch/AUR packages include system and user systemd units. |
 | macOS | Supported | Workspace tests run in CI; native source builds are supported. Docker images run natively on Apple Silicon via the `linux/arm64` manifest. |
 | Windows via WSL2 | Supported | Use the Linux install path inside WSL2 when the agent runs there. |
-| Native Windows | Experimental | PowerShell wrapper and `.ps1` hooks are available; real agent harness feedback still needed. See [`docs/windows.md`](docs/windows.md). |
+| Native Windows | Experimental | PowerShell wrapper is available. Claude Code uses Git Bash `.sh` hooks on native Windows; other script-hook agents use the current PowerShell defaults pending harness feedback. See [`docs/windows.md`](docs/windows.md). |
 | Claude Code | Supported | MCP config + lifecycle hooks. |
 | Codex | Supported | MCP config + lifecycle hooks. |
 | OpenCode | Supported | Remote MCP config + generated TypeScript plugin. |
@@ -78,10 +78,12 @@ priors are at the [bottom](#influences-and-prior-art).
   (`pi` / `omp` aliases).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth.
-- **Thin-client CLI.** `ai-memory bootstrap`, `purge-project`,
+- **Thin-client CLI.** `ai-memory status`, `bootstrap`, `purge-project`,
   `rename-project`, `lint`, `embed`, `forget-sweep`, `backup` are
   all HTTP clients of the running server - never touch SQLite or
-  wiki files directly. Server is the single source of truth.
+  wiki files directly. `status` also reports passive LLM/embedding
+  provider health from the last real provider call. Server is the
+  single source of truth.
 - **LLM is opt-in.** Zero-LLM mode still gives you FTS5 search +
   rule-based summarisation. Add a provider when you want consolidated
   pages and lint contradictions.
@@ -236,9 +238,10 @@ use `--mcp-url` if you installed MCP with a custom endpoint, and
 
 ### Install Notes
 
-- **Windows:** use the Linux path inside WSL2, or the native PowerShell
-  wrapper and `.ps1` hooks for native Windows agents. Do not mix path
-  worlds. See [`docs/windows.md`](docs/windows.md).
+- **Windows:** use the Linux path inside WSL2, or the native Windows wrapper
+  from PowerShell/cmd. Native Claude Code uses Git Bash `.sh` hooks; other
+  script-hook agents use PowerShell defaults. Do not mix path worlds. See
+  [`docs/windows.md`](docs/windows.md).
 - **Docker compose:** `docker compose -f docker/docker-compose.yml up -d`
   is supported; agent setup is the same as step 3 above.
 - **Remote server:** set `AI_MEMORY_SERVER_URL=http://<server-ip>:49374`

@@ -31,7 +31,7 @@ use ai_memory_consolidate::{
 use ai_memory_core::{
     DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
-use ai_memory_llm::{Embedder, LlmProvider};
+use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
     DecayParams, EmbeddingWrite, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
 };
@@ -64,6 +64,8 @@ pub struct AdminState {
     pub llm: Option<Arc<dyn LlmProvider>>,
     /// Optional embedder. When `None`, `/admin/embed` returns 503.
     pub embedder: Option<Arc<dyn Embedder>>,
+    /// Passive process-scoped health recorder for configured providers.
+    pub provider_health: ProviderHealth,
     /// Retention-decay parameters forwarded from server config.
     pub decay_params: DecayParams,
     /// Server's resolved data directory (e.g. `/data` in the docker
@@ -251,6 +253,8 @@ pub struct StatusReport {
     pub counts: ai_memory_store::StatusCounts,
     /// Derived-index and retrieval-readiness diagnostics.
     pub derived: ai_memory_store::DerivedIndexStatus,
+    /// Passive process-scoped provider health.
+    pub providers: ProviderHealthSnapshot,
 }
 
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
@@ -264,6 +268,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     db_path: state.db_path.display().to_string(),
                     counts,
                     derived,
+                    providers: state.provider_health.snapshot(),
                 };
                 (
                     StatusCode::OK,
@@ -1512,4 +1517,50 @@ async fn handle_write_page(
             .unwrap_or_else(|_| serde_json::json!({})),
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_memory_store::Store;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn status_reports_provider_health_block() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+        });
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["providers"]["llm"]["status"], "disabled");
+        assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+    }
 }

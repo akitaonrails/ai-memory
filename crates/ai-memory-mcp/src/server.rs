@@ -25,12 +25,24 @@ use serde::{Deserialize, Serialize};
 /// the agent can route natural-language requests without the user
 /// having to know the tool name or schema.
 pub const MEMORY_INSTRUCTIONS: &str = "\
-Long-term memory for the current project. Lifecycle hooks already \
-capture every prompt + tool call automatically — you do NOT need to \
-write routine notes by hand. When the user explicitly asks to remember \
-a permanent annotation/fact/rule, write a durable wiki page; do not use \
-a handoff for that. Use these tools when the conversation calls for \
-them:\n\
+Long-term memory for the current project.\n\
+\n\
+**Default to the current project — always.** Every tool here \
+auto-scopes to the project resolved from your session's working \
+directory. **Do NOT pass `project` or `cwd` arguments unless the user \
+explicitly references a *different* project by name** (e.g. 'what did \
+we decide in the other-app project?'). Phrases like 'this project', \
+'here', 'we', 'our work', 'where did we leave off' all mean the \
+*current* project — call the tool with no scoping args. If the user \
+asks about a handoff and the SessionStart auto-fetched block is already \
+in your context, answer from it; do NOT re-call the tool to look for it \
+in another project.\n\
+\n\
+Lifecycle hooks already capture every prompt + tool call automatically \
+— you do NOT need to write routine notes by hand. When the user \
+explicitly asks to remember a permanent annotation/fact/rule, write a \
+durable wiki page; do not use a handoff for that. Use these tools when \
+the conversation calls for them:\n\
 \n\
 - `memory_query` — when the user references prior work you don't \
   recognise, or asks 'have we done / discussed X', or you're about \
@@ -140,7 +152,7 @@ struct QueryArgs {
     #[serde(default, alias = "n", alias = "top_k")]
     limit: Option<usize>,
     /// Project to search. Omit to target the project you're currently
-    /// working in (resolved from recent hook activity). Only needed when
+    /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.** Only needed when
     /// one shared server fields several projects at once.
     #[serde(default)]
     project: Option<String>,
@@ -161,7 +173,7 @@ struct RecentArgs {
     #[serde(default, alias = "n")]
     limit: Option<usize>,
     /// Project to read. Omit to target the project you're currently
-    /// working in (resolved from recent hook activity).
+    /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
     /// Workspace to read together with `project`. Omit to use the
@@ -173,7 +185,7 @@ struct RecentArgs {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct StatusArgs {
     /// Project to report counts for. Omit to target the project you're
-    /// currently working in (resolved from recent hook activity).
+    /// currently working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
     /// Workspace to report together with `project`. Omit to use the
@@ -248,7 +260,7 @@ struct HandoffBeginArgs {
     #[serde(default)]
     cwd: Option<String>,
     /// Project to scope the handoff to. Omit to target the project you're
-    /// currently working in (resolved from recent hook activity).
+    /// currently working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
 }
@@ -256,10 +268,13 @@ struct HandoffBeginArgs {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct HandoffAcceptArgs {
     /// Restrict the search to handoffs created for a specific cwd.
+    /// **Omit unless the user explicitly asks about a handoff from a
+    /// *different* directory** — by default this scopes to the current
+    /// project (the SessionStart hook usually pre-fetches it into context).
     #[serde(default)]
     cwd: Option<String>,
     /// Project to accept a handoff from. Omit to target the project you're
-    /// currently working in (resolved from recent hook activity).
+    /// currently working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
 }
@@ -270,7 +285,7 @@ struct BriefingArgs {
     #[serde(default)]
     recent_pages_limit: Option<usize>,
     /// Project to brief on. Omit to target the project you're currently
-    /// working in (resolved from recent hook activity).
+    /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
     /// Workspace to brief together with `project`. Omit to use the
@@ -291,7 +306,7 @@ struct ExploreArgs {
     #[serde(default)]
     recent_pages_limit: Option<usize>,
     /// Project to explore. Omit to target the project you're currently
-    /// working in (resolved from recent hook activity).
+    /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
     /// Workspace to explore together with `project`. Omit to use the
@@ -319,7 +334,7 @@ struct WritePageArgs {
     #[serde(default)]
     pinned: bool,
     /// Project to write into. Omit to target the project you're currently
-    /// working in (resolved from recent hook activity).
+    /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
 }

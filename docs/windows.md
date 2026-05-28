@@ -16,7 +16,11 @@ launches Claude Code, Codex, Cursor, Gemini CLI, or another agent.
 
 The difference matters because hook configs contain executable paths.
 WSL2 agents need Linux paths and POSIX `.sh` hooks. Native Windows
-agents need Windows paths and PowerShell `.ps1` hooks.
+agents need Windows paths, but the hook runner is agent-specific:
+Claude Code invokes hooks through Git Bash, so ai-memory renders
+`bash -c` commands that call `.sh` scripts with Git Bash paths
+(`/c/Users/...`). Other native Windows script-hook agents keep the
+PowerShell `.ps1` default until their harness behavior is verified.
 
 ## Scenario A: Everything Inside WSL2
 
@@ -93,12 +97,14 @@ ai-memory install-hooks --agent claude-code --apply
 ```
 
 In this mode, the PowerShell wrapper runs the Linux container but tells
-the CLI to render Windows hook commands:
+the CLI to render hook commands for the native Windows agent:
 
 - Config files are written through the mounted Windows home directory.
 - Hook scripts are staged under `$HOME\.local\share\ai-memory\hooks\`.
-- Hook commands explicitly call `powershell.exe`.
-- Hook commands point at `.ps1` scripts.
+- Claude Code hook commands call `bash -c` and point at `.sh` scripts using
+  Git Bash paths such as `/c/Users/alice/...`.
+- Other native Windows script-hook agents currently call `powershell.exe` and
+  point at `.ps1` scripts.
 
 Use the matching `--client` / `--agent` values for other clients, for
 example `codex`, `cursor`, or `gemini-cli`.
@@ -130,17 +136,20 @@ target\debug\ai-memory.exe install-mcp --client claude-code --apply
 target\debug\ai-memory.exe install-hooks --agent claude-code --apply
 ```
 
-Native Windows builds automatically render `.ps1` lifecycle hooks. The
-hook bundle ships matching `.sh` and `.ps1` event scripts, and tests
-enforce one-to-one event/agent parity between them.
+Native Windows builds render agent-specific lifecycle hooks. Claude Code uses
+Git Bash-compatible `.sh` commands on native Windows; other script-hook agents
+use the PowerShell `.ps1` default. The hook bundle ships matching `.sh` and
+`.ps1` event scripts, and tests enforce one-to-one event/agent parity between
+them.
 
 ## Current Harness Caveats
 
 Windows hook support is new and needs real-world testing against native
 Windows agent builds.
 
-- Claude Code may be used natively on Windows or from inside WSL2. Test
-  which process launches the hooks before assuming path format.
+- Claude Code may be used natively on Windows or from inside WSL2. Native
+  Claude Code invokes hooks through Git Bash; WSL2 Claude Code uses normal
+  WSL paths.
 - Codex, OpenCode, Cursor, Gemini CLI, and OpenClaw may each choose different
   Windows config locations or shell execution behavior. ai-memory uses
   the current best-known defaults, but they need validation on real
@@ -166,8 +175,9 @@ For native Windows:
 
 1. Run all install commands from PowerShell or `cmd.exe` using
    `ai-memory` / `ai-memory.ps1`.
-2. Confirm generated hook commands reference `.ps1` files under your
-   Windows home directory.
+2. Confirm generated hook commands match the agent: Claude Code should use
+   `bash -c` plus `.sh` files with `/c/...` Git Bash paths; other script-hook
+   agents should use `.ps1` files under your Windows home directory.
 3. Launch the native Windows agent.
 4. Call `memory_status` from the agent.
 5. Send a prompt, then run `ai-memory status` or `ai-memory recent`.

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ai_memory_consolidate::{Consolidator, run_lint, run_sweep};
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, hook_router};
-use ai_memory_llm::{Embedder, LlmProvider, build_embedder, build_provider};
+use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
 use ai_memory_mcp::{AdminState, AiMemoryServer, admin_router};
 use ai_memory_store::{EmbeddingWrite, ReaderPool, Store, WriterHandle, f32_vec_to_bytes};
 use ai_memory_web;
@@ -86,7 +86,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let sanitizer = Sanitizer::new(&config.sanitize)
         .context("compiling sanitizer.extra_patterns from config")?;
     let wiki = Wiki::new(&config.data_dir, store.writer.clone())?.with_sanitizer(sanitizer.clone());
-    let (wiki, embedder) = configure_embedder(config, &store, wiki).await?;
+    let provider_health = ProviderHealth::default();
+    let (wiki, embedder) = configure_embedder(config, &store, wiki, &provider_health).await?;
 
     // Keep the guard alive for the lifetime of `serve`.
     let _watcher = start_watcher(&args, &wiki)?;
@@ -106,7 +107,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
-    let consolidator_setup = configure_consolidator(config, server, &store, &wiki, ws, proj)?;
+    let consolidator_setup =
+        configure_consolidator(config, server, &store, &wiki, ws, proj, &provider_health)?;
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
     let admin_llm = consolidator_setup.admin_llm;
@@ -187,6 +189,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 wiki: wiki.clone(),
                 llm: admin_llm,
                 embedder: embedder.clone(),
+                provider_health: provider_health.clone(),
                 decay_params: config.decay,
                 data_dir: config.data_dir.clone(),
                 db_path: store.db_path().to_path_buf(),
@@ -437,6 +440,7 @@ async fn configure_embedder(
     config: &Config,
     store: &Store,
     wiki: Wiki,
+    provider_health: &ProviderHealth,
 ) -> Result<(Wiki, Option<Arc<dyn Embedder>>)> {
     // M9 — pluggable embedder. Stored rows carry provider/model/dim so
     // query paths can ignore stale vectors after an embedding config change.
@@ -444,6 +448,9 @@ async fn configure_embedder(
         info!("AI_MEMORY_EMBEDDING_PROVIDER unset; hybrid search disabled (FTS5-only)");
         return Ok((wiki, None));
     };
+    let provider_name = cfg.provider.name().to_string();
+    let model = cfg.model.clone();
+    let dim = cfg.dim;
     let embedder = build_embedder(cfg).context("building embedder from config")?;
     let mismatch = store
         .reader
@@ -474,6 +481,7 @@ async fn configure_embedder(
         dim = embedder.dim(),
         "embedder enabled"
     );
+    let embedder = provider_health.wrap_embedder(embedder, provider_name, model, dim);
     Ok((wiki.with_embedder(embedder.clone()), Some(embedder)))
 }
 
@@ -498,6 +506,7 @@ fn configure_consolidator(
     wiki: &Wiki,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    provider_health: &ProviderHealth,
 ) -> Result<ConsolidatorSetup> {
     // Build the consolidator (if LLM configured) once, then share the
     // Arc between the MCP server (for `memory_consolidate` + lint),
@@ -514,7 +523,11 @@ fn configure_consolidator(
             admin_llm: None,
         });
     };
+    let provider_name = cfg.provider.name().to_string();
+    let model = cfg.model.clone();
+    let retry_hint = llm_retry_hint(&provider_name, &model, cfg.base_url.as_deref());
     let llm = build_provider(cfg).context("building LLM provider from config")?;
+    let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
     info!(
         provider = llm.name(),
         model = llm.model(),
@@ -551,6 +564,15 @@ fn validate_web_ui_args(enable_web: bool, web_ui_dir: Option<&Path>) -> Result<(
     }
 
     Ok(())
+}
+
+fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String {
+    let mut command = format!("ai-memory llm-test --provider {provider} --model {model}");
+    if let Some(base_url) = base_url {
+        command.push_str(&format!(" --base-url {base_url}"));
+    }
+    command.push_str(" --prompt ping");
+    command
 }
 
 fn mount_web_router(
@@ -789,9 +811,16 @@ mod tests {
         };
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
 
-        let (_wiki, embedder) = configure_embedder(&cfg, &store, wiki).await.unwrap();
+        let provider_health = ProviderHealth::default();
+        let (_wiki, embedder) = configure_embedder(&cfg, &store, wiki, &provider_health)
+            .await
+            .unwrap();
 
         let embedder = embedder.expect("configured embedder should be enabled");
         assert_eq!(embedder.provider(), "openai");
+        assert_eq!(
+            provider_health.snapshot().embedding.status,
+            ai_memory_llm::ProviderHealthStatus::Unknown
+        );
     }
 }

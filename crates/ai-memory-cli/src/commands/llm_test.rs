@@ -50,11 +50,25 @@ impl From<LlmProviderChoice> for ProviderChoice {
     fn from(value: LlmProviderChoice) -> Self {
         match value {
             LlmProviderChoice::Anthropic => Self::Anthropic,
+            LlmProviderChoice::AnthropicOauth => Self::AnthropicOAuth,
             LlmProviderChoice::Openai => Self::OpenAi,
             LlmProviderChoice::Gemini => Self::Gemini,
             LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
             LlmProviderChoice::OpenaiOauth => Self::OpenAiOAuth,
             LlmProviderChoice::Copilot => Self::Copilot,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_oauth_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::AnthropicOauth),
+            ProviderChoice::AnthropicOAuth
+        );
     }
 }

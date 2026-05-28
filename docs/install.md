@@ -410,6 +410,9 @@ Cursor, Gemini CLI, Antigravity CLI, and OpenClaw have lifecycle capture paths t
 > Gemini CLI, and Antigravity CLI use shell/PowerShell hook scripts: (1) `docker cp` the
 > bundled scripts to your home dir, (2) `docker run --rm install-hooks`
 > to render the config snippet.
+> On native Windows, Claude Code is the exception to the PowerShell default:
+> it runs hooks through Git Bash, so ai-memory renders `bash -c` commands for
+> the `.sh` scripts.
 > OpenClaw, OpenCode, and OMP are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
@@ -609,8 +612,9 @@ server's environment.
 
 On Windows, see [`docs/windows.md`](windows.md). The short version: run
 the install commands from the same environment that launches the agent.
-WSL2-launched agents need WSL paths and POSIX `.sh` hooks; native Windows
-agents need Windows paths and PowerShell `.ps1` hooks.
+WSL2-launched agents need WSL paths and POSIX `.sh` hooks. Native Claude Code
+uses Git Bash `.sh` hooks with Windows paths converted to `/c/...`; other
+native Windows script-hook agents use PowerShell `.ps1` defaults.
 
 When run from source, `install-hooks` finds the bundled scripts in
 the repo's `hooks/` automatically:
@@ -827,7 +831,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | Subcommand | Pattern | What it does |
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
-| `status` | `docker exec` | Counts, paths, and derived-index diagnostics |
+| `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki search with FTS5 + graph/vector RRF |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |
 | `backup --to` / `restore --from` | `docker exec` | Snapshot or restore the data dir |

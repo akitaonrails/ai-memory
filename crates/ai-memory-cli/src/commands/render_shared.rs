@@ -97,12 +97,13 @@ pub(crate) fn build_claude_code_payload(
     server_url: &str,
     auth_token: Option<&str>,
 ) -> serde_json::Value {
-    build_hook_payload(
+    build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
         auth_token,
         HookShape::Nested,
+        HookCommandPlatform::for_bash_runner(),
     )
 }
 
@@ -328,6 +329,11 @@ fn build_hook_payload(
 pub(crate) enum HookCommandPlatform {
     Posix,
     Windows,
+    /// Claude Code on Windows invokes hooks through bash (Git for
+    /// Windows), not PowerShell. Commands use POSIX `.sh` scripts
+    /// wrapped in `bash -c '...'` with drive-letter paths converted
+    /// to Git Bash format (`C:\x` → `/c/x`).
+    WindowsBash,
 }
 
 impl HookCommandPlatform {
@@ -337,7 +343,23 @@ impl HookCommandPlatform {
             Ok(v) if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
                 Self::Posix
             }
+            Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
             _ if cfg!(windows) => Self::Windows,
+            _ => Self::Posix,
+        }
+    }
+
+    /// Platform for agents known to use bash as their hook runner on
+    /// Windows (currently Claude Code). Returns `WindowsBash` on
+    /// Windows unless overridden by `AI_MEMORY_HOOK_PLATFORM`.
+    fn for_bash_runner() -> Self {
+        match std::env::var("AI_MEMORY_HOOK_PLATFORM") {
+            Ok(v) if v.eq_ignore_ascii_case("windows") => Self::Windows,
+            Ok(v) if v.eq_ignore_ascii_case("posix") || v.eq_ignore_ascii_case("unix") => {
+                Self::Posix
+            }
+            Ok(v) if v.eq_ignore_ascii_case("windows-bash") => Self::WindowsBash,
+            _ if cfg!(windows) => Self::WindowsBash,
             _ => Self::Posix,
         }
     }
@@ -405,7 +427,7 @@ fn build_hook_payload_for_platform(
 
 fn script_for_platform(script: &str, platform: HookCommandPlatform) -> Cow<'_, str> {
     match platform {
-        HookCommandPlatform::Posix => Cow::Borrowed(script),
+        HookCommandPlatform::Posix | HookCommandPlatform::WindowsBash => Cow::Borrowed(script),
         HookCommandPlatform::Windows => match script.strip_suffix(".sh") {
             Some(stem) => Cow::Owned(format!("{stem}.ps1")),
             None => Cow::Borrowed(script),
@@ -415,6 +437,10 @@ fn script_for_platform(script: &str, platform: HookCommandPlatform) -> Cow<'_, s
 
 pub(crate) fn hook_script_for_current_platform(script: &str) -> Cow<'_, str> {
     script_for_platform(script, HookCommandPlatform::current())
+}
+
+pub(crate) fn hook_script_for_claude_code(script: &str) -> Cow<'_, str> {
+    script_for_platform(script, HookCommandPlatform::for_bash_runner())
 }
 
 fn hook_command(
@@ -444,6 +470,31 @@ fn hook_command(
                 powershell_quote(&script.to_string_lossy())
             )
         }
+        HookCommandPlatform::WindowsBash => {
+            let bash_path = to_git_bash_path(&script.to_string_lossy());
+            let mut inner = format!("AI_MEMORY_HOOK_URL={} ", shell_quote(server_url));
+            if let Some(t) = auth_token {
+                inner.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(t)));
+            }
+            inner.push_str(&shell_quote(&bash_path));
+            format!("bash -c {}", shell_quote(&inner))
+        }
+    }
+}
+
+/// Convert a Windows path to Git Bash (MSYS2) format.
+/// `C:\Users\alice\hooks\x.sh` → `/c/Users/alice/hooks/x.sh`
+fn to_git_bash_path(path: &str) -> String {
+    let s = path.replace('\\', "/");
+    if s.len() >= 3
+        && s.as_bytes()[0].is_ascii_alphabetic()
+        && s.as_bytes()[1] == b':'
+        && s.as_bytes()[2] == b'/'
+    {
+        let drive = (s.as_bytes()[0] as char).to_ascii_lowercase();
+        format!("/{drive}{}", &s[2..])
+    } else {
+        s
     }
 }
 
@@ -846,5 +897,124 @@ mod tests {
                 "missing Antigravity event {expected}"
             );
         }
+    }
+
+    #[test]
+    fn to_git_bash_path_converts_drive_letter_and_backslashes() {
+        assert_eq!(
+            to_git_bash_path(r"C:\Users\alice\hooks\x.sh"),
+            "/c/Users/alice/hooks/x.sh"
+        );
+        assert_eq!(to_git_bash_path(r"D:\Projects\repo"), "/d/Projects/repo");
+    }
+
+    #[test]
+    fn to_git_bash_path_preserves_posix_paths() {
+        assert_eq!(
+            to_git_bash_path("/already/posix/path"),
+            "/already/posix/path"
+        );
+    }
+
+    #[test]
+    fn to_git_bash_path_handles_forward_slash_windows_paths() {
+        assert_eq!(
+            to_git_bash_path("C:/Users/alice/hooks/x.sh"),
+            "/c/Users/alice/hooks/x.sh"
+        );
+    }
+
+    #[test]
+    fn windows_bash_hook_command_wraps_in_bash_c_with_git_bash_paths() {
+        let cmd = hook_command(
+            &PathBuf::from(
+                r"C:\Users\alice\.local\share\ai-memory\hooks\claude-code\session-start.sh",
+            ),
+            "https://my-server.example.com",
+            Some("tok123"),
+            HookCommandPlatform::WindowsBash,
+        );
+        assert!(
+            cmd.starts_with("bash -c "),
+            "command must be bash-wrapped: {cmd}"
+        );
+        assert!(
+            cmd.contains("/c/Users/alice/"),
+            "Windows path must be converted to Git Bash format: {cmd}"
+        );
+        assert!(
+            cmd.contains("session-start.sh"),
+            "must use .sh script: {cmd}"
+        );
+        assert!(
+            cmd.contains("AI_MEMORY_HOOK_URL=https://my-server.example.com"),
+            "must inline hook URL: {cmd}"
+        );
+        assert!(
+            cmd.contains("AI_MEMORY_AUTH_TOKEN=tok123"),
+            "must inline auth token: {cmd}"
+        );
+    }
+
+    #[test]
+    fn windows_bash_hook_command_omits_token_when_absent() {
+        let cmd = hook_command(
+            &PathBuf::from(r"C:\Users\alice\hooks\session-start.sh"),
+            "http://localhost:49374",
+            None,
+            HookCommandPlatform::WindowsBash,
+        );
+        assert!(cmd.starts_with("bash -c "));
+        assert!(
+            !cmd.contains("AI_MEMORY_AUTH_TOKEN"),
+            "no token expected: {cmd}"
+        );
+    }
+
+    #[test]
+    fn windows_bash_script_for_platform_keeps_sh_extension() {
+        let s = script_for_platform("session-start.sh", HookCommandPlatform::WindowsBash);
+        assert_eq!(s, "session-start.sh");
+    }
+
+    #[test]
+    fn windows_bash_payload_uses_bash_c_and_sh_hooks() {
+        let root = PathBuf::from(r"C:\Users\alice\.local\share\ai-memory\hooks\claude-code");
+        let v = build_hook_payload_for_platform(
+            &CLAUDE_CODE_EVENTS,
+            &root,
+            "https://my-server.example.com",
+            Some("tok123"),
+            HookShape::Nested,
+            HookCommandPlatform::WindowsBash,
+        );
+        let cmd = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
+            .unwrap();
+        assert!(
+            cmd.starts_with("bash -c "),
+            "command must be bash-wrapped: {cmd}"
+        );
+        assert!(
+            cmd.contains("/c/Users/alice/"),
+            "path must be in Git Bash format: {cmd}"
+        );
+        assert!(
+            cmd.contains("session-start.sh"),
+            "must use .sh script: {cmd}"
+        );
+        assert!(
+            !cmd.contains("session-start.ps1"),
+            "must not use .ps1: {cmd}"
+        );
+        assert!(
+            cmd.contains("AI_MEMORY_HOOK_URL="),
+            "must inline URL: {cmd}"
+        );
+        assert!(
+            cmd.contains("AI_MEMORY_AUTH_TOKEN=tok123"),
+            "must inline token: {cmd}"
+        );
     }
 }

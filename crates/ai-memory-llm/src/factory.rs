@@ -39,6 +39,20 @@ pub enum ProviderChoice {
 }
 
 impl ProviderChoice {
+    /// Wire-format provider name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Gemini => "gemini",
+            Self::OpenAiCompat => "openai-compat",
+            Self::OpenAiOAuth => "openai-oauth",
+            Self::Copilot => "copilot",
+            Self::AnthropicOAuth => "anthropic-oauth",
+        }
+    }
+
     /// Auth requirement for this provider.
     #[must_use]
     pub const fn auth_requirement(self) -> AuthRequirement {

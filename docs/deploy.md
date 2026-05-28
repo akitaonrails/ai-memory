@@ -237,6 +237,10 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
   every project in the workspace, or add `--project <name>` to scope
   the rebuild. Scheduled embedding backfill can also fill missing
   rows when enabled.
+- **Provider failures**: `ai-memory status` reports passive LLM and
+  embedding health from the last real provider call. A fresh process
+  reports `unknown` until the server actually uses that role; it does
+  not probe providers or spend tokens for health reporting.
 - **Container restart loop**: check
   `docker logs ai-memory` - the `ai-memory starting` line at the top
   reports the resolved config; a missing required env var (e.g.
