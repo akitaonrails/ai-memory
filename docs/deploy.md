@@ -13,6 +13,9 @@ system service, or XDG user paths for the user service. The Docker deployment
 below remains `/data` inside the container and `/var/opt/docker/...` on the
 host.
 
+Published Docker images include `linux/amd64` and `linux/arm64` manifests, so
+homelab hosts on x86_64 and ARM64 can pull the same tag natively.
+
 ## What gets committed vs. what stays local
 
 The repo ships **templates only**. The real files with your homelab

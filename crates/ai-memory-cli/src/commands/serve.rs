@@ -179,6 +179,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 ingest_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
                 )),
+                consolidate_on_session_end: config.consolidate_on_session_end,
             });
             let admin = admin_router(AdminState {
                 writer: store.writer.clone(),

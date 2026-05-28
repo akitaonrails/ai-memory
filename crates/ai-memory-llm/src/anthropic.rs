@@ -18,10 +18,31 @@ pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// Pinned Anthropic API version header.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// `anthropic-beta` header sent on OAuth (subscription) requests. Mirrors
+/// the Claude Code OAuth handshake: the `oauth-2025-04-20` feature is what
+/// authorises a subscription bearer token against /v1/messages, and the
+/// `claude-code-*` feature matches what the official CLI sends. Values
+/// cross-checked against oh-my-pi's `claudeCodeBetaDefaults`.
+///
+/// NOTE: this header combination is derived from Claude Code's documented OAuth
+/// handshake and should be smoke-tested with a real `claude setup-token` token
+/// before use in production, as Anthropic may update the required beta values.
+const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
+
+/// Authentication mode for the Anthropic provider.
+#[derive(Clone)]
+enum AnthropicAuth {
+    /// Static API key sent as `x-api-key`.
+    ApiKey(SecretString),
+    /// OAuth bearer token from a Claude Pro/Max subscription
+    /// (obtained via `claude setup-token`).
+    OAuth(SecretString),
+}
+
 /// Anthropic Messages-API-backed provider.
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: SecretString,
+    auth: AnthropicAuth,
     base_url: String,
     model: String,
 }
@@ -41,7 +62,28 @@ impl AnthropicProvider {
             .build()?;
         Ok(Self {
             client,
-            api_key,
+            auth: AnthropicAuth::ApiKey(api_key),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            model: model.into(),
+        })
+    }
+
+    /// Construct a provider using an OAuth subscription token from
+    /// `claude setup-token` (Claude Pro/Max subscription). Hits the same
+    /// `/v1/messages` endpoint as `new`, but uses a Bearer token and the
+    /// `anthropic-beta: oauth-2025-04-20,claude-code-20250219` header
+    /// instead of `x-api-key`.
+    ///
+    /// # Errors
+    /// Returns a `reqwest::Error` if the underlying HTTP client cannot
+    /// be built.
+    pub fn new_oauth(token: SecretString, model: impl Into<String>) -> LlmResult<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()?;
+        Ok(Self {
+            client,
+            auth: AnthropicAuth::OAuth(token),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
         })
@@ -209,15 +251,17 @@ impl AnthropicProvider {
     async fn post<B: Serialize, R: DeserializeOwned>(&self, body: &B) -> LlmResult<R> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         debug!(url, "POST anthropic");
-        let resp = self
+        let mut builder = self
             .client
             .post(&url)
-            .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await?;
+            .header("content-type", "application/json");
+        // Apply the auth headers through the same helper the tests assert on,
+        // so a change to one can't silently diverge from the other.
+        for (name, value) in self.auth_headers() {
+            builder = builder.header(name, value);
+        }
+        let resp = builder.json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -227,5 +271,94 @@ impl AnthropicProvider {
             });
         }
         resp.json::<R>().await.map_err(LlmError::from)
+    }
+
+    /// The auth headers for this provider instance: `x-api-key` for a static
+    /// key, or `Authorization: Bearer` + `anthropic-beta` for an OAuth
+    /// subscription token. The two modes are mutually exclusive — OAuth must
+    /// never send `x-api-key` or Anthropic rejects the request. `post` applies
+    /// these, and the unit tests assert on them, so both stay in lockstep.
+    fn auth_headers(&self) -> Vec<(&'static str, String)> {
+        match &self.auth {
+            AnthropicAuth::ApiKey(key) => vec![("x-api-key", key.expose_secret().to_string())],
+            AnthropicAuth::OAuth(token) => vec![
+                ("authorization", format!("Bearer {}", token.expose_secret())),
+                ("anthropic-beta", ANTHROPIC_OAUTH_BETA.to_string()),
+            ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use secrecy::SecretString;
+
+    use super::*;
+
+    #[test]
+    fn api_key_provider_sends_x_api_key_no_authorization() {
+        let provider =
+            AnthropicProvider::new(SecretString::from("sk-ant-test"), "claude-sonnet-4-6").unwrap();
+        let headers = provider.auth_headers();
+        let names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
+        assert!(names.contains(&"x-api-key"), "expected x-api-key header");
+        assert!(
+            !names.contains(&"authorization"),
+            "api-key mode must NOT send authorization header"
+        );
+        assert!(
+            !names.contains(&"anthropic-beta"),
+            "api-key mode must NOT send anthropic-beta header"
+        );
+        let key_val = headers
+            .iter()
+            .find(|(n, _)| *n == "x-api-key")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert_eq!(key_val, "sk-ant-test");
+    }
+
+    #[test]
+    fn oauth_provider_sends_bearer_and_beta_no_x_api_key() {
+        let provider =
+            AnthropicProvider::new_oauth(SecretString::from("tok-oauth-test"), "claude-sonnet-4-6")
+                .unwrap();
+        let headers = provider.auth_headers();
+        let names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
+        assert!(
+            !names.contains(&"x-api-key"),
+            "oauth mode must NOT send x-api-key header"
+        );
+        assert!(
+            names.contains(&"authorization"),
+            "expected authorization header"
+        );
+        assert!(
+            names.contains(&"anthropic-beta"),
+            "expected anthropic-beta header"
+        );
+        let auth_val = headers
+            .iter()
+            .find(|(n, _)| *n == "authorization")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert_eq!(auth_val, "Bearer tok-oauth-test");
+        let beta_val = headers
+            .iter()
+            .find(|(n, _)| *n == "anthropic-beta")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(
+            beta_val.contains("oauth-2025-04-20"),
+            "anthropic-beta must contain oauth-2025-04-20"
+        );
+    }
+
+    #[test]
+    fn with_base_url_is_preserved_after_oauth_construction() {
+        let provider = AnthropicProvider::new_oauth(SecretString::from("tok"), "claude-sonnet-4-6")
+            .unwrap()
+            .with_base_url("http://localhost:9999");
+        assert_eq!(provider.base_url, "http://localhost:9999");
     }
 }

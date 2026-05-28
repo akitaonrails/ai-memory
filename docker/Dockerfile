@@ -6,6 +6,10 @@
 # Runtime: debian:bookworm-slim with a non-root `ai-memory` user that
 #          owns /data. CA certificates included for outgoing HTTPS (LLM
 #          providers in M6+).
+#
+# The default final target builds the binary from source. Release automation and
+# CI can target the prebuilt runtime stages after downloading native release
+# artifacts, avoiding duplicate Rust compiles in Docker jobs.
 
 FROM rust:1.95-slim-bookworm AS builder
 WORKDIR /work
@@ -27,21 +31,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     TAILWIND_SKIP=1 cargo build --release -p ai-memory-cli \
  && cp target/release/ai-memory /usr/local/bin/ai-memory
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 1000 --user-group --home-dir /data \
-        --shell /usr/sbin/nologin ai-memory \
+         --shell /usr/sbin/nologin ai-memory \
  && mkdir -p /data \
  && chown -R ai-memory:ai-memory /data
-COPY --from=builder /usr/local/bin/ai-memory /usr/local/bin/ai-memory
 # Lifecycle-hook scripts bundled into the image so docker-only users
 # can `ai-memory setup-agent` without needing a repo checkout. The
 # scripts live on a path scanned by `install_hooks::resolve_hooks_dir`
 # (and by `setup_agent::resolve_source`).
 COPY hooks /usr/local/share/ai-memory/hooks
-USER ai-memory
 ENV AI_MEMORY_DATA_DIR=/data
 WORKDIR /data
 EXPOSE 49374
@@ -49,3 +51,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/ai-memory", "status"]
 ENTRYPOINT ["/usr/local/bin/ai-memory"]
 CMD ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-web"]
+
+FROM runtime-base AS runtime-prebuilt-amd64
+COPY --chmod=0755 dist/docker/ai-memory-linux-x86_64/ai-memory /usr/local/bin/ai-memory
+USER ai-memory
+
+FROM runtime-base AS runtime-prebuilt-arm64
+COPY --chmod=0755 dist/docker/ai-memory-linux-aarch64/ai-memory /usr/local/bin/ai-memory
+USER ai-memory
+
+FROM runtime-base AS runtime-source
+COPY --from=builder /usr/local/bin/ai-memory /usr/local/bin/ai-memory
+USER ai-memory

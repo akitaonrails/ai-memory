@@ -47,7 +47,7 @@ the wiki without you naming tools explicitly.
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_accept` if no block exists | Resumes from the latest pending handoff. |
 | "Save context for the next session" | `memory_handoff_begin` | Writes a terse handoff with open questions and next steps. |
-| "Consolidate this session" | `memory_consolidate` | Manually runs what session-end normally runs automatically. |
+| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; session end otherwise writes a rule-based summary page). |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Audit the wiki" / "any contradictions?" | `memory_lint` | Runs stale-page, contradiction, and rule-suggestion checks. |
 | "How big is the wiki?" / "stats?" | `memory_status`, `memory_briefing` | Counts and recent activity windows. |

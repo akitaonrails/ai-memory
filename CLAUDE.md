@@ -234,10 +234,13 @@ Live progress is tracked via the TaskList tool inside Claude Code sessions.
 This project uses [ai-memory](https://github.com/akitaonrails/ai-memory)
 for cross-session continuity. **Lifecycle hooks already capture every
 prompt + tool call automatically.** You never need to manually write
-routine notes; the SessionStart hook auto-fetches pending handoffs and
-the SessionEnd hook auto-consolidates. Only write a durable wiki page
-when the user explicitly asks to remember or annotate something
-permanently.
+routine notes; the SessionStart hook auto-fetches pending handoffs, and
+on session end ai-memory writes a session-summary page and a handoff.
+LLM consolidation (compiling observations into topical wiki pages) runs
+on PreCompact, on demand via `memory_consolidate`, and at session end
+only when the server sets `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`. Only
+write a durable wiki page when the user explicitly asks to remember or
+annotate something permanently.
 
 ### When to reach for each tool
 
@@ -254,7 +257,7 @@ match the intent to the tool. They do not need to name the tool.
 | "where did we leave off?" — and you see a `📥 ai-memory: pending handoff` block in your context | already done — answer from that block; do NOT re-call `memory_handoff_accept` |
 | "where did we leave off?" — and no such block is visible | `memory_handoff_accept` (rare; the SessionStart hook usually got there first) |
 | "save context for the next session" / wrapping up | `memory_handoff_begin` (single-use handoff; terse summary; put detail in `open_questions` + `next_steps` bullets) |
-| "consolidate this session" / "compile what we learned" (usually automatic) | `memory_consolidate` |
+| "consolidate this session" / "compile what we learned" (also runs on PreCompact; at session end only if `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set) | `memory_consolidate` |
 | "remember this permanently" / "save a note" / "add an annotation" / durable project knowledge | `memory_write_page` (write a wiki page; do **not** use handoff for permanent notes) |
 | "audit the wiki" / "find contradictions" / "what rules should we add?" | `memory_lint` |
 | "prune old pages" / "memory cleanup" | `memory_forget_sweep` |

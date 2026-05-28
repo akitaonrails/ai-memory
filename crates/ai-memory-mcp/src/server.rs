@@ -58,7 +58,8 @@ them:\n\
   also auto-captures this). Keep the summary terse (2-3 sentences); \
   put detail in open_questions + next_steps bullets.\n\
 - `memory_consolidate` — when the user asks to compile session \
-  observations into wiki pages (usually automatic at session end).\n\
+  observations into wiki pages. Also runs on PreCompact, and at \
+  session end only when AI_MEMORY_CONSOLIDATE_ON_SESSION_END is set.\n\
 - `memory_write_page` — when the user explicitly asks to remember, \
   save, or annotate durable project knowledge. This writes a wiki page; \
   do NOT use `memory_handoff_begin` for permanent annotations.\n\

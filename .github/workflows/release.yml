@@ -1,9 +1,10 @@
 name: release
 
 # Triggered when a version tag is pushed, e.g. git push origin v0.3.2.
-# Builds the native Linux release tarball, creates the GitHub Release,
+# Builds native Linux release tarballs, creates the GitHub Release,
 # and pushes the Docker image to Docker Hub with both the version tag
-# and `latest` when Docker Hub credentials are configured.
+# and `latest` when Docker Hub credentials are configured. Docker images
+# reuse the native release artifacts instead of recompiling in Docker.
 #
 # Optional publish secrets (set in repo Settings → Secrets and variables → Actions):
 #   DOCKERHUB_USERNAME  — Docker Hub account name
@@ -59,9 +60,19 @@ jobs:
           echo "version=${tag_version}" >> "$GITHUB_OUTPUT"
 
   binary:
-    name: linux x86_64 binary
+    name: linux ${{ matrix.arch }} binary
     needs: validate-version
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            artifact: ai-memory-linux-x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            artifact: ai-memory-linux-aarch64
+            runner: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -75,8 +86,10 @@ jobs:
         run: cargo build --release -p ai-memory-cli
 
       - name: Create release tarball
+        env:
+          RELEASE_ARTIFACT: ${{ matrix.artifact }}
         run: |
-          artifact="ai-memory-linux-x86_64"
+          artifact="$RELEASE_ARTIFACT"
           mkdir -p "dist/$artifact"
           cp target/release/ai-memory "dist/$artifact/ai-memory"
           cp -a hooks "dist/$artifact/hooks"
@@ -96,10 +109,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ai-memory-linux-x86_64
+          name: ${{ matrix.artifact }}
           path: |
-            ai-memory-linux-x86_64.tar.gz
-            ai-memory-linux-x86_64.tar.gz.sha256
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
 
   # Gate the publish on the Docker Hub secrets actually being present, so a
   # fresh clone (or a fork) doesn't get a red failing run on every tag. The
@@ -133,9 +146,9 @@ jobs:
             echo "::warning::AUR_SSH_PRIVATE_KEY not set — skipping AUR publish."
           fi
 
-  docker:
-    name: docker build + push
-    needs: [check-secrets, validate-version]
+  docker-amd64:
+    name: docker amd64 image
+    needs: [binary, check-secrets, validate-version]
     if: needs.check-secrets.outputs.docker_enabled == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -143,6 +156,18 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-memory-linux-x86_64
+          path: artifacts
+
+      - name: Unpack prebuilt amd64 binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist/docker/ai-memory-linux-x86_64
+          tar -xzf artifacts/ai-memory-linux-x86_64.tar.gz \
+            -C dist/docker/ai-memory-linux-x86_64
 
       - uses: docker/setup-buildx-action@v3
 
@@ -152,24 +177,151 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push amd64 image by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/ai-memory:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/ai-memory:${{ needs.validate-version.outputs.version }}
+          target: runtime-prebuilt-amd64
+          platforms: linux/amd64
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/ai-memory
+
+      - name: Export amd64 digest
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build.outputs.digest }}"
+          if [ -z "$digest" ]; then
+            echo "docker build did not return an amd64 digest" >&2
+            exit 1
+          fi
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-amd64
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-arm64:
+    name: docker arm64 image
+    needs: [binary, check-secrets, validate-version]
+    if: needs.check-secrets.outputs.docker_enabled == 'true'
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-memory-linux-aarch64
+          path: artifacts
+
+      - name: Unpack prebuilt arm64 binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist/docker/ai-memory-linux-aarch64
+          tar -xzf artifacts/ai-memory-linux-aarch64.tar.gz \
+            -C dist/docker/ai-memory-linux-aarch64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push arm64 image by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime-prebuilt-arm64
+          platforms: linux/arm64
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/ai-memory
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Export arm64 digest
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build.outputs.digest }}"
+          if [ -z "$digest" ]; then
+            echo "docker build did not return an arm64 digest" >&2
+            exit 1
+          fi
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-arm64
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    name: docker manifest + smoke
+    needs: [check-secrets, docker-amd64, docker-arm64, validate-version]
+    if: needs.check-secrets.outputs.docker_enabled == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish multi-arch manifest
+        run: |
+          set -euo pipefail
+          image="${{ secrets.DOCKERHUB_USERNAME }}/ai-memory"
+          refs=()
+          for digest_file in /tmp/digests/*; do
+            refs+=("${image}@sha256:$(basename "$digest_file")")
+          done
+          if [ "${#refs[@]}" -ne 2 ]; then
+            echo "expected 2 image digests, found ${#refs[@]}" >&2
+            exit 1
+          fi
+          docker buildx imagetools create \
+            -t "${image}:latest" \
+            -t "${image}:${{ needs.validate-version.outputs.version }}" \
+            "${refs[@]}"
+
       - name: Smoke test the published image
         run: |
-          docker pull "${{ secrets.DOCKERHUB_USERNAME }}/ai-memory:${{ needs.validate-version.outputs.version }}"
-          docker run --rm \
-            "${{ secrets.DOCKERHUB_USERNAME }}/ai-memory:${{ needs.validate-version.outputs.version }}" \
-            --version
+          set -euo pipefail
+          image="${{ secrets.DOCKERHUB_USERNAME }}/ai-memory:${{ needs.validate-version.outputs.version }}"
+          for platform in linux/amd64 linux/arm64; do
+            docker pull --platform "$platform" "$image"
+            docker run --rm --platform "$platform" "$image" --version
+          done
 
   github-release:
     name: github release
@@ -191,7 +343,7 @@ jobs:
           echo "## Install" >> body.md
           echo '```bash' >> body.md
           echo "# Arch Linux (AUR)" >> body.md
-          echo "yay -S ai-memory-bin      # prebuilt Linux x86_64 binary" >> body.md
+          echo "yay -S ai-memory-bin      # prebuilt Linux x86_64/aarch64 binary" >> body.md
           echo "yay -S ai-memory          # builds from source" >> body.md
           echo "" >> body.md
           echo "# Docker" >> body.md
@@ -222,8 +374,9 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: ai-memory-linux-x86_64
+          pattern: ai-memory-linux-*
           path: artifacts
+          merge-multiple: true
 
       - name: Install AUR publish tools
         run: pacman -Syu --noconfirm --needed base-devel curl git openssh
@@ -237,7 +390,8 @@ jobs:
 
           version="$VERSION"
           source_sha="$(curl -fsSL "https://github.com/akitaonrails/ai-memory/archive/refs/tags/v${version}.tar.gz" | sha256sum | awk '{print $1}')"
-          bin_sha="$(sha256sum artifacts/ai-memory-linux-x86_64.tar.gz | awk '{print $1}')"
+          bin_x86_sha="$(sha256sum artifacts/ai-memory-linux-x86_64.tar.gz | awk '{print $1}')"
+          bin_arm_sha="$(sha256sum artifacts/ai-memory-linux-aarch64.tar.gz | awk '{print $1}')"
 
           useradd -m aurbuild
           chown -R aurbuild:aurbuild "$GITHUB_WORKSPACE"
@@ -260,13 +414,14 @@ jobs:
           runuser -u aurbuild -- env \
             HOME=/home/aurbuild \
             GIT_SSH_COMMAND='ssh -F /home/aurbuild/.ssh/config' \
-            bash -s -- "$version" "$source_sha" "$bin_sha" "$GITHUB_WORKSPACE" <<'EOF'
+            bash -s -- "$version" "$source_sha" "$bin_x86_sha" "$bin_arm_sha" "$GITHUB_WORKSPACE" <<'EOF'
           set -euo pipefail
 
           version="$1"
           source_sha="$2"
-          bin_sha="$3"
-          workspace="$4"
+          bin_x86_sha="$3"
+          bin_arm_sha="$4"
+          workspace="$5"
           workdir="/tmp/ai-memory-aur-publish"
 
           git config --global user.name "ai-memory release bot"
@@ -288,7 +443,8 @@ jobs:
           sed -i \
             -e "s/^pkgver=.*/pkgver=${version}/" \
             -e "s/^pkgrel=.*/pkgrel=1/" \
-            -e "s/^sha256sums_x86_64=('.*')/sha256sums_x86_64=('${bin_sha}')/" \
+            -e "s/^sha256sums_x86_64=('.*')/sha256sums_x86_64=('${bin_x86_sha}')/" \
+            -e "s/^sha256sums_aarch64=('.*')/sha256sums_aarch64=('${bin_arm_sha}')/" \
             "$bin_pkgbuild"
 
           publish_pkg() {

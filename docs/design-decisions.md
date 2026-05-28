@@ -86,7 +86,7 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 
 **LLM for consolidation passes:**
 - **Off by default**, behaves like agentmemory after #138's fix. Without a provider, the system still works: synthetic compression (rule-based), no LLM-generated summaries, no `memory_consolidate` page-rewrite.
-- With a provider, scheduled consolidation runs (1× per session-end + optional 6h timer).
+- With a provider, LLM consolidation runs on PreCompact, on demand via `memory_consolidate`, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true` (off by default — session end always writes a rule-based summary page + handoff regardless). Optional 6h maintenance timer.
 - Provider trait `LlmProvider { complete(...); complete_structured(...) }`. Implementations: `AnthropicProvider`, `OpenAIProvider`, `GeminiProvider`, `OpenAICompatProvider` (the latter covers Ollama / vLLM / LM Studio and supersedes the earlier `OllamaProvider`).
 - **Native HTTP per provider** - no LiteLLM-equivalent. The cognee tracker (#2412/#2430/#2537/#2608/#2749/#2782/#2840/#2842) showed silent-kwarg-drop in a generic gateway is the #1 source of provider bugs. Each provider's typed JSON, errors on unknown fields. Hand-coded but correct.
 - **Structured output via JSON schema, not XML, not Instructor-style wrapping.** Use each provider's native JSON-mode where available; for Anthropic, request a tool-use response with a typed schema. Validate with `serde_json` + `schemars`-derived schemas.

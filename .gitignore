@@ -1,5 +1,6 @@
 # Rust build artefacts.
 /target/
+/dist/
 **/*.rs.bk
 **/*.rs.orig
 

@@ -25,6 +25,17 @@ services:
       - "127.0.0.1:49374:49374"
     environment:
       - RUST_LOG=ai_memory=info,ai_memory_store=info,ai_memory_wiki=info,ai_memory_mcp=info,tracing_appender=warn
+      # Uncomment ONE provider block. All are opt-in; omit to run zero-LLM.
+      #
+      # Option A — Anthropic API key
+      #- AI_MEMORY_LLM_PROVIDER=anthropic
+      #- ANTHROPIC_API_KEY=sk-ant-...
+      #
+      # Option B — Anthropic via Claude Pro/Max subscription (claude setup-token)
+      # WARNING: unofficial, against Anthropic's usage policies — use at your
+      # own risk (may get your account rate-limited/banned). See docs/install.md.
+      #- AI_MEMORY_LLM_PROVIDER=anthropic-oauth
+      #- ANTHROPIC_OAUTH_TOKEN=
     healthcheck:
       test: ["CMD", "/usr/local/bin/ai-memory", "status"]
       interval: 30s

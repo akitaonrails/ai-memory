@@ -18,8 +18,8 @@
 
 | Area | Status | Notes |
 |---|---|---|
-| Linux | Supported | Primary Docker/server target and CI platform. Native Arch/AUR packages include system and user systemd units. |
-| macOS | Supported | Workspace tests run in CI; native source builds are supported. |
+| Linux | Supported | Primary Docker/server target and CI platform. Published Docker images support `linux/amd64` and `linux/arm64`. Native Arch/AUR packages include system and user systemd units. |
+| macOS | Supported | Workspace tests run in CI; native source builds are supported. Docker images run natively on Apple Silicon via the `linux/arm64` manifest. |
 | Windows via WSL2 | Supported | Use the Linux install path inside WSL2 when the agent runs there. |
 | Native Windows | Experimental | PowerShell wrapper and `.ps1` hooks are available; real agent harness feedback still needed. See [`docs/windows.md`](docs/windows.md). |
 | Claude Code | Supported | MCP config + lifecycle hooks. |
@@ -96,6 +96,17 @@ priors are at the [bottom](#influences-and-prior-art).
   `memory_query X` from the agent (or `ai-memory search X` from a
   terminal) - FTS5 over the wiki. Pages are LLM-consolidated, so
   the hit is a coherent decision page, not a raw chat log.
+- **"Remember this permanently."** When something is worth keeping
+  beyond auto-captured session logs - a decision, a convention, a
+  gotcha - tell the agent "save a permanent note that we standardised
+  on Postgres for X" or "annotate this as a project rule" and it calls
+  `memory_write_page` to write a durable, git-versioned wiki page. From
+  a terminal it's `ai-memory write-page --path decisions/0007-db.md
+  --title "Standardised on Postgres" --body "..." --pinned` (`--pinned`
+  exempts it from the decay sweep). Unlike a handoff (single-use) or an
+  auto-synthesised session page (rewritten on consolidation), a
+  write-page note is yours: it shows up in `memory_query`, renders in
+  `/web`, and stays until you change it.
 - **"This new project has months of history before ai-memory."**
   `cd /path/to/my-project && ai-memory bootstrap` collects
   `git log`, README, `docs/`, module headers, project rules and
@@ -124,7 +135,7 @@ For native Arch installs, use the AUR packages. They install
 user-level systemd units.
 
 ```bash
-yay -S ai-memory-bin    # prebuilt Linux x86_64 binary
+yay -S ai-memory-bin    # prebuilt Linux x86_64/aarch64 binary
 yay -S ai-memory        # builds from source
 ```
 
@@ -147,6 +158,10 @@ packaged unit. Full user-service, system-service, auth, and provider setup is in
 
 You need: Docker + an agent CLI (Claude Code, Codex, OpenCode, OMP, Cursor,
 Antigravity CLI, or anything else that speaks MCP).
+
+The published Docker image includes `linux/amd64` and `linux/arm64` variants,
+so Apple Silicon Macs and ARM64 Linux hosts can pull `akitaonrails/ai-memory`
+without `--platform linux/amd64` emulation.
 
 The default quick-start has **no authentication** - the server binds
 to loopback only, so on a single-user laptop nothing else can reach
@@ -338,13 +353,17 @@ inspection commands. CLI URL/auth configuration lives in
 
 ai-memory runs without an LLM: hooks still capture sessions, search uses
 FTS5, and summaries fall back to rule-based output. Add an LLM provider
-when you want session-end consolidation, richer linting, and bootstrap.
+when you want LLM consolidation (on PreCompact, on demand via
+`memory_consolidate`, or opt-in at session end with
+`AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
+Session end always writes a rule-based summary page + handoff either way.
 
 Recommended defaults:
 
 | Provider | Default | Use when |
 |---|---|---|
 | `anthropic` | `claude-haiku-4-5` | Best default for consolidation quality and rule classification. |
+| `anthropic-oauth` | `claude-sonnet-4-6` | Use a Claude Pro/Max subscription via `claude setup-token`, no API key. |
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
@@ -356,10 +375,27 @@ the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
 starts, run `ai-memory auth login openai-oauth` with the wrapper so the token
 lands in the same `ai-memory-data` volume as the server.
 
+`anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
+authenticates with an OAuth bearer token instead of an API key. Run
+`claude setup-token` once, then set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` and
+`ANTHROPIC_OAUTH_TOKEN=<token>` (or `CLAUDE_CODE_OAUTH_TOKEN`, which `claude
+setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed.
+**⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
+it may get your account rate-limited or banned. See
+[the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
+
 `copilot` stores a GitHub user token in the same auth file, exchanges it for a
 short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
 uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
 also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
+
+> [!TIP]
+> **For the OAuth/subscription backends (`anthropic-oauth`, `openai-oauth`,
+> `copilot`), pick a small, fast model** via `AI_MEMORY_LLM_MODEL` — e.g.
+> `claude-haiku-4-5` or `gpt-5-mini`. ai-memory's LLM work (consolidation,
+> lint, explore) is summarisation, not hard reasoning, so a Haiku/mini-class
+> model is plenty and is much easier on subscription rate limits. Save the
+> high-effort thinking models for your coding agent.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when

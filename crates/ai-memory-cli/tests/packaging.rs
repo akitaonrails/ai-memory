@@ -66,4 +66,35 @@ fn aur_packages_install_all_native_assets() {
     let install = read_repo("packaging/aur/ai-memory.install");
     assert!(install.contains("sudo -u ai-memory ai-memory --data-dir /var/lib/ai-memory"));
     assert!(!install.contains("sudo ai-memory --data-dir /var/lib/ai-memory"));
+
+    let bin_pkgbuild = read_repo("packaging/aur/PKGBUILD-bin");
+    assert!(bin_pkgbuild.contains("source_x86_64"));
+    assert!(bin_pkgbuild.contains("source_aarch64"));
+    assert!(bin_pkgbuild.contains("linux-x86_64.tar.gz"));
+    assert!(bin_pkgbuild.contains("linux-aarch64.tar.gz"));
+}
+
+#[test]
+fn docker_source_build_uses_vendored_tailwind() {
+    let dockerfile = read_repo("docker/Dockerfile");
+    assert!(dockerfile.contains("TAILWIND_SKIP=1 cargo build --release -p ai-memory-cli"));
+}
+
+#[test]
+fn docker_publish_jobs_use_prebuilt_binaries() {
+    let dockerfile = read_repo("docker/Dockerfile");
+    assert!(dockerfile.contains("FROM runtime-base AS runtime-prebuilt-amd64"));
+    assert!(dockerfile.contains("FROM runtime-base AS runtime-prebuilt-arm64"));
+    assert!(dockerfile.contains("dist/docker/ai-memory-linux-x86_64/ai-memory"));
+    assert!(dockerfile.contains("dist/docker/ai-memory-linux-aarch64/ai-memory"));
+
+    let release = read_repo(".github/workflows/release.yml");
+    assert!(release.contains("artifact: ai-memory-linux-x86_64"));
+    assert!(release.contains("artifact: ai-memory-linux-aarch64"));
+    assert!(release.contains("target: runtime-prebuilt-amd64"));
+    assert!(release.contains("target: runtime-prebuilt-arm64"));
+
+    let ci = read_repo(".github/workflows/ci.yml");
+    assert!(ci.contains("ci-ai-memory-linux-x86_64"));
+    assert!(ci.contains("--target runtime-prebuilt-amd64"));
 }

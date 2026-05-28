@@ -59,6 +59,13 @@ pub struct Config {
     pub llm_model: Option<String>,
     /// Optional LLM base URL override.
     pub llm_base_url: Option<String>,
+    /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
+    /// always-written heuristic session page), when an LLM provider is
+    /// configured. Off by default — SessionEnd stays cheap and
+    /// fire-and-forget; the LLM checkpoint otherwise happens on PreCompact
+    /// and via manual `memory_consolidate`. Set with
+    /// `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true`.
+    pub consolidate_on_session_end: bool,
     /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`).
     pub embedding_provider: Option<String>,
     /// Optional embedding model override.
@@ -110,6 +117,7 @@ pub struct RuntimeEnv {
     auth_token: Option<String>,
     host_cwd: Option<String>,
     anthropic_api_key: Option<SecretString>,
+    anthropic_oauth_token: Option<SecretString>,
     openai_api_key: Option<SecretString>,
     gemini_api_key: Option<SecretString>,
     llm_api_key: Option<SecretString>,
@@ -129,6 +137,10 @@ impl RuntimeEnv {
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
+            // CLAUDE_CODE_OAUTH_TOKEN is what `claude setup-token` writes;
+            // ANTHROPIC_OAUTH_TOKEN is our canonical name — accept both.
+            anthropic_oauth_token: env_secret("ANTHROPIC_OAUTH_TOKEN")
+                .or_else(|| env_secret("CLAUDE_CODE_OAUTH_TOKEN")),
             openai_api_key: env_secret("OPENAI_API_KEY"),
             // GOOGLE_API_KEY is the older alias many Google docs still
             // mention; accept either so users don't get tripped up.
@@ -210,6 +222,7 @@ impl Default for Config {
             llm_provider: None,
             llm_model: None,
             llm_base_url: None,
+            consolidate_on_session_end: false,
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,
@@ -325,10 +338,11 @@ impl Config {
             "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
             "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
             "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
+            "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot"
+                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth"
                 )));
             }
         };
@@ -336,6 +350,7 @@ impl Config {
             Some(s) => s.to_string(),
             None => match provider {
                 ProviderChoice::Anthropic => "claude-sonnet-4-6".to_string(),
+                ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
                 ProviderChoice::OpenAi => "gpt-4o-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-2.5-flash".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
@@ -441,6 +456,7 @@ impl Config {
             ProviderChoice::OpenAiCompat => self.runtime_env.llm_api_key.clone(),
             ProviderChoice::OpenAiOAuth => None,
             ProviderChoice::Copilot => None,
+            ProviderChoice::AnthropicOAuth => None,
         }
     }
 
@@ -505,6 +521,9 @@ impl Config {
                     .clone()
                     .or_else(|| self.llm_base_url.clone()),
             ),
+            AuthRequirement::AnthropicOAuthToken => {
+                ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
+            }
         }
     }
 
@@ -795,5 +814,47 @@ mod tests {
         assert_eq!(provider.model, "gpt-5.5");
         assert_eq!(auth.token_file, tmp.path().join("auth.json"));
         assert_eq!(auth.github_token.unwrap().expose_secret(), "ghu-test");
+    }
+
+    #[test]
+    fn anthropic_oauth_provider_resolves_choice_default_model_and_credential() {
+        let cfg = Config {
+            llm_provider: Some("anthropic-oauth".into()),
+            runtime_env: RuntimeEnv {
+                anthropic_oauth_token: Some(SecretString::from("tok-oauth-test")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(provider.provider, ProviderChoice::AnthropicOAuth);
+        assert_eq!(provider.model, "claude-sonnet-4-6");
+        assert_eq!(
+            provider.auth.requirement(),
+            AuthRequirement::AnthropicOAuthToken
+        );
+        assert_eq!(
+            provider
+                .auth
+                .require_anthropic_oauth_token()
+                .unwrap()
+                .expose_secret(),
+            "tok-oauth-test"
+        );
+    }
+
+    #[test]
+    fn anthropic_oauth_provider_underscore_alias_also_resolves() {
+        let cfg = Config {
+            llm_provider: Some("anthropic_oauth".into()),
+            runtime_env: RuntimeEnv {
+                anthropic_oauth_token: Some(SecretString::from("tok-alias")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(provider.provider, ProviderChoice::AnthropicOAuth);
     }
 }

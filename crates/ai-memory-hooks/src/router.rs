@@ -83,6 +83,12 @@ pub struct HookState {
     /// In-flight hook processing limiter. Requests acquire one permit before
     /// spawning work and return 429 immediately when saturated.
     pub ingest_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Opt-in (`AI_MEMORY_CONSOLIDATE_ON_SESSION_END`): when true and a
+    /// `consolidator` is present, SessionEnd also runs LLM consolidation on
+    /// top of the always-written heuristic session page. Off by default so
+    /// session close stays cheap; the LLM checkpoint otherwise happens on
+    /// PreCompact and via manual `memory_consolidate`.
+    pub consolidate_on_session_end: bool,
 }
 
 /// Build a router with `POST /hook` (event ingress) and `GET /handoff`
@@ -512,6 +518,27 @@ async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
             &observations,
         );
         let handoff_id = state.writer.insert_handoff(handoff).await?;
+        // Opt-in (AI_MEMORY_CONSOLIDATE_ON_SESSION_END): additionally run LLM
+        // consolidation so the session's knowledge is compiled into topical
+        // pages, not just the heuristic session record. The heuristic page
+        // above is always written first, so an LLM failure here is non-fatal —
+        // warn and keep the deterministic result. Runs before the commit so
+        // the consolidated pages land in the same atomic snapshot.
+        if state.consolidate_on_session_end
+            && let Some(c) = state.consolidator.as_ref()
+        {
+            match c.consolidate_session(session_id, false).await {
+                Ok(outcome) => info!(
+                    session = %session_id,
+                    path = %outcome.path,
+                    "SessionEnd: LLM consolidation written (opt-in)",
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    "SessionEnd LLM consolidation failed; heuristic page already written",
+                ),
+            }
+        }
         // Auto-commit the wiki tree so the session/handoff/log.md
         // changes land in git in one atomic snapshot.
         let commit_msg = format!(
@@ -737,6 +764,7 @@ mod tests {
             sanitizer,
             project_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_project: ActiveProject::new(),
+            consolidate_on_session_end: false,
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
@@ -1082,6 +1110,44 @@ mod tests {
         assert_ne!(
             expected_proj, state.project_id,
             "routing must not use server-default project"
+        );
+    }
+
+    /// SessionEnd must always write the heuristic `sessions/<id>.md` page,
+    /// even with `consolidate_on_session_end` enabled but no LLM provider:
+    /// the opt-in LLM pass is additive and guarded by a present
+    /// `consolidator`, so flag-on + no-provider degrades to today's
+    /// deterministic behavior (issue #40 — no regression).
+    #[tokio::test]
+    async fn session_end_writes_heuristic_page_even_with_consolidate_flag_on() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.consolidate_on_session_end = true; // flag on; consolidator stays None
+
+        let sid = "11111111-1111-1111-1111-111111111111";
+        for event in ["session-start", "session-end"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid }),
+            );
+            process(&state, env).await.unwrap();
+        }
+
+        let pages = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .any(|p| p.path.as_str().starts_with("sessions/")),
+            "SessionEnd must write a heuristic sessions/<id>.md page regardless of the flag; got {:?}",
+            pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>()
         );
     }
 

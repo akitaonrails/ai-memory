@@ -52,12 +52,20 @@ jobs:
   # ship to Docker Hub silently.
   release-build:
     name: cargo build --release
-    runs-on: ubuntu-latest
+    # Match the release workflow so the prebuilt binary runs on Debian bookworm
+    # in the Docker runtime image.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --bin ai-memory
+      - env:
+          TAILWIND_SKIP: "1"
+        run: cargo build --release --bin ai-memory
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-ai-memory-linux-x86_64
+          path: target/release/ai-memory
 
   native-packaging:
     name: native packaging assets
@@ -66,18 +74,22 @@ jobs:
       - uses: actions/checkout@v4
       - run: scripts/check-native-packaging.sh
 
-  # End-to-end docker smoke: builds the published image and confirms
-  # the binary inside runs. Catches Dockerfile drift (missing COPY,
-  # bad ENTRYPOINT) before it lands in production.
+  # End-to-end docker smoke: packages the release-build binary and confirms
+  # the image runs. Catches Dockerfile drift (missing COPY, bad ENTRYPOINT)
+  # before it lands in production without recompiling Rust in Docker.
   docker-smoke:
     name: docker image smoke
     runs-on: ubuntu-latest
     needs: release-build
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-ai-memory-linux-x86_64
+          path: dist/docker/ai-memory-linux-x86_64
       - uses: docker/setup-buildx-action@v3
       - name: build image (local tag only)
-        run: docker build -f docker/Dockerfile -t ai-memory:ci .
+        run: docker build --target runtime-prebuilt-amd64 -f docker/Dockerfile -t ai-memory:ci .
       - name: --version smoke
         run: docker run --rm ai-memory:ci --version
       - name: bundled hooks present

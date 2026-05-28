@@ -27,6 +27,9 @@ path (docker + Claude Code). This page covers everything else:
 > and replace `homelab` with `localhost` if the server runs on the
 > same machine as the agent CLI.
 
+The Docker image is published for `linux/amd64` and `linux/arm64`; Apple
+Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
+
 ---
 
 ## Server on a different machine
@@ -115,7 +118,7 @@ with `install-hooks --apply`.
 ### Package choice
 
 ```bash
-yay -S ai-memory-bin    # prebuilt Linux x86_64 binary, fastest install
+yay -S ai-memory-bin    # prebuilt Linux x86_64/aarch64 binary, fastest install
 yay -S ai-memory        # builds from source, works on x86_64 and aarch64
 ```
 
@@ -629,6 +632,7 @@ ai-memory works in three intensity tiers:
 |---|---|---|---|
 | **Zero-LLM** (default) | FTS5 search, rule-based session summaries, auto-handoffs from prompt + tool-call history | (none) | $0 |
 | **+ LLM consolidation** | LLM rewrites session pages as coherent narratives; PreCompact checkpoints; LLM-driven contradiction lint | `AI_MEMORY_LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | ~$0.01–0.05 / session |
+| **+ Anthropic via subscription** | Same LLM features using a Claude Pro/Max subscription instead of an API key | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` + `ANTHROPIC_OAUTH_TOKEN` | Uses your Claude subscription |
 | **+ ChatGPT/Codex OAuth** | Same LLM features using a ChatGPT Pro/Plus login instead of an OpenAI Platform key | `AI_MEMORY_LLM_PROVIDER=openai-oauth` + `ai-memory auth login openai-oauth` | Uses your ChatGPT subscription |
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ Hybrid retrieval** | RRF over FTS5 + vector cosine similarity. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` | ~$0.0001 / page on backfill |
@@ -640,6 +644,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | Setting | Default | Why |
 |---|---|---|
 | `AI_MEMORY_LLM_PROVIDER=anthropic` | `claude-haiku-4-5` | **Recommended default.** Best balance of speed, restraint, and classification quality. Not a reasoning model. Consistently classifies durable project rules as `kind: rule`. |
+| `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` | `claude-sonnet-4-6` | Anthropic via Claude subscription. Run `claude setup-token` once; set `ANTHROPIC_OAUTH_TOKEN` (or `CLAUDE_CODE_OAUTH_TOKEN`). No `ANTHROPIC_API_KEY` needed. Same `/v1/messages` endpoint, Bearer token auth. |
 | `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-5.4-mini` | Cheaper + faster alternative. Same parse reliability; mild over-classification on thin sessions. |
 | `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
@@ -653,6 +658,57 @@ If you set only the provider, ai-memory picks a sensible default:
 > thinking, GPT-o3, Gemini "thinking" variants) — they burn token budget on
 > internal reasoning and hang or emit empty responses with the strict-JSON
 > consolidation prompt. Turn reasoning off if you must use one.
+
+### Anthropic via Claude subscription (OAuth)
+
+> [!WARNING]
+> **Unofficial and against Anthropic's usage policies — use at your own risk.**
+> Anthropic provides no public OAuth API for the Claude Pro/Max subscription;
+> this reuses the `claude setup-token` credential against `/v1/messages`, which
+> is **not a supported or sanctioned integration**. Anthropic's terms reserve
+> subscription (Claude Code) access for interactive use, and using it as an
+> automated API backend may breach those terms and **could get your account
+> rate-limited, flagged, or banned**. The header recipe is also undocumented
+> and can change without notice. If you want a supported path, use the
+> `anthropic` provider with a real Platform API key. We ship this purely as an
+> opt-in convenience and make no guarantees about it.
+
+`anthropic-oauth` is for Claude Pro/Max subscribers who want to use their
+existing subscription instead of an Anthropic Platform API key. It hits the
+**same** `/v1/messages` endpoint as the `anthropic` provider — only the auth
+headers differ (Bearer token + `anthropic-beta: oauth-2025-04-20`).
+
+```bash
+# Obtain a token once using the Claude Code CLI:
+claude setup-token
+
+# Then export it (the CLI may also write CLAUDE_CODE_OAUTH_TOKEN automatically):
+export ANTHROPIC_OAUTH_TOKEN=<paste token here>
+export AI_MEMORY_LLM_PROVIDER=anthropic-oauth
+ai-memory serve
+```
+
+For Docker, pass the token as an env var:
+
+```bash
+docker run -d --name ai-memory \
+    -p 127.0.0.1:49374:49374 \
+    -v ai-memory-data:/data \
+    -e AI_MEMORY_LLM_PROVIDER=anthropic-oauth \
+    -e ANTHROPIC_OAUTH_TOKEN=<token> \
+    akitaonrails/ai-memory:latest
+```
+
+Both `ANTHROPIC_OAUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` are accepted;
+ai-memory checks `ANTHROPIC_OAUTH_TOKEN` first.
+
+> [!TIP]
+> **Pick a small, fast model.** ai-memory's LLM work — session
+> consolidation, lint, and explore — is summarisation/extraction, not hard
+> reasoning, so a Haiku-class model is plenty: faster, cheaper, and far easier
+> on subscription rate limits than Sonnet/Opus. Set e.g.
+> `AI_MEMORY_LLM_MODEL=claude-haiku-4-5`. Save the high-effort thinking models
+> for your actual coding agent.
 
 ### OpenAI OAuth / Codex
 
@@ -681,6 +737,14 @@ docker exec -it ai-memory ai-memory auth login openai-oauth
 
 Use `ai-memory auth status` to check whether a token is present and
 `ai-memory auth logout openai-oauth` to remove it.
+
+> [!TIP]
+> **Pick a small, fast model.** Consolidation / lint / explore are
+> summarisation tasks, not hard reasoning — a mini-class model is plenty and
+> is much easier on subscription rate limits. Set e.g.
+> `AI_MEMORY_LLM_MODEL=gpt-5-mini` (the `gpt-5.5` default works but is
+> overkill for this workload). Reserve the high-effort reasoning models for
+> your coding agent.
 
 ### GitHub Copilot
 

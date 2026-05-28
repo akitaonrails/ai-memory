@@ -114,7 +114,14 @@ cmd_upgrade() {
   if [ -d "${HOOKS_STAGE_DIR}" ]; then
     for d in "${HOOKS_STAGE_DIR}"/*/; do
       [ -d "${d}" ] || continue
-      found_agents+=("$(basename "${d}")")
+      name="$(basename "${d}")"
+      # `lib` (and any `_`-prefixed dir) holds shared hook helpers sourced
+      # by the per-agent scripts — it is NOT an agent. Skip it so we don't
+      # run `install-hooks --agent lib`, which clap rejects. (issue #38)
+      case "${name}" in
+        lib | _*) continue ;;
+      esac
+      found_agents+=("${name}")
     done
   fi
 

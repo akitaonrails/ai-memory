@@ -6,7 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.5.1] - 2026-05-27
+### Changed
+- Docker release publishing now builds Linux x86_64 and aarch64 artifacts once,
+  reuses those artifacts for Docker images, and smoke-tests both amd64 and arm64
+  images after assembling the multi-arch manifest.
+- The AUR `ai-memory-bin` package now supports aarch64 using the prebuilt Linux
+  aarch64 release artifact.
+- Docker source builds now use the vendored Tailwind CSS artifact, avoiding
+  cross-architecture Tailwind CLI cache collisions during multi-arch releases.
+
+## [0.5.0] - 2026-05-27
 ### Fixed
+- Docker release images now publish both `linux/amd64` and `linux/arm64`
+  manifests, so Apple Silicon and ARM64 Linux hosts can pull the image without
+  forcing x86 emulation ([#41]).
+
+## [0.4.0] - 2026-05-27
+### Added
+- `anthropic-oauth` LLM provider: use a Claude Pro/Max subscription via
+  `claude setup-token` instead of an API key. In-Rust, reuses the existing
+  Anthropic Messages client (incl. structured output). **Unofficial and
+  against Anthropic's usage policies — use at your own risk** (docs warn
+  prominently).
+- Opt-in `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`: when set and an LLM provider
+  is configured, SessionEnd additionally runs LLM consolidation on top of the
+  always-written rule-based summary page (non-fatal on failure) ([#40]).
+
+### Changed
+- Docs recommend a small/fast model (Haiku/mini class) for the OAuth /
+  subscription LLM backends — consolidation/lint/explore is summarisation, not
+  hard reasoning, and small models are far easier on subscription rate limits.
+- Aligned every prompt surface + doc with actual SessionEnd behavior: it always
+  writes a rule-based summary page + handoff; LLM consolidation runs on
+  PreCompact, on demand via `memory_consolidate`, and at session end only
+  behind the new opt-in flag ([#40]).
+
+### Fixed
+- Windows own-write detection: `inode_of` now returns the real NTFS file index
+  (was always `0`, which collapsed the watcher's own-write set) ([#37]).
+- `ai-memory upgrade` no longer fails with `invalid value 'lib' for --agent` —
+  the hook-refresh loop skips the shared `lib/` helper dir ([#38]).
 - Native packaging CI now supports non-root runners whose `systemd-tmpfiles`
   lacks `--dry-run`, while still operating only inside a temporary alternate
   root.
@@ -297,7 +338,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.5.0
+[0.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.4.0
 [0.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.3.2
 [0.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.3.1
 [0.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.3.0

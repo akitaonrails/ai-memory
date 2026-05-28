@@ -34,6 +34,8 @@ pub enum ProviderChoice {
     OpenAiOAuth,
     /// GitHub Copilot Chat backend.
     Copilot,
+    /// Anthropic Messages API via a Claude-subscription OAuth token.
+    AnthropicOAuth,
 }
 
 impl ProviderChoice {
@@ -55,6 +57,7 @@ impl ProviderChoice {
             },
             Self::OpenAiOAuth => AuthRequirement::OpenAiOAuthToken,
             Self::Copilot => AuthRequirement::CopilotToken,
+            Self::AnthropicOAuth => AuthRequirement::AnthropicOAuthToken,
         }
     }
 }
@@ -197,6 +200,14 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             let auth = config.auth.require_copilot_auth()?;
             Ok(Arc::new(CopilotProvider::new(auth, config.model)?))
         }
+        ProviderChoice::AnthropicOAuth => {
+            let token = config.auth.require_anthropic_oauth_token()?;
+            let mut provider = AnthropicProvider::new_oauth(token, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
+            Ok(Arc::new(provider))
+        }
     }
 }
 
@@ -237,6 +248,10 @@ mod tests {
         assert_eq!(
             ProviderChoice::Copilot.auth_requirement(),
             AuthRequirement::CopilotToken
+        );
+        assert_eq!(
+            ProviderChoice::AnthropicOAuth.auth_requirement(),
+            AuthRequirement::AnthropicOAuthToken
         );
     }
 

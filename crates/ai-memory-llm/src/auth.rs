@@ -44,6 +44,9 @@ pub enum AuthRequirement {
     OpenAiOAuthToken,
     /// Provider requires a GitHub token or stored auth for Copilot.
     CopilotToken,
+    /// Provider requires an Anthropic OAuth subscription token
+    /// (from `claude setup-token`).
+    AnthropicOAuthToken,
 }
 
 /// Resolved Copilot auth inputs.
@@ -68,6 +71,8 @@ pub enum Credential {
     OpenAiOAuthTokenFile(PathBuf),
     /// GitHub Copilot auth inputs.
     Copilot(CopilotAuth),
+    /// Anthropic OAuth subscription token from `claude setup-token`.
+    AnthropicOAuthToken(SecretString),
 }
 
 /// Resolved authentication for one provider instance.
@@ -129,6 +134,23 @@ impl ProviderAuth {
         }
     }
 
+    /// Resolve Anthropic OAuth auth from a subscription token (from `claude setup-token`).
+    #[must_use]
+    pub fn anthropic_oauth_token(token: Option<SecretString>) -> Self {
+        let has_token = token.is_some();
+        Self {
+            requirement: AuthRequirement::AnthropicOAuthToken,
+            credential: token.map(Credential::AnthropicOAuthToken),
+            source: if has_token {
+                CredentialSource::Environment {
+                    name: "ANTHROPIC_OAUTH_TOKEN",
+                }
+            } else {
+                CredentialSource::NotProvided
+            },
+        }
+    }
+
     fn from_api_key(
         requirement: AuthRequirement,
         key: Option<SecretString>,
@@ -182,6 +204,9 @@ impl ProviderAuth {
             (_, Some(Credential::Copilot(_))) => Err(LlmError::NotConfigured(
                 "API key credential expected, got copilot auth".into(),
             )),
+            (_, Some(Credential::AnthropicOAuthToken(_))) => Err(LlmError::NotConfigured(
+                "API key credential expected, got anthropic-oauth token".into(),
+            )),
             (AuthRequirement::RequiredApiKey { env_var }, None) => {
                 Err(LlmError::NotConfigured((*env_var).into()))
             }
@@ -195,6 +220,11 @@ impl ProviderAuth {
                 "copilot auth missing; run `ai-memory auth login copilot` or set COPILOT_GITHUB_TOKEN"
                     .into(),
             )),
+            (AuthRequirement::AnthropicOAuthToken, None) => Err(LlmError::NotConfigured(
+                "anthropic-oauth token missing; run `claude setup-token` and set \
+                 ANTHROPIC_OAUTH_TOKEN (or CLAUDE_CODE_OAUTH_TOKEN)"
+                    .into(),
+            )),
         }
     }
 
@@ -203,7 +233,33 @@ impl ProviderAuth {
     pub fn optional_api_key(&self) -> Option<SecretString> {
         match &self.credential {
             Some(Credential::ApiKey(key)) => Some(key.clone()),
-            Some(Credential::OpenAiOAuthTokenFile(_) | Credential::Copilot(_)) | None => None,
+            Some(
+                Credential::OpenAiOAuthTokenFile(_)
+                | Credential::Copilot(_)
+                | Credential::AnthropicOAuthToken(_),
+            )
+            | None => None,
+        }
+    }
+
+    /// Extract the Anthropic OAuth subscription token.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] when no token was resolved.
+    pub fn require_anthropic_oauth_token(&self) -> LlmResult<SecretString> {
+        match (&self.requirement, &self.credential) {
+            (
+                AuthRequirement::AnthropicOAuthToken,
+                Some(Credential::AnthropicOAuthToken(token)),
+            ) => Ok(token.clone()),
+            (AuthRequirement::AnthropicOAuthToken, None) => Err(LlmError::NotConfigured(
+                "anthropic-oauth token missing; run `claude setup-token` and set \
+                 ANTHROPIC_OAUTH_TOKEN (or CLAUDE_CODE_OAUTH_TOKEN)"
+                    .into(),
+            )),
+            _ => Err(LlmError::NotConfigured(
+                "anthropic-oauth token credential required".into(),
+            )),
         }
     }
 
@@ -318,5 +374,50 @@ mod tests {
             copilot.api_base_url.as_deref(),
             Some("https://api.example.test")
         );
+    }
+
+    #[test]
+    fn anthropic_oauth_token_round_trips_secret_and_reports_env_source() {
+        let auth = ProviderAuth::anthropic_oauth_token(Some(SecretString::from("oauth-tok-test")));
+        assert_eq!(
+            auth.source(),
+            CredentialSource::Environment {
+                name: "ANTHROPIC_OAUTH_TOKEN"
+            }
+        );
+        assert_eq!(
+            auth.require_anthropic_oauth_token()
+                .unwrap()
+                .expose_secret(),
+            "oauth-tok-test"
+        );
+        assert_eq!(auth.requirement(), AuthRequirement::AnthropicOAuthToken);
+    }
+
+    #[test]
+    fn anthropic_oauth_token_absent_returns_not_configured() {
+        let auth = ProviderAuth::anthropic_oauth_token(None);
+        assert_eq!(auth.source(), CredentialSource::NotProvided);
+        let err = auth.require_anthropic_oauth_token().unwrap_err();
+        assert!(
+            matches!(err, LlmError::NotConfigured(ref msg) if msg.contains("ANTHROPIC_OAUTH_TOKEN")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn require_api_key_rejects_anthropic_oauth_credential() {
+        let auth = ProviderAuth::anthropic_oauth_token(Some(SecretString::from("tok")));
+        let err = auth.require_api_key().unwrap_err();
+        assert!(
+            matches!(err, LlmError::NotConfigured(ref msg) if msg.contains("anthropic-oauth token")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn optional_api_key_returns_none_for_anthropic_oauth_credential() {
+        let auth = ProviderAuth::anthropic_oauth_token(Some(SecretString::from("tok")));
+        assert!(auth.optional_api_key().is_none());
     }
 }

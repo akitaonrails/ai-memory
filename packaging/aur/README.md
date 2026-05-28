@@ -3,8 +3,8 @@
 This directory contains the package definitions for two Arch User Repository
 packages:
 
-- `ai-memory-bin`: installs the prebuilt Linux x86_64 binary and bundled files
-  from GitHub Releases.
+- `ai-memory-bin`: installs the prebuilt Linux x86_64/aarch64 binary and bundled
+  files from GitHub Releases.
 - `ai-memory`: builds from the GitHub source tag with the local Rust toolchain.
 
 The files here are the source of truth for the AUR repos, but AUR still requires
@@ -15,7 +15,7 @@ each package to be pushed to its own Git repository with a generated `.SRCINFO`.
 Use an AUR helper:
 
 ```bash
-yay -S ai-memory-bin    # prebuilt binary, fastest on x86_64
+yay -S ai-memory-bin    # prebuilt binary, fastest on x86_64/aarch64
 yay -S ai-memory        # builds from source, supports x86_64/aarch64
 ```
 
@@ -75,10 +75,7 @@ version=X.Y.Z
 # Source package tarball
 curl -fsSL "https://github.com/akitaonrails/ai-memory/archive/refs/tags/v${version}.tar.gz" | sha256sum
 
-# Binary package release artifact
+# Binary package release artifacts
 curl -fsSL "https://github.com/akitaonrails/ai-memory/releases/download/v${version}/ai-memory-linux-x86_64.tar.gz.sha256"
+curl -fsSL "https://github.com/akitaonrails/ai-memory/releases/download/v${version}/ai-memory-linux-aarch64.tar.gz.sha256"
 ```
-
-`ai-memory-bin` is currently `x86_64` only because the release workflow publishes
-a Linux x86_64 binary. The source package includes `aarch64` because it compiles
-locally on Arch Linux ARM.

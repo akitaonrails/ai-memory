@@ -334,6 +334,7 @@ fn resolve_provider(side: &str, args: &Args) -> Result<ResolvedConfig> {
             None,
             base_url.clone(),
         ),
+        AuthRequirement::AnthropicOAuthToken => ProviderAuth::anthropic_oauth_token(api_key),
     };
 
     Ok(ResolvedConfig {
