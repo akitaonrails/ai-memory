@@ -292,8 +292,8 @@ fi
 # binary can derive the *real* host-side project name from it. The
 # `commands::resolve_project_name` helper checks this env var first
 # and falls back to the cwd basename only if it's unset.
-exec "${DOCKER}" run --rm "${TTY_ARGS[@]}" \
-  "${NETWORK_ARGS[@]}" \
+exec "${DOCKER}" run --rm ${TTY_ARGS[@]+"${TTY_ARGS[@]}"} \
+  ${NETWORK_ARGS[@]+"${NETWORK_ARGS[@]}"} \
   -v "${HOME}:${HOME}" \
   -v "${PWD}:/work" \
   -w /work \
@@ -301,5 +301,5 @@ exec "${DOCKER}" run --rm "${TTY_ARGS[@]}" \
   -e AI_MEMORY_HOST_CWD="${PWD}" \
   -u "$(id -u):$(id -g)" \
   "${DATA_ARGS[@]}" \
-  "${ENV_ARGS[@]}" \
+  ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
   "${IMAGE}" "$@"
