@@ -248,6 +248,7 @@ done
 # 127.0.0.1 would mean "this helper container", so thin-client commands like
 # `status` and `bootstrap` could not reach the default server.
 NETWORK_ARGS=()
+USER_ARGS=()
 case "$(uname -s 2>/dev/null || true)" in
   Linux)
     if [ -z "${AI_MEMORY_SERVER_URL:-}" ]; then
@@ -258,6 +259,19 @@ case "$(uname -s 2>/dev/null || true)" in
     if [ -z "${AI_MEMORY_SERVER_URL:-}" ]; then
       ENV_ARGS+=(-e "AI_MEMORY_SERVER_URL=http://host.docker.internal:49374")
     fi
+    # On macOS, Docker Desktop handles file-sharing permissions via its
+    # gRPC/SSH layer.  Passing -u <host-uid>:<host-gid> causes a UID
+    # mismatch: the data volume is typically owned by the container's
+    # internal uid 1000 (the ai-memory user), but the host UID on macOS
+    # is usually 501/502.  The one-shot wrapper container then cannot
+    # create log files or write to the data dir, crashing with
+    # "Permission denied" in the rolling file appender.
+    # Omitting -u lets the container run as its default (uid 1000)
+    # which matches the volume owner.
+    USER_ARGS=()
+    ;;
+  *)
+    USER_ARGS=(-u "$(id -u):$(id -g)")
     ;;
 esac
 
@@ -292,14 +306,14 @@ fi
 # binary can derive the *real* host-side project name from it. The
 # `commands::resolve_project_name` helper checks this env var first
 # and falls back to the cwd basename only if it's unset.
-exec "${DOCKER}" run --rm "${TTY_ARGS[@]}" \
-  "${NETWORK_ARGS[@]}" \
+exec "${DOCKER}" run --rm ${TTY_ARGS[@]+"${TTY_ARGS[@]}"} \
+  ${NETWORK_ARGS[@]+"${NETWORK_ARGS[@]}"} \
   -v "${HOME}:${HOME}" \
   -v "${PWD}:/work" \
   -w /work \
   -e HOME="${HOME}" \
   -e AI_MEMORY_HOST_CWD="${PWD}" \
-  -u "$(id -u):$(id -g)" \
+  "${USER_ARGS[@]}" \
   "${DATA_ARGS[@]}" \
-  "${ENV_ARGS[@]}" \
+  ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
   "${IMAGE}" "$@"
