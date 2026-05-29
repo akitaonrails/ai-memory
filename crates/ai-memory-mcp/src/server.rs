@@ -62,6 +62,11 @@ them:\n\
 - `memory_write_page` — when the user explicitly asks to remember, \
   save, or annotate durable project knowledge. This writes a wiki page; \
   do NOT use `memory_handoff_begin` for permanent annotations.\n\
+- `memory_read_page` — when the user asks to read, open, or show the \
+  full content of a specific page. Accepts a `query` (searches FTS5 and \
+  returns the top hit's full body) or a `path` (direct lookup). Use \
+  this instead of memory_query when the user wants the complete text, \
+  not just snippets.\n\
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
@@ -259,6 +264,21 @@ struct ExploreArgs {
     #[serde(default)]
     recent_pages_limit: Option<usize>,
     /// Project to explore. Omit to target the project you're currently
+    /// working in (resolved from recent hook activity).
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ReadPageArgs {
+    /// FTS5 query to find the page (searches and returns the top hit's full body).
+    /// Ignored when `path` is provided.
+    #[serde(default, alias = "q", alias = "search")]
+    query: Option<String>,
+    /// Exact wiki path (e.g. `notes/foo.md`). Takes precedence over `query`.
+    #[serde(default)]
+    path: Option<String>,
+    /// Project to read from. Omit to target the project you're currently
     /// working in (resolved from recent hook activity).
     #[serde(default)]
     project: Option<String>,
@@ -685,6 +705,74 @@ impl AiMemoryServer {
         ok_json(&serde_json::json!({
             "page_id": page_id.to_string(),
             "path": path.to_string()
+        }))
+    }
+
+    /// Fetch the full body of a single wiki page.
+    #[tool(description = "Fetch the FULL body of a wiki page for the current \
+        project. Use this when the user asks to read, open, or show a specific \
+        page by name or topic — not just snippets. \
+        \
+        Two modes: \
+        (1) pass `query` — runs an FTS5 search and returns the top hit's \
+        complete body (title + markdown, frontmatter stripped); \
+        (2) pass `path` — direct lookup by the page's relative wiki path \
+        (e.g. `notes/budget.md`). `path` takes precedence when both are given. \
+        \
+        Returns `{ path, title, body, frontmatter }`. Errors if the page is \
+        not found or neither argument is supplied.")]
+    async fn memory_read_page(
+        &self,
+        Parameters(args): Parameters<ReadPageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Err(McpError::internal_error(
+                "memory_read_page requires the server to be built with a wiki handle",
+                None,
+            ));
+        };
+        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+
+        let page_path = if let Some(p) = args.path {
+            PagePath::new(p)
+                .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?
+        } else if let Some(query) = args.query {
+            let hits = self
+                .reader
+                .search_pages_for_project(ws, proj, query.clone(), 1)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            match hits.into_iter().next() {
+                Some(h) => h.path,
+                None => {
+                    return Err(McpError::internal_error(
+                        format!("no pages found for query {query:?}"),
+                        None,
+                    ));
+                }
+            }
+        } else {
+            return Err(McpError::invalid_params(
+                "provide either `query` or `path`",
+                None,
+            ));
+        };
+
+        let md = wiki
+            .read_page(ws, proj, &page_path)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let title = md
+            .frontmatter
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        ok_json(&serde_json::json!({
+            "path": page_path.to_string(),
+            "title": title,
+            "body": md.body,
+            "frontmatter": md.frontmatter,
         }))
     }
 
@@ -1123,6 +1211,7 @@ mod tests {
             "memory_handoff_begin",
             "memory_consolidate",
             "memory_write_page",
+            "memory_read_page",
             "memory_lint",
             "memory_forget_sweep",
             "memory_install_self_routing",

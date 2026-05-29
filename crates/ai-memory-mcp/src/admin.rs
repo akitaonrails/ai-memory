@@ -14,6 +14,7 @@
 //! - `POST /admin/purge-project`  — delete a project and all its data.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
+//! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -122,6 +123,7 @@ fn default_chunk_input_tokens() -> usize {
 /// - `POST /admin/bootstrap`
 /// - `GET  /admin/status`
 /// - `GET  /admin/search`
+/// - `GET  /admin/read-page`
 /// - `POST /admin/reorg`
 /// - `POST /admin/lint`
 /// - `POST /admin/forget-sweep`
@@ -136,6 +138,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/bootstrap", post(handle_bootstrap))
         .route("/admin/status", get(handle_status))
         .route("/admin/search", get(handle_search))
+        .route("/admin/read-page", get(handle_read_page))
         .route("/admin/reorg", post(handle_reorg))
         .route("/admin/lint", post(handle_lint))
         .route("/admin/forget-sweep", post(handle_forget_sweep))
@@ -331,6 +334,113 @@ async fn handle_search(
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// read-page
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/read-page`.
+///
+/// Two modes:
+/// - Path mode: `workspace` + `project` + `path` — direct lookup.
+/// - Query mode: `workspace` + `project` + `q` — FTS5 search scoped to
+///   the given project; fetches the top-ranking hit's full body.
+#[derive(Debug, Deserialize)]
+struct ReadPageQuery {
+    /// Workspace name (required).
+    workspace: String,
+    /// Project name (required).
+    project: String,
+    /// Direct wiki path (e.g. `notes/foo.md`). Takes precedence over `q`.
+    #[serde(default)]
+    path: Option<String>,
+    /// FTS5 query. Used when `path` is absent; fetches the top hit's full body.
+    #[serde(default)]
+    q: Option<String>,
+}
+
+/// Response body for `GET /admin/read-page`.
+#[derive(Debug, Serialize)]
+struct ReadPageResponse {
+    path: String,
+    workspace: String,
+    project: String,
+    title: Option<String>,
+    body: String,
+    frontmatter: serde_json::Value,
+}
+
+async fn handle_read_page(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ReadPageQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match resolve_ws_proj(&state, &query.workspace, &query.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    // Resolve the page path: direct `path` takes precedence over `q`.
+    let page_path = if let Some(raw) = query.path {
+        match ai_memory_core::PagePath::new(raw) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+                );
+            }
+        }
+    } else if let Some(q) = query.q {
+        let hits = match state
+            .reader
+            .search_pages_for_project(ws, proj, q.clone(), 1)
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => return internal_err(e.to_string()),
+        };
+        match hits.into_iter().next() {
+            Some(h) => h.path,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": format!("no pages found for query {q:?}") })),
+                );
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "provide `path` or `q`" })),
+        );
+    };
+
+    match state.wiki.read_page(ws, proj, &page_path) {
+        Ok(md) => {
+            let title = md
+                .frontmatter
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let resp = ReadPageResponse {
+                path: page_path.to_string(),
+                workspace: query.workspace,
+                project: query.project,
+                title,
+                body: md.body,
+                frontmatter: md.frontmatter,
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({}))),
+            )
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }

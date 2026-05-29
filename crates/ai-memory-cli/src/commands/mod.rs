@@ -21,6 +21,7 @@ pub mod lint;
 pub mod llm_test;
 pub mod openclaw_plugin;
 pub mod purge_project;
+pub mod read_page;
 pub mod rename_project;
 pub mod render_shared;
 pub mod reorg;

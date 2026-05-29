@@ -33,6 +33,10 @@ pub enum Command {
     Status(StatusArgs),
     /// Full-text search the wiki via FTS5.
     Search(SearchArgs),
+    /// Fetch and display the full body of a wiki page.
+    /// Accepts either `--path` (exact path) or a positional query that
+    /// searches FTS5 and fetches the top matching page.
+    ReadPage(ReadPageArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
     /// Run the MCP server (with watcher) over stdio or HTTP.
@@ -403,6 +407,26 @@ pub struct SearchArgs {
     #[arg(short = 'n', long, default_value_t = 10)]
     pub limit: usize,
     /// Emit results as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `read-page`.
+#[derive(Debug, Args)]
+pub struct ReadPageArgs {
+    /// FTS5 query to find the page (searches and fetches the top hit).
+    /// Ignored when `--path` is provided.
+    pub query: Option<String>,
+    /// Exact wiki path (e.g. `notes/foo.md`). Takes precedence over `query`.
+    #[arg(long)]
+    pub path: Option<String>,
+    /// Workspace name. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the current project.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Emit the page as JSON (includes frontmatter).
     #[arg(long)]
     pub json: bool,
 }
