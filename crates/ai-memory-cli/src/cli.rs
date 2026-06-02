@@ -788,8 +788,12 @@ pub struct WritePageArgs {
     #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
     pub workspace: String,
     /// Project name within the workspace (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_PROJECT.to_string())]
-    pub project: String,
+    /// When omitted, auto-derived from the current project — the SAME
+    /// heuristic `read-page`/`search` use, so a write and the read-back
+    /// that follows it always resolve to the same project (no "wrote to
+    /// `scratch`, read from `<cwd>`" divergence).
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 #[cfg(test)]

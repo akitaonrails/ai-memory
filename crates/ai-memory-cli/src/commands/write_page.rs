@@ -50,10 +50,14 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
         args.body
     };
 
-    // `project` has a non-empty default ("scratch"); pass it directly so the
-    // explicit --project flag always wins. The auto-detect path is only useful
-    // for commands whose project arg is truly optional (no default).
-    let project = args.project.clone();
+    // Resolve the project the SAME way `read-page`/`search` do: an explicit
+    // `--project` wins, otherwise auto-detect from the current dir. Previously
+    // `write-page` hard-defaulted to "scratch" while `read-page` auto-detected,
+    // so a write+read-back pair from any dir not named "scratch" silently
+    // targeted two different projects — the write landed in `default/scratch`
+    // and the read 404'd ("ghost write"). Sharing one resolver removes the
+    // divergence at the source.
+    let project = super::resolve_project_name(config, args.project.as_deref())?;
 
     let endpoint = ServerEndpoint::from_config(config);
     let resp: WritePageResponseBody = post_json(
