@@ -1224,6 +1224,8 @@ const handoffChecked = new Set<string>();
 const preCompactLast = new Map<string, number>();
 
 function startSession(ctx: any, extra: Record<string, unknown> = {{}}): void {{
+  // Skip subagent sessions (--mode json --no-session) — ephemeral, no ai-memory tracking
+  if (ctx?.mode === "json") return;
   const id = sessionID(ctx);
   if (!id || startedSessions.has(id)) return;
   startedSessions.add(id);
@@ -1339,6 +1341,8 @@ export default function AiMemoryExtension(api: any): void {{
   }});
 
   api.on("session_shutdown", (_event: any, ctx: any) => {{
+    // Skip subagent sessions (--mode json --no-session) — they create noise handoffs
+    if (ctx.mode === "json") return;
     startSession(ctx);
     postHook("session-end", sessionPayload(ctx));
   }});
