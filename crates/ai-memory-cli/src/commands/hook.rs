@@ -21,18 +21,52 @@ use crate::cli::HookArgs;
 use super::hook_capture::{build_client, extract_cwd, get_handoff, marker_query_suffix};
 use super::hook_spool;
 
-/// Per-event POST budget during a drain (off the hot path — generous enough for
-/// a remote/slow server).
-const DRAIN_EVENT_TIMEOUT: Duration = Duration::from_secs(3);
+// All drain/handoff timings default to the values below and can be overridden
+// (in milliseconds) by the matching env var, for very high-latency or
+// large-backlog instances. Two kinds: per-request timeouts cap each individual
+// POST / handoff GET; session-boundary budgets cap how long a boundary spends
+// draining (so a boundary never hangs unbounded).
+const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 3000;
+const DEFAULT_HANDOFF_TIMEOUT_MS: u64 = 3000;
+const DEFAULT_START_BUDGET_MS: u64 = 3000;
+const DEFAULT_END_BUDGET_MS: u64 = 10000;
+
+/// Per-event POST timeout during a drain. Env: `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MS`.
+fn drain_event_timeout() -> Duration {
+    env_ms("AI_MEMORY_HOOK_DRAIN_TIMEOUT_MS", DEFAULT_DRAIN_TIMEOUT_MS)
+}
+/// Synchronous handoff GET timeout. Env: `AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MS`.
+fn handoff_timeout() -> Duration {
+    env_ms(
+        "AI_MEMORY_HOOK_HANDOFF_TIMEOUT_MS",
+        DEFAULT_HANDOFF_TIMEOUT_MS,
+    )
+}
 /// Total budget for the `session-start` cleanup drain (kept tight so session
-/// start stays snappy even when the server is down — leftovers wait).
-const START_DRAIN_BUDGET: Duration = Duration::from_secs(3);
+/// start stays snappy even when the server is down — leftovers wait). Env:
+/// `AI_MEMORY_HOOK_START_BUDGET_MS`.
+fn start_drain_budget() -> Duration {
+    env_ms("AI_MEMORY_HOOK_START_BUDGET_MS", DEFAULT_START_BUDGET_MS)
+}
 /// Total budget for the `session-end` flush (the main delivery point; a session
-/// boundary tolerates more, and the agent isn't mid-tool-call).
-const END_DRAIN_BUDGET: Duration = Duration::from_secs(10);
-/// Budget for the synchronous handoff fetch (larger than a loopback default so
-/// a remote server can answer).
-const HANDOFF_TIMEOUT: Duration = Duration::from_secs(3);
+/// boundary tolerates more). Env: `AI_MEMORY_HOOK_END_BUDGET_MS`.
+fn end_drain_budget() -> Duration {
+    env_ms("AI_MEMORY_HOOK_END_BUDGET_MS", DEFAULT_END_BUDGET_MS)
+}
+
+/// Read a positive-integer millisecond override from `name`, falling back to
+/// `default_ms` for missing / empty / non-numeric / zero values.
+fn env_ms(name: &str, default_ms: u64) -> Duration {
+    parse_ms(std::env::var(name).ok(), default_ms)
+}
+
+fn parse_ms(raw: Option<String>, default_ms: u64) -> Duration {
+    let ms = raw
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default_ms);
+    Duration::from_millis(ms)
+}
 
 /// Run a single hook end-to-end. Always returns Ok and always writes a JSON
 /// object to stdout — a hook must never fail the agent.
@@ -72,12 +106,12 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     // session-start: drain any backlog (e.g. from a previous session that ended
     // abruptly), then fetch + inject the pending handoff for the resuming agent.
     if args.event == "session-start" {
-        let _ = hook_spool::drain(&spool, &dd, START_DRAIN_BUDGET, DRAIN_EVENT_TIMEOUT).await;
+        let _ = hook_spool::drain(&spool, &dd, start_drain_budget(), drain_event_timeout()).await;
         let client = build_client();
         let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
         let handoff_url = format!("{base}/handoff?agent={}{qs}", args.agent);
         if let Some(handoff) =
-            get_handoff(&client, &handoff_url, bearer.as_deref(), HANDOFF_TIMEOUT).await
+            get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
         {
             let envelope = serde_json::json!({
                 "hookSpecificOutput": {
@@ -93,7 +127,7 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     // session-end: the main delivery point — flush the session's spooled
     // observations (oldest-first) so the server has them before it consolidates.
     if args.event == "session-end" {
-        let _ = hook_spool::drain(&spool, &dd, END_DRAIN_BUDGET, DRAIN_EVENT_TIMEOUT).await;
+        let _ = hook_spool::drain(&spool, &dd, end_drain_budget(), drain_event_timeout()).await;
     }
 
     println!("{{}}");
@@ -112,4 +146,39 @@ fn resolve_data_dir(data_dir: Option<&Path>) -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("ai-memory")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ms_falls_back_on_invalid() {
+        assert_eq!(parse_ms(None, 3000), Duration::from_millis(3000));
+        assert_eq!(
+            parse_ms(Some(String::new()), 3000),
+            Duration::from_millis(3000)
+        );
+        assert_eq!(
+            parse_ms(Some("abc".into()), 3000),
+            Duration::from_millis(3000)
+        );
+        // Zero is rejected (a 0ms timeout would drop every request).
+        assert_eq!(
+            parse_ms(Some("0".into()), 3000),
+            Duration::from_millis(3000)
+        );
+    }
+
+    #[test]
+    fn parse_ms_honours_valid_override() {
+        assert_eq!(
+            parse_ms(Some("8000".into()), 3000),
+            Duration::from_millis(8000)
+        );
+        assert_eq!(
+            parse_ms(Some("  6000 ".into()), 3000),
+            Duration::from_millis(6000)
+        );
+    }
 }
