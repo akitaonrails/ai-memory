@@ -174,12 +174,13 @@ native on an i7-6700HQ). Notes:
   - `windows-native` — direct binary call (default on native Windows).
   - `windows-bash` — `bash -c` + `.sh` through Git Bash (the previous
     default; set this to opt back in).
-  - `posix` — POSIX `.sh` (default on macOS / Linux).
+  - `posix` — POSIX `.sh`. The Docker-wrapper default (the host has no local
+    binary); set it explicitly to opt a native install back into the scripts.
   - `posix-native` — direct binary call on macOS / Linux (`<exe> hook
-    --event …`) instead of the `.sh` script, so the hook uses the local
-    event spool + OIDC-token fallback. **Opt-in** (never the default,
-    because the Docker wrapper renders for the host with no local binary).
-    Set it when ai-memory is installed as a native binary (cargo / release).
+    --event …`) instead of the `.sh` script, so the hook uses the local event
+    spool + OIDC-token fallback. The **default for a native macOS / Linux
+    install** (cargo / release binary), mirroring `windows-native`. The Docker
+    wrapper forces `posix`, so its host-rendered config keeps the `.sh` scripts.
 
   Set the env var before running `install-hooks` so the chosen platform
   is baked into the rendered hook commands.

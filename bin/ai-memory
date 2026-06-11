@@ -213,6 +213,13 @@ if [ -z "${AI_MEMORY_NO_TTY:-}" ] && [ -t 0 ] && [ -t 1 ]; then
   TTY_ARGS=(-it)
 fi
 
+# The CLI runs INSIDE the container but renders hook config for the HOST, which
+# has no local ai-memory binary. Native installs default to `posix-native` (the
+# binary hook command); the wrapper must NOT inherit that or it would bake the
+# *container's* binary path into the host's hook config. Force the shell-script
+# platform (`posix`) unless the operator chose one explicitly.
+export AI_MEMORY_HOOK_PLATFORM="${AI_MEMORY_HOOK_PLATFORM:-posix}"
+
 ENV_ARGS=()
 for var in \
   AI_MEMORY_SERVER_URL \

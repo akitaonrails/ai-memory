@@ -342,10 +342,11 @@ pub(crate) enum HookCommandPlatform {
     WindowsNative,
     /// POSIX (Linux/macOS), native: invoke the `ai-memory` binary directly
     /// (`<exe> hook --event …`) instead of the `.sh` script, so the hook gets
-    /// the local spool + OIDC-token fallback. **Opt-in** via
-    /// `AI_MEMORY_HOOK_PLATFORM=posix-native` — never the default, because the
-    /// Docker wrapper renders for the host with no local binary (it keeps the
-    /// `.sh` path). Use it when ai-memory is installed as a native binary.
+    /// the local spool + OIDC-token fallback. The **default** for native
+    /// Linux/macOS Claude Code installs (mirrors `WindowsNative`). The Docker
+    /// wrapper forces `posix` so its host-rendered config keeps the `.sh` path
+    /// (the host has no local binary). Override with
+    /// `AI_MEMORY_HOOK_PLATFORM=posix` to get the shell scripts.
     PosixNative,
 }
 
@@ -377,7 +378,10 @@ impl HookCommandPlatform {
             Ok(v) if v.eq_ignore_ascii_case("windows-native") => Self::WindowsNative,
             Ok(v) if v.eq_ignore_ascii_case("posix-native") => Self::PosixNative,
             _ if cfg!(windows) => Self::WindowsNative,
-            _ => Self::Posix,
+            // Native macOS / Linux defaults to the binary hook command (spool +
+            // OIDC), same as Windows. The Docker wrapper forces `posix` so its
+            // host-rendered config keeps using the `.sh` scripts.
+            _ => Self::PosixNative,
         }
     }
 }
