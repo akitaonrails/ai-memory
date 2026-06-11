@@ -403,13 +403,25 @@ fn strip_instructions_block(content: &str) -> (String, bool) {
     (format!("{head}{tail}"), true)
 }
 
-/// True when a hook command string was written by ai-memory. Install
-/// inlines `AI_MEMORY_HOOK_URL=<url> [AI_MEMORY_AUTH_TOKEN=…] <path>`
-/// into the command (render_shared.rs); the `AI_MEMORY_HOOK_URL=`
-/// prefix is unconditional, so it is the reliable signature —
-/// independent of auth, --server-url, --hooks-dir, --host-prefix.
+/// True when a hook command string was written by ai-memory. Install renders
+/// one of two shapes (render_shared.rs), each with its own reliable signature:
+///
+/// - **Shell scripts** (`.sh`/`.ps1`, the Docker / `setup-agent` path) inline
+///   `AI_MEMORY_HOOK_URL=<url> [AI_MEMORY_AUTH_TOKEN=…] <path>` — the
+///   `AI_MEMORY_HOOK_URL=` prefix is unconditional.
+/// - **Native binary call** (`windows-native` / `posix-native`, the default for
+///   a local-binary Claude Code install) is `<exe> hook --event <e> --agent
+///   <a> --server-url <url> [--auth-token <t>]` — the
+///   `hook --event …` / `--agent …` / `--server-url …` triple is unique to
+///   ai-memory's own `hook` subcommand.
+///
+/// Both signatures are independent of auth, the `--server-url` value,
+/// `--hooks-dir`, and `--host-prefix`.
 fn hook_command_is_ours(command: &str) -> bool {
     command.contains("AI_MEMORY_HOOK_URL=")
+        || (command.contains("hook --event ")
+            && command.contains(" --agent ")
+            && command.contains(" --server-url "))
 }
 
 /// Result of stripping ai-memory entries from a hooks JSON file.
@@ -760,10 +772,24 @@ mod tests {
     }
 
     #[test]
+    fn hook_signature_matches_native_binary_command() {
+        // `posix-native` / `windows-native`: a direct binary call, no
+        // `AI_MEMORY_HOOK_URL=` prefix. The `hook --event`/`--agent`/
+        // `--server-url` triple is the signature.
+        let posix = "'/home/u/.cargo/bin/ai-memory' hook --event stop --agent claude-code --server-url 'http://127.0.0.1:49374'";
+        assert!(hook_command_is_ours(posix));
+        let win = "\"C:\\Users\\u\\.cargo\\bin\\ai-memory.exe\" hook --event session-start --agent claude-code --server-url \"http://h:49374\" --auth-token \"tok\"";
+        assert!(hook_command_is_ours(win));
+    }
+
+    #[test]
     fn hook_signature_rejects_third_party_with_generic_name() {
         // A user's own hook that happens to be named stop.sh — no prefix.
         assert!(!hook_command_is_ours("/usr/local/bin/my-stop.sh"));
         assert!(!hook_command_is_ours("/opt/tools/hooks/session-start.sh"));
+        // A third-party tool that merely mentions "hook" is not ours: it
+        // lacks the full subcommand triple.
+        assert!(!hook_command_is_ours("/usr/bin/git-hook --event push"));
     }
 
     #[test]
