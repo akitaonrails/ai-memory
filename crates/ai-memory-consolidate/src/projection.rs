@@ -7,6 +7,10 @@ use ai_memory_core::{Observation, ObservationKind};
 const DEFAULT_EVEN_SAMPLE_BUCKETS: usize = 16;
 const MAX_RENDERED_TITLE_CHARS: usize = 500;
 const MAX_RENDERED_SOURCE_CHARS: usize = 128;
+const MAX_RECENT_TAIL_RESERVATION: usize = 128;
+const RECENT_TAIL_RESERVATION_DIVISOR: usize = 2;
+const RECENCY_SCORE_WEIGHT: i32 = 30;
+const HIGH_SIGNAL_SCORE_BONUS: i32 = 45;
 
 /// Budget and rendering controls for observation projection.
 #[derive(Debug, Clone)]
@@ -84,6 +88,24 @@ pub fn project_observations(
     observations: &[Observation],
     cfg: &ObservationProjectionConfig,
 ) -> ProjectedObservations {
+    project_observations_with_preference(observations, cfg, false)
+}
+
+/// Project observations while preferring later in-session facts. This is kept
+/// crate-internal so the public projection config stays source-compatible.
+#[must_use]
+pub(crate) fn project_observations_prefer_recent(
+    observations: &[Observation],
+    cfg: &ObservationProjectionConfig,
+) -> ProjectedObservations {
+    project_observations_with_preference(observations, cfg, true)
+}
+
+fn project_observations_with_preference(
+    observations: &[Observation],
+    cfg: &ObservationProjectionConfig,
+    prefer_recent: bool,
+) -> ProjectedObservations {
     if observations.is_empty() {
         return ProjectedObservations {
             text: "(none)".into(),
@@ -115,11 +137,12 @@ pub fn project_observations(
         };
     }
 
-    let mut selected = select_observation_indices(observations, cfg.max_selected_observations);
+    let mut selected =
+        select_observation_indices(observations, cfg.max_selected_observations, prefer_recent);
     let mut rendered = render_projection(observations, &selected, cfg.per_body_excerpt_chars);
 
     while rendered.text.chars().count() > cfg.max_total_chars && selected.len() > 1 {
-        let Some(remove_idx) = lowest_prunable_index(observations, &selected) else {
+        let Some(remove_idx) = lowest_prunable_index(observations, &selected, prefer_recent) else {
             break;
         };
         selected.retain(|idx| *idx != remove_idx);
@@ -272,7 +295,11 @@ fn fit_text_to_budget(text: &str, max_chars: usize, marker: &str) -> String {
     out
 }
 
-fn select_observation_indices(observations: &[Observation], limit: usize) -> Vec<usize> {
+fn select_observation_indices(
+    observations: &[Observation],
+    limit: usize,
+    prefer_recent: bool,
+) -> Vec<usize> {
     if observations.len() <= limit {
         return (0..observations.len()).collect();
     }
@@ -283,13 +310,21 @@ fn select_observation_indices(observations: &[Observation], limit: usize) -> Vec
     }
     selected.insert(0);
     selected.insert(observations.len() - 1);
+    if prefer_recent {
+        for idx in recent_tail_indices(observations.len(), limit) {
+            if selected.len() >= limit {
+                break;
+            }
+            selected.insert(idx);
+        }
+    }
     let even = even_sample_indices(observations.len());
     let mut scored: Vec<(i32, usize)> = observations
         .iter()
         .enumerate()
         .filter(|(idx, _)| !selected.contains(idx))
         .map(|(idx, obs)| {
-            let mut score = observation_score(obs, idx, observations.len());
+            let mut score = observation_score(obs, idx, observations.len(), prefer_recent);
             if even.contains(&idx) {
                 score += 40;
             }
@@ -324,14 +359,82 @@ fn even_sample_indices(total: usize) -> BTreeSet<usize> {
     out
 }
 
-fn lowest_prunable_index(observations: &[Observation], selected: &[usize]) -> Option<usize> {
-    selected
+fn recent_tail_indices(total: usize, limit: usize) -> Vec<usize> {
+    if total == 0 || limit == 0 {
+        return Vec::new();
+    }
+    let tail_len = if limit <= 2 {
+        1
+    } else {
+        (limit / RECENT_TAIL_RESERVATION_DIVISOR).clamp(2, MAX_RECENT_TAIL_RESERVATION)
+    }
+    .min(total);
+    let start = total.saturating_sub(tail_len);
+    (start..total).collect()
+}
+
+fn recent_pruning_indices(total: usize) -> Vec<usize> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let tail_len = if total <= 2 {
+        1
+    } else {
+        (total / RECENT_TAIL_RESERVATION_DIVISOR).clamp(2, MAX_RECENT_TAIL_RESERVATION)
+    }
+    .min(total);
+    let start = total.saturating_sub(tail_len);
+    (start..total).collect()
+}
+
+fn lowest_prunable_index(
+    observations: &[Observation],
+    selected: &[usize],
+    prefer_recent: bool,
+) -> Option<usize> {
+    let recent_tail: BTreeSet<_> = if prefer_recent {
+        recent_pruning_indices(observations.len())
+            .into_iter()
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let candidates: Vec<_> = selected
         .iter()
         .copied()
         .filter(|idx| !is_hard_anchor(observations, *idx))
+        .collect();
+
+    lowest_scored_index(
+        observations,
+        candidates
+            .iter()
+            .copied()
+            .filter(|idx| !recent_tail.contains(idx)),
+        prefer_recent,
+    )
+    .or_else(|| {
+        if prefer_recent {
+            selected
+                .iter()
+                .copied()
+                .find(|idx| idx + 1 != observations.len() && !recent_tail.contains(idx))
+        } else {
+            None
+        }
+    })
+    .or_else(|| lowest_scored_index(observations, candidates.iter().copied(), prefer_recent))
+}
+
+fn lowest_scored_index(
+    observations: &[Observation],
+    indices: impl Iterator<Item = usize>,
+    prefer_recent: bool,
+) -> Option<usize> {
+    indices
         .map(|idx| {
             (
-                observation_score(&observations[idx], idx, observations.len()),
+                observation_score(&observations[idx], idx, observations.len(), prefer_recent),
                 idx,
             )
         })
@@ -343,7 +446,7 @@ fn is_hard_anchor(observations: &[Observation], idx: usize) -> bool {
     idx == 0 || idx + 1 == observations.len()
 }
 
-fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
+fn observation_score(obs: &Observation, idx: usize, total: usize, prefer_recent: bool) -> i32 {
     let mut score = i32::from(obs.importance);
     score += match obs.kind {
         ObservationKind::UserPrompt => 100,
@@ -356,11 +459,14 @@ fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
         ObservationKind::Other => 15,
         ObservationKind::PreToolUse => 5,
     };
+    if prefer_recent {
+        score += recency_score(idx, total);
+    }
     if idx == 0 || idx + 1 == total {
         score += 100;
     }
-    if has_high_signal_terms(obs) {
-        score += 45;
+    if has_high_signal_terms(obs, prefer_recent) {
+        score += HIGH_SIGNAL_SCORE_BONUS;
     }
     if obs.importance >= 9 {
         score += 45;
@@ -379,10 +485,19 @@ fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
     score
 }
 
-fn has_high_signal_terms(obs: &Observation) -> bool {
+fn recency_score(idx: usize, total: usize) -> i32 {
+    let denominator = total.saturating_sub(1);
+    if denominator == 0 {
+        return 0;
+    }
+    let score = (idx as u128).saturating_mul(RECENCY_SCORE_WEIGHT as u128) / denominator as u128;
+    i32::try_from(score).unwrap_or(i32::MAX)
+}
+
+fn has_high_signal_terms(obs: &Observation, prefer_recent: bool) -> bool {
     let body_prefix = obs.body.chars().take(4_000).collect::<String>();
     let text = format!("{}\n{}", obs.title, body_prefix).to_ascii_lowercase();
-    [
+    let has_base_term = [
         "root cause",
         "fix",
         "fixed",
@@ -407,7 +522,12 @@ fn has_high_signal_terms(obs: &Observation) -> bool {
         "release",
     ]
     .iter()
-    .any(|keyword| text.contains(keyword))
+    .any(|keyword| text.contains(keyword));
+    has_base_term
+        || (prefer_recent
+            && ["correction", "corrected", "confirmed"]
+                .iter()
+                .any(|keyword| text.contains(keyword)))
 }
 
 #[cfg(test)]
@@ -525,6 +645,219 @@ mod tests {
         assert_eq!(projected.selected_indices.first().copied(), Some(0));
         assert_eq!(projected.selected_indices.last().copied(), Some(39));
         assert!(projected.text.contains("observations omitted"));
+    }
+
+    #[test]
+    fn long_sessions_keep_late_plain_correction_over_stale_early_observation() {
+        let mut observations: Vec<_> = (0..30)
+            .map(|idx| obs(idx, ObservationKind::PreToolUse, "routine", "routine", 5))
+            .collect();
+        observations[1] = obs(
+            1,
+            ObservationKind::PostToolUse,
+            "deploy plan",
+            "Deploy is manual.",
+            5,
+        );
+        observations[28] = obs(
+            28,
+            ObservationKind::PostToolUse,
+            "deploy update",
+            "Deploy is Coolify plus Traefik.",
+            5,
+        );
+
+        let projected = project_observations_prefer_recent(
+            &observations,
+            &ObservationProjectionConfig::new(20_000, 3, 200),
+        );
+
+        assert_eq!(projected.selected_indices, vec![0, 28, 29]);
+        assert!(projected.text.contains("Coolify plus Traefik"));
+        assert!(!projected.text.contains("Deploy is manual."));
+    }
+
+    #[test]
+    fn count_cap_keeps_recent_tail_correction_in_long_sessions() {
+        let mut observations: Vec<_> = (0..300)
+            .map(|idx| {
+                obs(
+                    idx,
+                    ObservationKind::UserPrompt,
+                    "high signal filler",
+                    "fix failed error regression decision",
+                    9,
+                )
+            })
+            .collect();
+        observations[1] = obs(
+            1,
+            ObservationKind::UserPrompt,
+            "deploy plan",
+            "Deploy is manual.",
+            9,
+        );
+        observations[220] = obs(
+            220,
+            ObservationKind::PostToolUse,
+            "deploy update",
+            "Deploy uses Coolify plus Traefik.",
+            5,
+        );
+
+        let projected = project_observations_prefer_recent(
+            &observations,
+            &ObservationProjectionConfig::new(200_000, 256, 200),
+        );
+
+        assert_eq!(projected.selected_count, 256);
+        assert!(projected.selected_indices.contains(&220));
+        assert!(projected.text.contains("Coolify plus Traefik"));
+    }
+
+    #[test]
+    fn recent_tail_reservation_does_not_evict_older_high_signal_observations() {
+        let mut observations: Vec<_> = (0..300)
+            .map(|idx| obs(idx, ObservationKind::PreToolUse, "routine", "routine", 5))
+            .collect();
+        for idx in [5, 20, 35, 50, 65, 80, 95, 110] {
+            observations[idx] = obs(
+                idx,
+                ObservationKind::UserPrompt,
+                "high signal",
+                "fix failed error regression decision",
+                9,
+            );
+        }
+
+        let projected = project_observations_prefer_recent(
+            &observations,
+            &ObservationProjectionConfig::new(200_000, 20, 200),
+        );
+
+        for idx in [5, 20, 35, 50, 65, 80, 95, 110] {
+            assert!(projected.selected_indices.contains(&idx));
+        }
+    }
+
+    #[test]
+    fn character_budget_pruning_keeps_late_correction() {
+        let mut observations: Vec<_> = (0..60)
+            .map(|idx| obs(idx, ObservationKind::PreToolUse, "routine", "routine", 5))
+            .collect();
+        observations[1] = obs(
+            1,
+            ObservationKind::UserPrompt,
+            "deploy plan",
+            "Deploy is manual.",
+            5,
+        );
+        observations[52] = obs(
+            52,
+            ObservationKind::PostToolUse,
+            "deploy update",
+            "Deploy uses Coolify plus Traefik.",
+            5,
+        );
+
+        let projected = project_observations_prefer_recent(
+            &observations,
+            &ObservationProjectionConfig::new(1_400, 20, 80),
+        );
+
+        assert!(projected.selected_indices.contains(&52));
+        assert!(projected.text.contains("Coolify plus Traefik"));
+        assert!(!projected.text.contains("Deploy is manual."));
+    }
+
+    #[test]
+    fn small_limit_recent_mode_reserves_plain_late_correction() {
+        let mut observations: Vec<_> = (0..30)
+            .map(|idx| obs(idx, ObservationKind::PreToolUse, "routine", "routine", 5))
+            .collect();
+        observations[1] = obs(
+            1,
+            ObservationKind::UserPrompt,
+            "stale deploy claim",
+            "fix failed error regression decision; deploy is manual.",
+            9,
+        );
+        observations[28] = obs(
+            28,
+            ObservationKind::PostToolUse,
+            "deploy correction",
+            "Deploy uses Coolify plus Traefik.",
+            5,
+        );
+
+        let projected = project_observations_prefer_recent(
+            &observations,
+            &ObservationProjectionConfig::new(20_000, 3, 200),
+        );
+
+        assert_eq!(projected.selected_indices, vec![0, 28, 29]);
+        assert!(projected.text.contains("Coolify plus Traefik"));
+        assert!(!projected.text.contains("deploy is manual"));
+    }
+
+    #[test]
+    fn tiny_recent_budget_prefers_latest_anchor_over_first_anchor() {
+        let observations = vec![
+            obs(
+                0,
+                ObservationKind::UserPrompt,
+                "stale deploy claim",
+                &format!("Deploy is manual. {}", "x".repeat(1_000)),
+                9,
+            ),
+            obs(1, ObservationKind::PreToolUse, "routine", "routine", 5),
+            obs(
+                2,
+                ObservationKind::SessionEnd,
+                "final deploy state",
+                "Deploy uses Coolify plus Traefik.",
+                5,
+            ),
+        ];
+
+        let projected = project_observations_prefer_recent(
+            &observations,
+            &ObservationProjectionConfig::new(650, 2, 500),
+        );
+
+        assert_eq!(projected.selected_indices, vec![2]);
+        assert!(projected.text.contains("Coolify plus Traefik"));
+        assert!(!projected.text.contains("Deploy is manual"));
+    }
+
+    #[test]
+    fn tight_recent_budget_keeps_penultimate_correction_before_first_anchor() {
+        let observations = vec![
+            obs(
+                0,
+                ObservationKind::UserPrompt,
+                "stale deploy claim",
+                &format!("Deploy is manual. {}", "x".repeat(1_000)),
+                9,
+            ),
+            obs(
+                1,
+                ObservationKind::PostToolUse,
+                "deploy correction",
+                "Deploy uses Coolify plus Traefik.",
+                5,
+            ),
+            obs(2, ObservationKind::SessionEnd, "session end", "done", 5),
+        ];
+
+        let projected = project_observations_prefer_recent(
+            &observations,
+            &ObservationProjectionConfig::new(650, 3, 500),
+        );
+
+        assert_eq!(projected.selected_indices, vec![1, 2]);
+        assert!(projected.text.contains("Coolify plus Traefik"));
+        assert!(!projected.text.contains("Deploy is manual"));
     }
 
     #[test]

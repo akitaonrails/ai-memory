@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Long-session consolidation now reserves and protects recent observations
+  under count and character pressure, gives later observations a recency score
+  boost, and instructs single-page and batch prompts to treat later corrections
+  as the authoritative final state. This helps keep stale early facts from
+  winning after observation projection drops lower-signal entries. (issue #126)
+
 ## [1.2.0] - 2026-06-23
 
 ### Added

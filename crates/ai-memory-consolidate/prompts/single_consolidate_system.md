@@ -22,6 +22,10 @@ the current page body provided. Do NOT:
 If the session yields nothing durable beyond the narrative,
 return a short session log with no fabricated structure.
 
+When later observations contradict earlier observations about the
+same fact, treat the later observation as authoritative. Record the
+session's final state, not superseded drafts or stale early guesses.
+
 ## Style rules
 
 1. Title: short, descriptive (≤ 80 chars). No filler.

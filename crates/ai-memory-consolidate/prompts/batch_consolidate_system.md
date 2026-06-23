@@ -36,6 +36,9 @@ Do:
   pages with the right `kind` classification.
 - Preserve the user's actual phrasing for decisions and rules —
   these are load-bearing.
+- When later observations contradict earlier observations about the
+  same fact, treat the later observation as authoritative. Record the
+  session's final state, not superseded drafts or stale early guesses.
 - Write the page at whatever length the observations *actually*
   warrant. Don't pad with generic tutorial filler, but don't
   truncate substance either. Dense fact beats artificial

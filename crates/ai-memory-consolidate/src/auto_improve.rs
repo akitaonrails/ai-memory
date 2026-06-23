@@ -1993,19 +1993,22 @@ mod tests {
             (
                 write_eval_script("#!/bin/sh\ncat >/dev/null\nexit 7\n"),
                 "eval_gate_error",
+                5,
             ),
             (
                 write_eval_script("#!/bin/sh\ncat >/dev/null\nprintf 'not-json'\n"),
                 "eval_gate_error",
+                5,
             ),
             (
                 write_eval_script("#!/bin/sh\ncat >/dev/null\nsleep 3\n"),
                 "eval_gate_timeout",
+                1,
             ),
         ];
-        for (command, expected_reason) in cases {
+        for (command, expected_reason, timeout_secs) in cases {
             let mut cfg = eval_cfg(command);
-            cfg.timeout_secs = 1;
+            cfg.timeout_secs = timeout_secs;
             let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
             let mut rejected = Vec::new();
             let mut warnings = Vec::new();

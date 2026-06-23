@@ -14,7 +14,7 @@ use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use crate::projection::{ObservationProjectionConfig, project_observations};
+use crate::projection::{ObservationProjectionConfig, project_observations_prefer_recent};
 use crate::types::{ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome, SlotKind};
 
 /// Errors raised by the consolidator.
@@ -479,7 +479,7 @@ fn build_batch_request_with_slots(
     buf.push_str("Session id: ");
     buf.push_str(&session_id.to_string());
     buf.push_str("\n\nObservations:\n");
-    let projected = project_observations(
+    let projected = project_observations_prefer_recent(
         observations,
         &ObservationProjectionConfig::new(
             OBSERVATION_BUDGET_CHARS,
@@ -587,7 +587,7 @@ fn build_request(
     buf.push_str("Session id: ");
     buf.push_str(&session_id.to_string());
     buf.push_str("\nObservations (in order):\n\n");
-    let projected = project_observations(
+    let projected = project_observations_prefer_recent(
         observations,
         &ObservationProjectionConfig::new(
             OBSERVATION_BUDGET_CHARS,
@@ -773,16 +773,20 @@ mod tests {
 
     /// Helper for prompt construction tests.
     fn obs_of_size(body_len: usize) -> Observation {
+        test_obs(ObservationKind::Other, "t", &"x".repeat(body_len), 5)
+    }
+
+    fn test_obs(kind: ObservationKind, title: &str, body: &str, importance: u8) -> Observation {
         Observation {
             id: ObservationId::new(),
             workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
             session_id: SessionId::new(),
-            kind: ObservationKind::Other,
-            title: "t".into(),
-            body: "x".repeat(body_len),
+            kind,
+            title: title.into(),
+            body: body.into(),
             created_at: Timestamp::UNIX_EPOCH,
-            importance: 5,
+            importance,
             extension: None,
             source_event: None,
         }
@@ -797,6 +801,77 @@ mod tests {
         assert!(prompt.contains("id:"));
         assert!(prompt.contains("created_at:"));
         assert!(prompt.contains("importance:"));
+    }
+
+    #[test]
+    fn consolidation_prompts_prefer_later_corrections() {
+        let correction_rule = "treat the later observation as authoritative";
+        assert!(SYSTEM_PROMPT.contains(correction_rule));
+        assert!(BATCH_SYSTEM_PROMPT.contains(correction_rule));
+    }
+
+    #[test]
+    fn build_request_uses_recent_projection_for_late_corrections() {
+        let mut observations: Vec<_> = (0..300)
+            .map(|_| {
+                test_obs(
+                    ObservationKind::UserPrompt,
+                    "high signal filler",
+                    "fix failed error regression decision",
+                    9,
+                )
+            })
+            .collect();
+        observations[1] = test_obs(
+            ObservationKind::UserPrompt,
+            "deploy plan",
+            "Deploy is manual.",
+            9,
+        );
+        observations[220] = test_obs(
+            ObservationKind::PostToolUse,
+            "deploy update",
+            "Deploy uses Coolify plus Traefik.",
+            5,
+        );
+
+        let request = build_request(SessionId::new(), &observations, "");
+        let prompt = &request.messages[0].content;
+
+        assert!(prompt.contains("Coolify plus Traefik"));
+        assert!(!prompt.contains("Deploy is manual."));
+    }
+
+    #[test]
+    fn build_batch_request_uses_recent_projection_for_late_corrections() {
+        let mut observations: Vec<_> = (0..300)
+            .map(|_| {
+                test_obs(
+                    ObservationKind::UserPrompt,
+                    "high signal filler",
+                    "fix failed error regression decision",
+                    9,
+                )
+            })
+            .collect();
+        observations[1] = test_obs(
+            ObservationKind::UserPrompt,
+            "deploy plan",
+            "Deploy is manual.",
+            9,
+        );
+        observations[220] = test_obs(
+            ObservationKind::PostToolUse,
+            "deploy update",
+            "Deploy uses Coolify plus Traefik.",
+            5,
+        );
+
+        let request = build_batch_request(SessionId::new(), &observations);
+        let prompt = &request.messages[0].content;
+
+        assert!(prompt.contains("Coolify plus Traefik"));
+        assert!(!prompt.contains("Deploy is manual."));
     }
 
     #[test]
