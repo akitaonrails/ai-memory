@@ -726,8 +726,11 @@ fn uninstall_dry_run_previews_purge() {
     let normalized_stdout = normalize_path_text(&stdout);
     for sub in ["wiki", "db", "raw"] {
         let p = data.path().join(sub);
+        let expected_suffix = format!("/{sub}");
         assert!(
-            normalized_stdout.contains(&normalize_path_text(p.display().to_string())),
+            normalized_stdout
+                .lines()
+                .any(|line| line.starts_with("would purge ") && line.ends_with(&expected_suffix)),
             "missing {sub} in: {stdout}"
         );
         // Dry-run must not delete.
