@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Upgraded `crossbeam-epoch` to the RUSTSEC-2026-0204 fixed release.
+- Fixed the Docker wrapper on macOS with rootless Docker so host-config
+  commands (`install-mcp`, `install-hooks`, `install-instructions`, and
+  related setup/removal commands) keep the `-u 0:0` mapping needed to write
+  bind-mounted agent configuration as the invoking host user.
+- Stabilized the Windows uninstall purge-preview regression test against
+  verbatim temp-path spelling.
+
 ## [1.11.1] - 2026-07-09
 
 ### Fixed

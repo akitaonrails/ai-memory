@@ -211,9 +211,19 @@ fn macos_wrapper_routes_urls_by_real_subcommand() {
 // logging argv to a file for `run` (read back by the test).
 #[cfg(unix)]
 fn run_wrapper_with_fake_docker(args: &[&str], docker_info_stdout: &str) -> String {
+    run_wrapper_with_fake_docker_and_uname(args, docker_info_stdout, None)
+}
+
+#[cfg(unix)]
+fn run_wrapper_with_fake_docker_and_uname(
+    args: &[&str],
+    docker_info_stdout: &str,
+    uname_stdout: Option<&str>,
+) -> String {
     let tmp = tempfile::tempdir().unwrap();
     let docker_args = tmp.path().join("docker-args.txt");
     let docker = tmp.path().join("docker");
+    let uname = tmp.path().join("uname");
     std::fs::write(
         &docker,
         format!(
@@ -226,22 +236,44 @@ fn run_wrapper_with_fake_docker(args: &[&str], docker_info_stdout: &str) -> Stri
         ),
     )
     .unwrap();
+    if let Some(uname_stdout) = uname_stdout {
+        std::fs::write(
+            &uname,
+            format!("#!/usr/bin/env bash\nprintf '{}\\n'\n", uname_stdout),
+        )
+        .unwrap();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if uname_stdout.is_some() {
+            std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
+    let path = if uname_stdout.is_some() {
+        Some(format!(
+            "{}:{}",
+            shell_path(tmp.path()),
+            std::env::var("PATH").unwrap_or_default()
+        ))
+    } else {
+        None
+    };
+
     let mut command = shell_script_command(&repo_root().join("bin/ai-memory"));
-    let output = command
+    command
         .args(args)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
-        .env_remove("AI_MEMORY_SERVER_URL")
-        .output()
-        .unwrap();
+        .env_remove("AI_MEMORY_SERVER_URL");
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "wrapper failed: stdout={} stderr={}",
@@ -249,6 +281,15 @@ fn run_wrapper_with_fake_docker(args: &[&str], docker_info_stdout: &str) -> Stri
         String::from_utf8_lossy(&output.stderr)
     );
     std::fs::read_to_string(docker_args).unwrap()
+}
+
+#[cfg(unix)]
+fn run_wrapper_with_fake_rootless_docker_on_fake_macos(args: &[&str]) -> String {
+    run_wrapper_with_fake_docker_and_uname(
+        args,
+        "[name=apparmor name=seccomp,profile=default name=rootless]",
+        Some("Darwin"),
+    )
 }
 
 #[cfg(unix)]
@@ -281,6 +322,36 @@ fn rootless_docker_uses_root_uid_only_for_host_config_commands() {
         !args.contains("-u\n0:0"),
         "thin-client commands only touch the /data named volume, which isn't \
          host-visible, so they must keep the host-UID mapping; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_macos_rootless_docker_keeps_root_uid_for_host_config_commands() {
+    let args = run_wrapper_with_fake_rootless_docker_on_fake_macos(&["install-mcp"]);
+    assert!(
+        args.contains("-u\n0:0"),
+        "macOS rootless Docker still needs uid 0 for host config writes; got {args}"
+    );
+
+    let args = run_wrapper_with_fake_rootless_docker_on_fake_macos(&["status"]);
+    assert!(
+        !args.contains("-u\n0:0"),
+        "macOS thin-client commands should keep Docker Desktop's default uid; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_macos_rootful_docker_keeps_default_uid_for_host_config_commands() {
+    let args = run_wrapper_with_fake_docker_and_uname(
+        &["install-mcp"],
+        "[name=seccomp,profile=default]",
+        Some("Darwin"),
+    );
+    assert!(
+        !args.contains("-u\n0:0") && !args.contains("-u\n"),
+        "macOS rootful Docker should keep Docker Desktop's default uid; got {args}"
     );
 }
 

@@ -319,8 +319,11 @@ esac
 # write to a host bind mount: other commands only touch the /data named
 # volume, which isn't host-visible and doesn't have this problem, so leave
 # their UID mapping alone.
-if [ "${WRITES_HOST_FILES}" -eq 1 ] \
-   && "${DOCKER}" info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q 'name=rootless'; then
+ROOTLESS_DOCKER=0
+if "${DOCKER}" info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q 'name=rootless'; then
+  ROOTLESS_DOCKER=1
+fi
+if [ "${WRITES_HOST_FILES}" -eq 1 ] && [ "${ROOTLESS_DOCKER}" -eq 1 ]; then
   USER_ARGS=(-u 0:0)
 fi
 
@@ -350,8 +353,13 @@ case "$(uname -s 2>/dev/null || true)" in
     # create log files or write to the data dir, crashing with
     # "Permission denied" in the rolling file appender.
     # Omitting -u lets the container run as its default (uid 1000)
-    # which matches the volume owner.
-    USER_ARGS=()
+    # which matches the volume owner. Keep the earlier rootless-Docker
+    # exception for commands that write host config: under rootless Docker,
+    # UID 0 maps back to the invoking host user and is the only mapping that
+    # can write bind-mounted agent config reliably.
+    if ! { [ "${ROOTLESS_DOCKER}" -eq 1 ] && [ "${WRITES_HOST_FILES}" -eq 1 ]; }; then
+      USER_ARGS=()
+    fi
     ;;
 esac
 

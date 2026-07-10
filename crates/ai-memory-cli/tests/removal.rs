@@ -39,7 +39,11 @@ fn command_with_home(home: &Path) -> Command {
 }
 
 fn normalize_path_text(value: impl AsRef<str>) -> String {
-    value.as_ref().replace('\\', "/")
+    value
+        .as_ref()
+        .replace('\\', "/")
+        .replace("//?/UNC/", "//")
+        .replace("//?/", "")
 }
 
 fn run_uninstall(project: &Path, home: &Path, args: &[&str]) -> std::process::Output {
