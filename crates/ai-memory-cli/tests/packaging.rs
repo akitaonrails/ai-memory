@@ -226,15 +226,31 @@ fn run_wrapper_with_fake_docker(args: &[&str], docker_info_stdout: &str) -> Stri
         ),
     )
     .unwrap();
+    // Pin `uname -s` to Linux via a fake on PATH so the rootless-UID logic
+    // under test runs regardless of the CI runner's real OS. On a macOS host
+    // the wrapper's Darwin arm deliberately clears USER_ARGS (Docker Desktop
+    // handles bind-mount perms), which is unrelated to the Linux rootless
+    // subordinate-UID behavior this asserts — so without pinning, the test
+    // exercised the wrong branch and failed on macOS runners. Mirrors the
+    // fake-uname approach in run_wrapper_on_fake_macos.
+    let uname = tmp.path().join("uname");
+    std::fs::write(&uname, "#!/usr/bin/env bash\nprintf 'Linux\\n'\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    let path = format!(
+        "{}:{}",
+        shell_path(tmp.path()),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let mut command = shell_script_command(&repo_root().join("bin/ai-memory"));
     let output = command
         .args(args)
+        .env("PATH", path)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
