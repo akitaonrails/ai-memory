@@ -723,10 +723,11 @@ fn uninstall_dry_run_previews_purge() {
 
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("would purge"), "stdout was: {stdout}");
+    let normalized_stdout = normalize_path_text(&stdout);
     for sub in ["wiki", "db", "raw"] {
         let p = data.path().join(sub);
         assert!(
-            stdout.contains(&p.display().to_string()),
+            normalized_stdout.contains(&normalize_path_text(p.display().to_string())),
             "missing {sub} in: {stdout}"
         );
         // Dry-run must not delete.
