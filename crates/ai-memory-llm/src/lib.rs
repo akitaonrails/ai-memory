@@ -27,6 +27,7 @@
 //!   No tenacity-style 8-128s backoff (cognee #2840 lesson).
 
 pub mod anthropic;
+pub mod atlascloud;
 pub mod auth;
 pub mod copilot;
 pub mod embedding;
@@ -48,6 +49,7 @@ mod response;
 mod text;
 
 pub use anthropic::AnthropicProvider;
+pub use atlascloud::{ATLASCLOUD_BASE_URL, ATLASCLOUD_DEFAULT_MODEL, AtlasCloudProvider};
 pub use auth::{AuthRequirement, CopilotAuth, Credential, CredentialSource, ProviderAuth};
 pub use copilot::{
     COPILOT_INTEGRATION_ID, CopilotProvider, CopilotToken, DEFAULT_COPILOT_API_BASE_URL,

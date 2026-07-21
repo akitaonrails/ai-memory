@@ -9,8 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use ai_memory_llm::{
-    AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult, OPENCODE_DEFAULT_MODEL,
-    ProviderAuth, ProviderChoice, ProviderConfig,
+    ATLASCLOUD_DEFAULT_MODEL, AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult,
+    OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice, ProviderConfig,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -202,6 +202,7 @@ pub struct RuntimeEnv {
     copilot_client_id: Option<String>,
     voyage_api_key: Option<SecretString>,
     opencode_api_key: Option<SecretString>,
+    atlascloud_api_key: Option<SecretString>,
 }
 
 impl RuntimeEnv {
@@ -231,6 +232,7 @@ impl RuntimeEnv {
             copilot_client_id: env_string("AI_MEMORY_COPILOT_CLIENT_ID"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
             opencode_api_key: env_secret("OPENCODE_API_KEY"),
+            atlascloud_api_key: env_secret("ATLASCLOUD_API_KEY"),
         }
     }
 
@@ -658,10 +660,11 @@ impl Config {
             "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
             "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
             "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
+            "atlascloud" | "atlas-cloud" | "atlas_cloud" | "atlas" => ProviderChoice::AtlasCloud,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode|atlascloud"
                 )));
             }
         };
@@ -682,6 +685,7 @@ impl Config {
                     ));
                 }
                 ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
+                ProviderChoice::AtlasCloud => ATLASCLOUD_DEFAULT_MODEL.to_string(),
             },
         };
         Ok(Some(ProviderConfig {
@@ -779,6 +783,7 @@ impl Config {
             ProviderChoice::Copilot => None,
             ProviderChoice::AnthropicOAuth => None,
             ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
+            ProviderChoice::AtlasCloud => self.runtime_env.atlascloud_api_key.clone(),
         }
     }
 
@@ -1390,6 +1395,36 @@ mod tests {
             assert_eq!(
                 provider.auth.require_api_key().unwrap().expose_secret(),
                 "sk-opencode-test",
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn atlascloud_provider_resolves_aliases_default_model_and_api_key() {
+        for spelling in ["atlascloud", "atlas-cloud", "atlas_cloud", "atlas"] {
+            let cfg = Config {
+                llm_provider: Some(spelling.into()),
+                runtime_env: RuntimeEnv {
+                    atlascloud_api_key: Some(SecretString::from("sk-atlascloud-test")),
+                    ..RuntimeEnv::default()
+                },
+                ..Config::default()
+            };
+
+            let provider = cfg.llm_provider_config().unwrap().unwrap();
+            assert_eq!(provider.provider, ProviderChoice::AtlasCloud, "{spelling}");
+            assert_eq!(provider.model, ATLASCLOUD_DEFAULT_MODEL, "{spelling}");
+            assert_eq!(
+                provider.auth.requirement(),
+                AuthRequirement::RequiredApiKey {
+                    env_var: "ATLASCLOUD_API_KEY"
+                },
+                "{spelling}"
+            );
+            assert_eq!(
+                provider.auth.require_api_key().unwrap().expose_secret(),
+                "sk-atlascloud-test",
                 "{spelling}"
             );
         }

@@ -1068,6 +1068,8 @@ pub enum LlmProviderChoice {
     Copilot,
     /// OpenCode Zen/Go cloud API.
     Opencode,
+    /// Atlas Cloud OpenAI-compatible API.
+    Atlascloud,
 }
 
 /// Arguments for `embed`.

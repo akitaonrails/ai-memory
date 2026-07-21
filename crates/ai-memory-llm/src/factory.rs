@@ -8,6 +8,7 @@ use std::sync::Arc;
 use secrecy::SecretString;
 
 use crate::AnthropicProvider;
+use crate::AtlasCloudProvider;
 use crate::CopilotProvider;
 use crate::GeminiProvider;
 use crate::OpenAiCompatProvider;
@@ -39,6 +40,8 @@ pub enum ProviderChoice {
     AnthropicOAuth,
     /// OpenCode Zen/Go cloud API (OpenAI-compatible endpoint).
     OpenCode,
+    /// Atlas Cloud OpenAI-compatible API.
+    AtlasCloud,
 }
 
 impl ProviderChoice {
@@ -54,6 +57,7 @@ impl ProviderChoice {
             Self::Copilot => "copilot",
             Self::AnthropicOAuth => "anthropic-oauth",
             Self::OpenCode => "opencode",
+            Self::AtlasCloud => "atlascloud",
         }
     }
 
@@ -78,6 +82,9 @@ impl ProviderChoice {
             Self::AnthropicOAuth => AuthRequirement::AnthropicOAuthToken,
             Self::OpenCode => AuthRequirement::RequiredApiKey {
                 env_var: "OPENCODE_API_KEY",
+            },
+            Self::AtlasCloud => AuthRequirement::RequiredApiKey {
+                env_var: "ATLASCLOUD_API_KEY",
             },
         }
     }
@@ -237,6 +244,10 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             let key = config.auth.require_api_key()?;
             Ok(Arc::new(OpenCodeProvider::new(key, config.model)?))
         }
+        ProviderChoice::AtlasCloud => {
+            let key = config.auth.require_api_key()?;
+            Ok(Arc::new(AtlasCloudProvider::new(key, config.model)?))
+        }
     }
 }
 
@@ -281,6 +292,12 @@ mod tests {
         assert_eq!(
             ProviderChoice::AnthropicOAuth.auth_requirement(),
             AuthRequirement::AnthropicOAuthToken
+        );
+        assert_eq!(
+            ProviderChoice::AtlasCloud.auth_requirement(),
+            AuthRequirement::RequiredApiKey {
+                env_var: "ATLASCLOUD_API_KEY"
+            }
         );
     }
 
