@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.17.3"
+version = "1.18.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -26,15 +26,15 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "1.17.3" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "1.17.3" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "1.17.3" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "1.17.3" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "1.17.3" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "1.17.3" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "1.17.3" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "1.17.3" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "1.17.3" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "1.18.0" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "1.18.0" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "1.18.0" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "1.18.0" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "1.18.0" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "1.18.0" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "1.18.0" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "1.18.0" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "1.18.0" }
 
 # (Workspace shared deps follow below)
 

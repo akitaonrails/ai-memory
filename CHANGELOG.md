@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-07-23
+
 ### Added
 - The session-review sampler now scores a non-empty `Stop` observation just
   below `PreCompact` (88 vs 90) instead of the low `55` prior, so the opt-in
@@ -2255,7 +2257,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.17.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.18.0...HEAD
+[1.18.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.18.0
 [1.17.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.3
 [1.17.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.2
 [1.17.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.1
