@@ -24,7 +24,7 @@ use crate::auto_improve::{
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
     self, DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary,
-    PurgeSummary, ReorgSummary,
+    PurgeSessionSummary, PurgeSessionsSummary, PurgeSummary, ReorgSummary,
 };
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::workstream::{

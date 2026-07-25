@@ -38,8 +38,8 @@ pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary, PurgeSummary,
-    ReorgSummary,
+    DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary,
+    PurgeSessionSummary, PurgeSessionsSummary, PurgeSummary, ReorgSummary,
 };
 pub use reader::{
     ActivityWindow, AutoImproveCandidateSession, BriefPageBody, BriefingPage, BriefingSnapshot,
