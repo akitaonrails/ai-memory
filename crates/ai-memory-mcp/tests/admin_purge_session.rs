@@ -2,7 +2,7 @@
 
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, ProjectId,
-    SessionId, Tier, WorkspaceId,
+    Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
@@ -92,17 +92,20 @@ async fn seed_session(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectId, Se
     for i in 0..4u8 {
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id: sid,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: format!("obs {i}"),
-                body: "body".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: format!("obs {i}"),
+                    body: "body".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
     }
@@ -291,7 +294,7 @@ async fn purge_session_deletes_data_and_file() {
         "summary page file removed from disk"
     );
 
-    // Project + workspace survive (only the session was purged).
+    // Project + workspace are reaped (orphaned by the session purge).
     let proj_exists: bool = store
         .reader
         .with_conn(move |conn| {
@@ -306,7 +309,7 @@ async fn purge_session_deletes_data_and_file() {
         })
         .await
         .unwrap();
-    assert!(proj_exists, "project survives a single-session purge");
+    assert!(!proj_exists, "orphaned project reaped by session purge");
 }
 
 /// A session with no summary page still purges cleanly (no file removal
@@ -339,17 +342,20 @@ async fn purge_session_without_summary_page_is_clean() {
         .unwrap();
     store
         .writer
-        .insert_observation(NewObservation {
-            session_id: sid,
-            workspace_id: ws,
-            project_id: proj,
-            kind: ObservationKind::UserPrompt,
-            extension: None,
-            source_event: None,
-            title: "t".into(),
-            body: "b".into(),
-            importance: 5,
-        })
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "t".into(),
+                body: "b".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
         .await
         .unwrap();
 

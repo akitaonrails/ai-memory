@@ -3145,7 +3145,8 @@ async fn handle_purge_session(
         actor,
         ..Default::default()
     };
-    let resolved_purge_ctx = match state
+    // Admission can abort the purge via a reject-policy webhook.
+    let _ = match state
         .wiki
         .admit_purge_project(ws_id, proj_id, Some(purge_ctx))
         .await
@@ -3176,27 +3177,23 @@ async fn handle_purge_session(
         Err(e) => return internal_err(e.to_string()),
     };
 
-    // Remove the session's summary page file from disk. The DB rows are gone;
-    // the file lives at <wiki>/<ws>/<proj>/sessions/<session_id>.md. We route
-    // through Wiki::delete_page so admission + quarantine semantics match a
-    // normal page delete. Skip when the session had no summary page.
+    // Remove the session's summary page file from disk. The DB rows are already
+    // gone (purge_session deleted them and may have reaped the orphaned
+    // project/workspace), so we remove the file directly instead of routing
+    // through Wiki::delete_page — which would fail at ensure_project_workspace
+    // when the project row has been reaped.
     let summary_path = ai_memory_core::PagePath::new(format!("sessions/{session_id}.md"))
         .expect("sessions/<uuid>.md is a valid page path");
     let mut file_deleted = false;
     let mut file_failed: Option<String> = None;
     if summary.had_summary_page {
-        match state
-            .wiki
-            .delete_page(
-                ws_id,
-                proj_id,
-                &summary_path,
-                resolved_purge_ctx.clone(),
-                author_id,
-            )
-            .await
-        {
+        let abs = state.wiki.abs_path(ws_id, proj_id, &summary_path);
+        match std::fs::remove_file(&abs) {
             Ok(()) => file_deleted = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File already gone — treat as success.
+                file_deleted = true;
+            }
             Err(e) => {
                 warn!(
                     path = %summary_path.as_str(),
