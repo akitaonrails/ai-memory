@@ -16,6 +16,7 @@ pub mod routing_skills;
 pub mod routing_snippet;
 pub mod sanitize;
 pub mod user;
+mod workstream;
 
 /// Default workspace name used by the single-workspace v1 flow.
 pub const DEFAULT_WORKSPACE_NAME: &str = "default";
@@ -40,11 +41,16 @@ pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{Handoff, HandoffState, NewHandoff};
 pub use ids::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, HandoffId, ObservationId, PageId, PagePath,
-    ProjectId, SessionId, UserId, WorkspaceId,
+    AgentKind, AutoImproveProposalId, AutoImproveRunId, HandoffId, ManagedRunId, ObservationId,
+    PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId, WorkstreamId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{LinkTarget, NewPage, Page, Tier};
 pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, find_marker_line, full_block};
 pub use sanitize::{SanitizeConfig, Sanitized, Sanitizer};
 pub use user::{MAX_EMAIL_LEN, MAX_USERNAME_LEN, NewUser, User, validate_email, validate_username};
+pub use workstream::{
+    FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
+    ManagedRunContextResponse, ManagedRunStatus, NewWorkstreamEvent, PrepareManagedRunRequest,
+    PrepareManagedRunResponse, WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind,
+};

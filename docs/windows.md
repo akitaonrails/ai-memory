@@ -91,6 +91,8 @@ docker run -d --name ai-memory `
     -v ai-memory-data:/data `
     akitaonrails/ai-memory:latest
 
+# Do not also run `ai-memory serve`; the long-lived container above is the server.
+
 # Verify the wrapper can reach the server.
 ai-memory status
 
@@ -106,9 +108,17 @@ the CLI to render hook commands for the native Windows agent:
 - Hook scripts are staged under `$HOME\.local\share\ai-memory\hooks\`.
 - Local supported profiles default to host-native commands. Claude Code may use
   its exec form (`command` executable + `args` argv array), while other agents
-  use native single command strings matching their hook schema. PowerShell/Git
-  Bash script bundles are compatibility fallbacks and do not enforce
-  capture-policy v1.
+  use native single command strings matching their hook schema. The wrapper
+  renders those `.ps1` fallback commands with PowerShell `-EncodedCommand` so a
+  hook runner cannot expand their `$env:` setup before the inner PowerShell
+  process receives it. Those commands force text output and suppress progress
+  records so nested PowerShell runners do not emit `CLIXML` hook stderr.
+  PowerShell/Git Bash script bundles are compatibility fallbacks and do not
+  enforce capture-policy v1.
+
+After upgrading the wrapper/image, rerun `install-hooks --agent <agent> --apply`
+for each native Windows agent so existing hook entries receive the current
+command form.
 
 Use the matching `--client` / `--agent` values for other clients, for
 example `codex`, `devin`, `kimi-code`, `cursor`, or `gemini-cli`.
@@ -242,19 +252,23 @@ native on an i7-6700HQ). Notes:
   `ai-memory.exe`, so release binaries and Cargo-built binaries work directly.
 - The `.sh`/`.ps1` scripts stay bundled as a fallback — the Docker /
   `setup-agent` flow (no local binary) keeps emitting the shell command.
-- `AI_MEMORY_HOOK_PLATFORM` accepts four values:
+- `AI_MEMORY_HOOK_PLATFORM` accepts five values:
   - `windows-native` — Claude exec-form direct binary call (default on native Windows).
+  - `windows` — PowerShell `-EncodedCommand` + staged `.ps1` script. The native
+    Windows Docker-wrapper default because the helper container cannot install
+    its Linux binary into a host hook entry.
   - `windows-bash` — `bash -c` + `.sh` through Git Bash (the previous
     default; set this to opt back in, or as a fallback for older Claude Code
     builds that do not support exec form).
-  - `posix` — POSIX `.sh`. The Docker-wrapper default (the host has no local
-    binary); set it explicitly to opt a native install back into the scripts.
+  - `posix` — POSIX `.sh`. The Linux/macOS Docker-wrapper default (the host has
+    no local binary); set it explicitly to opt a native install back into the
+    scripts.
   - `posix-native` — direct binary call on macOS / Linux (`<exe> hook
     --event …`) instead of the `.sh` script, so the hook uses the local event
     spool + OIDC-token fallback. The **default for native macOS / Linux
     Claude Code installs** (cargo / release binary), mirroring
-    `windows-native`. The Docker wrapper forces `posix`, so its host-rendered
-    config keeps the `.sh` scripts.
+    `windows-native`. The Linux/macOS Docker wrapper forces `posix`, so its
+    host-rendered config keeps the `.sh` scripts.
 
   Set the env var before running `install-hooks` so the chosen platform
   is baked into the rendered hook commands.
@@ -333,7 +347,8 @@ For WSL2:
 2. Confirm generated hook commands reference `.sh` files under WSL paths.
 3. Launch the agent from WSL2.
 4. Call `memory_status` from the agent.
-5. Send a prompt, then run `ai-memory status` or `ai-memory recent`.
+5. Record `ai-memory status`, send a prompt, then confirm its `sessions` or
+   `observations` count increased.
 
 For native Windows:
 
@@ -342,11 +357,14 @@ For native Windows:
 2. Confirm generated hook commands match the agent: Claude Code should use
    the native `"…ai-memory.exe" hook --event …` command (or `bash -c` + `.sh`
    when `AI_MEMORY_HOOK_PLATFORM=windows-bash`); other script-hook agents
-   should use their generated script-command hook entries under your Windows
-   home directory.
+   should use `powershell.exe ... -EncodedCommand <payload>` entries for the
+   generated `.ps1` hooks under your Windows home directory.
 3. Launch the native Windows agent.
 4. Call `memory_status` from the agent.
-5. Send a prompt, then run `ai-memory status` or `ai-memory recent`.
+5. Record `ai-memory status`, send a prompt, then confirm its `sessions` or
+   `observations` count increased.
 
 Report which mode you tested, which agent and version you used, and
 whether the hook command executed or failed with a path/shell error.
+The built-in `/web` browser lists compiled wiki pages; zero pages there does
+not mean the raw hook observations were missed.

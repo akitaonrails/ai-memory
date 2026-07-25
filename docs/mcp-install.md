@@ -47,7 +47,7 @@ endpoint. The trade-off:
 | | What you get | What you don't get |
 |---|---|---|
 | **MCP only** | LLM can query the wiki, accept handoffs, run memory_consolidate, and run `memory_auto_improve` learning reviews | No automatic session-end summaries; no auto-handoff at session boundaries |
-| **MCP + hooks** | All of the above *plus* every prompt/tool-call captured automatically; handoffs surface at SessionStart with no human prompting **only when the client consumes startup-hook output or an equivalent context-injection result** | Grok and Zero discard SessionStart stdout; ask them to call `memory_handoff_accept` when resuming. |
+| **MCP + hooks** | All of the above *plus* bounded sanitized prompt/tool-lifecycle observations captured automatically; handoffs surface at SessionStart with no human prompting **only when the client consumes startup-hook output or an equivalent context-injection result** | Hook observations are not complete native transcripts. Grok and Zero discard SessionStart stdout; ask them to call `memory_handoff_accept` when resuming. |
 
 For MCP-only use, you can still cover the session-boundary gap by asking
 the LLM to call `memory_handoff_begin` manually before quitting.
@@ -333,8 +333,8 @@ parallel subagent support. It uses a separate `mcp_config.json`
 `serverUrl` (not `httpUrl`) for streamable-HTTP endpoints.
 
 ```bash
-# One-shot via CLI:
-ai-memory install-mcp --client antigravity-cli
+# Merge the MCP entry into the Antigravity config:
+ai-memory install-mcp --client antigravity-cli --apply
 ```
 
 The rendered snippet writes to `mcp_config.json` under `mcpServers`:
@@ -408,7 +408,17 @@ The rendered hooks config looks like:
 **Gotchas:**
 - Antigravity CLI uses `serverUrl` for HTTP MCP endpoints, not `url`
   or `httpUrl`. The `--apply` flag writes the correct key.
+- MCP and hooks use separate files: MCP belongs in
+  `~/.gemini/antigravity-cli/mcp_config.json`, while hooks belong in
+  `~/.gemini/config/hooks.json`.
 - Hook scripts are staged under `~/.local/share/ai-memory/hooks/antigravity-cli/`.
+- Native Windows Docker-wrapper installs render hook entries as
+  `powershell.exe ... -EncodedCommand <payload>` so Antigravity's outer command
+  runner cannot expand the inner `$env:` setup. The child also forces text
+  output and disables progress so PowerShell does not serialize progress records
+  as `CLIXML` hook stderr. Rerun
+  `install-hooks --agent antigravity-cli --apply` after upgrading to refresh
+  existing entries.
 - The `PreInvocation` event fires before each model call (not just at
   session start). ai-memory uses it as the closest equivalent to Gemini
   CLI's `SessionStart`; when a pending handoff exists, the hook injects
@@ -416,6 +426,9 @@ The rendered hooks config looks like:
 - Antigravity CLI does not expose a true session-end hook. `Stop` records
   a stop observation only; call `memory_handoff_begin` before quitting when
   you need the next agent to receive a handoff.
+- The built-in `/web` route displays compiled wiki pages, not raw session or
+  observation rows. To verify hook capture, compare the `sessions` and
+  `observations` counts from `ai-memory status` before and after a prompt.
 - Source: <https://antigravity.google/docs/hooks>
 
 ---

@@ -45,6 +45,8 @@ pub async fn resolve_oidc(client: &reqwest::Client, auth_path: &Path) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use ai_memory_llm::OidcExtras;
+
     use super::*;
 
     use secrecy::SecretString;
@@ -54,9 +56,11 @@ mod tests {
             access: SecretString::from(access.to_string()),
             refresh: SecretString::from("refresh-token".to_string()),
             expires_at_ms,
-            issuer: "https://issuer.example.com/realms/team".to_string(),
-            client_id: "ai-memory-cli".to_string(),
-            token_endpoint: endpoint.to_string(),
+            extra: OidcExtras {
+                issuer: "https://issuer.example.com/realms/team".to_string(),
+                client_id: "ai-memory-cli".to_string(),
+                token_endpoint: endpoint.to_string(),
+            },
         }
     }
 

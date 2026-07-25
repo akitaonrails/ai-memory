@@ -152,6 +152,14 @@ pub struct Config {
     /// SessionEnd cheap and fire-and-forget. The LLM checkpoint also runs on
     /// PreCompact and via manual `memory_consolidate`.
     pub consolidate_on_session_end: bool,
+    /// Server-side opt-in for assistant/Stop capture (#196). When true, the
+    /// server honors a client's sanitized `_ai_memory_assistant` marker on a
+    /// `Stop` event and persists the excerpt as the Stop body. Off by default;
+    /// when off the marker is stripped and the Stop stays empty. The client half
+    /// of the double opt-in is baked separately by
+    /// `install-hooks --capture-assistant`. Set with
+    /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
+    pub capture_assistant: bool,
     /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`).
     pub embedding_provider: Option<String>,
     /// Optional embedding model override.
@@ -597,7 +605,8 @@ impl Default for Config {
             llm_key_cooldown_secs: None,
             llm_api_key: None,
             llm_compat_strict: false,
-            consolidate_on_session_end: true,
+            consolidate_on_session_end: false,
+            capture_assistant: false,
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,

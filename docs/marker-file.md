@@ -86,6 +86,11 @@ default_global = "true"
 # session start. Only agents whose session-start hook injects stdout as
 # context benefit (Claude Code, Codex, OpenCode, …). Off by default: the
 # brief costs tokens on EVERY session start, so opt in per repo.
+# Kimi Code note: kimi discards SessionStart hook stdout, so there the
+# brief is delivered on the FIRST user prompt of the session instead
+# (once per session, same as Claude). Its local delivery markers are created
+# only for opted-in repositories and bounded to the 512 newest sessions;
+# re-briefing after /clear is not supported in v1.
 [briefing]
 inject_on_session_start = "true"
 
@@ -203,9 +208,13 @@ its existing tool-response/error excerpt and caps the complete rendered body at
 body, and association is only by matching agent-provided call IDs. User-prompt stores its prompt
 text, notification stores its message/text, and post-compaction stores its
 summary; other event bodies are currently empty unless explicitly supported.
-Stop and assistant-message capture remain disabled and deferred. The metadata
-header is closed; the PostToolUse response/error excerpt remains the existing
-bounded content capture.
+Stop/assistant-message capture is disabled by default and never persisted; it is
+available only through the explicit double opt-in described in the install guide
+(`install-hooks --capture-assistant` on the client plus `capture_assistant` on
+the server), where the excerpt is sanitized on both sides and capped. It is not
+gated by this marker file — assistant text is not path-attributable, so a
+`.ai-memory.toml` cannot narrow it. The metadata header is closed; the
+PostToolUse response/error excerpt remains the existing bounded content capture.
 Capture exclusions are evaluated only where paths have a proven schema, so they
 do not claim to filter those other bodies.
 
@@ -283,13 +292,13 @@ the `default` bucket entirely.
 
 ## Migrating existing projects
 
-Projects already created under workspace `default` stay there. Move
-one with the CLI:
+Projects already created under workspace `default` stay there. Move one to a
+different workspace with the CLI:
 
 ```sh
-ai-memory rename-project \
-    --workspace default --project foo \
-    --new-workspace movvia
+ai-memory move-project \
+    --from-workspace default --project foo \
+    --to-workspace movvia --confirm
 ```
 
 ## Install-wide default (no marker)

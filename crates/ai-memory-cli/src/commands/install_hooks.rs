@@ -34,8 +34,22 @@ use crate::commands::render_shared::{
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
-/// `~/.claude/settings.json` — Claude Code hooks live under `hooks`.
+/// Claude Code's settings file — hooks live under `hooks`.
+/// `$CLAUDE_CONFIG_DIR/settings.json` when the var is set, else
+/// `~/.claude/settings.json`.
 pub(crate) fn claude_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    claude_settings_path_in(std::env::var_os("CLAUDE_CONFIG_DIR"))
+}
+
+/// The env value comes in as a parameter so tests can exercise both
+/// branches without mutating process env (mirrors
+/// `install_mcp::kimi_code_home`).
+fn claude_settings_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = crate::commands::path_util::claude_config_dir(env_override) {
+        return Ok(dir.join("settings.json"));
+    }
     Ok(home_dir()
         .context("could not locate $HOME for ~/.claude/settings.json")?
         .join(".claude")
@@ -205,6 +219,18 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
             "[ai-memory] selected shell/PowerShell compatibility path does not enforce capture-policy v1; use a native platform selection or generated integration."
         );
     }
+    // Assistant/Stop capture is Claude Code + native-platform only (#196). No
+    // silent fallback: bail so an operator on a script-fallback platform or a
+    // different agent is told the flag has no effect instead of installing a
+    // command whose capture would be silently dropped.
+    if args.capture_assistant && !capture_assistant_allowed(args.agent) {
+        anyhow::bail!(
+            "--capture-assistant requires --agent claude-code on a native hook platform \
+             (PosixNative/WindowsNative). The current selection uses the script fallback or a \
+             different agent, where the opt-in cannot take effect. Remove --capture-assistant or \
+             switch to a native Claude Code install."
+        );
+    }
     if args.apply {
         return match args.agent {
             AgentChoice::OpenCode => apply_to_opencode_plugin(&server_url, auth, &args),
@@ -265,7 +291,19 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
         AgentChoice::Omp => render_omp_extension(&server_url, auth, strategy),
         AgentChoice::ClaudeCode => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-            render_claude_code(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+            let settings_path = match &args.config_file {
+                Some(p) => p.clone(),
+                None => claude_settings_path()?,
+            };
+            render_claude_code(
+                &hooks_dir,
+                &server_url,
+                auth,
+                &config.data_dir,
+                strategy,
+                &settings_path,
+                args.capture_assistant,
+            )
         }
         AgentChoice::Codex => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
@@ -395,7 +433,7 @@ fn apply_base_path_to_hook_url(url: &str, base_path: &str) -> String {
     if !existing_path.is_empty() {
         return url.to_string();
     }
-    let prefix = crate::commands::serve::normalize_prefix(base_path);
+    let prefix = ai_memory_web::normalize_prefix(base_path);
     if prefix.is_empty() {
         origin
     } else {
@@ -765,6 +803,14 @@ fn overlay_event_hooks(
 /// Mutate `~/.claude/settings.json` in place: replace the hook entries
 /// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
 /// user has wired up to other tools.
+/// Whether `--capture-assistant` may take effect for this agent + platform
+/// (#196): Claude Code on a native hook platform only. Any other agent or a
+/// script-fallback platform cannot honor the opt-in, so the installer bails
+/// instead of enabling it silently.
+fn capture_assistant_allowed(agent: AgentChoice) -> bool {
+    matches!(agent, AgentChoice::ClaudeCode) && local_hook_policy_v1_supported()
+}
+
 fn apply_to_claude_code_settings(
     hooks_dir: &Path,
     server_url: &str,
@@ -785,6 +831,7 @@ fn apply_to_claude_code_settings(
         auth_token,
         Some(data_dir),
         strategy,
+        args.capture_assistant,
     );
     let our_hooks = payload
         .get("hooks")
@@ -892,12 +939,35 @@ fn apply_to_devin_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "devin")?;
+    apply_to_devin_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+#[cfg(test)]
+fn apply_to_devin_settings_in(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    staging_data_local: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts_in(hooks_dir, "devin", staging_data_local)?;
+    apply_to_devin_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+fn apply_to_devin_settings_with_staged(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => devin_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "devin")?;
-    let command_dir = staged_command_dir(&staged, "devin");
+    let command_dir = staged_command_dir(staged, "devin");
     let strategy = args.project_strategy.baked();
     let payload = build_devin_payload_with_data_dir(
         &command_dir,
@@ -1514,6 +1584,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
         return format!(
             "{TS_TOML_FLAG}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
+  const managedRun = process.env.AI_MEMORY_RUN_ID;
+  if (managedRun) url.searchParams.set("managed_run", managedRun);
   const marker = findMarker(cwd);
   if (!marker || !cwd) return;
   url.searchParams.set("cwd", cwd);
@@ -1543,6 +1615,8 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
         );
     };
     let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
+  const managedRun = process.env.AI_MEMORY_RUN_ID;
+  if (managedRun) url.searchParams.set("managed_run", managedRun);
   if (!cwd) return;
   url.searchParams.set("cwd", cwd);
   let workspace: string | undefined;
@@ -1788,7 +1862,7 @@ function textFromParts(parts: unknown): string {{
 
 const sessionCwds = new Map<string, string>();
 const startedSessions = new Set<string>();
-const handoffChecked = new Set<string>();
+const handoffFetches = new Map<string, Promise<string | undefined>>();
 const preCompactLast = new Map<string, number>();
 
 function cwdFor(id: string | undefined, directory: string): string {{
@@ -1803,7 +1877,12 @@ function startSession(id: string | undefined, cwd: string, extra: Record<string,
   if (!id || startedSessions.has(id)) return;
   startedSessions.add(id);
   rememberCwd(id, cwd);
-  postHook("session-start", {{ sessionID: id, cwd, ...extra }});
+  // Generated integrations inject through fetchHandoff below. In managed mode
+  // a queued SessionStart response is not model-visible and must not consume
+  // the workstream context before that synchronous fetch receives it.
+  if (!process.env.AI_MEMORY_RUN_ID) {{
+    postHook("session-start", {{ sessionID: id, cwd, ...extra }});
+  }}
 }}
 
 function endSession(id: string | undefined, directory: string, cwd?: string): void {{
@@ -1811,7 +1890,7 @@ function endSession(id: string | undefined, directory: string, cwd?: string): vo
   const resolvedCwd = cwd || cwdFor(id, directory);
   postHook("session-end", {{ sessionID: id, cwd: resolvedCwd }});
   sessionCwds.delete(id);
-  handoffChecked.delete(id);
+  handoffFetches.delete(id);
   preCompactLast.delete(id);
 }}
 
@@ -1839,10 +1918,11 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   }}
 }}
 
-async function fetchHandoff(cwd: string): Promise<string | undefined> {{
+async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
+  if (id) url.searchParams.set("session_id", id);
   applyMarkerParams(url, cwd);
   try {{
     const response = await fetch(url, {{
@@ -1935,10 +2015,14 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
     }},
     "experimental.chat.system.transform": async (input, output) => {{
       const id = sessionID(input);
-      if (!id || handoffChecked.has(id)) return;
-      handoffChecked.add(id);
+      if (!id) return;
       startSession(id, cwdFor(id, directory));
-      const handoff = await fetchHandoff(cwdFor(id, directory));
+      let pending = handoffFetches.get(id);
+      if (!pending) {{
+        pending = fetchHandoff(cwdFor(id, directory), id);
+        handoffFetches.set(id, pending);
+      }}
+      const handoff = await pending;
       if (handoff) (output as any).system.push(handoff);
     }},
   }};
@@ -2371,7 +2455,12 @@ function startSession(ctx: any, extra: Record<string, unknown> = {{}}): void {{
   const id = sessionID(ctx);
   if (!id || startedSessions.has(id)) return;
   startedSessions.add(id);
-  postHook("session-start", {{ ...sessionPayload(ctx), ...extra }});
+  // Generated integrations inject through fetchHandoff below. In managed mode
+  // a queued SessionStart response is not model-visible and must not consume
+  // the workstream context before that synchronous fetch receives it.
+  if (!process.env.AI_MEMORY_RUN_ID) {{
+    postHook("session-start", {{ ...sessionPayload(ctx), ...extra }});
+  }}
 }}
 
 function postPreCompact(ctx: any): void {{
@@ -2398,10 +2487,11 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   }}
 }}
 
-async function fetchHandoff(cwd: string): Promise<string | undefined> {{
+async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
+  if (id) url.searchParams.set("session_id", id);
   applyMarkerParams(url, cwd);
   try {{
     const response = await fetch(url, {{
@@ -2431,7 +2521,7 @@ export default function AiMemoryExtension(api: any): void {{
     const id = sessionID(ctx);
     if (!id || handoffChecked.has(id)) return;
     handoffChecked.add(id);
-    const handoff = await fetchHandoff(ctx?.cwd ?? "");
+    const handoff = await fetchHandoff(ctx?.cwd ?? "", id);
     if (!handoff) return;
     return {{
       message: {{
@@ -2843,6 +2933,8 @@ fn render_claude_code(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    settings_path: &Path,
+    capture_assistant: bool,
 ) -> Result<()> {
     // Soft check: warn (don't bail) if a script is missing. The user
     // may be running this command inside docker against a host path
@@ -2867,15 +2959,22 @@ fn render_claude_code(
         auth_token,
         Some(data_dir),
         project_strategy,
+        capture_assistant,
     );
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing claude code hook config")?;
-    println!("# Claude Code hook config — merge into ~/.claude/settings.json");
+    println!(
+        "# Claude Code hook config — merge into {}",
+        settings_path.display()
+    );
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
-        println!("#       Treat ~/.claude/settings.json as sensitive (chmod 600).");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            settings_path.display()
+        );
     }
     println!();
     println!("{serialized}");
@@ -3152,6 +3251,37 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
+    #[test]
+    fn capture_assistant_allowed_only_for_claude_native() {
+        use crate::cli::AgentChoice::*;
+        // Every non-Claude agent is rejected regardless of platform (#196): the
+        // opt-in cannot take effect for them, so the installer must bail.
+        for agent in [
+            Codex,
+            Cursor,
+            GeminiCli,
+            OpenCode,
+            Pi,
+            Omp,
+            Openclaw,
+            AntigravityCli,
+            Grok,
+            Zero,
+            Devin,
+            KimiCode,
+        ] {
+            assert!(
+                !capture_assistant_allowed(agent),
+                "{agent:?} must not allow --capture-assistant"
+            );
+        }
+        // Claude Code tracks the native-platform gate exactly.
+        assert_eq!(
+            capture_assistant_allowed(ClaudeCode),
+            local_hook_policy_v1_supported()
+        );
+    }
+
     #[cfg(unix)]
     fn bash_program_for_installer_test() -> Option<std::path::PathBuf> {
         Some(std::path::PathBuf::from("bash"))
@@ -3290,6 +3420,7 @@ mod tests {
     fn default_hook_args() -> InstallHooksArgs {
         InstallHooksArgs {
             agent: AgentChoice::OpenCode,
+            capture_assistant: false,
             hooks_dir: None,
             server_url: None,
             auth_token: None,
@@ -3609,6 +3740,7 @@ mod tests {
         .unwrap();
         let args = InstallHooksArgs {
             agent: AgentChoice::Zero,
+            capture_assistant: false,
             config_file: Some(path.clone()),
             ..default_hook_args()
         };
@@ -4213,6 +4345,7 @@ model = "gpt-5"
         assert!(generated.contains("const CAPTURE_POLICY_V1 = 1;"));
         assert!(generated.contains("const CAPTURE_MARKER_MAX_BYTES = 64 * 1024;"));
         assert!(generated.contains("async function fetchHandoff"));
+        assert!(generated.contains("if (!process.env.AI_MEMORY_RUN_ID) {"));
         assert!(generated.contains("const response = await fetch(url, {"));
         assert!(generated.contains("signal: timeoutSignal(1000)"));
         assert!(!generated.contains("signal: timeoutSignal(500)"));
@@ -4230,6 +4363,11 @@ model = "gpt-5"
         assert!(plugin.contains(r#""experimental.chat.system.transform": async"#));
         assert!(plugin.contains("export default AiMemoryHooks"));
         assert!(plugin.contains("const startedSessions = new Set<string>();"));
+        assert!(
+            plugin
+                .contains("const handoffFetches = new Map<string, Promise<string | undefined>>();")
+        );
+        assert!(!plugin.contains("handoffChecked"));
         assert!(plugin.contains("function startSession"));
         assert!(plugin.contains("function endSession"));
         assert!(plugin.contains("fetchHandoff"));
@@ -4267,7 +4405,7 @@ model = "gpt-5"
         );
         assert!(plugin.contains("!startedSessions.delete(id)"));
         assert!(plugin.contains("sessionCwds.delete(id);"));
-        assert!(plugin.contains("handoffChecked.delete(id);"));
+        assert!(plugin.contains("handoffFetches.delete(id);"));
         assert!(plugin.contains("preCompactLast.delete(id);"));
         assert!(plugin.contains("postHook(\"user-prompt\""));
         assert!(plugin.contains("Bearer ${TOKEN}"));
@@ -4356,6 +4494,7 @@ model = "gpt-5"
         assert!(extension.contains("postHook(\"session-start\""));
         assert!(extension.contains("postHook(\"user-prompt\""));
         assert!(extension.contains("fetchHandoff"));
+        assert!(extension.contains("if (!process.env.AI_MEMORY_RUN_ID) {"));
         assert!(extension.contains("function applyMarkerParams"));
         assert!(extension.contains("readFileSync(marker, \"utf8\")"));
         assert!(extension.contains("text.split(/\\r?\\n/)"));
@@ -4421,6 +4560,7 @@ model = "gpt-5"
         let tmp = TempDir::new().unwrap();
         let args = InstallHooksArgs {
             agent: AgentChoice::Omp,
+            capture_assistant: false,
             hooks_dir: None,
             server_url: Some("http://127.0.0.1:49374".into()),
             auth_token: None,
@@ -4449,6 +4589,7 @@ model = "gpt-5"
         let path = tmp.path().join("extensions").join("ai-memory.ts");
         let args = InstallHooksArgs {
             agent: AgentChoice::Pi,
+            capture_assistant: false,
             hooks_dir: None,
             server_url: Some("http://127.0.0.1:49374".into()),
             auth_token: None,
@@ -5149,6 +5290,27 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
     }
 
     #[test]
+    fn claude_settings_path_honours_claude_config_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\claude"
+        } else {
+            "/custom/claude"
+        };
+        let path = claude_settings_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(path, Path::new(custom).join("settings.json"));
+
+        // Empty override and unset var both fall back to ~/.claude/settings.json.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = claude_settings_path_in(env).unwrap();
+            assert!(
+                path.ends_with(Path::new(".claude").join("settings.json")),
+                "default must be ~/.claude/settings.json, got {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn kimi_code_config_path_honours_kimi_code_home() {
         let custom = if cfg!(windows) {
             r"C:\custom\kimi"
@@ -5192,13 +5354,15 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         let config_tmp = TempDir::new().unwrap();
         let config_path = config_tmp.path().join("hooks.v1.json");
 
-        apply_to_devin_settings(
+        apply_to_devin_settings_in(
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            config_tmp.path(),
             &InstallHooksArgs {
                 agent: AgentChoice::Devin,
+                capture_assistant: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
@@ -5253,13 +5417,15 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         )
         .unwrap();
 
-        apply_to_devin_settings(
+        apply_to_devin_settings_in(
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            config_tmp.path(),
             &InstallHooksArgs {
                 agent: AgentChoice::Devin,
+                capture_assistant: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
@@ -5311,6 +5477,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
 
         let args_v1 = InstallHooksArgs {
             agent: AgentChoice::Devin,
+            capture_assistant: false,
             hooks_dir: Some(hooks_tmp.path().to_path_buf()),
             server_url: Some("http://127.0.0.1:49374".to_string()),
             auth_token: None,
@@ -5320,19 +5487,21 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             apply: false,
         };
 
-        apply_to_devin_settings(
+        apply_to_devin_settings_in(
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
+            config_tmp.path(),
             config_tmp.path(),
             &args_v1,
         )
         .unwrap();
 
-        apply_to_devin_settings(
+        apply_to_devin_settings_in(
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
+            config_tmp.path(),
             config_tmp.path(),
             &args_v1,
         )
@@ -5353,6 +5522,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
 
         let args_config = InstallHooksArgs {
             agent: AgentChoice::Devin,
+            capture_assistant: false,
             hooks_dir: Some(hooks_tmp.path().to_path_buf()),
             server_url: Some("http://127.0.0.1:49374".to_string()),
             auth_token: None,
@@ -5362,19 +5532,21 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             apply: false,
         };
 
-        apply_to_devin_settings(
+        apply_to_devin_settings_in(
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
+            config_tmp2.path(),
             config_tmp2.path(),
             &args_config,
         )
         .unwrap();
 
-        apply_to_devin_settings(
+        apply_to_devin_settings_in(
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
+            config_tmp2.path(),
             config_tmp2.path(),
             &args_config,
         )
@@ -5412,13 +5584,15 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         )
         .unwrap();
 
-        apply_to_devin_settings(
+        apply_to_devin_settings_in(
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
             config_tmp.path(),
+            config_tmp.path(),
             &InstallHooksArgs {
                 agent: AgentChoice::Devin,
+                capture_assistant: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,

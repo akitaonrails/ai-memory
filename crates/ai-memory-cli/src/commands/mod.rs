@@ -13,6 +13,7 @@ pub mod backup;
 pub mod bootstrap;
 pub mod checkpoints;
 pub mod commit;
+pub mod completions;
 pub mod curator;
 pub mod data_purge;
 pub mod delete_page;
@@ -48,12 +49,14 @@ pub mod reorg;
 pub mod reset;
 pub mod restore;
 pub mod restore_page;
+pub mod run;
 pub mod search;
 pub mod serve;
 pub mod setup_agent;
 pub mod status;
 pub mod uninstall;
 pub mod user;
+pub mod workstream_search;
 pub mod write_page;
 
 /// Resolve the effective project name for a client command.

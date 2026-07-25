@@ -27,7 +27,8 @@ markdown stays the source of truth.
 Solid arrows are request, read, and write paths. Dashed arrows are
 background reconciliation or provider-backed maintenance. The core invariant is
 unchanged: the markdown wiki is the source of truth, and SQLite is the derived
-index for search, sessions, observations, handoffs, audit, and embeddings.
+index for search, sessions, observations, handoffs, audit, embeddings, and the
+optional managed-workstream continuity ledger.
 Auto-improvement sits on the provider-backed maintenance side: the server
 schedules reviews for newly completed sessions in every project, records
 validated proposals in the pending-writes audit trail, and auto-approves them
@@ -46,7 +47,8 @@ from hook paths.
 1. Agent CLI emits a lifecycle hook (SessionStart, UserPromptSubmit,
    PostToolUse, …). Shell-script hooks `curl` event JSON to `POST /hook`
    with a short timeout. Native `ai-memory hook --event ...` commands spool
-   events locally, do a short bounded cleanup at session start, and hand
+   events locally with a stable per-entry idempotency key, do a short bounded
+   cleanup at session start, and hand
    session-end delivery to a detached lock-aware `hook-drain` helper;
    high-latency operators can raise the drain/handoff/background caps with
    minute-based env vars.
@@ -58,8 +60,16 @@ from hook paths.
    storage. See [Capture exclusions](marker-file.md#capture-exclusions).
 2. Server's hook router sanitises the payload (the only path from
    untrusted text into the store), assigns an [`ObservationKind`], and
-   enqueues a `WriteCmd` to the writer actor. `log.md` gets an
-   appended `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
+   enqueues a `WriteCmd` to the writer actor. For native keyed events, the
+   project-scoped key and observation commit together. The key is marked
+   complete only after downstream processing: an incomplete replay resumes
+   wiki/handoff effects without another observation, while a completed replay
+   is acknowledged and skipped. A bounded per-project/key gate serializes an
+   overlapping retry with the original processor. Downstream effects remain
+   at-least-once until that completion marker, so a process crash during those
+   effects may repeat an already applied effect rather than silently lose the
+   rest. `log.md` gets an appended
+   `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
    `Handoff` row for the next agent. Auto-commits the wiki. Clients
@@ -101,6 +111,26 @@ from hook paths.
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
 
+**Optional managed-workstream loop:** `ai-memory run` opens a lease for the
+current repository/worktree workstream, resolves an explicit harness or the
+newest usable local/linked harness, creates or resumes that harness's native
+session, and marks lifecycle calls with an invocation-scoped run id.
+SessionStart injects an unseen bounded event range; Crush receives it through a
+temporary supported global-context path because it lacks SessionStart. The host
+imports the native transcript tail and a Git checkpoint when the child exits.
+ai-memory opens native stores read-only. Raw sanitized JSONL segments are
+immutable, while SQLite supplies monotonic sequences, FTS, native
+source/delivery cursors, and idempotent retry state. A full-ledger
+`workstream-search` path complements
+the bounded startup packet. An interactive empty workstream may adopt a
+checkout-matching native session once. Eligibility comes from authoritative
+ledger/session state: after any harness establishes the workstream, a newly
+joining harness starts fresh and receives portable history instead of adopting
+unrelated old native history. Handled launcher failures cancel their lease;
+normal reopen retries brief finalization conflicts, while an unclean process
+death remains bounded by the renewable lease expiry. See [Managed cross-harness
+workstreams](managed-workstreams.md).
+
 ## Hook event vocabulary
 
 The core observation vocabulary is a closed set of agent lifecycle
@@ -141,8 +171,9 @@ backpressure, or single-writer SQLite actor.
 * `<data_dir>/db/memory.sqlite` - derived index. WAL mode. One
   writer actor owns the writer `Connection`; reads go through a
   cloneable read-only pool.
-* `<data_dir>/raw/` - reserved for raw session log archives; current raw
-  fallback recall searches the durable `observations` table via FTS5.
+* `<data_dir>/raw/` - immutable sanitized managed-workstream JSONL segments.
+  Legacy raw fallback recall searches the durable `observations` table via
+  FTS5; lifecycle HookEnvelope JSON is not a complete transcript archive.
 * `<data_dir>/logs/` - rolling daily `tracing` output.
 * `<data_dir>/models/` - reserved for bundled embedding models
   (M9.5+, when local `ort` lands).
@@ -154,8 +185,10 @@ backpressure, or single-writer SQLite actor.
 | `workspaces`, `projects` | Top of the 3-tuple identity coordinate. |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
-| `sessions`, `observations` | Hook capture, full audit log. |
+| `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. They are an operational audit trail, not a complete native transcript. |
 | `observations_fts` | FTS5 virtual table over raw observation `(title, body)`, used only as bounded fallback. |
+| `workstreams`, `managed_runs`, `workstream_native_sessions` | Optional lease state plus per-harness native source and delivery cursors for `ai-memory run`. |
+| `workstream_events`, `workstream_events_fts` | Append-only normalized visible transcript events and full-text search; immutable sanitized source batches also live under `raw/workstreams/`. |
 | `links` | Wikilink / markdown cross-references. `to_page_id` (a global PageId) is nullable for unresolved forward links. `to_workspace` / `to_project` carry a cross-project scope (NULL = the source page's own project). |
 | `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
@@ -218,6 +251,7 @@ crates/
 ├── ai-memory-hooks/       payload schemas, sanitiser, /hook ingress.
 ├── ai-memory-llm/         provider auth boundary + LlmProvider / Embedder traits.
 ├── ai-memory-consolidate/ Karpathy ingest / lint / sweep / auto-improve pipeline.
+├── ai-memory-workstream/  read-only native transcript + launch adapters.
 └── ai-memory-cli/         `ai-memory` binary entry point + thin HTTP subcommands.
 ```
 
@@ -315,6 +349,9 @@ that touch the relevant area.
    (agentmemory #221 / #143.)
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>`
    has no other constructor than `sanitize()`. (design-decisions §14.)
+   The opt-in assistant/Stop excerpt (#196) enters through this same
+   boundary: the client sanitizes it before it reaches the wire, and the
+   server re-scrubs it here with its configured patterns before the write.
 7. **JSON-schema structured outputs only.** Native provider JSON
    modes; no XML, no Instructor wrapping. (agentmemory #492 / #539,
    cognee #2840.)

@@ -83,6 +83,8 @@ id_newtype!(pub SessionId, "Identifier for a single agent run.");
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
+id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
+id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
@@ -196,6 +198,8 @@ pub enum AgentKind {
     /// Pi coding agent.
     #[serde(rename = "pi")]
     Pi,
+    /// Charmbracelet Crush coding agent.
+    Crush,
     /// xAI Grok Build CLI (`grok`).
     Grok,
     /// Zero coding agent (Gitlawb/zero).
@@ -214,7 +218,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -225,6 +229,7 @@ impl AgentKind {
         Self::AntigravityCli,
         Self::Omp,
         Self::Pi,
+        Self::Crush,
         Self::Grok,
         Self::Zero,
         Self::Devin,
@@ -246,6 +251,7 @@ impl AgentKind {
             Self::AntigravityCli => "antigravity-cli",
             Self::Omp => "omp",
             Self::Pi => "pi",
+            Self::Crush => "crush",
             Self::Grok => "grok",
             Self::Zero => "zero",
             Self::Devin => "devin",
@@ -269,6 +275,7 @@ impl AgentKind {
             "openclaw" | "open-claw" => Self::OpenClaw,
             "antigravity-cli" | "antigravity" | "agy" => Self::AntigravityCli,
             "pi" => Self::Pi,
+            "crush" => Self::Crush,
             "omp" | "oh-my-pi" => Self::Omp,
             "grok" => Self::Grok,
             "zero" => Self::Zero,
@@ -293,9 +300,32 @@ impl AgentKind {
     /// tool. Unknown future agents return `false` until we know their
     /// SessionStart stdout semantics; accepting a handoff is single-use and
     /// should fail safe.
+    ///
+    /// Kimi Code fires `SessionStart` but discards the hook's stdout/result
+    /// entirely (`packages/agent-core/src/session/index.ts` ignores the
+    /// dispatch return, verified in the v0.28.1 source), so the handoff is
+    /// delivered on `UserPromptSubmit` instead — see
+    /// [`Self::user_prompt_injects_handoff`].
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
-        !matches!(self, Self::Grok | Self::Zero | Self::Other)
+        !matches!(
+            self,
+            Self::Crush | Self::Grok | Self::Zero | Self::KimiCode | Self::Other
+        )
+    }
+
+    /// Whether this agent injects the native `user-prompt` (UserPromptSubmit)
+    /// hook's stdout into the upcoming turn as context. Only Kimi Code does:
+    /// its `SessionStart` stdout is discarded (see
+    /// [`Self::session_start_injects_handoff`]), while `UserPromptSubmit`
+    /// stdout is prepended to the turn as a user message with
+    /// `origin: {kind: 'hook_result'}` (`agent/turn/index.ts`,
+    /// `session/hooks/user-prompt.ts`, verified in the v0.28.1 source).
+    /// Empty stdout injects nothing, so the hook prints the raw handoff body
+    /// or nothing at all — never a JSON envelope.
+    #[must_use]
+    pub fn user_prompt_injects_handoff(self) -> bool {
+        matches!(self, Self::KimiCode)
     }
 }
 
@@ -380,8 +410,22 @@ mod tests {
         );
         // Unknown tags still degrade to Other.
         assert_eq!(AgentKind::from_wire("kimi-2"), AgentKind::Other);
-        // Kimi Code can inject the session-start handoff (consumes additionalContext).
-        assert!(AgentKind::KimiCode.session_start_injects_handoff());
+        // Kimi Code discards SessionStart stdout (verified in the v0.28.1
+        // source), so the handoff is delivered on UserPromptSubmit instead.
+        assert!(!AgentKind::KimiCode.session_start_injects_handoff());
+        assert!(AgentKind::KimiCode.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn user_prompt_handoff_injection_is_kimi_only() {
+        for agent in AgentKind::ALL {
+            assert_eq!(
+                agent.user_prompt_injects_handoff(),
+                agent == AgentKind::KimiCode,
+                "{}",
+                agent.as_str()
+            );
+        }
     }
 
     #[test]
@@ -439,6 +483,11 @@ mod tests {
             serde_json::from_str::<AgentKind>(&pi).unwrap(),
             AgentKind::Pi
         );
+
+        let crush = serde_json::to_string(&AgentKind::Crush).unwrap();
+        assert_eq!(crush, "\"crush\"");
+        assert_eq!(AgentKind::from_wire("crush"), AgentKind::Crush);
+        assert!(!AgentKind::Crush.session_start_injects_handoff());
 
         let openclaw = serde_json::to_string(&AgentKind::OpenClaw).unwrap();
         assert_eq!(openclaw, "\"openclaw\"");

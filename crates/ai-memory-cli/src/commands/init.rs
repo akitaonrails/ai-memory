@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::auth::generate_token_hex;
 use crate::cli::InitArgs;
 use crate::config::Config;
+use ai_memory_mcp::auth::generate_token_hex;
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../../templates/config.default.toml");
 

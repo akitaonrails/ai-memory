@@ -174,7 +174,7 @@ async fn login_openai_oauth(config: &Config, timeout_secs: u64) -> Result<()> {
     token.save(&path).map_err(anyhow::Error::from)?;
 
     println!("openai-oauth: logged in");
-    if let Some(account_id) = token.account_id.as_deref() {
+    if let Some(account_id) = token.extra.account_id.as_deref() {
         println!("account: {account_id}");
     }
     println!("token file: {}", path.display());
@@ -230,7 +230,7 @@ fn status(config: &Config) -> Result<()> {
     match OpenAiOAuthToken::load(&openai_path).map_err(anyhow::Error::from)? {
         Some(token) => {
             println!("openai-oauth: logged in");
-            if let Some(account_id) = token.account_id.as_deref() {
+            if let Some(account_id) = token.extra.account_id.as_deref() {
                 println!("account: {account_id}");
             }
             println!("expires in: {}", format_duration_until(token.expires_at_ms));
@@ -283,7 +283,7 @@ fn status(config: &Config) -> Result<()> {
     match OidcToken::load(&oidc_path).map_err(anyhow::Error::from)? {
         Some(token) => {
             println!("oidc-device: logged in");
-            println!("issuer: {}", token.issuer);
+            println!("issuer: {}", token.extra.issuer);
             println!("expires in: {}", format_duration_until(token.expires_at_ms));
             println!("token file: {}", oidc_path.display());
         }

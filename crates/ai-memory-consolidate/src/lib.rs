@@ -9,10 +9,12 @@
 //! M7b extends this to multi-page atomic fan-out.
 
 pub mod auto_improve;
+pub mod auto_improve_schedule;
 pub mod auto_improve_telemetry;
 pub mod bootstrap;
 pub mod consolidator;
 pub mod curator;
+pub mod embed;
 pub mod lint;
 pub mod projection;
 pub mod sweep;
@@ -33,6 +35,10 @@ pub use auto_improve::{
     DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS, default_auto_improve_eval_targets,
     run_auto_improve_review,
 };
+pub use auto_improve_schedule::{
+    ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome,
+    initialize_auto_improve_scheduler_scopes, run_auto_improve_scheduler_tick,
+};
 pub use auto_improve_telemetry::{
     AutoImproveTelemetryFinding, AutoImproveTelemetryParams, AutoImproveTelemetryReport,
     AutoImproveTerminalRates, DEFAULT_AUTO_IMPROVE_TELEMETRY_SINCE_DAYS,
@@ -51,6 +57,9 @@ pub use consolidator::{
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
     run_curator_report,
+};
+pub use embed::{
+    EmbedBackfillCounts, EmbedBackfillError, EmbedBackfillOptions, run_embedding_backfill,
 };
 pub use lint::{LintError, LintFinding, LintReport, run_lint};
 pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep};

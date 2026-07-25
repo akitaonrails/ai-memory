@@ -21,23 +21,32 @@
 //! This crate does not read process environment directly; server configuration
 //! is resolved once by `ai-memory-cli` and threaded in as typed state.
 
+mod assistant_capture;
 pub mod capture_policy;
 pub mod log;
 pub mod payload;
 pub mod router;
 pub mod synth;
+pub mod workstream;
 
 // Re-export the sanitizer types from core so callers that grew up
 // pointing at this crate's `sanitize` module keep working.
 pub use ai_memory_core::{SanitizeConfig, Sanitized, Sanitizer};
+// Client-side symbols used by the CLI crate; the server-side `apply_assistant_backstop`
+// and the protocol/table internals stay crate-private (router reaches them via
+// `crate::assistant_capture`).
+pub use assistant_capture::{
+    ClientAssistantTransform, strip_assistant_message_raw, transform_for_client,
+};
 pub use capture_policy::{
     CaptureConfig, CaptureDecision, CaptureDisposition, CapturePolicy, CaptureProtocol,
     CaptureSource, ExtractionState, PolicyState, ToolFamily,
 };
 pub use payload::{HookEnvelope, HookEvent};
 pub use router::{
-    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState,
-    IngestRateLimiter, ProjectCache, ProjectCacheStore, SubagentSessionSet, SubagentSessions,
-    hook_router,
+    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_INGEST_GATE_MAX_ENTRIES,
+    DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, IngestGates, IngestRateLimiter, ProjectCache,
+    ProjectCacheStore, SubagentSessionSet, SubagentSessions, hook_router,
 };
 pub use synth::synthesize_session_page;
+pub use workstream::{WorkstreamState, workstream_router};

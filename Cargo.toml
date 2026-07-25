@@ -10,13 +10,14 @@ members = [
     "crates/ai-memory-consolidate",
     "crates/ai-memory-web",
     "crates/ai-memory-cli",
+    "crates/ai-memory-workstream",
     # Live A/B harness — not part of the shipped binary, but in
     # the workspace so it shares deps + builds with the rest.
     "evals",
 ]
 
 [workspace.package]
-version = "1.15.0"
+version = "1.18.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -25,14 +26,15 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "1.15.0" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "1.15.0" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "1.15.0" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "1.15.0" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "1.15.0" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "1.15.0" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "1.15.0" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "1.15.0" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "1.18.0" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "1.18.0" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "1.18.0" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "1.18.0" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "1.18.0" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "1.18.0" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "1.18.0" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "1.18.0" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "1.18.0" }
 
 # (Workspace shared deps follow below)
 
@@ -66,6 +68,10 @@ uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 # Config & CLI.
 figment = { version = "0.10", features = ["toml", "env"] }
 clap = { version = "4", features = ["derive", "env"] }
+# Shell-completion generator for `ai-memory completions <shell>`. Reads the
+# same derived `Command` the parser uses, so completions can never drift
+# from the actual CLI surface.
+clap_complete = "4"
 dirs = "5"
 # Format-preserving TOML editor for install-mcp --apply against
 # Codex's config.toml. Plain `toml` round-trips destroy comments;

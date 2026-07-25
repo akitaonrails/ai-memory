@@ -111,4 +111,8 @@ pub enum StoreError {
     /// A requested state transition is not allowed.
     #[error("invalid state: {0}")]
     InvalidState(String),
+
+    /// A live `ai-memory run` lease already owns the selected workstream.
+    #[error("workstream is already active: {0}")]
+    WorkstreamBusy(String),
 }

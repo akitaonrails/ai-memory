@@ -10,15 +10,15 @@
 //!    touches the disk on a redundant call.
 //! 4. Otherwise copies the existing file to `<path>.bak-<unix-ts>`
 //!    so the user has a recovery path.
-//! 5. Writes the new content to a sibling tempfile, fsyncs, then
-//!    renames over the original (POSIX atomic).
+//! 5. Writes the new content via the canonical
+//!    [`ai_memory_wiki::write_atomic`] (sibling tempfile + fsync +
+//!    rename + parent-dir fsync).
 //!
 //! Every `--apply` mode (install-mcp, install-hooks, install-instructions, …)
 //! routes through this function. The mutator decides the format (JSON /
 //! TOML / markdown) and the idempotency rule; the I/O atomics live here.
 
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -103,30 +103,21 @@ fn backup_path_for(path: &Path) -> PathBuf {
     PathBuf::from(bak)
 }
 
-/// Tempfile + rename atomic write. The tempfile MUST land in the
-/// same directory as the target so `rename(2)` stays intra-filesystem
-/// — otherwise we get EXDEV ("Invalid cross-device link").
-///
-/// This used to fall back to `tempfile()` (i.e. `$TMPDIR`, typically
-/// `/tmp` on tmpfs) when the target had no parent component, but
-/// that breaks any relative path like `CLAUDE.md` whose parent is
-/// `""` (empty) — the project lives on a different filesystem than
-/// `/tmp` in just about every realistic setup. Treat empty parent
-/// as `.` (current directory) instead.
+/// Atomic write via the canonical [`ai_memory_wiki::write_atomic`]
+/// (tempfile + fsync + rename + parent-dir fsync). The one wrinkle kept
+/// here: the tempfile MUST land in the same directory as the target so
+/// `rename(2)` stays intra-filesystem — otherwise we get EXDEV
+/// ("Invalid cross-device link"). A bare relative path like `CLAUDE.md`
+/// has an *empty* parent, so treat it as `.` (current directory); a
+/// `$TMPDIR` fallback would sit on a different filesystem than the
+/// project in just about every realistic setup.
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
+    let path = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => path.to_path_buf(),
+        _ => Path::new(".").join(path),
     };
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".ai-memory-apply-tmp.")
-        .tempfile_in(parent)
-        .with_context(|| format!("creating tempfile next to {}", path.display()))?;
-    tmp.write_all(content.as_bytes())
-        .context("writing tempfile content")?;
-    tmp.as_file().sync_data().context("fsync tempfile")?;
-    tmp.persist(path)
-        .with_context(|| format!("renaming tempfile into place at {}", path.display()))?;
+    ai_memory_wiki::write_atomic(&path, content.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

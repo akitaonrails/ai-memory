@@ -159,15 +159,6 @@ impl AuthzError {
 }
 
 impl AuthLevel {
-    /// `true` if this tier is allowed to perform root-only admin
-    /// operations (currently just `Root`). Centralises the
-    /// authorization check so handlers don't drift on what counts
-    /// as "root-only".
-    #[must_use]
-    pub fn is_root(self) -> bool {
-        matches!(self, AuthLevel::Root)
-    }
-
     /// Check whether this auth tier can use `capability`.
     ///
     /// `multi_user_enabled` is the store-backed presence of any user row:

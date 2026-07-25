@@ -69,3 +69,21 @@ impl LlmProvider for OpenCodeProvider {
         self.inner.complete_structured_raw(request, schema).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_reports_opencode_name_and_configured_model() {
+        let provider = OpenCodeProvider::new(SecretString::from("sk-test"), "model-x").unwrap();
+        assert_eq!(provider.name(), "opencode");
+        assert_eq!(provider.model(), "model-x");
+    }
+
+    #[test]
+    fn public_constants_point_at_zen_base_url() {
+        assert_eq!(OPENCODE_ZEN_BASE_URL, "https://opencode.ai/zen/go/v1");
+        assert!(!OPENCODE_DEFAULT_MODEL.is_empty());
+    }
+}

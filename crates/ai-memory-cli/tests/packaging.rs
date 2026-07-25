@@ -1,8 +1,12 @@
 //! Packaging asset regression tests.
 
+#[cfg(unix)]
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -72,6 +76,7 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL")
+        .env_remove("CLAUDE_CONFIG_DIR")
         .output()
         .unwrap();
     assert!(
@@ -204,6 +209,212 @@ fn macos_wrapper_routes_urls_by_real_subcommand() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn managed_run_wrapper_uses_host_binary_path_and_remote_server_without_docker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let native = tmp.path().join("native-ai-memory");
+    let docker = tmp.path().join("docker");
+    let record = tmp.path().join("native-record.txt");
+    let docker_record = tmp.path().join("docker-record.txt");
+    std::fs::write(
+        &native,
+        format!(
+            "#!/usr/bin/env bash\n\
+             printf 'server=%s\\nauth=%s\\npath=%s\\n' \"$AI_MEMORY_SERVER_URL\" \"$AI_MEMORY_AUTH_TOKEN\" \"$PATH\" > {}\n\
+             printf 'arg=%s\\n' \"$@\" >> {}\n",
+            shell_path(&record),
+            shell_path(&record)
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &docker,
+        format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\nexit 99\n",
+            shell_path(&docker_record)
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let host_path = format!(
+        "{}:{}",
+        shell_path(tmp.path()),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = shell_script_command(&repo_root().join("bin/ai-memory"))
+        .args(["run", "codex", "--yolo", "resume"])
+        .env("AI_MEMORY_NATIVE_BIN", &native)
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_SERVER_URL", "http://192.168.0.90:49374")
+        .env("AI_MEMORY_AUTH_TOKEN", "remote-test-token")
+        .env("PATH", &host_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wrapper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = std::fs::read_to_string(record).unwrap();
+    assert_eq!(
+        record,
+        format!(
+            "server=http://192.168.0.90:49374\n\
+             auth=remote-test-token\n\
+             path={host_path}\n\
+             arg=run\n\
+             arg=codex\n\
+             arg=--yolo\n\
+             arg=resume\n"
+        )
+    );
+    assert!(!docker_record.exists(), "managed run entered Docker");
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_upgrade_does_not_claim_an_updated_remote_server_is_stale() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docker = tmp.path().join("docker");
+    std::fs::write(
+        &docker,
+        "#!/usr/bin/env bash\n\
+         case \"$1\" in\n\
+           pull | ps) exit 0 ;;\n\
+           *) exit 1 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let output = shell_script_command(&repo_root().join("bin/ai-memory"))
+        .arg("upgrade")
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_SKIP_SELF_UPGRADE", "1")
+        .env("AI_MEMORY_SERVER_URL", "http://192.168.0.90:49374")
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wrapper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("does not\n  inspect or redeploy the remote server"));
+    assert!(stdout.contains("If that host is not already current"));
+    assert!(!stdout.contains("remote server still\n  runs the previous version"));
+}
+
+#[cfg(unix)]
+#[test]
+fn docker_wrapper_completions_tolerate_an_early_reader_close() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docker = tmp.path().join("docker");
+    std::fs::write(
+        &docker,
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = info ]; then\n\
+           printf '[name=seccomp,profile=default]\\n'\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = run ]; then\n\
+           i=0\n\
+           while [ \"$i\" -lt 20000 ]; do\n\
+             printf 'complete -c ai-memory -n condition-%s\\n' \"$i\"\n\
+             i=$((i + 1))\n\
+           done\n\
+           exit 0\n\
+         fi\n\
+         exit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut child = shell_script_command(&repo_root().join("bin/ai-memory"))
+        .args(["completions", "fish"])
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_NO_TTY", "1")
+        .env("AI_MEMORY_NO_VERSION_CHECK", "1")
+        .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env("HOME", tmp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first_line = String::new();
+    stdout.read_line(&mut first_line).unwrap();
+    drop(stdout);
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(first_line, "complete -c ai-memory -n condition-0\n");
+    assert!(
+        output.status.success(),
+        "early close should stay quiet and successful: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("broken pipe"),
+        "wrapper leaked Docker's broken-pipe diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn docker_wrapper_completions_preserve_helper_failure_without_partial_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docker = tmp.path().join("docker");
+    std::fs::write(
+        &docker,
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = info ]; then\n\
+           printf '[name=seccomp,profile=default]\\n'\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = run ]; then\n\
+           printf 'partial completion output\\n'\n\
+           printf 'helper failed\\n' >&2\n\
+           exit 42\n\
+         fi\n\
+         exit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let output = shell_script_command(&repo_root().join("bin/ai-memory"))
+        .args(["completions", "fish"])
+        .env("AI_MEMORY_DOCKER", &docker)
+        .env("AI_MEMORY_NO_TTY", "1")
+        .env("AI_MEMORY_NO_VERSION_CHECK", "1")
+        .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(42));
+    assert!(
+        output.stdout.is_empty(),
+        "failed helper leaked partial completions: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "helper failed\n");
+}
+
 // Unlike run_wrapper_on_fake_macos's docker fake (which only ever sees one
 // meaningful call — the final `docker run`), the rootless-Docker UID check
 // calls `docker info` *before* `docker run`, so this fake must dispatch on
@@ -212,6 +423,21 @@ fn macos_wrapper_routes_urls_by_real_subcommand() {
 #[cfg(unix)]
 fn run_wrapper_with_fake_docker(args: &[&str], docker_info_stdout: &str) -> String {
     run_wrapper_with_fake_docker_and_uname(args, docker_info_stdout, None)
+}
+
+#[cfg(unix)]
+fn run_wrapper_with_fake_docker_and_claude_config(
+    args: &[&str],
+    docker_info_stdout: &str,
+    claude_config_dir: &str,
+) -> String {
+    run_wrapper_with_fake_docker_env(
+        args,
+        docker_info_stdout,
+        None,
+        Some(claude_config_dir),
+        None,
+    )
 }
 
 // The wrapper also shells out to `id -u` / `id -g` when choosing its default
@@ -227,11 +453,38 @@ fn run_wrapper_with_fake_docker_and_uname(
     docker_info_stdout: &str,
     uname_stdout: Option<&str>,
 ) -> String {
+    run_wrapper_with_fake_docker_env(args, docker_info_stdout, uname_stdout, None, None)
+}
+
+#[cfg(unix)]
+fn run_wrapper_with_fake_selinux(
+    args: &[&str],
+    docker_info_stdout: &str,
+    selinux_mode: &str,
+) -> String {
+    run_wrapper_with_fake_docker_env(
+        args,
+        docker_info_stdout,
+        Some("Linux"),
+        None,
+        Some(selinux_mode),
+    )
+}
+
+#[cfg(unix)]
+fn run_wrapper_with_fake_docker_env(
+    args: &[&str],
+    docker_info_stdout: &str,
+    uname_stdout: Option<&str>,
+    claude_config_dir: Option<&str>,
+    selinux_mode: Option<&str>,
+) -> String {
     let tmp = tempfile::tempdir().unwrap();
     let docker_args = tmp.path().join("docker-args.txt");
     let docker = tmp.path().join("docker");
     let uname = tmp.path().join("uname");
     let id = tmp.path().join("id");
+    let getenforce = tmp.path().join("getenforce");
     std::fs::write(
         &docker,
         format!(
@@ -261,6 +514,14 @@ fn run_wrapper_with_fake_docker_and_uname(
          esac\n",
     )
     .unwrap();
+    std::fs::write(
+        &getenforce,
+        format!(
+            "#!/usr/bin/env bash\nprintf '{}\\n'\n",
+            selinux_mode.unwrap_or("Disabled")
+        ),
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -269,6 +530,7 @@ fn run_wrapper_with_fake_docker_and_uname(
             std::fs::set_permissions(&uname, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::set_permissions(&id, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&getenforce, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     // Always prepend the fake-binary dir to PATH: `id` is shadowed
@@ -287,7 +549,11 @@ fn run_wrapper_with_fake_docker_and_uname(
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
-        .env_remove("AI_MEMORY_SERVER_URL");
+        .env_remove("AI_MEMORY_SERVER_URL")
+        .env_remove("CLAUDE_CONFIG_DIR");
+    if let Some(claude_config_dir) = claude_config_dir {
+        command.env("CLAUDE_CONFIG_DIR", claude_config_dir);
+    }
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -296,6 +562,20 @@ fn run_wrapper_with_fake_docker_and_uname(
         String::from_utf8_lossy(&output.stderr)
     );
     std::fs::read_to_string(docker_args).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_forwards_claude_config_dir_to_helper_container() {
+    let args = run_wrapper_with_fake_docker_and_claude_config(
+        &["install-hooks", "--agent", "claude-code", "--apply"],
+        "[name=seccomp,profile=default]",
+        "/home/alice/.config/claude",
+    );
+    assert!(
+        args.contains("-e\nCLAUDE_CONFIG_DIR"),
+        "wrapper must forward Claude's config root; got {args}"
+    );
 }
 
 #[cfg(unix)]
@@ -381,6 +661,56 @@ fn rootful_docker_keeps_host_uid_for_host_config_commands() {
         "rootful Docker must not switch to root UID — that would write \
          ~/.local/share/ai-memory/hooks owned by root instead of the invoking \
          user; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn selinux_enforcing_disables_labels_only_for_host_file_commands() {
+    let selinux_info = "[name=seccomp,profile=default name=selinux name=cgroupns]";
+
+    for subcommand in [
+        "install-mcp",
+        "install-hooks",
+        "setup-agent",
+        "install-instructions",
+        "install-skills",
+        "uninstall",
+        "backup",
+    ] {
+        let args = run_wrapper_with_fake_selinux(&[subcommand], selinux_info, "Enforcing");
+        assert!(
+            args.contains("--security-opt\nlabel=disable"),
+            "{subcommand} writes bind-mounted host files and needs the scoped \
+             SELinux exception; got {args}"
+        );
+    }
+
+    let args = run_wrapper_with_fake_selinux(&["status"], selinux_info, "Enforcing");
+    assert!(
+        !args.contains("label=disable"),
+        "thin-client commands must retain SELinux label confinement; got {args}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn selinux_label_exception_requires_enforcement_and_daemon_support() {
+    let selinux_info = "[name=seccomp,profile=default name=selinux name=cgroupns]";
+    let args = run_wrapper_with_fake_selinux(&["install-mcp"], selinux_info, "Permissive");
+    assert!(
+        !args.contains("label=disable"),
+        "permissive hosts do not need a label exception; got {args}"
+    );
+
+    let args = run_wrapper_with_fake_selinux(
+        &["install-mcp"],
+        "[name=seccomp,profile=default name=cgroupns]",
+        "Enforcing",
+    );
+    assert!(
+        !args.contains("label=disable"),
+        "a daemon without SELinux support must not receive SELinux options; got {args}"
     );
 }
 

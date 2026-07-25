@@ -1,0 +1,28 @@
+[package]
+name = "ai-memory-workstream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Read-only native harness adapters and managed launch planning for ai-memory."
+
+[dependencies]
+ai-memory-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# Kimi wire records timestamp in ms epoch; jiff renders them RFC3339 like the
+# other harnesses' native ISO strings.
+jiff.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

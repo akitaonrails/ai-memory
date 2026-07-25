@@ -365,12 +365,18 @@ impl Consolidator {
 
         let ids = self.wiki.apply_batch(requests).await?;
         let rationale_short = batch.rationale.chars().take(60).collect::<String>();
-        let _ = self.wiki.commit_all(&format!(
-            "consolidate-batch(session {}): {} page(s) — {}",
-            short_id(&session_id.to_string()),
-            ids.len(),
-            rationale_short,
-        ));
+        let _ = self
+            .wiki
+            .commit_all(&format!(
+                "consolidate-batch(session {}): {} page(s) — {}",
+                short_id(&session_id.to_string()),
+                ids.len(),
+                rationale_short,
+            ))
+            .map_err(|e| {
+                tracing::warn!(error = %e, "consolidate-batch auto-commit failed");
+                e
+            });
 
         let outcomes = outcomes_preview
             .into_iter()

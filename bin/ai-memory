@@ -9,6 +9,7 @@
 #
 # Special wrapper-only subcommands (not forwarded to the binary):
 #   ai-memory upgrade       Pull the latest image + remind to re-stage hooks.
+#   ai-memory run ...       Use a cached native client so it can exec host agents.
 #
 # Env overrides:
 #   AI_MEMORY_IMAGE         docker image (default: akitaonrails/ai-memory:latest)
@@ -21,6 +22,9 @@
 #   COPILOT_GITHUB_TOKEN    GitHub token for AI_MEMORY_LLM_PROVIDER=copilot
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
+#   AI_MEMORY_NATIVE_BIN    native ai-memory binary used for `run` (optional)
+#   CLAUDE_CONFIG_DIR       Claude Code config root (forwarded to the helper;
+#                           paths under $HOME are covered by the home bind mount)
 set -euo pipefail
 
 IMAGE="${AI_MEMORY_IMAGE:-akitaonrails/ai-memory:latest}"
@@ -109,6 +113,7 @@ cmd_upgrade() {
   fi
   echo "→ pulling ${IMAGE}"
   "${DOCKER}" pull "${IMAGE}"
+  rm -f "${CACHE_DIR}/native-runner/last-check"
 
   local found_agents=()
   if [ -d "${HOOKS_STAGE_DIR}" ]; then
@@ -176,22 +181,106 @@ cmd_upgrade() {
     fi
   fi
 
-  # If the server runs on a different host (homelab scenario), only
-  # the local wrapper + image + hook scripts got refreshed here.
-  # Surface that, because the user still needs to deploy on the
-  # remote box for the server-side binary to update.
+  # If the server runs on a different host (homelab scenario), this command
+  # cannot know or change that host's deployment state.
   if [ -n "${AI_MEMORY_SERVER_URL:-}" ] \
      && ! echo "${AI_MEMORY_SERVER_URL}" | grep -qE '^https?://(127\.|localhost|\[?::1\]?)'; then
     echo
     echo "→ Note: AI_MEMORY_SERVER_URL points at ${AI_MEMORY_SERVER_URL}"
-    echo "  Your local image is now up to date, but the remote server still"
-    echo "  runs the previous version. Redeploy on that host (e.g. \`bin/deploy\`"
-    echo "  or \`docker compose pull && docker compose up -d\` in its deploy dir)"
-    echo "  for the server-side binary to update."
+    echo "  ai-memory upgrade updates this wrapper and local image only; it does not"
+    echo "  inspect or redeploy the remote server. If that host is not already current,"
+    echo "  run \`bin/deploy\` or \`docker compose pull && docker compose up -d\`"
+    echo "  in its deploy directory."
   fi
 
   mkdir -p "${CACHE_DIR}"
   touch "${VERSION_CHECK_FILE}"
+}
+
+# `ai-memory run` must execute on the host: native harnesses and their
+# native transcript stores are host resources, not contents of the helper
+# container. Keep a checksum-verified release client beside the wrapper cache.
+native_run_binary() {
+  if [ -n "${AI_MEMORY_NATIVE_BIN:-}" ]; then
+    [ -x "${AI_MEMORY_NATIVE_BIN}" ] || {
+      echo "ai-memory: AI_MEMORY_NATIVE_BIN is not executable: ${AI_MEMORY_NATIVE_BIN}" >&2
+      return 1
+    }
+    printf '%s\n' "${AI_MEMORY_NATIVE_BIN}"
+    return 0
+  fi
+
+  local os arch artifact base native_dir binary archive check_file need_refresh remote_sum local_sum tmp
+  case "$(uname -s 2>/dev/null || true)" in
+    Linux) os="linux" ;;
+    Darwin) os="macos" ;;
+    *)
+      echo "ai-memory: the Docker wrapper cannot provide managed host launches on this OS" >&2
+      echo "install the native release binary and run: ai-memory run <harness> ..." >&2
+      return 1
+      ;;
+  esac
+  case "$(uname -m 2>/dev/null || true)" in
+    x86_64 | amd64) arch="x86_64" ;;
+    aarch64 | arm64) arch="aarch64" ;;
+    *)
+      echo "ai-memory: no managed-run release binary is published for $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+  artifact="ai-memory-${os}-${arch}"
+  base="https://github.com/akitaonrails/ai-memory/releases/latest/download/${artifact}.tar.gz"
+  native_dir="${CACHE_DIR}/native-runner"
+  binary="${native_dir}/ai-memory"
+  archive="${native_dir}/${artifact}.tar.gz"
+  check_file="${native_dir}/last-check"
+  mkdir -p "${native_dir}"
+
+  need_refresh=0
+  [ -x "${binary}" ] && [ -f "${archive}" ] || need_refresh=1
+  if [ "${need_refresh}" -eq 0 ] && { [ ! -f "${check_file}" ] || [ -n "$(find "${check_file}" -mtime +0 2>/dev/null)" ]; }; then
+    remote_sum=$(curl -fsSL "${base}.sha256" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+    if command -v sha256sum >/dev/null 2>&1; then
+      local_sum=$(sha256sum "${archive}" | awk '{ print $1 }')
+    else
+      local_sum=$(shasum -a 256 "${archive}" | awk '{ print $1 }')
+    fi
+    if [ -n "${remote_sum}" ] && [ "${remote_sum}" != "${local_sum}" ]; then
+      need_refresh=1
+    fi
+    touch "${check_file}"
+  fi
+
+  if [ "${need_refresh}" -eq 1 ]; then
+    command -v curl >/dev/null 2>&1 || {
+      echo "ai-memory: curl is required to install the native managed-run client" >&2
+      return 1
+    }
+    tmp="${native_dir}/.install-$$"
+    rm -rf "${tmp}"
+    mkdir -p "${tmp}"
+    echo "ai-memory: installing checksum-verified native managed-run client (${artifact})" >&2
+    curl -fsSL "${base}" -o "${tmp}/${artifact}.tar.gz"
+    curl -fsSL "${base}.sha256" -o "${tmp}/${artifact}.tar.gz.sha256"
+    if command -v sha256sum >/dev/null 2>&1; then
+      (cd "${tmp}" && sha256sum -c "${artifact}.tar.gz.sha256" >/dev/null)
+    else
+      remote_sum=$(awk 'NR == 1 { print $1 }' "${tmp}/${artifact}.tar.gz.sha256")
+      local_sum=$(shasum -a 256 "${tmp}/${artifact}.tar.gz" | awk '{ print $1 }')
+      [ "${remote_sum}" = "${local_sum}" ] || {
+        echo "ai-memory: native managed-run client checksum mismatch" >&2
+        rm -rf "${tmp}"
+        return 1
+      }
+    fi
+    tar -xzf "${tmp}/${artifact}.tar.gz" -C "${tmp}"
+    [ -x "${tmp}/ai-memory" ] || chmod +x "${tmp}/ai-memory"
+    mv "${tmp}/${artifact}.tar.gz" "${archive}"
+    mv "${tmp}/ai-memory" "${binary}"
+    rm -rf "${tmp}"
+    touch "${check_file}"
+  fi
+  printf '%s\n' "${binary}"
 }
 
 # ---- intercept wrapper-only subcommands ----------------------------------
@@ -201,6 +290,11 @@ case "${1:-}" in
     shift
     cmd_upgrade
     exit 0
+    ;;
+  run)
+    shift
+    NATIVE_RUN_BIN=$(native_run_binary)
+    exec "${NATIVE_RUN_BIN}" run "$@"
     ;;
 esac
 
@@ -233,8 +327,10 @@ for var in \
   AI_MEMORY_EMBEDDING_BASE_URL \
   AI_MEMORY_EMBEDDING_DIM \
   AI_MEMORY_ALLOWED_HOSTS \
+  AI_MEMORY_WORKSTREAM_ID \
   AI_MEMORY_HOOK_PLATFORM \
   AI_MEMORY_HOOKS_HOST_ROOT \
+  CLAUDE_CONFIG_DIR \
   ANTHROPIC_API_KEY \
   OPENAI_API_KEY \
   COPILOT_GITHUB_TOKEN \
@@ -319,18 +415,33 @@ esac
 # write to a host bind mount: other commands only touch the /data named
 # volume, which isn't host-visible and doesn't have this problem, so leave
 # their UID mapping alone.
+DOCKER_SECURITY_OPTIONS=$("${DOCKER}" info --format '{{.SecurityOptions}}' 2>/dev/null || true)
 ROOTLESS_DOCKER=0
-if "${DOCKER}" info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q 'name=rootless'; then
+if printf '%s\n' "${DOCKER_SECURITY_OPTIONS}" | grep -q 'name=rootless'; then
   ROOTLESS_DOCKER=1
 fi
 if [ "${WRITES_HOST_FILES}" -eq 1 ] && [ "${ROOTLESS_DOCKER}" -eq 1 ]; then
   USER_ARGS=(-u 0:0)
 fi
 
+SELINUX_ARGS=()
 case "$(uname -s 2>/dev/null || true)" in
   Linux)
     if [ -z "${AI_MEMORY_SERVER_URL:-}" ]; then
       NETWORK_ARGS=(--network host)
+    fi
+    # SELinux blocks the helper's container label from writing normal home
+    # labels even when its uid/gid match the host user. Relabeling the entire
+    # $HOME bind with :z/:Z is unsafe, so relax label confinement only for the
+    # short-lived, trusted helper commands that actually write host files.
+    SELINUX_MODE=$(getenforce 2>/dev/null || true)
+    if [ -z "${SELINUX_MODE}" ] && [ -r /sys/fs/selinux/enforce ]; then
+      SELINUX_MODE=$(cat /sys/fs/selinux/enforce 2>/dev/null || true)
+    fi
+    if [ "${WRITES_HOST_FILES}" -eq 1 ] \
+      && { [ "${SELINUX_MODE}" = "Enforcing" ] || [ "${SELINUX_MODE}" = "enforcing" ] || [ "${SELINUX_MODE}" = "1" ]; } \
+      && printf '%s\n' "${DOCKER_SECURITY_OPTIONS}" | grep -q 'name=selinux'; then
+      SELINUX_ARGS=(--security-opt label=disable)
     fi
     ;;
   Darwin)
@@ -375,8 +486,8 @@ else
 fi
 
 # Mount $HOME at the same path inside the container so:
-#   - dirs::home_dir() resolves identically (~/.claude/settings.json
-#     auto-detect works without --config-file)
+#   - dirs::home_dir() resolves identically (Claude's default paths and any
+#     CLAUDE_CONFIG_DIR beneath $HOME work without extra path flags)
 #   - install-hooks stages scripts into ~/.local/share/ai-memory/hooks/
 #
 # Mount $PWD at /work and set the container workdir there. This
@@ -394,14 +505,51 @@ fi
 # binary can derive the *real* host-side project name from it. The
 # `commands::resolve_project_name` helper checks this env var first
 # and falls back to the cwd basename only if it's unset.
-exec "${DOCKER}" run --rm ${TTY_ARGS[@]+"${TTY_ARGS[@]}"} \
-  ${NETWORK_ARGS[@]+"${NETWORK_ARGS[@]}"} \
-  -v "${HOME}:${HOME}" \
-  -v "${PWD}:/work" \
-  -w /work \
-  -e HOME="${HOME}" \
-  -e AI_MEMORY_HOST_CWD="${PWD}" \
-  ${USER_ARGS[@]+"${USER_ARGS[@]}"} \
-  "${DATA_ARGS[@]}" \
-  ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
-  "${IMAGE}" "$@"
+HELPER_ARGS=(run --rm)
+# Bash 3.2 (still shipped by macOS) rejects an empty-array expansion under
+# `set -u`. The `array[@]+...` form appends only arrays with at least one item.
+HELPER_ARGS+=(${TTY_ARGS[@]+"${TTY_ARGS[@]}"})
+HELPER_ARGS+=(${NETWORK_ARGS[@]+"${NETWORK_ARGS[@]}"})
+HELPER_ARGS+=(${SELINUX_ARGS[@]+"${SELINUX_ARGS[@]}"})
+HELPER_ARGS+=(
+  -v "${HOME}:${HOME}"
+  -v "${PWD}:/work"
+  -w /work
+  -e HOME="${HOME}"
+  -e AI_MEMORY_HOST_CWD="${PWD}"
+)
+HELPER_ARGS+=(${USER_ARGS[@]+"${USER_ARGS[@]}"})
+HELPER_ARGS+=("${DATA_ARGS[@]}")
+HELPER_ARGS+=(${ENV_ARGS[@]+"${ENV_ARGS[@]}"})
+HELPER_ARGS+=("${IMAGE}" "$@")
+
+# The native binary renders completions into a buffer so a short consumer such
+# as `head` can close stdout without surfacing an error. Docker's streaming
+# client does not share that behavior: it reports its own broken pipe before the
+# container can return success. Buffer this bounded, read-only command outside
+# Docker, then preserve the same quiet SIGPIPE behavior while streaming the
+# completed script to the caller. Docker failures still return before any
+# partial completion script is printed.
+if [ "${WRAPPER_SUBCOMMAND}" = "completions" ]; then
+  COMPLETIONS_TMP=$(mktemp "${TMPDIR:-/tmp}/ai-memory-completions.XXXXXX")
+  trap 'rm -f "${COMPLETIONS_TMP}"' EXIT
+  if "${DOCKER}" "${HELPER_ARGS[@]}" >"${COMPLETIONS_TMP}"; then
+    DOCKER_STATUS=0
+  else
+    DOCKER_STATUS=$?
+  fi
+  if [ "${DOCKER_STATUS}" -ne 0 ]; then
+    exit "${DOCKER_STATUS}"
+  fi
+  if cat "${COMPLETIONS_TMP}"; then
+    OUTPUT_STATUS=0
+  else
+    OUTPUT_STATUS=$?
+  fi
+  rm -f "${COMPLETIONS_TMP}"
+  trap - EXIT
+  [ "${OUTPUT_STATUS}" -eq 141 ] && exit 0
+  exit "${OUTPUT_STATUS}"
+fi
+
+exec "${DOCKER}" "${HELPER_ARGS[@]}"

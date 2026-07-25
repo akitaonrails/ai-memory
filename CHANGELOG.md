@@ -8,6 +8,280 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GET /admin/open-sessions` lists open (not yet ended) sessions for one
+  workspace/project/agent, newest first (`all=true` returns every match).
+  `ai-memory finalize-session` now uses this endpoint instead of opening
+  the local SQLite index directly, so every CLI command is a thin HTTP
+  client of the running server; the command now requires a reachable
+  server and no longer works against an offline data directory.
+
+## [1.18.0] - 2026-07-23
+
+### Added
+- The store writer only accepts `Sanitized<NewObservation>`: the privacy
+  strip is enforced by the type system at the persistence boundary, so an
+  unsanitized observation cannot reach disk by construction.
+- The session-review sampler now scores a non-empty `Stop` observation just
+  below `PreCompact` (88 vs 90) instead of the low `55` prior, so the opt-in
+  assistant/Stop excerpt (a late summary or correction) competes for a sampling
+  slot while keeping the `UserPrompt` base priority higher. An empty `Stop`
+  keeps its low prior. The reviewer still sees only the first 1500 characters
+  of any observation body, so a correction inside a long excerpt must fall in
+  that window ([#196]).
+- Opt-in assistant/Stop capture for Claude Code (#196). When BOTH the server
+  (`capture_assistant = true` / `AI_MEMORY_CAPTURE_ASSISTANT=true`) and the
+  client (`install-hooks --agent claude-code --capture-assistant`) opt in, a
+  Claude Code `Stop` event carries a sanitized, 2 KB-capped excerpt of the
+  assistant's final turn as the Stop body. The client sanitizes with the
+  built-in patterns and truncates before the excerpt ever touches the spool or
+  wire, splicing a versioned `_ai_memory_assistant` marker into the body and a
+  `capture_assistant=1` flag onto the event URL; the server re-scrubs with its
+  configured `[sanitize]` patterns and re-enforces the 2 KB cap at the
+  persistence boundary (never trusting the client's length). Off by default,
+  and any gate failure (server off, wrong agent/event, malformed or
+  future-versioned marker, empty excerpt) degrades to an empty Stop with the
+  same `202` response. Assistant text is privacy-sensitive — see `SECURITY.md`
+  for what it can contain and where it flows. Script-fallback installs cannot
+  sanitize the field and drop the whole Stop event instead; move to a native
+  install to capture it.
+- Managed workstreams now support Kimi Code through `ai-memory run kimi`;
+  `kimi-code` and `kimi-cli` are accepted aliases for the installed `kimi`
+  executable.
+  Returning runs resume the linked native session with `--session <id>`;
+  fresh sessions are discovered post-exit by exact checkout match through
+  `state.json`'s `workDir` (the session bucket name is a one-way hash and is
+  never parsed). The adapter reads `$KIMI_CODE_HOME/sessions` (default
+  `~/.kimi-code/sessions`) and imports only visible user/assistant/tool
+  messages and compaction summaries from `agents/main/wire.jsonl`, excluding
+  system prompts, hidden reasoning, hook-injected context (`hook_result` and
+  related origins), and subagent transcripts. Wrapper `--yolo` maps to Kimi
+  Code's `--yolo`, and kimi joins the automatic bare-run harness pool. The
+  deterministic and opt-in real-harness acceptance paths cover Kimi creation,
+  transcript import, cross-harness delivery, and returning native resume; the
+  native contract was live-verified against Kimi Code v0.29.0.
+
+### Fixed
+- Native hook spool retries now reuse a per-entry idempotency key, so a lost
+  batch response does not duplicate observations or completed session-end
+  effects. The server claims each key atomically with its observation, resumes
+  downstream wiki/handoff work when a prior delivery stopped incomplete, and
+  skips only events already marked complete. Overlapping deliveries of the same
+  key are serialized; keys are project-scoped and expire after the spool retry
+  horizon.
+- Managed-workstream overview and command-reference documentation now
+  consistently includes Kimi Code in the supported and automatic-selection
+  harness lists.
+- Windows PowerShell fallback hooks now force text output and silence
+  non-interactive progress records. This prevents nested PowerShell runners
+  such as Antigravity CLI from reporting serialized `CLIXML` progress on every
+  hook while preserving the hook's JSON stdout. Existing script-fallback
+  installs should rerun `install-hooks --agent <agent> --apply` after upgrading
+  ([#224]).
+- Kimi Code handoffs are now delivered through the `UserPromptSubmit` hook
+  instead of `SessionStart`. Kimi Code fires `SessionStart` but discards the
+  hook's stdout/result (verified against kimi-code v0.28.1,
+  `packages/agent-core/src/session/index.ts`), so the previous hook consumed
+  pending handoffs — legacy and managed — without ever showing them to the
+  model. `UserPromptSubmit` stdout is injected as a user message before the
+  turn. The native `ai-memory hook` path now also accepts the
+  `user-prompt-submit` event token alongside `user-prompt` for kimi handoff
+  delivery. Existing native hook commands pick up the correction when the
+  binary is upgraded; script-fallback installations must re-run
+  `ai-memory install-hooks --agent kimi-code --apply` to refresh their staged
+  scripts.
+- The `[briefing]` compiled project brief is now gated to once per session
+  for Kimi Code: it rides the first user prompt (kimi discards SessionStart
+  hook stdout, so session-start delivery is impossible) and later prompts
+  keep fetching the handoff without the briefing params, so the server no
+  longer recomposes the brief on every prompt. This also works for managed
+  handoffs, creates local markers only for opted-in repositories, and retains
+  at most 512 markers. Re-briefing after `/clear` is not supported in v1.
+- Kimi Code managed transcript cursors now validate the imported byte prefix
+  before resuming. When Kimi rewrites `wire.jsonl` in place, ai-memory safely
+  replays the journal with stable event IDs instead of seeking into a changed
+  record or skipping new events.
+- Kimi Code managed transcript extraction now imports native
+  `context.append_loop_event` assistant text, tool calls, and tool results.
+  Current Kimi journals store model output in those records rather than
+  re-appending it as a completed assistant message.
+- `ai-memory run kimi server ...` now passes through Kimi Code's deprecated
+  but still functional `server` utility command instead of treating it as an
+  interactive session launch.
+
+## [1.17.3] - 2026-07-22
+
+### Fixed
+- Corrected Docker-wrapper upgrade guidance: `ai-memory upgrade` no longer
+  claims a configured remote server is stale when it cannot inspect that
+  deployment, and the install guide now makes clear that refreshing Docker
+  script hooks does not convert them to native capture-policy commands.
+
+## [1.17.2] - 2026-07-22
+
+### Added
+- `ai-memory completions <shell>` prints a shell-completion script for bash,
+  zsh, fish, PowerShell, or elvish. The script is generated from the binary's
+  own command tree, so it always matches the installed version; install paths
+  per shell are documented in `docs/shell-completions.md`. The command reads no
+  config and needs no data directory, so it works before `ai-memory init`.
+
+### Changed
+- Documented Atlas Cloud through the existing `openai-compat` provider instead
+  of adding a redundant provider type, including the endpoint, model, and API
+  key mapping needed for deployment.
+- The native hook binary now drops any raw assistant-message field (Claude
+  Code's `last_assistant_message` on `Stop`) before it can reach the local
+  spool or the wire, and drains pre-existing spooled entries with the field
+  stripped too. The server applies the same strip defensively on `/hook` and
+  `/hook/batch` before building an envelope. This field was already never
+  persisted, so there is no behavior change; it closes a raw-text exposure in
+  the spool/wire. Optional assistant/Stop capture proposed in #196 remains
+  disabled. Upgrading the binary is sufficient for native Claude Code installs;
+  script-fallback installs (Docker wrapper, `AI_MEMORY_HOOK_PLATFORM=posix`)
+  still send the raw field to the server, which strips it immediately on
+  receipt. Closing the local-wire vector requires a native client on the agent
+  host and using it to reinstall hooks; running the installer through the
+  Docker wrapper only refreshes its scripts ([#196]).
+
+### Fixed
+- Removed the unused `syntect` dependency and its `plist`, `quick-xml`,
+  `bincode`, and `yaml-rust` transitive dependencies. This eliminates two
+  high-severity `quick-xml` denial-of-service advisories and makes the prior
+  temporary cargo-audit exceptions unnecessary; ai-memory's rendered Markdown
+  behavior is unchanged because the syntax-highlighting crate was never used.
+- The Docker wrapper now buffers generated shell completions before streaming
+  them to stdout. Piping `ai-memory completions <shell>` into a short-lived
+  consumer such as `head` no longer exposes Docker's own broken-pipe error or
+  non-zero exit after the native command completed successfully; real helper
+  container failures still propagate without printing a partial script.
+- The Linux Docker wrapper now detects an SELinux-enforcing host plus a
+  SELinux-enabled daemon and adds `--security-opt label=disable` only to
+  short-lived helper commands that write bind-mounted host files. This avoids
+  `Permission denied` during `install-*`, `setup-agent`, `uninstall`, and
+  `backup` without relabeling the user's home directory or changing the
+  long-lived server container ([#212]).
+- Windows `.ps1` fallback hook commands now use PowerShell `-EncodedCommand`
+  instead of embedding `$env:` setup inside a nested quoted command. This
+  prevents outer Windows hook runners such as Antigravity CLI from expanding
+  the setup before the inner PowerShell process receives it. Existing Windows
+  Docker-wrapper installs should rerun `install-hooks --agent <agent> --apply`
+  after upgrading ([#214]).
+- `install-mcp --client claude-code` and `uninstall` now honour
+  `CLAUDE_CONFIG_DIR`: MCP registrations go to
+  `$CLAUDE_CONFIG_DIR/.claude.json` when the variable is set (non-empty),
+  falling back to `~/.claude.json` otherwise. Uninstall checks both the active
+  relocated path and the home default so enabling the variable does not orphan
+  a prior default-path registration. The
+  dry-run output prints the resolved config path instead of a hardcoded path.
+- `install-hooks --agent claude-code` and `setup-agent` follow the same
+  resolution for the hooks settings file: `$CLAUDE_CONFIG_DIR/settings.json`
+  when set, else `~/.claude/settings.json`. Uninstall checks both locations;
+  rendered output and the chmod-600 warning show the resolved path.
+- `install-skills --scope global` (claude-code root) installs to
+  `$CLAUDE_CONFIG_DIR/skills` when the variable is set, else
+  `~/.claude/skills`. `uninstall` sweeps the relocated root alongside the
+  home default so installs that predate the env var are still removed.
+- The Docker CLI wrapper forwards `CLAUDE_CONFIG_DIR` into its helper
+  container for relocated Claude Code configs beneath the existing home bind.
+
+## [1.17.1] - 2026-07-20
+
+### Fixed
+- Managed launch failures now cancel their server lease immediately, and a new
+  launch waits briefly when the previous launcher is still finalizing. The
+  parent launcher also survives terminal interrupts long enough to finish or
+  cancel the run, preventing a normal quit-and-reopen from being blocked by the
+  90-second crash-recovery lease.
+- CLI startup diagnostics now show the configured server URL and use the real
+  host name in lease-owner messages, avoiding misleading `localhost` labels for
+  remote-server clients.
+
+## [1.17.0] - 2026-07-20
+
+### Added
+- `ai-memory run` without a harness now selects among checkout-local Claude
+  Code, Codex, OpenCode, Pi, and Crush sessions. Empty workstreams adopt the
+  newest session automatically; established workstreams prefer their most
+  recently linked available harness. A directory with no matching session
+  exits with explicit start commands instead of creating an empty workstream.
+- Managed workstreams now support Crush through its project-local read-only
+  SQLite transcript and supported `options.global_context_paths` configuration.
+  ai-memory never writes the original Crush config or session database; the
+  launched Crush process retains normal ownership of its native session writes.
+- Wrapper-owned `run --yolo` translates to each harness's native dangerous-mode
+  option for Claude Code, Codex, OpenCode, Pi, and Crush.
+- A managed-harness contribution protocol documents the native-session,
+  read-only import, context-delivery, migration, privacy, and acceptance-test
+  requirements for adding agents beyond the currently supported set.
+
+### Changed
+- The first interactive `ai-memory run` on an otherwise-empty workstream now
+  offers recent native sessions recorded for the same checkout, with the newest
+  as the default or an explicit fresh-session choice. Adoption is disabled for
+  `--new`, explicit selectors, scripted/noninteractive launches, and any
+  workstream already established by another harness, preventing obsolete local
+  sessions from contaminating later cross-harness switches.
+
+### Fixed
+- Managed utility invocations such as `ai-memory run codex --version` no longer
+  discover and import a different process's recently updated native session.
+  Passthrough commands also do not fetch or acknowledge managed startup context.
+- Managed runs now verify the host harness executable before opening a server
+  lease and report how to refresh a stale Docker wrapper. The wrapper path is
+  regression-tested to preserve a remote `AI_MEMORY_SERVER_URL`, auth, and the
+  host `PATH` without entering Docker, and now retains the `run` subcommand when
+  it hands control to the native ai-memory client.
+- Corrected stale project-move flags in the marker guide and documented the
+  distinction between a server-side project rename and a physical checkout or
+  native-session relocation.
+
+## [1.16.0] - 2026-07-20
+
+### Added
+- Optional managed cross-harness workstreams via `ai-memory run` for Claude
+  Code, Codex, OpenCode, Pi, and OMP. Direct harness launches retain the legacy
+  hook/handoff behavior. Managed launches transparently create or resume one
+  native session per harness, pass all harness argv through without a `--`
+  separator, inject unseen portable context at SessionStart, import visible
+  native transcript tails through read-only adapters, and record non-mutating
+  repository checkpoints. A lease prevents concurrent writers; deterministic
+  event ids, incremental cursors, immutable sanitized JSONL segments, and
+  batched idempotent imports make retry and crash recovery explicit. Hidden
+  reasoning and private provider records are excluded with loss annotations.
+  `ai-memory workstream-search` searches history older than the bounded startup
+  packet. The Linux/macOS Docker wrapper uses a checksum-verified cached native
+  client for `run` so host agent executables and transcript stores remain
+  accessible. A separate opt-in local acceptance runner validates real
+  cross-harness delivery and native resume without adding credentialed model
+  calls to CI. Generated OpenCode/Pi/OMP integrations reserve managed context
+  acknowledgement for their model-visible injection path; OpenCode caches the
+  packet per native session so auxiliary model requests cannot consume it
+  before the main coding turn. Pi/OMP native `--session-dir` overrides are
+  honored by the importer, as are native store environment overrides for all
+  five adapters. This includes complete atomic-write temp transcripts left by
+  a Pi-family process that exits before its final rename.
+
+### Changed
+- Configuring the hosted `anthropic` or `openai` provider without an explicit
+  model now selects the documented recommended defaults, `claude-haiku-4-5`
+  and `gpt-5.4-mini`, instead of the older `claude-sonnet-4-6` and
+  `gpt-4o-mini` fallbacks. Explicit `AI_MEMORY_LLM_MODEL` values are unchanged.
+### Fixed
+- User-facing help and current-reference documentation now match the shipped
+  agent integrations, multi-user activation boundary, MCP URL normalization,
+  Pi bridge, and `memory_consolidate` configuration requirements. Local
+  documentation links and anchors were also audited and repaired.
+- Reader APIs now derive absent page kinds consistently from canonical path
+  families. Session, concept, procedure, note, and slot pages no longer surface
+  as generic facts, while an explicit frontmatter `kind` still takes precedence
+  ([#198]).
+- Native lifecycle hooks now accept one leading UTF-8 BOM on JSON stdin, which
+  covers PowerShell pipelines on Windows. Other malformed payloads are dropped
+  before spool or network delivery with a bounded content-free stderr warning;
+  hooks still return `{}` and exit successfully ([#197]).
+
+## [1.15.0] - 2026-07-19
+### Added
 - `ai-memory move-project` now accepts a `--workspace <new>` (alias for
   `--to-workspace`) to move the current CWD project into another workspace, and
   auto-derives the source workspace from the repo's `.ai-memory.toml` marker
@@ -1979,7 +2253,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.14.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.18.0...HEAD
+[1.18.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.18.0
+[1.17.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.3
+[1.17.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.2
+[1.17.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.1
+[1.17.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.0
+[1.16.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.16.0
+[1.15.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.15.0
 [1.14.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.14.0
 [1.13.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.13.0
 [1.12.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.12.0

@@ -13,7 +13,6 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
-mod auth;
 mod auth_bearer;
 mod cli;
 mod commands;
@@ -42,6 +41,12 @@ async fn main() -> Result<()> {
     let command = match command {
         Command::Hook(args) => return commands::hook::run(data_dir, args).await,
         Command::HookDrain(_args) => return commands::hook::run_drain(data_dir).await,
+        // Completions are pure text derived from the command tree. Emitting
+        // them must not require a loadable config or an initialised data dir
+        // (they are typically generated before `init`, or in a packaging
+        // step), and tracing must not get the chance to interleave anything
+        // into the script on stdout.
+        Command::Completions(args) => return commands::completions::run(args),
         other => other,
     };
 
@@ -59,6 +64,7 @@ async fn main() -> Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
+        server_url = %config.server_url,
         data_dir = %config.data_dir.display(),
         bind = %config.bind,
         "ai-memory starting",
@@ -67,6 +73,14 @@ async fn main() -> Result<()> {
     match command {
         Command::Init(args) => commands::init::run(&config, args, config_path.as_deref()),
         Command::Status(args) => commands::status::run(&config, args).await,
+        Command::Run(args) => {
+            let exit_code = commands::run::run(&config, args).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
+        Command::WorkstreamSearch(args) => commands::workstream_search::run(&config, args).await,
         Command::AuditContamination(args) => {
             commands::audit_contamination::run(&config, args).await
         }
@@ -113,5 +127,7 @@ async fn main() -> Result<()> {
         Command::Uninstall(args) => commands::uninstall::run(&config, args),
         Command::Auth(args) => commands::auth::run(&config, args).await,
         Command::User(args) => commands::user::run(&config, args).await,
+        // `Completions` is handled in the fast-path above (before config/tracing).
+        Command::Completions(args) => commands::completions::run(args),
     }
 }

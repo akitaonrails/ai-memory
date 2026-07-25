@@ -66,13 +66,6 @@ impl ChatRequest {
         }
     }
 
-    /// Attach a system prompt to the request.
-    #[must_use]
-    pub fn with_system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
-        self
-    }
-
     /// Override the max-tokens cap.
     #[must_use]
     pub const fn with_max_tokens(mut self, n: u32) -> Self {

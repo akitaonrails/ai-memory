@@ -16,16 +16,19 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ai_memory_core::{AgentKind, SessionId};
+use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
-use ai_memory_hooks::{CaptureDisposition, PolicyState};
+use ai_memory_hooks::{CaptureDisposition, HookEvent, PolicyState};
 use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
 
+use sha2::{Digest as _, Sha256};
+
 use super::hook_capture::{
     build_client, canonical_context, capture_policy, extract_cwd, get_handoff, marker_query_suffix,
-    resolve_cwd_with_fallbacks, url_encode,
+    marker_query_suffix_without_briefing, marker_requests_briefing, resolve_cwd_with_fallbacks,
+    url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -48,9 +51,11 @@ const START_BUDGET_ENV: &str = "AI_MEMORY_HOOK_START_BUDGET_MINUTES";
 const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGET_MINUTES";
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
+const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
 const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
+const MAX_BRIEFED_MARKERS: usize = 512;
 /// Total budget AND per-event timeout for the mid-session catch-up drain — kept
 /// well under a second so a `post-tool-use` hook never stalls a tool call (one
 /// in-flight POST against a slow server is bounded by this too).
@@ -148,6 +153,77 @@ fn store_session_id(data_dir: &Path, agent: AgentKind, session_id: &str) {
 
 fn clear_session_id(data_dir: &Path, agent: AgentKind) {
     let _ = fs::remove_file(session_id_state_path(data_dir, agent));
+}
+
+/// `<data_dir>/briefed/<key>` — records that the compiled project brief
+/// (`[briefing] inject_on_session_start`) was already delivered for this
+/// session by the user-prompt handoff path. kimi-code discards SessionStart
+/// hook stdout, so the brief rides the FIRST user prompt of the session
+/// (parity with Claude's once-per-SessionStart brief); the marker keeps
+/// later prompts from re-requesting it. Keyed by the payload's canonical
+/// session id when Kimi supplies one; payloads without one fall back to a
+/// stable hash of agent+cwd so a session-less agent still briefs once per
+/// checkout. The key is sanitized to a safe file name.
+fn briefed_marker_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    let key = session_id.map_or_else(
+        || {
+            format!(
+                "{:x}",
+                Sha256::digest(format!("{agent}\n{}", cwd.unwrap_or_default()).as_bytes())
+            )
+        },
+        sanitize_briefed_key,
+    );
+    data_dir.join("briefed").join(key)
+}
+
+fn sanitize_briefed_key(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Best-effort marker write with bounded retention: on failure the worst case
+/// is a re-brief on the next prompt, which is acceptable.
+fn mark_briefed(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() || fs::write(path, b"").is_err() {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let mut stale_candidates = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then_some((
+                metadata.modified().ok(),
+                entry.file_name(),
+                entry.path(),
+            ))
+        })
+        .filter(|(_, _, candidate)| candidate != path)
+        .collect::<Vec<_>>();
+    stale_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let keep_others = MAX_BRIEFED_MARKERS.saturating_sub(1);
+    for (_, _, stale) in stale_candidates.into_iter().skip(keep_others) {
+        let _ = fs::remove_file(stale);
+    }
 }
 
 fn fresh_session_id(data_dir: &Path, agent: AgentKind) -> String {
@@ -253,6 +329,18 @@ fn env_lookup(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+fn managed_run_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
+    env_lookup(MANAGED_RUN_ENV)
+        .filter(|value| value.parse::<ManagedRunId>().is_ok())
+        .map_or_else(String::new, |value| {
+            format!("&managed_run={}", url_encode(&value))
+        })
+}
+
+fn managed_run_query_suffix() -> String {
+    managed_run_query_suffix_with(env_lookup)
+}
+
 /// Read a positive-integer minute override from `name`, falling back to the
 /// built-in short default for missing / empty / non-numeric / zero values. Clamp
 /// large values so a typo cannot block a hook boundary for hours or days.
@@ -315,6 +403,29 @@ where
             return Ok(());
         }
     };
+    // Assistant/Stop capture (#196). On an opted-in install
+    // (`install-hooks --capture-assistant`), extract the assistant message,
+    // sanitize + cap it, and splice the versioned `_ai_memory_assistant` marker
+    // into the body. Otherwise just strip any raw assistant field defensively —
+    // the field is never persisted until the server-gated opt-in accepts it.
+    // Reserialize only when the JSON actually changed, so unrelated events keep
+    // byte-exact spool bodies (see `native_hook_accepts_plain_and_bom_prefixed_json`).
+    let capture_assistant = if args.capture_assistant {
+        let transform = ai_memory_hooks::transform_for_client(
+            &mut json,
+            AgentKind::from_wire(&args.agent),
+            ai_memory_hooks::HookEvent::parse(&args.event),
+        );
+        if transform.changed {
+            payload = serde_json::to_string(&json)?;
+        }
+        transform.captured
+    } else {
+        if ai_memory_hooks::strip_assistant_message_raw(&mut json) {
+            payload = serde_json::to_string(&json)?;
+        }
+        false
+    };
     let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
     let policy = policy_cwd.as_deref().map(capture_policy);
     let tool_event = is_tool_event(&args.event);
@@ -376,7 +487,8 @@ where
     let dd = resolve_data_dir(data_dir.as_deref());
     let spool = hook_spool::spool_dir(&dd);
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
-    let hook_qs = format!("{qs}{session_qs}");
+    let managed_qs = managed_run_query_suffix();
+    let hook_qs = format!("{qs}{session_qs}{managed_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
     // mode is decided without a round-trip: an explicit `--auth-token` is
@@ -387,9 +499,23 @@ where
             .ok()
             .flatten()
             .is_some();
+    // Append the opt-in capture flag outside the marker query so the server can
+    // gate on it (#196). Only present when a valid protocol was actually spliced
+    // into this event's body, so the flag and the marker always travel together.
+    let capture_qs = if capture_assistant {
+        "&capture_assistant=1"
+    } else {
+        ""
+    };
+    // Idempotency key: minted ONCE here and baked into the spooled URL, so
+    // every retry of this entry re-sends the same key. The server claims it
+    // atomically with the observation row and skips replays whose previous
+    // delivery succeeded but whose response was lost — closing the
+    // conservative-retry duplication vector. Older servers ignore the param.
+    let ingest_key = uuid::Uuid::new_v4().simple().to_string();
     let event_url = format!(
-        "{base}/hook?event={}&agent={}{}",
-        args.event, args.agent, hook_qs
+        "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
+        args.event, args.agent, hook_qs, capture_qs
     );
     let entry = hook_spool::entry_for(
         event_url,
@@ -444,7 +570,15 @@ where
         if AgentKind::from_wire(&args.agent).session_start_injects_handoff() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
-            let handoff_url = format!("{base}/handoff?agent={}{qs}", args.agent);
+            let native_session_qs = canonical_session_id
+                .as_deref()
+                .map_or_else(String::new, |session_id| {
+                    format!("&session_id={}", url_encode(session_id))
+                });
+            let handoff_url = format!(
+                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                args.agent
+            );
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
@@ -458,6 +592,81 @@ where
                 return Ok(());
             }
         }
+    }
+
+    // user-prompt: agents whose SessionStart stdout is discarded (Kimi Code)
+    // receive the handoff here instead — kimi injects UserPromptSubmit stdout
+    // into the turn verbatim as a `hook_result` user message. The payload
+    // carries the native session id when available, so the destructive GET
+    // can also link the managed run to the native session, same as
+    // session-start does.
+    // The installed kimi hook passes the script stem (`user-prompt-submit`)
+    // while the legacy shell path posts `user-prompt`; HookEvent::parse
+    // canonicalizes both (and the snake/native spellings) to UserPrompt.
+    if HookEvent::parse(&args.event) == HookEvent::UserPrompt
+        && AgentKind::from_wire(&args.agent).user_prompt_injects_handoff()
+    {
+        let client = build_client();
+        let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
+        let native_session_qs = canonical_session_id
+            .as_deref()
+            .map_or_else(String::new, |session_id| {
+                format!("&session_id={}", url_encode(session_id))
+            });
+        // Gate the `[briefing]` params to the FIRST user prompt of the
+        // session: kimi has no working SessionStart injection, so the brief
+        // is delivered here exactly once (parity with Claude); afterwards
+        // the handoff fetch continues on every prompt — it is cheap and
+        // self-limiting (empty body when nothing is pending) — but without
+        // `&briefing`/`&briefing_budget`, so the server does not recompose
+        // the brief per prompt. The marker survives `/clear`, so re-briefing
+        // after a context clear is not supported in v1.
+        let briefed_path = policy_cwd
+            .as_deref()
+            .filter(|cwd| marker_requests_briefing(cwd))
+            .map(|_| {
+                briefed_marker_path(
+                    &dd,
+                    &args.agent,
+                    canonical_session_id.as_deref(),
+                    policy_cwd.as_deref(),
+                )
+            });
+        let handoff_qs = if briefed_path.as_ref().is_some_and(|path| path.is_file()) {
+            policy_cwd
+                .as_deref()
+                .map(|cwd| {
+                    marker_query_suffix_without_briefing(
+                        cwd,
+                        args.project_strategy.and_then(|s| s.baked()),
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            qs.clone()
+        };
+        let handoff_url = format!(
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}",
+            args.agent
+        );
+        let handoff =
+            get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await;
+        // Mark the session as briefed only AFTER the GET completed — success
+        // OR error. Fail-open on purpose: with the server down, repeating
+        // the brief-flagged request on every prompt would not deliver
+        // anything anyway, and the one lost brief is recovered on the next
+        // session.
+        if let Some(path) = briefed_path.as_deref() {
+            mark_briefed(path);
+        }
+        if let Some(handoff) = handoff {
+            writeln!(stdout, "{handoff}")?;
+        }
+        // Never print the usual `{}` here: kimi injects any non-empty stdout
+        // into the turn verbatim, so an envelope would become user-visible
+        // text. Empty handoff or any fetch error means print nothing at all
+        // (kimi ignores empty stdout; warnings go to stderr).
+        return Ok(());
     }
 
     // Boundary drain trigger: enqueue first, then ask a detached native drainer
@@ -542,6 +751,7 @@ mod tests {
             auth_token: None,
             project_strategy: None,
             check_capture: false,
+            capture_assistant: false,
         }
     }
 
@@ -1012,6 +1222,7 @@ mod tests {
             auth_token: None,
             project_strategy: None,
             check_capture: false,
+            capture_assistant: false,
         };
 
         run_with_payload(
@@ -1053,6 +1264,7 @@ mod tests {
                 auth_token: None,
                 project_strategy: None,
                 check_capture: false,
+                capture_assistant: false,
             };
 
             run_with_payload(
@@ -1093,6 +1305,7 @@ mod tests {
             auth_token: None,
             project_strategy: None,
             check_capture: false,
+            capture_assistant: false,
         };
 
         run_with_payload(Some(data_dir), args, "{}".into(), &mut stdout, |_path| {
@@ -1119,6 +1332,7 @@ mod tests {
             auth_token: None,
             project_strategy: None,
             check_capture: false,
+            capture_assistant: false,
         };
 
         run_with_payload(
@@ -1367,5 +1581,366 @@ mod tests {
             .unwrap();
             assert_eq!(body["session_id"], value, "{key}");
         }
+    }
+
+    fn kimi_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "kimi-code".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+        }
+    }
+
+    /// Recording HTTP stub: replies to every request with `status`/`body` and
+    /// streams each request head back so tests can assert which endpoints the
+    /// hook touched (session-start also drains the spool, so POSTs to `/hook`
+    /// are legitimate traffic here — only `GET /handoff` is interesting).
+    async fn serve_requests(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0_u8; 8192];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..read]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// Wait briefly for the first recorded request (if any).
+    async fn first_request(
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Option<String> {
+        tokio::time::timeout(Duration::from_millis(500), requests.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn kimi_user_prompt_prints_the_handoff_body_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            kimi_hook_args("user-prompt", &base),
+            serde_json::json!({
+                "sessionId": "session_abc",
+                "cwd": tmp.path(),
+                "prompt": "hello"
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        // Kimi injects UserPromptSubmit stdout verbatim into the turn, so the
+        // body must be the bare handoff — never a JSON envelope.
+        assert_eq!(stdout, b"AMWS-HANDOFF-DELTA\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert!(request.contains("agent=kimi-code"), "{request}");
+        // The native session id rides along so the destructive fetch can link
+        // the managed run to the kimi session.
+        assert!(request.contains("session_id=session_abc"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn kimi_user_prompt_submit_stem_also_delivers_the_handoff() {
+        // The default PosixNative/WindowsNative installs pass the script stem
+        // (`--event user-prompt-submit`), not the legacy `user-prompt` token;
+        // both must trigger delivery or the production path would print `{}`
+        // and kimi would inject it as literal context.
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            kimi_hook_args("user-prompt-submit", &base),
+            serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
+                .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"AMWS-HANDOFF-DELTA\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            kimi_hook_args("user-prompt-submit", &base),
+            serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
+                .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert_eq!(stdout, b"");
+    }
+
+    #[tokio::test]
+    async fn kimi_user_prompt_prints_nothing_when_no_handoff_is_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            kimi_hook_args("user-prompt", &base),
+            serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
+                .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        // The hook still attempted the fetch (a miss is indistinguishable
+        // from an empty handoff server-side)...
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        // ...but stdout stays empty: kimi injects nothing, and a `{}`
+        // envelope would show up as literal user-visible text.
+        assert_eq!(stdout, b"");
+    }
+
+    #[tokio::test]
+    async fn kimi_session_start_never_fetches_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A handoff IS pending; kimi's SessionStart stdout is discarded, so
+        // the hook must not consume it here (it is delivered on user-prompt).
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            kimi_hook_args("session-start", &base),
+            serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path()}).to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        // The session-start backlog drain may POST the spooled event, but no
+        // request may touch /handoff.
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_user_prompt_does_not_fetch_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut args = kimi_hook_args("user-prompt", &base);
+        args.agent = "claude-code".into();
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            args,
+            serde_json::json!({"session_id": "claude-session", "cwd": tmp.path()}).to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        // Claude keeps receiving the handoff on session-start; user-prompt
+        // output stays the plain empty object and no fetch happens.
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+        }
+    }
+
+    fn write_briefing_marker(dir: &Path) {
+        std::fs::write(
+            dir.join(".ai-memory.toml"),
+            "[briefing]\ninject_on_session_start = true\nmax_chars = 6000\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn kimi_user_prompt_briefing_only_on_first_prompt_of_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        write_briefing_marker(&cwd);
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let payload = serde_json::json!({
+            "sessionId": "session_abc",
+            "cwd": cwd,
+            "prompt": "hi"
+        })
+        .to_string();
+
+        // First prompt of the session: the briefing params ride along so the
+        // server appends the compiled project brief (kimi cannot receive it
+        // on SessionStart — that hook's stdout is discarded).
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            kimi_hook_args("user-prompt-submit", &base),
+            payload.clone(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"AMWS-HANDOFF-DELTA\n");
+        let first = first_request(&mut requests).await.unwrap();
+        assert!(first.starts_with("GET /handoff?"), "{first}");
+        assert!(first.contains("&briefing=true"), "{first}");
+        assert!(first.contains("&briefing_budget=6000"), "{first}");
+        // ...and the session is marked as briefed.
+        assert!(data_dir.join("briefed").join("session_abc").is_file());
+
+        // Second prompt: the handoff is still fetched and printed (cheap and
+        // self-limiting), but the briefing params are gone so the server
+        // does not recompose the brief on every prompt.
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            kimi_hook_args("user-prompt-submit", &base),
+            payload,
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"AMWS-HANDOFF-DELTA\n");
+        let second = first_request(&mut requests).await.unwrap();
+        assert!(second.starts_with("GET /handoff?"), "{second}");
+        assert!(second.contains("agent=kimi-code"), "{second}");
+        assert!(second.contains("session_id=session_abc"), "{second}");
+        assert!(second.contains("&cwd="), "{second}");
+        assert!(!second.contains("briefing"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn kimi_user_prompt_briefing_fallback_key_hashes_agent_and_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        write_briefing_marker(&cwd);
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        // No session id in the payload: the briefed marker is keyed by a
+        // stable hash of agent+cwd, so a session-less payload still briefs
+        // only once.
+        let payload = serde_json::json!({"cwd": cwd, "prompt": "hi"}).to_string();
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            kimi_hook_args("user-prompt", &base),
+            payload.clone(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"AMWS-HANDOFF-DELTA\n");
+        let first = first_request(&mut requests).await.unwrap();
+        assert!(first.contains("&briefing=true"), "{first}");
+        let expected_key = format!(
+            "{:x}",
+            Sha256::digest(format!("kimi-code\n{}", cwd.to_str().unwrap()).as_bytes())
+        );
+        assert!(data_dir.join("briefed").join(expected_key).is_file());
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            kimi_hook_args("user-prompt", &base),
+            payload,
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"AMWS-HANDOFF-DELTA\n");
+        let second = first_request(&mut requests).await.unwrap();
+        assert!(second.starts_with("GET /handoff?"), "{second}");
+        assert!(!second.contains("briefing"), "{second}");
+    }
+
+    #[tokio::test]
+    async fn kimi_user_prompt_without_briefing_creates_no_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            kimi_hook_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "session_abc",
+                "cwd": cwd,
+                "prompt": "hi"
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert!(!request.contains("briefing"), "{request}");
+        assert!(!data_dir.join("briefed").exists());
+    }
+
+    #[test]
+    fn briefed_markers_are_bounded_and_keep_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_dir = tmp.path().join("briefed");
+        let count = MAX_BRIEFED_MARKERS + 20;
+        for index in 0..count {
+            mark_briefed(&marker_dir.join(format!("session-{index:04}")));
+        }
+
+        let retained = std::fs::read_dir(&marker_dir).unwrap().count();
+        assert_eq!(retained, MAX_BRIEFED_MARKERS);
+        assert!(
+            marker_dir
+                .join(format!("session-{:04}", count - 1))
+                .is_file()
+        );
     }
 }

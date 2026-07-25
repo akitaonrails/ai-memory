@@ -55,12 +55,28 @@ pub struct HookQuery {
     /// instead of just the current one — the meta-repo case (e.g. `ai-memory`
     /// needing to see `ai-memory-ops` / `infra` without passing `global=true`).
     pub default_global: Option<String>,
+    /// Invocation-scoped `ai-memory run` lease. Absent for every direct
+    /// harness launch, preserving legacy capture and handoff behavior.
+    pub managed_run: Option<String>,
+    /// Client-side opt-in for assistant/Stop capture, baked onto the native
+    /// `stop` hook command by `install-hooks --capture-assistant`. A truthy
+    /// value tells the server the client deliberately attached a sanitized
+    /// `_ai_memory_assistant` excerpt; the server still gates on its own
+    /// `capture_assistant` config before persisting it (#196).
+    pub capture_assistant: Option<String>,
+    /// Client idempotency key, minted once when the event is spooled and
+    /// re-sent verbatim on every retry of that entry. Lets the server drop
+    /// a replay whose previous delivery succeeded but whose response was
+    /// lost (the conservative-retry duplication vector). Absent on older
+    /// clients; older servers ignore it — both directions keep today's
+    /// behavior.
+    pub ingest_key: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
 /// body. We keep the original raw JSON around so consumers can extract
 /// agent-specific fields they care about.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct HookEnvelope {
     /// Mapped lifecycle event.
     pub event: HookEvent,
@@ -90,16 +106,64 @@ pub struct HookEnvelope {
     /// router publishes it on the actor's `ActiveProject` so default-scoped
     /// read tools broaden to a global search.
     pub recall_default_global_requested: bool,
+    /// Invocation-scoped managed-run id forwarded by the host hook.
+    pub managed_run: Option<String>,
     /// Optional third-party extension namespace.
     pub extension: Option<String>,
     /// Optional source event name from the extension vocabulary.
     pub source_event: Option<String>,
+    /// Whether the client requested assistant/Stop capture for this event
+    /// (the `capture_assistant` query flag baked onto the native `stop`
+    /// command). The server still gates on its own `capture_assistant` config
+    /// before honoring it (#196).
+    pub capture_assistant_requested: bool,
+    /// Validated client idempotency key (`ingest_key` query param): 1–64
+    /// ASCII `[A-Za-z0-9_-]` chars, else dropped at parse time. `Some` makes
+    /// the ingest path dedup the event against a replayed delivery.
+    pub ingest_key: Option<String>,
     /// Optional title hint extracted from the body.
     pub title_hint: Option<String>,
     /// Optional body excerpt extracted from the agent's raw payload.
     pub body_excerpt: Option<String>,
     /// The agent's raw JSON, kept for forensics.
     pub raw: serde_json::Value,
+}
+
+/// Manual `Debug` that omits raw and derived hook content. A stray `?env` or
+/// `%env` in a tracing span must not copy prompt or tool content into logs.
+impl std::fmt::Debug for HookEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookEnvelope")
+            .field("event", &self.event)
+            .field("agent", &self.agent)
+            .field("session_id", &self.session_id)
+            .field("cwd", &self.cwd)
+            .field("workspace_override", &self.workspace_override)
+            .field("project_override", &self.project_override)
+            .field("project_strategy", &self.project_strategy)
+            .field("drop_subagent_requested", &self.drop_subagent_requested)
+            .field(
+                "recall_default_global_requested",
+                &self.recall_default_global_requested,
+            )
+            .field("managed_run", &self.managed_run)
+            .field(
+                "capture_assistant_requested",
+                &self.capture_assistant_requested,
+            )
+            .field("extension", &self.extension)
+            .field("source_event", &self.source_event)
+            .field(
+                "title_hint",
+                &self.title_hint.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "body_excerpt",
+                &self.body_excerpt.as_ref().map(|_| "<redacted>"),
+            )
+            .field("raw", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Keys by which agent harnesses tag a hook event as belonging to a SUBAGENT
@@ -319,6 +383,8 @@ impl HookEnvelope {
         let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
+        let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
+        let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
         let source_event = extension.as_ref().and_then(|_| {
             let raw_source = query
@@ -365,6 +431,7 @@ impl HookEnvelope {
                     .and_then(|_| extension_body_excerpt(&raw))
             })
         };
+        let ingest_key = query.ingest_key.filter(|k| valid_ingest_key(k));
         Self {
             event,
             agent,
@@ -375,6 +442,9 @@ impl HookEnvelope {
             project_strategy,
             drop_subagent_requested,
             recall_default_global_requested,
+            managed_run,
+            capture_assistant_requested,
+            ingest_key,
             extension,
             source_event,
             title_hint,
@@ -382,6 +452,18 @@ impl HookEnvelope {
             raw,
         }
     }
+}
+
+/// An ingest key is client-controlled input: accept only short, plain tokens
+/// (1–64 ASCII alphanumerics, `-` or `_` — a UUID simple/hyphenated form
+/// fits). Anything else is treated as absent rather than rejected, so a
+/// malformed key degrades to today's at-least-once behavior instead of a 4xx.
+fn valid_ingest_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn legacy_tool_title(
@@ -694,25 +776,31 @@ fn truncate_for_title(s: &str) -> String {
 }
 
 fn truncate_excerpt(s: &str) -> String {
-    const MAX: usize = 2_000;
-    if s.len() <= MAX {
-        s.to_string()
-    } else {
-        // Reserve the ellipsis within the byte cap, not beyond it.
-        let limit = MAX - '…'.len_utf8();
-        let mut buf = String::with_capacity(MAX);
-        let mut end = 0;
-        for (idx, ch) in s.char_indices() {
-            let next = idx + ch.len_utf8();
-            if next > limit {
-                break;
-            }
-            end = next;
-        }
-        buf.push_str(&s[..end]);
-        buf.push('…');
-        buf
+    truncate_utf8_bytes(s, 2_000)
+}
+
+/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary, reserving the
+/// ellipsis within the cap (never beyond it). Shared by the tool-excerpt cap
+/// and the opt-in assistant excerpt cap (#196) so there is one UTF-8-safe
+/// truncation, two named caps.
+pub(crate) fn truncate_utf8_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
     }
+    // Reserve the ellipsis within the byte cap, not beyond it.
+    let limit = max.saturating_sub('…'.len_utf8());
+    let mut buf = String::with_capacity(max);
+    let mut end = 0;
+    for (idx, ch) in s.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > limit {
+            break;
+        }
+        end = next;
+    }
+    buf.push_str(&s[..end]);
+    buf.push('…');
+    buf
 }
 
 fn normalize_extension_name(value: Option<&str>) -> Option<String> {
@@ -782,6 +870,70 @@ mod tests {
         assert_eq!(HookEvent::parse("PreToolUse"), HookEvent::PreToolUse);
         assert_eq!(HookEvent::parse("user_prompt"), HookEvent::UserPrompt);
         assert_eq!(HookEvent::parse("bogus"), HookEvent::Other);
+    }
+
+    #[test]
+    fn debug_never_renders_hook_content() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                managed_run: Some("run-1".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "dbg",
+                "prompt": "SENTINEL_DERIVED_CONTENT",
+                "secret": "SENTINEL_RAW_PAYLOAD",
+            }),
+        );
+        assert_eq!(
+            env.body_excerpt.as_deref(),
+            Some("SENTINEL_DERIVED_CONTENT")
+        );
+        let rendered = format!("{env:?}");
+        assert!(
+            !rendered.contains("SENTINEL_RAW_PAYLOAD"),
+            "Debug leaked the raw payload: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SENTINEL_DERIVED_CONTENT"),
+            "Debug leaked derived hook content: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "raw was not redacted");
+        assert!(rendered.contains("UserPrompt"), "event field went missing");
+        assert!(rendered.contains("run-1"), "managed run field went missing");
+    }
+
+    /// `ingest_key` is client-controlled input: only short plain tokens pass;
+    /// anything else degrades to "absent" (at-least-once), never a 4xx.
+    #[test]
+    fn ingest_key_is_validated_at_parse_time() {
+        let fire = |key: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    ingest_key: key.map(str::to_string),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": "k-1" }),
+            )
+        };
+        // A UUID in simple or hyphenated form passes untouched.
+        assert_eq!(
+            fire(Some("abcDEF123_-")).ingest_key.as_deref(),
+            Some("abcDEF123_-")
+        );
+        // Empty, oversized or non-token input is dropped, not rejected.
+        let oversized = "x".repeat(65);
+        for bad in ["", "spaces here", "chave!", "key\n", oversized.as_str()] {
+            assert_eq!(
+                fire(Some(bad)).ingest_key,
+                None,
+                "expected {bad:?} to be dropped"
+            );
+        }
+        assert_eq!(fire(None).ingest_key, None);
     }
 
     #[test]

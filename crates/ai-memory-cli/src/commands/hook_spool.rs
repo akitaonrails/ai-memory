@@ -120,7 +120,7 @@ fn now_ms() -> u64 {
 /// # Errors
 /// Returns an error only when the spool file cannot be written.
 pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
-    std::fs::create_dir_all(spool)?;
+    create_spool_dir(spool)?;
     let seq = ENQUEUE_SEQ.fetch_add(1, Ordering::Relaxed);
     let name = format!(
         "{:013}-{}-{seq:016x}.json",
@@ -134,6 +134,41 @@ pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
     std::fs::rename(&tmp, &final_path)?;
     prune_spool_file_count(spool);
     Ok(())
+}
+
+/// Create the spool directory `0700` on Unix so the excerpt bodies that reside
+/// there (up to `MAX_AGE_MS`) — and even the timestamp+pid metadata in the file
+/// names — are only reachable by the owner (#196). The spool holds private
+/// capture until it drains; a world-readable directory would leak that. On
+/// non-Unix the mode is a no-op (falls back to `create_dir_all`). Idempotent:
+/// an existing directory's mode is left untouched (never widened, never
+/// narrowed) to avoid churning a path an operator may have set deliberately.
+fn create_spool_dir(spool: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        if spool.is_dir() {
+            return Ok(());
+        }
+        match std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(spool)
+        {
+            Ok(()) => Ok(()),
+            // A concurrent drainer/enqueue may have created it between the check
+            // and the call; treat an existing directory as success.
+            Err(e) if spool.is_dir() => {
+                let _ = e;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(spool)
+    }
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -624,7 +659,7 @@ fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> 
         result.remaining += 1;
         return None;
     };
-    let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
+    let Ok(mut entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
         // Unparseable spool file: drop it so it can't wedge the queue.
         let _ = std::fs::remove_file(path);
         result.dropped += 1;
@@ -635,7 +670,27 @@ fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> 
         result.dropped += 1;
         return None;
     }
+    // Backstop for entries spooled by a pre-#196 binary: strip any raw
+    // assistant-message field before this entry can reach either drain path
+    // (`/hook/batch` chunk or the per-event fallback). Loading is the single
+    // choke point both paths pass through, so one strip here covers both.
+    strip_assistant_from_entry(&mut entry);
     Some(entry)
+}
+
+/// Drop any raw assistant-message field (#196) from a spooled entry's body.
+/// Reserializes only when the field was actually present, so untouched entries
+/// keep byte-exact bodies. A body that no longer parses is left as-is; the
+/// downstream `body_is_malformed` check already drops/retries it.
+fn strip_assistant_from_entry(entry: &mut SpoolEntry) {
+    let Ok(mut body) = serde_json::from_str::<serde_json::Value>(&entry.body) else {
+        return;
+    };
+    if ai_memory_hooks::strip_assistant_message_raw(&mut body)
+        && let Ok(reserialized) = serde_json::to_string(&body)
+    {
+        entry.body = reserialized;
+    }
 }
 
 fn body_is_malformed(entry: &SpoolEntry) -> bool {
@@ -830,6 +885,112 @@ mod tests {
         assert_eq!(loaded.url, "https://x/hook?event=stop");
         assert_eq!(loaded.auth_mode, AuthMode::Static);
         assert_eq!(loaded.token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn load_live_entry_strips_legacy_assistant_message() {
+        // Simulate a spool entry written by a pre-#196 binary: the raw body
+        // still carries `last_assistant_message`. Loading it for a drain must
+        // strip the field so neither drain path (batch or per-event fallback)
+        // can put it on the wire.
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let dirty = entry_for(
+            "https://x/hook?event=stop&agent=claude-code".into(),
+            r#"{"session_id":"legacy","last_assistant_message":"SENTINEL_ASSISTANT_MESSAGE"}"#
+                .into(),
+            None,
+            false,
+        );
+        enqueue(&spool, &dirty).unwrap();
+        let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+
+        let mut result = DrainResult::default();
+        let loaded = load_live_entry(&path, &mut result).expect("entry is live");
+        assert!(
+            !loaded.body.contains("SENTINEL_ASSISTANT_MESSAGE"),
+            "drain load left the assistant message in the body: {}",
+            loaded.body
+        );
+        assert!(
+            !loaded.body.contains("last_assistant_message"),
+            "drain load left the raw field key in the body: {}",
+            loaded.body
+        );
+        assert!(
+            loaded.body.contains("legacy"),
+            "unrelated field was dropped"
+        );
+    }
+
+    #[test]
+    fn load_live_entry_keeps_clean_body_byte_exact() {
+        // An entry with no assistant field must not be reserialized (its bytes
+        // are preserved), so the strip never churns unrelated events.
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let body = r#"{"session_id":"s","prompt":"hi"}"#;
+        let clean = entry_for(
+            "https://x/hook?event=user-prompt-submit&agent=claude-code".into(),
+            body.into(),
+            None,
+            false,
+        );
+        enqueue(&spool, &clean).unwrap();
+        let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+
+        let mut result = DrainResult::default();
+        let loaded = load_live_entry(&path, &mut result).expect("entry is live");
+        assert_eq!(loaded.body, body, "clean body must stay byte-exact");
+    }
+
+    #[test]
+    fn drain_preserves_capture_flag_and_protocol_round_trip() {
+        // An opted-in Stop entry carries `capture_assistant=1` on the URL and the
+        // sanitized `_ai_memory_assistant` marker in the body. The drain must
+        // preserve BOTH through spool → load → batch: the load-time strip only
+        // targets the raw `last_assistant_message`, never the protocol (#196).
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let entry = entry_for(
+            "https://x/hook?event=stop&agent=claude-code&capture_assistant=1".into(),
+            r#"{"session_id":"s","_ai_memory_assistant":{"version":1,"excerpt":"done"}}"#.into(),
+            None,
+            false,
+        );
+        enqueue(&spool, &entry).unwrap();
+        let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+
+        let mut result = DrainResult::default();
+        let loaded = load_live_entry(&path, &mut result).expect("entry is live");
+        assert!(loaded.url.contains("capture_assistant=1"), "flag dropped");
+        assert!(
+            loaded.body.contains("_ai_memory_assistant"),
+            "protocol dropped"
+        );
+
+        let batch = batch_payload(&[(path, loaded)]).expect("batch built");
+        assert!(
+            batch.contains("capture_assistant=1"),
+            "batch lost the capture flag: {batch}"
+        );
+        assert!(
+            batch.contains("_ai_memory_assistant"),
+            "batch lost the protocol: {batch}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enqueue_creates_spool_dir_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        // A nested path that does not exist yet, so `create_spool_dir` builds it.
+        let spool = tmp.path().join("nested").join("hook-spool");
+        let entry = entry_for("https://x/hook".into(), "{}".into(), None, false);
+        enqueue(&spool, &entry).unwrap();
+        let mode = std::fs::metadata(&spool).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "spool dir must be owner-only");
     }
 
     #[test]

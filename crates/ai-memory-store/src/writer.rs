@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, HandoffId, NewHandoff, NewObservation, NewPage, NewSession, NewUser, ObservationId,
-    PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
+    AgentKind, HandoffId, ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewUser,
+    ObservationId, PageId, PagePath, ProjectId, Sanitized, SessionId, UserId, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -23,10 +23,13 @@ use crate::auto_improve::{
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
-    self, DeleteWorkspaceSummary, EmbeddingWrite, MoveSummary, PurgeSessionSummary,
-    PurgeSessionsSummary, PurgeSummary, ReorgSummary,
+    self, DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary,
+    PurgeSummary, ReorgSummary,
 };
 use crate::users::{self, TOKEN_HASH_LEN};
+use crate::workstream::{
+    FinishWorkstreamRun, FinishedWorkstreamRun, PrepareWorkstreamRun, PreparedWorkstreamRun,
+};
 
 /// Commands accepted by the writer thread.
 pub(crate) enum WriteCmd {
@@ -90,6 +93,16 @@ pub(crate) enum WriteCmd {
     InsertObservation {
         obs: NewObservation,
         reply: oneshot::Sender<StoreResult<ObservationId>>,
+    },
+    InsertObservationIngest {
+        obs: NewObservation,
+        ingest_key: String,
+        reply: oneshot::Sender<StoreResult<IngestObservationOutcome>>,
+    },
+    CompleteObservationIngest {
+        project_id: ProjectId,
+        ingest_key: String,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     InsertHandoff {
         handoff: NewHandoff,
@@ -284,6 +297,32 @@ pub(crate) enum WriteCmd {
         job: crate::maintenance::MaintenanceJob,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    PrepareWorkstreamRun {
+        input: PrepareWorkstreamRun,
+        reply: oneshot::Sender<StoreResult<PreparedWorkstreamRun>>,
+    },
+    HeartbeatManagedRun {
+        run_id: ManagedRunId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    CancelManagedRun {
+        run_id: ManagedRunId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    LinkManagedRunSession {
+        run_id: ManagedRunId,
+        agent: AgentKind,
+        native_session_id: String,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    AcceptManagedRunContext {
+        run_id: ManagedRunId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    FinishWorkstreamRun {
+        input: FinishWorkstreamRun,
+        reply: oneshot::Sender<StoreResult<FinishedWorkstreamRun>>,
+    },
     Shutdown,
 }
 
@@ -470,12 +509,66 @@ impl WriterHandle {
 
     /// Append an observation row.
     ///
+    /// Takes [`Sanitized<NewObservation>`] — the privacy strip is enforced by
+    /// the type system at the store boundary, so an unsanitized observation
+    /// cannot reach disk by construction ([`Sanitized::new`] is the single
+    /// constructor and applies the scrub).
+    ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn insert_observation(&self, obs: NewObservation) -> StoreResult<ObservationId> {
+    pub async fn insert_observation(
+        &self,
+        obs: Sanitized<NewObservation>,
+    ) -> StoreResult<ObservationId> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::InsertObservation { obs, reply: tx })
-            .await?;
+        self.send(WriteCmd::InsertObservation {
+            obs: obs.into_inner(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Claim a keyed hook event and append its observation atomically.
+    ///
+    /// The outcome tells the hook router whether it inserted a new observation,
+    /// must resume incomplete downstream effects, or can skip a fully completed
+    /// replay. Keys are scoped to the observation's project.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn insert_observation_ingest(
+        &self,
+        obs: Sanitized<NewObservation>,
+        ingest_key: String,
+    ) -> StoreResult<IngestObservationOutcome> {
+        let obs = obs.into_inner();
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::InsertObservationIngest {
+            obs,
+            ingest_key,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Mark a keyed hook event complete after all downstream effects finish.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL/state errors.
+    pub async fn complete_observation_ingest(
+        &self,
+        project_id: ProjectId,
+        ingest_key: String,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CompleteObservationIngest {
+            project_id,
+            ingest_key,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1103,6 +1196,70 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Select a workstream and open its single active managed-run lease.
+    pub async fn prepare_workstream_run(
+        &self,
+        input: PrepareWorkstreamRun,
+    ) -> StoreResult<PreparedWorkstreamRun> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PrepareWorkstreamRun { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Extend a managed-run lease. Returns false for missing/stale runs.
+    pub async fn heartbeat_managed_run(&self, run_id: ManagedRunId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::HeartbeatManagedRun { run_id, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Release a managed-run lease after a handled launcher failure.
+    pub async fn cancel_managed_run(&self, run_id: ManagedRunId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CancelManagedRun { run_id, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Attach the harness-native session observed by a managed SessionStart.
+    pub async fn link_managed_run_session(
+        &self,
+        run_id: ManagedRunId,
+        agent: AgentKind,
+        native_session_id: impl Into<String>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkManagedRunSession {
+            run_id,
+            agent,
+            native_session_id: native_session_id.into(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Acknowledge successful SessionStart delivery for a managed run.
+    pub async fn accept_managed_run_context(&self, run_id: ManagedRunId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::AcceptManagedRunContext { run_id, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Index an immutable transcript segment and release the run lease.
+    pub async fn finish_workstream_run(
+        &self,
+        input: FinishWorkstreamRun,
+    ) -> StoreResult<FinishedWorkstreamRun> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::FinishWorkstreamRun { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     async fn send(&self, cmd: WriteCmd) -> StoreResult<()> {
         self.inner
             .tx
@@ -1227,6 +1384,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::InsertObservation { obs, reply } => {
                 let result = ops::insert_observation(&mut conn, &obs);
                 send_or_warn(reply, result, "insert_observation");
+            }
+            WriteCmd::InsertObservationIngest {
+                obs,
+                ingest_key,
+                reply,
+            } => {
+                let result = ops::insert_observation_keyed(&mut conn, &obs, &ingest_key);
+                send_or_warn(reply, result, "insert_observation_ingest");
+            }
+            WriteCmd::CompleteObservationIngest {
+                project_id,
+                ingest_key,
+                reply,
+            } => {
+                let result = ops::complete_observation_ingest(&mut conn, &project_id, &ingest_key);
+                send_or_warn(reply, result, "complete_observation_ingest");
             }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
@@ -1478,7 +1651,267 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::maintenance::record_success(&conn, job);
                 send_or_warn(reply, result, "record_maintenance_job_success");
             }
+            WriteCmd::PrepareWorkstreamRun { input, reply } => {
+                let result = crate::workstream::prepare_run(&mut conn, &input);
+                send_or_warn(reply, result, "prepare_workstream_run");
+            }
+            WriteCmd::HeartbeatManagedRun { run_id, reply } => {
+                let result = crate::workstream::heartbeat(&mut conn, run_id);
+                send_or_warn(reply, result, "heartbeat_managed_run");
+            }
+            WriteCmd::CancelManagedRun { run_id, reply } => {
+                let result = crate::workstream::cancel_run(&mut conn, run_id);
+                send_or_warn(reply, result, "cancel_managed_run");
+            }
+            WriteCmd::LinkManagedRunSession {
+                run_id,
+                agent,
+                native_session_id,
+                reply,
+            } => {
+                let result = crate::workstream::link_native_session(
+                    &mut conn,
+                    run_id,
+                    agent,
+                    &native_session_id,
+                );
+                send_or_warn(reply, result, "link_managed_run_session");
+            }
+            WriteCmd::AcceptManagedRunContext { run_id, reply } => {
+                let result = crate::workstream::accept_context(&mut conn, run_id);
+                send_or_warn(reply, result, "accept_managed_run_context");
+            }
+            WriteCmd::FinishWorkstreamRun { input, reply } => {
+                let result = crate::workstream::finish_run(&mut conn, &input);
+                send_or_warn(reply, result, "finish_workstream_run");
+            }
         }
     }
     tracing::debug!("writer thread exiting cleanly");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+    use ai_memory_core::{NewPage, PagePath, Tier};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {
+        NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: "test".into(),
+            body: body.into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+        }
+    }
+
+    /// Enqueue a workspace creation without awaiting the reply, returning
+    /// the oneshot receiver so the caller decides when to collect it.
+    async fn enqueue_workspace(
+        writer: &WriterHandle,
+        name: &str,
+    ) -> oneshot::Receiver<StoreResult<WorkspaceId>> {
+        let (tx, rx) = oneshot::channel();
+        writer
+            .inner
+            .tx
+            .send(WriteCmd::GetOrCreateWorkspace {
+                name: name.to_owned(),
+                reply: tx,
+            })
+            .await
+            .expect("writer channel closed while enqueueing");
+        rx
+    }
+
+    /// Commands enqueued on the bounded channel run on the writer thread in
+    /// FIFO order: insertion rowids must match enqueue order exactly.
+    #[tokio::test]
+    async fn executes_commands_in_fifo_order() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+
+        let mut pending = Vec::new();
+        for i in 0..8 {
+            pending.push(enqueue_workspace(&store.writer, &format!("fifo-{i:02}")).await);
+        }
+        for rx in pending {
+            rx.await.unwrap().unwrap();
+        }
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM workspaces WHERE name LIKE 'fifo-%' ORDER BY rowid")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let expected: Vec<String> = (0..8).map(|i| format!("fifo-{i:02}")).collect();
+        assert_eq!(
+            names, expected,
+            "single writer thread must apply commands in enqueue order"
+        );
+    }
+
+    /// A command whose SQL fails returns the error on *its* oneshot only;
+    /// the actor keeps processing — the next command succeeds.
+    #[tokio::test]
+    async fn sql_error_reaches_caller_without_killing_actor() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        // FK violation: no project row exists for this id.
+        let err = store
+            .writer
+            .upsert_page(sample_page(ws, ProjectId::new(), "notes/bogus.md", "x"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected the raw SQL failure to reach the caller, got {err:?}"
+        );
+
+        // The actor survived: a well-formed write lands afterwards.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/fine.md", "ok"))
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "only the post-error write may be present");
+    }
+
+    /// A batch command is one transaction: a failure part-way through rolls
+    /// back the pages that already succeeded inside the same batch.
+    #[tokio::test]
+    async fn batch_upsert_rolls_back_on_mid_batch_failure() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        let pages = vec![
+            sample_page(ws, proj, "notes/good.md", "good"),
+            // Second page references a project that does not exist.
+            sample_page(ws, ProjectId::new(), "notes/bad.md", "bad"),
+        ];
+        let err = store.writer.upsert_pages_batch(pages).await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected FK failure from the batch, got {err:?}"
+        );
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "mid-batch failure must roll back the earlier page too"
+        );
+
+        // Actor is still alive after the rolled-back batch.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/after.md", "after"))
+            .await
+            .unwrap();
+    }
+
+    /// Dropping the last handle queues `Shutdown` behind the pending
+    /// commands and joins the thread: every already-enqueued command is
+    /// answered, and the join returning proves the thread exited (no hang).
+    #[tokio::test]
+    async fn drop_completes_pending_commands_and_joins_thread() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let writer = store.writer.clone();
+        let db_path = store.db_path().to_owned();
+        drop(store);
+
+        let mut pending = Vec::new();
+        for i in 0..8 {
+            pending.push(enqueue_workspace(&writer, &format!("drain-{i:02}")).await);
+        }
+        // Joins the writer thread inside `Drop for WriterInner`; returns
+        // only after the queue (including Shutdown) was drained.
+        drop(writer);
+
+        for rx in pending {
+            let id = tokio::time::timeout(Duration::from_secs(10), rx)
+                .await
+                .expect("pending command was not answered before the writer stopped")
+                .expect("reply oneshot dropped")
+                .unwrap();
+            let conn = Connection::open(&db_path).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workspaces WHERE id = ?1",
+                    [id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "pending command must have committed");
+        }
+    }
+
+    /// Once the actor has stopped, calls fail fast with
+    /// [`StoreError::WriterClosed`] instead of hanging on a dead channel.
+    #[tokio::test]
+    async fn commands_after_shutdown_return_writer_closed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let writer = store.writer.clone();
+        drop(store);
+
+        writer
+            .inner
+            .tx
+            .send(WriteCmd::Shutdown)
+            .await
+            .expect("writer channel closed before Shutdown");
+
+        // FIFO guarantees Shutdown is processed first; whether the send
+        // itself fails or the reply oneshot is dropped, the caller sees
+        // WriterClosed either way.
+        let err = writer
+            .get_or_create_workspace("too-late")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::WriterClosed),
+            "expected WriterClosed, got {err:?}"
+        );
+    }
 }

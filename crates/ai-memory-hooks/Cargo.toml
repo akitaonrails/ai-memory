@@ -14,7 +14,6 @@ ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true
 ai-memory-consolidate.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Parse the per-event `?event=…` query of each spooled URL in `/hook/batch`,
@@ -25,7 +24,7 @@ tracing.workspace = true
 jiff.workspace = true
 uuid.workspace = true
 axum.workspace = true
-regex.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

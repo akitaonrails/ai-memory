@@ -15,11 +15,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
-use crate::auth_file::{load_entry, now_ms, save_entry};
+use crate::auth_file::now_ms;
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited, response_text_limited};
+use crate::stored_token::{StoredOAuthToken, refresh_grant};
 use crate::text::truncate_with_ellipsis;
 use crate::types::{ChatRequest, ChatResponse, Role, Usage};
 
@@ -41,8 +42,6 @@ pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Scopes used by Codex/OpenCode for ChatGPT sign-in.
 pub const OAUTH_SCOPES: &str = "openid profile email offline_access";
 
-const REFRESH_MARGIN_MS: u64 = 60_000;
-
 /// Status code used when the Codex SSE stream carries a terminal error
 /// event (`response.failed`/`response.incomplete`/`response.cancelled`
 /// or a top-level `error` payload). 502 ("Bad Gateway") models the
@@ -57,29 +56,16 @@ const SSE_TERMINAL_ERROR_STATUS: u16 = 502;
 /// bodies — same defensive cap, same reasoning.
 const SSE_ERROR_BODY_TRIM: usize = 1024;
 
-/// Stored OpenAI OAuth token.
-#[derive(Clone)]
-pub struct OpenAiOAuthToken {
-    /// Access token sent as the bearer token.
-    pub access: SecretString,
-    /// Refresh token used to mint a new access token.
-    pub refresh: SecretString,
-    /// Expiry in milliseconds since Unix epoch.
-    pub expires_at_ms: u64,
+/// OpenAI-specific claim persisted next to the shared token triple.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OpenAiExtras {
     /// ChatGPT account/workspace id, when present in the token claims.
+    #[serde(rename = "accountId", skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
 }
 
-impl std::fmt::Debug for OpenAiOAuthToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenAiOAuthToken")
-            .field("access", &"<redacted>")
-            .field("refresh", &"<redacted>")
-            .field("expires_at_ms", &self.expires_at_ms)
-            .field("account_id", &self.account_id)
-            .finish()
-    }
-}
+/// Stored OpenAI OAuth token.
+pub type OpenAiOAuthToken = StoredOAuthToken<OpenAiExtras>;
 
 impl OpenAiOAuthToken {
     /// Build a token from an OAuth token response.
@@ -100,14 +86,8 @@ impl OpenAiOAuthToken {
             access: SecretString::from(access),
             refresh: SecretString::from(refresh.into()),
             expires_at_ms: now_ms().saturating_add(expires_in_secs.saturating_mul(1000)),
-            account_id,
+            extra: OpenAiExtras { account_id },
         }
-    }
-
-    /// True when the access token is expired or within the refresh margin.
-    #[must_use]
-    pub fn needs_refresh(&self) -> bool {
-        now_ms().saturating_add(REFRESH_MARGIN_MS) >= self.expires_at_ms
     }
 
     /// Load the OpenAI OAuth token from a shared token file.
@@ -116,18 +96,7 @@ impl OpenAiOAuthToken {
     /// Returns [`LlmError::Auth`] when the file exists but cannot be read or
     /// parsed.
     pub fn load(path: &Path) -> LlmResult<Option<Self>> {
-        let Some(entry) = load_entry::<OAuthEntry>(path, "openai")? else {
-            return Ok(None);
-        };
-        if entry.kind != "oauth" {
-            return Ok(None);
-        }
-        Ok(Some(Self {
-            access: SecretString::from(entry.access),
-            refresh: SecretString::from(entry.refresh),
-            expires_at_ms: entry.expires,
-            account_id: entry.account_id,
-        }))
+        Self::load_key(path, "openai")
     }
 
     /// Save the token into the shared token file, preserving unknown keys.
@@ -135,14 +104,7 @@ impl OpenAiOAuthToken {
     /// # Errors
     /// Returns [`LlmError::Auth`] when the file cannot be written.
     pub fn save(&self, path: &Path) -> LlmResult<()> {
-        let entry = OAuthEntry {
-            kind: "oauth".into(),
-            access: self.access.expose_secret().to_string(),
-            refresh: self.refresh.expose_secret().to_string(),
-            expires: self.expires_at_ms,
-            account_id: self.account_id.clone(),
-        };
-        save_entry(path, "openai", Some(entry))
+        self.save_key(path, "openai")
     }
 
     /// Remove the OpenAI entry from the shared token file.
@@ -150,7 +112,7 @@ impl OpenAiOAuthToken {
     /// # Errors
     /// Returns [`LlmError::Auth`] when the file cannot be updated.
     pub fn remove(path: &Path) -> LlmResult<()> {
-        save_entry::<OAuthEntry>(path, "openai", None)
+        Self::remove_key(path, "openai")
     }
 }
 
@@ -236,7 +198,7 @@ impl OpenAiOAuthProvider {
             .header("originator", "codex_cli_rs")
             .header("session_id", uuid::Uuid::new_v4().to_string())
             .json(body);
-        if let Some(account_id) = token.account_id.as_deref() {
+        if let Some(account_id) = token.extra.account_id.as_deref() {
             request = request.header("chatgpt-account-id", account_id);
         }
         let resp = request.send().await.map_err(LlmError::from)?;
@@ -298,25 +260,15 @@ async fn refresh_access_token(
     client: &reqwest::Client,
     current: &OpenAiOAuthToken,
 ) -> LlmResult<OpenAiOAuthToken> {
-    let resp = client
-        .post(OPENAI_OAUTH_TOKEN_URL)
-        .header("content-type", "application/x-www-form-urlencoded")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", current.refresh.expose_secret()),
-            ("client_id", CODEX_CLIENT_ID),
-        ])
-        .send()
-        .await
-        .map_err(LlmError::from)?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = provider_error_body(resp).await;
-        return Err(LlmError::Auth(format!(
-            "openai-oauth refresh failed ({status}): {body}. Run `ai-memory auth login openai-oauth` again."
-        )));
-    }
-    let token_response = response_json_limited::<OpenAiOAuthTokenResponse>(resp).await?;
+    let token_response = refresh_grant::<OpenAiOAuthTokenResponse>(
+        client,
+        OPENAI_OAUTH_TOKEN_URL,
+        current.refresh.expose_secret(),
+        CODEX_CLIENT_ID,
+        "openai-oauth refresh failed",
+        "Run `ai-memory auth login openai-oauth` again.",
+    )
+    .await?;
     Ok(OpenAiOAuthToken::from_token_response(
         token_response.access_token,
         token_response
@@ -324,7 +276,7 @@ async fn refresh_access_token(
             .unwrap_or_else(|| current.refresh.expose_secret().to_string()),
         token_response.expires_in.unwrap_or(3600),
         token_response.id_token.as_deref(),
-        current.account_id.clone(),
+        current.extra.account_id.clone(),
     ))
 }
 
@@ -578,17 +530,6 @@ fn extract_output_text(response: &CodexResponsesResponse) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct OAuthEntry {
-    #[serde(rename = "type")]
-    kind: String,
-    access: String,
-    refresh: String,
-    expires: u64,
-    #[serde(rename = "accountId", skip_serializing_if = "Option::is_none")]
-    account_id: Option<String>,
-}
-
 fn extract_account_id_from_jwt(token: &str) -> Option<String> {
     let payload = token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -638,7 +579,9 @@ mod tests {
             access: SecretString::from("access"),
             refresh: SecretString::from("refresh"),
             expires_at_ms: 1234,
-            account_id: Some("acct".into()),
+            extra: OpenAiExtras {
+                account_id: Some("acct".into()),
+            },
         };
         token.save(&path).unwrap();
         let value =
@@ -656,13 +599,17 @@ mod tests {
             access: SecretString::from("access"),
             refresh: SecretString::from("refresh"),
             expires_at_ms: 1234,
-            account_id: None,
+            extra: OpenAiExtras { account_id: None },
         };
         token.save(&path).unwrap();
         let loaded = OpenAiOAuthToken::load(&path).unwrap().unwrap();
         assert_eq!(loaded.access.expose_secret(), "access");
         assert_eq!(loaded.refresh.expose_secret(), "refresh");
         assert_eq!(loaded.expires_at_ms, 1234);
+        // On-disk format: `accountId` is omitted entirely when absent.
+        let value =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(value["openai"].get("accountId").is_none());
     }
 
     #[test]
@@ -711,7 +658,7 @@ mod tests {
             access: SecretString::from("access"),
             refresh: SecretString::from("refresh"),
             expires_at_ms: 1234,
-            account_id: None,
+            extra: OpenAiExtras { account_id: None },
         };
         token.save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();

@@ -18,6 +18,7 @@ pub use admission::{
     AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, MAX_ADMISSION_WEBHOOKS,
     MAX_RESPONSE_BYTES, WebhookConfig,
 };
+pub use atomic::write_atomic;
 pub use error::{WikiError, WikiResult};
 pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
 pub use markdown::{Markdown, derive_title, emit, parse};

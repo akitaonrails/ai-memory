@@ -10,9 +10,9 @@
 
 use anyhow::Result;
 
-use crate::auth::generate_token_hex;
 use crate::cli::GenerateAuthTokenArgs;
 use crate::config::Config;
+use ai_memory_mcp::auth::generate_token_hex;
 
 /// Run the `generate-auth-token` subcommand.
 ///

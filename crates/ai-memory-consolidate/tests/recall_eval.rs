@@ -17,7 +17,8 @@
 use std::sync::Arc;
 
 use ai_memory_core::{
-    AgentKind, NewObservation, NewSession, ObservationKind, PagePath, SessionId, Tier,
+    AgentKind, NewObservation, NewSession, ObservationKind, PagePath, Sanitized, Sanitizer,
+    SessionId, Tier,
 };
 use ai_memory_llm::{Embedder, SyntheticEmbedder};
 use ai_memory_store::Store;
@@ -277,17 +278,20 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
         .expect("begin session");
     store
         .writer
-        .insert_observation(NewObservation {
-            session_id,
-            workspace_id: ws,
-            project_id: proj,
-            kind: ObservationKind::UserPrompt,
-            extension: None,
-            source_event: None,
-            title: "raw prompt".into(),
-            body: "raw fallback detail mentions capybara exactly once".into(),
-            importance: 5,
-        })
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "raw prompt".into(),
+                body: "raw fallback detail mentions capybara exactly once".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
         .await
         .expect("insert observation");
 

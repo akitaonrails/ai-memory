@@ -28,10 +28,15 @@ use ai_memory_wiki::Wiki;
 use axum::Router;
 
 mod markdown;
+pub mod mount;
 mod routes;
 mod state;
 mod templates;
 
+pub use mount::{
+    WebMountSpec, inject_base_href, inject_base_path_meta, mount_web_router, normalize_prefix,
+    web_base_href,
+};
 pub use state::WebState;
 
 /// Build the read-only web router. Call once at server startup and

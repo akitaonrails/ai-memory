@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli::{InstallSkillsAgent, InstallSkillsArgs, InstallSkillsScope};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::install_mcp;
-use crate::commands::path_util::home_dir;
+use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::config::Config;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -88,12 +88,14 @@ fn resolve_target_roots_from_env(args: &InstallSkillsArgs) -> Result<Vec<TargetR
         && args.agent == InstallSkillsAgent::Grok)
         .then(install_mcp::grok_home)
         .transpose()?;
+    let claude_config_dir = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
     resolve_target_roots_for_platform(
         args,
         &cwd,
         home.as_deref(),
         appdata.as_deref(),
         grok_home.as_deref(),
+        claude_config_dir.as_deref(),
         SkillHostPlatform::current(),
     )
 }
@@ -104,7 +106,7 @@ fn resolve_target_roots(
     cwd: &Path,
     home: Option<&Path>,
 ) -> Result<Vec<TargetRoot>> {
-    resolve_target_roots_for_platform(args, cwd, home, None, None, SkillHostPlatform::Other)
+    resolve_target_roots_for_platform(args, cwd, home, None, None, None, SkillHostPlatform::Other)
 }
 
 fn resolve_target_roots_for_platform(
@@ -113,6 +115,7 @@ fn resolve_target_roots_for_platform(
     home: Option<&Path>,
     appdata: Option<&Path>,
     grok_home: Option<&Path>,
+    claude_config_dir: Option<&Path>,
     platform: SkillHostPlatform,
 ) -> Result<Vec<TargetRoot>> {
     if let Some(target_dir) = &args.target_dir {
@@ -128,6 +131,7 @@ fn resolve_target_roots_for_platform(
                 home,
                 appdata,
                 grok_home,
+                claude_config_dir,
                 platform,
             )?]
         }
@@ -139,6 +143,7 @@ fn resolve_target_roots_for_platform(
                 home,
                 appdata,
                 grok_home,
+                claude_config_dir,
                 platform,
             )?]
         }
@@ -150,6 +155,7 @@ fn resolve_target_roots_for_platform(
                 home,
                 appdata,
                 grok_home,
+                claude_config_dir,
                 platform,
             )?]
         }
@@ -161,6 +167,7 @@ fn resolve_target_roots_for_platform(
                 home,
                 appdata,
                 grok_home,
+                claude_config_dir,
                 platform,
             )?]
         }
@@ -172,6 +179,7 @@ fn resolve_target_roots_for_platform(
                 home,
                 appdata,
                 grok_home,
+                claude_config_dir,
                 platform,
             )?,
             agent_root(
@@ -181,6 +189,7 @@ fn resolve_target_roots_for_platform(
                 home,
                 appdata,
                 grok_home,
+                claude_config_dir,
                 platform,
             )?,
         ],
@@ -213,6 +222,7 @@ enum SkillRootKind {
     Grok,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn agent_root(
     scope: InstallSkillsScope,
     kind: SkillRootKind,
@@ -220,6 +230,7 @@ fn agent_root(
     home: Option<&Path>,
     appdata: Option<&Path>,
     grok_home: Option<&Path>,
+    claude_config_dir: Option<&Path>,
     platform: SkillHostPlatform,
 ) -> Result<PathBuf> {
     if scope == InstallSkillsScope::Global
@@ -236,6 +247,16 @@ fn agent_root(
         && let Some(grok_home) = grok_home
     {
         return Ok(grok_home.join(SKILLS_DIR));
+    }
+
+    // Claude Code relocates its whole config dir under $CLAUDE_CONFIG_DIR;
+    // global skills live at `$CLAUDE_CONFIG_DIR/skills`, not
+    // `~/.claude/skills`. Project scope stays under the repo.
+    if scope == InstallSkillsScope::Global
+        && kind == SkillRootKind::Claude
+        && let Some(claude_config_dir) = claude_config_dir
+    {
+        return Ok(claude_config_dir.join(SKILLS_DIR));
     }
 
     let base = match scope {
@@ -445,6 +466,7 @@ mod tests {
             Some(home),
             Some(appdata),
             None,
+            None,
             SkillHostPlatform::Windows,
         )
         .unwrap();
@@ -466,6 +488,7 @@ mod tests {
             Some(home),
             None,
             None,
+            None,
             SkillHostPlatform::Windows,
         )
         .unwrap_err();
@@ -481,10 +504,41 @@ mod tests {
             Some(Path::new("/home/alice")),
             None,
             Some(Path::new("/custom/grok")),
+            None,
             SkillHostPlatform::Other,
         )
         .unwrap();
         assert_eq!(root_names(&roots), ["/custom/grok/skills"]);
+    }
+
+    #[test]
+    fn global_claude_skill_root_uses_injected_claude_config_dir() {
+        let roots = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::ClaudeCode),
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            Some(Path::new("/stores/claude")),
+            SkillHostPlatform::Other,
+        )
+        .unwrap();
+        assert_eq!(root_names(&roots), ["/stores/claude/skills"]);
+    }
+
+    #[test]
+    fn project_claude_skill_root_ignores_claude_config_dir() {
+        let roots = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::ClaudeCode),
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            Some(Path::new("/stores/claude")),
+            SkillHostPlatform::Other,
+        )
+        .unwrap();
+        assert_eq!(root_names(&roots), ["/repo/.claude/skills"]);
     }
 
     #[test]

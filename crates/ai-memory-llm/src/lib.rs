@@ -46,6 +46,7 @@ pub mod types;
 
 mod auth_file;
 mod response;
+mod stored_token;
 mod text;
 
 pub use anthropic::AnthropicProvider;
@@ -67,15 +68,18 @@ pub use health::{
     ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
 };
 pub use oidc::{
-    DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcToken, OidcTokenResponse,
-    PollOutcome, discover, poll_token_once, refresh_access_token, request_device_code,
+    DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcExtras, OidcToken,
+    OidcTokenResponse, PollOutcome, discover, poll_token_once, refresh_access_token,
+    request_device_code,
 };
 pub use openai::OpenAiProvider;
 pub use openai_compat::OpenAiCompatProvider;
 pub use openai_oauth::{
     CODEX_CLIENT_ID, CODEX_RESPONSES_URL, OPENAI_OAUTH_AUTH_URL, OPENAI_OAUTH_ISSUER,
-    OPENAI_OAUTH_TOKEN_URL, OpenAiOAuthProvider, OpenAiOAuthToken, OpenAiOAuthTokenResponse,
+    OPENAI_OAUTH_TOKEN_URL, OpenAiExtras, OpenAiOAuthProvider, OpenAiOAuthToken,
+    OpenAiOAuthTokenResponse,
 };
 pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
 pub use provider::{LlmProvider, complete_structured};
+pub use stored_token::StoredOAuthToken;
 pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, Usage};

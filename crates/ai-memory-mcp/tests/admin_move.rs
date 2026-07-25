@@ -13,7 +13,7 @@
 //! both versions survive), then purge the source — there the episodic rows
 //! (sessions/observations/handoffs) are dropped by the purge.
 
-use ai_memory_core::{PagePath, Tier};
+use ai_memory_core::{PagePath, Sanitized, Sanitizer, Tier};
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::{
@@ -639,17 +639,20 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
         .unwrap();
     store
         .writer
-        .insert_observation(NewObservation {
-            session_id: sid,
-            workspace_id: src_ws,
-            project_id: src_proj,
-            kind: ObservationKind::UserPrompt,
-            extension: None,
-            source_event: None,
-            title: "prompt".into(),
-            body: "do the thing".into(),
-            importance: 5,
-        })
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid,
+                workspace_id: src_ws,
+                project_id: src_proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "do the thing".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
         .await
         .unwrap();
 

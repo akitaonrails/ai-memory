@@ -14,14 +14,14 @@
 //! OMP uses a native `~/.omp/agent/mcp.json` file with the same
 //! `mcpServers` root as several other clients.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
-use crate::commands::path_util::home_dir;
+use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::commands::render_shared::bearer_header_value;
 use crate::config::{Config, DEFAULT_MCP_URL};
 
@@ -56,7 +56,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         return apply_to_config_file(&args);
     }
     let snippet = match args.client {
-        McpClient::ClaudeCode => render_claude_code(&args)?,
+        McpClient::ClaudeCode => render_claude_code(&args, &resolve_config_file(&args)?)?,
         McpClient::Codex => render_codex(&args),
         McpClient::Grok => render_grok(&args)?,
         McpClient::OpenCode => render_opencode(&args)?,
@@ -111,15 +111,7 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
     use crate::cli::McpClient;
     let home = || home_dir().context("could not locate $HOME for config-file auto-detect");
     Ok(match client {
-        // Claude Code reads MCP-server registrations from `~/.claude.json`
-        // (the same file `claude mcp add`/`claude mcp list` operate on).
-        // `~/.claude/settings.json` is a separate file for hooks /
-        // permissions / etc. — putting `mcpServers` there does NOT make
-        // Claude Code load the server. (Confirmed against CC 1.x by
-        // observing that `mcpServers` in settings.json is silently
-        // ignored while the same entry under `~/.claude.json` shows up
-        // in `claude mcp list`.)
-        McpClient::ClaudeCode => home()?.join(".claude.json"),
+        McpClient::ClaudeCode => claude_code_config_path_in(std::env::var_os("CLAUDE_CONFIG_DIR"))?,
         McpClient::Codex => home()?.join(".codex").join("config.toml"),
         // Project scope is `.grok/config.toml` under cwd/repo; pass
         // --config-file for that case rather than inventing a second default.
@@ -184,6 +176,25 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .join(".vscode")
             .join("mcp.json"),
     })
+}
+
+/// Claude Code reads MCP-server registrations from `.claude.json`
+/// (the same file `claude mcp add`/`claude mcp list` operate on) —
+/// `$CLAUDE_CONFIG_DIR/.claude.json` when the var is set, else
+/// `~/.claude.json`. `settings.json` is a separate file for hooks /
+/// permissions / etc. — putting `mcpServers` there does NOT make
+/// Claude Code load the server. (Confirmed against CC 1.x by
+/// observing that `mcpServers` in settings.json is silently ignored
+/// while the same entry under `~/.claude.json` shows up in
+/// `claude mcp list`.) The env value comes in as a parameter so tests
+/// can exercise both branches without mutating process env.
+fn claude_code_config_path_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = claude_config_dir(env_override) {
+        return Ok(dir.join(".claude.json"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.claude.json")?
+        .join(".claude.json"))
 }
 
 /// Kimi Code's data dir: `$KIMI_CODE_HOME` when set (non-empty), else
@@ -623,7 +634,7 @@ fn upsert_toml_mcp_server(doc: &mut toml_edit::DocumentMut, name: &str, server: 
     doc.insert("mcp_servers", Item::Table(parent));
 }
 
-fn render_claude_code(args: &InstallMcpArgs) -> Result<String> {
+fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<String> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
     let cli_line = if let Some(b) = &bearer {
         format!(
@@ -646,8 +657,9 @@ fn render_claude_code(args: &InstallMcpArgs) -> Result<String> {
          # Recommended (one-shot CLI):\n\
          {cli_line}\n\
          #\n\
-         # Equivalent JSON if you'd rather edit ~/.claude.json directly:\n\
-         {snippet}\n"
+         # Equivalent JSON if you'd rather edit {config_path} directly:\n\
+         {snippet}\n",
+        config_path = config_path.display(),
     ))
 }
 
@@ -934,10 +946,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn claude_code_config_path_honours_claude_config_dir() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\claude"
+        } else {
+            "/custom/claude"
+        };
+        let path = claude_code_config_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(path, std::path::Path::new(custom).join(".claude.json"));
+
+        // Empty override and unset var both fall back to ~/.claude.json.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = claude_code_config_path_in(env).unwrap();
+            assert!(
+                path.ends_with(".claude.json") && !path.starts_with(custom),
+                "default must be ~/.claude.json, got {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn claude_code_render_shows_resolved_config_path() {
+        let args = args_for(McpClient::ClaudeCode);
+        let config_path = std::path::Path::new("/stores/claude/.claude.json");
+        let out = render_claude_code(&args, config_path).unwrap();
+        assert!(
+            out.contains("/stores/claude/.claude.json"),
+            "render must mention the resolved config path:\n{out}"
+        );
+        assert!(
+            !out.contains("~/.claude.json"),
+            "render must not hardcode ~/.claude.json when the resolved path differs:\n{out}"
+        );
+    }
+
     fn render_with_token(client: McpClient) -> String {
         let args = args_with_token(client);
         match args.client {
-            McpClient::ClaudeCode => render_claude_code(&args).unwrap(),
+            McpClient::ClaudeCode => {
+                render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap()
+            }
             McpClient::Codex => render_codex(&args),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
@@ -1022,7 +1072,9 @@ mod tests {
     fn render_for_test(client: McpClient) -> String {
         let args = args_for(client);
         match args.client {
-            McpClient::ClaudeCode => render_claude_code(&args).unwrap(),
+            McpClient::ClaudeCode => {
+                render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap()
+            }
             McpClient::Codex => render_codex(&args),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),

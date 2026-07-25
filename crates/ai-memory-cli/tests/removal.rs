@@ -35,9 +35,14 @@ fn command_with_home(home: &Path) -> Command {
         .env("LOCALAPPDATA", local_app_data)
         .env("AI_MEMORY_HOME", home)
         .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"))
+        .env_remove("AI_MEMORY_SERVER_URL")
+        .env_remove("AI_MEMORY_AUTH_TOKEN")
         // A host-level KIMI_CODE_HOME would pull uninstall's kimi-code
         // config sweep out of the sandbox; tests opt back in explicitly.
-        .env_remove("KIMI_CODE_HOME");
+        .env_remove("KIMI_CODE_HOME")
+        // Keep Claude installer/removal tests inside their temp HOME unless a
+        // test explicitly opts into a relocated config root.
+        .env_remove("CLAUDE_CONFIG_DIR");
     command
 }
 
@@ -115,6 +120,103 @@ fn install_then_uninstall_round_trip_claude_hooks() {
             after["hooks"].get(ours).is_none(),
             "{ours} should be removed"
         );
+    }
+}
+
+#[test]
+fn relocated_claude_uninstall_sweeps_active_and_legacy_installs() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let relocated = home.path().join("claude-work");
+
+    let run = |relocate: bool, args: &[&str]| {
+        let mut command = command_with_home(home.path());
+        if relocate {
+            command.env("CLAUDE_CONFIG_DIR", &relocated);
+        }
+        command
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+
+    for relocate in [false, true] {
+        for args in [
+            &["install-hooks", "--agent", "claude-code", "--apply"][..],
+            &["install-mcp", "--client", "claude-code", "--apply"][..],
+            &[
+                "install-skills",
+                "--agent",
+                "claude-code",
+                "--scope",
+                "global",
+            ][..],
+        ] {
+            let output = run(relocate, args);
+            assert!(
+                output.status.success(),
+                "install failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    let legacy_settings = home.path().join(".claude/settings.json");
+    let legacy_mcp = home.path().join(".claude.json");
+    let legacy_skills = home.path().join(".claude/skills");
+    let relocated_settings = relocated.join("settings.json");
+    let relocated_mcp = relocated.join(".claude.json");
+    let relocated_skills = relocated.join("skills");
+    for path in [
+        &legacy_settings,
+        &legacy_mcp,
+        &relocated_settings,
+        &relocated_mcp,
+    ] {
+        assert!(path.exists(), "installer did not create {}", path.display());
+    }
+    for root in [&legacy_skills, &relocated_skills] {
+        assert!(
+            root.join(MANAGED_SKILLS[0].relative_path).exists(),
+            "installer did not create managed skills under {}",
+            root.display()
+        );
+    }
+
+    let output = run(true, &["uninstall", "--apply", "--yes"]);
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for path in [&legacy_settings, &relocated_settings] {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.contains("AI_MEMORY_HOOK_URL"),
+            "Claude hooks survived in {}",
+            path.display()
+        );
+    }
+    for path in [&legacy_mcp, &relocated_mcp] {
+        let content = std::fs::read_to_string(path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            config["mcpServers"].get("ai-memory").is_none(),
+            "Claude MCP entry survived in {}: {content}",
+            path.display(),
+        );
+    }
+    for root in [&legacy_skills, &relocated_skills] {
+        for skill in MANAGED_SKILLS {
+            assert!(
+                !root.join(skill.relative_path).exists(),
+                "managed skill survived under {}",
+                root.display()
+            );
+        }
     }
 }
 

@@ -28,6 +28,11 @@ rmcp.workspace = true
 schemars.workspace = true
 axum.workspace = true
 http.workspace = true
+# HTTP auth middleware (bearer/basic/cookie): constant-time token
+# compare, Basic-header decoding, random token generation.
+subtle.workspace = true
+base64.workspace = true
+getrandom.workspace = true
 # Time gap calculation for `memory_explore` (parse stored ISO-8601
 # timestamps + delta against now). The rest of the crate doesn't
 # need a clock dep.
@@ -41,6 +46,7 @@ ai-memory-wiki.workspace = true
 async-trait.workspace = true
 flate2.workspace = true
 tar.workspace = true
+tempfile.workspace = true
 tower.workspace = true
 
 [lints]

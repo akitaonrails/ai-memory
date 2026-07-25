@@ -167,8 +167,10 @@ cannot forward the real agent session id automatically; pass explicit \
 `workspace` + `project` / `scopes`, or use a session-aware bridge that \
 forwards the lifecycle-hook session id on MCP calls.\n\
 \n\
-Lifecycle hooks already capture every prompt + tool call automatically \
-— you do NOT need to write routine notes by hand. When the user \
+Lifecycle hooks already capture sanitized, bounded prompt and tool-lifecycle \
+observations automatically. They are not complete native transcripts; managed \
+`ai-memory run` launches add the portable visible-event ledger. You do NOT \
+need to write routine notes by hand. When the user \
 explicitly asks to remember a permanent annotation/fact/rule, write a \
 durable wiki page; do not use a handoff for that. Use these tools when \
 the conversation calls for them:\n\
@@ -1073,27 +1075,10 @@ impl AiMemoryServer {
     /// Attach an LLM-backed consolidator. Without this, the
     /// `memory_consolidate` tool errors with "not configured". Also
     /// stores the LLM provider so `memory_lint` can run its
-    /// contradiction pass.
-    #[must_use]
-    pub fn with_consolidator(mut self, wiki: Wiki, llm: Arc<dyn LlmProvider>) -> Self {
-        let consolidator = Consolidator::new(
-            self.reader.clone(),
-            self.writer.clone(),
-            wiki.clone(),
-            llm.clone(),
-            self.workspace_id,
-            self.project_id,
-        );
-        self.consolidator = Some(Arc::new(consolidator));
-        self.llm = Some(llm);
-        self.wiki = Some(wiki);
-        self
-    }
-
-    /// Variant of [`Self::with_consolidator`] that accepts a pre-built
-    /// `Arc<Consolidator>`. Used when the same consolidator must be
-    /// shared with another subsystem (e.g. the hook router's
-    /// PreCompact branch) so both paths see the same handle.
+    /// contradiction pass. Accepts a pre-built `Arc<Consolidator>` so
+    /// the same consolidator can be shared with another subsystem
+    /// (e.g. the hook router's PreCompact branch) and both paths see
+    /// the same handle.
     #[must_use]
     pub fn with_consolidator_arc(
         mut self,
@@ -2797,6 +2782,7 @@ fn test_optional_parts() -> OptionalParts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::{Sanitized, Sanitizer};
     use std::collections::BTreeSet;
 
     #[test]
@@ -2971,17 +2957,20 @@ mod tests {
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id,
-                project_id,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: title.into(),
-                body: body.into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: title.into(),
+                    body: body.into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
     }
@@ -4073,17 +4062,20 @@ mod tests {
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "raw prompt".into(),
-                body: "raw fallback contains quokka only detail".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "raw prompt".into(),
+                    body: "raw fallback contains quokka only detail".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
 
@@ -4142,17 +4134,20 @@ mod tests {
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: scoped,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "raw prompt".into(),
-                body: "raw fallback contains quokka only detail".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: scoped,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "raw prompt".into(),
+                    body: "raw fallback contains quokka only detail".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
 

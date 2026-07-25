@@ -21,13 +21,12 @@ tracing.workspace = true
 axum.workspace = true
 jiff.workspace = true
 sha2.workspace = true
+tower.workspace = true
+tower-http.workspace = true
 
 # Templating + markdown.
 askama = "0.12"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
-# Syntax highlighting for fenced code blocks. Default features pull
-# in onig (regex via C); the pure-Rust regex feature avoids that.
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 [build-dependencies]
 anyhow.workspace = true

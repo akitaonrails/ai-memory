@@ -9,7 +9,7 @@
 
 use ai_memory_core::{
     ActorContext, AgentKind, NewObservation, NewPage, NewSession, ObservationKind, PagePath,
-    SessionId, Tier,
+    Sanitized, Sanitizer, SessionId, Tier,
 };
 use ai_memory_llm::SyntheticEmbedder;
 use ai_memory_mcp::{AdminState, admin_router};
@@ -346,17 +346,20 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
         .unwrap();
     store
         .writer
-        .insert_observation(NewObservation {
-            session_id: sid_a,
-            workspace_id: ws,
-            project_id: scratch,
-            kind: ObservationKind::UserPrompt,
-            extension: None,
-            source_event: None,
-            title: "alpha prompt".into(),
-            body: "".into(),
-            importance: 5,
-        })
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid_a,
+                workspace_id: ws,
+                project_id: scratch,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "alpha prompt".into(),
+                body: "".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
         .await
         .unwrap();
 
@@ -374,17 +377,20 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
         .unwrap();
     store
         .writer
-        .insert_observation(NewObservation {
-            session_id: sid_b,
-            workspace_id: ws,
-            project_id: scratch,
-            kind: ObservationKind::UserPrompt,
-            extension: None,
-            source_event: None,
-            title: "beta prompt".into(),
-            body: "".into(),
-            importance: 5,
-        })
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: sid_b,
+                workspace_id: ws,
+                project_id: scratch,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "beta prompt".into(),
+                body: "".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        ))
         .await
         .unwrap();
 

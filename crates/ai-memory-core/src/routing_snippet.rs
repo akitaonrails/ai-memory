@@ -46,10 +46,11 @@ forward the real agent session id automatically; pass explicit
 `workspace` + `project` / `scopes`, or use a session-aware bridge that
 forwards the lifecycle-hook session id on MCP calls.
 
-**Lifecycle hooks already capture every prompt and tool call
-automatically.** Do not manually write routine notes. Only write durable
-memory when the user explicitly asks to remember or annotate something
-permanently.
+**Lifecycle hooks already capture sanitized, bounded prompt and tool-lifecycle
+observations automatically.** They are not complete native transcripts;
+managed `ai-memory run` launches add the portable visible-event ledger. Do not
+manually write routine notes. Only write durable memory when the user explicitly asks
+to remember or annotate something permanently.
 
 ### Use the installed ai-memory Agent Skills
 

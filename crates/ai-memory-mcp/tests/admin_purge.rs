@@ -6,7 +6,7 @@
 
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, ProjectId,
-    SessionId, Tier, WorkspaceId,
+    Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
@@ -139,17 +139,20 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         for i in 0..3u8 {
             store
                 .writer
-                .insert_observation(NewObservation {
-                    session_id: sid,
-                    workspace_id: ws,
-                    project_id: proj,
-                    kind: ObservationKind::UserPrompt,
-                    extension: None,
-                    source_event: None,
-                    title: format!("{label} obs {i}"),
-                    body: "body".into(),
-                    importance: 5,
-                })
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        session_id: sid,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: format!("{label} obs {i}"),
+                        body: "body".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
                 .await
                 .unwrap();
         }

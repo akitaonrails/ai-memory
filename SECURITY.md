@@ -43,6 +43,27 @@ the project is and is not designed to defend against.
   `(workspace_id, project_id)`. A purge operation for project A cannot
   delete files that also belong to project B.
 
+- **Assistant/Stop capture is opt-in and sanitized (#196).** The assistant's
+  final turn is never persisted by default. Storing it requires a **double
+  opt-in** — `capture_assistant` on the server and `install-hooks
+  --capture-assistant` on the client. When enabled, be aware that:
+  - The excerpt is sanitized twice — the client scrubs with the built-in
+    patterns *before* it reaches the spool or wire, and the server re-scrubs
+    with its configured `[sanitize]` patterns before storing. Operator
+    `extra_patterns` run only on the server side, so a secret matched only by an
+    `extra_patterns` rule may still sit in the excerpt on the client spool/wire
+    before it reaches the server. Client-side redactions are irreversible: the
+    server's `allowlist` cannot restore text the client already replaced with
+    `[REDACTED]`.
+  - Captured assistant text flows into the consolidation and reviewer prompts,
+    and — if you configure a cloud LLM provider — is sent to that provider.
+  - The opt-in is **global** to the install: there is no per-project marker to
+    exclude a sensitive repository once the flag is on (assistant text is not
+    path-attributable). Turn the server flag off to disable it everywhere.
+  - The excerpt can quote code, secrets, or content from paths ai-memory never
+    sees; the `Sanitizer` is a best-effort credential strip, not a guarantee
+    (see the injection note below).
+
 ### Out of scope for v1
 
 - **Multi-tenant authentication and authorisation.** There is one bearer
@@ -53,7 +74,11 @@ the project is and is not designed to defend against.
   controls, etc.).
 - **MCP tool-call injection via agent output.** The privacy strip
   (`Sanitizer`) removes obvious credential patterns from hook payloads, but
-  it is not a comprehensive injection fence.
+  it is not a comprehensive injection fence. This applies to the opt-in
+  assistant/Stop excerpt too: it is untrusted text (it can echo whatever a
+  tool put in the assistant's response) that, once captured, flows into the
+  consolidation/reviewer prompts. Enabling `capture_assistant` widens this
+  surface — leave it off unless you accept that trade-off.
 - **Denial of service.** The server is not hardened against a malicious local
   actor hammering it with requests.
 

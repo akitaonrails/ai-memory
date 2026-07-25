@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -41,22 +41,23 @@ dependencies = [
  "ai-memory-store",
  "ai-memory-web",
  "ai-memory-wiki",
+ "ai-memory-workstream",
  "anyhow",
  "axum",
  "base64",
  "clap",
+ "clap_complete",
  "dirs",
  "figment",
  "flate2",
  "fs2",
- "getrandom 0.3.4",
  "jiff",
  "reqwest",
  "rmcp",
  "secrecy",
  "serde",
  "serde_json",
- "subtle",
+ "sha2",
  "sysinfo",
  "tar",
  "tempfile",
@@ -68,11 +69,12 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -95,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "jiff",
  "regex",
@@ -110,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -129,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -141,12 +143,11 @@ dependencies = [
  "axum",
  "git2",
  "jiff",
- "regex",
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha2",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -154,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -177,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -188,13 +189,16 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "flate2",
+ "getrandom 0.3.4",
  "http",
  "jiff",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "subtle",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -206,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -230,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-web"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-store",
@@ -243,17 +247,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "syntect",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tower",
+ "tower-http",
  "tracing",
 ]
 
 [[package]]
 name = "ai-memory-wiki"
-version = "1.15.0"
+version = "1.18.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -276,6 +280,22 @@ dependencies = [
  "tower",
  "tracing",
  "winapi-util",
+]
+
+[[package]]
+name = "ai-memory-workstream"
+version = "1.18.0"
+dependencies = [
+ "ai-memory-core",
+ "anyhow",
+ "jiff",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -497,30 +517,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bincode"
-version = "1.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "bit-set"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
-dependencies = [
- "bit-vec",
-]
-
-[[package]]
-name = "bit-vec"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
-
-[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -620,6 +616,15 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db8b397918185f0161ff3d6fcaa9e4bfc09b8367caf6e1d4a2848e5477ed027b"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
@@ -865,17 +870,6 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
-name = "fancy-regex"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "998b056554fbe42e03ae0e152895cd1a7e1002aec800fdc6635d20270260c46f"
-dependencies = [
- "bit-set",
- "regex-automata",
- "regex-syntax",
-]
 
 [[package]]
 name = "fastrand"
@@ -1655,12 +1649,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "linked-hash-map"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1940,19 +1928,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "plist"
-version = "1.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "092791278e026273c1b65bbdcfbba3a300f2994c896bd01ab01da613c29c46f1"
-dependencies = [
- "base64",
- "indexmap",
- "quick-xml",
- "serde",
- "time",
-]
-
-[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2040,15 +2015,6 @@ name = "pulldown-cmark-escape"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
-
-[[package]]
-name = "quick-xml"
-version = "0.39.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "quinn"
@@ -2783,27 +2749,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "syntect"
-version = "5.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "656b45c05d95a5704399aeef6bd0ddec7b2b3531b7c9e900abbf7c4d2190c925"
-dependencies = [
- "bincode",
- "fancy-regex",
- "flate2",
- "fnv",
- "once_cell",
- "plist",
- "regex-syntax",
- "serde",
- "serde_derive",
- "serde_json",
- "thiserror 2.0.18",
- "walkdir",
- "yaml-rust",
 ]
 
 [[package]]
@@ -3928,15 +3873,6 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
-]
-
-[[package]]
-name = "yaml-rust"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56c1936c4cc7a1c9ab21a1ebb602eb942ba868cbd44a99cb7cdc5892335e1c85"
-dependencies = [
- "linked-hash-map",
 ]
 
 [[package]]

@@ -156,7 +156,9 @@ impl Harness {
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
+            ingest_gates: ai_memory_hooks::IngestGates::default(),
             consolidate_on_session_end: false,
+            capture_assistant_enabled: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(
                 ai_memory_hooks::IngestRateLimiter::disabled(),

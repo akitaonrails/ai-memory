@@ -21,6 +21,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::commands::path_util::strip_windows_verbatim_prefix;
@@ -260,6 +261,7 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    capture_assistant: bool,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
@@ -273,7 +275,8 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
             data_dir,
             project_strategy,
         )
-        .allow_claude_windows_exec(),
+        .allow_claude_windows_exec()
+        .with_capture_assistant(capture_assistant),
     )
 }
 
@@ -738,6 +741,8 @@ fn kimi_code_hook_commands_for_platform(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HookCommandPlatform {
     Posix,
+    /// Windows script fallback: invoke the staged `.ps1` hook through an
+    /// encoded PowerShell program so a host runner cannot expand its env setup.
     Windows,
     /// Claude Code on Windows invokes hooks through bash (Git for
     /// Windows), not PowerShell. Commands use POSIX `.sh` scripts
@@ -753,9 +758,9 @@ pub(crate) enum HookCommandPlatform {
     /// POSIX (Linux/macOS), native: invoke the `ai-memory` binary directly
     /// (`<exe> hook --event …`) instead of the `.sh` script, so the hook gets
     /// the local spool + OIDC-token fallback. The **default** for native
-    /// Linux/macOS Claude Code installs (mirrors `WindowsNative`). The Docker
-    /// wrapper forces `posix` so its host-rendered config keeps the `.sh` path
-    /// (the host has no local binary). Override with
+    /// Linux/macOS Claude Code installs (mirrors `WindowsNative`). The
+    /// Linux/macOS Docker wrapper forces `posix` so its host-rendered config
+    /// keeps the `.sh` path (the host has no local binary). Override with
     /// `AI_MEMORY_HOOK_PLATFORM=posix` to get the shell scripts.
     PosixNative,
 }
@@ -773,6 +778,9 @@ struct HookCommandContext<'a> {
     /// snippets keep command-string script fallback even when the platform env
     /// is overridden to `windows-native`.
     claude_windows_exec_allowed: bool,
+    /// Bake `--capture-assistant` onto the native `stop` command only (#196).
+    /// Set exclusively by `install-hooks --agent claude-code --capture-assistant`.
+    capture_assistant: bool,
 }
 
 impl<'a> HookCommandContext<'a> {
@@ -788,12 +796,29 @@ impl<'a> HookCommandContext<'a> {
             data_dir,
             project_strategy,
             claude_windows_exec_allowed: false,
+            capture_assistant: false,
         }
     }
 
     const fn allow_claude_windows_exec(mut self) -> Self {
         self.claude_windows_exec_allowed = true;
         self
+    }
+
+    const fn with_capture_assistant(mut self, on: bool) -> Self {
+        self.capture_assistant = on;
+        self
+    }
+}
+
+/// Bake `--capture-assistant` onto the native `stop` command only (#196), so the
+/// other events stay byte-identical. Empty for every other event, and for a
+/// context that did not opt in.
+fn native_capture_assistant_arg(context: HookCommandContext<'_>, event: &str) -> &'static str {
+    if context.capture_assistant && event == "stop" {
+        " --capture-assistant"
+    } else {
+        ""
     }
 }
 
@@ -831,8 +856,8 @@ impl HookCommandPlatform {
     /// Windows unless overridden by `AI_MEMORY_HOOK_PLATFORM`.
     fn for_bash_runner() -> Self {
         // Native macOS / Linux defaults to the binary hook command (spool +
-        // OIDC), same as Windows. The Docker wrapper forces `posix` so its
-        // host-rendered config keeps using the `.sh` scripts.
+        // OIDC), same as Windows. The Linux/macOS Docker wrapper forces
+        // `posix` so its host-rendered config keeps using the `.sh` scripts.
         Self::from_env_override().unwrap_or(if cfg!(windows) {
             Self::WindowsNative
         } else {
@@ -999,7 +1024,14 @@ fn hook_command(
             format!("{prefix}{}", shell_quote(&script.to_string_lossy()))
         }
         HookCommandPlatform::Windows => {
-            let mut setup = format!("$env:AI_MEMORY_HOOK_URL={}", powershell_quote(server_url));
+            // Hook runners launch this child with redirected streams. Force
+            // text output and suppress non-interactive progress so Windows
+            // PowerShell does not serialize progress records as CLIXML. Leave
+            // input formatting at its default: the hook reads raw Console.In.
+            let mut setup = format!(
+                "$ProgressPreference='SilentlyContinue'; $env:AI_MEMORY_HOOK_URL={}",
+                powershell_quote(server_url)
+            );
             if let Some(t) = auth_token {
                 setup.push_str(&format!(
                     "; $env:AI_MEMORY_AUTH_TOKEN={}",
@@ -1012,9 +1044,10 @@ fn hook_command(
                     powershell_quote(s)
                 ));
             }
+            let program = format!("{setup}; & {}", powershell_quote(&script.to_string_lossy()));
+            let encoded = powershell_encoded_command(&program);
             format!(
-                "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{setup}; & {}\"",
-                powershell_quote(&script.to_string_lossy())
+                "powershell.exe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand {encoded}"
             )
         }
         HookCommandPlatform::WindowsBash => {
@@ -1063,6 +1096,7 @@ fn hook_command(
                 context.project_strategy,
                 NativeQuote::Windows,
             ));
+            cmd.push_str(native_capture_assistant_arg(context, event));
             cmd
         }
         HookCommandPlatform::PosixNative => {
@@ -1091,9 +1125,18 @@ fn hook_command(
                 context.project_strategy,
                 NativeQuote::Posix,
             ));
+            cmd.push_str(native_capture_assistant_arg(context, event));
             cmd
         }
     }
+}
+
+fn powershell_encoded_command(program: &str) -> String {
+    let utf16_le = program
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(utf16_le)
 }
 
 fn windows_native_exec_spec(
@@ -1138,6 +1181,11 @@ fn windows_native_exec_spec_with_exe(
     if let Some(strategy) = context.project_strategy {
         args.push("--project-strategy".to_string());
         args.push(strategy.to_string());
+    }
+    // Native-exec is the PRIMARY Windows Claude Code path, so the flag must be
+    // baked here too — not only in the string form above (#196).
+    if context.capture_assistant && event == "stop" {
+        args.push("--capture-assistant".to_string());
     }
     HookHandlerSpec::Exec {
         command: plain_windows_path_arg(exe),
@@ -1231,8 +1279,31 @@ fn win_double_quote(s: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(windows)]
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    #[cfg(windows)]
+    use std::process::Stdio;
+
+    fn decode_powershell_encoded_command(command: &str) -> String {
+        let (_, encoded) = command
+            .split_once(" -EncodedCommand ")
+            .expect("missing PowerShell -EncodedCommand payload");
+        assert!(
+            !encoded.contains(char::is_whitespace),
+            "encoded payload must be one command-line token"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("invalid base64 PowerShell program");
+        assert_eq!(bytes.len() % 2, 0, "UTF-16LE payload has an odd length");
+        let utf16 = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&utf16).expect("invalid UTF-16 PowerShell program")
+    }
 
     fn build_posix_hook_payload(
         events: &[(&str, &str)],
@@ -1845,6 +1916,65 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
         assert!(args.iter().all(|arg| !arg.contains(r"\\?\")));
     }
 
+    fn exec_args(script: &str, capture_assistant: bool) -> Vec<String> {
+        let spec = windows_native_exec_spec_with_exe(
+            Path::new(r"C:\ai-memory\ai-memory.exe"),
+            Path::new(script),
+            "http://h:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "claude-code",
+                None,
+                None,
+            )
+            .with_capture_assistant(capture_assistant),
+        );
+        let HookHandlerSpec::Exec { args, .. } = spec else {
+            panic!("expected exec spec")
+        };
+        args
+    }
+
+    #[test]
+    fn capture_assistant_exec_flag_only_on_stop_and_only_when_opted_in() {
+        // Bare filenames so `file_stem()` yields the event on any host (a
+        // backslash path is a single component on Unix).
+        // Opted in: only the `stop` command carries the flag (#196, D1).
+        assert!(exec_args("stop.sh", true).contains(&"--capture-assistant".to_string()));
+        assert!(
+            !exec_args("session-start.sh", true).contains(&"--capture-assistant".to_string()),
+            "flag must not leak onto non-stop commands"
+        );
+        // Not opted in: even the stop command stays byte-identical to before.
+        assert!(
+            !exec_args("stop.sh", false).contains(&"--capture-assistant".to_string()),
+            "flag must be absent without opt-in"
+        );
+    }
+
+    #[test]
+    fn capture_assistant_string_form_only_on_stop() {
+        // POSIX + Windows string forms: the flag rides only the stop command.
+        for platform in [
+            HookCommandPlatform::PosixNative,
+            HookCommandPlatform::WindowsNative,
+        ] {
+            let ctx = HookCommandContext::new(platform, "claude-code", None, None)
+                .with_capture_assistant(true);
+            let stop = hook_command(Path::new("stop.sh"), "http://h", None, ctx);
+            let start = hook_command(Path::new("session-start.sh"), "http://h", None, ctx);
+            assert!(
+                stop.contains("--capture-assistant"),
+                "{platform:?} stop missing flag: {stop}"
+            );
+            assert!(
+                !start.contains("--capture-assistant"),
+                "{platform:?} session-start must not carry flag: {start}"
+            );
+        }
+    }
+
     #[test]
     fn windows_native_exec_form_is_claude_only_and_guarded() {
         fn handler_for(
@@ -2020,17 +2150,138 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
-        assert!(cmd.starts_with("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command"));
-        assert!(cmd.contains("$env:AI_MEMORY_HOOK_URL='http://localhost:49374'"));
-        assert!(cmd.contains("$env:AI_MEMORY_AUTH_TOKEN='tok''en'"));
+        assert!(cmd.starts_with(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand "
+        ));
         assert!(
-            cmd.contains("session-start.ps1"),
-            "expected ps1 script path: {cmd}"
+            !cmd.contains("$env:"),
+            "outer command must be opaque: {cmd}"
         );
         assert!(
-            !cmd.contains("session-start.sh"),
-            "Windows command must not use sh: {cmd}"
+            !cmd.contains("http://localhost:49374"),
+            "outer command must not expose values to its caller: {cmd}"
         );
+        let program = decode_powershell_encoded_command(cmd);
+        assert!(program.starts_with("$ProgressPreference='SilentlyContinue';"));
+        assert!(program.contains("$env:AI_MEMORY_HOOK_URL='http://localhost:49374'"));
+        assert!(program.contains("$env:AI_MEMORY_AUTH_TOKEN='tok''en'"));
+        assert!(
+            program.contains("session-start.ps1"),
+            "expected ps1 script path: {program}"
+        );
+        assert!(
+            !program.contains("session-start.sh"),
+            "Windows command must not use sh: {program}"
+        );
+    }
+
+    #[test]
+    fn antigravity_windows_commands_survive_an_outer_powershell_runner() {
+        let root = PathBuf::from("C:/Users/alice/.local/share/ai-memory/hooks/antigravity-cli");
+        let v = build_antigravity_payload_for_platform(
+            &root,
+            "http://localhost:49374",
+            Some("tok'en"),
+            HookCommandPlatform::Windows,
+            "antigravity-cli",
+            None,
+            Some("repo-root"),
+        );
+
+        for pointer in [
+            "/ai-memory/PreInvocation/0/command",
+            "/ai-memory/PreToolUse/0/hooks/0/command",
+        ] {
+            let command = v.pointer(pointer).and_then(Value::as_str).unwrap();
+            assert!(
+                command.contains(" -EncodedCommand "),
+                "{pointer}: {command}"
+            );
+            assert!(
+                command.contains(" -OutputFormat Text "),
+                "{pointer}: nested PowerShell output must stay textual: {command}"
+            );
+            assert!(
+                !command.contains("$env:")
+                    && !command.contains("localhost:49374")
+                    && !command.contains(".ps1"),
+                "{pointer}: outer runner must see only an opaque program: {command}"
+            );
+
+            let program = decode_powershell_encoded_command(command);
+            assert!(
+                program.starts_with("$ProgressPreference='SilentlyContinue';"),
+                "{pointer}: {program}"
+            );
+            assert!(
+                program.contains("$env:AI_MEMORY_HOOK_URL='http://localhost:49374'"),
+                "{pointer}: {program}"
+            );
+            assert!(
+                program.contains("$env:AI_MEMORY_AUTH_TOKEN='tok''en'"),
+                "{pointer}: {program}"
+            );
+            assert!(
+                program.contains("$env:AI_MEMORY_PROJECT_STRATEGY='repo-root'"),
+                "{pointer}: {program}"
+            );
+            assert!(program.contains(".ps1"), "{pointer}: {program}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_encoded_hook_executes_through_an_outer_powershell() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("hook with spaces.ps1");
+        fs::write(
+            &script,
+            r#"if ($env:AI_MEMORY_HOOK_URL -ne "http://localhost:49374") { exit 9 }
+if ($env:AI_MEMORY_AUTH_TOKEN -ne "tok'en") { exit 10 }
+Write-Progress -Activity "hook progress" -Status "must stay silent"
+$payload = [Console]::In.ReadToEnd()
+[Console]::Out.Write($payload)
+"#,
+        )
+        .unwrap();
+        let command = hook_command(
+            &script,
+            "http://localhost:49374",
+            Some("tok'en"),
+            HookCommandContext::new(HookCommandPlatform::Windows, "antigravity-cli", None, None),
+        );
+
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &command,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook":"ok"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "nested PowerShell failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "non-interactive hook wrote stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, br#"{"hook":"ok"}"#);
     }
 
     #[test]
@@ -2158,8 +2409,9 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
             None,
         );
         let (_, cmd) = &commands[0];
-        assert!(cmd.contains("session-start.ps1"), "{cmd}");
-        assert!(!cmd.contains("session-start.sh"), "{cmd}");
+        let program = decode_powershell_encoded_command(cmd);
+        assert!(program.contains("session-start.ps1"), "{program}");
+        assert!(!program.contains("session-start.sh"), "{program}");
     }
 
     #[test]
@@ -2265,9 +2517,10 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
     #[test]
     fn windows_ps_hook_command_bakes_project_strategy_env() {
         let cmd = strategy_cmd(HookCommandPlatform::Windows, Some("repo-root"));
+        let program = decode_powershell_encoded_command(&cmd);
         assert!(
-            cmd.contains("$env:AI_MEMORY_PROJECT_STRATEGY='repo-root'"),
-            "powershell must bake the strategy env: {cmd}"
+            program.contains("$env:AI_MEMORY_PROJECT_STRATEGY='repo-root'"),
+            "powershell must bake the strategy env: {program}"
         );
     }
 
@@ -2309,13 +2562,18 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
             HookCommandPlatform::WindowsNative,
         ] {
             let cmd = strategy_cmd(platform, None);
+            let inspect = if platform == HookCommandPlatform::Windows {
+                decode_powershell_encoded_command(&cmd)
+            } else {
+                cmd
+            };
             assert!(
-                !cmd.contains("AI_MEMORY_PROJECT_STRATEGY"),
-                "{platform:?}: no strategy env when None: {cmd}"
+                !inspect.contains("AI_MEMORY_PROJECT_STRATEGY"),
+                "{platform:?}: no strategy env when None: {inspect}"
             );
             assert!(
-                !cmd.contains("--project-strategy"),
-                "{platform:?}: no strategy flag when None: {cmd}"
+                !inspect.contains("--project-strategy"),
+                "{platform:?}: no strategy flag when None: {inspect}"
             );
         }
     }

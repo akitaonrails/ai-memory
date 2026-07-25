@@ -14,6 +14,8 @@ path (docker + Claude Code). This page covers everything else:
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
   (cargo install, building from source)
+- [Managed cross-harness workstreams](managed-workstreams.md)
+  (`ai-memory run`, transparent native resume, and argument forwarding)
 - [LLM provider tiers + self-hosted Ollama](#llm-provider-tiers)
 - [Subcommand reference](#subcommand-reference)
 - [Managed routing snippets and Agent Skills](#managed-routing-snippets-and-agent-skills)
@@ -65,6 +67,18 @@ export AI_MEMORY_AUTH_TOKEN="$TOKEN"
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
+
+If `CLAUDE_CONFIG_DIR` is set, the claude-code installers match Claude Code's
+own config resolution: `install-mcp` writes the MCP registration to
+`$CLAUDE_CONFIG_DIR/.claude.json` (instead of `~/.claude.json`),
+`install-hooks` / `setup-agent` target `$CLAUDE_CONFIG_DIR/settings.json`
+(instead of `~/.claude/settings.json`), and `install-skills --scope global`
+uses `$CLAUDE_CONFIG_DIR/skills` (instead of `~/.claude/skills`). `uninstall`
+sweeps the active relocated paths alongside the home defaults. It cannot
+discover an older arbitrary `CLAUDE_CONFIG_DIR` that is no longer set. The
+Docker wrapper forwards the variable for config roots under its existing
+`$HOME` bind mount; use the native binary when the relocated root is outside
+`$HOME`.
 
 The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve`,
 `curator`, `pending-writes`, etc.) inherit the two env vars automatically. So do
@@ -378,10 +392,58 @@ Docker script bundles do not enforce it. Re-run `install-hooks --agent <agent>
 capability output reflects the selected integration. See the canonical
 [capture exclusions reference](marker-file.md#capture-exclusions).
 
+Some agent harnesses attach the assistant's final turn to their `Stop` event —
+Claude Code sends it as a raw `last_assistant_message`. By default that text is
+never persisted: the native hook binary strips the raw field before it can reach
+the local spool or the wire, and the server strips it defensively on arrival.
+
+**Opt-in capture (#196).** You can opt in to storing a sanitized, 2 KB-capped
+excerpt of the assistant's final turn as the Stop body. It is a **double
+opt-in** — enable the server first, then the client:
+
+1. **Server:** set `capture_assistant = true` in the live
+   `<data_dir>/config.toml` (or the service's configured TOML file), or set
+   `AI_MEMORY_CAPTURE_ASSISTANT=true`, then restart `ai-memory serve`.
+2. **Client:** re-install the Claude Code hooks with the flag:
+
+   ```bash
+   ai-memory install-hooks --agent claude-code --capture-assistant --apply
+   ```
+
+The client sanitizes (built-in patterns) and truncates the excerpt before it
+touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
+before storing. If either side is off — or the marker is malformed — the Stop
+stays empty. Re-running `install-hooks` without `--capture-assistant` removes
+the flag (idempotent). `--capture-assistant` is Claude Code + native-platform
+only; on any other agent or the script fallback the installer refuses it rather
+than enabling something that cannot take effect. Assistant text is
+privacy-sensitive — read the `SECURITY.md` notes on what it can contain and where
+it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
+is configured) before enabling it.
+
+Upgrading the binary is sufficient for native Claude Code installs, and pending
+spooled events drain with the raw field stripped as well. Installs that run the
+`.sh`/`.ps1` script fallback (the Docker script bundle or an explicit
+`AI_MEMORY_HOOK_PLATFORM=posix`) cannot sanitize the assistant text, so a `Stop`
+payload still carrying the raw field is dropped whole by the script rather than
+POSTed verbatim. The Docker wrapper deliberately keeps script commands because a
+binary path inside its helper container is not valid on the host; running
+`install-hooks` through that wrapper refreshes the scripts but does not convert
+them. To capture assistant text safely, install a native ai-memory client on the
+agent host, then use that native executable to run
+`install-hooks --agent claude-code --apply`. Even if the script fallback is
+retained, the server still strips any raw field on receipt before persistence.
+
 Native `ai-memory hook --event ...` commands spool events locally. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
+Each spooled entry keeps one idempotency key across retries. A server that
+processed an event but lost the batch response will not duplicate its
+observation or completed session-end effects; if processing stopped after the
+observation commit, the retry re-runs downstream wiki/handoff work. Those
+incomplete effects remain at-least-once until the server marks the event
+complete.
 On Unix, the helper uses a trusted `setsid` launcher when available and falls
 back to a separate process group otherwise; Windows uses detached/breakaway
 process flags. The spool is capped, so a permanently undrained backlog is
@@ -606,8 +668,14 @@ native `ai-memory hook --event … --agent kimi-code` commands on local installs
 (local spool plus batched delivery, capture-policy v1 enforced); the staged
 script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
 compatibility fallback (fire-and-forget POSTs to `/hook`). A pending handoff
-is injected at `SessionStart` through the hook's stdout, which Kimi Code
-appends to the model context.
+is injected at `UserPromptSubmit` through the hook's stdout, which Kimi Code
+appends to the model context as a user message before the turn; Kimi Code
+fires `SessionStart` but discards that hook's stdout, so hooks installed by
+an older release consumed handoffs without delivering them. Existing native
+hook commands invoke the current `ai-memory` binary and pick up the corrected
+delivery behavior on upgrade. Re-run
+`ai-memory install-hooks --agent kimi-code --apply` only for a
+script-fallback installation so its staged scripts are refreshed.
 
 Kimi Code hook entries accept only `event`, `matcher`, `command`, and
 `timeout`; extra fields make the whole `config.toml` fail to load, so prefer
@@ -860,8 +928,9 @@ The short version: run the install commands from the same environment that
 launches the agent. WSL2-launched agents need WSL paths and POSIX `.sh` hooks.
 Native Windows agents can use the tagged `ai-memory-windows-x86_64.zip`, the
 Docker Desktop wrapper, or a source build. Native Claude Code uses Claude exec
-form with a real `ai-memory.exe` by default; other native Windows script-hook
-agents use PowerShell `.ps1` defaults.
+form with a real `ai-memory.exe` by default; the Windows Docker wrapper renders
+other native Windows script-hook agents through encoded PowerShell `.ps1`
+fallback commands.
 
 When run from source, `install-hooks` finds the bundled scripts in
 the repo's `hooks/` automatically. Extracted release archives also
@@ -1032,7 +1101,7 @@ Advanced users with a pre-minted Copilot API token can set
 Pass `--client-id` or set `AI_MEMORY_COPILOT_CLIENT_ID` if you operate your own
 OAuth app.
 
-### Self-hosted LLMs (Ollama / vLLM / LM Studio / OpenRouter)
+### OpenAI-compatible providers (Ollama / vLLM / LM Studio / hosted APIs)
 
 ```bash
 docker run -d --name ai-memory \
@@ -1054,6 +1123,20 @@ required. For OpenRouter (Kimi, DeepSeek, etc.):
 -e AI_MEMORY_LLM_MODEL=moonshotai/kimi-k2.6
 -e LLM_API_KEY=sk-or-v1-...
 ```
+
+[Atlas Cloud](https://www.atlascloud.ai/models/qwen/qwen3.5-flash) uses the
+same provider; no Atlas-specific ai-memory provider is needed. Pass its API key
+through the generic compatibility credential:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://api.atlascloud.ai/v1
+-e AI_MEMORY_LLM_MODEL=qwen/qwen3.5-flash
+-e LLM_API_KEY="$ATLASCLOUD_API_KEY"
+```
+
+Replace the model with another current Atlas model id when needed. ai-memory
+does not select a default for hosted compatibility endpoints.
 
 Modern Ollama, vLLM, LM Studio, llama.cpp, and gateway endpoints may honour
 OpenAI-style `response_format=json_schema`. If the tolerant default parser fails
@@ -1105,10 +1188,12 @@ docker exec ai-memory ai-memory search "karpathy"
 docker exec ai-memory ai-memory backup --to /data/snapshot.tar.gz
 
 # B) One-shot, no running container needed for pure-stdout helpers
-#    (generate-auth-token, install-mcp, install-hooks, setup-agent, llm-test).
+#    (generate-auth-token, completions, install-mcp, install-hooks, setup-agent,
+#    llm-test).
 #    Auth login is stateful: use docker exec against the running container or
 #    the wrapper so it writes into the same data volume as the server.
 docker run --rm akitaonrails/ai-memory:latest generate-auth-token
+docker run --rm akitaonrails/ai-memory:latest completions zsh
 docker run --rm akitaonrails/ai-memory:latest install-mcp --client cursor
 docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 ```
@@ -1116,6 +1201,8 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | Subcommand | Pattern | What it does |
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
+| `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, or OMP explicitly; exact `--yolo` is wrapper-owned and other native arguments pass through |
+| `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki search with FTS5 + graph/vector RRF |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |
@@ -1136,6 +1223,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `install-skills [--scope] [--agent]` | same host environment used for the agent skill dirs | Install or update only the managed ai-memory Agent Skills |
 | `uninstall --apply` | same host environment used for install | Remove only ai-memory-owned hooks, MCP entries, instruction blocks, managed skill files, and generated plugin files after content/marker validation. Use `--mcp-url` for custom MCP endpoints and `--mcp-name` only to narrow removal. |
 | `llm-test --provider …` | `docker run --rm -e …` | Smoke-test an LLM provider |
+| `completions <shell>` | `docker run --rm` or native binary | Print a bash/zsh/fish/PowerShell/elvish completion script; see [`shell-completions.md`](shell-completions.md) |
 
 ### Managed routing snippets and Agent Skills
 
@@ -1356,6 +1444,31 @@ helper container. For local loopback servers, it automatically bridges
 that helper back to the host's `127.0.0.1:49374`, so `ai-memory status`,
 `ai-memory search`, and `ai-memory bootstrap` work with the same default
 URL as the generated agent config.
+
+#### SELinux-enforcing hosts
+
+On SELinux-enforcing Linux systems such as Fedora, RHEL, and openSUSE, normal
+home-directory labels can prevent the helper container from writing agent
+config even when its UID and GID match the host user. The wrapper checks both
+the host enforcement mode and Docker's advertised security options. For the
+short-lived helper commands that write host files (`install-*`, `setup-agent`,
+`uninstall`, and `backup`), it adds `--security-opt label=disable`; thin-client
+commands remain confined. This relaxes SELinux label confinement only for that
+trusted helper invocation. It does not modify the long-lived ai-memory server,
+which uses a Docker-managed named volume.
+
+Do not add `:z` or `:Z` to the wrapper's whole `$HOME` bind. Docker's
+[bind-mount documentation](https://docs.docker.com/engine/storage/bind-mounts/#configure-the-selinux-label)
+warns that relabeling system directories such as `/home` can make the host
+inoperable. Docker documents `label=disable` in the
+[`docker run` security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt).
+
+`ai-memory run` is the exception: the current wrapper intercepts it and starts a
+cached checksum-verified native client on the host, where harness executables
+and session stores exist. It preserves an explicit remote
+`AI_MEMORY_SERVER_URL`. If `run` logs `data_dir=/data` and then cannot find
+`codex`, `claude`, or another harness executable, refresh the stale wrapper with
+`ai-memory upgrade` on that client machine.
 
 ### Docker compose alternative
 

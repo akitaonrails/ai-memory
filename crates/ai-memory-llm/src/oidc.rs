@@ -6,22 +6,21 @@
 //! **per-developer** JWT instead of a shared static token. The stored token is
 //! refreshed on demand from the hook fast-path.
 //!
-//! Storage mirrors [`crate::openai_oauth`]: the same shared `auth.json` file,
-//! under the `"oidc"` key, with `type: "oauth"` so the shared loader accepts it.
-//! The server side is unchanged — its auth layer already validates a Keycloak
-//! JWT on the hook routes (requiring the `mcp:read` realm role).
+//! Storage uses the shared [`crate::stored_token`] core: the same shared
+//! `auth.json` file as [`crate::openai_oauth`], under the `"oidc"` key, with
+//! `type: "oauth"` so the shared loader accepts it. The server side is
+//! unchanged — its auth layer already validates a Keycloak JWT on the hook
+//! routes (requiring the `mcp:read` realm role).
 
 use std::path::Path;
 
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 
-use crate::auth_file::{load_entry, now_ms, save_entry};
+use crate::auth_file::now_ms;
 use crate::error::{LlmError, LlmResult};
 use crate::response::{provider_error_body, response_json_limited};
-
-/// Refresh once the access token is within this margin of expiry.
-const REFRESH_MARGIN_MS: u64 = 60_000;
+use crate::stored_token::{StoredOAuthToken, refresh_grant};
 
 /// Default device-flow scopes: `openid` (ID token), `profile` (so the access
 /// token carries `preferred_username` → `X-Memory-Actor-User` on the server),
@@ -29,15 +28,9 @@ const REFRESH_MARGIN_MS: u64 = 60_000;
 /// server requires is a **realm role** on the user, not a scope.
 pub const OIDC_DEFAULT_SCOPE: &str = "openid profile offline_access";
 
-/// Stored OIDC device-grant token.
-#[derive(Clone)]
-pub struct OidcToken {
-    /// Access token sent as the bearer to the ai-memory server.
-    pub access: SecretString,
-    /// Refresh token used to mint a new access token.
-    pub refresh: SecretString,
-    /// Expiry in milliseconds since the Unix epoch.
-    pub expires_at_ms: u64,
+/// OIDC-specific fields persisted next to the shared token triple.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OidcExtras {
     /// OIDC issuer this token was minted by (kept for `status` display).
     pub issuer: String,
     /// Public client id used for the device + refresh grants.
@@ -46,18 +39,8 @@ pub struct OidcToken {
     pub token_endpoint: String,
 }
 
-impl std::fmt::Debug for OidcToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OidcToken")
-            .field("access", &"<redacted>")
-            .field("refresh", &"<redacted>")
-            .field("expires_at_ms", &self.expires_at_ms)
-            .field("issuer", &self.issuer)
-            .field("client_id", &self.client_id)
-            .field("token_endpoint", &self.token_endpoint)
-            .finish()
-    }
-}
+/// Stored OIDC device-grant token.
+pub type OidcToken = StoredOAuthToken<OidcExtras>;
 
 impl OidcToken {
     /// Build a token from a token-endpoint response. `previous_refresh` is used
@@ -90,16 +73,12 @@ impl OidcToken {
             refresh: SecretString::from(refresh),
             expires_at_ms: now_ms()
                 .saturating_add(resp.expires_in.unwrap_or(300).saturating_mul(1000)),
-            issuer: issuer.into(),
-            client_id: client_id.into(),
-            token_endpoint: token_endpoint.into(),
+            extra: OidcExtras {
+                issuer: issuer.into(),
+                client_id: client_id.into(),
+                token_endpoint: token_endpoint.into(),
+            },
         })
-    }
-
-    /// True when the access token is expired or within the refresh margin.
-    #[must_use]
-    pub fn needs_refresh(&self) -> bool {
-        now_ms().saturating_add(REFRESH_MARGIN_MS) >= self.expires_at_ms
     }
 
     /// Load the OIDC token from the shared `auth.json` file.
@@ -107,20 +86,7 @@ impl OidcToken {
     /// # Errors
     /// Returns [`LlmError::Auth`] when the file exists but cannot be read/parsed.
     pub fn load(path: &Path) -> LlmResult<Option<Self>> {
-        let Some(entry) = load_entry::<OidcEntry>(path, "oidc")? else {
-            return Ok(None);
-        };
-        if entry.kind != "oauth" {
-            return Ok(None);
-        }
-        Ok(Some(Self {
-            access: SecretString::from(entry.access),
-            refresh: SecretString::from(entry.refresh),
-            expires_at_ms: entry.expires,
-            issuer: entry.issuer,
-            client_id: entry.client_id,
-            token_endpoint: entry.token_endpoint,
-        }))
+        Self::load_key(path, "oidc")
     }
 
     /// Save the token into the shared `auth.json` file, preserving other keys.
@@ -128,16 +94,7 @@ impl OidcToken {
     /// # Errors
     /// Returns [`LlmError::Auth`] when the file cannot be written.
     pub fn save(&self, path: &Path) -> LlmResult<()> {
-        let entry = OidcEntry {
-            kind: "oauth".into(),
-            access: self.access.expose_secret().to_string(),
-            refresh: self.refresh.expose_secret().to_string(),
-            expires: self.expires_at_ms,
-            issuer: self.issuer.clone(),
-            client_id: self.client_id.clone(),
-            token_endpoint: self.token_endpoint.clone(),
-        };
-        save_entry(path, "oidc", Some(entry))
+        self.save_key(path, "oidc")
     }
 
     /// Remove the OIDC entry from the shared `auth.json` file.
@@ -145,20 +102,8 @@ impl OidcToken {
     /// # Errors
     /// Returns [`LlmError::Auth`] when the file cannot be updated.
     pub fn remove(path: &Path) -> LlmResult<()> {
-        save_entry::<OidcEntry>(path, "oidc", None)
+        Self::remove_key(path, "oidc")
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct OidcEntry {
-    #[serde(rename = "type")]
-    kind: String,
-    access: String,
-    refresh: String,
-    expires: u64,
-    issuer: String,
-    client_id: String,
-    token_endpoint: String,
 }
 
 /// The two endpoints we need from `<issuer>/.well-known/openid-configuration`.
@@ -320,29 +265,20 @@ pub async fn refresh_access_token(
     client: &reqwest::Client,
     token: &OidcToken,
 ) -> LlmResult<OidcToken> {
-    let resp = client
-        .post(&token.token_endpoint)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", token.refresh.expose_secret()),
-            ("client_id", token.client_id.as_str()),
-        ])
-        .send()
-        .await
-        .map_err(LlmError::from)?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = provider_error_body(resp).await;
-        return Err(LlmError::Auth(format!(
-            "OIDC refresh failed ({status}): {body}. Run `ai-memory auth login oidc-device` again."
-        )));
-    }
-    let token_response = response_json_limited::<OidcTokenResponse>(resp).await?;
+    let token_response = refresh_grant::<OidcTokenResponse>(
+        client,
+        &token.extra.token_endpoint,
+        token.refresh.expose_secret(),
+        &token.extra.client_id,
+        "OIDC refresh failed",
+        "Run `ai-memory auth login oidc-device` again.",
+    )
+    .await?;
     OidcToken::from_token_response(
         &token_response,
-        token.issuer.clone(),
-        token.client_id.clone(),
-        token.token_endpoint.clone(),
+        token.extra.issuer.clone(),
+        token.extra.client_id.clone(),
+        token.extra.token_endpoint.clone(),
         Some(token.refresh.expose_secret()),
     )
 }
@@ -356,10 +292,13 @@ mod tests {
             access: SecretString::from("access-x".to_string()),
             refresh: SecretString::from("refresh-y".to_string()),
             expires_at_ms: now_ms() + 3_600_000,
-            issuer: "https://kc.example.com/realms/ai-memory".to_string(),
-            client_id: "ai-memory-dev".to_string(),
-            token_endpoint: "https://kc.example.com/realms/ai-memory/protocol/openid-connect/token"
-                .to_string(),
+            extra: OidcExtras {
+                issuer: "https://kc.example.com/realms/ai-memory".to_string(),
+                client_id: "ai-memory-dev".to_string(),
+                token_endpoint:
+                    "https://kc.example.com/realms/ai-memory/protocol/openid-connect/token"
+                        .to_string(),
+            },
         }
     }
 
@@ -372,9 +311,9 @@ mod tests {
         let loaded = OidcToken::load(&path).unwrap().unwrap();
         assert_eq!(loaded.access.expose_secret(), "access-x");
         assert_eq!(loaded.refresh.expose_secret(), "refresh-y");
-        assert_eq!(loaded.client_id, "ai-memory-dev");
+        assert_eq!(loaded.extra.client_id, "ai-memory-dev");
         assert_eq!(
-            loaded.token_endpoint,
+            loaded.extra.token_endpoint,
             "https://kc.example.com/realms/ai-memory/protocol/openid-connect/token"
         );
     }

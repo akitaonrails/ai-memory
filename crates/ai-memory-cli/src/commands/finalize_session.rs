@@ -1,13 +1,12 @@
 //! `ai-memory finalize-session` — manually synthesize SessionEnd for Codex.
 
 use ai_memory_core::AgentKind;
-use ai_memory_store::{DB_FILENAME, OpenSession, ReaderPool};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::FinalizeSessionArgs;
 use crate::config::Config;
-use crate::http_client::ServerEndpoint;
+use crate::http_client::{ServerEndpoint, ServerResponseError, get_json};
 
 #[derive(Debug, Serialize)]
 struct SessionEndPayload<'a> {
@@ -26,6 +25,19 @@ struct HookBatchAck {
     accepted: usize,
 }
 
+/// Response shape of `GET /admin/open-sessions` on the server.
+#[derive(Debug, Deserialize)]
+struct OpenSessionsResponse {
+    sessions: Vec<OpenSessionEntry>,
+}
+
+/// One open session as reported by `GET /admin/open-sessions`.
+#[derive(Debug, Deserialize)]
+struct OpenSessionEntry {
+    session_id: String,
+    cwd: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct FinalizeSessionReport {
     workspace: String,
@@ -37,34 +49,18 @@ struct FinalizeSessionReport {
 /// Run the `finalize-session` subcommand.
 ///
 /// # Errors
-/// Returns an error if the local store cannot be read or the configured server
-/// rejects a synthetic `session-end` hook.
+/// Returns an error if the configured server cannot list the scope's open
+/// sessions or rejects a synthetic `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     let agent = args.agent.kind();
     let project = super::resolve_project_name(config, args.project.as_deref())?;
-    let db_path = config.data_dir.join("db").join(DB_FILENAME);
-    if !db_path.exists() {
-        return print_report(args, project, agent, Vec::new());
-    }
-    let reader = ReaderPool::new(&db_path, 1).context("opening local store reader")?;
-    let workspace_id = match reader.find_workspace(args.workspace.clone()).await? {
-        Some(id) => id,
-        None => return print_report(args, project, agent, Vec::new()),
-    };
-    let project_id = match reader.find_project(workspace_id, project.clone()).await? {
-        Some(id) => id,
-        None => return print_report(args, project, agent, Vec::new()),
-    };
-
-    let limit = if args.all { None } else { Some(1) };
-    let sessions = reader
-        .open_sessions_for_scope_agent(workspace_id, project_id, agent, limit)
-        .await?;
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let sessions =
+        fetch_open_sessions(&endpoint, &args.workspace, &project, agent, args.all).await?;
     if sessions.is_empty() {
         return print_report(args, project, agent, Vec::new());
     }
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let client = reqwest::Client::new();
     let fallback_cwd = effective_cwd(config)?;
     let mut finalized = Vec::with_capacity(sessions.len());
@@ -79,10 +75,46 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
             agent,
         )
         .await?;
-        finalized.push(session.session_id.to_string());
+        finalized.push(session.session_id.clone());
     }
 
     print_report(args, project, agent, finalized)
+}
+
+/// List open sessions for the scope + agent via the server. An unknown
+/// workspace/project fails closed server-side with a 404; that maps to
+/// "nothing to finalize" here, matching the previous direct-DB behavior
+/// for a missing scope.
+async fn fetch_open_sessions(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    agent: AgentKind,
+    all: bool,
+) -> Result<Vec<OpenSessionEntry>> {
+    let all = if all { "true" } else { "false" };
+    let result = get_json::<OpenSessionsResponse>(
+        endpoint,
+        "/admin/open-sessions",
+        &[
+            ("workspace", workspace),
+            ("project", project),
+            ("agent", agent.as_str()),
+            ("all", all),
+        ],
+    )
+    .await;
+    match result {
+        Ok(response) => Ok(response.sessions),
+        Err(e) => {
+            if let Some(server_err) = e.downcast_ref::<ServerResponseError>()
+                && server_err.status() == reqwest::StatusCode::NOT_FOUND
+            {
+                return Ok(Vec::new());
+            }
+            Err(e)
+        }
+    }
 }
 
 fn print_report(
@@ -122,7 +154,7 @@ fn print_report(
 async fn post_session_end_batch(
     client: &reqwest::Client,
     endpoint: &ServerEndpoint,
-    session: &OpenSession,
+    session: &OpenSessionEntry,
     fallback_cwd: &str,
     workspace: &str,
     project: &str,
@@ -134,7 +166,7 @@ async fn post_session_end_batch(
     let items = [HookBatchItem {
         url: hook_url,
         body: SessionEndPayload {
-            session_id: session.session_id.to_string(),
+            session_id: session.session_id.clone(),
             cwd,
         },
     }];

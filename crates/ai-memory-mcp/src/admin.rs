@@ -9,6 +9,7 @@
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
+//! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -44,19 +45,20 @@ use std::str::FromStr;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
-    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport, SourceCounts,
-    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
-    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
-    run_curator_report, run_lint, run_sweep,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
+    EmbedBackfillCounts, EmbedBackfillOptions, SourceCounts, prune_sources_to_budget,
+    render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
+    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report,
+    run_embedding_backfill, run_lint, run_sweep,
 };
 use ai_memory_core::{
-    ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
-    PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
+    DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
+    DecayParams, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
     ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
     f32_vec_to_bytes, lookup_existing_scope, lookup_existing_scope_with_global_fallback,
     lookup_existing_workspace,
@@ -76,7 +78,6 @@ use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
-const EMBEDDING_WRITE_BATCH: usize = 100;
 const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 
 /// Shared state for the admin router.
@@ -531,6 +532,7 @@ pub fn admin_router(state: AdminState) -> Router {
         )
         .route("/admin/status", get(handle_status))
         .route("/admin/projects", get(handle_list_projects))
+        .route("/admin/open-sessions", get(handle_open_sessions))
         .route(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
@@ -642,7 +644,7 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::empty())
-                    .unwrap()
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
             }),
         Err(e) => {
             warn!(error = %e, "backup failed");
@@ -656,7 +658,7 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
                     Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body(Body::empty())
-                        .unwrap()
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                 })
         }
     }
@@ -820,6 +822,87 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                 Json(serde_json::json!({ "error": e.to_string() })),
             ),
         },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// open-sessions
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/open-sessions` — open (not yet ended)
+/// sessions for one scope + agent, newest first. Backs the thin
+/// `ai-memory finalize-session` command, which posts synthetic
+/// session-end hooks for whatever this returns.
+#[derive(Debug, Deserialize)]
+struct OpenSessionsQuery {
+    /// Workspace name (required).
+    workspace: String,
+    /// Project name (required).
+    project: String,
+    /// Agent kind filter, kebab-case (`codex`, `claude-code`, …).
+    agent: String,
+    /// When true, return every open session; otherwise just the newest.
+    #[serde(default)]
+    all: bool,
+}
+
+/// Wire shape for one open session in the `GET /admin/open-sessions`
+/// response.
+#[derive(Debug, Serialize)]
+struct OpenSessionEntry {
+    session_id: String,
+    cwd: Option<String>,
+}
+
+/// Parse a kebab-case agent wire string into an [`AgentKind`].
+fn parse_agent_kind(raw: &str) -> Option<AgentKind> {
+    AgentKind::ALL.into_iter().find(|kind| kind.as_str() == raw)
+}
+
+async fn handle_open_sessions(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<OpenSessionsQuery>,
+) -> impl IntoResponse {
+    let Some(agent) = parse_agent_kind(&query.agent) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown agent kind: {}", query.agent)
+            })),
+        );
+    };
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let limit = if query.all { None } else { Some(1) };
+    match state
+        .reader
+        .open_sessions_for_scope_agent(ws, proj, agent, limit)
+        .await
+    {
+        Ok(sessions) => {
+            let sessions: Vec<OpenSessionEntry> = sessions
+                .into_iter()
+                .map(|s| OpenSessionEntry {
+                    session_id: s.session_id.to_string(),
+                    cwd: s.cwd,
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(&sessions)
+                        .map(|list| serde_json::json!({ "sessions": list }))
+                        .unwrap_or_else(|_| serde_json::json!({ "sessions": [] })),
+                ),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -2465,23 +2548,6 @@ pub struct EmbedReport {
     pub dim: u32,
 }
 
-#[derive(Default)]
-struct EmbedCounts {
-    embedded: usize,
-    skipped: usize,
-    failed: usize,
-    would_embed: usize,
-}
-
-impl EmbedCounts {
-    fn absorb(&mut self, other: Self) {
-        self.embedded += other.embedded;
-        self.skipped += other.skipped;
-        self.failed += other.failed;
-        self.would_embed += other.would_embed;
-    }
-}
-
 async fn embed_project_pages(
     state: &AdminState,
     embedder: &Arc<dyn Embedder>,
@@ -2489,87 +2555,18 @@ async fn embed_project_pages(
     proj: ProjectId,
     reembed: bool,
     dry_run: bool,
-) -> Result<EmbedCounts, (StatusCode, Json<serde_json::Value>)> {
-    let provider = embedder.provider().to_string();
-    let model = embedder.model().to_string();
-    let dim = embedder.dim();
-
-    let candidates = state
-        .reader
-        .decay_candidates(ws, proj)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
-
-    let already: std::collections::HashSet<_> = if reembed {
-        std::collections::HashSet::new()
-    } else {
-        state
-            .reader
-            .embedded_page_ids(ws, proj, provider.clone(), model.clone(), dim)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?
-            .into_iter()
-            .collect()
-    };
-
-    let mut counts = EmbedCounts::default();
-    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
-
-    for cand in candidates {
-        if !reembed && already.contains(&cand.id) {
-            counts.skipped += 1;
-            continue;
-        }
-        if dry_run {
-            counts.would_embed += 1;
-            continue;
-        }
-        let md = match state.wiki.read_page(ws, proj, &cand.path) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
-                counts.failed += 1;
-                continue;
-            }
-        };
-        if md.body.trim().is_empty() {
-            counts.skipped += 1;
-            continue;
-        }
-        let vec = match embedder.embed_document(&md.body).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: provider call failed");
-                counts.failed += 1;
-                continue;
-            }
-        };
-        pending.push(EmbeddingWrite {
-            page_id: cand.id,
-            vector_bytes: f32_vec_to_bytes(&vec),
-            provider: provider.clone(),
-            model: model.clone(),
-            dim,
-        });
-        if pending.len() >= EMBEDDING_WRITE_BATCH {
-            flush_embedding_batch(
-                &state.writer,
-                &mut pending,
-                &mut counts.embedded,
-                &mut counts.failed,
-            )
-            .await;
-        }
-    }
-    flush_embedding_batch(
+) -> Result<EmbedBackfillCounts, (StatusCode, Json<serde_json::Value>)> {
+    run_embedding_backfill(
+        &state.reader,
         &state.writer,
-        &mut pending,
-        &mut counts.embedded,
-        &mut counts.failed,
+        &state.wiki,
+        embedder,
+        ws,
+        proj,
+        EmbedBackfillOptions { reembed, dry_run },
     )
-    .await;
-
-    Ok(counts)
+    .await
+    .map_err(|e| internal_err(e.to_string()))
 }
 
 async fn handle_embed(
@@ -2592,7 +2589,7 @@ async fn handle_embed(
     let model = embedder.model().to_string();
     let dim = embedder.dim();
 
-    let mut totals = EmbedCounts::default();
+    let mut totals = EmbedBackfillCounts::default();
 
     if req.all_projects {
         if let Some(ws) = state
@@ -2659,25 +2656,6 @@ async fn handle_embed(
         StatusCode::OK,
         Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
     ))
-}
-
-async fn flush_embedding_batch(
-    writer: &WriterHandle,
-    pending: &mut Vec<EmbeddingWrite>,
-    embedded: &mut usize,
-    failed: &mut usize,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    let batch = std::mem::replace(pending, Vec::with_capacity(EMBEDDING_WRITE_BATCH));
-    let count = batch.len();
-    if let Err(e) = writer.store_embeddings(batch).await {
-        *failed += count;
-        warn!(count, error = %e, "embed: store_embeddings failed");
-    } else {
-        *embedded += count;
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -5494,6 +5472,7 @@ fn map_user_store_err(e: ai_memory_store::StoreError) -> (StatusCode, Json<serde
 mod tests {
     use super::*;
     use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind};
+    use ai_memory_core::{Sanitized, Sanitizer};
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
     use ai_memory_store::Store;
     use axum::body::to_bytes;
@@ -5597,6 +5576,152 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn open_sessions_filters_by_scope_and_agent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        let older = SessionId::new();
+        let latest = SessionId::new();
+        let other_agent = SessionId::new();
+        let other_scope = SessionId::new();
+        let ended = SessionId::new();
+        for (id, project_id, agent) in [
+            (older, target, AgentKind::Codex),
+            (other_agent, target, AgentKind::ClaudeCode),
+            (other_scope, other_project, AgentKind::Codex),
+            (ended, target, AgentKind::Codex),
+            (latest, target, AgentKind::Codex),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: agent,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                })
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(ended, None).await.unwrap();
+
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+        });
+
+        // Default: only the newest open session for the scope + agent.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], latest.to_string());
+        assert_eq!(sessions[0]["cwd"], "/tmp/target");
+
+        // `all=true`: every open codex session in the scope, ended and
+        // other-scope/other-agent sessions excluded.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex&all=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        let ids: Vec<&str> = sessions
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&latest.to_string().as_str()));
+        assert!(ids.contains(&older.to_string().as_str()));
+
+        // Unknown agent kind fails closed with a 400.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Unknown scope fails closed with a 404 — never auto-created.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=ghost&agent=codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            store
+                .reader
+                .find_project(ws, "ghost".to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "read route must not auto-create scopes"
+        );
     }
 
     fn read_page_test_router() -> (TempDir, Router) {
@@ -5931,17 +6056,20 @@ mod tests {
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "prompt".into(),
-                body: "focus changed and durable lesson".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
 
@@ -6058,17 +6186,20 @@ mod tests {
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "prompt".into(),
-                body: "focus changed and durable lesson".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
         let mut state =
@@ -6153,17 +6284,20 @@ mod tests {
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "prompt".into(),
-                body: "durable lesson".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
         let mut state =

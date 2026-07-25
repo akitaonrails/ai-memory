@@ -10,6 +10,7 @@
 
 pub mod actor;
 pub mod admin;
+pub mod auth;
 mod server;
 
 pub use actor::actor_from_headers;

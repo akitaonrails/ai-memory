@@ -23,6 +23,17 @@ pub struct ReorgSummary {
     pub pages_graveyarded: usize,
 }
 
+/// Result of atomically claiming a keyed hook observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngestObservationOutcome {
+    /// This delivery claimed the key and inserted the observation.
+    Inserted(ObservationId),
+    /// The observation exists, but downstream hook effects did not finish.
+    ResumePending,
+    /// The observation and downstream hook effects already completed.
+    AlreadyComplete,
+}
+
 /// Summary returned by [`purge_project`] and exposed via
 /// [`crate::writer::WriterHandle::purge_project`].
 #[derive(Debug, Default, Clone)]
@@ -861,6 +872,89 @@ pub fn insert_observation(
     conn: &mut Connection,
     obs: &NewObservation,
 ) -> StoreResult<ObservationId> {
+    insert_observation_row(conn, obs)
+}
+
+/// Ingest-keys older than this are swept opportunistically on every keyed
+/// insert. Keys only need to outlive the client spool (7 days + retry
+/// backoff); 30 days is a generous margin.
+const INGEST_KEY_TTL_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+
+/// Claim a project-scoped ingest key and append its observation atomically.
+///
+/// The key claim and the observation row commit in ONE transaction: either
+/// both land or neither does, so a crash cannot claim a key without its
+/// observation. A claimed-but-incomplete key tells the ingest path to resume
+/// downstream wiki/handoff effects without inserting another observation. A
+/// completed key means the whole event can be acknowledged and skipped.
+pub fn insert_observation_keyed(
+    conn: &mut Connection,
+    obs: &NewObservation,
+    ingest_key: &str,
+) -> StoreResult<IngestObservationOutcome> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+
+    // Sweep before looking up the current key so an expired key can be reused
+    // even when no unrelated keyed event arrived in the meantime.
+    tx.execute(
+        "DELETE FROM ingest_keys WHERE seen_at < ?1",
+        params![now - INGEST_KEY_TTL_MICROS],
+    )?;
+    let existing: Option<Option<i64>> = tx
+        .query_row(
+            "SELECT completed_at FROM ingest_keys \
+             WHERE project_id = ?1 AND key = ?2",
+            params![obs.project_id.as_bytes(), ingest_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(completed_at) = existing {
+        tx.commit()?;
+        return Ok(if completed_at.is_some() {
+            IngestObservationOutcome::AlreadyComplete
+        } else {
+            IngestObservationOutcome::ResumePending
+        });
+    }
+
+    tx.execute(
+        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) \
+         VALUES (?1, ?2, ?3, NULL)",
+        params![obs.project_id.as_bytes(), ingest_key, now],
+    )?;
+    let id = insert_observation_row(&tx, obs)?;
+    tx.commit()?;
+    Ok(IngestObservationOutcome::Inserted(id))
+}
+
+/// Mark a keyed hook event complete after its downstream effects finish.
+///
+/// This transition is idempotent so two resumed processors can converge on the
+/// same completed key without turning a successful delivery into an error.
+pub fn complete_observation_ingest(
+    conn: &mut Connection,
+    project_id: &ProjectId,
+    ingest_key: &str,
+) -> StoreResult<()> {
+    let completed_at = Timestamp::now().as_microsecond();
+    let matched = conn.execute(
+        "UPDATE ingest_keys \
+         SET completed_at = COALESCE(completed_at, ?1) \
+         WHERE project_id = ?2 AND key = ?3",
+        params![completed_at, project_id.as_bytes(), ingest_key],
+    )?;
+    if matched == 0 {
+        return Err(StoreError::InvalidState(
+            "cannot complete an ingest key that was not claimed".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The observation INSERT itself, shared by the plain and keyed paths
+/// (`&Connection` so it also runs inside a [`rusqlite::Transaction`]).
+fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResult<ObservationId> {
     let id = ObservationId::new();
     let now = Timestamp::now().as_microsecond();
     let kind = observation_kind_as_str(obs.kind);
@@ -2143,6 +2237,8 @@ mod tests {
 
     struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
 
+    static WARNING_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
     impl Write for CapturedLogWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
@@ -2163,6 +2259,7 @@ mod tests {
     }
 
     fn capture_warnings(run: impl FnOnce()) -> String {
+        let _guard = WARNING_CAPTURE_LOCK.lock().unwrap();
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::WARN)
@@ -2930,21 +3027,7 @@ mod tests {
     #[test]
     fn begin_session_accepts_all_supported_agent_kinds() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
-        for agent_kind in [
-            AgentKind::ClaudeCode,
-            AgentKind::Codex,
-            AgentKind::OpenCode,
-            AgentKind::Cursor,
-            AgentKind::GeminiCli,
-            AgentKind::ClaudeDesktop,
-            AgentKind::OpenClaw,
-            AgentKind::AntigravityCli,
-            AgentKind::Omp,
-            AgentKind::Pi,
-            AgentKind::Grok,
-            AgentKind::Devin,
-            AgentKind::Other,
-        ] {
+        for agent_kind in AgentKind::ALL {
             let sid = SessionId::new();
             begin_session(
                 &mut conn,

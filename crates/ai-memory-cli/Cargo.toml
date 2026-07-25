@@ -20,15 +20,16 @@ ai-memory-llm.workspace = true
 ai-memory-mcp.workspace = true
 ai-memory-store.workspace = true
 ai-memory-web.workspace = true
+ai-memory-workstream.workspace = true
 ai-memory-wiki.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
-subtle.workspace = true
-getrandom.workspace = true
+sha2.workspace = true
 base64.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 dirs.workspace = true
 figment.workspace = true
 flate2.workspace = true
@@ -47,6 +48,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 tempfile.workspace = true
 

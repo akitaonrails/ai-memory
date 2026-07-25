@@ -353,6 +353,12 @@ fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
         ObservationKind::SessionEnd => 95,
         ObservationKind::PreCompact => 90,
         ObservationKind::PostCompaction => 85,
+        // A non-empty Stop carries the opt-in assistant excerpt (#196) — a
+        // high-signal end-of-turn summary or late correction. Score it just
+        // below PreCompact (90), above PostCompaction (85), so it competes for a
+        // sampling slot without TYING any kind (ties resolve by position). An
+        // empty Stop (capture off, or gated out) keeps its low prior.
+        ObservationKind::Stop if !obs.body.trim().is_empty() => 88,
         ObservationKind::Stop => 55,
         ObservationKind::PostToolUse => 30,
         ObservationKind::Notification => 25,
@@ -642,5 +648,103 @@ mod tests {
         let projected = project_observations(&observations, &cfg);
         assert!(projected.text.chars().count() <= cfg.max_total_chars);
         assert!(projected.text.contains("observations omitted"));
+    }
+
+    /// Lock the base reviewer ordering for the opt-in Stop excerpt (#196):
+    /// a non-empty Stop scores below PreCompact (no tie — ties resolve by
+    /// position), above PostCompaction, well above an empty Stop, and below a
+    /// UserPrompt. Same idx/total/importance means only the kind term (and body
+    /// emptiness) differs; neutral text avoids high-signal and anchor bonuses.
+    #[test]
+    fn non_empty_stop_score_sits_below_precompact_above_postcompaction() {
+        let idx = 50;
+        let total = 100;
+        let imp = 5;
+        let mk = |kind, body| observation_score(&obs(idx, kind, "note", body, imp), idx, total);
+
+        let stop_full = mk(ObservationKind::Stop, "the assistant said hello");
+        let stop_empty = mk(ObservationKind::Stop, "");
+        let precompact = mk(ObservationKind::PreCompact, "the assistant said hello");
+        let postcompaction = mk(ObservationKind::PostCompaction, "the assistant said hello");
+        let user_prompt = mk(ObservationKind::UserPrompt, "the assistant said hello");
+
+        // Kind terms: Stop-nonempty 88, PreCompact 90, PostCompaction 85,
+        // Stop-empty 55, UserPrompt 100. Everything else cancels.
+        assert_eq!(stop_full, precompact - 2, "must sit just below PreCompact");
+        assert_eq!(
+            stop_full,
+            postcompaction + 3,
+            "must sit above PostCompaction"
+        );
+        assert_eq!(stop_full, stop_empty + 33, "non-empty must beat empty Stop");
+        assert!(
+            user_prompt > stop_full,
+            "the UserPrompt base priority must remain higher"
+        );
+    }
+
+    /// A late non-empty Stop (the opt-in assistant excerpt with a correction) is
+    /// selected out of a long routine session AND its text reaches the projection.
+    #[test]
+    fn non_empty_stop_late_correction_is_selected_and_rendered() {
+        let mut observations: Vec<_> = (0..60)
+            .map(|idx| obs(idx, ObservationKind::PostToolUse, "routine", "x", 1))
+            .collect();
+        // The assistant's final turn retracts an earlier claim — the exact signal
+        // PR3 wants the reviewer to see. Kept within the excerpt window.
+        observations[40] = obs(
+            40,
+            ObservationKind::Stop,
+            "stop",
+            "CORRECTION_SENTINEL: the earlier fix was wrong; use config.rs instead",
+            6,
+        );
+        let cfg = ObservationProjectionConfig::new(20_000, 12, 2_000);
+        let projected = project_observations(&observations, &cfg);
+
+        assert!(
+            projected.selected_indices.contains(&40),
+            "non-empty Stop must win a sampling slot: {:?}",
+            projected.selected_indices
+        );
+        assert!(
+            projected.text.contains("CORRECTION_SENTINEL"),
+            "the correction must reach the reviewer projection"
+        );
+    }
+
+    /// A sampled multi-turn session retains representative prompts and
+    /// non-empty Stops together. This is not a claim that every prompt fits in
+    /// every bounded projection.
+    #[test]
+    fn sampled_session_retains_prompts_and_non_empty_stops() {
+        let mut observations: Vec<_> = (0..60)
+            .map(|idx| obs(idx, ObservationKind::PostToolUse, "routine", "x", 1))
+            .collect();
+        let prompts = [10, 25, 45];
+        let stops = [15, 30, 50];
+        for &i in &prompts {
+            observations[i] = obs(i, ObservationKind::UserPrompt, "prompt", "a request", 5);
+        }
+        for &i in &stops {
+            observations[i] = obs(i, ObservationKind::Stop, "stop", "assistant summary", 5);
+        }
+        let cfg = ObservationProjectionConfig::new(20_000, 12, 2_000);
+        let projected = project_observations(&observations, &cfg);
+
+        for i in prompts {
+            assert!(
+                projected.selected_indices.contains(&i),
+                "expected UserPrompt at {i} to be selected: {:?}",
+                projected.selected_indices
+            );
+        }
+        for i in stops {
+            assert!(
+                projected.selected_indices.contains(&i),
+                "non-empty Stop at {i} was not selected: {:?}",
+                projected.selected_indices
+            );
+        }
     }
 }

@@ -256,13 +256,17 @@ fn emit_claude_code(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
         build_claude_code_payload(emit_root, &args.server_url, args.auth_token.as_deref());
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing Claude Code hook config")?;
-    println!("# Claude Code — merge into ~/.claude/settings.json");
+    let settings_path = crate::commands::install_hooks::claude_settings_path()?;
+    println!("# Claude Code — merge into {}", settings_path.display());
     println!("# Hook scripts (must be reachable from the host that runs Claude Code):");
     println!("#   {}", emit_root.display());
     println!("# AI-memory server: {}", args.server_url);
     if args.auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook's env block.");
-        println!("#       Treat ~/.claude/settings.json as sensitive (chmod 600).");
+        println!(
+            "#       Treat {} as sensitive (chmod 600).",
+            settings_path.display()
+        );
     }
     println!("# Tip: also run `ai-memory install-mcp --client claude-code --auth-token <…>`");
     println!("#      to register the MCP endpoint (separate from hooks).");
