@@ -17,6 +17,7 @@ TMP=$(mktemp -d)
 ORIG_HOME=${HOME:-}
 HOME="$TMP"
 export HOME
+unset AI_MEMORY_RUN_ID AI_MEMORY_MANAGED_WORKSTREAM_ID AI_MEMORY_MANAGED_WORKSTREAM_NAME
 trap 'rm -rf "$TMP"; HOME=$ORIG_HOME' EXIT
 
 assert_eq() {
@@ -53,6 +54,27 @@ assert_eq "walks up to find marker" "$TMP/a/.ai-memory.toml" \
     "$(ai_memory_find_marker "$TMP/a/b/c/d")"
 assert_eq "no marker returns empty" "" \
     "$(ai_memory_find_marker "$TMP/nonexistent/path")"
+
+# A checkout outside HOME may inherit a marker inside its own git tree, but
+# never one from an unrelated parent. A plain directory outside HOME checks
+# only its exact cwd.
+OUTSIDE_HOME="$TMP/account-home"
+mkdir -p "$OUTSIDE_HOME" "$TMP/outside/repo/src" "$TMP/outside/plain"
+printf 'workspace = "wrong"\n' >"$TMP/outside/.ai-memory.toml"
+mkdir -p "$TMP/outside/repo/.git"
+printf 'workspace = "right"\n' >"$TMP/outside/repo/.ai-memory.toml"
+HOME="$OUTSIDE_HOME"
+export HOME
+assert_eq "outside HOME finds marker within checkout" \
+    "$TMP/outside/repo/.ai-memory.toml" \
+    "$(ai_memory_find_marker "$TMP/outside/repo/src")"
+rm -f "$TMP/outside/repo/.ai-memory.toml"
+assert_eq "outside HOME stops at checkout root" "" \
+    "$(ai_memory_find_marker "$TMP/outside/repo/src")"
+assert_eq "outside HOME plain dir rejects parent marker" "" \
+    "$(ai_memory_find_marker "$TMP/outside/plain")"
+HOME="$TMP"
+export HOME
 
 # --- extract_cwd ------------------------------------------------------
 PAYLOAD='{"session_id":"x","cwd":"/home/u/foo","tool":"Read"}'

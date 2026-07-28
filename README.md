@@ -34,7 +34,7 @@
 | Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks; generated plugin enforces capture exclusions. |
-| Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
+| Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). No automatic true session-end hook, so run `ai-memory finalize-session --agent antigravity-cli` after the final turn when you need a summary, handoff, and opt-in SessionEnd consolidation. |
 | Grok Build CLI | Supported | MCP config (`install-mcp --client grok` → `$GROK_HOME/config.toml`, default `~/.grok/config.toml`) + lifecycle hooks (`install-hooks --agent grok` → `$GROK_HOME/hooks/ai-memory.json`, default `~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle). Capture works; no hook handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. `ai-memory run grok` adds managed workstream resume with the context packet delivered natively through `--rules`. Skills root: `.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`). |
 | Zero | Supported | `install-mcp --client zero` (native HTTP + bearer in `~/.config/zero/config.json`) + lifecycle hooks via `install-hooks --agent zero --apply` (exec-form native commands in `~/.config/zero/hooks.json`, JSON payload on stdin, no shell). Capture works incl. specialist (subagent) events; no handoff injection — Zero discards `sessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `UserPromptSubmit` stdout (Kimi Code discards `SessionStart` hook stdout); `ai-memory run kimi` adds managed workstream resume. |
@@ -105,9 +105,18 @@ priors are at the [bottom](#influences-and-prior-art).
   `global_scope_hits`, so preferences travel with you into new projects
   without naming a magic project or paying the all-projects
   `global=true` fan-out. Event capture never writes there.
+- **Authority-aware recall.** FTS5, graph-neighbor RRF, and optional vector RRF
+  still generate candidates by relevance. Before truncation, a bounded
+  adjustment favors maintained `_rules/`, `decisions/`, `procedures/`, and
+  `gotchas/` pages over closely matching episodic session evidence. Tier,
+  `pinned`, and explicit `canonical` / `active` / `source-of-truth` or
+  `superseded` / `historical` / `test-fixture` / `do-not-answer-from` tags
+  contribute without becoming absolute filters, so targeted history searches
+  still find session pages.
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
-  at session-end (or PreCompact; Codex can use `ai-memory finalize-session`
-  for a manual final close), not retrieved over raw logs.
+  at session-end (or PreCompact; clients without a true session-end event can
+  use `ai-memory finalize-session --agent <agent>` for a manual final close),
+  not retrieved over raw logs.
   Supersession chain + git-versioned markdown means you can
   time-travel with `ai-memory checkpoints`, `restore-page`, or raw `git log`.
 - **Built-in `/web` browser.** Read-only HTML UI for the wiki -
@@ -384,7 +393,9 @@ does not leave an older default-path ai-memory installation behind.
 If your agent often starts inside repository subdirectories or linked
 worktrees, add `--project-strategy repo-root` to `install-hooks` so captures
 collapse to the main git repo name; see [`docs/install.md`](docs/install.md)
-and [`docs/marker-file.md`](docs/marker-file.md) for details.
+and [`docs/marker-file.md`](docs/marker-file.md) for details. Later bare
+`--apply` refreshes, including `ai-memory upgrade`, preserve that choice;
+pass `--project-strategy basename` explicitly to remove it.
 
 The Docker wrapper also bridges thin-client commands such as
 `ai-memory status` and `ai-memory bootstrap` back to the host's
@@ -654,6 +665,15 @@ when you want LLM consolidation (on PreCompact, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
 Session end always writes a rule-based summary page + handoff either way.
+When the session-end opt-in is enabled, provider work is durably queued after
+those deterministic writes and handled by one bounded server worker, so hook
+drain latency does not cancel it. Failed jobs retry with backoff and survive a
+server restart. A resumed native session is ended again only after its
+observation generation advances; the persisted generation watermark makes
+duplicate SessionEnd delivery and system clock skew converge without repeated
+provider work. The end watermark and automatic handoff commit atomically, and
+an interrupted keyed replay finishes the wiki commit, queue insert, and key
+completion without duplicating that handoff.
 
 Recommended defaults:
 
@@ -706,6 +726,9 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when
 you want vector reranking in addition to FTS5 + graph-neighbor retrieval.
+Both the FTS-only and hybrid paths apply the same bounded page-authority
+adjustment after candidate generation; embeddings improve relevance recall but
+do not decide which source is canonical.
 
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud examples, and
@@ -728,7 +751,8 @@ One Rust binary runs an MCP/HTTP server and owns one data directory:
 Hooks POST observations to the server. The server serializes writes
 through one SQLite writer, compiles session observations into markdown
 pages, and serves retrieval through FTS5, graph-neighbor RRF, optional
-vector RRF, and bounded raw-observation fallback for non-global searches.
+vector RRF, bounded source-authority adjustment, and bounded raw-observation
+fallback for non-global searches.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the data-flow
 diagram, crate breakdown, schema notes, and invariants.

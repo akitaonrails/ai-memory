@@ -300,25 +300,27 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/overview?limit=10
 
 Bundles what a frontend usually needs on its home view in one round-trip.
 
-**Workspace overview** returns `briefing` + `memory_health` aggregated
-across all projects in the workspace:
+**Workspace overview** returns the latest open handoff across the workspace,
+plus `briefing` and `health` aggregated across all of its projects:
 
 ```json
 {
-  "briefing":      { "counts": { … }, "activity_7d": { … }, "rules": [ … ], "recent_pages": [ … ] },
-  "memory_health": { "stale_count": 4, "duplicate_count": 1, "orphan_count": 12,
-                     "stale_pages": [HealthPage, …], "duplicate_pages": [ … ], "orphan_pages": [ … ] }
+  "handoff":  { "agent": "claude-code", "at": "…", "project": "ai-memory", "summary": "…", "open_questions": [ … ], "next_steps": [ … ] },
+  "briefing": { "counts": { … }, "activity_7d": { … }, "rules": [ … ], "recent_pages": [ … ] },
+  "health":   { "stale": 4, "duplicates": 1, "contradictions": 0, "orphans": 12,
+                "audited_at": null, "stale_pages": [HealthPage, …],
+                "duplicate_pages": [ … ], "orphan_pages": [ … ] }
 }
 ```
 
-**Project overview** additionally includes the latest open handoff (or
-`null`):
+**Project overview** uses the same response shape, scoped to that project. In
+either response, `handoff` is `null` when no open handoff matches the scope:
 
 ```json
 {
-  "handoff":       { "id": "01928d…", "from_agent": "claude-code", "summary": "…", "open_questions": [ … ], "next_steps": [ … ] },
-  "briefing":      { … },
-  "memory_health": { … }
+  "handoff":  { "agent": "claude-code", "at": "…", "project": "ai-memory", "summary": "…", "open_questions": [ … ], "next_steps": [ … ] },
+  "briefing": { … },
+  "health":   { … }
 }
 ```
 
@@ -334,7 +336,7 @@ across all projects in the workspace:
 }
 ```
 
-> Note: `last_open_handoff` is **not** consumed by the read API — the
+> Note: `handoff` is **not** consumed by the read API — the
 > handoff stays "open" and can still be accepted by the next agent.
 
 ### 4.9 Cross-project graph

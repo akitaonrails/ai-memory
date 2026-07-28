@@ -82,6 +82,26 @@ pub enum StoreError {
     #[error("workspace still has {0} project(s); pass force to delete anyway")]
     WorkspaceNotEmpty(u64),
 
+    /// A project purge was rejected because one of its managed workstreams
+    /// still holds a live run lease. `workstreams` is `ON DELETE CASCADE` from
+    /// `projects`, and `managed_runs` cascades from `workstreams`, so the
+    /// purge would delete the lease row out from under a running agent — whose
+    /// heartbeat then fails with `409 managed run lease is not active` for the
+    /// rest of the session and whose transcript never reaches the ledger.
+    /// Carries the offending workstream names so the operator can find the
+    /// session before retrying with force.
+    #[error(
+        "project has {count} active managed run(s) in workstream(s) {workstreams}; \
+         finish or cancel them first, or pass force to purge anyway (the running \
+         agent will stop being able to save its history)"
+    )]
+    ManagedRunActive {
+        /// How many `managed_runs` rows are still `state = 'active'`.
+        count: u64,
+        /// Comma-separated workstream names holding those runs.
+        workstreams: String,
+    },
+
     /// A workspace rename was rejected because the destination name is already
     /// in use by another workspace (`workspaces.name` is UNIQUE).
     #[error("workspace name '{0}' is already taken")]

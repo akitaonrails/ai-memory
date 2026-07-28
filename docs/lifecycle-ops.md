@@ -8,10 +8,10 @@ on a homelab box where mistakes are harder to undo.
 
 | Command | Safe with server **running**? | Wipes data? | Reversible? | Notes |
 |---|---|---|---|---|
-| `purge-project --confirm` | ✅ yes | the one project's data | no | Atomic `rm -rf <project_root>` on the namespaced disk path; sibling projects untouched. |
+| `purge-project --confirm` | ✅ yes | the one project's data | no | Deletes the UUID-namespaced wiki root and raw workstream segments; sibling projects remain untouched. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
-| `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory, reports filesystem partial failures, and dispatches mirror notification after durable work. |
+| `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `backup --output-path` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
@@ -77,20 +77,40 @@ What happens, in order:
 
 1. Server looks up `(workspace_id, project_id)` by name. Returns 404
    if either is missing.
-2. Counts rows that will cascade (`pages`, `sessions`,
-   `observations`, `handoffs`, `page_embeddings`).
-3. Single `DELETE FROM projects WHERE id = ?` - the V01 + V05
+2. Refuses with 409 when a managed workstream under the project still
+   holds a **live** run lease (`managed_runs.state = 'active'` AND
+   `lease_expires_at` in the future). `workstreams` cascades out of
+   `projects` and `managed_runs` cascades out of `workstreams`, so
+   purging would delete a running agent's lease row: its heartbeat
+   would then fail with `409 managed run lease is not active` for the
+   rest of the session and the transcript would never reach the ledger.
+   A lapsed lease (crashed wrapper) does **not** block the purge.
+   `--force` purges anyway.
+3. Counts rows that will cascade (`pages`, `sessions`,
+   `observations`, `handoffs`, `page_embeddings`, plus `workstreams`
+   and `managed_runs`).
+4. Single `DELETE FROM projects WHERE id = ?` - the V01 + V05
    `ON DELETE CASCADE` foreign keys propagate to every dependent
    table in one transaction.
-4. `std::fs::remove_dir_all(<wiki_root>/<workspace_id>/<project_id>)`
-   wipes the on-disk project root.
-5. Returns a summary: `{label, pages_deleted, sessions_deleted, …,
-   files_deleted: [<project_root>], files_failed: [...]}`.
+5. Best-effort filesystem cleanup removes both the UUID-namespaced wiki root
+   and every `<data_dir>/raw/workstreams/<workstream_id>/` segment directory.
+6. Returns a summary: `{label, pages_deleted, sessions_deleted, …,
+   workstreams_deleted, managed_runs_deleted, workstream_ids,
+   files_deleted: [<project_root>, <raw_workstream_dir>, ...],
+   files_failed: [...]}`.
+
+`workstream_ids` remains in the report for auditability. Each corresponding
+raw segment directory is removed on the server and appears in
+`files_deleted`; a failed removal appears in `files_failed` alongside wiki
+cleanup failures.
 
 Failure modes:
 
 - **Workspace or project name not found** → 404, no mutation.
 - **Confirmation flag omitted** → 400, no mutation.
+- **Live managed run, no `--force`** → 409 naming the workstreams, no
+   mutation. Finish or cancel the session, or re-run with `--force`
+   (the running agent then stops being able to save its history).
 - **`remove_dir_all` partial failure** (e.g. permissions) → DB
    rows are already gone but `files_failed` is populated. Re-run
    the command with the same args is idempotent; the second call
@@ -159,17 +179,20 @@ Failure modes:
 
 ### `/admin/delete-workspace`
 
-Deletes a workspace row and all child projects/pages/sessions through the
-`workspace_id` cascade. The route is guarded by `force: true` for non-empty
-workspaces and follows the destructive-operation ordering used by project
-purges:
+Deletes a workspace row and all child projects/pages/sessions/managed
+workstreams through the `workspace_id` cascade. The route is guarded by
+`force: true` for non-empty workspaces and follows the destructive-operation
+ordering used by project purges:
 
 1. Look up the workspace without creating missing scopes.
 2. Run blocking `op=purge_workspace` admission. A reject-policy webhook aborts
    before DB rows or files are removed.
 3. Take a pre-delete checkpoint if the wiki tree is dirty.
 4. Delete the workspace in one writer-actor transaction.
-5. Remove `<wiki_root>/<workspace_id>` from disk.
+5. Remove `<wiki_root>/<workspace_id>` and every affected
+   `<data_dir>/raw/workstreams/<workstream_id>` directory from disk. The
+   response reports `workstreams_deleted`, `managed_runs_deleted`, and the
+   cleaned `workstream_ids` alongside the filesystem results.
 6. Dispatch non-blocking `purge_workspace` mirror notifications after durable
    work. If the DB delete committed but disk removal failed, the response
    includes `files_failed` and webhook `ctx.partial_failure: true`.
@@ -214,9 +237,11 @@ a low-level re-stamp:
    wiki root).
 6. Re-stamp `workspace_id` across every domain table for the project in
    **one transaction**, keeping the same `project_id`
-   (`projects`, `pages`, `sessions`, `observations`, `handoffs`,
-   `audit_log`). `page_embeddings` and `links` are keyed by `page_id`, so
-   they follow with no re-stamp.
+   (`projects`, `pages`, `sessions`, `observations`, `handoffs`, `audit_log`,
+   auto-improvement state, SessionEnd consolidation jobs, and managed
+   `workstreams`). Native workstream sessions, runs, and events remain attached
+   through `workstream_id`; `page_embeddings` and `links` remain attached
+   through `page_id`, so none of those rows need a direct re-stamp.
 
 Ordering is **rename-FIRST, SQL-commit-LAST**, so the **DB is never ahead of
 disk**: a rename failure touches nothing; a crash between the two steps leaves
@@ -249,10 +274,18 @@ deploy — the admission/git-mirror webhooks all fire), source embeddings
 are carried over verbatim, and only then is the source purged
 (`merged_into_existing: true`, `source_purged: true`).
 
+`--force` overrides only the hook router's active-project guard. It never
+deletes a live managed-workstream lease during this destructive path; finish
+or cancel that run before retrying. A true move keeps the same project and
+lease ids, so it does not need this additional guard.
+
 Copy-before-purge means any copy failure aborts **before** the purge,
 leaving the source intact. An unreadable source file is skipped and also
 blocks the purge (`source_purged: false`) so a fixed re-run is safe
-(re-running is idempotent — copied pages just supersede).
+(re-running is idempotent — copied pages just supersede). A **live managed
+run** under the source blocks the purge leg the same way: the move returns
+409 saying how many pages were already copied, and the source stays intact
+until the session ends and the move is re-run.
 
 **Same-path conflicts (`on_conflict`).** When a source page's path already
 exists in the destination with a different body, frontmatter, title, tier, or

@@ -46,10 +46,11 @@ pub async fn run(config: &Config, args: PendingWritesArgs) -> Result<()> {
 }
 
 async fn list(config: &Config, ep: &ServerEndpoint, args: PendingWritesListArgs) -> Result<()> {
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let limit = args.limit.to_string();
     let mut query = vec![
-        ("workspace", args.workspace.as_str()),
+        ("workspace", workspace.as_str()),
         ("project", project.as_str()),
         ("limit", limit.as_str()),
     ];
@@ -70,12 +71,13 @@ async fn list(config: &Config, ep: &ServerEndpoint, args: PendingWritesListArgs)
 }
 
 async fn show(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) -> Result<()> {
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let detail: ProposalDetail = get_json(
         ep,
         &format!("/admin/pending-writes/{}", args.id),
         &[
-            ("workspace", args.workspace.as_str()),
+            ("workspace", workspace.as_str()),
             ("project", project.as_str()),
         ],
     )
@@ -96,12 +98,13 @@ async fn show(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) ->
 }
 
 async fn diff(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) -> Result<()> {
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let resp: DiffResponse = get_json(
         ep,
         &format!("/admin/pending-writes/{}/diff", args.id),
         &[
-            ("workspace", args.workspace.as_str()),
+            ("workspace", workspace.as_str()),
             ("project", project.as_str()),
         ],
     )
@@ -115,12 +118,13 @@ async fn diff(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) ->
 }
 
 async fn approve(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) -> Result<()> {
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let resp: serde_json::Value = post_json_with_query(
         ep,
         &format!("/admin/pending-writes/{}/approve", args.id),
         &[
-            ("workspace", args.workspace.as_str()),
+            ("workspace", workspace.as_str()),
             ("project", project.as_str()),
         ],
         &serde_json::json!({}),
@@ -135,12 +139,13 @@ async fn approve(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs)
 }
 
 async fn reject(config: &Config, ep: &ServerEndpoint, args: PendingWriteRejectArgs) -> Result<()> {
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let resp: serde_json::Value = post_json_with_query(
         ep,
         &format!("/admin/pending-writes/{}/reject", args.id),
         &[
-            ("workspace", args.workspace.as_str()),
+            ("workspace", workspace.as_str()),
             ("project", project.as_str()),
         ],
         &serde_json::json!({ "reason": args.reason }),

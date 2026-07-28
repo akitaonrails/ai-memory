@@ -1,4 +1,4 @@
-//! `ai-memory finalize-session` — manually synthesize SessionEnd for Codex.
+//! `ai-memory finalize-session` — manually synthesize SessionEnd for an agent.
 
 use ai_memory_core::AgentKind;
 use anyhow::{Context, Result, bail};
@@ -53,12 +53,12 @@ struct FinalizeSessionReport {
 /// sessions or rejects a synthetic `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     let agent = args.agent.kind();
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let sessions =
-        fetch_open_sessions(&endpoint, &args.workspace, &project, agent, args.all).await?;
+    let sessions = fetch_open_sessions(&endpoint, &workspace, &project, agent, args.all).await?;
     if sessions.is_empty() {
-        return print_report(args, project, agent, Vec::new());
+        return print_report(args, workspace, project, agent, Vec::new());
     }
 
     let client = reqwest::Client::new();
@@ -70,7 +70,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
             &endpoint,
             session,
             fallback_cwd.as_str(),
-            &args.workspace,
+            &workspace,
             &project,
             agent,
         )
@@ -78,7 +78,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
         finalized.push(session.session_id.clone());
     }
 
-    print_report(args, project, agent, finalized)
+    print_report(args, workspace, project, agent, finalized)
 }
 
 /// List open sessions for the scope + agent via the server. An unknown
@@ -119,12 +119,13 @@ async fn fetch_open_sessions(
 
 fn print_report(
     args: FinalizeSessionArgs,
+    workspace: String,
     project: String,
     agent: AgentKind,
     finalized: Vec<String>,
 ) -> Result<()> {
     let report = FinalizeSessionReport {
-        workspace: args.workspace,
+        workspace,
         project,
         agent: agent.as_str().to_string(),
         finalized,
@@ -232,7 +233,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn selects_latest_scoped_codex_session_only_by_default() {
+    async fn selects_latest_scoped_session_for_requested_agent_by_default() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let ws = store
@@ -255,10 +256,10 @@ mod tests {
         let other_agent = SessionId::new();
         let other_scope = SessionId::new();
         for (id, project_id, agent) in [
-            (older, target, AgentKind::Codex),
-            (other_agent, target, AgentKind::ClaudeCode),
-            (other_scope, other_project, AgentKind::Codex),
-            (latest, target, AgentKind::Codex),
+            (older, target, AgentKind::AntigravityCli),
+            (other_agent, target, AgentKind::Codex),
+            (other_scope, other_project, AgentKind::AntigravityCli),
+            (latest, target, AgentKind::AntigravityCli),
         ] {
             store
                 .writer
@@ -275,11 +276,36 @@ mod tests {
 
         let selected = store
             .reader
-            .open_sessions_for_scope_agent(ws, target, AgentKind::Codex, Some(1))
+            .open_sessions_for_scope_agent(ws, target, AgentKind::AntigravityCli, Some(1))
             .await
             .unwrap();
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].session_id, latest);
+    }
+
+    #[test]
+    fn synthetic_end_url_uses_requested_antigravity_agent() {
+        let endpoint =
+            ServerEndpoint::from_pair(Some("http://127.0.0.1:49374/base".to_string()), None);
+        let url = session_end_hook_url(
+            &endpoint,
+            "/tmp/project",
+            "default",
+            "project",
+            AgentKind::AntigravityCli,
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(parsed.path(), "/base/hook");
+        assert_eq!(query.get("event").map(String::as_str), Some("session-end"));
+        assert_eq!(
+            query.get("agent").map(String::as_str),
+            Some("antigravity-cli")
+        );
+        assert_eq!(query.get("workspace").map(String::as_str), Some("default"));
+        assert_eq!(query.get("project").map(String::as_str), Some("project"));
     }
 }

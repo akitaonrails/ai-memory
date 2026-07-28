@@ -44,6 +44,40 @@ $HomePath = (Resolve-Path -LiteralPath $HOME).Path
 $WorkPath = (Get-Location).Path
 $HookHostRoot = ($HomePath -replace '\\', '/') + "/.local/share/ai-memory/hooks"
 
+$HomeRoot = $HomePath.TrimEnd([char[]]@('/', '\\'))
+$HomePrefix = $HomeRoot + [IO.Path]::DirectorySeparatorChar
+$InsideHome = $WorkPath.Equals($HomeRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    $WorkPath.StartsWith($HomePrefix, [StringComparison]::OrdinalIgnoreCase)
+$ScopeMountArgs = @()
+if ($InsideHome) {
+    $ScopeSuffix = if ($WorkPath.Length -eq $HomeRoot.Length) {
+        ""
+    } else {
+        $WorkPath.Substring($HomeRoot.Length) -replace '\\', '/'
+    }
+    $ScopeCwd = "/host-home$ScopeSuffix"
+} else {
+    $ScopeRoot = $WorkPath
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        $DetectedScopeRoot = (& git -C $WorkPath rev-parse --show-toplevel 2>$null)
+        if (-not [string]::IsNullOrWhiteSpace($DetectedScopeRoot)) {
+            $ScopeRoot = [IO.Path]::GetFullPath($DetectedScopeRoot.Trim())
+        }
+    }
+    $ScopeRoot = $ScopeRoot.TrimEnd([char[]]@('/', '\\'))
+    $ScopePrefix = $ScopeRoot + [IO.Path]::DirectorySeparatorChar
+    if ($WorkPath.Equals($ScopeRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $ScopeSuffix = ""
+    } elseif ($WorkPath.StartsWith($ScopePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        $ScopeSuffix = $WorkPath.Substring($ScopeRoot.Length) -replace '\\', '/'
+    } else {
+        $ScopeRoot = $WorkPath
+        $ScopeSuffix = ""
+    }
+    $ScopeMountArgs = @("-v", "${ScopeRoot}:/scope:ro")
+    $ScopeCwd = "/scope$ScopeSuffix"
+}
+
 $DockerArgs = @("run", "--rm", "-i")
 # Keep stdin attached in every mode. `AI_MEMORY_NO_TTY` suppresses only the
 # pseudo-terminal allocation.
@@ -57,10 +91,12 @@ $DockerArgs += @(
     "-w", "/work",
     "-e", "HOME=/host-home",
     "-e", "AI_MEMORY_HOST_CWD=$WorkPath",
+    "-e", "AI_MEMORY_SCOPE_CWD=$ScopeCwd",
     "-e", "AI_MEMORY_DATA_DIR=/data",
     "-e", "AI_MEMORY_HOOK_PLATFORM=windows",
     "-e", "AI_MEMORY_HOOKS_HOST_ROOT=$HookHostRoot"
 )
+$DockerArgs += $ScopeMountArgs
 
 if ($env:AI_MEMORY_DATA_DIR -and (Test-Path -LiteralPath $env:AI_MEMORY_DATA_DIR -PathType Container)) {
     $DataPath = (Resolve-Path -LiteralPath $env:AI_MEMORY_DATA_DIR).Path

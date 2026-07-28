@@ -29,7 +29,11 @@ struct MoveProjectRequest {
 /// Returns an error when `--confirm` is absent, the server is unreachable,
 /// or the server returns a non-2xx response.
 pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (from_workspace, project) = super::resolve_scope(
+        config,
+        args.from_workspace.as_deref(),
+        args.project.as_deref(),
+    )?;
 
     if !args.confirm {
         bail!(
@@ -41,10 +45,10 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
              Re-run with --confirm to proceed:\n\n  \
              ai-memory move-project --from-workspace {} --project {} \
              --to-workspace {} --confirm",
-            args.from_workspace,
+            from_workspace,
             project,
             args.to_workspace,
-            args.from_workspace,
+            from_workspace,
             project,
             args.to_workspace,
         );
@@ -55,7 +59,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         &endpoint,
         "/admin/move-project",
         &MoveProjectRequest {
-            from_workspace: args.from_workspace.clone(),
+            from_workspace: from_workspace.clone(),
             project: project.clone(),
             to_workspace: args.to_workspace.clone(),
             confirm: true,
@@ -75,7 +79,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         println!(
             "Moved {}/{} → {}/{}: {pages} pages re-stamped (true move — \
              sessions, observations and history preserved).",
-            args.from_workspace, project, args.to_workspace, project,
+            from_workspace, project, args.to_workspace, project,
         );
     } else {
         // copy-purge (merge into an existing same-named project).
@@ -89,7 +93,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         println!(
             "Moved {}/{} → {}/{}: {pages} pages copied (merged into existing \
              project){tail}.",
-            args.from_workspace, project, args.to_workspace, project,
+            from_workspace, project, args.to_workspace, project,
         );
         if skipped_count > 0 {
             println!(

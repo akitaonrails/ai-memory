@@ -23,6 +23,7 @@ mod migrations;
 mod ops;
 mod reader;
 mod scope;
+mod session_consolidation;
 pub mod users;
 mod workstream;
 mod writer;
@@ -62,6 +63,7 @@ pub use scope::{
     create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,
     lookup_global_scope, resolve_many_existing_scopes,
 };
+pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
@@ -2117,6 +2119,123 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn search_ranks_page_authority_without_hiding_session_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        let mut decision = sample_page(
+            ws,
+            proj,
+            "decisions/embedding-policy.md",
+            "The current decision keeps LLM embeddings optional and uses them only for reranking.",
+        );
+        decision.title = "LLM embedding policy".into();
+        decision.pinned = true;
+        decision.frontmatter_json =
+            serde_json::json!({"tags": ["decision", "canonical", "active"]});
+        store.writer.upsert_page(decision).await.unwrap();
+
+        let mut session = sample_page(
+            ws,
+            proj,
+            "sessions/2026-07-27.md",
+            "What is the current decision about LLM embeddings? This session preserves historical evidence and chronicleonlytoken.",
+        );
+        session.title = "What is the current decision about LLM embeddings?".into();
+        session.tier = Tier::Episodic;
+        store.writer.upsert_page(session).await.unwrap();
+
+        for idx in 0..5 {
+            let mut noisy_session = sample_page(
+                ws,
+                proj,
+                &format!("sessions/noisy-{idx}.md"),
+                "What is the current decision about LLM embeddings? This session repeats the question as historical evidence.",
+            );
+            noisy_session.title = "What is the current decision about LLM embeddings?".into();
+            noisy_session.tier = Tier::Episodic;
+            store.writer.upsert_page(noisy_session).await.unwrap();
+        }
+
+        let mut rejected = sample_page(
+            ws,
+            proj,
+            "sessions/rejected-fixture.md",
+            "What is the current decision about LLM embeddings? This obsolete answer repeats LLM embeddings current decision.",
+        );
+        rejected.title = "Current decision about LLM embeddings".into();
+        rejected.tier = Tier::Episodic;
+        rejected.frontmatter_json =
+            serde_json::json!({"tags": ["superseded", "do_not_answer_from"]});
+        store.writer.upsert_page(rejected).await.unwrap();
+
+        let query = "what is the current decision about LLM embeddings";
+        let scoped = store
+            .reader
+            .search_pages_for_project(ws, proj, query.into(), 10)
+            .await
+            .unwrap();
+        let scoped_paths: Vec<&str> = scoped.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(
+            scoped_paths[0], "decisions/embedding-policy.md",
+            "authority-ranked hits: {scoped:?}"
+        );
+        assert_eq!(
+            scoped_paths.last().copied(),
+            Some("sessions/rejected-fixture.md")
+        );
+        assert!(scoped.windows(2).all(|pair| pair[0].rank <= pair[1].rank));
+
+        let top_one = store
+            .reader
+            .search_pages_for_project(ws, proj, query.into(), 1)
+            .await
+            .unwrap();
+        assert_eq!(top_one[0].path.as_str(), "decisions/embedding-policy.md");
+
+        let global = store
+            .reader
+            .search_pages_with_meta(query.into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");
+
+        let hybrid = store
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                query.into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hybrid[0].path.as_str(), "decisions/embedding-policy.md");
+
+        let session_evidence = store
+            .reader
+            .search_pages_for_project(ws, proj, "chronicleonlytoken".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(session_evidence.len(), 1);
+        assert_eq!(session_evidence[0].path.as_str(), "sessions/2026-07-27.md");
+    }
+
     /// Regression: bare `word:` in agent queries is FTS5 column syntax, not
     /// a literal token (`no such column: pick` / `memory`).
     #[tokio::test]
@@ -2579,6 +2698,236 @@ mod tests {
                 .await
                 .unwrap(),
             Some(first)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_and_automatic_handoff_commit_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        let handoff = |project_id| NewHandoff {
+            workspace_id: ws,
+            project_id,
+            from_session_id: Some(session_id),
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: None,
+            summary: "continue".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+        };
+
+        assert!(
+            store
+                .writer
+                .end_session_with_handoff(session_id, None, handoff(other))
+                .await
+                .is_err(),
+            "a mismatched handoff must reject the whole end transition"
+        );
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap(),
+            SessionEndDisposition::Open,
+            "failed handoff insertion must leave the session open"
+        );
+
+        store
+            .writer
+            .end_session_with_handoff(session_id, None, handoff(proj))
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let ended: Option<i64> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let handoffs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM handoffs WHERE from_session_id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_some());
+        assert_eq!(handoffs, 1);
+    }
+
+    #[tokio::test]
+    async fn session_end_disposition_uses_observation_generation_not_wall_clock() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropInvalid,
+            "a missing session must not enter already-ended recovery"
+        );
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        let other_proj = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, other_proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropInvalid
+        );
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropInvalid
+        );
+        let first_observation = store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "first".into(),
+                    body: "initial work".into(),
+                    importance: 8,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let ended_at: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE observations SET created_at = ?1 WHERE id = ?2",
+            params![ended_at + 1_000_000, first_observation.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::AlreadyEnded,
+            "a covered observation must stay covered even if its timestamp is in the future"
+        );
+
+        let resumed_observation = store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: "resumed".into(),
+                    body: "new work".into(),
+                    importance: 7,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        conn.execute(
+            "UPDATE observations SET created_at = 1 WHERE id = ?1",
+            params![resumed_observation.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::ReEndWithNewWork,
+            "a new observation must trigger re-end even if its timestamp predates ended_at"
+        );
+
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::AlreadyEnded,
+            "stamping the new generation must make the re-end converge"
         );
     }
 
@@ -3054,7 +3403,11 @@ mod tests {
                 },
             )
             .unwrap();
-            super::ops::end_session(&mut conn, &session_id, Some(&page_id)).unwrap();
+            conn.execute(
+                "UPDATE sessions SET ended_at = 1, summary_page_id = ?1 WHERE id = ?2",
+                params![page_id.as_bytes(), session_id.as_bytes()],
+            )
+            .unwrap();
         }
 
         let store = Store::open(tmp.path()).unwrap();

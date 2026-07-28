@@ -23,7 +23,7 @@ use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
 
 use crate::cli::{RunArgs, RunHarnessChoice};
-use crate::commands::{path_util, resolve_project_name};
+use crate::commands::{path_util, resolve_scope};
 use crate::config::Config;
 use crate::http_client::{
     ServerEndpoint, ServerResponseError, get_json, post_empty, post_json, post_json_no_content,
@@ -87,11 +87,16 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     };
     let executable = args.executable.map(PathBuf::into_os_string);
     ensure_executable_available(provisional_harness, executable.as_deref())?;
-    let project = resolve_project_name(config, args.project.as_deref())?;
+    // Resolve BOTH halves here. `--workspace` used to default to a literal
+    // `default`, so a checkout whose marker declared another workspace put its
+    // managed workstream in one scope while its hook-captured sessions went to
+    // another — the same repository split in two.
+    let (workspace, project) =
+        resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let prepare = PrepareManagedRunRequest {
-        workspace: args.workspace,
+        workspace,
         project,
         cwd: repository.cwd.to_string_lossy().into_owned(),
         repo_fingerprint: repository.repo_fingerprint,

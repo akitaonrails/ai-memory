@@ -489,6 +489,32 @@ else
   DATA_ARGS+=(-v "${DATA_VOLUME}:/data")
 fi
 
+# `AI_MEMORY_HOST_CWD` keeps project identity stable inside the helper, while
+# `AI_MEMORY_SCOPE_CWD` names the same directory inside a bounded read-only
+# mount used for marker discovery. $HOME is already mounted below. For
+# checkouts outside it, expose no more than the nearest git root (or the exact
+# cwd outside git), matching the marker walk's trust bound.
+SCOPE_ARGS=()
+case "${PWD}" in
+  "${HOME}"|"${HOME}"/*) ;;
+  *)
+    SCOPE_ROOT="${PWD}"
+    if command -v git >/dev/null 2>&1; then
+      DETECTED_SCOPE_ROOT=$(git -C "${PWD}" rev-parse --show-toplevel 2>/dev/null || true)
+      [ -n "${DETECTED_SCOPE_ROOT}" ] && SCOPE_ROOT="${DETECTED_SCOPE_ROOT}"
+    fi
+    case "${PWD}" in
+      "${SCOPE_ROOT}") SCOPE_REL="" ;;
+      "${SCOPE_ROOT}"/*) SCOPE_REL="${PWD#"${SCOPE_ROOT}"}" ;;
+      *) SCOPE_ROOT="${PWD}"; SCOPE_REL="" ;;
+    esac
+    SCOPE_ARGS+=(
+      -v "${SCOPE_ROOT}:/scope:ro"
+      -e "AI_MEMORY_SCOPE_CWD=/scope${SCOPE_REL}"
+    )
+    ;;
+esac
+
 # Mount $HOME at the same path inside the container so:
 #   - dirs::home_dir() resolves identically (Claude's default paths and any
 #     CLAUDE_CONFIG_DIR beneath $HOME work without extra path flags)
@@ -522,6 +548,7 @@ HELPER_ARGS+=(
   -e HOME="${HOME}"
   -e AI_MEMORY_HOST_CWD="${PWD}"
 )
+HELPER_ARGS+=(${SCOPE_ARGS[@]+"${SCOPE_ARGS[@]}"})
 HELPER_ARGS+=(${USER_ARGS[@]+"${USER_ARGS[@]}"})
 HELPER_ARGS+=("${DATA_ARGS[@]}")
 HELPER_ARGS+=(${ENV_ARGS[@]+"${ENV_ARGS[@]}"})

@@ -91,9 +91,10 @@ pub struct Config {
     pub llm_compat_strict: bool,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
-    /// configured. Off by default — SessionEnd stays cheap and
-    /// fire-and-forget; the LLM checkpoint otherwise happens on PreCompact
-    /// and via manual `memory_consolidate`. Set with
+    /// configured. Off by default. Provider work is durably queued after the
+    /// deterministic session page and handoff, then handled outside the hook
+    /// response by one bounded retrying worker. The LLM checkpoint otherwise
+    /// happens on PreCompact and via manual `memory_consolidate`. Set with
     /// `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true`.
     pub consolidate_on_session_end: bool,
     /// Server-side opt-in for assistant/Stop capture (#196). When true, the
@@ -204,6 +205,9 @@ pub struct RuntimeEnv {
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
+    scope_cwd: Option<String>,
+    ignore_marker: bool,
+    project_strategy: Option<String>,
     claude_code_session_id: Option<String>,
     anthropic_api_key: Option<SecretString>,
     anthropic_oauth_token: Option<SecretString>,
@@ -227,6 +231,15 @@ impl RuntimeEnv {
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
+            scope_cwd: env_string("AI_MEMORY_SCOPE_CWD"),
+            // One-invocation escape hatch: run a command against the fallback
+            // scope without editing (or leaving) the marker's tree.
+            ignore_marker: env_string("AI_MEMORY_IGNORE_MARKER")
+                .is_some_and(|value| crate::marker::is_truthy(&value)),
+            // Install-wide project strategy, matching what `install-hooks
+            // --project-strategy` bakes into the generated hook commands.
+            // Consulted only when a marker does not pin one.
+            project_strategy: env_string("AI_MEMORY_PROJECT_STRATEGY"),
             claude_code_session_id: env_string("CLAUDE_CODE_SESSION_ID"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
             // CLAUDE_CODE_OAUTH_TOKEN is what `claude setup-token` writes;
@@ -254,6 +267,31 @@ impl RuntimeEnv {
     #[must_use]
     pub fn host_cwd(&self) -> Option<&str> {
         self.host_cwd.as_deref()
+    }
+
+    /// Container-visible cwd used only for marker discovery.
+    #[must_use]
+    pub fn scope_cwd(&self) -> Option<&str> {
+        self.scope_cwd.as_deref()
+    }
+
+    /// Operator home captured by the single config-read path.
+    #[must_use]
+    pub fn home_dir(&self) -> Option<&str> {
+        self.home_dir.as_deref()
+    }
+
+    /// Whether `AI_MEMORY_IGNORE_MARKER` asked this invocation to resolve its
+    /// scope as if no `.ai-memory.toml` existed.
+    #[must_use]
+    pub fn ignore_marker(&self) -> bool {
+        self.ignore_marker
+    }
+
+    /// Install-wide `--project-strategy` default baked into the environment.
+    #[must_use]
+    pub fn project_strategy(&self) -> Option<&str> {
+        self.project_strategy.as_deref()
     }
 
     /// Claude Code lifecycle session id inherited by an stdio MCP subprocess.

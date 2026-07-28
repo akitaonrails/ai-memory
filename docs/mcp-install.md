@@ -485,9 +485,17 @@ The rendered hooks config looks like:
   session start). ai-memory uses it as the closest equivalent to Gemini
   CLI's `SessionStart`; when a pending handoff exists, the hook injects
   it via Antigravity's `injectSteps[].ephemeralMessage` output.
-- Antigravity CLI does not expose a true session-end hook. `Stop` records
-  a stop observation only; call `memory_handoff_begin` before quitting when
-  you need the next agent to receive a handoff.
+- Antigravity CLI does not expose a true session-end hook. `Stop` records a
+  stop observation only because it marks the end of one execution loop, not
+  the conversation. After the final turn, run
+  `ai-memory finalize-session --agent antigravity-cli` to create the final
+  summary and automatic handoff and to queue opt-in SessionEnd consolidation.
+- `memory_handoff_begin` always creates an explicit, project-wide manual
+  handoff with no `from_session_id` and `from_agent = other`; that
+  session-neutral shape is the same for every MCP client. Handoffs carrying a
+  Codex or Claude session id came from canonical SessionEnd processing, not
+  from the manual tool. Use the explicit Antigravity finalizer when the
+  session itself must end and produce an attributed automatic handoff.
 - The built-in `/web` route displays compiled wiki pages, not raw session or
   observation rows. To verify hook capture, compare the `sessions` and
   `observations` counts from `ai-memory status` before and after a prompt.
@@ -885,7 +893,7 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff, either through a true session-end hook, the supported Codex manual finalizer, or by calling `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex has no reliable true session-end event, so run `ai-memory finalize-session` when you need the final summary/handoff/auto-improve eligibility. Antigravity CLI has no true session-end event in the current integration, so ask it to call `memory_handoff_begin` before quitting when you need a handoff. |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex and Antigravity CLI have no reliable true session-end event: run `ai-memory finalize-session` for Codex or `ai-memory finalize-session --agent antigravity-cli` for Antigravity after the final turn. |
 | **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
@@ -894,11 +902,13 @@ still-active sessions from `dispose` during normal plugin teardown; abrupt
 process exits can still lose that fallback, so `session.deleted` remains the
 primary close path.
 
-Codex `Stop` is not a session end. The Codex hook install intentionally omits
-`SessionEnd`; `ai-memory finalize-session` finds the latest open Codex session
-for the current workspace/project and posts a synthetic `session-end` event
-through the same server path as real hook clients. Use `--all` only when you
-want to close every matching open Codex session in that scope.
+Codex and Antigravity `Stop` events are not session ends. Their hook installs
+intentionally omit `SessionEnd`; `ai-memory finalize-session` defaults to
+Codex, while `--agent antigravity-cli` selects Antigravity. The command finds
+the latest matching open session for the current workspace/project and posts a
+synthetic `session-end` event through the same server path as real hook clients.
+Use `--all` only when you want to close every matching open session for the
+selected agent in that scope.
 
 So a typical mixed workflow looks like:
 

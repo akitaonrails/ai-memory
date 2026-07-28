@@ -24,7 +24,9 @@ pub(crate) fn apply(
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let plugin_dir = resolve_plugin_dir(args)?;
-    let strategy = args.project_strategy.baked();
+    let strategy = args
+        .project_strategy
+        .and_then(crate::cli::ProjectStrategyArg::baked);
     let outcomes = write_package(&plugin_dir, server_url, auth_token, strategy)?;
     for (path, outcome) in &outcomes {
         println!(
@@ -297,7 +299,7 @@ fn build_plugin(
 import {{ definePluginEntry }} from "openclaw/plugin-sdk/plugin-entry";
 import {{ execFileSync }} from "node:child_process";
 import {{ closeSync, existsSync, openSync, readFileSync as readMarkerText, readSync }} from "node:fs";
-import {{ basename, dirname, join, resolve }} from "node:path";
+import {{ basename, dirname, join, resolve, sep }} from "node:path";
 import {{ homedir }} from "node:os";
 
 const SERVER = {server_literal}.replace(/\/+$/, "");
@@ -319,10 +321,24 @@ function findMarker(cwd: string | undefined): string | undefined {{
   if (!cwd) return undefined;
   let dir = resolve(cwd);
   const home = homedir();
+  let boundary: string | undefined;
+  if (home && (dir === home || dir.startsWith(home.endsWith(sep) ? home : home + sep))) {{
+    boundary = home;
+  }} else if (home) {{
+    let probe = dir;
+    while (probe && probe !== dirname(probe)) {{
+      if (existsSync(join(probe, ".git"))) {{
+        boundary = probe;
+        break;
+      }}
+      probe = dirname(probe);
+    }}
+    boundary ??= dir;
+  }}
   while (dir && dir !== dirname(dir)) {{
     const marker = join(dir, ".ai-memory.toml");
     if (existsSync(marker)) return marker;
-    if (home && dir === home) return undefined;
+    if (boundary && dir === boundary) return undefined;
     dir = dirname(dir);
   }}
   return undefined;
@@ -555,7 +571,11 @@ mod tests {
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
         assert!(plugin.contains("import { execFileSync } from \"node:child_process\";"));
-        assert!(plugin.contains("import { basename, dirname, join, resolve } from \"node:path\";"));
+        assert!(
+            plugin.contains("import { basename, dirname, join, resolve, sep } from \"node:path\";")
+        );
+        assert!(plugin.contains("if (existsSync(join(probe, \".git\")))"));
+        assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("--git-common-dir"));
         assert!(

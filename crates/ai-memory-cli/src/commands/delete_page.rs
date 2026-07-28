@@ -37,14 +37,15 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
     // Resolve the project the same way write-page/read-page do: explicit
     // flag wins, otherwise derive the current project from host cwd / repo
     // root. Keeps delete + read-back pairs targeting the same project.
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
 
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let resp: DeletePageResponseBody = post_json(
         &endpoint,
         "/admin/delete-page",
         &DeletePageBody {
-            workspace: args.workspace.clone(),
+            workspace: workspace.clone(),
             project: project.clone(),
             path: args.path.clone(),
         },
@@ -53,9 +54,6 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
     .context("deleting page via server")?;
 
     let status = if resp.deleted { "✓ deleted" } else { "no-op" };
-    println!(
-        "{} {} under {}/{}",
-        status, resp.path, args.workspace, project
-    );
+    println!("{} {} under {}/{}", status, resp.path, workspace, project);
     Ok(())
 }

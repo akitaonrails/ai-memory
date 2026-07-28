@@ -17,9 +17,13 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// response (e.g. 404 workspace/project not found, 422 name taken or invalid).
 pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let from = super::resolve_project_name(config, args.from.as_deref())?;
+    // Rename happens inside one workspace, so the marker resolves it the same
+    // way it does for every other command. `--to` stays literal: it names the
+    // new project, it does not select a scope.
+    let (workspace, from) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.from.as_deref())?;
     let body = serde_json::json!({
-        "workspace": args.workspace,
+        "workspace": workspace,
         "from": from,
         "to": args.to,
     });
@@ -27,7 +31,7 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     let pages = summary["pages"].as_u64().unwrap_or(0);
     println!(
         "Renamed {}/{} → {}/{} ({} pages now under the new name).",
-        args.workspace, from, args.workspace, args.to, pages
+        workspace, from, workspace, args.to, pages
     );
     Ok(())
 }

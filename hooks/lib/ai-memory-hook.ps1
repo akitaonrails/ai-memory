@@ -39,11 +39,34 @@ function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
     $dir = $Cwd
+    $home = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    $boundary = $null
+    if ($home) {
+        $homePrefix = $home.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
+        $insideHome = ($dir -eq $home) -or $dir.StartsWith(
+            $homePrefix,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+        if ($insideHome) {
+            $boundary = $home
+        } else {
+            $probe = $dir
+            while ($probe -and (Test-Path $probe)) {
+                if (Test-Path (Join-Path $probe ".git")) {
+                    $boundary = $probe
+                    break
+                }
+                $parent = Split-Path $probe -Parent
+                if (-not $parent -or $parent -eq $probe) { break }
+                $probe = $parent
+            }
+            if (-not $boundary) { $boundary = $dir }
+        }
+    }
     while ($dir -and (Test-Path $dir)) {
         $candidate = Join-Path $dir ".ai-memory.toml"
         if (Test-Path $candidate -PathType Leaf) { return $candidate }
-        if ($env:HOME -and $dir -eq $env:HOME) { return $null }
-        if ($env:USERPROFILE -and $dir -eq $env:USERPROFILE) { return $null }
+        if ($boundary -and $dir -eq $boundary) { return $null }
         $parent = Split-Path $dir -Parent
         if (-not $parent -or $parent -eq $dir) { return $null }
         $dir = $parent

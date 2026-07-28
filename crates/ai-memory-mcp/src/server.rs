@@ -290,7 +290,10 @@ together only for a named sibling workspace/project).\n\
 full page with `memory_read_page` before acting. Treat `_rules/` as \
 constraints, `gotchas/` as preflight warnings, `procedures/` as \
 checklists, and `decisions/` as settled architecture unless the user \
-explicitly asks to revisit them. Before non-trivial coding, debugging, \
+explicitly asks to revisit them. Query ranking already gives those \
+maintained sources a bounded advantage over closely matching session \
+evidence, but does not hide historical pages or make `pinned` an \
+unconditional answer. Before non-trivial coding, debugging, \
 deployment, release, auth, scope, migration, PR-review, or \
 data-preservation work, search memory for the subsystem and task type \
 first.\n\
@@ -1111,7 +1114,8 @@ impl AiMemoryServer {
         by ai-memory across earlier runs. Call this BEFORE proposing \
         designs, BEFORE answering 'why does X work this way', and \
         whenever the user references prior work you don't recognise. \
-        FTS5 + graph RRF + (when configured) vector RRF re-ranking. \
+        FTS5 + graph RRF + (when configured) vector RRF re-ranking, \
+        followed by a bounded kind/tier/pinned/tag source-authority adjustment. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
         If compiled wiki search misses in default/project/`scopes` mode, \

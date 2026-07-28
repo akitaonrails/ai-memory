@@ -4,7 +4,8 @@
 //!
 //! Every write goes through [`apply_atomic`], which:
 //!
-//! 1. Reads the existing file (or empty string if absent).
+//! 1. Resolves a symlink chain without replacing the link, then reads the
+//!    existing target file (or empty string if absent).
 //! 2. Runs the caller-supplied mutator to compute the new content.
 //! 3. If the new content equals the old, returns `NoOp` — never
 //!    touches the disk on a redundant call.
@@ -62,9 +63,10 @@ pub fn apply_atomic<F>(path: &Path, mutator: F) -> Result<ApplyOutcome>
 where
     F: FnOnce(&str) -> Result<String>,
 {
-    let existed = path.exists();
+    let write_target = resolve_write_target(path)?;
+    let existed = write_target.exists();
     let original = if existed {
-        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+        fs::read_to_string(&write_target).with_context(|| format!("reading {}", path.display()))?
     } else {
         String::new()
     };
@@ -75,7 +77,7 @@ where
         return Ok(ApplyOutcome::NoOp);
     }
 
-    if let Some(parent) = path.parent()
+    if let Some(parent) = write_target.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)
@@ -84,16 +86,53 @@ where
 
     if existed {
         let backup = backup_path_for(path);
-        fs::copy(path, &backup)
+        fs::copy(&write_target, &backup)
             .with_context(|| format!("backing up {} → {}", path.display(), backup.display()))?;
     }
 
-    write_atomic(path, &new_content)?;
+    write_atomic(&write_target, &new_content)?;
     Ok(if existed {
         ApplyOutcome::Updated
     } else {
         ApplyOutcome::Created
     })
+}
+
+/// Follow final-component symlinks to the path that an atomic rename should
+/// replace. This also handles a dangling final target, which `canonicalize`
+/// cannot resolve, without replacing the user's symlink itself.
+fn resolve_write_target(path: &Path) -> Result<PathBuf> {
+    const MAX_SYMLINK_DEPTH: usize = 40;
+
+    let mut target = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_DEPTH {
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let destination = fs::read_link(&target)
+                    .with_context(|| format!("resolving symlink {}", target.display()))?;
+                target = if destination.is_absolute() {
+                    destination
+                } else {
+                    target
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(destination)
+                };
+            }
+            Ok(_) => return Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting symlink {}", target.display()));
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "refusing to write through a symlink chain deeper than {MAX_SYMLINK_DEPTH}: {}",
+        path.display()
+    )
 }
 
 fn backup_path_for(path: &Path) -> PathBuf {
@@ -105,15 +144,15 @@ fn backup_path_for(path: &Path) -> PathBuf {
 
 /// Atomic write via the canonical [`ai_memory_wiki::write_atomic`]
 /// (tempfile + fsync + rename + parent-dir fsync). The one wrinkle kept
-/// here: the tempfile MUST land in the same directory as the target so
-/// `rename(2)` stays intra-filesystem — otherwise we get EXDEV
-/// ("Invalid cross-device link"). A bare relative path like `CLAUDE.md`
-/// has an *empty* parent, so treat it as `.` (current directory); a
-/// `$TMPDIR` fallback would sit on a different filesystem than the
-/// project in just about every realistic setup.
+/// here: the tempfile MUST land in the same directory as the resolved target so
+///   `rename(2)` stays intra-filesystem — otherwise we get EXDEV
+///   ("Invalid cross-device link"). A bare relative path like `CLAUDE.md`
+///   has an *empty* parent, so treat it as `.` (current directory); a
+///   `$TMPDIR` fallback would sit on a different filesystem than the
+///   project in just about every realistic setup.
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
     let path = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => path.to_path_buf(),
+        Some(parent) if !parent.as_os_str().is_empty() => path.to_path_buf(),
         _ => Path::new(".").join(path),
     };
     ai_memory_wiki::write_atomic(&path, content.as_bytes())
@@ -235,6 +274,79 @@ mod tests {
         assert_eq!(backups.len(), 1, "exactly one backup file expected");
         let bak_content = fs::read_to_string(backups[0].path()).unwrap();
         assert_eq!(bak_content, "old\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_through_symlink_updates_target_and_keeps_link() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        // A tracked "dotfiles" file, plus a symlink standing in for the config
+        // path the tool is pointed at (e.g. ~/.claude/settings.json).
+        let target = tmp.path().join("dotfiles/settings.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "old\n").unwrap();
+        let link = tmp.path().join("settings.json");
+        symlink(&target, &link).unwrap();
+
+        let outcome = apply_atomic(&link, |_| Ok("new\n".into())).unwrap();
+
+        assert_eq!(outcome, ApplyOutcome::Updated);
+        // The link must survive as a link, not be replaced by a regular file.
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the write"
+        );
+        // The write landed on the real file the link points at.
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        assert_eq!(fs::read_to_string(&link).unwrap(), "new\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_through_dangling_relative_symlink_creates_target_and_keeps_link() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let target_dir = tmp.path().join("dotfiles");
+        fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("settings.json");
+        let link = tmp.path().join("settings.json");
+        symlink("dotfiles/settings.json", &link).unwrap();
+
+        let outcome = apply_atomic(&link, |_| Ok("new\n".into())).unwrap();
+
+        assert_eq!(outcome, ApplyOutcome::Created);
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_rejects_a_symlink_loop_without_replacing_it() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let link = tmp.path().join("settings.json");
+        symlink("settings.json", &link).unwrap();
+
+        let error = apply_atomic(&link, |_| Ok("new\n".into())).unwrap_err();
+
+        assert!(format!("{error:#}").contains("symlink chain deeper"));
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

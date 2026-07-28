@@ -19,6 +19,7 @@ mod commands;
 mod config;
 mod http_client;
 mod logging;
+mod marker;
 mod process_guard;
 
 use cli::{Cli, Command};

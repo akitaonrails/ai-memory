@@ -56,13 +56,13 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 
 | You say | Agent calls | Effect |
 |---|---|---|
-| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + graph/vector RRF over compiled wiki pages, with bounded raw-observation fallback. |
+| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + graph/vector RRF over compiled wiki pages, followed by bounded source-authority ranking and raw-observation fallback on a page miss. |
 | Before proposing architecture | `memory_query` | Checks prior decisions and gotchas before suggesting designs. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_accept` if no block exists | Resumes from the latest pending handoff. |
 | "Save context for the next session" | `memory_handoff_begin` | Writes a terse session-end handoff with open questions and next steps. Do not use for status or briefing requests. |
 | "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Marks an exact open handoff id expired before the next session can consume it. |
-| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; session end otherwise writes a rule-based summary page). |
+| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; session end otherwise writes a rule-based summary page). Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
 | "What did we learn from this session?" / "what memory should we add?" | `memory_auto_improve` | Manually reviews the latest completed session by default. The server also runs scheduled auto-improvement for new completed sessions when an LLM is configured. `[auto_improve.scheduler] enabled = false` disables automatic review; `[auto_improve] require_approval = true` leaves scheduled and manual proposals in pending-writes for review. |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Delete this page" / "remove the note about X" | `memory_delete_page` | Removes a page by exact path. Pass `workspace` + `project` together when the page lives in a sibling workspace, so a project name shared between workspaces never silently routes the delete to the wrong slot. |
@@ -74,6 +74,15 @@ matching `_rules/`, `gotchas/`, `procedures/`, or `decisions/` pages, read the
 full page before acting: rules are constraints, gotchas are preflight warnings,
 procedures are checklists, and decisions are settled architecture unless the
 user explicitly asks to revisit them.
+
+Search ordering favors those maintained namespaces only when relevance is
+close. `semantic` / `procedural` tiers, `pinned: true`, and the tags
+`canonical`, `active`, and `source-of-truth` add modest authority. `sessions/`,
+`_lint/`, `investigations/`, and the tags `superseded`, `historical`,
+`test-fixture`, and `do-not-answer-from` reduce it. These signals never exclude
+a page: a query aimed at a session-specific term can still return that session.
+`pinned` remains primarily a retention and automation-mutation control, not an
+unconditional search override.
 
 ## Install the routing snippet and Agent Skills
 

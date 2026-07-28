@@ -141,6 +141,11 @@ without env vars or flags, hooks reuse the existing ai-memory MCP entry for
 that agent when possible. This keeps remote MCP config and lifecycle capture
 pointed at the same server instead of falling back to loopback.
 
+All installer `--apply` modes preserve symlinked configuration files: the
+atomic update is written to the symlink target, including a missing final
+target, while the timestamped backup stays next to the user-facing config
+path. This keeps stow, chezmoi, and similar dotfile-managed installs linked.
+
 `init`, `serve`, and `generate-auth-token` do not need these env vars because
 they either create local files or start the server itself.
 
@@ -157,10 +162,13 @@ strategy into the hooks:
 ai-memory install-hooks --apply --agent claude-code --project-strategy repo-root
 ```
 
-`--project-strategy` accepts `basename` (the default; bakes nothing, so existing
-installs are unchanged) or `repo-root`. It works for every agent and delivery
-path. A per-repo `.ai-memory.toml` marker's own `project_strategy` / `project`
-still take precedence — see
+`--project-strategy` accepts `basename` (the new-install default; bakes nothing)
+or `repo-root`. Omitting it during a later `--apply` preserves the strategy
+already baked into that agent's ai-memory hooks, including during the wrapper's
+automatic post-upgrade refresh. Pass `basename` explicitly to remove an
+existing `repo-root` default. This works for every agent and delivery path. A
+per-repo `.ai-memory.toml` marker's own `project_strategy` / `project` still
+take precedence — see
 [the marker-file reference](marker-file.md#install-wide-default-no-marker).
 
 ---
@@ -469,7 +477,10 @@ boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 Each spooled entry keeps one idempotency key across retries. A server that
 processed an event but lost the batch response will not duplicate its
 observation or completed session-end effects; if processing stopped after the
-observation commit, the retry re-runs downstream wiki/handoff work. Those
+observation commit, the retry re-runs downstream work. SessionEnd atomically
+commits its end watermark with its automatic handoff; a retry that finds that
+transaction complete finishes any interrupted wiki commit, durable provider
+enqueue, and ingest-key completion without adding a second handoff. Those
 incomplete effects remain at-least-once until the server marks the event
 complete.
 On Unix, the helper uses a trusted `setsid` launcher when available and falls
@@ -630,6 +641,16 @@ auto-improvement eligibility for the current project, run:
 ```bash
 ai-memory finalize-session
 # add --all to close every matching open Codex session in this workspace/project
+```
+
+Antigravity CLI also lacks a true session-end event. Its `Stop` hook marks the
+end of one execution loop, so ai-memory intentionally records it without
+closing the conversation. After the final turn, finalize the latest matching
+Antigravity session explicitly:
+
+```bash
+ai-memory finalize-session --agent antigravity-cli
+# add --all only to close every matching open Antigravity session in this scope
 ```
 
 ### Devin CLI
@@ -1211,7 +1232,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, or Grok Build CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
-| `search "<query>"` | `docker exec` | Wiki search with FTS5 + graph/vector RRF |
+| `search "<query>"` | `docker exec` | Wiki search with FTS5 + graph/vector RRF + bounded source authority |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |
 | `backup --to` / `restore --from` | `docker exec` | Snapshot or restore the data dir |
 | `checkpoints` / `restore-page` | `docker exec` | List wiki git checkpoints or restore one markdown page and reindex it |
@@ -1352,8 +1373,10 @@ remote or uses a custom host/port.
 
 ```
 --repo-path <PATH>         (default: git rev-parse --show-toplevel)
---workspace <NAME>         (default: "default")
---project <NAME>           (default: derived from cwd — main repo root's
+--workspace <NAME>         (default: the nearest `.ai-memory.toml` marker's
+                            `workspace`, else "default")
+--project <NAME>           (default: the marker's `project` when pinned,
+                            else derived from cwd — main repo root's
                             basename via `git rev-parse --show-toplevel`,
                             or basename(cwd) when no repo is found.
                             "scratch" only as a defensive fallback for

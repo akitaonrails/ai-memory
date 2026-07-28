@@ -53,14 +53,15 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
     // Resolve the project the same way read-page/search do: explicit flag wins,
     // otherwise derive the current project from host cwd / repo root. This keeps
     // write + read-back pairs from silently targeting different projects.
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
 
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let resp: WritePageResponseBody = post_json(
         &endpoint,
         "/admin/write-page",
         &WritePageBody {
-            workspace: args.workspace.clone(),
+            workspace: workspace.clone(),
             project: project.clone(),
             path: args.path.clone(),
             body: body_text,
@@ -77,7 +78,7 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
     let short_id = &resp.page_id[..resp.page_id.len().min(8)];
     println!(
         "✓ wrote {} (page_id={}) under {}/{}",
-        resp.path, short_id, args.workspace, project
+        resp.path, short_id, workspace, project
     );
     Ok(())
 }

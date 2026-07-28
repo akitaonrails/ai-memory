@@ -245,7 +245,7 @@ path is roughly 3-5× faster per hook (measured ~735 ms shell → ~150-205 ms
 native on an i7-6700HQ). Notes:
 
 - The binary path comes from the `ai-memory` that runs `install-hooks`, so
-  `cargo install --path crates/ai-memory-cli` puts it on a stable
+  `cargo install --locked --path crates/ai-memory-cli` puts it on a stable
   `~/.cargo/bin` path.
 - Exec form requires a real executable path (`.exe`). It does not run `.cmd` or
   `.bat` shims through a shell. `install-hooks` uses the path of the running

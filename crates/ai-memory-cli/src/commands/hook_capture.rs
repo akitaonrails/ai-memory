@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::commands::path_util::home_dir;
+use crate::marker::{find_marker, is_truthy, parse_toml_flag, parse_toml_key, repo_root_project};
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
 use ai_memory_hooks::{CaptureConfig, CapturePolicy, CaptureSource};
 
@@ -299,94 +300,6 @@ fn marker_query_suffix_impl(
         }
     }
     qs
-}
-
-/// Parse a root-level `key = <value>` line, accepting a quoted string
-/// (`key = "true"`) OR a bare token (`key = true` / `key = 1`), so a
-/// `[recall] default_global = true` marker works whether or not the operator
-/// quotes the value. Line-based like [`parse_toml_key`], so section headers
-/// are ignored; strips an optional trailing `# comment`.
-fn parse_toml_flag(file: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(file).ok()?;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let Some(after_key) = trimmed.strip_prefix(key) else {
-            continue;
-        };
-        let Some(rest) = after_key.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let val = rest
-            .split('#')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"');
-        if !val.is_empty() {
-            return Some(val.to_string());
-        }
-    }
-    None
-}
-
-fn is_truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-fn repo_root_project(cwd: &str) -> Option<String> {
-    let root = ai_memory_consolidate::discover_main_repo_root(Path::new(cwd)).ok()?;
-    root.file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-}
-
-/// Walk up from `cwd` toward `$HOME` (or the filesystem root) looking
-/// for `.ai-memory.toml`. Stops at `$HOME` to avoid leaking a parent
-/// user's declaration on shared machines (parity with
-/// `ai_memory_find_marker`).
-fn find_marker(cwd: &str) -> Option<PathBuf> {
-    let home = home_dir();
-    let mut dir = Path::new(cwd);
-    loop {
-        let candidate = dir.join(".ai-memory.toml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if home.as_deref() == Some(dir) {
-            return None;
-        }
-        match dir.parent() {
-            Some(parent) if parent != dir => dir = parent,
-            _ => return None,
-        }
-    }
-}
-
-/// Parse a root-level `key = "value"` line (no nesting, arrays, or
-/// tables), mirroring `ai_memory_parse_toml_key`. Returns the first
-/// match. Avoids pulling in a TOML parser dependency.
-fn parse_toml_key(file: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(file).ok()?;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let Some(after_key) = trimmed.strip_prefix(key) else {
-            continue;
-        };
-        let Some(rest) = after_key.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let Some(rest) = rest.trim_start().strip_prefix('"') else {
-            continue;
-        };
-        if let Some(end) = rest.find('"') {
-            return Some(rest[..end].to_string());
-        }
-    }
-    None
 }
 
 /// Build a reqwest client for the hook's one-shot requests. `no_proxy`
@@ -716,69 +629,9 @@ mod tests {
         assert!(got.is_none(), "non-2xx body must not become context");
     }
 
-    /// Happy-path TOML parser: extracts each declared root-level
-    /// `key = "value"` pair. Mirrors the shell `ai_memory_parse_toml_key`.
-    #[test]
-    fn parse_toml_key_extracts_root_level_strings() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let marker = tmp.path().join(".ai-memory.toml");
-        std::fs::write(
-            &marker,
-            r#"
-workspace = "acme"
-project = "infra"
-project_strategy = "repo-root"
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            parse_toml_key(&marker, "workspace").as_deref(),
-            Some("acme")
-        );
-        assert_eq!(parse_toml_key(&marker, "project").as_deref(), Some("infra"));
-        assert_eq!(
-            parse_toml_key(&marker, "project_strategy").as_deref(),
-            Some("repo-root")
-        );
-        assert_eq!(parse_toml_key(&marker, "absent"), None);
-    }
-
-    /// Shapes the naive parser deliberately doesn't handle (parity with
-    /// the shell `_lib.sh` helper) — pin the contract so a future
-    /// "robustify" refactor doesn't silently start matching them.
-    #[test]
-    fn parse_toml_key_skips_unsupported_shapes() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let marker = tmp.path().join(".ai-memory.toml");
-        std::fs::write(
-            &marker,
-            r#"
-# Single-quoted values are not honoured.
-workspace = 'acme'
-# Comments after the value are not stripped.
-project = "infra" # this is fine
-"#,
-        )
-        .unwrap();
-        assert_eq!(parse_toml_key(&marker, "workspace"), None);
-        // The trailing comment is appended to the value because the parser
-        // looks for the first `"` — pin it so the contract is explicit.
-        assert_eq!(parse_toml_key(&marker, "project").as_deref(), Some("infra"));
-    }
-
-    /// `find_marker` walks up from `cwd` until it finds `.ai-memory.toml`
-    /// or reaches `$HOME`. Verify the walking — drop the marker two dirs
-    /// above the simulated cwd and confirm it's found.
-    #[test]
-    fn find_marker_walks_up_from_cwd() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let marker = tmp.path().join(".ai-memory.toml");
-        std::fs::write(&marker, "workspace = \"w\"\n").unwrap();
-        let deep = tmp.path().join("a/b/c");
-        std::fs::create_dir_all(&deep).unwrap();
-        let found = find_marker(deep.to_str().unwrap());
-        assert_eq!(found.as_deref(), Some(marker.as_path()));
-    }
+    // The marker parser's own tests (`parse_toml_key`, `find_marker`) moved to
+    // `crate::marker` along with the code. What stays here is hook-specific:
+    // the strict `[capture]` section and the query-string suffix.
 
     #[test]
     fn capture_section_is_strict_and_marker_read_is_bounded() {
@@ -969,13 +822,13 @@ drop_subagent_captures = "true"
     #[test]
     fn marker_query_suffix_repo_root_non_git_keeps_project_implicit() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let child = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&child).unwrap();
         std::fs::write(
-            tmp.path().join(".ai-memory.toml"),
+            child.join(".ai-memory.toml"),
             "workspace = \"oss\"\nproject_strategy = \"repo-root\"\n",
         )
         .unwrap();
-        let child = tmp.path().join("plain-dir");
-        std::fs::create_dir_all(&child).unwrap();
         let qs = marker_query_suffix(child.to_str().unwrap(), None);
         assert!(qs.contains("&workspace=oss"), "{qs}");
         assert!(!qs.contains("&project="), "{qs}");
@@ -1024,11 +877,6 @@ drop_subagent_captures = "true"
 
         let worktrees = tmp.path().join("worktrees");
         std::fs::create_dir_all(&worktrees).unwrap();
-        std::fs::write(
-            worktrees.join(".ai-memory.toml"),
-            "workspace = \"oss\"\nproject_strategy = \"repo-root\"\n",
-        )
-        .unwrap();
         let wt = worktrees.join("acme-api/wt-feature");
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         if !std::process::Command::new("git")
@@ -1042,6 +890,11 @@ drop_subagent_captures = "true"
         {
             return;
         }
+        std::fs::write(
+            wt.join(".ai-memory.toml"),
+            "workspace = \"oss\"\nproject_strategy = \"repo-root\"\n",
+        )
+        .unwrap();
 
         let qs = marker_query_suffix(wt.to_str().unwrap(), None);
         assert!(qs.contains("&workspace=oss"), "{qs}");

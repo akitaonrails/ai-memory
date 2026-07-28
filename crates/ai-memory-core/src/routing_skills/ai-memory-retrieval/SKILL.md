@@ -42,6 +42,12 @@ If a current-project search is empty or thin, do not conclude the knowledge was 
 
 Search returns snippets, not complete bodies. An empty-looking or short snippet does not prove the page is empty because the match can be outside the snippet window. Fetch the full page when the path or title looks relevant, especially for rules, procedures, decisions, and gotchas.
 
+Search order combines relevance with a bounded source-authority adjustment.
+Maintained rules, decisions, procedures, and gotchas normally beat closely
+matching session evidence; explicitly historical or session-specific queries
+can still return session pages because low-authority sources are downgraded,
+not hidden. Do not treat `pinned` alone as proof that a page answers the query.
+
 ## Apply retrieved guidance
 
 Treat matching pages under `_rules/`, `gotchas/`, `procedures/`, and `decisions/` as operating constraints.

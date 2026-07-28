@@ -453,6 +453,9 @@ pub struct HookState {
     /// session close stays cheap; the LLM checkpoint otherwise happens on
     /// PreCompact and via manual `memory_consolidate`.
     pub consolidate_on_session_end: bool,
+    /// Coalescing wake-up for the durable SessionEnd consolidation worker.
+    /// The database is the queue; notifications only reduce pickup latency.
+    pub session_consolidation_notify: Option<Arc<tokio::sync::Notify>>,
     /// Opt-in (`AI_MEMORY_CAPTURE_ASSISTANT`): when true, the server honors the
     /// client's `_ai_memory_assistant` protocol on a `Stop` event and persists
     /// the sanitized excerpt as the Stop body. Off by default; when off the
@@ -1850,6 +1853,35 @@ async fn process_envelope(state: Arc<HookState>, env: HookEnvelope, actor_user: 
     }
 }
 
+async fn enqueue_session_end_consolidation(
+    state: &HookState,
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> anyhow::Result<()> {
+    if !state.consolidate_on_session_end || state.consolidator.is_none() {
+        return Ok(());
+    }
+    let Some(notify) = state.session_consolidation_notify.as_ref() else {
+        warn!(
+            session = %session_id,
+            "SessionEnd LLM consolidation enabled without a queue worker"
+        );
+        return Ok(());
+    };
+    let inserted = state
+        .writer
+        .enqueue_session_consolidation(workspace_id, project_id, session_id)
+        .await?;
+    notify.notify_one();
+    debug!(
+        session = %session_id,
+        inserted,
+        "SessionEnd LLM consolidation queued"
+    );
+    Ok(())
+}
+
 async fn process(
     state: &HookState,
     env: HookEnvelope,
@@ -1937,11 +1969,38 @@ async fn process(
             .await?
         {
             ai_memory_store::SessionEndDisposition::Open => {}
-            ai_memory_store::SessionEndDisposition::DropStale => {
+            ai_memory_store::SessionEndDisposition::DropInvalid => {
                 info!(
                     session = %session_id,
                     agent = %env.agent.as_str(),
-                    "ignoring SessionEnd for missing, mismatched, or already-ended session"
+                    "ignoring SessionEnd for missing, mismatched, or cross-agent session"
+                );
+                return Ok(());
+            }
+            ai_memory_store::SessionEndDisposition::AlreadyEnded => {
+                // End stamping and the legacy handoff commit atomically. A
+                // first delivery can still be cancelled after that transaction
+                // but before the wiki commit, durable LLM enqueue, or ingest-key
+                // completion. Re-run those idempotent tail effects before
+                // acknowledging the already-ended session.
+                let commit_msg = format!("repair session {}", short_id(&session_id.to_string()),);
+                match state.wiki.commit_all(&commit_msg) {
+                    Ok(Some(oid)) => debug!(commit = %oid, "wiki recovery auto-commit"),
+                    Ok(None) => debug!("wiki clean during SessionEnd recovery"),
+                    Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
+                }
+                enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
+                if let Some(key) = env.ingest_key {
+                    let completed = state
+                        .writer
+                        .complete_observation_ingest_if_claimed(proj, key.clone())
+                        .await?;
+                    debug!(key, completed, "SessionEnd recovery ingest-key completion");
+                }
+                info!(
+                    session = %session_id,
+                    agent = %env.agent.as_str(),
+                    "recovered tail effects for already-ended SessionEnd"
                 );
                 return Ok(());
             }
@@ -2144,8 +2203,8 @@ async fn process(
                 actor: ai_memory_core::ActorContext::anonymous(),
             })
             .await?;
-        state.writer.end_session(session_id, Some(page_id)).await?;
         let handoff_id = if managed {
+            state.writer.end_session(session_id, Some(page_id)).await?;
             None
         } else {
             let handoff = build_auto_handoff(
@@ -2156,37 +2215,13 @@ async fn process(
                 env.cwd.clone(),
                 &observations,
             );
-            Some(state.writer.insert_handoff(handoff).await?)
+            Some(
+                state
+                    .writer
+                    .end_session_with_handoff(session_id, Some(page_id), handoff)
+                    .await?,
+            )
         };
-        // Opt-in (AI_MEMORY_CONSOLIDATE_ON_SESSION_END): additionally run LLM
-        // consolidation so the session's knowledge is compiled into topical
-        // pages, not just the heuristic session record. The heuristic page
-        // above is always written first, so an LLM failure here is non-fatal —
-        // warn and keep the deterministic result. Runs before the commit so
-        // the consolidated pages land in the same atomic snapshot.
-        if state.consolidate_on_session_end
-            && let Some(c) = state.consolidator.as_ref()
-        {
-            match c
-                .consolidate_session(
-                    session_id,
-                    false,
-                    ai_memory_core::ActorContext::anonymous(),
-                    None,
-                )
-                .await
-            {
-                Ok(outcome) => info!(
-                    session = %session_id,
-                    path = %outcome.path,
-                    "SessionEnd: LLM consolidation written (opt-in)",
-                ),
-                Err(e) => warn!(
-                    error = %e,
-                    "SessionEnd LLM consolidation failed; heuristic page already written",
-                ),
-            }
-        }
         // Auto-commit the wiki tree so the session/handoff/log.md
         // changes land in git in one atomic snapshot.
         let commit_msg = format!(
@@ -2199,6 +2234,11 @@ async fn process(
             Ok(None) => debug!("wiki clean; no auto-commit"),
             Err(e) => warn!(error = %e, "auto-commit failed"),
         }
+        // Persist the optional LLM work before acknowledging the hook, after
+        // deterministic wiki writes are committed so the worker cannot race
+        // their git snapshot. Stale redelivery above repairs cancellation in
+        // the narrow window after `end_session`.
+        enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
         if let Some(handoff_id) = handoff_id {
             info!(
                 session = %session_id,
@@ -2486,6 +2526,7 @@ mod tests {
             project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
             active_project: ActiveProject::new(),
             consolidate_on_session_end: false,
+            session_consolidation_notify: None,
             capture_assistant_enabled: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
@@ -4768,7 +4809,7 @@ mod tests {
         //    points at it (exactly the purge-on-live-server scenario).
         state
             .writer
-            .purge_project(ws, proj, "default/heal-project", None)
+            .purge_project(ws, proj, "default/heal-project", None, false)
             .await
             .unwrap();
         assert!(
@@ -4951,7 +4992,7 @@ mod tests {
 
         state
             .writer
-            .purge_project(ws, proj, "default/repo-root-project", None)
+            .purge_project(ws, proj, "default/repo-root-project", None, false)
             .await
             .unwrap();
 
@@ -5173,7 +5214,18 @@ mod tests {
     #[tokio::test]
     async fn mismatched_session_end_does_not_create_summary_or_handoff() {
         let tmp = TempDir::new().unwrap();
-        let state = make_state(&tmp).await;
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm,
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.consolidate_on_session_end = true;
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
         let target = state
             .writer
             .get_or_create_project(state.workspace_id, "target", None)
@@ -5238,6 +5290,16 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "mismatched SessionEnd must not create a target handoff"
+        );
+        let now = Timestamp::now().as_microsecond();
+        assert!(
+            state
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "mismatched SessionEnd must not enter consolidation recovery"
         );
     }
 
@@ -5362,6 +5424,194 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_end_queues_llm_work_without_calling_provider() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm.clone(),
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.consolidate_on_session_end = true;
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+        let sid = "10101010-1010-1010-1010-101010101010";
+        let fire = |event: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid, "prompt": "finish" }),
+            )
+        };
+        process(&state, fire("user-prompt-submit"), None)
+            .await
+            .unwrap();
+        process(&state, fire("session-end"), None).await.unwrap();
+
+        assert!(
+            llm.0.lock().unwrap().is_none(),
+            "the hook path must leave provider work to the queue worker"
+        );
+        let now = Timestamp::now().as_microsecond();
+        let job = state
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .expect("SessionEnd persisted a consolidation job");
+        assert_eq!(job.session_id(), sid.parse().unwrap());
+        assert_eq!(job.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_session_end_redelivery_converges_interrupted_tail_effects() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm,
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.consolidate_on_session_end = true;
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+        let sid = "20202020-2020-2020-2020-202020202020";
+        let session_id: SessionId = sid.parse().unwrap();
+        let fire = |event: &str, key: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    ingest_key: key.map(str::to_string),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid, "prompt": "finish" }),
+            )
+        };
+        process(&state, fire("user-prompt-submit", None), None)
+            .await
+            .unwrap();
+        let (workspace_id, project_id, _) = state
+            .reader
+            .find_session_scope(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending_observation = || {
+            Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::SessionEnd,
+                    extension: None,
+                    source_event: None,
+                    title: "session-end".into(),
+                    body: "finish".into(),
+                    importance: 7,
+                },
+                &state.sanitizer,
+            )
+        };
+        assert!(matches!(
+            state
+                .writer
+                .insert_observation_ingest(pending_observation(), "entry-recovery".into())
+                .await
+                .unwrap(),
+            IngestObservationOutcome::Inserted(_)
+        ));
+
+        // Reproduce the durable boundary from #270: the summary file exists and
+        // the atomic end+handoff transaction committed, then the request was
+        // cancelled before the wiki commit, queue insert, or key completion.
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        let page = synthesize_session_page(workspace_id, project_id, session_id, &observations);
+        let page_id = state
+            .wiki
+            .write_page(ai_memory_wiki::WritePageRequest {
+                workspace_id,
+                project_id,
+                path: page.path,
+                frontmatter: page.frontmatter_json,
+                body: page.body,
+                tier: page.tier,
+                pinned: page.pinned,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+            })
+            .await
+            .unwrap();
+        let handoff = build_auto_handoff(
+            workspace_id,
+            project_id,
+            AgentKind::Codex,
+            session_id,
+            None,
+            &observations,
+        );
+        state
+            .writer
+            .end_session_with_handoff(session_id, Some(page_id), handoff)
+            .await
+            .unwrap();
+
+        process(&state, fire("session-end", Some("entry-recovery")), None)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let job = state
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .expect("stale redelivery must restore the missing durable job");
+        assert_eq!(job.session_id(), session_id);
+        assert_eq!(job.generation(), 2);
+        assert_eq!(
+            state
+                .writer
+                .insert_observation_ingest(pending_observation(), "entry-recovery".into())
+                .await
+                .unwrap(),
+            IngestObservationOutcome::AlreadyComplete,
+            "the recovered event must finish its pending ingest key"
+        );
+        let briefing = state
+            .reader
+            .briefing_for_project(workspace_id, project_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            briefing.pending_handoff_count, 1,
+            "recovery must preserve exactly one automatic handoff"
+        );
+        assert!(
+            state
+                .wiki
+                .commit_all("verify recovery clean")
+                .unwrap()
+                .is_none(),
+            "recovery must commit the summary file left by the interrupted request"
+        );
+    }
+
     // Issue #152: an agent that resumes an ended session under the same id
     // and keeps working must get its page re-compiled by the second
     // SessionEnd instead of that end being dropped as "already-ended".
@@ -5405,7 +5655,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             disposition,
-            ai_memory_store::SessionEndDisposition::DropStale,
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
             "a freshly-ended session with no newer work must drop duplicate ends"
         );
         let page_after_first_end = state
@@ -5434,7 +5684,7 @@ mod tests {
         assert_eq!(
             disposition,
             ai_memory_store::SessionEndDisposition::ReEndWithNewWork,
-            "observations after ended_at must mark the session re-endable"
+            "a newer observation generation must mark the session re-endable"
         );
 
         process(&state, fire("session-end", None), None)
@@ -5464,8 +5714,9 @@ mod tests {
                 .is_some(),
             "the re-end must refresh the auto-handoff"
         );
-        // ended_at advanced past the resumed work: the next duplicate end is
-        // dropped again (pins the de1cef2 dedupe behaviour post-re-end).
+        // The persisted end generation now covers the resumed work, so the
+        // next duplicate end is dropped again (pins the de1cef2 dedupe
+        // behaviour post-re-end).
         let disposition = state
             .reader
             .session_end_disposition(
@@ -5478,8 +5729,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             disposition,
-            ai_memory_store::SessionEndDisposition::DropStale,
-            "after the re-end, ended_at must cover the resumed work again"
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
+            "after the re-end, the generation watermark must cover resumed work"
         );
     }
 

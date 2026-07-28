@@ -103,7 +103,7 @@ pub enum Command {
     AutoImproveReport(AutoImproveReportArgs),
     /// Run auto-improvement for one completed session.
     AutoImprove(AutoImproveArgs),
-    /// Manually finalize the latest open Codex session for this project.
+    /// Manually finalize the latest open session for one agent in this project.
     FinalizeSession(FinalizeSessionArgs),
     /// Review, approve, or reject staged auto-improvement proposals.
     PendingWrites(PendingWritesArgs),
@@ -174,9 +174,10 @@ pub enum Command {
 #[derive(Debug, Args)]
 #[command(trailing_var_arg = true)]
 pub struct RunArgs {
-    /// Workspace containing the managed workstream.
-    #[arg(long, default_value = "default")]
-    pub workspace: String,
+    /// Workspace containing the managed workstream. Defaults to the nearest
+    /// `.ai-memory.toml` marker's `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project override. Defaults to the current repository project.
     #[arg(long)]
     pub project: Option<String>,
@@ -469,9 +470,15 @@ pub struct ReorgArgs {
 /// Arguments for `purge-project`.
 #[derive(Debug, Args)]
 pub struct PurgeProjectArgs {
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Purge even when a managed workstream under this project still holds a
+    /// live run lease. Workstreams cascade out of the project row, so without
+    /// this the purge refuses rather than deleting a running session's lease.
+    #[arg(long)]
+    pub force: bool,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -485,9 +492,10 @@ pub struct PurgeProjectArgs {
 /// Arguments for `rename-project`.
 #[derive(Debug, Args)]
 pub struct RenameProjectArgs {
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Current project name. When omitted, auto-derives from the
     /// basename of the current git repo root (or CWD) — handy when
     /// running `ai-memory rename-project --to new-name` from a dir
@@ -503,9 +511,11 @@ pub struct RenameProjectArgs {
 /// Arguments for `move-project`.
 #[derive(Debug, Args)]
 pub struct MoveProjectArgs {
-    /// Source workspace. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub from_workspace: String,
+    /// Source workspace. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`. Only the source is marker-resolved;
+    /// `--to-workspace` names the destination and stays literal.
+    #[arg(long)]
+    pub from_workspace: Option<String>,
     /// Project name to move. When omitted, auto-derived from the basename
     /// of the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -517,10 +527,9 @@ pub struct MoveProjectArgs {
     /// source, both irreversible. Without this flag the CLI errors out.
     #[arg(long)]
     pub confirm: bool,
-    /// Override the live-session guard. By default the server refuses (409) to
-    /// move the project a hook session is actively writing to; `--force`
-    /// proceeds anyway (still safe — the move keeps the active pointer correct
-    /// and the schema rejects any stale write).
+    /// Override the active-project guard. In a copy-purge merge this never
+    /// overrides a live managed-workstream lease, because deleting that lease
+    /// would strand the running agent's transcript.
     #[arg(long)]
     pub force: bool,
     /// Merge conflict policy (copy-purge path only): what to do when a source
@@ -626,10 +635,11 @@ pub struct BootstrapArgs {
     /// any subdir of the project works).
     #[arg(long)]
     pub repo_path: Option<PathBuf>,
-    /// Workspace name. Defaults to `default` (the single workspace
-    /// all hook-captured sessions land in today).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default` — the same resolution the lifecycle hooks
+    /// use, so bootstrap pages land where the session captures do.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the resolved repo path — same heuristic the hook router uses
     /// to bucket per-cwd observations, so the bootstrap pages land
@@ -768,9 +778,10 @@ pub struct AuditContaminationArgs {
 pub struct SearchArgs {
     /// FTS5 query string (e.g. `"karpathy wiki"` or `quick OR slow`).
     pub query: String,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -791,9 +802,10 @@ pub struct ReadPageArgs {
     /// Exact wiki path (e.g. `notes/foo.md`). Takes precedence over `query`.
     #[arg(long)]
     pub path: Option<String>,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -808,11 +820,12 @@ pub struct DeletePageArgs {
     /// Exact wiki path to delete (e.g. `notes/foo.md`).
     #[arg(long)]
     pub path: String,
-    /// Workspace name. Defaults to `default`. Required (no auto-detect) so
-    /// a cross-workspace project-name collision can never silently route
-    /// the delete to the wrong slot.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`. Resolution is announced on stderr so a
+    /// cross-workspace project-name collision can never silently route the
+    /// delete to the wrong slot.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project
     /// (same heuristic write-page/read-page use).
     #[arg(long)]
@@ -866,9 +879,10 @@ pub struct RestorePageArgs {
     /// Git checkpoint/revision to restore from.
     #[arg(long)]
     pub from: String,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -987,13 +1001,14 @@ impl AgentChoice {
 /// Arguments for `finalize-session`.
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
-    /// Agent kind to finalize. Defaults to Codex because Codex has no reliable
-    /// true SessionEnd hook.
+    /// Agent kind to finalize. Defaults to Codex for backward compatibility;
+    /// Codex and Antigravity CLI have no reliable true SessionEnd hook.
     #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
     pub agent: AgentChoice,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -1108,8 +1123,8 @@ pub struct EmbedArgs {
     #[arg(long)]
     pub force: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo). Matches the
     /// hook router's per-cwd convention so this command targets the
@@ -1125,8 +1140,8 @@ pub struct ForgetSweepArgs {
     #[arg(long)]
     pub dry_run: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1145,8 +1160,8 @@ pub struct LintArgs {
     #[arg(long)]
     pub no_llm: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1162,9 +1177,10 @@ pub struct CuratorArgs {
     /// Stage one pending curator report page for approval.
     #[arg(long)]
     pub stage: bool,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1177,9 +1193,10 @@ pub struct CuratorArgs {
 /// Arguments for `auto-improve-report`.
 #[derive(Debug, Args)]
 pub struct AutoImproveReportArgs {
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1204,9 +1221,10 @@ pub struct AutoImproveArgs {
     /// Completed session UUID to review.
     #[arg(long)]
     pub session_id: String,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1251,8 +1269,8 @@ pub enum PendingWritesCommand {
 
 #[derive(Debug, Args)]
 pub struct PendingWritesListArgs {
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long)]
@@ -1266,8 +1284,8 @@ pub struct PendingWritesListArgs {
 #[derive(Debug, Args)]
 pub struct PendingWriteIdArgs {
     pub id: String,
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long)]
@@ -1277,8 +1295,8 @@ pub struct PendingWriteIdArgs {
 #[derive(Debug, Args)]
 pub struct PendingWriteRejectArgs {
     pub id: String,
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long, default_value = "rejected by reviewer")]
@@ -1314,7 +1332,7 @@ pub struct LlmTestArgs {
 /// resolves its project from the main git repo root (collapsing
 /// subdirectories and worktrees) without a per-repo `.ai-memory.toml`
 /// marker. A marker's own `project_strategy` still wins.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProjectStrategyArg {
     /// `project = basename(cwd)` — the default; bakes nothing.
     Basename,
@@ -1430,10 +1448,13 @@ pub struct InstallHooksArgs {
     /// `repo-root` makes every session resolve its project from the main
     /// git repo root (collapsing subdirectories and worktrees) without a
     /// per-repo `.ai-memory.toml` marker. A marker's own `project_strategy`
-    /// still wins. Defaults to `basename`, which bakes nothing and is
-    /// identical to prior behavior.
-    #[arg(long, value_enum, default_value_t = ProjectStrategyArg::Basename)]
-    pub project_strategy: ProjectStrategyArg,
+    /// still wins. `basename` bakes nothing and is identical to prior
+    /// behavior. Omitting the flag leaves it unset: an `--apply` re-run then
+    /// preserves whatever strategy an earlier `--apply` baked, so a bare
+    /// re-apply (e.g. the auto-refresh in `ai-memory upgrade`) does not
+    /// silently revert `repo-root` back to `basename`.
+    #[arg(long, value_enum)]
+    pub project_strategy: Option<ProjectStrategyArg>,
     /// Bake `--capture-assistant` onto the installed native `stop` command so a
     /// Claude Code `stop` event carries a sanitized excerpt of the assistant's
     /// final turn (#196). Only valid for `--agent claude-code` on a native
@@ -1515,6 +1536,10 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_watcher: bool,
     /// Workspace name (auto-created).
+    ///
+    /// Not marker-aware, unlike the client commands: the server has no
+    /// caller cwd to walk up from, and this is the baked fallback for hook
+    /// events that arrive without a usable one.
     #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
     pub workspace: String,
     /// Project name within the workspace (auto-created).
@@ -1595,8 +1620,8 @@ pub struct WritePageArgs {
     #[arg(long)]
     pub pinned: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name within the workspace. When omitted, auto-detect from the
     /// current project using the same resolver as read-page/search.
     #[arg(long)]
@@ -1994,23 +2019,53 @@ mod tests {
         };
         assert!(matches!(
             args.project_strategy,
-            ProjectStrategyArg::RepoRoot
+            Some(ProjectStrategyArg::RepoRoot)
         ));
-        assert_eq!(args.project_strategy.baked(), Some("repo-root"));
+        assert_eq!(
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            Some("repo-root")
+        );
     }
 
     #[test]
-    fn install_hooks_project_strategy_defaults_to_basename() {
+    fn install_hooks_project_strategy_defaults_to_unset() {
         let cli = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", "claude-code"])
             .expect("install-hooks parses without --project-strategy");
         let Command::InstallHooks(args) = cli.command else {
             panic!("expected install-hooks command");
         };
+        // No flag → None, so a re-apply preserves whatever is already baked.
+        assert!(args.project_strategy.is_none());
+        assert_eq!(
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            None
+        );
+    }
+
+    #[test]
+    fn install_hooks_explicit_basename_still_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "claude-code",
+            "--project-strategy",
+            "basename",
+        ])
+        .expect("install-hooks parses --project-strategy basename");
+        let Command::InstallHooks(args) = cli.command else {
+            panic!("expected install-hooks command");
+        };
+        // Explicit basename is distinct from "unset": it forces basename and
+        // overrides an already-baked repo-root on re-apply.
         assert!(matches!(
             args.project_strategy,
-            ProjectStrategyArg::Basename
+            Some(ProjectStrategyArg::Basename)
         ));
-        assert_eq!(args.project_strategy.baked(), None);
+        assert_eq!(
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            None
+        );
     }
 
     #[test]

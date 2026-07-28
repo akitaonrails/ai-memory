@@ -433,13 +433,14 @@ where
         payload = serde_json::to_string(&json)?;
     }
     let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
+    let inspection_cwd = policy_cwd.as_deref().map(canonical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
     let tool_event = is_tool_event(&args.event);
     let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
         policy.inspect(
             AgentKind::from_wire(&args.agent),
             &json,
-            policy_cwd.as_deref().unwrap_or(""),
+            inspection_cwd.as_deref().unwrap_or(""),
         )
     });
     if args.check_capture {
@@ -715,6 +716,14 @@ fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option
             session_id,
         )
     }
+}
+
+fn canonical_capture_cwd(cwd: &str) -> String {
+    Path::new(cwd)
+        .canonicalize()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| cwd.to_owned())
 }
 
 fn is_tool_event(event: &str) -> bool {
@@ -1434,6 +1443,46 @@ mod tests {
         let mut args = devin_hook_args("post-tool-use");
         args.server_url = "http://127.0.0.1:1".into();
         run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret/SENTINEL"}}).to_string(), &mut stdout, |_| { called.set(true); Ok(()) }).await.unwrap();
+        assert_eq!(stdout, b"{}\n");
+        assert!(!called.get());
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_drop_handles_symlinked_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let alias = tmp.path().join("project-alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        let called = std::cell::Cell::new(false);
+        run_with_payload(
+            Some(data_dir.clone()),
+            devin_hook_args("post-tool-use"),
+            serde_json::json!({
+                "cwd": alias,
+                "tool_name": "Edit",
+                "tool_input": {"path": "secret/SENTINEL"}
+            })
+            .to_string(),
+            &mut stdout,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
         assert_eq!(stdout, b"{}\n");
         assert!(!called.get());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);

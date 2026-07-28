@@ -36,6 +36,8 @@ The follow-up implementation landed the pragmatic subset of this roadmap:
 | Raw fallback | `observations_fts` provides bounded raw fallback when compiled wiki search misses. |
 | Diagnostics | `status` includes FTS row counts, missing embeddings, embedding triples, and unresolved/stale link counts. |
 | Retrieval evals | Recall harness now covers FTS/vector, graph expansion, and raw fallback. |
+| Procedural learning | Consolidation can classify procedural memory; auto-improvement creates or patches bounded `procedures/` pages. |
+| SessionEnd consolidation | The deterministic summary/handoff completes before optional provider work enters a durable, retryable queue outside hook latency. |
 
 ## Prior Art Summary
 
@@ -134,24 +136,21 @@ auditable. When a slot's write regime matters, use frontmatter:
 `slot_kind: state` for mutable current focus or pending items. Missing
 `slot_kind` defaults to `state`.
 
-### P0: Make Maintenance Scheduled, Not Only Manual
+### P0: Schedule Maintenance Outside Hooks
 
-ai-memory already has the machinery for lint, forget sweep, embeddings,
-and consolidation. Most of it is still on-demand. A memory system should
-quietly maintain itself.
+This recommendation is implemented. The server schedules maintenance with
+clear intervals and summaries while preserving the manual commands:
 
-Recommended next step: a server-side scheduler with clear intervals,
-logs, and dry-run-equivalent summaries for:
-
-| Job | Why |
+| Job | Current behavior |
 |---|---|
-| forget sweep | Make the retention formula real without relying on the user to ask. |
-| lint | Surface stale pages, duplicate titles, rule suggestions, and contradictions before they accumulate. |
-| embedding backfill | Keep hybrid retrieval complete after pages are created without embeddings or after provider recovery. |
-| optional consolidation queue | Keep session summaries compiled without blocking hooks. |
+| forget sweep | Runs daily by default so retention does not depend on a manual request. |
+| lint | Runs daily by default to surface stale pages, duplicate titles, rule suggestions, broken cross-project links, and optional LLM contradictions. |
+| embedding backfill | Runs only when its interval is enabled and an embedder is configured. |
+| optional consolidation queue | Enqueues SessionEnd provider work durably when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is enabled; one bounded worker retries it outside hook processing. |
 
-This should stay outside hook latency. Agentmemory's hook-blocking
-incidents are the warning label.
+The deterministic SessionEnd page and handoff remain independent of provider
+availability. Agentmemory's hook-blocking incidents remain the warning label
+for keeping scheduled and queued provider work outside hook latency.
 
 ### P0: Clarify And Fix The Vector Indexing Contract
 
@@ -167,7 +166,7 @@ reasonable availability tradeoff, but docs and invariants should be
 precise: FTS5/page persistence is transactional; vector completeness is
 best-effort unless a backfill/status mechanism says otherwise.
 
-Recommended options:
+Options evaluated:
 
 | Option | Tradeoff |
 |---|---|
@@ -175,8 +174,8 @@ Recommended options:
 | Add `embedding_status` and scheduled backfill | Better availability and observability, slightly more schema/state. |
 | Document vector indexing as optional best-effort | Minimal change, but less trustworthy without visible status. |
 
-The best pragmatic path is status plus scheduled backfill. It preserves
-the durable FTS path while making vector gaps visible.
+The implemented choice is status plus scheduled backfill. It preserves the
+durable FTS path, exposes vector gaps, and keeps backfill opt-in.
 
 ### P1: Make Graph/Link Retrieval First-Class
 
@@ -304,19 +303,19 @@ that now would be speculative.
 | Verbatim-everything with no decay | Leads to bloat and later destructive cleanup pressure. |
 | Destructive repair tooling | Any repair/rebuild must be graveyard-first or derived-index-only. |
 
-## Documentation Mismatches To Fix
+## Documentation Status Audit
 
-These are not necessarily product bugs, but docs should match the code.
+These items previously drifted from the code. Their current status is:
 
 | Area | Current status |
 |---|---|
-| MCP tool count/list | Fixed: architecture and install docs list the current 11-tool surface. |
-| Lint scope | Some descriptions mention broken cross-reference auditing, but current lint implements stale episodic pages, duplicate titles, rule suggestions, and optional LLM contradictions. Link checking should wait for link parsing. |
-| sqlite-vec status | Some design language frames sqlite-vec as the chosen/current vector index. Current implementation stores packed vectors in SQLite and does brute-force cosine. |
+| MCP tool count/list | Fixed: architecture and design docs list the current 16-tool surface. |
+| Lint scope | Fixed: lint covers stale episodic pages, duplicate titles, rule suggestions, broken cross-project links, and optional LLM contradictions. |
+| sqlite-vec status | Fixed: the vector policy documents packed vectors in SQLite with brute-force cosine as the current backend. |
 | raw archive status | Fixed: docs distinguish reserved `raw/` files from implemented observation-FTS fallback. |
-| scheduled maintenance | Fixed: docs describe default scheduled lint/sweep and opt-in embedding backfill. |
-| procedural tier | The type exists, but procedural extraction/frequency decay is not a developed lifecycle path yet. |
-| SessionEnd consolidation | SessionEnd currently writes a deterministic session page and handoff. LLM consolidation is opt-in and available through PreCompact/manual consolidation; docs should avoid implying all SessionEnd pages are LLM-fanned-out automatically. |
+| scheduled maintenance | Fixed: docs describe default scheduled lint/sweep, opt-in embedding backfill, and the independent hollow-project cleanup. |
+| procedural tier | Fixed: consolidation can classify procedural memory, auto-improvement can create or patch bounded `procedures/` pages, and retention preserves semantic/procedural tiers. |
+| SessionEnd consolidation | Fixed: SessionEnd always writes a deterministic page and handoff; opt-in LLM work uses a durable retry queue, while PreCompact/manual consolidation remain available. |
 | batch embeddings | Fixed: code comments and status diagnostics now describe batch vector completeness as backfill-owned. |
 
 ## Implemented Roadmap Slice
@@ -332,6 +331,10 @@ These are not necessarily product bugs, but docs should match the code.
    fallback when compiled pages miss.
 6. **Make retrieval claims test-backed.** The recall harness covers the new
    graph and raw fallback paths.
+7. **Add procedural learning.** Consolidation and auto-improvement can produce
+   bounded durable procedure pages without weakening retention safeguards.
+8. **Queue optional SessionEnd consolidation.** Provider work is durable,
+   retryable, and independent of the deterministic summary/handoff path.
 
 ## Bottom Line
 

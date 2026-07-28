@@ -35,9 +35,10 @@ pub async fn run(config: &Config, args: CuratorArgs) -> Result<()> {
     }
     let dry_run = args.dry_run || !args.stage;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let request = CuratorRequest {
-        workspace: args.workspace,
+        workspace,
         project: project.clone(),
         dry_run,
         stage: args.stage,

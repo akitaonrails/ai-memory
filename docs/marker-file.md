@@ -23,10 +23,12 @@ ai-memory or running CLI commands per directory.
 
 ## Where to put it
 
-`.ai-memory.toml` in **any ancestor** of your `cwd`. Lifecycle hooks
-walk up from `cwd` toward `$HOME` (or `/` if `$HOME` is unset) and
-use the **first** marker found. Closer markers override outer ones. When
-a marker is found, hook scripts also forward the current `cwd` so
+`.ai-memory.toml` in **any allowed ancestor** of your `cwd`. Lifecycle hooks
+walk up from `cwd` toward `$HOME` (or `/` if `$HOME` is unset) and use the
+**first** marker found. When cwd is outside `$HOME`, the walk stops at the
+nearest checkout root (`.git` file or directory); outside a checkout, only cwd
+itself is checked. Closer markers override outer ones. When a marker is found,
+hook scripts also forward the current `cwd` so
 workspace-only markers can still resolve `project = basename(cwd)` for
 handoff lookups.
 
@@ -320,10 +322,57 @@ This is **install-time config**, written into the agent's hook command (and
 the generated OpenCode / OMP / Pi / OpenClaw plugins) — the same status as the
 `AI_MEMORY_AUTH_TOKEN` / `AI_MEMORY_HOOK_URL` it sits beside, *not* a user-set
 runtime override (which was deliberately rejected in #16). The flag accepts
-`basename` (the default — bakes nothing, behavior unchanged) or `repo-root`.
+`basename` (the new-install default — bakes nothing) or `repo-root`. A later
+`install-hooks --apply` without the flag preserves the value already baked into
+ai-memory's hooks; pass `--project-strategy basename` explicitly to remove it.
 
 Precedence is unchanged: a marker's explicit `project_strategy` or `project`
 still wins over the install default.
+
+## Who reads the marker
+
+Both entry points, as of v1.20:
+
+- **Lifecycle hooks** forward the marker's fields to the server on every
+  event, so session captures land in the declared scope.
+- **Client CLI commands** resolve `(workspace, project)` locally before
+  calling the server — `run`, `bootstrap`, `search`, `read-page`,
+  `write-page`, `lint`, `curator`, `embed`, `pending-writes`,
+  `forget-sweep`, `auto-improve`, `purge-project`, `rename-project`,
+  `move-project` (source side), and friends.
+
+Before v1.20 only the hooks read it. A checkout declaring
+`workspace = "acme"` therefore had its captures land in `acme` while every
+CLI command resolved into `default` — the same repository split across two
+scopes, with `ai-memory run`'s managed workstream on the wrong side of the
+split.
+
+Each field is resolved independently:
+
+1. The explicit flag (`--workspace` / `--project`).
+2. The nearest marker: `workspace`, and `project` — or the main repo root's
+   basename when only `project_strategy = "repo-root"` is set.
+3. The previous fallbacks: `default`, and the cwd-derived project name.
+
+When rung 2 decides a field, the command prints one line to stderr naming
+the resolved scope, which half (or halves) the marker decided, and the
+marker that decided it:
+
+```console
+$ ai-memory search "scope resolver"
+ai-memory: scope acme/api (workspace + project from /Users/dev/projects/acme/.ai-memory.toml)
+```
+
+`AI_MEMORY_IGNORE_MARKER=1` skips rung 2 for one invocation, restoring the
+pre-v1.20 resolution without editing or leaving the marker's tree. It
+applies to **client commands only** — the lifecycle hooks still forward the
+marker's fields on every event, so an invocation run with it set resolves
+into a different scope than the session captures around it. Use it for
+one-off reads, not as a way to relocate a repository's memory.
+
+`ai-memory serve` is deliberately excluded: the server has no caller cwd to
+walk up from, and its `--workspace` / `--project` are the baked fallback for
+hook events that arrive without a usable one.
 
 ## What the marker file does NOT do
 
@@ -338,6 +387,10 @@ still wins over the install default.
   *default* can still be baked into an install without a marker via
   `install-hooks --project-strategy repo-root`, but that is install-time
   config, not a runtime override the user sets in their shell.)
+- ❌ No reach outside the trust boundary. The walk stops at `$HOME`; a
+  checkout outside it stops at that checkout's root and needs a marker inside
+  the checkout. A non-git directory outside `$HOME` needs a marker in its
+  exact cwd.
 
 ## Troubleshooting
 

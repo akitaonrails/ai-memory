@@ -50,6 +50,12 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const BOOTSTRAP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Startup and failure retry delay, capped by each job's configured interval.
 const MAINTENANCE_STARTUP_DELAY_CAP: Duration = Duration::from_secs(60);
+/// How often the durable SessionEnd consolidation worker checks for work when
+/// no hook notification arrives (including jobs recovered after restart).
+const SESSION_CONSOLIDATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// A claimed job may be recovered after this long without completion. Provider
+/// requests are expected to finish well inside this lease.
+const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
 
 /// Validate the credentials that keep an existing multi-user installation
 /// closed. Bootstrap installs have no user rows yet and retain their historical
@@ -151,6 +157,127 @@ async fn run_persisted_maintenance_job<F, Fut, R, RFut, N>(
             Err(error) => {
                 tracing::warn!(%error, job = job.as_str(), "scheduled maintenance job failed; retrying");
                 delay = retry_delay;
+            }
+        }
+    }
+}
+
+fn session_consolidation_retry_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(4);
+    Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
+}
+
+async fn run_session_consolidation_worker(
+    writer: WriterHandle,
+    consolidator: Arc<Consolidator>,
+    notify: Arc<tokio::sync::Notify>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let now = jiff::Timestamp::now().as_microsecond();
+        let lease_micros =
+            i64::try_from(SESSION_CONSOLIDATION_LEASE.as_micros()).unwrap_or(i64::MAX);
+        let job = match writer
+            .claim_session_consolidation(now, now.saturating_sub(lease_micros))
+            .await
+        {
+            Ok(job) => job,
+            Err(error) => {
+                tracing::warn!(%error, "SessionEnd consolidation queue claim failed");
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = notify.notified() => {},
+                    () = tokio::time::sleep(SESSION_CONSOLIDATION_POLL_INTERVAL) => {},
+                }
+                continue;
+            }
+        };
+
+        let Some(job) = job else {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = notify.notified() => {},
+                () = tokio::time::sleep(SESSION_CONSOLIDATION_POLL_INTERVAL) => {},
+            }
+            continue;
+        };
+
+        let session_id = job.session_id();
+        let generation = job.generation();
+        let attempts = job.attempts();
+        let consolidation = consolidator.consolidate_session(
+            session_id,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+        );
+        tokio::pin!(consolidation);
+        let result = tokio::select! {
+            () = cancel.cancelled() => {
+                if let Err(error) = writer.release_session_consolidation(job).await {
+                    tracing::warn!(%error, %session_id, generation, "failed to release SessionEnd consolidation during shutdown");
+                }
+                return;
+            }
+            result = &mut consolidation => result,
+        };
+
+        match result {
+            Ok(outcome) => match writer.complete_session_consolidation(job).await {
+                Ok(()) => info!(
+                    session = %session_id,
+                    generation,
+                    attempts,
+                    path = %outcome.path,
+                    "SessionEnd: queued LLM consolidation written (opt-in)",
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    session = %session_id,
+                    generation,
+                    "SessionEnd consolidation succeeded but queue completion failed",
+                ),
+            },
+            Err(error) => {
+                let retry_at = if attempts < ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+                    let delay = session_consolidation_retry_delay(attempts);
+                    let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
+                    Some(
+                        jiff::Timestamp::now()
+                            .as_microsecond()
+                            .saturating_add(delay_micros),
+                    )
+                } else {
+                    None
+                };
+                let terminal = retry_at.is_none();
+                if let Err(store_error) = writer
+                    .fail_session_consolidation(job, error.to_string(), retry_at)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %store_error,
+                        session = %session_id,
+                        generation,
+                        "failed to persist SessionEnd consolidation failure",
+                    );
+                } else if terminal {
+                    tracing::error!(
+                        %error,
+                        session = %session_id,
+                        generation,
+                        attempts,
+                        "SessionEnd LLM consolidation exhausted retries; heuristic page remains",
+                    );
+                } else {
+                    tracing::warn!(
+                        %error,
+                        session = %session_id,
+                        generation,
+                        attempts,
+                        "SessionEnd LLM consolidation failed; queued for retry",
+                    );
+                }
             }
         }
     }
@@ -364,6 +491,27 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         TransportKind::Http => {
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());
             let cancel = CancellationToken::new();
+            let (session_consolidation_notify, session_consolidation_task) =
+                if config.consolidate_on_session_end {
+                    if let Some(consolidator) = consolidator.clone() {
+                        let notify = Arc::new(tokio::sync::Notify::new());
+                        let task = tokio::spawn(run_session_consolidation_worker(
+                            store.writer.clone(),
+                            consolidator,
+                            notify.clone(),
+                            cancel.child_token(),
+                        ));
+                        info!(
+                            max_attempts = ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
+                            "durable SessionEnd consolidation worker started"
+                        );
+                        (Some(notify), Some(task))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
             let server_clone = server.clone();
             // `Host`-header allowlist for the HTTP DNS-rebinding guard.
             // Sourced from Config (which already handles the
@@ -433,6 +581,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 )),
                 ingest_gates: ai_memory_hooks::IngestGates::default(),
                 consolidate_on_session_end: config.consolidate_on_session_end,
+                session_consolidation_notify,
                 capture_assistant_enabled: config.capture_assistant,
                 subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                     ai_memory_hooks::SubagentSessionSet::default(),
@@ -611,13 +760,21 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                      docs/https-via-proxy.md for copy-paste templates."
                 );
             }
-            axum::serve(listener, router)
+            let shutdown_cancel = cancel.clone();
+            let serve_result = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     info!("ctrl-c received; shutting down");
-                    cancel.cancel();
+                    shutdown_cancel.cancel();
                 })
-                .await?;
+                .await;
+            cancel.cancel();
+            if let Some(task) = session_consolidation_task
+                && let Err(error) = task.await
+            {
+                tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+            }
+            serve_result?;
         }
     }
     Ok(())
@@ -697,12 +854,13 @@ async fn start_maintenance_scheduler(
         }));
     }
 
-    // Hollow-project sweep: deletes project rows with zero data of any
-    // kind (pages, sessions, observations, handoffs) once they are older
-    // than HOLLOW_PROJECT_MIN_AGE_DAYS. Safe by construction — nothing
-    // exists to lose — which is why it runs unconditionally under the
-    // maintenance flag with no extra config. Runs once shortly after
-    // startup (so upgrades clean up immediately) and then daily.
+    // Hollow-project sweep: deletes project rows with no pages, sessions,
+    // observations, handoffs, managed workstreams, or auto-improvement data
+    // once they are older than HOLLOW_PROJECT_MIN_AGE_DAYS. Safe by
+    // construction — nothing exists to lose — which is why it runs
+    // unconditionally under the maintenance flag with no extra config. Runs
+    // once shortly after startup (so upgrades clean up immediately) and then
+    // daily.
     if maintenance_enabled {
         /// A week of grace before a hollow row is considered noise, so a
         /// project created moments before its first real event is never
@@ -1310,7 +1468,10 @@ fn host_without_port(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{PagePath, Tier};
+    use ai_memory_core::{
+        AgentKind, NewObservation, NewSession, ObservationKind, PagePath, Sanitized, Sanitizer,
+        SessionId, Tier,
+    };
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult, SyntheticEmbedder};
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
@@ -1841,6 +2002,155 @@ mod tests {
         {
             Box::pin(async move { panic!("preflight-skipped scheduler test must not call LLM") })
         }
+    }
+
+    struct SuccessfulConsolidationLlm;
+
+    impl LlmProvider for SuccessfulConsolidationLlm {
+        fn name(&self) -> &'static str {
+            "successful-consolidation"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "test".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "title": "Compiled session",
+                    "body_markdown": "Durable worker completed this session.",
+                    "tags": ["test"]
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn session_consolidation_worker_consumes_and_completes_durable_job() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "finish".into(),
+                    body: "complete the durable job".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(SuccessfulConsolidationLlm),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+        ));
+        notify.notify_one();
+
+        let path = format!("sessions/{session_id}.md");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if store
+                    .reader
+                    .page_body_by_ids(workspace_id, project_id, &path)
+                    .await
+                    .unwrap()
+                    .is_some_and(|page| page.body.contains("Durable worker completed"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker should consume the queued job");
+
+        cancel.cancel();
+        task.await.unwrap();
+        let now = jiff::Timestamp::now().as_microsecond();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "completed work must not be claimed again"
+        );
     }
 
     async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {

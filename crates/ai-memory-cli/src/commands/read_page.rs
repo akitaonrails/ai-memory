@@ -37,14 +37,15 @@ struct PageContent {
 /// or neither `--path` nor a query is supplied.
 pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
 
     let page: PageContent = if let Some(ref raw_path) = args.path {
         get_json(
             &ep,
             "/admin/read-page",
             &[
-                ("workspace", args.workspace.as_str()),
+                ("workspace", workspace.as_str()),
                 ("project", project.as_str()),
                 ("path", raw_path.as_str()),
             ],
@@ -55,7 +56,7 @@ pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
             &ep,
             "/admin/read-page",
             &[
-                ("workspace", args.workspace.as_str()),
+                ("workspace", workspace.as_str()),
                 ("project", project.as_str()),
                 ("q", query.as_str()),
             ],

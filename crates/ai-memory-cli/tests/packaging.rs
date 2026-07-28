@@ -283,6 +283,16 @@ fn wrapper_keeps_stdin_attached_when_it_is_a_pipe() {
         !flags.contains(&"-t") && !flags.contains(&"-it"),
         "no TTY may be requested when stdin is a pipe; got {args}"
     );
+    assert!(
+        flags
+            .iter()
+            .any(|arg| arg.starts_with("AI_MEMORY_SCOPE_CWD=/scope")),
+        "an outside-home checkout must expose its bounded marker path; got {args}"
+    );
+    assert!(
+        flags.iter().any(|arg| arg.ends_with(":/scope:ro")),
+        "the marker scope mount must be read-only; got {args}"
+    );
 }
 
 #[test]
@@ -304,6 +314,9 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
         posix.contains("CLAUDE_CODE_SESSION_ID"),
         "POSIX wrapper must forward Claude's session id into the bridge container"
     );
+    assert!(posix.contains("git -C \"${PWD}\" rev-parse --show-toplevel"));
+    assert!(posix.contains("AI_MEMORY_SCOPE_CWD=/scope${SCOPE_REL}"));
+    assert!(posix.contains("${SCOPE_ROOT}:/scope:ro"));
 
     let powershell = read_repo("bin/ai-memory.ps1");
     assert!(
@@ -322,6 +335,8 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
         powershell.contains("\"CLAUDE_CODE_SESSION_ID\""),
         "PowerShell wrapper must forward Claude's session id into the bridge container"
     );
+    assert!(powershell.contains("AI_MEMORY_SCOPE_CWD=$ScopeCwd"));
+    assert!(powershell.contains("${ScopeRoot}:/scope:ro"));
 }
 
 #[cfg(unix)]

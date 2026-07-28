@@ -96,7 +96,7 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 
 **LLM for consolidation passes:**
 - **Off by default**, behaves like agentmemory after #138's fix. Without a provider, the system still works: synthetic compression (rule-based), no LLM-generated summaries, no `memory_consolidate` page-rewrite.
-- With a provider, LLM consolidation runs on PreCompact, on demand via `memory_consolidate`, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true` (off by default — session end always writes a rule-based summary page + handoff regardless). Optional 6h maintenance timer.
+- With a provider, LLM consolidation runs on PreCompact, on demand via `memory_consolidate`, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true` (off by default — session end always writes a rule-based summary page + handoff regardless). SessionEnd provider work is persisted by observation generation and consumed outside the hook request by one bounded retrying worker, so client drain cancellation cannot lose it. The automatic handoff and completed-end watermark commit in one SQLite transaction; an already-ended keyed replay converges the remaining wiki commit, provider enqueue, and ingest-key completion. The completed end also stores the observation count it covered; a resumed session re-enters the end path only after that count advances, avoiding non-convergent wall-clock comparisons. Optional 6h maintenance timer.
 - Providers implement `LlmProvider { complete(...); complete_structured(...) }`. The current provider and authentication matrix lives in [`ARCHITECTURE.md`](ARCHITECTURE.md); this design boundary also covers OpenAI-compatible endpoints such as Ollama, vLLM, and LM Studio.
 - **Native HTTP per provider** - no LiteLLM-equivalent. The cognee tracker (#2412/#2430/#2537/#2608/#2749/#2782/#2840/#2842) showed silent-kwarg-drop in a generic gateway is the #1 source of provider bugs. Each provider's typed JSON, errors on unknown fields. Hand-coded but correct.
 - **Structured output via JSON schema, not XML, not Instructor-style wrapping.** Use each provider's native JSON-mode where available; for Anthropic, request a tool-use response with a typed schema. Validate with `serde_json` + `schemars`-derived schemas.
@@ -140,6 +140,16 @@ Adopt agentmemory's tier model **but** keep the surface narrow:
 | **Procedural** | Repeated patterns extracted from episodic clusters (`pattern` type with frequency ≥ 2) | Indefinite | Frequency-decay if not re-observed in N days |
 
 **Implementation note:** the four tiers map to one `pages` table with a `tier` enum column + an `observations` table for bounded working/episodic projections, not four separate tables. Keeps schema migrations sane.
+
+**Retrieval authority:** tier is also one bounded signal after relevance
+candidate generation. The canonical page-kind classifier, `pinned`, and a
+small built-in tag vocabulary (`canonical`, `active`, `source-of-truth`,
+`superseded`, `historical`, `test-fixture`, `do-not-answer-from`) join it in a
+post-fusion multiplier. This is deliberately not an independent retriever or
+an absolute override: it resolves close contests between durable knowledge and
+episodic evidence without hiding targeted session/history matches. `pinned`
+continues to control retention and automated mutation first; its retrieval
+effect alone is small.
 
 ## 8. Consolidation (the Karpathy bit)
 

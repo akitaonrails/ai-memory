@@ -116,6 +116,23 @@ jobs:
           name: ci-ai-memory-${{ matrix.artifact }}
           path: target/release/ai-memory
 
+  # `cargo install --path` deliberately resolves without the workspace lockfile.
+  # Keep that user-facing path visible alongside the normal lock-aware gates so
+  # an allowed upstream dependency update cannot break source installation.
+  source-install:
+    name: cargo install --path (fresh resolution)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+      - name: Install with a fresh dependency resolution
+        env:
+          TAILWIND_SKIP: "1"
+        run: cargo install --path crates/ai-memory-cli --debug --root target/source-install
+      - name: Smoke test installed binary
+        run: target/source-install/bin/ai-memory --version
+
   native-packaging:
     name: native packaging assets
     runs-on: ubuntu-latest

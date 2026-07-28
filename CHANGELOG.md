@@ -19,10 +19,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the index by a sha-stamped reconciler, and the fs watcher stands down for
   backends without an on-disk root. See `docs/storage-adapters.md`.
 
+## [1.19.2] - 2026-07-28
+
 ### Fixed
-- `cargo install` from a fresh dependency resolve no longer breaks against
-  rmcp 1.8 (its `peer_info()` signature changed); the workspace now targets
-  rmcp 1.8 directly.
+- Source installation no longer fails when `cargo install --path` resolves
+  rmcp 1.8, whose `peer_info()` return type differs from rmcp 1.7. CI now checks
+  the unlocked source-install resolution separately from the workspace's
+  lock-aware gates, while the documented persistent Windows install uses
+  `--locked` for reproducibility. (#285)
+- Antigravity CLI hook installation and documentation now expose the existing
+  agent-aware manual finalizer:
+  `ai-memory finalize-session --agent antigravity-cli`. Antigravity's `Stop`
+  event ends one execution loop rather than the conversation, so it remains a
+  normal observation; the explicit command closes the latest scoped session
+  through the canonical SessionEnd path, producing its summary and automatic
+  handoff and queueing opt-in consolidation. The docs also clarify that
+  `memory_handoff_begin` deliberately creates a session-neutral, project-wide
+  manual handoff for every MCP client; attributed handoffs come from canonical
+  SessionEnd processing. (#284)
+
+## [1.19.1] - 2026-07-27
+
+### Changed
+- Wiki search now applies a bounded source-authority adjustment after FTS5,
+  graph, and optional vector candidate generation. Canonical rules, decisions,
+  procedures, gotchas, semantic/procedural tiers, `pinned` pages, and
+  `canonical` / `active` / `source-of-truth` tags win close relevance contests;
+  episodic sessions, `_lint/` output, investigations, and pages tagged
+  `superseded`, `historical`, `test-fixture`, or `do-not-answer-from` are
+  downgraded but remain searchable. Exact session-only queries still retrieve
+  their evidence, and the returned `rank` includes the bounded adjustment so
+  multi-scope merging preserves the same order. (#269)
+- Client CLI commands now resolve their `(workspace, project)` from the
+  nearest `.ai-memory.toml` marker, not just the lifecycle hooks. Previously
+  only the hook path read the marker, so a checkout declaring
+  `workspace = "acme"` had its captures land in `acme` while `run`,
+  `bootstrap`, `search`, `write-page` and every other scope-taking command
+  resolved into `default` — the same repository split across two scopes, with
+  `ai-memory run`'s managed workstream stranded on the wrong side. Each field
+  still prefers an explicit flag; when the marker decides one, the command
+  announces the resolved scope on stderr, naming which half the marker
+  decided. `AI_MEMORY_IGNORE_MARKER=1` restores the previous resolution for
+  one invocation (client commands only — the hooks keep reading the marker).
+  `embed --force` without `--project` still fans out across the workspace and
+  no longer needs a derivable project name. `ai-memory serve` is unchanged:
+  it has no caller cwd, and its `--workspace` / `--project` remain the baked
+  fallback for hook events without a usable one. (#259)
+- Marker discovery now stays inside its trust boundary when the caller's cwd
+  is outside `$HOME`: it walks no higher than the nearest checkout root, or
+  checks only cwd for a non-git directory. Workspace-only markers also keep
+  the hooks' documented `project = basename(cwd)` behavior for CLI commands,
+  including subdirectories and linked worktrees. (#259)
+
+### Fixed
+- Scheduled hollow-project cleanup now treats managed workstreams as project
+  data. Older projects whose only history is a managed workstream, including
+  those with a live run, are no longer cascade-deleted out from under the
+  workstream heartbeat or left with orphaned transcript segments. (#279)
+- Hybrid search now gives its FTS, vector, and graph streams the same bounded
+  candidate window used by authority-aware FTS search. Small result limits no
+  longer exclude a canonical page before post-fusion authority ranking can
+  promote it, and candidate-limit arithmetic is saturating throughout. (#277)
+- Forced workspace deletion now removes the immutable managed-workstream
+  segment directories whose database rows are removed by the workspace
+  cascade. Its admin report includes workstream/run counts and IDs, and raw
+  segment cleanup participates in the existing filesystem partial-failure
+  reporting instead of leaving transcript data orphaned. (#275)
+- Lossless `move-project` true moves now re-stamp managed workstreams into the
+  destination workspace in the same transaction as the project and its other
+  denormalized child rows. Previously the project moved while its managed
+  workstreams retained the source `workspace_id`, hiding portable history from
+  destination-scope lookup and violating the project/workspace pairing
+  invariant. The admin response now reports `workstreams_moved`. (#273)
+- SessionEnd recovery now commits the ended generation and automatic handoff in
+  one SQLite transaction, then lets an already-ended native replay converge the
+  remaining wiki commit, durable consolidation enqueue, and ingest-key
+  completion. An interruption after `ended_at` can no longer strand a missing
+  handoff or permanently pending spool key, and missing or scope/agent-
+  mismatched SessionEnd events no longer attempt consolidation recovery against
+  an unrelated session. (#271)
+- Bare `install-hooks --apply` re-runs, including the Docker wrapper's
+  post-upgrade refresh, now preserve an install's baked `repo-root` project
+  strategy for every supported hook integration. An explicit
+  `--project-strategy basename` still removes the install-wide default. (#267)
+- Installer `--apply` modes now write through symlinked agent configuration
+  files instead of atomically replacing the symlink itself. Symlink chains and
+  dangling final targets are preserved, while backups remain next to the
+  user-facing configuration path. (#264)
+- SessionEnd re-consolidation now converges by comparing the current
+  observation count with a persisted count stamped by the latest completed
+  end, instead of comparing independently generated wall-clock timestamps.
+  Clock skew could otherwise leave an old observation permanently "new" and
+  repeatedly rewrite the same session page, handoff, and opt-in LLM job with no
+  agent activity. Existing ended sessions are baselined during migration so an
+  upgrade does not enqueue historical catch-up work. (#268)
+- Capture exclusions now canonicalize an existing hook working directory
+  before matching paths, so filesystem aliases such as macOS `/var` versus
+  `/private/var` cannot turn an excluded file event into a spooled event.
+  Marker discovery tests likewise accept the canonical path they request.
+  (#265)
+- Opt-in SessionEnd LLM consolidation now runs from a durable, generation-
+  idempotent queue instead of inside the hook batch request. The hook commits
+  its deterministic session page and handoff, persists the provider job, and
+  returns without waiting for LLM latency; a single bounded worker recovers
+  queued or expired-lease work after restart and makes at most five provider
+  attempts with backoff. A stale SessionEnd redelivery also repairs the
+  enqueue when the original request was cancelled just after `ended_at`, so
+  the default hook drain timeout can no longer silently strand the heuristic
+  page as the final result. (#265)
+- `purge-project` no longer deletes a project out from under a running agent.
+  `workstreams` cascades from `projects` and `managed_runs` cascades from
+  `workstreams`, so purging a scope that still held a live managed run tore
+  out its lease row: the wrapper then failed every heartbeat with
+  `409 managed run lease is not active` and the session's transcript never
+  reached the ledger. The purge now refuses with a `409` naming the offending
+  workstreams unless `--force` is passed, and its report counts the
+  `workstreams` and `managed_runs` the cascade removes; their
+  `raw/workstreams/<id>/` directories are now removed server-side and included
+  in the same filesystem success/failure report instead of being orphaned.
+  Those counters previously showed `0 pages, 0 sessions, …` and made such a
+  scope look safe to delete. Liveness is the lease, not the row state: a
+  crashed wrapper leaves `state = 'active'` behind until the next
+  `ai-memory run` sweeps it, so only a lease that has not yet expired blocks
+  the purge. `move-project`'s
+  copy-purge merge surfaces the same conflict as a `409` naming how many
+  pages were already copied, instead of a `500`; its `--force` flag only
+  overrides the active-project guard and never destroys a live managed-run
+  lease. (#259)
 
 ## [1.19.0] - 2026-07-25
 
@@ -2400,7 +2523,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.19.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.19.2...HEAD
+[1.19.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.2
+[1.19.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.1
 [1.19.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.0
 [1.18.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.18.0
 [1.17.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.3

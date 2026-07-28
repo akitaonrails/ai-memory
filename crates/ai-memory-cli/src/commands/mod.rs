@@ -56,7 +56,160 @@ pub mod user;
 pub mod workstream_search;
 pub mod write_page;
 
+/// Resolve the effective `(workspace, project)` pair for a client command.
+///
+/// Each field is resolved independently, in this order:
+///
+/// 1. The explicit flag (`--workspace` / `--project`) when non-empty.
+/// 2. The nearest `.ai-memory.toml` marker: `workspace`, and `project` —
+///    or the hook-compatible derived project when the marker leaves it
+///    unpinned (`basename(cwd)` by default, main repo root for `repo-root`).
+/// 3. Today's fallbacks: [`crate::config::DEFAULT_WORKSPACE`] and
+///    [`resolve_project_name`]'s cwd chain.
+///
+/// Rung 2 is why this function exists. Before it, only the lifecycle hooks
+/// read the marker, so a checkout declaring `workspace = "acme"` still had
+/// every CLI command resolve into `default` — the same repository ended up
+/// split across two scopes, with `run`'s managed workstream on one side and
+/// the hook-captured sessions on the other.
+///
+/// Resolution is announced on stderr whenever the marker decides a field, so
+/// a scope that differs from the flags the user typed is never silent.
+/// `AI_MEMORY_IGNORE_MARKER=1` skips rung 2 entirely.
+pub(crate) fn resolve_scope(
+    config: &Config,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+) -> Result<(String, String)> {
+    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
+    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
+    // Both halves pinned on the command line: the marker cannot change the
+    // answer, so skip the walk and the file reads entirely.
+    if let (Some(workspace), Some(project)) = (explicit_ws, explicit_proj) {
+        return Ok((workspace.to_string(), project.to_string()));
+    }
+    let marker = marker_scope(config);
+
+    let mut decided: Vec<&str> = Vec::with_capacity(2);
+    let workspace = match explicit_ws {
+        Some(explicit) => explicit.to_string(),
+        None => match marker
+            .as_ref()
+            .and_then(|(scope, _, _)| scope.workspace.clone())
+        {
+            Some(declared) => {
+                decided.push("workspace");
+                declared
+            }
+            None => crate::config::DEFAULT_WORKSPACE.to_string(),
+        },
+    };
+
+    let project = match explicit_proj {
+        Some(explicit) => explicit.to_string(),
+        None => {
+            // A marker's explicit `project` pins the name for its whole tree.
+            // Otherwise derive exactly as the hook does: basename(cwd) by
+            // default, or the main repository root for `repo-root`.
+            let declared = marker
+                .as_ref()
+                .and_then(|(scope, identity_cwd, lookup_cwd)| {
+                    scope.project.clone().or_else(|| {
+                        if scope.is_repo_root() {
+                            crate::marker::repo_root_project(lookup_cwd)
+                        } else {
+                            ai_memory_consolidate::derive_project_name(
+                                std::path::Path::new(identity_cwd),
+                                ai_memory_consolidate::ProjectNameStrategy::Basename,
+                            )
+                            .map(|(name, _)| name)
+                        }
+                    })
+                });
+            match declared {
+                Some(name) => {
+                    decided.push("project");
+                    name
+                }
+                None => resolve_project_name(config, None)?,
+            }
+        }
+    };
+
+    if let Some((scope, _, _)) = marker.as_ref().filter(|_| !decided.is_empty()) {
+        // Name only the halves the marker actually decided: an explicit flag
+        // that was honoured must not read as if the file overrode it.
+        eprintln!(
+            "ai-memory: scope {workspace}/{project} ({} from {})",
+            decided.join(" + "),
+            scope.path.display()
+        );
+    }
+    Ok((workspace, project))
+}
+
+/// Resolve only the workspace half, for the one command whose project half is
+/// deliberately absent (`embed --force` fans out across every project in the
+/// workspace). Resolving the pair there would make the command fail on the
+/// cwd-derived project name it is about to throw away.
+pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> String {
+    if let Some(explicit) = explicit_ws.filter(|s| !s.is_empty()) {
+        return explicit.to_string();
+    }
+    match marker_scope(config) {
+        Some((scope, _, _)) => match scope.workspace {
+            Some(declared) => {
+                eprintln!(
+                    "ai-memory: workspace {declared} (workspace from {})",
+                    scope.path.display()
+                );
+                declared
+            }
+            None => crate::config::DEFAULT_WORKSPACE.to_string(),
+        },
+        None => crate::config::DEFAULT_WORKSPACE.to_string(),
+    }
+}
+
+/// The nearest scope-declaring marker plus the cwd the walk started from.
+fn marker_scope(config: &Config) -> Option<(crate::marker::MarkerScope, String, String)> {
+    let identity_cwd = scope_cwd(config)?;
+    // The Docker wrapper preserves the host cwd for identity but binds the
+    // checkout at /work. Check the host path when its bounded root is mounted;
+    // otherwise use the physical cwd so a marker in the /work bind is still
+    // visible. Project derivation keeps using the host identity either way.
+    let lookup_cwd = if let Some(scope_cwd) = config.runtime_env.scope_cwd() {
+        scope_cwd.to_string()
+    } else if std::path::Path::new(&identity_cwd).exists() {
+        identity_cwd.clone()
+    } else {
+        std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.to_string_lossy().into_owned())?
+    };
+    let scope = crate::marker::read_scope(&lookup_cwd, &config.runtime_env)?;
+    Some((scope, identity_cwd, lookup_cwd))
+}
+
+/// The directory marker discovery walks up from.
+///
+/// Prefers `AI_MEMORY_HOST_CWD` for the same reason [`resolve_project_name`]
+/// does: inside the docker wrapper the container's own `current_dir()` is the
+/// `/work` bind mount, which would find the wrong marker (or none).
+fn scope_cwd(config: &Config) -> Option<String> {
+    if let Some(host_cwd) = config.runtime_env.host_cwd() {
+        return Some(host_cwd.to_string());
+    }
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.to_string_lossy().into_owned())
+}
+
 /// Resolve the effective project name for a client command.
+///
+/// Prefer [`resolve_scope`] for new call sites: this resolves only half the
+/// scope and never consults the marker, so a command that uses it alone still
+/// pairs its project with whatever workspace the caller passed.
 ///
 /// Precedence:
 /// 1. `explicit` (the user's `--project` flag) when non-empty.
@@ -159,5 +312,150 @@ mod tests {
         };
 
         assert_eq!(resolve_project_name(&config, None).unwrap(), "my-project");
+    }
+
+    /// Build a config whose scope resolution walks up from `cwd`, and drop a
+    /// marker there when `marker` is given.
+    fn config_at(dir: &std::path::Path, marker: Option<&str>) -> Config {
+        if let Some(body) = marker {
+            std::fs::write(dir.join(".ai-memory.toml"), body).unwrap();
+        }
+        Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(dir.to_str().unwrap()),
+            ..Config::default()
+        }
+    }
+
+    /// The bug this whole path exists for: a checkout whose marker declares a
+    /// workspace used to resolve into `default` for every CLI command, while
+    /// the lifecycle hooks — the only marker reader at the time — sent that
+    /// same checkout's captures to the declared workspace.
+    #[test]
+    fn resolve_scope_takes_the_workspace_from_the_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(tmp.path(), Some("workspace = \"acme\"\n"));
+
+        let (workspace, project) = resolve_scope(&config, None, None).unwrap();
+
+        assert_eq!(workspace, "acme");
+        assert_eq!(
+            project,
+            tmp.path().file_name().unwrap().to_str().unwrap(),
+            "an unpinned project still comes from the cwd chain"
+        );
+    }
+
+    #[test]
+    fn workspace_only_marker_uses_hook_basename_from_a_subdirectory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".ai-memory.toml"), "workspace = \"acme\"\n").unwrap();
+        let subdir = tmp.path().join("crates").join("cli");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(subdir.to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("acme".to_string(), "cli".to_string())
+        );
+        assert_eq!(
+            resolve_scope(&config, Some("flagged"), None).unwrap(),
+            ("flagged".to_string(), "cli".to_string()),
+            "an explicit workspace must not restore the main-repo fallback"
+        );
+    }
+
+    #[test]
+    fn workspace_only_marker_uses_linked_worktree_directory_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("feature-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: /repo/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        std::fs::write(worktree.join(".ai-memory.toml"), "workspace = \"acme\"\n").unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(worktree.to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("acme".to_string(), "feature-worktree".to_string()),
+            "workspace-only markers preserve the hook's basename worktree identity"
+        );
+    }
+
+    /// A marker that pins `project` overrides the cwd-derived name for its
+    /// whole tree.
+    #[test]
+    fn resolve_scope_takes_a_pinned_project_from_the_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(
+            tmp.path(),
+            Some("workspace = \"acme\"\nproject = \"pinned\"\n"),
+        );
+
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("acme".to_string(), "pinned".to_string())
+        );
+    }
+
+    /// Explicit flags are rung 1: they beat the marker on both halves, and
+    /// each half is resolved independently.
+    #[test]
+    fn resolve_scope_prefers_explicit_flags_over_the_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(
+            tmp.path(),
+            Some("workspace = \"acme\"\nproject = \"pinned\"\n"),
+        );
+
+        assert_eq!(
+            resolve_scope(&config, Some("flagged"), Some("flagged-proj")).unwrap(),
+            ("flagged".to_string(), "flagged-proj".to_string())
+        );
+        assert_eq!(
+            resolve_scope(&config, Some("flagged"), None).unwrap(),
+            ("flagged".to_string(), "pinned".to_string()),
+            "an explicit workspace must not drag the project along with it"
+        );
+        assert_eq!(
+            resolve_scope(&config, None, Some("flagged-proj")).unwrap(),
+            ("acme".to_string(), "flagged-proj".to_string()),
+            "and vice versa"
+        );
+    }
+
+    /// No marker means the previous behaviour, byte for byte.
+    #[test]
+    fn resolve_scope_without_a_marker_keeps_the_old_fallbacks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(tmp.path(), None);
+
+        let (workspace, project) = resolve_scope(&config, None, None).unwrap();
+
+        assert_eq!(workspace, crate::config::DEFAULT_WORKSPACE);
+        assert_eq!(project, tmp.path().file_name().unwrap().to_str().unwrap());
+    }
+
+    /// A marker carrying only `[capture]` rules declares no scope, so it must
+    /// not pull the command out of the default workspace.
+    #[test]
+    fn resolve_scope_ignores_a_marker_without_scope_keys() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(
+            tmp.path(),
+            Some("[capture]\nignore_paths = [\"secret/**\"]\n"),
+        );
+
+        let (workspace, _) = resolve_scope(&config, None, None).unwrap();
+
+        assert_eq!(workspace, crate::config::DEFAULT_WORKSPACE);
     }
 }

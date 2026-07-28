@@ -95,7 +95,7 @@
   <rect class="reader" x="555" y="535" width="345" height="110" />
   <text class="box-title" x="580" y="568">Read pool and retrieval</text>
   <text class="box-text" x="580" y="594">FTS5 + graph-neighbor RRF</text>
-  <text class="box-text" x="580" y="615">optional vector RRF + raw fallback</text>
+  <text class="box-text" x="580" y="615">vector RRF + authority + raw fallback</text>
 
   <rect class="job" x="960" y="535" width="300" height="110" />
   <text class="box-title" x="985" y="568">Lifecycle and scheduled jobs</text>

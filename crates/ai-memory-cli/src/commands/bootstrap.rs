@@ -73,8 +73,9 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     }
 
     // ---- project — auto-derive from repo basename if absent -------
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
-    info!(workspace = %args.workspace, project = %project, repo_path = %repo_path.display(), git = has_git, "bootstrap target");
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
+    info!(workspace = %workspace, project = %project, repo_path = %repo_path.display(), git = has_git, "bootstrap target");
 
     // ---- collect sources locally ----------------------------------
     let sources = collect_sources(
@@ -122,7 +123,7 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
             args.max_input_tokens,
             args.chunk_input_tokens,
         );
-        print_human_report(&outcome, &args.workspace, &project);
+        print_human_report(&outcome, &workspace, &project);
         let report = serde_json::to_string_pretty(&outcome)?;
         println!("\n--- machine-readable ---\n{report}");
         return Ok(());
@@ -130,7 +131,7 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
 
     // ---- POST to server -------------------------------------------
     let body = serde_json::json!({
-        "workspace": args.workspace,
+        "workspace": workspace,
         "project": project,
         "sources": sources,
         "sources_collected": collected,
@@ -141,7 +142,7 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     });
     let outcome: BootstrapOutcome = post_json(&ep, "/admin/bootstrap", &body).await?;
 
-    print_human_report(&outcome, &args.workspace, &project);
+    print_human_report(&outcome, &workspace, &project);
     let report = serde_json::to_string_pretty(&outcome)?;
     println!("\n--- machine-readable ---\n{report}");
     Ok(())

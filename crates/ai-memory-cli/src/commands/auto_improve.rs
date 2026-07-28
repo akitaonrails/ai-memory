@@ -61,10 +61,11 @@ struct ProposalOutcome {
 /// Returns an error if the server is unreachable or rejects the review request.
 pub async fn run(config: &Config, args: AutoImproveArgs) -> Result<()> {
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let settings = &config.auto_improve;
     let request = AutoImproveRequest {
-        workspace: args.workspace,
+        workspace,
         project: project.clone(),
         session_id: args.session_id,
         min_observations: args.min_observations.unwrap_or(settings.min_observations),

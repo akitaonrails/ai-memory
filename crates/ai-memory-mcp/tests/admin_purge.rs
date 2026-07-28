@@ -9,7 +9,7 @@ use ai_memory_core::{
     Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_mcp::{AdminState, admin_router};
-use ai_memory_store::{DecayParams, Store};
+use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
 use ai_memory_wiki::{
     AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig, Wiki, WritePageRequest,
 };
@@ -18,6 +18,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::post as route_post;
 use serde_json::json;
+use std::path::Path;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -306,6 +307,74 @@ async fn purge_project_deletes_data_and_files() {
     assert!(
         !proj_dir.exists(),
         "project directory must be removed after purge"
+    );
+}
+
+#[tokio::test]
+async fn purge_project_removes_raw_workstream_segments() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let (workspace_id, _keep, project_id) = seed_two_projects(&store, &state.wiki).await;
+    let prepared = store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            workspace_id,
+            project_id,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: vec![AgentKind::Codex],
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .cancel_managed_run(prepared.run_id)
+            .await
+            .unwrap()
+    );
+    let raw_dir = tmp
+        .path()
+        .join("raw/workstreams")
+        .join(prepared.workstream_id.to_string());
+    std::fs::create_dir_all(&raw_dir).unwrap();
+    std::fs::write(raw_dir.join("000001.jsonl"), "event\n").unwrap();
+
+    let resp = post(
+        state,
+        "/admin/purge-project",
+        json!({ "workspace": "default", "project": "doomed", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+
+    assert!(
+        !raw_dir.exists(),
+        "raw workstream directory must be removed"
+    );
+    assert_eq!(body["workstreams_deleted"], 1);
+    assert_eq!(body["managed_runs_deleted"], 1);
+    assert_eq!(
+        body["workstream_ids"],
+        json!([prepared.workstream_id.to_string()])
+    );
+    let raw_suffix = Path::new("raw")
+        .join("workstreams")
+        .join(prepared.workstream_id.to_string());
+    assert!(
+        body["files_deleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.as_str())
+            .any(|path| Path::new(path).ends_with(&raw_suffix)),
+        "raw cleanup must be visible in the report: {body}"
     );
 }
 
