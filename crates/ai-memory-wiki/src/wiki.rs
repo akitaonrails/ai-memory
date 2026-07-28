@@ -10,13 +10,16 @@ use ai_memory_core::{
 use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    FailAutoImproveProposal, MoveSummary, ReaderPool, WriterHandle, artifact_path_for,
-    f32_vec_to_bytes,
+    ContentBackend, FailAutoImproveProposal, MoveSummary, ReaderPool, WriterHandle,
+    artifact_path_for, f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
 use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
 use crate::atomic;
+use crate::backend::{
+    FsContentBackend, replace_file_with_rollback_snapshot, rollback_or_inconsistent,
+};
 use crate::error::{WikiError, WikiResult};
 use crate::git::{Checkpoint, GitAdapter};
 use crate::markdown::{Markdown, derive_title, emit, extract_links, parse};
@@ -51,6 +54,11 @@ pub struct ReindexSummary {
 pub struct Wiki {
     root: PathBuf,
     writer: WriterHandle,
+    /// Content source-of-truth backend. Defaults to the filesystem
+    /// backend (markdown + index with rollback); the Outl backend is
+    /// injected via [`Wiki::with_content_backend`] when
+    /// `[storage] backend = "outl"`.
+    content: Arc<dyn ContentBackend>,
     git: GitAdapter,
     embedder: Option<Arc<dyn Embedder>>,
     /// Privacy strip applied to every page body before persistence.
@@ -88,9 +96,11 @@ impl Wiki {
         let root = data_dir.join("wiki");
         std::fs::create_dir_all(&root)?;
         let git = GitAdapter::open_or_init(&root)?;
+        let content = Arc::new(FsContentBackend::new(root.clone(), writer.clone()));
         Ok(Self {
             root,
             writer,
+            content,
             git,
             embedder: None,
             sanitizer: Sanitizer::builtin(),
@@ -125,6 +135,16 @@ impl Wiki {
     #[must_use]
     pub fn with_store_reader(mut self, reader: ReaderPool) -> Self {
         self.store_reader = Some(reader);
+        self
+    }
+
+    /// Replace the default filesystem content backend with an
+    /// alternative source of truth (e.g. the Outl backend). The engine
+    /// keeps orchestrating sanitize/admission/embedding; only the
+    /// persistence of page content is swapped.
+    #[must_use]
+    pub fn with_content_backend(mut self, content: Arc<dyn ContentBackend>) -> Self {
+        self.content = content;
         self
     }
 
@@ -256,53 +276,14 @@ impl Wiki {
             None
         };
 
-        let src = self.project_root(from_workspace, project_id);
-        let dst = self.project_root(to_workspace, project_id);
-
-        if dst.exists() {
-            return Err(crate::WikiError::DestinationExists(
-                dst.display().to_string(),
-            ));
+        let summary = self
+            .content
+            .move_project(project_id, from_workspace, to_workspace)
+            .await?;
+        if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+            chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
         }
-
-        let renamed = if src.exists() {
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::rename(&src, &dst)?;
-            true
-        } else {
-            // Nothing on disk to move (a project with zero written pages).
-            false
-        };
-
-        match self
-            .writer
-            .move_project_workspace(project_id, from_workspace, to_workspace)
-            .await
-        {
-            Ok(summary) => {
-                if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
-                    chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
-                }
-                Ok(summary)
-            }
-            Err(e) => {
-                if renamed {
-                    if let Some(parent) = src.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    if let Err(rollback_err) = std::fs::rename(&dst, &src) {
-                        return Err(crate::WikiError::Io(std::io::Error::other(format!(
-                            "INCONSISTENT STATE: files moved but DB re-stamp failed ({e}) and dir rename-back also failed ({rollback_err}); manually move {} -> {} or finish the re-stamp",
-                            dst.display(),
-                            src.display()
-                        ))));
-                    }
-                }
-                Err(e.into())
-            }
-        }
+        Ok(summary)
     }
 
     async fn ensure_project_workspace(
@@ -328,20 +309,26 @@ impl Wiki {
             .join(path.as_str())
     }
 
-    /// Read the page at `path` from disk for the given project.
+    /// Read the page at `path` from the content source of truth for the
+    /// given project.
     ///
     /// # Errors
-    /// Returns [`WikiError::Io`] if the file is missing or unreadable, or
+    /// Returns [`WikiError::Io`] if the page is missing or unreadable, or
     /// [`WikiError::Yaml`] if the frontmatter block is malformed.
-    pub fn read_page(
+    pub async fn read_page(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         path: &PagePath,
     ) -> WikiResult<Markdown> {
-        let abs = self.abs_path(workspace_id, project_id, path);
-        let raw = std::fs::read_to_string(&abs)?;
-        parse(&raw)
+        let content = self
+            .content
+            .read_page(workspace_id, project_id, path)
+            .await?;
+        Ok(Markdown {
+            frontmatter: content.frontmatter,
+            body: content.body,
+        })
     }
 
     /// Restore one page from a git checkpoint and reindex it into the store.
@@ -474,34 +461,9 @@ impl Wiki {
             chain.notify(Some(path.as_str()), &ctx).await?;
             resolved_ctx = Some(ctx);
         }
-        let abs = self.abs_path(workspace_id, project_id, path);
-        let quarantined = match quarantine_file(&abs) {
-            Ok(path) => path,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(crate::WikiError::Io(e)),
-        };
-
-        let delete_result = self
-            .writer
+        self.content
             .delete_page(workspace_id, project_id, path.clone(), author_id)
-            .await;
-        if let Err(e) = delete_result {
-            if let Some(quarantine) = &quarantined
-                && let Err(restore_err) = std::fs::rename(quarantine, &abs)
-            {
-                tracing::error!(
-                    path = %path.as_str(),
-                    quarantine = %quarantine.display(),
-                    error = %restore_err,
-                    "delete_page: DB delete failed and restoring quarantined file also failed"
-                );
-            }
-            return Err(e.into());
-        }
-
-        if let Some(quarantine) = quarantined {
-            std::fs::remove_file(&quarantine)?;
-        }
+            .await?;
 
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
             chain.dispatch_async(Some(path.as_str()), &serde_json::Value::Null, "", ctx);
@@ -621,12 +583,10 @@ impl Wiki {
         project_id: ProjectId,
     ) -> WikiResult<()> {
         let _guard = self.mutation_lock.write().await;
-        let root = self.project_root(workspace_id, project_id);
-        match std::fs::remove_dir_all(&root) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(crate::WikiError::Io(e)),
-        }
+        self.content
+            .remove_project(workspace_id, project_id)
+            .await?;
+        Ok(())
     }
 
     /// Remove a workspace's on-disk directory (`<wiki_root>/<ws>`), including
@@ -637,12 +597,8 @@ impl Wiki {
     /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
     pub async fn remove_workspace_dir(&self, workspace_id: WorkspaceId) -> WikiResult<()> {
         let _guard = self.mutation_lock.write().await;
-        let root = self.root.join(workspace_id.to_string());
-        match std::fs::remove_dir_all(&root) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(crate::WikiError::Io(e)),
-        }
+        self.content.remove_workspace(workspace_id).await?;
+        Ok(())
     }
 
     /// Dispatch non-blocking purge webhooks after the caller's purge has
@@ -851,7 +807,7 @@ impl Wiki {
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
 
-        let md = self.read_page(workspace_id, project_id, &path)?;
+        let md = self.read_page(workspace_id, project_id, &path).await?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
         // Markdown is the source of truth: preserve explicit tier/pinned
@@ -1049,14 +1005,10 @@ impl Wiki {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        // Pre-compute markdown for each request. Filesystem work happens only
+        // Pre-compute markdown for each request. Persistence happens only
         // after the mutation guard + project/workspace validation below.
-        let mut staged: Vec<(
-            WritePageRequest,
-            String,
-            std::path::PathBuf,
-            Option<AdmissionContext>,
-        )> = Vec::with_capacity(requests.len());
+        let mut staged: Vec<(WritePageRequest, String, Option<AdmissionContext>)> =
+            Vec::with_capacity(requests.len());
         for mut req in requests {
             // Defence-in-depth scrub at the batch boundary too.
             req.body = self.sanitizer.scrub(&req.body);
@@ -1098,82 +1050,45 @@ impl Wiki {
                 .take()
                 .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &req.path));
             let emitted = emit(&markdown)?;
-            let abs = self.abs_path(req.workspace_id, req.project_id, &req.path);
             req.frontmatter = markdown.frontmatter;
             req.body = markdown.body;
             let req_with_title = WritePageRequest {
                 title: Some(title),
                 ..req
             };
-            staged.push((req_with_title, emitted, abs, resolved_ctx));
+            staged.push((req_with_title, emitted, resolved_ctx));
         }
 
         let (ids, dispatches) = {
             let _guard = self.mutation_lock.read().await;
-            let mut staged_files: Vec<(
-                WritePageRequest,
-                tempfile::NamedTempFile,
-                std::path::PathBuf,
-                Option<AdmissionContext>,
-            )> = Vec::with_capacity(staged.len());
-            for (req, emitted, abs, ctx) in staged {
+            let mut batch: Vec<(ai_memory_core::NewPage, String)> =
+                Vec::with_capacity(staged.len());
+            let mut dispatches = Vec::with_capacity(staged.len());
+            for (req, emitted, ctx) in staged {
                 self.ensure_project_workspace(req.workspace_id, req.project_id)
                     .await?;
-                let parent = abs.parent().ok_or_else(|| {
-                    ai_memory_wiki_error("page path has no parent (cannot stage tempfile)")
-                })?;
-                std::fs::create_dir_all(parent)?;
-                let mut tmp = tempfile::Builder::new()
-                    .prefix(".ai-memory-tmp.")
-                    .tempfile_in(parent)?;
-                use std::io::Write as _;
-                tmp.write_all(emitted.as_bytes())?;
-                tmp.as_file().sync_data()?;
-                staged_files.push((req, tmp, abs, ctx));
-            }
-
-            // Build NewPage batch with the precomputed titles.
-            let pages: Vec<ai_memory_core::NewPage> = staged_files
-                .iter()
-                .map(|(req, _, _, _)| ai_memory_core::NewPage {
-                    workspace_id: req.workspace_id,
-                    project_id: req.project_id,
-                    path: req.path.clone(),
-                    title: req.title.clone().unwrap_or_default(),
-                    body: req.body.clone(),
-                    tier: req.tier,
-                    frontmatter_json: req.frontmatter.clone(),
-                    pinned: req.pinned,
-                    links: extract_links(&req.body, &req.path),
-                    author_id: req.author_id,
-                })
-                .collect();
-
-            // Install files first so the DB is never ahead of markdown. If the
-            // SQL batch fails below, rollback restores the prior disk state;
-            // if the process crashes in this window, startup/reindex repairs
-            // the derived DB from the markdown source of truth.
-            let mut installed = Vec::with_capacity(staged_files.len());
-            let mut dispatches = Vec::with_capacity(staged_files.len());
-            for (req, tmp, abs, ctx) in staged_files {
-                let install = match persist_tmp_with_rollback_snapshot(tmp, &abs) {
-                    Ok(install) => install,
-                    Err(e) => {
-                        rollback_or_inconsistent(&installed, &e)?;
-                        return Err(e);
-                    }
-                };
-                installed.push(install);
+                batch.push((
+                    ai_memory_core::NewPage {
+                        workspace_id: req.workspace_id,
+                        project_id: req.project_id,
+                        path: req.path.clone(),
+                        title: req.title.clone().unwrap_or_default(),
+                        body: req.body.clone(),
+                        tier: req.tier,
+                        frontmatter_json: req.frontmatter.clone(),
+                        pinned: req.pinned,
+                        links: extract_links(&req.body, &req.path),
+                        author_id: req.author_id,
+                    },
+                    emitted,
+                ));
                 dispatches.push((req.path, req.frontmatter, req.body, ctx));
             }
 
-            let ids = match self.writer.upsert_pages_batch(pages).await {
-                Ok(ids) => ids,
-                Err(e) => {
-                    rollback_or_inconsistent(&installed, &e)?;
-                    return Err(e.into());
-                }
-            };
+            // The backend stages + installs the SoT writes and commits the
+            // index rows in one transaction, rolling the SoT back (where it
+            // can) when the index write fails.
+            let ids = self.content.persist_pages_batch(batch).await?;
 
             (ids, dispatches)
         };
@@ -1285,34 +1200,23 @@ impl Wiki {
             let _guard = self.mutation_lock.read().await;
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
-            let abs = self.abs_path(workspace_id, project_id, &path);
-            if let Some(parent) = abs.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let installed = replace_file_with_rollback_snapshot(&abs, emitted.as_bytes())?;
-
-            match self
-                .writer
-                .upsert_page(NewPage {
-                    workspace_id,
-                    project_id,
-                    path,
-                    title,
-                    body: final_body.clone(),
-                    tier,
-                    frontmatter_json: final_frontmatter,
-                    pinned,
-                    links,
-                    author_id,
-                })
-                .await
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    rollback_or_inconsistent(std::slice::from_ref(&installed), &e)?;
-                    return Err(e.into());
-                }
-            }
+            self.content
+                .persist_page(
+                    NewPage {
+                        workspace_id,
+                        project_id,
+                        path,
+                        title,
+                        body: final_body.clone(),
+                        tier,
+                        frontmatter_json: final_frontmatter,
+                        pinned,
+                        links,
+                        author_id,
+                    },
+                    emitted,
+                )
+                .await?
         };
         // Embed if configured. We do this on the caller's task so the
         // tool reply still happens "indexes commit in the same
@@ -1501,99 +1405,6 @@ fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult
         patch,
         detail.body_markdown,
     ))
-}
-
-#[derive(Debug)]
-struct InstalledFile {
-    path: PathBuf,
-    previous: Option<Vec<u8>>,
-}
-
-fn snapshot_existing_file(path: &Path) -> WikiResult<Option<Vec<u8>>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(WikiError::Io(e)),
-    }
-}
-
-fn sync_parent_best_effort(path: &Path) {
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
-}
-
-fn persist_tmp_with_rollback_snapshot(
-    tmp: tempfile::NamedTempFile,
-    path: &Path,
-) -> WikiResult<InstalledFile> {
-    let previous = snapshot_existing_file(path)?;
-    let persisted = tmp.persist(path)?;
-    persisted.sync_data()?;
-    sync_parent_best_effort(path);
-    Ok(InstalledFile {
-        path: path.to_path_buf(),
-        previous,
-    })
-}
-
-fn replace_file_with_rollback_snapshot(path: &Path, bytes: &[u8]) -> WikiResult<InstalledFile> {
-    let previous = snapshot_existing_file(path)?;
-    atomic::write_atomic(path, bytes)?;
-    Ok(InstalledFile {
-        path: path.to_path_buf(),
-        previous,
-    })
-}
-
-fn rollback_installed_files(installed: &[InstalledFile]) -> WikiResult<()> {
-    for file in installed.iter().rev() {
-        match &file.previous {
-            Some(bytes) => {
-                atomic::write_atomic(&file.path, bytes)?;
-            }
-            None => match std::fs::remove_file(&file.path) {
-                Ok(()) => sync_parent_best_effort(&file.path),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(WikiError::Io(e)),
-            },
-        }
-    }
-    Ok(())
-}
-
-fn rollback_or_inconsistent<E: std::fmt::Display>(
-    installed: &[InstalledFile],
-    cause: &E,
-) -> WikiResult<()> {
-    if let Err(rollback_err) = rollback_installed_files(installed) {
-        return Err(WikiError::Io(std::io::Error::other(format!(
-            "INCONSISTENT STATE: wiki files changed but store write failed ({cause}) and rollback failed ({rollback_err})"
-        ))));
-    }
-    Ok(())
-}
-
-fn quarantine_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
-    let Some(parent) = path.parent() else {
-        return Err(std::io::Error::other(
-            "page path has no parent (cannot quarantine delete)",
-        ));
-    };
-    let tmp = tempfile::Builder::new()
-        .prefix(".ai-memory-delete.")
-        .tempfile_in(parent)?;
-    let (_file, quarantine) = tmp.keep().map_err(|e| e.error)?;
-    std::fs::remove_file(&quarantine)?;
-    match std::fs::rename(path, &quarantine) {
-        Ok(()) => Ok(Some(quarantine)),
-        Err(e) => {
-            let _ = std::fs::remove_file(&quarantine);
-            Err(e)
-        }
-    }
 }
 
 fn scrub_frontmatter_strings(value: &mut serde_json::Value, sanitizer: &Sanitizer) {
@@ -2021,7 +1832,7 @@ mod tests {
         request.pinned = true;
         let id = wiki.write_page(request).await.unwrap();
 
-        let md = wiki.read_page(ws, proj, &path).unwrap();
+        let md = wiki.read_page(ws, proj, &path).await.unwrap();
         assert_eq!(md.frontmatter["tier"], "episodic");
         assert_eq!(md.frontmatter["pinned"], true);
         let id2 = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
@@ -2045,7 +1856,7 @@ mod tests {
         );
         batch_req.tier = Tier::Procedural;
         wiki.apply_batch(vec![batch_req]).await.unwrap();
-        let md = wiki.read_page(ws, proj, &batch_path).unwrap();
+        let md = wiki.read_page(ws, proj, &batch_path).await.unwrap();
         assert_eq!(md.frontmatter["tier"], "procedural");
         wiki.reindex_page(ws, proj, batch_path.clone())
             .await
@@ -2107,7 +1918,7 @@ mod tests {
             .unwrap();
         assert_eq!(meta.tier, "episodic");
         assert!(meta.pinned);
-        let md = wiki.read_page(ws, proj, &path).unwrap();
+        let md = wiki.read_page(ws, proj, &path).await.unwrap();
         assert_eq!(md.body.trim(), "old");
     }
 
@@ -3186,6 +2997,7 @@ mod tests {
 
         let md = wiki
             .read_page(ws, proj, &PagePath::new("notes/note.md").unwrap())
+            .await
             .unwrap();
         assert_eq!(md.frontmatter["last_modified_by"]["username"], "alice");
         assert_eq!(
@@ -3237,6 +3049,7 @@ mod tests {
 
         let md = wiki
             .read_page(ws, proj, &PagePath::new("notes/anon.md").unwrap())
+            .await
             .unwrap();
         assert!(
             md.frontmatter.get("last_modified_by").is_none(),

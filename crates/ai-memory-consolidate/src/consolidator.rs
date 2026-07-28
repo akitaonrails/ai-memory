@@ -141,6 +141,7 @@ impl Consolidator {
         let current_body = self
             .wiki
             .read_page(ws, proj, &path)
+            .await
             .map(|md| md.body)
             .unwrap_or_default();
         let request = build_request(session_id, &observations, &current_body);
@@ -242,7 +243,7 @@ impl Consolidator {
             .unwrap_or((self.workspace_id, self.project_id)))
     }
 
-    fn should_skip_high_resistance_slot_update(
+    async fn should_skip_high_resistance_slot_update(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -251,7 +252,11 @@ impl Consolidator {
         if !is_slot_path(&req.path) {
             return Ok(false);
         }
-        let existing = match self.wiki.read_page(workspace_id, project_id, &req.path) {
+        let existing = match self
+            .wiki
+            .read_page(workspace_id, project_id, &req.path)
+            .await
+        {
             Ok(md) => Some(md.frontmatter),
             Err(ai_memory_wiki::WikiError::Io(err))
                 if err.kind() == std::io::ErrorKind::NotFound =>
@@ -279,7 +284,7 @@ impl Consolidator {
         let mut slots = Vec::with_capacity(briefing.slots.len());
         for slot in briefing.slots {
             let path = PagePath::new(slot.path)?;
-            let md = self.wiki.read_page(workspace_id, project_id, &path)?;
+            let md = self.wiki.read_page(workspace_id, project_id, &path).await?;
             slots.push(SlotSnapshot {
                 path: path.as_str().to_string(),
                 title: slot.title,
@@ -352,7 +357,10 @@ impl Consolidator {
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
             let (req, outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
-            if self.should_skip_high_resistance_slot_update(ws, proj, &req)? {
+            if self
+                .should_skip_high_resistance_slot_update(ws, proj, &req)
+                .await?
+            {
                 debug!(
                     path = %req.path.as_str(),
                     "skipping invariant slot update without explicit invariant contradiction signal",

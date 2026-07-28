@@ -11,6 +11,7 @@ description = "SQLite storage layer with single-writer actor and FTS5/sqlite-vec
 [dependencies]
 ai-memory-core.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,9 +32,31 @@ rusqlite.workspace = true
 refinery.workspace = true
 parking_lot.workspace = true
 
+# Outl adapter (feature `adapter-outl`): embedded Outl workspace as the
+# content source of truth. Optional so consumers that only need the
+# sqlite default never build the Outl crates.
+outl-core = { workspace = true, optional = true }
+outl-actions = { workspace = true, optional = true }
+outl-ws = { workspace = true, optional = true }
+
+[features]
+default = []
+# Content-backend adapters compiled into this crate. Each adapter is a
+# module under `src/adapters/` gated by its own feature; the registry
+# (`adapters::registry`) only lists the ones enabled.
+adapter-outl = ["dep:outl-core", "dep:outl-actions", "dep:outl-ws"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+
+[[test]]
+name = "outl_backend"
+required-features = ["adapter-outl"]
+
+[[test]]
+name = "outl_bench"
+required-features = ["adapter-outl"]
 
 [lints]
 workspace = true

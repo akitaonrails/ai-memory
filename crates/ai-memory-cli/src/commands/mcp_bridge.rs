@@ -106,6 +106,7 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         .with_context(|| format!("connecting session-aware bridge to {server_url}"))?;
     let server_info = upstream
         .peer_info()
+        .as_deref()
         .cloned()
         .context("upstream MCP server completed initialization without server info")?;
     let bridge = SessionAwareBridge {
@@ -261,7 +262,7 @@ mod tests {
         let upstream = ().serve(upstream_transport).await.unwrap();
         let bridge = SessionAwareBridge {
             upstream: upstream.peer().clone(),
-            server_info: upstream.peer_info().cloned().unwrap(),
+            server_info: upstream.peer_info().as_deref().cloned().unwrap(),
         };
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let downstream_server = tokio::spawn(async move { bridge.serve(server_io).await.unwrap() });

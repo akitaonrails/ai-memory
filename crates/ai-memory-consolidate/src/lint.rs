@@ -267,6 +267,7 @@ async fn contradiction_pass(
     for c in &subset {
         let preview = wiki
             .read_page(workspace_id, project_id, &c.path)
+            .await
             .map(|md| md.body.chars().take(400).collect::<String>())
             .unwrap_or_else(|_| "(unable to read)".into());
         prompt.push_str(&format!("## `{}`\n\n{}\n\n---\n\n", c.path, preview));

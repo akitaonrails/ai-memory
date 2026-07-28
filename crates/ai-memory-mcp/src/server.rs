@@ -1965,7 +1965,7 @@ impl AiMemoryServer {
         // Markdown on disk is the source of truth. Only a missing markdown file
         // uses the DB fallback; parse/permission/corruption errors must surface
         // so operators can fix the disk source of truth.
-        match wiki.read_page(ws, proj, &page_path) {
+        match wiki.read_page(ws, proj, &page_path).await {
             Ok(md) => {
                 let title = md
                     .frontmatter

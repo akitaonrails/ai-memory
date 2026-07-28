@@ -141,6 +141,12 @@ pub struct Config {
     /// and `per_actor` are for shared installs. See [`AutoScopeSettings`]
     /// and [`ai_memory_core::ActiveProjectMode`].
     pub auto_scope: AutoScopeSettings,
+    /// `[storage]` — which content source-of-truth backend persists page
+    /// content. `sqlite` (default) keeps the historical markdown-under-
+    /// `wiki/` + SQLite-index pipeline; `outl` stores page content in an
+    /// embedded Outl workspace (op-log CRDT) while the SQLite index keeps
+    /// serving search/recency/graph in both modes. See [`StorageSettings`].
+    pub storage: StorageSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -330,6 +336,76 @@ pub struct AuthSettings {
     pub token_pepper: Option<String>,
 }
 
+/// `[storage]` — content backend selection.
+///
+/// `backend` names either the built-in `"sqlite"` default (markdown
+/// wiki + SQLite index) or a registered content-backend adapter (see
+/// `ai_memory_store::adapters`). Each adapter reads its own
+/// `[storage.<name>]` table — the config layer treats those sections as
+/// opaque so new adapters never require edits here. Example:
+///
+/// ```toml
+/// [storage]
+/// backend = "outl"
+///
+/// [storage.outl]
+/// workspace_dir = "~/notes"
+/// slug_prefix = "ai-memory"
+/// mode = "primary"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageSettings {
+    /// Which backend persists page content. `"sqlite"` (default) or the
+    /// name of a registered adapter.
+    pub backend: String,
+    /// Per-adapter config tables, keyed by adapter name, passed to the
+    /// selected adapter verbatim at boot.
+    #[serde(flatten)]
+    pub adapters: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for StorageSettings {
+    fn default() -> Self {
+        Self {
+            backend: DEFAULT_STORAGE_BACKEND.to_string(),
+            adapters: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Name of the built-in content backend.
+pub const DEFAULT_STORAGE_BACKEND: &str = "sqlite";
+
+impl StorageSettings {
+    /// Whether the built-in sqlite/wiki pipeline is selected.
+    #[must_use]
+    pub fn is_default_backend(&self) -> bool {
+        self.backend == DEFAULT_STORAGE_BACKEND
+    }
+
+    /// Fail fast on inconsistent `[storage]` settings before any
+    /// subsystem starts. Adapter-specific validation happens in the
+    /// adapter's factory at boot (the config layer doesn't know which
+    /// adapters are compiled in).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.backend.trim().is_empty() {
+            return Err("[storage] backend must not be empty".into());
+        }
+        Ok(())
+    }
+
+    /// The selected adapter's raw `[storage.<name>]` section (`Null`
+    /// when the operator wrote none).
+    #[must_use]
+    pub fn adapter_settings(&self) -> serde_json::Value {
+        self.adapters
+            .get(&self.backend)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+}
+
 /// `[auto_scope]` — controls how the hook-published "currently active
 /// project" pointer is shared across concurrent callers. The legacy default
 /// is `single` (process-wide slot, last-write-wins). Opt-in modes isolate
@@ -388,6 +464,7 @@ impl Default for Config {
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
+            storage: StorageSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
@@ -647,6 +724,14 @@ impl Config {
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
         config.runtime_env = runtime_env;
+
+        // Adapter-specific validation (paths, required keys) happens in
+        // the selected adapter's factory at boot; here we only reject
+        // structurally broken `[storage]` settings.
+        config
+            .storage
+            .validate()
+            .map_err(|msg| anyhow::anyhow!(msg))?;
 
         Ok(config)
     }
@@ -1139,6 +1224,69 @@ mod tests {
         assert!(cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
+    }
+
+    #[test]
+    fn storage_defaults_to_sqlite() {
+        let cfg = Config::default();
+        assert!(cfg.storage.is_default_backend());
+        assert_eq!(cfg.storage.backend, DEFAULT_STORAGE_BACKEND);
+        assert_eq!(cfg.storage.adapter_settings(), serde_json::Value::Null);
+        cfg.storage.validate().unwrap();
+    }
+
+    #[test]
+    fn storage_adapter_section_is_passed_through_opaquely() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+            [storage]
+            backend = "outl"
+
+            [storage.outl]
+            workspace_dir = "~/notes"
+            slug_prefix = "mem"
+            mode = "shadow"
+
+            [storage.some-future-adapter]
+            anything = ["goes", 42]
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!cfg.storage.is_default_backend());
+        assert_eq!(cfg.storage.backend, "outl");
+        let section = cfg.storage.adapter_settings();
+        assert_eq!(section["workspace_dir"], "~/notes");
+        assert_eq!(section["slug_prefix"], "mem");
+        assert_eq!(section["mode"], "shadow");
+        // Sections for other (even unknown) adapters load without error
+        // — the config layer never interprets them.
+        assert!(cfg.storage.adapters.contains_key("some-future-adapter"));
+    }
+
+    #[test]
+    fn storage_unknown_backend_loads_and_defers_to_registry() {
+        // The config layer can't know which adapters are compiled in;
+        // an unknown name loads fine and fails at boot with the list of
+        // registered adapters.
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(&cfg_path, "[storage]\nbackend = \"nope\"\n").unwrap();
+        let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.storage.backend, "nope");
+        assert_eq!(cfg.storage.adapter_settings(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn storage_empty_backend_fails_to_load() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        std::fs::write(&cfg_path, "[storage]\nbackend = \"\"\n").unwrap();
+        let err = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
     }
 
     #[test]

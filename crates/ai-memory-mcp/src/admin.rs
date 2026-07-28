@@ -1066,7 +1066,7 @@ async fn handle_read_page(
         );
     };
 
-    match state.wiki.read_page(ws, proj, &page_path) {
+    match state.wiki.read_page(ws, proj, &page_path).await {
         Ok(md) => {
             let title = md
                 .frontmatter
@@ -3848,7 +3848,7 @@ async fn prepare_source_pages(
             state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
             Ok(Some(ref m)) if m.pinned
         );
-        let md = state.wiki.read_page(src_ws, src_proj, &path).ok();
+        let md = state.wiki.read_page(src_ws, src_proj, &path).await.ok();
         // Compute the conflict decision once. The check is "is there a
         // DIFFERENT page at this path?", which requires both the dest
         // body and the source markdown — when either is missing, treat

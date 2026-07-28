@@ -159,6 +159,7 @@ async fn page_handler(
     let markdown = state
         .wiki
         .read_page(meta.workspace_id, meta.project_id, &page_path)
+        .await
         .map_err(|_| not_found("page file not found"))?;
 
     // ETag is computed over the markdown body PLUS the resolved author

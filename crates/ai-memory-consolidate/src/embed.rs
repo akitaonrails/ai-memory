@@ -119,7 +119,7 @@ pub async fn run_embedding_backfill(
             counts.would_embed += 1;
             continue;
         }
-        let md = match wiki.read_page(workspace_id, project_id, &cand.path) {
+        let md = match wiki.read_page(workspace_id, project_id, &cand.path).await {
             Ok(md) => md,
             Err(e) => {
                 warn!(path = %cand.path, error = %e, "embed: skip unreadable page");

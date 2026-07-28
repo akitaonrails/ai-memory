@@ -44,6 +44,31 @@ pub enum WikiError {
     DestinationExists(String),
 }
 
+impl From<ai_memory_store::ContentError> for WikiError {
+    fn from(value: ai_memory_store::ContentError) -> Self {
+        use ai_memory_store::ContentError as CE;
+        match value {
+            CE::Io(e) => Self::Io(e),
+            CE::Store(e) => Self::Store(e),
+            CE::Parse(msg) => Self::Yaml(msg),
+            CE::DestinationExists(path) => Self::DestinationExists(path),
+            CE::Backend(msg) => Self::Io(std::io::Error::other(msg)),
+        }
+    }
+}
+
+impl From<WikiError> for ai_memory_store::ContentError {
+    fn from(value: WikiError) -> Self {
+        match value {
+            WikiError::Io(e) => Self::Io(e),
+            WikiError::Store(e) => Self::Store(e),
+            WikiError::Yaml(msg) => Self::Parse(msg),
+            WikiError::DestinationExists(path) => Self::DestinationExists(path),
+            other => Self::Backend(other.to_string()),
+        }
+    }
+}
+
 impl From<serde_yaml::Error> for WikiError {
     fn from(value: serde_yaml::Error) -> Self {
         Self::Yaml(value.to_string())

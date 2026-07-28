@@ -7,6 +7,7 @@
 
 pub mod admission;
 mod atomic;
+mod backend;
 mod error;
 mod git;
 mod markdown;
@@ -19,6 +20,7 @@ pub use admission::{
     MAX_RESPONSE_BYTES, WebhookConfig,
 };
 pub use atomic::write_atomic;
+pub use backend::FsContentBackend;
 pub use error::{WikiError, WikiResult};
 pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
 pub use markdown::{Markdown, derive_title, emit, parse};

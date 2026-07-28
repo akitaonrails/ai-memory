@@ -31,6 +31,7 @@ pub(crate) async fn handler(
     let markdown_doc = match state
         .wiki
         .read_page(meta.workspace_id, meta.project_id, &page_path)
+        .await
     {
         Ok(doc) => doc,
         Err(_) => return not_found_response(),

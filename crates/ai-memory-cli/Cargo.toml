@@ -18,7 +18,7 @@ ai-memory-core.workspace = true
 ai-memory-hooks.workspace = true
 ai-memory-llm.workspace = true
 ai-memory-mcp.workspace = true
-ai-memory-store.workspace = true
+ai-memory-store = { workspace = true, features = ["adapter-outl"] }
 ai-memory-web.workspace = true
 ai-memory-workstream.workspace = true
 ai-memory-wiki.workspace = true

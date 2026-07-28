@@ -979,7 +979,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
     assert_eq!(body["path"], "notes/recover.md");
     assert_eq!(body["restored_from"], old_oid.to_string());
 
-    let md = state.wiki.read_page(ws, proj, &path).unwrap();
+    let md = state.wiki.read_page(ws, proj, &path).await.unwrap();
     assert_eq!(md.body, "old body");
     let stored = store
         .reader

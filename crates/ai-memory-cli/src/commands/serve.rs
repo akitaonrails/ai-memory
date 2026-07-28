@@ -222,6 +222,44 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         // when a chain is configured, and the startup scope-manifest backfill
         // (below) always needs it to enumerate scopes.
         .with_store_reader(store.reader.clone());
+
+    // `[storage] backend = "<name>"`: swap the content source of truth to a
+    // registered adapter (see `crate::adapters`). `"sqlite"` is the built-in
+    // default and short-circuits the registry. The adapter owns its
+    // background tasks (reconcilers, sync loops); we keep the handles alive
+    // for the lifetime of `serve`. A backend without an on-disk fs root
+    // (`fs_root() == None`) means the wiki/ markdown pipeline stands down.
+    let (wiki, _adapter_tasks, content_has_fs_root) = if config.storage.is_default_backend() {
+        (wiki, Vec::new(), true)
+    } else {
+        let name = config.storage.backend.as_str();
+        let factory = ai_memory_store::adapters::find(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "[storage] backend = \"{name}\" is not a registered adapter \
+                 (available: sqlite, {})",
+                ai_memory_store::adapters::names().join(", ")
+            )
+        })?;
+        let built = factory
+            .build(ai_memory_store::AdapterContext {
+                home_dir: config.home_dir.clone(),
+                writer: store.writer.clone(),
+                reader: store.reader.clone(),
+                fs_backend: Arc::new(ai_memory_wiki::FsContentBackend::new(
+                    wiki_root.clone(),
+                    store.writer.clone(),
+                )),
+                settings: config.storage.adapter_settings(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("building storage adapter \"{name}\": {e}"))?;
+        let has_fs_root = built.backend.fs_root().is_some();
+        (
+            wiki.with_content_backend(built.backend),
+            built.tasks,
+            has_fs_root,
+        )
+    };
     // Attach the admission webhook chain (operator-configured via
     // `[[admission_webhooks]]` in config.toml or `AI_MEMORY_ADMISSION_WEBHOOKS__N__*`
     // env vars). Empty config = no chain attached, zero overhead. The store
@@ -257,8 +295,15 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         Err(e) => tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)"),
     }
 
-    // Keep the guard alive for the lifetime of `serve`.
-    let _watcher = start_watcher(&args, &wiki)?;
+    // Keep the guard alive for the lifetime of `serve`. A content backend
+    // without an on-disk root (adapter-owned SoT) has no wiki/ files to
+    // watch — the adapter's own tasks play the watcher's role.
+    let _watcher = if content_has_fs_root {
+        start_watcher(&args, &wiki)?
+    } else {
+        info!("fs watcher disabled: content backend has no filesystem root");
+        None
+    };
 
     // Shared between the MCP server and the hook router: the hook
     // router publishes the cwd-resolved project on each event; the MCP
@@ -1920,6 +1965,7 @@ mod tests {
         for project in [first, second] {
             assert!(
                 wiki.read_page(ws, project, &PagePath::new("_lint".to_string()).unwrap())
+                    .await
                     .is_err(),
                 "lint reports are dated pages, not the directory itself"
             );

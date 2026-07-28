@@ -271,6 +271,7 @@ async fn move_project_true_move_into_fresh_dest() {
             dst_proj,
             &PagePath::new("decisions/0001.md".to_string()).unwrap(),
         )
+        .await
         .unwrap();
     assert!(
         read.body.contains("decision body"),

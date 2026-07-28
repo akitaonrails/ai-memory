@@ -36,6 +36,13 @@ ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "1.19
 ai-memory-web = { path = "crates/ai-memory-web", version = "1.19.0" }
 ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "1.19.0" }
 
+# Outl embedded content-backend adapter (`ai-memory-store` feature
+# `adapter-outl`). 0.8 ships the batch op-log append the adapter's
+# actor relies on (`Workspace::enter_batch`/`end_batch`).
+outl-core = "0.8"
+outl-actions = "0.8"
+outl-ws = "0.8"
+
 # (Workspace shared deps follow below)
 
 # Error handling.
@@ -100,7 +107,7 @@ fs2 = "0.4"
 winapi-util = "0.1"
 
 # MCP server SDK.
-rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+rmcp = { version = "1.8", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
 # Same `http` 1.x rmcp/axum use, so handlers can read the injected

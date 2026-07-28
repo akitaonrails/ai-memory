@@ -303,6 +303,7 @@ impl Bootstrap {
             if self
                 .wiki
                 .read_page(cfg.workspace_id, cfg.project_id, &manifest_path)
+                .await
                 .is_ok()
             {
                 return Err(BootstrapError::AlreadyBootstrapped);

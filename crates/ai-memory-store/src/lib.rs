@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+pub mod adapters;
 mod auto_improve;
+pub mod content;
 pub mod decay;
 mod error;
 mod fts_query;
@@ -26,6 +28,11 @@ mod workstream;
 mod writer;
 
 pub use fts_query::prepare_fts5_query;
+
+pub use content::{
+    AdapterContext, BuiltBackend, ContentBackend, ContentBackendFactory, ContentError,
+    ContentResult, PageContent,
+};
 
 pub use auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
