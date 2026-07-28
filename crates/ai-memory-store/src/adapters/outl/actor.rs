@@ -61,6 +61,13 @@ pub(crate) enum Cmd {
         projected_sha: String,
         reply: Reply<()>,
     },
+    /// Remove the projected-sha stamp so the reconciler treats the page
+    /// as diverged. Used when the index write failed after a successful
+    /// SoT write (the page is durable in Outl but the index is behind).
+    ClearStamp {
+        slug: String,
+        reply: Reply<()>,
+    },
     /// Re-open the workspace when other actors' ops files changed on
     /// disk, so the materialized tree sees their writes. Replies `true`
     /// when a refresh happened.
@@ -75,6 +82,8 @@ pub struct OwnedContent {
     pub body: String,
     /// Title (from the `title::` prop, falling back to slug).
     pub title: String,
+    /// `tier::` prop value at read time, if any.
+    pub tier: Option<String>,
     /// `ai-memory-sha` prop value at read time, if any.
     pub stored_sha: Option<String>,
 }
@@ -223,6 +232,12 @@ impl OutlHandle {
         })
         .await
     }
+
+    /// Drop the projected-sha stamp so the next reconcile pass re-indexes
+    /// the page (used when the index write failed after the SoT write).
+    pub async fn clear_stamp(&self, slug: String) -> Result<(), String> {
+        self.call(|reply| Cmd::ClearStamp { slug, reply }).await
+    }
 }
 
 fn handle(ctx: &mut WsCtx, cmd: Cmd) {
@@ -268,6 +283,20 @@ fn handle(ctx: &mut WsCtx, cmd: Cmd) {
         } => {
             let result = match outl_actions::find_by_slug(&ctx.workspace, &slug) {
                 Some(id) => set_text_prop(ctx, id, PROJECTED_SHA_PROP, &projected_sha),
+                None => Ok(()),
+            };
+            let _ = reply.send(result);
+        }
+        Cmd::ClearStamp { slug, reply } => {
+            let result = match outl_actions::find_by_slug(&ctx.workspace, &slug) {
+                Some(id) => outl_actions::set_property(
+                    &mut ctx.workspace,
+                    &ctx.hlc,
+                    id,
+                    PROJECTED_SHA_PROP,
+                    None,
+                )
+                .map_err(|e| format!("clear {PROJECTED_SHA_PROP}: {e}")),
                 None => Ok(()),
             };
             let _ = reply.send(result);
@@ -416,10 +445,12 @@ fn read_owned(ctx: &mut WsCtx, slug: &str) -> Option<OwnedContent> {
     collect_texts(ctx, id, &mut texts);
     let title = outl_actions::read_text_prop(&ctx.workspace, id, "title")
         .unwrap_or_else(|| slug.to_string());
+    let tier = outl_actions::read_text_prop(&ctx.workspace, id, "tier");
     let stored_sha = outl_actions::read_text_prop(&ctx.workspace, id, PROJECTED_SHA_PROP);
     Some(OwnedContent {
         body: super::project::texts_to_body(&texts),
         title,
+        tier,
         stored_sha,
     })
 }

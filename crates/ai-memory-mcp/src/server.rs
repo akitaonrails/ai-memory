@@ -1966,9 +1966,10 @@ impl AiMemoryServer {
             ));
         };
 
-        // Markdown on disk is the source of truth. Only a missing markdown file
-        // uses the DB fallback; parse/permission/corruption errors must surface
-        // so operators can fix the disk source of truth.
+        // The configured content backend is the source of truth (markdown on
+        // disk by default, an adapter-owned store otherwise). Only a missing
+        // page uses the DB fallback; parse/permission/corruption errors must
+        // surface so operators can fix the source of truth.
         match wiki.read_page(ws, proj, &page_path).await {
             Ok(md) => {
                 let title = md

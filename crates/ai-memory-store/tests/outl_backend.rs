@@ -313,3 +313,90 @@ async fn second_concurrent_opener_gets_ephemeral_actor() {
         "second opener must not steal the config actor"
     );
 }
+
+#[tokio::test]
+async fn move_project_preserves_tier_prop() {
+    let rig = rig().await;
+    let ws2 = rig
+        .store
+        .writer
+        .get_or_create_workspace("second")
+        .await
+        .unwrap();
+    rig.backend
+        .persist_page(new_page(&rig, "a.md", BODY), String::new())
+        .await
+        .unwrap();
+
+    rig.backend
+        .move_project(rig.proj, rig.ws, ws2)
+        .await
+        .unwrap();
+
+    let moved = slug::encode("ai-memory", ws2, rig.proj, &PagePath::new("a.md").unwrap());
+    let owned = rig
+        .backend
+        .handle()
+        .read_owned(moved)
+        .await
+        .unwrap()
+        .expect("moved page exists under the new slug");
+    assert_eq!(
+        owned.tier.as_deref(),
+        Some("semantic"),
+        "re-slugged page must keep its tier prop"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_heals_missing_index_row_only_when_stamp_diverged() {
+    let rig = rig().await;
+    let path = PagePath::new("notes/healme.md").unwrap();
+    rig.backend
+        .persist_page(new_page(&rig, "notes/healme.md", BODY), String::new())
+        .await
+        .unwrap();
+
+    // Simulate the decay sweep: drop the index row, leave the stamped
+    // SoT copy. Reconcile must NOT resurrect it.
+    rig.store
+        .writer
+        .delete_page(rig.ws, rig.proj, path.clone(), None)
+        .await
+        .unwrap();
+    let outcome = reconcile::run_once(&rig.backend).await.unwrap();
+    assert_eq!(outcome.reindexed, 0, "decayed page must stay unindexed");
+    assert!(
+        rig.store
+            .reader
+            .page_body_by_ids(rig.ws, rig.proj, "notes/healme.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Simulate an index write that failed right after the SoT write:
+    // persist drops the stamp. Reconcile must index the page fresh
+    // from the SoT copy.
+    let page_slug = slug::encode("ai-memory", rig.ws, rig.proj, &path);
+    rig.backend
+        .handle()
+        .clear_stamp(page_slug.clone())
+        .await
+        .unwrap();
+    let outcome = reconcile::run_once(&rig.backend).await.unwrap();
+    assert_eq!(outcome.reindexed, 1, "dirty page must be healed");
+    let row = rig
+        .store
+        .reader
+        .page_body_by_ids(rig.ws, rig.proj, "notes/healme.md")
+        .await
+        .unwrap()
+        .expect("healed index row");
+    assert!(row.body.contains("We picked outl as SoT."));
+    assert_eq!(row.tier, "semantic");
+
+    // The heal restamps the page: the next pass converges.
+    let outcome = reconcile::run_once(&rig.backend).await.unwrap();
+    assert_eq!(outcome.reindexed, 0, "healed page must not re-reconcile");
+}

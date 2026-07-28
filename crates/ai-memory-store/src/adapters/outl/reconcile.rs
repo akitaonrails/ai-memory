@@ -8,6 +8,13 @@
 //! projection time. Pages only ai-memory touched are skipped, so the
 //! index keeps serving the ORIGINAL document body for them.
 //!
+//! The stamp also encodes the heal contract for missing index rows:
+//! a page whose stamp matches its content but has no row was dropped
+//! by the decay sweep on purpose and stays untouched, while a page
+//! with a missing/diverged stamp and no row (failed index write after
+//! a SoT write, or a page created inside Outl under our prefix) is
+//! indexed fresh from the SoT copy.
+//!
 //! The scan runs over a long-lived in-process `Workspace` whose reader
 //! merges every `ops-*.jsonl` on boot; to observe writes from OTHER
 //! actors made after boot, the actor thread's storage layer picks them
@@ -28,11 +35,8 @@ use super::{OutlContentBackend, sha256_hex, slug};
 pub struct ReconcileOutcome {
     /// Pages scanned (everything under the slug prefix).
     pub scanned: usize,
-    /// Pages whose content diverged and were re-indexed.
+    /// Pages whose content diverged and were (re-)indexed.
     pub reindexed: usize,
-    /// Pages skipped because the index has no row to merge onto
-    /// (e.g. hard-deleted by decay — the SoT copy stays untouched).
-    pub orphans: usize,
 }
 
 /// Run one reconcile pass now. Exposed for tests and for a manual
@@ -58,25 +62,38 @@ pub async fn run_once(backend: &OutlContentBackend) -> Result<ReconcileOutcome, 
         };
         let current_sha = sha256_hex(&content.body);
         if content.stored_sha.as_deref() == Some(current_sha.as_str()) {
-            continue; // our own projection, index already has the original body
+            // Untouched projection: the index either has the original
+            // body already, or deliberately dropped the row (decay
+            // sweep). Either way the pass leaves the page alone, so
+            // decayed pages never resurrect.
+            continue;
         }
 
-        // External edit. Merge the Outl body onto the existing index
-        // row, preserving frontmatter/tier/pinned from the index.
+        // Stamp missing or diverged: an external edit, or an index
+        // write that failed right after the SoT write (persist drops
+        // the stamp). Merge the Outl body onto the existing index row
+        // when there is one (preserving frontmatter/tier/pinned), or
+        // index the page fresh from the SoT copy when there is none.
         let existing = backend
             .reader
             .page_body_by_ids(ws, proj, path.as_str())
             .await
             .map_err(|e| e.to_string())?;
-        let Some(existing) = existing else {
-            outcome.orphans += 1;
-            tracing::debug!(slug = %page_slug, "reconcile: no index row (decayed/purged); leaving SoT copy alone");
-            continue;
+        let (frontmatter, tier, pinned) = match &existing {
+            Some(row) => (
+                serde_json::from_str(&row.frontmatter_json).unwrap_or(serde_json::Value::Null),
+                Tier::from_str(&row.tier).unwrap_or(Tier::Semantic),
+                row.pinned,
+            ),
+            None => {
+                let tier = content
+                    .tier
+                    .as_deref()
+                    .and_then(|t| Tier::from_str(t).ok())
+                    .unwrap_or(Tier::Semantic);
+                (serde_json::json!({ "tier": tier.as_str() }), tier, false)
+            }
         };
-
-        let frontmatter =
-            serde_json::from_str(&existing.frontmatter_json).unwrap_or(serde_json::Value::Null);
-        let tier = Tier::from_str(&existing.tier).unwrap_or(Tier::Semantic);
         let page = NewPage {
             workspace_id: ws,
             project_id: proj,
@@ -85,7 +102,7 @@ pub async fn run_once(backend: &OutlContentBackend) -> Result<ReconcileOutcome, 
             body: content.body,
             tier,
             frontmatter_json: frontmatter,
-            pinned: existing.pinned,
+            pinned,
             // Wikilink extraction lives in the wiki layer; externally
             // edited pages temporarily lose graph edges until their
             // next engine write. TODO: share the extractor.

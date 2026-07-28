@@ -409,17 +409,29 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // Make the wiki tree self-describing: write each scope's `_meta.md`
     // (workspace/project name + repo_path) if missing, so the markdown alone
     // can rebuild the index via `ai-memory reindex`. Idempotent; non-fatal.
-    match wiki.backfill_scope_manifests().await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(count = n, "wrote _meta.md scope manifests"),
-        Err(e) => tracing::warn!(error = %e, "scope-manifest backfill failed (non-fatal)"),
-    }
-    match wiki.ensure_upgrade_baseline_checkpoint() {
-        Ok(Some(oid)) => {
-            tracing::info!(checkpoint = %oid, "created wiki upgrade baseline checkpoint")
+    // Both steps act on the wiki markdown tree / its git repo, so they stand
+    // down (like the watcher below) when the content backend owns the SoT
+    // elsewhere — otherwise they would seed manifests and git history for a
+    // tree that is no longer the source of truth.
+    if content_has_fs_root {
+        match wiki.backfill_scope_manifests().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "wrote _meta.md scope manifests"),
+            Err(e) => tracing::warn!(error = %e, "scope-manifest backfill failed (non-fatal)"),
         }
-        Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)"),
+        match wiki.ensure_upgrade_baseline_checkpoint() {
+            Ok(Some(oid)) => {
+                tracing::info!(checkpoint = %oid, "created wiki upgrade baseline checkpoint")
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)")
+            }
+        }
+    } else {
+        info!(
+            "wiki manifest backfill + git baseline skipped: content backend has no filesystem root"
+        );
     }
 
     // Keep the guard alive for the lifetime of `serve`. A content backend

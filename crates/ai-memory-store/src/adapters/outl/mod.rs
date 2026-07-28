@@ -105,6 +105,18 @@ impl OutlContentBackend {
         Ok(())
     }
 
+    /// Best-effort: drop the sha stamps so the reconciler re-indexes
+    /// these pages instead of trusting stale index rows. Failures are
+    /// logged — the SoT copy is durable either way and a later engine
+    /// write restamps.
+    async fn mark_dirty(&self, slugs: &[String]) {
+        for page_slug in slugs {
+            if let Err(e) = self.handle.clear_stamp(page_slug.clone()).await {
+                tracing::warn!(slug = %page_slug, error = %e, "outl: failed to mark page dirty after index write failure");
+            }
+        }
+    }
+
     async fn write_to_outl(&self, page: &NewPage) -> Result<(), ContentError> {
         let slug = slug::encode(
             &self.slug_prefix,
@@ -147,11 +159,24 @@ pub fn sha256_hex(s: &str) -> String {
 impl ContentBackend for OutlContentBackend {
     async fn persist_page(&self, page: NewPage, _rendered: String) -> ContentResult<PageId> {
         // SoT first (append-only op log), index second. A failure
-        // between the two leaves the index behind; the reconciler
-        // heals it (see crate docs — this is the documented contract
-        // change vs the fs backend's rollback).
+        // between the two leaves the index behind; dropping the sha
+        // stamp marks the page diverged so the reconciler re-indexes it
+        // on its next pass (see crate docs — this is the documented
+        // contract change vs the fs backend's rollback).
         self.write_to_outl(&page).await?;
-        Ok(self.writer.upsert_page(page).await?)
+        let page_slug = slug::encode(
+            &self.slug_prefix,
+            page.workspace_id,
+            page.project_id,
+            &page.path,
+        );
+        match self.writer.upsert_page(page).await {
+            Ok(id) => Ok(id),
+            Err(e) => {
+                self.mark_dirty(std::slice::from_ref(&page_slug)).await;
+                Err(e.into())
+            }
+        }
     }
 
     async fn persist_pages_batch(
@@ -159,11 +184,24 @@ impl ContentBackend for OutlContentBackend {
         pages: Vec<(NewPage, String)>,
     ) -> ContentResult<Vec<PageId>> {
         let mut batch = Vec::with_capacity(pages.len());
+        let mut slugs = Vec::with_capacity(pages.len());
         for (page, _rendered) in pages {
             self.write_to_outl(&page).await?;
+            slugs.push(slug::encode(
+                &self.slug_prefix,
+                page.workspace_id,
+                page.project_id,
+                &page.path,
+            ));
             batch.push(page);
         }
-        Ok(self.writer.upsert_pages_batch(batch).await?)
+        match self.writer.upsert_pages_batch(batch).await {
+            Ok(ids) => Ok(ids),
+            Err(e) => {
+                self.mark_dirty(&slugs).await;
+                Err(e.into())
+            }
+        }
     }
 
     async fn delete_page(
@@ -239,8 +277,12 @@ impl ContentBackend for OutlContentBackend {
             let new_slug = slug::encode(&self.slug_prefix, to_workspace, project_id, &path);
             let specs = project::body_to_specs(&content.body);
             let sha = projected_sha(&specs);
+            // Carry the tier prop across the re-slug; a page we wrote
+            // always has one, but fall back to the default tier rather
+            // than stamping an empty string.
+            let tier = content.tier.unwrap_or_else(|| "semantic".into());
             self.handle
-                .upsert_page(new_slug, content.title, String::new(), specs, sha)
+                .upsert_page(new_slug, content.title, tier, specs, sha)
                 .await
                 .map_err(ContentError::Backend)?;
             self.handle
