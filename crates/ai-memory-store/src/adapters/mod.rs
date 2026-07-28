@@ -23,6 +23,8 @@ pub mod outl;
 
 /// Every compiled-in content-backend adapter.
 #[must_use]
+// Pushes are `#[cfg]`-gated per feature; a `vec![]` literal can't express that.
+#[allow(clippy::vec_init_then_push)]
 pub fn registry() -> Vec<Box<dyn ContentBackendFactory>> {
     let mut factories: Vec<Box<dyn ContentBackendFactory>> = Vec::new();
     #[cfg(feature = "adapter-outl")]

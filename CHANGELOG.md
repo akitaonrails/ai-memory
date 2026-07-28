@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `[storage] backend = "<name>"` in `config.toml` selects a pluggable content
+  storage adapter. `sqlite` (the default) keeps the historical markdown
+  `wiki/` + SQLite pipeline unchanged; the new feature-gated `outl` adapter
+  (`ai-memory-store` feature `adapter-outl`) persists page content into an
+  embedded [Outl](https://github.com/avelino/outl) workspace as the content
+  source of truth, while SQLite keeps serving search/recency/graph as the
+  derived index. Each adapter reads its own opaque `[storage.<name>]`
+  section, external edits made inside the target app are absorbed back into
+  the index by a sha-stamped reconciler, and the fs watcher stands down for
+  backends without an on-disk root. See `docs/storage-adapters.md`.
+
+### Fixed
+- `cargo install` from a fresh dependency resolve no longer breaks against
+  rmcp 1.8 (its `peer_info()` signature changed); the workspace now targets
+  rmcp 1.8 directly.
+
 ## [1.19.0] - 2026-07-25
 
 ### Fixed

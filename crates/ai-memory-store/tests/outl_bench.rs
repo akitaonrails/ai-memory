@@ -154,7 +154,7 @@ async fn bench_outl_backend() {
             .read_page(
                 rig.ws,
                 rig.proj,
-                &PagePath::new(&format!("bench/page-{:04}.md", i % PAGES)).unwrap(),
+                &PagePath::new(format!("bench/page-{:04}.md", i % PAGES)).unwrap(),
             )
             .await
             .unwrap();
