@@ -4425,7 +4425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_run_heartbeat_extends_only_a_live_lease() {
+    async fn managed_run_heartbeat_extends_and_reclaims_while_active() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (ws, proj) = open_managed_scope(&store, "managed-heartbeat").await;
@@ -4450,14 +4450,20 @@ mod tests {
             "heartbeat must extend the lease"
         );
 
-        // A lease that already lapsed cannot be revived by a heartbeat.
+        // A lapsed-but-unswept lease IS revived: the wrapper is the only
+        // process that knows the run id, and a laptop sleeping past the
+        // lease window must not lock the session out of its own run.
         set_managed_run_lease(store.db_path(), run.run_id, 1);
         assert!(
-            !store
+            store
                 .writer
                 .heartbeat_managed_run(run.run_id)
                 .await
                 .unwrap()
+        );
+        assert!(
+            managed_run_lease(store.db_path(), run.run_id) >= initial,
+            "heartbeat must reclaim a lapsed lease while the run is still active"
         );
 
         // Unknown runs never heartbeat.

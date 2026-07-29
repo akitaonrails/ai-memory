@@ -409,13 +409,23 @@ fn validate_workstream_name(name: &str) -> StoreResult<()> {
     Ok(())
 }
 
-/// Extend the lease for a live managed run.
+/// Extend the lease for a managed run that still owns its workstream.
+///
+/// Deliberately does NOT require `lease_expires_at > now`: a laptop
+/// sleeping past the 90s lease window leaves the wrapper alive with a
+/// lapsed lease, and requiring liveness here locked it out with `409`
+/// heartbeats for the rest of the session. As long as the row is still
+/// `state = 'active'` nobody swept or replaced the run (the partial
+/// unique index allows one active run per workstream), so the only
+/// process that knows this run id reclaiming its own lease is safe.
+/// Once a sweep flips the row to `'expired'` (or the run finished /
+/// was purged), the heartbeat keeps failing — that lockout is real.
 pub(crate) fn heartbeat(conn: &mut Connection, run_id: ManagedRunId) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
     let changed = conn.execute(
         "UPDATE managed_runs SET lease_expires_at = ?1 \
-         WHERE id = ?2 AND state = 'active' AND lease_expires_at > ?3",
-        params![now + LEASE_MICROS, run_id.as_bytes(), now],
+         WHERE id = ?2 AND state = 'active'",
+        params![now + LEASE_MICROS, run_id.as_bytes()],
     )?;
     Ok(changed > 0)
 }

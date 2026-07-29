@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A managed run's heartbeat now reclaims its lease after the machine sleeps
+  past the 90s lease window. Previously the wrapper woke up locked out,
+  logging `409 managed run lease is not active` every 30s for the rest of
+  the session even though nothing else had taken over its workstream; the
+  lockout now only remains for runs that were actually swept, finished, or
+  purged.
+
 ### Added
 - `[storage] backend = "<name>"` in `config.toml` selects a pluggable content
   storage adapter. `sqlite` (the default) keeps the historical markdown
