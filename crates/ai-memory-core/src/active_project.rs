@@ -102,9 +102,16 @@ pub enum ActiveProjectMode {
 /// pre-identity callers working without a special branch at every call site.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ActorKey {
-    /// Stable username when the request was authenticated as a known user
-    /// (rung 1 root with `root_username`, or rung 2 DB user). `None` for
-    /// anonymous calls.
+    /// The key naming the human this request belongs to, or `None` for an
+    /// anonymous call.
+    ///
+    /// Named `user` for history, but it is **not** the username field: every
+    /// publisher fills it from [`crate::ActorContext::identity_key`], so behind
+    /// an ingress that forwards only the OIDC subject claim this holds that
+    /// subject. Reading it as "the username" is safe; re-deriving it from
+    /// `ActorContext::user` at a call site is not — the two publishers (the hook
+    /// ingress and the MCP `actor_key_from_parts`) would then disagree with
+    /// every reader about which slot a proxied operator's entry lives in.
     pub user: Option<String>,
     /// Per-agent-run session identifier published by the lifecycle hooks
     /// (Claude Code, Codex, OpenCode, …). `None` when the call site has no

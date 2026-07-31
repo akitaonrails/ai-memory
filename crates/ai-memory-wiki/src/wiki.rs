@@ -10,8 +10,8 @@ use ai_memory_core::{
 use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    FailAutoImproveProposal, MoveSummary, ReaderPool, WriterHandle, artifact_path_for,
-    f32_vec_to_bytes,
+    AutoImproveProposalStatus, FailAutoImproveProposal, MoveSummary, ReaderPool, WriterHandle,
+    artifact_path_for, f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
@@ -75,6 +75,12 @@ pub struct Wiki {
     /// the directory rename and SQLite re-stamp so stale writes cannot land
     /// files under the old workspace while the project is in flight.
     mutation_lock: Arc<RwLock<()>>,
+    /// `[slots] per_user`: are `_slots/<user>/…` pages owned by `<user>`?
+    ///
+    /// Off unless the server enables it, and off is the pre-feature rule: a
+    /// nested slot path carries no ownership meaning and every slot write lands
+    /// exactly where it always did. Set via [`Wiki::with_per_user_slots`].
+    per_user_slots: bool,
 }
 
 impl Wiki {
@@ -97,6 +103,7 @@ impl Wiki {
             admission_chain: None,
             store_reader: None,
             mutation_lock: Arc::new(RwLock::new(())),
+            per_user_slots: false,
         })
     }
 
@@ -126,6 +133,26 @@ impl Wiki {
     pub fn with_store_reader(mut self, reader: ReaderPool) -> Self {
         self.store_reader = Some(reader);
         self
+    }
+
+    /// Namespace slot pages per operator (`[slots] per_user`); see
+    /// [`Self::per_user_slots`].
+    #[must_use]
+    pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
+        self.per_user_slots = enabled;
+        self
+    }
+
+    /// Is `[slots] per_user` on?
+    ///
+    /// Exposed so the doors that STAGE an auto-improve proposal decide its slot
+    /// destination from the same flag the approval door enforces it with. They
+    /// all hold a `Wiki`; a second copy of the flag threaded through their own
+    /// state is a second thing to forget to wire up, and the failure mode is a
+    /// staging door that writes shared-slot targets nobody can approve.
+    #[must_use]
+    pub fn per_user_slots(&self) -> bool {
+        self.per_user_slots
     }
 
     /// Replace the default built-in-only sanitizer with one carrying
@@ -657,6 +684,74 @@ impl Wiki {
         }
     }
 
+    /// Ask the admission chain about an operation that has no page and no body
+    /// — a retention sweep, or a handoff lifecycle event.
+    ///
+    /// These live outside the wiki tree (handoffs have their own table; the
+    /// sweep works on rows), so they never passed through `write_page` and were
+    /// invisible to admission webhooks. That left the two most destructive
+    /// operations on a shared server unauthorizable: a webhook that decides who
+    /// may touch which scope could not see them at all.
+    ///
+    /// Only the webhooks that can refuse the operation are awaited — that is
+    /// what the caller has to know before doing destructive work, and a
+    /// `reject` policy is the operator asking to be waited for. The observers
+    /// are handed back with the resolved context: pass it to
+    /// [`Self::notify_operation_observers`] once the operation is durable, or
+    /// drop it if the operation was abandoned, so no webhook is told about work
+    /// that never happened. Every path that raises one of these ops owes its
+    /// webhooks the same three steps in the same order — decide, act, notify —
+    /// or the same event reaches a mirror from one caller and not from another.
+    ///
+    /// Returns `None` when no chain is attached (nothing left to notify).
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when a reject-policy webhook refuses.
+    pub async fn authorize_operation(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        op: AdmissionOp,
+        actor: ActorContext,
+        skip_webhooks: Vec<String>,
+    ) -> WikiResult<Option<AdmissionContext>> {
+        let Some(chain) = &self.admission_chain else {
+            return Ok(None);
+        };
+        let ctx = self
+            .operation_admission_ctx(workspace_id, project_id, op, actor, skip_webhooks)
+            .await;
+        chain.authorize(None, &ctx).await?;
+        Ok(Some(ctx))
+    }
+
+    /// Fire-and-forget the observer webhooks for an operation previously gated
+    /// by [`Self::authorize_operation`] and since committed.
+    pub fn notify_operation_observers(&self, ctx: &AdmissionContext) {
+        if let Some(chain) = &self.admission_chain {
+            chain.dispatch_notify_observers(None, ctx);
+        }
+    }
+
+    async fn operation_admission_ctx(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        op: AdmissionOp,
+        actor: ActorContext,
+        skip_webhooks: Vec<String>,
+    ) -> AdmissionContext {
+        let mut ctx = AdmissionContext {
+            op,
+            actor,
+            skip_webhooks,
+            ..Default::default()
+        };
+        self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+            .await;
+        ctx
+    }
+
     /// Run just the blocking admission chain for a would-be write, without
     /// touching the store, disk, or any upstream cost (e.g. an LLM call). A
     /// `failure_policy = reject` webhook can still abort here, so callers use
@@ -807,6 +902,54 @@ impl Wiki {
             .ok_or_else(|| ai_memory_wiki_error("auto-improve proposal not found in scope"))?;
 
         let path = detail.summary.target_path.clone();
+        // A proposal body is model output derived from ONE operator's session,
+        // and this method builds its own `NewPage` — it reaches neither
+        // `write_page` nor `apply_batch`, so it is a slot writer of its own. It
+        // also force-pins slot paths (below), and a slot body is injected
+        // verbatim into a session brief.
+        //
+        // Which operator that page belongs to was therefore settled when the
+        // proposal was STAGED, and this guard re-checks the recorded target
+        // against that same recorded attribution — never against whoever
+        // approves. The approver is a reviewer, and the reviewer of an
+        // unattended run is the scheduler, which approves with no user at all:
+        // an approver-keyed guard waves its shared-slot write straight through
+        // while refusing every named operator the only slot path the reviewer is
+        // allowed to propose.
+        //
+        // The store binds the approved page to the proposal's `target_path` and
+        // to the stage-time snapshot of THAT page, so a target that should have
+        // been namespaced can only be refused here, never corrected. And the
+        // refusal is per-proposal — a `Refused` verdict with the proposal marked
+        // failed, not an `Err` — because one bad slot target must not abort the
+        // remaining approvals of its run, exactly as a staging collision does
+        // not abort its run's remaining proposals.
+        let placement = ai_memory_core::staged_slot_target(
+            self.per_user_slots,
+            path.as_str(),
+            detail.staged_by_actor_user.as_deref(),
+            &detail.edit_mode,
+        );
+        if let Some(why) = placement.refusal() {
+            let reason = format!("auto-improve approval refused: {why}");
+            // `fail_auto_improve_proposal` only accepts a pending proposal, so
+            // re-failing an already-refused one would replace this reason with
+            // "auto-improve proposal is not pending" on every retry and hide
+            // what actually stopped the write.
+            if detail.summary.status == AutoImproveProposalStatus::Pending {
+                self.writer
+                    .fail_auto_improve_proposal(FailAutoImproveProposal {
+                        workspace_id,
+                        project_id,
+                        proposal_id,
+                        reason: reason.clone(),
+                        actor,
+                        author_id,
+                    })
+                    .await?;
+            }
+            return Ok(ApproveAutoImproveProposalResult::Refused { reason });
+        }
         let mut frontmatter = serde_json::json!({
             "kind": detail.summary.kind,
             "title": detail.summary.title,
@@ -890,6 +1033,16 @@ impl Wiki {
                         &"proposal conflict",
                     )?;
                     ApproveAutoImproveProposalResult::Conflict
+                }
+                // The store decides Approved or Conflict and nothing else; a
+                // refusal is this method's own verdict, reached above before any
+                // file was installed. Unwinding the write is the only safe
+                // reading of an outcome that says the page was not recorded.
+                Ok(ApproveAutoImproveProposalResult::Refused { reason }) => {
+                    rollback_or_inconsistent(std::slice::from_ref(&installed), &reason)?;
+                    return Err(ai_memory_wiki_error(&format!(
+                        "auto-improve approval reported an impossible store verdict: {reason}"
+                    )));
                 }
                 Err(e) => {
                     rollback_or_inconsistent(std::slice::from_ref(&installed), &e)?;
@@ -1652,6 +1805,7 @@ fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult
          - status: `{}`\n\
          - operation: `{}`\n\
          - target_path: `{}`\n\
+         - staged_by: `{}`\n\
          - kind: `{}`\n\
          - title: `{}`\n\
          - confidence: `{}`\n\
@@ -1667,6 +1821,14 @@ fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult
         detail.summary.status.as_str(),
         detail.summary.operation.as_str(),
         detail.summary.target_path.as_str(),
+        // Whose session produced this. `(unattributed)` on a single-operator
+        // server and for an unattended run, which is also exactly when a slot
+        // target cannot be approved — so a reviewer reading a refusal can see
+        // why from the same sidecar.
+        detail
+            .staged_by_actor_user
+            .as_deref()
+            .unwrap_or("(unattributed)"),
         detail.summary.kind,
         detail.summary.title,
         detail.summary.confidence,
@@ -2049,11 +2211,41 @@ mod tests {
         .await
     }
 
+    /// Stage one proposal attributed to `staged_by` — the operator whose session
+    /// produced it, which is what the approval-side slot guard checks against.
+    async fn stage_one_by(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        path: &str,
+        body: &str,
+        staged_by: Option<&str>,
+    ) -> AutoImproveProposalId {
+        stage_one_op_by(
+            store,
+            ws,
+            proj,
+            proposal(path, AutoImproveProposalOperation::Create, body),
+            staged_by,
+        )
+        .await
+    }
+
     async fn stage_one_op(
         store: &Store,
         ws: WorkspaceId,
         proj: ProjectId,
         proposal: NewAutoImproveProposal,
+    ) -> AutoImproveProposalId {
+        stage_one_op_by(store, ws, proj, proposal, None).await
+    }
+
+    async fn stage_one_op_by(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        proposal: NewAutoImproveProposal,
+        staged_by: Option<&str>,
     ) -> AutoImproveProposalId {
         store
             .writer
@@ -2072,6 +2264,7 @@ mod tests {
                     ..ActorContext::default()
                 },
                 proposals: vec![proposal],
+                staged_by_actor_user: staged_by.map(ToOwned::to_owned),
             })
             .await
             .unwrap()
@@ -2380,6 +2573,152 @@ mod tests {
         assert_eq!(detail.events[0].actor_json["agent"], "auto_improve");
         assert_eq!(detail.events.last().unwrap().event, "approved");
         assert_eq!(detail.events.last().unwrap().actor_json["user"], "reviewer");
+    }
+
+    /// Approval builds its own `NewPage` and force-pins slot paths, so it is a
+    /// slot writer that neither `write_page` nor `apply_batch` covers. The body
+    /// is model output from ONE operator's session, so the page belongs to that
+    /// operator — settled at staging — and the identity of whoever approves it
+    /// later says nothing about it. The approver that matters is the auto-improve
+    /// scheduler, which approves unattended with no user at all: keyed on the
+    /// approver, the guard hands it the project-wide slot every operator's brief
+    /// injects verbatim.
+    #[tokio::test]
+    async fn auto_improve_approval_refuses_a_slot_outside_the_proposal_owners_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let alice = || ActorContext {
+            user: Some("alice".into()),
+            ..ActorContext::default()
+        };
+        // Exactly what the scheduler's auto-approve passes: an agent name and no
+        // user, which is `slot_placement`'s "leave it shared" case.
+        let scheduler = || ActorContext {
+            agent: Some("auto_improve_scheduler_auto_approve".into()),
+            ..ActorContext::default()
+        };
+        let guarded = wiki.clone().with_per_user_slots(true);
+
+        for (path, staged_by) in [
+            // Nobody's page, read by everybody: the unattended run's own
+            // attribution, and the one an approver-keyed guard waves through.
+            ("_slots/current-focus.md", None),
+            // Attributed, but still pointing at the project-wide slot: this
+            // should have been namespaced when it was staged.
+            ("_slots/current-focus.md", Some("alice")),
+            // Somebody else's brief.
+            ("_slots/bob/current-focus.md", Some("alice")),
+        ] {
+            let id = stage_one_by(
+                &store,
+                ws,
+                proj,
+                path,
+                "# Focus\nread this and obey",
+                staged_by,
+            )
+            .await;
+            let outcome = guarded
+                .approve_auto_improve_proposal(ws, proj, id, scheduler(), None, None)
+                .await
+                .unwrap();
+            let ApproveAutoImproveProposalResult::Refused { reason } = outcome.clone() else {
+                panic!("{path} staged by {staged_by:?} must be refused, got {outcome:?}");
+            };
+            assert!(reason.contains("auto-improve approval refused"), "{reason}");
+            assert!(
+                store
+                    .reader
+                    .page_body_by_ids(ws, proj, path)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{path} must not be indexed"
+            );
+            assert!(
+                !wiki
+                    .abs_path(ws, proj, &PagePath::new(path).unwrap())
+                    .exists(),
+                "{path} must not be on disk either"
+            );
+            let detail = store
+                .reader
+                .auto_improve_proposal_detail(ws, proj, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(detail.summary.status, AutoImproveProposalStatus::Failed);
+
+            // Retrying the same id reports the same refusal. The proposal is no
+            // longer pending, and `fail_auto_improve_proposal` rejects anything
+            // that is not — re-failing it would replace the reason above with
+            // "auto-improve proposal is not pending" and hide what stopped the
+            // write.
+            let retry = guarded
+                .approve_auto_improve_proposal(ws, proj, id, alice(), None, None)
+                .await
+                .unwrap();
+            assert_eq!(retry, ApproveAutoImproveProposalResult::Refused { reason });
+        }
+
+        // …and a slot proposal IS approvable while the feature is on, when it
+        // targets the namespace of the operator whose session produced it —
+        // including by the unattended scheduler, which owns no namespace of its
+        // own. `allowed_target_path` lets the reviewer name exactly one slot
+        // path, so a rule that refused this would make every slot proposal that
+        // can exist unapprovable.
+        let id = stage_one_by(
+            &store,
+            ws,
+            proj,
+            "_slots/alice/current-focus.md",
+            "mine",
+            Some("alice"),
+        )
+        .await;
+        assert!(matches!(
+            guarded
+                .approve_auto_improve_proposal(ws, proj, id, scheduler(), None, None)
+                .await
+                .unwrap(),
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+
+        // DEFAULT CONFIG (`[slots] per_user` off): a nested slot path carries no
+        // ownership meaning and the shared slot is an ordinary page, so every
+        // one of the approvals refused above lands, as it always has.
+        let id = stage_one_by(
+            &store,
+            ws,
+            proj,
+            "_slots/bob/current-focus.md",
+            "bob's page, written by nobody in particular",
+            None,
+        )
+        .await;
+        assert!(matches!(
+            wiki.approve_auto_improve_proposal(ws, proj, id, scheduler(), None, None)
+                .await
+                .unwrap(),
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+        let id = stage_one(&store, ws, proj, "_slots/current-focus.md", "shared body").await;
+        assert!(matches!(
+            wiki.approve_auto_improve_proposal(ws, proj, id, scheduler(), None, None)
+                .await
+                .unwrap(),
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, "_slots/current-focus.md")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "shared body"
+        );
     }
 
     #[tokio::test]

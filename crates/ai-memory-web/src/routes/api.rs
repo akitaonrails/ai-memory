@@ -57,6 +57,10 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             "/workspaces/{workspace}/projects/{project}/overview",
             axum::routing::get(project_overview_handler),
         )
+        .route(
+            "/workspaces/{workspace}/projects/{project}/handoffs",
+            axum::routing::get(handoffs_handler),
+        )
         .route("/graph", axum::routing::get(graph_handler))
         .with_state(state)
 }
@@ -414,13 +418,20 @@ async fn recent_handler(
 
 async fn briefing_handler(
     State(state): State<Arc<WebState>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
     let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
     let briefing = state
         .reader
-        .briefing_for_project(workspace_id, project_id, query.limit.clamp(1, 100))
+        .briefing_for_project(
+            workspace_id,
+            project_id,
+            query.limit.clamp(1, 100),
+            owner_filter_for(actor),
+            &BROWSER_SLOT_VISIBILITY,
+        )
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -431,6 +442,7 @@ async fn briefing_handler(
 
 async fn overview_handler(
     State(state): State<Arc<WebState>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path(workspace): Path<String>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
@@ -441,9 +453,18 @@ async fn overview_handler(
         .map_err(internal_error)?
         .ok_or_else(|| not_found(format!("workspace '{workspace}' not found")))?;
 
+    // Scoped to the requesting actor, like the briefing below and like
+    // `project_overview_handler`: an identified caller sees their own baton plus
+    // the shared ones, a browser the server cannot attribute sees only the
+    // shared ones — so an owned handoff, and the raw prompt text inside it, is
+    // never rendered to someone it does not belong to. Pinning this to
+    // "unattributed" instead would make the card permanently empty on any server
+    // that stamps an owner, while `pending_handoff_count` in the briefing beside
+    // it — which does apply the actor's filter — kept counting the same row.
+    let owner_filter = owner_filter_for(actor);
     let handoff = match state
         .reader
-        .latest_open_handoff_for_workspace(workspace_id)
+        .latest_open_handoff_for_workspace(workspace_id, owner_filter.clone())
         .await
         .map_err(internal_error)?
     {
@@ -468,7 +489,12 @@ async fn overview_handler(
 
     let briefing = state
         .reader
-        .briefing_for_workspace(workspace_id, query.limit.clamp(1, 100))
+        .briefing_for_workspace(
+            workspace_id,
+            query.limit.clamp(1, 100),
+            owner_filter,
+            &BROWSER_SLOT_VISIBILITY,
+        )
         .await
         .map_err(internal_error)?;
 
@@ -504,17 +530,237 @@ async fn overview_handler(
     ))
 }
 
+/// Slot rule for the browser's snapshots: every slot, whoever is looking.
+///
+/// This surface is a whole-wiki reader — it lists every page and serves every
+/// body through `/page` and `/search` with no per-operator filtering — so
+/// hiding namespaced slots from one JSON endpoint would narrow nothing while
+/// making the snapshot disagree with the page list beside it. Per-operator
+/// scoping belongs to the surfaces that feed an agent's context: the session
+/// brief and the consolidation prompt.
+const BROWSER_SLOT_VISIBILITY: ai_memory_core::SlotVisibility = ai_memory_core::SlotVisibility::All;
+
+/// Build the owner filter for a read-only API request.
+///
+/// A caller the server can name sees their own rows plus the shared ones; a
+/// caller it cannot sees only shared ones, so an owned handoff — and the
+/// prompt-derived text inside it — never reaches someone it does not belong to.
+///
+/// "Can name" is [`ai_memory_core::ActorContext::identity_key`], not
+/// `actor.user`: an ingress that forwards only the OIDC subject claim asserts
+/// `sub` alone, and reading `user` here would file every such operator as
+/// unattributed while the auth layer calls them a user — hiding their own
+/// handoffs, and the bodies of the shared ones, from them in their own UI.
+fn owner_filter_for(
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
+) -> ai_memory_core::OwnerFilter {
+    ai_memory_core::OwnerFilter::for_actor_context(
+        &actor.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
+    )
+}
+
+/// May this request read the prompt-derived body of a handoff?
+///
+/// Three ways to qualify: the caller resolved to an identity and is reading rows
+/// that are their own or shared; the caller holds root, which is the operator —
+/// they already read every page body through the wiki API, so redacting their
+/// own handoffs from their own UI costs them and protects nobody; or the server
+/// does not authenticate at all and the whole wiki is open by design.
+/// `require_bearer` stamps [`ai_memory_core::AuthLevel::Anonymous`] on every
+/// request of a server with no configured token; the extension is missing only
+/// when the API is mounted with no auth layer whatsoever, which is the same open
+/// posture. What is left — an auth-configured server, a caller it can neither
+/// name nor recognise as root — is the only case that redacts. See
+/// [`handoffs_handler`] for why the body is treated differently from the
+/// metadata beside it.
+///
+/// [`ai_memory_core::OwnerFilter::Any`] is the cross-owner recovery filter, so
+/// it is root-only here. Nothing on this route produces it today, but the
+/// sibling recovery switches exist elsewhere; making the check local to this
+/// gate means adding an `all_owners` query parameter later cannot quietly hand
+/// every operator's prompt trail to a caller the server cannot name.
+///
+/// # What actually reaches the `Unattributed` arm
+///
+/// Two live cases, both served, and one that redacts and has no producer today.
+/// `Unattributed` + [`ai_memory_core::AuthLevel::Anonymous`] is rung 0 — no
+/// `[auth].bearer_token`, the default — which stamps
+/// [`ai_memory_core::ActorContext::anonymous`] on **every** request; and
+/// `Unattributed` + [`ai_memory_core::AuthLevel::Root`] is an authenticating
+/// server with no `[auth].root_username`, where the root template names nobody.
+/// Both are open postures and the arm serves them.
+///
+/// What has no producer is `Unattributed` at a NAMED tier: the DB-user rung
+/// fills `user` from the row, and the proxy downgrade only reaches
+/// [`ai_memory_core::AuthLevel::User`] when the proxy asserted `user` *or*
+/// `sub` — both of which [`ai_memory_core::ActorContext::identity_key`]
+/// resolves, so the filter is `User(_)` and the body is served by the arm
+/// above. That gap is the fail-safe: a future rung, or a mount that injects a
+/// tier without an actor, redacts by default instead of leaking. Weakening the
+/// arm because "nothing produces it" removes the fail-safe, not dead code.
+fn serves_handoff_body(
+    owner_filter: &ai_memory_core::OwnerFilter,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+) -> bool {
+    let level = auth.map(|axum::Extension(level)| level);
+    let root = level == Some(ai_memory_core::AuthLevel::Root);
+    match owner_filter {
+        ai_memory_core::OwnerFilter::User(_) => true,
+        ai_memory_core::OwnerFilter::Any => root,
+        ai_memory_core::OwnerFilter::Unattributed => {
+            root || matches!(level, None | Some(ai_memory_core::AuthLevel::Anonymous))
+        }
+    }
+}
+
+/// One handoff in the listing. Richer than [`ApiHandoff`] (the single "pending"
+/// card): it carries the state and ownership needed to answer "where did my
+/// baton go".
+#[derive(Serialize)]
+struct ApiHandoffEntry {
+    id: String,
+    agent: String,
+    at: String,
+    state: String,
+    /// Prompt-derived text, withheld from a caller the server can neither name
+    /// nor recognise as root — see [`handoffs_handler`]. Absent together with
+    /// `open_questions` and `next_steps` whenever `redacted` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_questions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_steps: Option<Vec<String>>,
+    /// True when the three fields above were withheld, so a frontend can say
+    /// "sign in to read this" instead of rendering a blank card.
+    redacted: bool,
+    files_touched: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    /// Operator the handoff belongs to; absent when shared with the project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    /// Operator that consumed it, when it has been accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HandoffListQuery {
+    /// `open` | `accepted` | `expired`. Omit for every state — which is how an
+    /// operator finds a baton that was already consumed.
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default = "default_handoff_limit")]
+    limit: usize,
+}
+
+const fn default_handoff_limit() -> usize {
+    50
+}
+
+/// List a project's handoffs.
+///
+/// Before this there was no way to enumerate handoffs anywhere in the system:
+/// readers only ever fetched the single pending one and consumed it, so a baton
+/// that went to the wrong place simply vanished. Scoped by owner, so this does
+/// not become a way to read other operators' context.
+///
+/// # The prompt-derived body needs a caller the server can vouch for
+///
+/// The metadata — state, timestamps, agent, cwd, touched files, ownership — is
+/// what makes the listing useful and is served to anyone who may call it.
+/// `summary`, `open_questions` and `next_steps` are not metadata: an automatic
+/// SessionEnd handoff synthesises them verbatim from the operator's prompts, and
+/// the listing returns the project's whole history rather than the single newest
+/// open row the overview card shows. A caller with no identity matches every
+/// *shared* handoff — which is all of them on a server that stamps no owner — so
+/// serving those three fields to one would hand the entire prompt trail to
+/// whoever can reach the endpoint.
+///
+/// [`serves_handoff_body`] therefore withholds them from exactly one caller: an
+/// auth-configured server's request that resolved to neither a username nor
+/// root. Root is the operator — `[auth].root_username` is optional, so the
+/// ordinary single-operator deployment authenticates as root while stamping no
+/// owner on anything, and redacting there would blank out the operator's own
+/// handoffs in their own UI while the overview card beside it, which never
+/// gated the same three fields, kept rendering them.
+///
+/// A server with no auth configured is the other open case: it already serves
+/// every page body unauthenticated, so withholding here would narrow nothing
+/// while making the listing useless. The rule is about not widening what a
+/// server that *does* authenticate shows to a caller it cannot place.
+async fn handoffs_handler(
+    State(state): State<Arc<WebState>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    Path((workspace, project)): Path<(String, String)>,
+    Query(query): Query<HandoffListQuery>,
+) -> Result<Response, Response> {
+    let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
+    let handoff_state = match query.state.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => Some(raw.parse::<ai_memory_core::HandoffState>().map_err(|_| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                format!("unknown handoff state: {raw}"),
+            )
+        })?),
+    };
+    let owner_filter = owner_filter_for(actor);
+    let with_body = serves_handoff_body(&owner_filter, auth);
+    let handoffs = state
+        .reader
+        .list_handoffs(
+            workspace_id,
+            project_id,
+            handoff_state,
+            owner_filter,
+            query.limit.clamp(1, 200),
+        )
+        .await
+        .map_err(internal_error)?;
+    let entries: Vec<ApiHandoffEntry> = handoffs
+        .into_iter()
+        .map(|h| ApiHandoffEntry {
+            id: h.id.to_string(),
+            agent: h.from_agent.as_str().to_owned(),
+            at: h.created_at.to_string(),
+            state: h.state.as_str().to_owned(),
+            summary: with_body.then_some(h.summary),
+            open_questions: with_body.then_some(h.open_questions),
+            next_steps: with_body.then_some(h.next_steps),
+            redacted: !with_body,
+            files_touched: h.files_touched,
+            cwd: h.cwd,
+            owner: h.owner_user,
+            accepted_by: h.accepted_by_user,
+            accepted_at: h.accepted_at.map(|t| t.to_string()),
+        })
+        .collect();
+    Ok(with_cache(
+        Json(serde_json::json!({ "handoffs": entries })).into_response(),
+        LIST_CACHE_MAX_AGE,
+    ))
+}
+
 async fn project_overview_handler(
     State(state): State<Arc<WebState>>,
+    actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Path((workspace, project)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Response, Response> {
     let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
     let limit = query.limit.clamp(1, 100);
 
+    // Same scoping as `overview_handler`; computed once and reused for the
+    // briefing below so both halves of the response agree on visibility.
+    let owner_filter = owner_filter_for(actor);
     let handoff = state
         .reader
-        .latest_open_handoff(workspace_id, project_id, None)
+        .latest_open_handoff(workspace_id, project_id, None, owner_filter.clone())
         .await
         .map_err(internal_error)?
         .map(|h| ApiHandoff {
@@ -528,7 +774,13 @@ async fn project_overview_handler(
 
     let briefing = state
         .reader
-        .briefing_for_project(workspace_id, project_id, limit)
+        .briefing_for_project(
+            workspace_id,
+            project_id,
+            limit,
+            owner_filter,
+            &BROWSER_SLOT_VISIBILITY,
+        )
         .await
         .map_err(internal_error)?;
 
@@ -894,5 +1146,46 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serves_handoff_body;
+    use ai_memory_core::{AuthLevel, OwnerFilter};
+    use axum::Extension;
+
+    /// Nothing routes an `Any` filter into the listing today; this is the trap
+    /// check for whoever wires the `all_owners` recovery switch onto it. Reading
+    /// past ownership must cost root — not merely a token the server accepted,
+    /// and not a name the request happens to carry, since the rows returned then
+    /// belong to other operators.
+    #[test]
+    fn cross_owner_filter_serves_body_only_to_root() {
+        for level in [None, Some(AuthLevel::Anonymous), Some(AuthLevel::User)] {
+            assert!(
+                !serves_handoff_body(&OwnerFilter::Any, level.map(Extension)),
+                "cross-owner body served at {level:?}"
+            );
+        }
+        assert!(serves_handoff_body(
+            &OwnerFilter::Any,
+            Some(Extension(AuthLevel::Root))
+        ));
+    }
+
+    /// The operator of the ordinary authenticated deployment: root bearer, no
+    /// `[auth].root_username`, so nothing names them and every handoff they
+    /// wrote is shared. Redacting there hides their own data from them.
+    #[test]
+    fn root_reads_the_body_it_wrote_unattributed() {
+        assert!(serves_handoff_body(
+            &OwnerFilter::Unattributed,
+            Some(Extension(AuthLevel::Root))
+        ));
+        assert!(!serves_handoff_body(
+            &OwnerFilter::Unattributed,
+            Some(Extension(AuthLevel::User))
+        ));
     }
 }

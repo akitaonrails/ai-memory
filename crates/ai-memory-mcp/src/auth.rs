@@ -47,7 +47,7 @@ use std::sync::Arc;
 use ai_memory_core::{ActorContext, AuthLevel};
 use ai_memory_store::{ReaderPool, TokenPepper, WriterHandle, hash_token};
 use axum::extract::State;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
@@ -97,6 +97,12 @@ pub struct AuthState {
     /// Multi-user lookup tier. `None` until both pepper and reader
     /// are available — see [`Self::with_multiuser`].
     multiuser: Option<MultiUserResolver>,
+    /// Shared secret that a trusted authenticating proxy presents to assert an
+    /// end-user identity via `X-Memory-Actor-*` headers — see
+    /// [`Self::with_trusted_proxy`]. `None` (the default) means those headers
+    /// are ignored entirely, which is the only safe default for a server whose
+    /// port anything on the network can reach.
+    actor_proxy_secret: Option<String>,
 }
 
 impl AuthState {
@@ -120,6 +126,40 @@ impl AuthState {
     #[must_use]
     pub fn with_root_actor(mut self, actor: ActorContext) -> Self {
         self.root_actor = actor;
+        self
+    }
+
+    /// Does `actor` name the operator configured as root?
+    ///
+    /// Used to decide whether a proxy-asserted identity keeps root capability.
+    /// With no `root_username` configured there is no one to match, so nobody
+    /// the proxy names is root.
+    fn asserts_root_identity(&self, actor: &ActorContext) -> bool {
+        match (self.root_actor.user.as_deref(), actor.user.as_deref()) {
+            (Some(root), Some(asserted)) => root == asserted,
+            _ => false,
+        }
+    }
+
+    /// Trust an authenticating proxy to assert WHO the caller is.
+    ///
+    /// A proxy that terminates SSO (validating an OIDC token, say) usually
+    /// cannot forward the end user's credential upstream: it authenticates to
+    /// this server with the single root token and describes the human in
+    /// `X-Memory-Actor-*` headers. Without a way to tell that proxy apart from
+    /// any other client, those headers cannot be believed — anyone able to
+    /// reach the port could claim to be anyone — so they are ignored by
+    /// default and every caller collapses into the one root identity.
+    ///
+    /// Presenting `secret` in `X-Memory-Actor-Proxy-Secret` on a request that
+    /// already authenticated as root lets the headers overlay the root actor.
+    /// The secret IS the switch: there is no separate "trust headers" flag to
+    /// turn on without one, so this cannot be enabled insecurely by accident.
+    /// A blank secret is treated as absent.
+    #[must_use]
+    pub fn with_trusted_proxy(mut self, secret: impl Into<String>) -> Self {
+        let secret = secret.into();
+        self.actor_proxy_secret = Some(secret).filter(|s| !s.trim().is_empty());
         self
     }
 
@@ -150,6 +190,128 @@ impl AuthState {
     pub fn enabled(&self) -> bool {
         self.expected.is_some()
     }
+}
+
+/// axum middleware closure. Wire with
+/// `axum::middleware::from_fn_with_state(state, require_bearer)`.
+///
+/// Token sources, in priority order:
+/// 1. `Authorization: Bearer <token>` header. Works for any method.
+///    This is what MCP + hook clients send.
+/// 2. **GET only:** `Authorization: Basic <base64(user:token)>`.
+///    Username is ignored; the password portion is the token.
+///    Browsers send this automatically after the native credential
+///    prompt fires on a 401 + `WWW-Authenticate: Basic`. On success
+///    we also set the `ai_memory_auth` cookie so subsequent visits
+///    (including from a fresh browser session) skip the prompt.
+/// 3. **GET only:** `ai_memory_auth` cookie set by the Basic handshake.
+///
+/// POST / PUT / DELETE / etc. require the Bearer header. Cookie and
+/// Basic auth are GET-only, which confines cookie-CSRF to read-only
+/// pages — `/mcp` + `/hook` are POST-only and stay header-gated.
+///
+/// On 401 for GET requests the response includes both `Basic` and
+/// `Bearer` challenges in `WWW-Authenticate`. Browsers honour the
+/// `Basic` challenge (native dialog); MCP clients honour the `Bearer`
+/// challenge.
+/// Header a trusted proxy uses to prove it is the proxy.
+const ACTOR_PROXY_SECRET_HEADER: &str = "x-memory-actor-proxy-secret";
+
+/// Every header the trusted-proxy overlay reads, including the secret itself.
+/// A repeated occurrence of any of them makes the assertion ambiguous — see
+/// [`overlay_trusted_proxy_actor`].
+const PROXY_ASSERTION_HEADERS: [&str; 6] = [
+    ACTOR_PROXY_SECRET_HEADER,
+    "x-memory-actor-user",
+    "x-memory-actor-sub",
+    "x-memory-actor-agent",
+    "x-memory-actor-client",
+    "x-memory-actor-session-id",
+];
+
+/// What the trusted-proxy overlay concluded about a request.
+enum ProxyAssertion {
+    /// No overlay: no configured secret, no secret header, or a mismatch. The
+    /// root actor is untouched and the caller stays plain root.
+    Absent,
+    /// The proxy proved itself; the actor now carries whatever it asserted,
+    /// which may be nobody.
+    Applied,
+    /// The proxy's headers arrived more than once, so WHO the caller is cannot
+    /// be decided. The request must fail rather than pick a value.
+    Ambiguous,
+}
+
+/// Let a trusted proxy say WHO the caller is, overlaying the asserted identity
+/// onto the root actor.
+///
+/// Everything is fail-closed: no configured secret, a missing header, or a
+/// mismatch all leave `actor` untouched, so the pre-existing behaviour (every
+/// proxied caller collapses into the single root identity) is what you get
+/// until an operator deliberately configures the shared secret.
+///
+/// Only fields the proxy actually asserts are overlaid; the root actor's own
+/// values survive for anything the proxy left out.
+///
+/// # The proxy MUST strip client-supplied `X-Memory-Actor-*` headers
+///
+/// This whole overlay assumes the `X-Memory-Actor-*` values on the wire are the
+/// proxy's, not the caller's. An ingress configured to *append* its headers
+/// rather than replace them leaves the client's value in place beside the
+/// proxy's, and there is no way to tell which is which — so a duplicate is
+/// treated as a spoofing attempt and the request is refused
+/// ([`ProxyAssertion::Ambiguous`]) instead of one of the two being picked.
+fn overlay_trusted_proxy_actor(
+    state: &AuthState,
+    headers: &HeaderMap,
+    actor: &mut ActorContext,
+) -> ProxyAssertion {
+    let Some(expected) = state.actor_proxy_secret.as_deref() else {
+        return ProxyAssertion::Absent;
+    };
+    // Checked before the comparison below because `HeaderMap::get` returns the
+    // FIRST value: a client that prepends its own secret header would otherwise
+    // force a mismatch, suppress the proxy's assertion, and be handed the
+    // undowngraded root identity — an escalation, not just a lost overlay.
+    if PROXY_ASSERTION_HEADERS
+        .iter()
+        .any(|name| headers.get_all(*name).iter().count() > 1)
+    {
+        return ProxyAssertion::Ambiguous;
+    }
+    let presented = headers
+        .get(ACTOR_PROXY_SECRET_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    // Constant-time: this is a credential comparison like the bearer above.
+    // Differing lengths already compare unequal, so an absent header is safe.
+    if !bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) {
+        return ProxyAssertion::Absent;
+    }
+    let asserted = crate::actor::actor_from_headers(headers);
+    // The proxy owns the IDENTITY fields wholesale: user, name, email and sub
+    // are taken from what it asserts, never merged with the root template.
+    // Merging per-field looks harmless but is not — a proxy that forwards only
+    // `sub` would leave the root template's `user` in place, so every human
+    // would share one owner while carrying someone else's subject. Taking the
+    // block as a unit means a proxy that names nobody yields an unattributed
+    // actor (shared-only access), which is the fail-safe direction.
+    actor.user = asserted.user;
+    actor.sub = asserted.sub;
+    actor.name = None;
+    actor.email = None;
+    // Transport/agent detail is not identity: keep whatever the request layer
+    // already knew when the proxy does not describe it.
+    if asserted.client.is_some() {
+        actor.client = asserted.client;
+    }
+    if asserted.agent.is_some() {
+        actor.agent = asserted.agent;
+    }
+    if asserted.session_id.is_some() {
+        actor.session_id = asserted.session_id;
+    }
+    ProxyAssertion::Applied
 }
 
 /// axum middleware closure. Wire with
@@ -210,8 +372,44 @@ pub async fn require_bearer(
         // info, hook payload) — not from config. Leave it for the
         // hook router / MCP server to overlay onto the actor.
         actor.agent = actor.agent.or(None);
+        // Rung 1b: a trusted proxy may name the real human behind this root
+        // credential. No-op unless the shared secret is configured AND
+        // presented, so an untrusted client cannot assert an identity by
+        // setting headers.
+        let assertion = overlay_trusted_proxy_actor(&state, req.headers(), &mut actor);
+        if matches!(assertion, ProxyAssertion::Ambiguous) {
+            debug!("auth rejected: duplicated trusted-proxy identity header");
+            return ambiguous_proxy_identity();
+        }
+        // The credential is root's, but the human it stands for usually is not.
+        // Keeping AuthLevel::Root here would hand root capability to every
+        // person the proxy authenticates, which would silently void the
+        // admin-gated operations (sweep, purge, delete) for exactly the
+        // multi-operator deployment this overlay exists to serve. Only a
+        // caller the proxy names AS the configured root operator stays root.
+        //
+        // The downgrade needs an asserted IDENTITY, not merely a valid secret:
+        // a proxy that echoes the secret on its own health checks or on
+        // machine-to-machine traffic asserts nobody, and demoting those would
+        // strip root from the deployment's own maintenance calls.
+        //
+        // "Somebody" cannot mean `user` alone. An ingress that terminates OIDC
+        // and forwards only the subject claim names a human just as much — one
+        // that can never match `root_username` — so keying on `user` would hand
+        // root to every person behind exactly the proxy this overlay serves.
+        // Any identity field the overlay adopts counts.
+        let named_someone = matches!(assertion, ProxyAssertion::Applied)
+            && (actor.user.is_some() || actor.sub.is_some());
+        let level = if named_someone && !state.asserts_root_identity(&actor) {
+            AuthLevel::User
+        } else {
+            AuthLevel::Root
+        };
+        if matches!(assertion, ProxyAssertion::Applied) {
+            debug!(actor.user = ?actor.user, ?level, "identity asserted by trusted proxy");
+        }
         req.extensions_mut().insert(actor);
-        req.extensions_mut().insert(AuthLevel::Root);
+        req.extensions_mut().insert(level);
 
         // First successful Basic-auth hit (no cookie yet) → also stamp
         // the cookie so the user doesn't get the dialog again next
@@ -334,6 +532,19 @@ fn build_session_cookie(token: &str) -> String {
     // on a LAN. A TLS-terminating reverse proxy is the right place to
     // add Secure if the service is exposed publicly.
     format!("{AUTH_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000")
+}
+
+/// The proxy's identity headers contradict themselves. Not a 401 — the
+/// credential was fine; the request itself is malformed, and retrying it with
+/// the same headers will keep failing until the ingress is fixed to REPLACE
+/// `X-Memory-Actor-*` rather than append to whatever the client sent.
+fn ambiguous_proxy_identity() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "duplicate X-Memory-Actor-* header: the proxy must replace \
+         client-supplied actor headers, not append to them\n",
+    )
+        .into_response()
 }
 
 fn unauthorized(include_basic_challenge: bool) -> Response {
@@ -738,6 +949,400 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let actor = body_as_actor(resp).await;
         assert!(!actor.has_any(), "rung 0 must inject anonymous actor");
+    }
+
+    /// A proxy-asserted human must NOT inherit root capability: the credential
+    /// belongs to the proxy, the identity belongs to an ordinary person, and
+    /// admin-gated operations (sweep, purge, delete) key off the level.
+    #[tokio::test]
+    async fn proxy_asserted_identity_is_downgraded_to_user_level() {
+        let root = ActorContext {
+            user: Some("root-operator".into()),
+            ..ActorContext::default()
+        };
+        let state = Arc::new(
+            AuthState::new(Some("the-root-token".into()))
+                .with_root_actor(root)
+                .with_trusted_proxy("proxy-shared-secret"),
+        );
+        let router = Router::new()
+            .route("/level", get(echo_auth_level))
+            .layer(axum::middleware::from_fn_with_state(state, require_bearer));
+
+        let level_for = |user: &'static str| {
+            let router = router.clone();
+            async move {
+                let resp = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/level")
+                            .header("Authorization", "Bearer the-root-token")
+                            .header("X-Memory-Actor-Proxy-Secret", "proxy-shared-secret")
+                            .header("X-Memory-Actor-User", user)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                String::from_utf8(bytes.to_vec()).unwrap()
+            }
+        };
+
+        assert_eq!(
+            level_for("alice").await,
+            "user",
+            "an ordinary human behind the proxy must not hold root capability"
+        );
+        // The operator the server is configured to treat as root keeps it.
+        assert_eq!(level_for("root-operator").await, "root");
+    }
+
+    /// The proxy's own traffic — health checks, machine-to-machine calls —
+    /// carries the secret but names nobody. Downgrading on the secret alone
+    /// would strip root from those for no reason: there is no other human whose
+    /// authority the request could be standing in for.
+    #[tokio::test]
+    async fn proxy_secret_without_an_asserted_user_keeps_root_level() {
+        let state = Arc::new(
+            AuthState::new(Some("the-root-token".into()))
+                .with_root_actor(ActorContext {
+                    user: Some("root-operator".into()),
+                    ..ActorContext::default()
+                })
+                .with_trusted_proxy("proxy-shared-secret"),
+        );
+        let resp = Router::new()
+            .route("/level", get(echo_auth_level))
+            .layer(axum::middleware::from_fn_with_state(state, require_bearer))
+            .oneshot(
+                Request::builder()
+                    .uri("/level")
+                    .header("Authorization", "Bearer the-root-token")
+                    .header("X-Memory-Actor-Proxy-Secret", "proxy-shared-secret")
+                    .header("X-Memory-Actor-Agent", "healthcheck")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "root");
+    }
+
+    /// An ingress that terminates OIDC and forwards only the subject claim
+    /// (no `preferred_username`, so no `X-Memory-Actor-User`) still names a
+    /// human. That human can never match `root_username`, so keeping root here
+    /// would hand purge, delete and the forget sweep to everyone behind the
+    /// proxy — worse than the collapse-into-root this overlay replaces.
+    #[tokio::test]
+    async fn proxy_asserting_only_sub_is_downgraded_to_user_level() {
+        let state = Arc::new(
+            AuthState::new(Some("the-root-token".into()))
+                .with_root_actor(ActorContext {
+                    user: Some("root-operator".into()),
+                    ..ActorContext::default()
+                })
+                .with_trusted_proxy("proxy-shared-secret"),
+        );
+        let resp = Router::new()
+            .route("/level", get(echo_auth_level))
+            .layer(axum::middleware::from_fn_with_state(state, require_bearer))
+            .oneshot(
+                Request::builder()
+                    .uri("/level")
+                    .header("Authorization", "Bearer the-root-token")
+                    .header("X-Memory-Actor-Proxy-Secret", "proxy-shared-secret")
+                    .header("X-Memory-Actor-Sub", "oidc-subject-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.to_vec()).unwrap(),
+            "user",
+            "a sub-only assertion names somebody who is not the root operator"
+        );
+    }
+
+    /// An ingress that APPENDS `X-Memory-Actor-User` instead of replacing it
+    /// leaves the caller's own value first in the list, and `HeaderMap::get`
+    /// returns the first — so Bob sending `X-Memory-Actor-User: alice` would be
+    /// Alice everywhere. Neither value may be adopted: refuse the request.
+    #[tokio::test]
+    async fn duplicated_actor_user_header_is_refused() {
+        let state = AuthState::new(Some("the-root-token".into()))
+            .with_root_actor(ActorContext {
+                user: Some("root-operator".into()),
+                ..ActorContext::default()
+            })
+            .with_trusted_proxy("proxy-shared-secret");
+        let resp = router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", "Bearer the-root-token")
+                    .header("X-Memory-Actor-Proxy-Secret", "proxy-shared-secret")
+                    // Bob's own header, then the proxy's appended one.
+                    .header("X-Memory-Actor-User", "alice")
+                    .header("X-Memory-Actor-User", "bob")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an ambiguous asserted identity must fail closed, not resolve to one of the two"
+        );
+    }
+
+    /// The secret header has the same first-wins hazard, and worse consequences:
+    /// a client that prepends garbage forces a mismatch, suppresses the proxy's
+    /// assertion, and would be handed the undowngraded ROOT identity.
+    #[tokio::test]
+    async fn duplicated_proxy_secret_header_is_refused() {
+        let state = AuthState::new(Some("the-root-token".into()))
+            .with_root_actor(ActorContext {
+                user: Some("root-operator".into()),
+                ..ActorContext::default()
+            })
+            .with_trusted_proxy("proxy-shared-secret");
+        let resp = router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", "Bearer the-root-token")
+                    .header("X-Memory-Actor-Proxy-Secret", "not-the-secret")
+                    .header("X-Memory-Actor-Proxy-Secret", "proxy-shared-secret")
+                    .header("X-Memory-Actor-User", "bob")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Without a proxy assertion the root bearer keeps root, unchanged.
+    #[tokio::test]
+    async fn plain_root_bearer_keeps_root_level() {
+        let state = Arc::new(
+            AuthState::new(Some("the-root-token".into()))
+                .with_root_actor(ActorContext {
+                    user: Some("root-operator".into()),
+                    ..ActorContext::default()
+                })
+                .with_trusted_proxy("proxy-shared-secret"),
+        );
+        let resp = Router::new()
+            .route("/level", get(echo_auth_level))
+            .layer(axum::middleware::from_fn_with_state(state, require_bearer))
+            .oneshot(
+                Request::builder()
+                    .uri("/level")
+                    .header("Authorization", "Bearer the-root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "root");
+    }
+
+    /// A proxy that forwards only the subject names nobody, so the actor must
+    /// come out unattributed rather than silently keeping the root username —
+    /// otherwise every human collapses onto one owner carrying a foreign `sub`.
+    #[tokio::test]
+    async fn proxy_asserting_only_sub_yields_an_unattributed_user() {
+        let state = AuthState::new(Some("the-root-token".into()))
+            .with_root_actor(ActorContext {
+                user: Some("root-operator".into()),
+                email: Some("root@example.com".into()),
+                ..ActorContext::default()
+            })
+            .with_trusted_proxy("proxy-shared-secret");
+        let resp = router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", "Bearer the-root-token")
+                    .header("X-Memory-Actor-Proxy-Secret", "proxy-shared-secret")
+                    .header("X-Memory-Actor-Sub", "oidc-subject-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let actor = body_as_actor(resp).await;
+        assert_eq!(actor.user, None, "the root username must not survive");
+        assert_eq!(actor.sub.as_deref(), Some("oidc-subject-123"));
+        assert_eq!(actor.email, None);
+    }
+
+    /// Security boundary: the `X-Memory-Actor-*` headers are pure client input.
+    /// With no proxy secret configured they must be ignored completely, or
+    /// anyone who can reach the port authenticates as root and then names
+    /// themselves whoever they like.
+    #[tokio::test]
+    async fn actor_headers_are_ignored_without_a_configured_proxy_secret() {
+        let root = ActorContext {
+            user: Some("boss".into()),
+            ..ActorContext::default()
+        };
+        let state = AuthState::new(Some("the-root-token".into())).with_root_actor(root);
+        let resp = router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", "Bearer the-root-token")
+                    .header("X-Memory-Actor-User", "impostor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let actor = body_as_actor(resp).await;
+        assert_eq!(
+            actor.user.as_deref(),
+            Some("boss"),
+            "unproven actor headers must not override the root identity"
+        );
+    }
+
+    /// Same headers, secret configured but NOT presented: still ignored.
+    #[tokio::test]
+    async fn actor_headers_are_ignored_without_the_proxy_secret_header() {
+        let root = ActorContext {
+            user: Some("boss".into()),
+            ..ActorContext::default()
+        };
+        let state = AuthState::new(Some("the-root-token".into()))
+            .with_root_actor(root)
+            .with_trusted_proxy("proxy-shared-secret");
+        let resp = router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", "Bearer the-root-token")
+                    .header("X-Memory-Actor-User", "impostor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let actor = body_as_actor(resp).await;
+        assert_eq!(actor.user.as_deref(), Some("boss"));
+    }
+
+    /// A wrong secret is as good as none.
+    #[tokio::test]
+    async fn actor_headers_are_ignored_when_the_proxy_secret_mismatches() {
+        let root = ActorContext {
+            user: Some("boss".into()),
+            ..ActorContext::default()
+        };
+        let state = AuthState::new(Some("the-root-token".into()))
+            .with_root_actor(root)
+            .with_trusted_proxy("proxy-shared-secret");
+        let resp = router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", "Bearer the-root-token")
+                    .header("X-Memory-Actor-Proxy-Secret", "wrong")
+                    .header("X-Memory-Actor-User", "impostor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let actor = body_as_actor(resp).await;
+        assert_eq!(actor.user.as_deref(), Some("boss"));
+    }
+
+    /// The point of the feature: with the secret proven, two different humans
+    /// behind the same root credential become two different actors.
+    #[tokio::test]
+    async fn trusted_proxy_identity_overlays_the_root_actor() {
+        let root = ActorContext {
+            user: Some("boss".into()),
+            email: Some("boss@example.com".into()),
+            name: Some("Boss".into()),
+            ..ActorContext::default()
+        };
+        let state = Arc::new(
+            AuthState::new(Some("the-root-token".into()))
+                .with_root_actor(root)
+                .with_trusted_proxy("proxy-shared-secret"),
+        );
+        let router = Router::new()
+            .route("/probe", get(echo_actor))
+            .layer(axum::middleware::from_fn_with_state(state, require_bearer));
+
+        for user in ["alice", "bob"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/probe")
+                        .header("Authorization", "Bearer the-root-token")
+                        .header("X-Memory-Actor-Proxy-Secret", "proxy-shared-secret")
+                        .header("X-Memory-Actor-User", user)
+                        .header("X-Memory-Actor-Session-Id", format!("sess-{user}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let actor = body_as_actor(resp).await;
+            assert_eq!(actor.user.as_deref(), Some(user));
+            assert_eq!(actor.session_id.as_deref(), Some(&*format!("sess-{user}")));
+            // The root template's contact details describe the root operator,
+            // not the human just named, so they must not be carried over.
+            assert_eq!(actor.email, None);
+            assert_eq!(actor.name, None);
+        }
+    }
+
+    /// A blank secret must not enable the overlay — otherwise an empty config
+    /// value would make a missing header compare equal and trust everyone.
+    #[tokio::test]
+    async fn blank_proxy_secret_does_not_enable_the_overlay() {
+        let root = ActorContext {
+            user: Some("boss".into()),
+            ..ActorContext::default()
+        };
+        let state = AuthState::new(Some("the-root-token".into()))
+            .with_root_actor(root)
+            .with_trusted_proxy("   ");
+        let resp = router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", "Bearer the-root-token")
+                    .header("X-Memory-Actor-User", "impostor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let actor = body_as_actor(resp).await;
+        assert_eq!(actor.user.as_deref(), Some("boss"));
     }
 
     #[tokio::test]

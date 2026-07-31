@@ -1012,6 +1012,13 @@ pub struct FinalizeSessionArgs {
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
+    /// Finalize sessions belonging to OTHER operators too.
+    ///
+    /// By default only your own (and unattributed) sessions are considered, so
+    /// finalizing cannot end a colleague's live session. Use this to recover a
+    /// teammate's session that died without emitting SessionEnd.
+    #[arg(long, default_value_t = false)]
+    pub all_owners: bool,
     /// Finalize every matching open session instead of just the latest one.
     #[arg(long)]
     pub all: bool,

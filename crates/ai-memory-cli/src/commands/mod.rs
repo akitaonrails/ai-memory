@@ -285,6 +285,27 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
     ))
 }
 
+/// Human-readable lines for the proposals the server refused to stage.
+///
+/// Empty when nothing was skipped, so a clean run prints nothing extra. Every
+/// staging command shares this: a skipped proposal is otherwise
+/// indistinguishable from one the reviewer never produced — the run reports
+/// success either way, only with one proposal fewer — and the operator has no
+/// way to learn that a paid review result was dropped.
+pub(crate) fn skipped_proposal_lines(skipped: &[ai_memory_store::SkippedProposal]) -> Vec<String> {
+    if skipped.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::with_capacity(skipped.len() + 1);
+    lines.push(format!("Skipped {} proposal(s):", skipped.len()));
+    lines.extend(
+        skipped
+            .iter()
+            .map(|s| format!("  - {}: {}", s.target_path, s.reason)),
+    );
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +332,27 @@ mod tests {
         };
 
         assert_eq!(resolve_project_name(&config, None).unwrap(), "my-project");
+    }
+
+    #[test]
+    fn skipped_proposal_lines_are_empty_on_a_clean_run() {
+        assert!(skipped_proposal_lines(&[]).is_empty());
+    }
+
+    #[test]
+    fn skipped_proposal_lines_name_the_path_and_the_reason() {
+        let lines = skipped_proposal_lines(&[ai_memory_store::SkippedProposal {
+            target_path: "procedures/release.md".into(),
+            reason: "a proposal is already pending review for this path".into(),
+        }]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains('1'), "{lines:?}");
+        assert!(lines[1].contains("procedures/release.md"), "{lines:?}");
+        assert!(
+            lines[1].contains("already pending review"),
+            "the reason has to travel with the path, or the operator only \
+             learns that something vanished: {lines:?}"
+        );
     }
 
     /// Build a config whose scope resolution walks up from `cwd`, and drop a

@@ -353,6 +353,7 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
             project_id: proj,
             agent_kind: AgentKind::OpenCode,
             cwd: None,
+            actor_user: None,
         })
         .await
         .expect("begin session");

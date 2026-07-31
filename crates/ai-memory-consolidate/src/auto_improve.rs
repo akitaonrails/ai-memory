@@ -432,7 +432,25 @@ pub async fn run_auto_improve_review(
     }
 
     let briefing = reader
-        .briefing_for_project(workspace_id, project_id, 100)
+        .briefing_for_project(
+            workspace_id,
+            project_id,
+            100,
+            // Internal review pass: the pending-handoff count is not surfaced.
+            ai_memory_core::OwnerFilter::Any,
+            // The default rule, so this query is identical to the one it has
+            // always run. `briefing.slots` is dropped, but `recent_pages` is
+            // NOT: it becomes the prompt's don't-duplicate-these list and the
+            // create-vs-update index, so with `[slots] per_user` on the paths
+            // and titles of other operators' `_slots/<user>/…` pages do reach
+            // the model. Their bodies do not — only `_rules/` and
+            // `procedures/` pages are loaded for patching. Narrowing this to
+            // the session's operator would hide pages that exist from the
+            // index, and the reviewer would propose `create` for them, which
+            // staging refuses; the exposure is a path and a title, so the
+            // trade is deliberate rather than overlooked.
+            &ai_memory_core::SlotVisibility::default(),
+        )
         .await?;
     let session_page_path = format!("sessions/{session_id}.md");
     let session_page = reader
@@ -2212,6 +2230,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();

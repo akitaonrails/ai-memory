@@ -162,4 +162,12 @@ pub struct ConsolidationOutcome {
     pub page_id: Option<PageId>,
     /// Tags applied to the page.
     pub tags: Vec<String>,
+    /// Why this page was NOT written, when it was not.
+    ///
+    /// Absent on a normal outcome, so existing consumers see the same JSON
+    /// shape. Present when the consolidator declined the update — currently a
+    /// high-resistance (`slot_kind: invariant`) slot, which on a shared server
+    /// may belong to a different operator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
 }

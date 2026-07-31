@@ -63,11 +63,12 @@ Many projects use CLAUDE.md for Claude Code and
 AGENTS.md for Codex / OpenCode / Cursor / Gemini CLI / Grok Build CLI / Kimi Code,
 but if the project says one file is canonical, use that file.
 
-If the rule is a standing *user/team* preference that should apply to
-every project (tech choices, code style, personal conventions), save it
-to ai-memory's reserved global scope instead — the durable-pages skill
-covers how. Default memory reads surface global-scope pages in every
-project automatically.
+If the rule is a standing preference that should apply to every project
+(tech choices, code style, durable conventions), save it to ai-memory's
+reserved global scope instead — the durable-pages skill covers how.
+Default memory reads surface global-scope pages in every project
+automatically. That scope is server-wide: on an instance shared with
+other people, a rule saved there replaces the one they see too.
 
 ### Refreshing this snippet
 

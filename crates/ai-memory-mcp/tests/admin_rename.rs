@@ -40,6 +40,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -328,6 +329,7 @@ async fn rename_project_pages_still_searchable() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
 
     let rename_resp = post(
@@ -400,6 +402,7 @@ async fn rename_project_after_purge_returns_404_not_silent_200() {
         token_pepper: None,
         active_project: state.active_project.clone(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     let purge_resp = post(
         purge_state,

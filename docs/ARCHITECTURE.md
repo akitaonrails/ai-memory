@@ -129,9 +129,10 @@ from hook paths.
    `global=true` searches compiled wiki pages across projects only. Page hits
    bump `access_count` + `last_accessed_at` - the M8 reinforcement term, which
    `memory_feedback` complements with explicit per-page salience. That bump is
-   throttled to at most once per page per minute, so a burst of overlapping
-   searches does not flood the writer actor with redundant reinforcement
-   writes.
+   throttled to at most once per page per operator per minute, so a burst of
+   overlapping searches does not flood the writer actor with redundant
+   reinforcement writes without letting one reader's bump swallow another's.
+
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);

@@ -1,0 +1,42 @@
+# Two-operator simulation for feat/multiuser-foundations.
+#
+#   docker compose -f compose.yml up -d
+#   alice -> http://localhost:8081   bob -> http://localhost:8082
+#   carol (OIDC subject only) -> http://localhost:8083
+#   the server itself, unproxied -> http://localhost:49374
+#
+# The unproxied port is deliberately exposed: it is how the harness checks that
+# a client which forges X-Memory-Actor-* headers WITHOUT the proxy secret is
+# ignored, and that a duplicated header fails closed rather than resolving to
+# one of the two identities.
+
+services:
+  ai-memory:
+    image: ai-memory:multiuser-test
+    container_name: multiuser-test-ai-memory
+    restart: "no"
+    volumes:
+      - multiuser-test-data:/data
+      - ./config.toml:/data/config.toml:ro
+    ports:
+      - "127.0.0.1:49374:49374"
+    environment:
+      - RUST_LOG=ai_memory=debug,ai_memory_mcp=debug,ai_memory_hooks=debug,ai_memory_store=info
+    command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--workspace", "mutest", "--project", "app"]
+
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: multiuser-test-proxy
+    restart: "no"
+    depends_on:
+      - ai-memory
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:8082:8082"
+      - "127.0.0.1:8083:8083"
+
+volumes:
+  multiuser-test-data:
+    name: multiuser-test-data

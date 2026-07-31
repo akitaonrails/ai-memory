@@ -30,6 +30,15 @@ pub struct DecayParams {
     /// Days a soft-deleted (sweep-evicted) page must survive before
     /// hard-delete, *with* zero subsequent access.
     pub hard_delete_after_days: i64,
+    /// How much a page being reinforced by MANY distinct operators should
+    /// count for, beyond the raw hit count.
+    ///
+    /// `0.0` (the default) makes [`retention_score_with_breadth`] identical to
+    /// the historical formula, so existing deployments keep byte-identical
+    /// eviction decisions until this is deliberately raised. Only meaningful
+    /// once requests carry distinct identities: with one shared credential
+    /// every read lands under the same actor.
+    pub breadth_weight: f64,
 }
 
 impl Default for DecayParams {
@@ -38,6 +47,8 @@ impl Default for DecayParams {
             lambda: 0.02,
             sigma: 0.6,
             mu: 0.04,
+            // Off: the score is identical to the pre-breadth formula.
+            breadth_weight: 0.0,
             salience_default: 1.0,
             cold_threshold: 0.20,
             hard_delete_after_days: 180,
@@ -63,10 +74,47 @@ pub fn retention_score(
     days_since_access: Option<f64>,
     salience: Option<f64>,
 ) -> f64 {
+    retention_score_with_breadth(
+        params,
+        age_days,
+        access_count,
+        days_since_access,
+        salience,
+        0,
+    )
+}
+
+/// Retention score that also accounts for HOW MANY distinct operators reinforced
+/// the page.
+///
+/// `access_count` cannot tell "50 reads by one person" from "one read by each of
+/// 50 people", although only the second says the page is load-bearing for a
+/// team. `distinct_actors` supplies that, weighted by
+/// [`DecayParams::breadth_weight`].
+///
+/// Identity at the default weight of `0.0`, and identity again for
+/// `distinct_actors` of 0 (no per-actor rows recorded — every page written
+/// before this existed) or 1 (a single reader). So enabling the table changes
+/// no score until an operator deliberately turns the weight up, and there is no
+/// eviction cliff to migrate around.
+///
+/// `salience` is the page's own feedback-moved salience; it scales the time
+/// term independently of breadth, which scales the access term.
+#[must_use]
+pub fn retention_score_with_breadth(
+    params: &DecayParams,
+    age_days: f64,
+    access_count: u32,
+    days_since_access: Option<f64>,
+    salience: Option<f64>,
+    distinct_actors: u32,
+) -> f64 {
     let salience = salience.unwrap_or(params.salience_default);
     let time_term = salience * (-params.lambda * age_days).exp();
+    // g(0) = g(1) = 1, monotonically non-decreasing afterwards.
+    let breadth = 1.0 + params.breadth_weight * (f64::from(distinct_actors.max(1)) - 1.0).ln_1p();
     let access_term = days_since_access.map_or(0.0, |d| {
-        params.sigma * (1.0 + f64::from(access_count)).ln() * (-params.mu * d).exp()
+        params.sigma * (1.0 + f64::from(access_count)).ln() * (-params.mu * d).exp() * breadth
     });
     time_term + access_term
 }

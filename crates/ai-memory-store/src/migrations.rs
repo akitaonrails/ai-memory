@@ -52,7 +52,7 @@ pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: u32) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+    use ai_memory_core::{AgentKind, NewObservation, ObservationKind, SessionId};
     use rusqlite::{Connection, params};
 
     /// A store migrated by a newer build (an applied version above anything
@@ -363,15 +363,21 @@ mod tests {
         let project_id =
             crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
         let session_id = SessionId::new();
-        crate::ops::begin_session(
-            &mut conn,
-            &NewSession {
-                id: session_id,
-                workspace_id,
-                project_id,
-                agent_kind: AgentKind::Codex,
-                cwd: None,
-            },
+        // Era-appropriate raw insert. This fixture deliberately stops at V33
+        // and then migrates forward, so it must not go through `begin_session`:
+        // that writes whatever columns the CURRENT schema has, and every later
+        // migration that adds one would break a test about an older era.
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![
+                session_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                AgentKind::Codex.as_str(),
+                jiff::Timestamp::now().as_microsecond(),
+            ],
         )
         .unwrap();
         crate::ops::insert_observation(

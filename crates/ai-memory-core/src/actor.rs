@@ -202,6 +202,45 @@ impl AuthLevel {
     }
 }
 
+/// Canonical name of the admission-chain loop-prevention header.
+pub const SKIP_ADMISSION_CHAIN_HEADER: &str = "x-memory-skip-admission-chain";
+
+/// Parse the admission-chain skip list from the raw
+/// `X-Memory-Skip-Admission-Chain` header value (comma-separated webhook
+/// names). Entries are trimmed and empty tokens dropped, so `"a, ,b,"` →
+/// `["a", "b"]`; `None` yields an empty list.
+#[must_use]
+pub fn parse_skip_admission_chain(raw: Option<&str>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The same list, but honoured only for a caller that holds
+/// [`Capability::SkipAdmissionChain`].
+///
+/// The header is client-controlled, so a regular DB user must not be able to
+/// set it and walk past a `reject`-policy admission webhook. Every transport
+/// that forwards the skip list (MCP tools, admin routes, hook ingress) goes
+/// through this one predicate rather than re-deriving the tier rule.
+#[must_use]
+pub fn skip_admission_chain_for(level: AuthLevel, raw: Option<&str>) -> Vec<String> {
+    if level
+        .authorize(Capability::SkipAdmissionChain, true)
+        .is_ok()
+    {
+        parse_skip_admission_chain(raw)
+    } else {
+        Vec::new()
+    }
+}
+
 impl ActorContext {
     /// `true` if at least one identity field is set.
     ///
@@ -226,6 +265,35 @@ impl ActorContext {
     #[must_use]
     pub fn anonymous() -> Self {
         Self::default()
+    }
+
+    /// Does this actor name a specific human, and under what key?
+    ///
+    /// Every ownership decision in the engine — which rows a caller may read,
+    /// which name a new row is stamped with — goes through here rather than
+    /// reaching for [`Self::user`] directly, because "identified" is not the
+    /// same question as "has a username". An ingress that terminates OIDC and
+    /// forwards only the subject claim asserts `sub` with no
+    /// `preferred_username`; the auth middleware already resolves that request
+    /// to [`AuthLevel::User`], so a per-site `.user` check would call the same
+    /// request identified for authorization and anonymous for ownership — and
+    /// the operator would stop seeing rows they had just written.
+    ///
+    /// `user` wins whenever it is present. That order is the invariant, not a
+    /// preference: a proxy that starts forwarding `sub` beside a username it
+    /// was already forwarding must not re-bucket the rows already stamped
+    /// under that username into a second, `sub`-keyed pile.
+    ///
+    /// Blank and whitespace-only values name nobody — they would otherwise
+    /// mint an owner literally called `""` that the next blank-actor caller
+    /// would match. Same rule [`crate::OwnerFilter::for_actor`] applies.
+    #[must_use]
+    pub fn identity_key(&self) -> Option<&str> {
+        [self.user.as_deref(), self.sub.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|value| !value.is_empty())
     }
 }
 
@@ -303,6 +371,26 @@ mod tests {
     }
 
     #[test]
+    fn skip_admission_chain_parses_csv_and_honours_the_tier_rule() {
+        assert_eq!(
+            parse_skip_admission_chain(Some("a, ,b,")),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(parse_skip_admission_chain(None).is_empty());
+        for level in [AuthLevel::Root, AuthLevel::Anonymous] {
+            assert_eq!(
+                skip_admission_chain_for(level, Some("mirror")),
+                vec!["mirror".to_string()],
+                "{level:?} may skip a webhook it re-entered from",
+            );
+        }
+        assert!(
+            skip_admission_chain_for(AuthLevel::User, Some("mirror")).is_empty(),
+            "a DB user must not bypass a reject-policy webhook via a header",
+        );
+    }
+
+    #[test]
     fn has_any_truth_table() {
         // Each field individually flips has_any() to true. Catches an
         // accidental omission if someone adds a new field and forgets
@@ -336,6 +424,62 @@ mod tests {
 
         a.client = Some("72836f52".into());
         assert!(a.has_any());
+    }
+
+    /// An actor the auth middleware resolved to `AuthLevel::User` must be
+    /// identified for ownership too, whichever field the proxy filled in. The
+    /// sub-only rung is the one a per-site `.user` check silently drops.
+    #[test]
+    fn identity_key_accepts_sub_when_no_username_was_asserted() {
+        let sub_only = ActorContext {
+            sub: Some("oidc-subject-123".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(sub_only.identity_key(), Some("oidc-subject-123"));
+    }
+
+    /// `user` outranks `sub` so a proxy that starts forwarding both cannot
+    /// re-bucket rows already stamped under the username.
+    #[test]
+    fn identity_key_prefers_user_over_sub() {
+        let both = ActorContext {
+            user: Some("alice".into()),
+            sub: Some("oidc-subject-123".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(both.identity_key(), Some("alice"));
+    }
+
+    /// Naming nobody stays naming nobody: an agent/session-only actor carries
+    /// transport detail, not identity, and blanks are not names.
+    #[test]
+    fn identity_key_is_none_without_a_named_human() {
+        assert_eq!(ActorContext::anonymous().identity_key(), None);
+        let transport_only = ActorContext {
+            agent: Some("claude-code".into()),
+            session_id: Some("s-1".into()),
+            client: Some("72836f52".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(transport_only.identity_key(), None);
+        let blank = ActorContext {
+            user: Some("   ".into()),
+            sub: Some("\t".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(blank.identity_key(), None);
+    }
+
+    /// A blank `user` beside a real `sub` must fall through rather than
+    /// resolving the whole actor to "nobody".
+    #[test]
+    fn identity_key_skips_a_blank_user_and_uses_sub() {
+        let actor = ActorContext {
+            user: Some("  ".into()),
+            sub: Some("oidc-subject-123".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(actor.identity_key(), Some("oidc-subject-123"));
     }
 
     #[test]

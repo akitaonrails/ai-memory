@@ -389,7 +389,35 @@ pub struct AiMemoryServer {
     /// repeated or overlapping queries from flooding the single writer
     /// actor with redundant reinforcement writes. Shared across `Clone`s
     /// so every request handler consults the same clock.
-    access_bump_seen: Arc<Mutex<HashMap<PageId, Instant>>>,
+    /// Per-(page, operator) throttle for access-count bumps.
+    ///
+    /// Keyed by operator as well as page: with a page-only key one operator's
+    /// read swallows everyone else's reinforcement for the whole window, so the
+    /// counter measures "distinct minutes in which SOMEBODY read this",
+    /// undercounting in proportion to team size. Keyed by `user` rather than
+    /// the full `ActorKey`, because that also carries a client-supplied
+    /// session id — including it would let parallel sessions of one operator
+    /// multiply the bumps and defeat the throttle's actual purpose, which is
+    /// protecting the single writer actor from query bursts.
+    access_bump_seen: Arc<Mutex<AccessBumpSeen>>,
+    /// True when a trusted authenticating proxy is configured to assert end-user
+    /// identities (`[auth].actor_proxy_secret`).
+    ///
+    /// Distinct operators reach this server by two independent routes: rows in
+    /// `users` (rung 2) and proxy-asserted usernames (rung 1b). Only the first
+    /// is visible to `users_exist()`, so the admin gates need this flag too —
+    /// see [`AiMemoryServer::require_admin_capability`]. Static config, set
+    /// once at startup; `false` for stdio and for every deployment that never
+    /// configures a proxy secret, which is what keeps single-operator servers
+    /// on their historical behaviour.
+    trusted_proxy_identity: bool,
+    /// `[slots] per_user`: are `_slots/<user>/…` pages owned by `<user>`?
+    ///
+    /// Decides two things here: which slots a briefing lists, and whether a
+    /// write into somebody else's slot namespace is refused. `false` — the
+    /// default, and every deployment that never sets the flag — means a nested
+    /// slot path is an ordinary shared page, so both stay exactly as they were.
+    per_user_slots: bool,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -718,10 +746,19 @@ struct HandoffBeginArgs {
     /// Files touched during the session.
     #[serde(default)]
     files_touched: Vec<String>,
-    /// Working directory at the time of handoff. Used to match the
-    /// next agent's `memory_handoff_accept` call.
+    /// Working directory at the time of handoff. Recorded on the handoff and
+    /// used to scope AUTOMATIC session-end handoffs by path boundary. A handoff
+    /// created through this tool is project-wide, so `cwd` does not narrow who
+    /// receives it — ownership does.
     #[serde(default)]
     cwd: Option<String>,
+    /// Publish the handoff to everyone in the project instead of keeping it for
+    /// you. By default a handoff belongs to the operator that created it, so on
+    /// a shared server a teammate's session cannot consume it by accident. Set
+    /// this when you deliberately want to pass the baton to whoever picks the
+    /// project up next.
+    #[serde(default)]
+    shared: Option<bool>,
     /// Project to scope the handoff to. Omit to target the project you're
     /// currently working in (resolved from recent hook activity). When set to a
     /// name that doesn't exist yet, the project is **created** — so the handoff
@@ -747,6 +784,12 @@ struct HandoffAcceptArgs {
     /// project (the SessionStart hook usually pre-fetches it into context).
     #[serde(default)]
     cwd: Option<String>,
+    /// Also consider handoffs that belong to OTHER operators. Off by default:
+    /// on a shared server you only see your own plus the ones published to the
+    /// whole project. Use this for recovery ("somebody left a baton here and
+    /// they are away"), knowing it consumes their handoff.
+    #[serde(default)]
+    any_owner: Option<bool>,
     /// Project to accept a handoff from. Omit to target the project you're
     /// currently working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
@@ -761,6 +804,10 @@ struct HandoffAcceptArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct HandoffCancelArgs {
+    /// Cancel even when the handoff belongs to another operator. Off by
+    /// default; requires the same authority as other cross-operator actions.
+    #[serde(default)]
+    any_owner: Option<bool>,
     /// Exact handoff id returned by `memory_handoff_begin`. Required so this
     /// tool only discards a handoff the agent can identify.
     handoff_id: String,
@@ -959,8 +1006,29 @@ impl AiMemoryServer {
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
+            trusted_proxy_identity: false,
+            per_user_slots: false,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Declare that a trusted proxy may assert end-user identities — mirror of
+    /// `AuthState::with_trusted_proxy`, which is where the secret itself lives.
+    ///
+    /// Without this the admin gates cannot tell a proxied deployment apart from
+    /// a single-operator one; see [`Self::trusted_proxy_identity`].
+    #[must_use]
+    pub fn with_trusted_proxy_identity(mut self, enabled: bool) -> Self {
+        self.trusted_proxy_identity = enabled;
+        self
+    }
+
+    /// Namespace slots per operator (`[slots] per_user`); see
+    /// [`Self::per_user_slots`].
+    #[must_use]
+    pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
+        self.per_user_slots = enabled;
+        self
     }
 
     /// Configure whether auto-improvement requires manual pending-writes approval.
@@ -1028,7 +1096,14 @@ impl AiMemoryServer {
             return ai_memory_core::ActorKey::default();
         };
         let ctx = parts.extensions.get::<ai_memory_core::ActorContext>();
-        let user = ctx.and_then(|c| c.user.clone());
+        // Same identity rule as the hook ingress, which is the side that
+        // PUBLISHES into this map: keying on `user` here while the router keyed
+        // on the whole identity would put a sub-only proxied operator's writes
+        // in one slot and their reads in another, so `[auto_scope] per_actor`
+        // would silently miss on every read.
+        let user = ctx
+            .and_then(ai_memory_core::ActorContext::identity_key)
+            .map(str::to_owned);
         let header_session = |name: &str| {
             parts
                 .headers
@@ -1596,7 +1671,10 @@ impl AiMemoryServer {
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let hits = self.rerank_hits(&args.query, hits, limit).await;
-        self.spawn_access_bump(hits.iter().map(|(h, _)| h.id).collect());
+        self.spawn_access_bump(
+            hits.iter().map(|(h, _)| h.id).collect(),
+            aps_actor.user.as_deref(),
+        );
         // Raw-observation fallback when compiled-page search misses. Works
         // for a single resolved project (default / workspace+project) AND
         // for explicit `scopes` — the recommended scope-bleed mitigation —
@@ -1674,7 +1752,10 @@ impl AiMemoryServer {
                             )
                             .await
                             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                        self.spawn_access_bump(hits.iter().map(|(h, _)| h.id).collect());
+                        self.spawn_access_bump(
+                            hits.iter().map(|(h, _)| h.id).collect(),
+                            aps_actor.user.as_deref(),
+                        );
                         hits.into_iter()
                             .map(|(hit, score_details)| QueryHit { hit, score_details })
                             .collect()
@@ -1753,11 +1834,193 @@ impl AiMemoryServer {
             .recent_pages_for_project(ws, proj, limit)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
+        self.spawn_access_bump(
+            hits.iter().map(|h| h.id).collect(),
+            aps_actor.user.as_deref(),
+        );
         ok_json(&MemoryRecentResponse {
             hits,
             global_hits: Vec::new(),
         })
+    }
+
+    /// Ask the admission chain's deciders about an operation that writes no
+    /// page, and hand back the context its observers are owed once the
+    /// operation has actually happened.
+    ///
+    /// The observers are deliberately NOT run here: these tools decide before
+    /// they know whether there is anything to do (an accept may find no
+    /// handoff, a cancel may be refused by ownership), and a mirror told about
+    /// an operation the engine then abandons has been lied to. Pass the context
+    /// to [`Self::notify_operation_observers`] on the success path only — the
+    /// same order the hook ingress uses for the same ops.
+    ///
+    /// A no-op when the server was built without a wiki handle (stdio/tests).
+    async fn authorize_operation(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        op: ai_memory_wiki::AdmissionOp,
+        parts: &axum::http::request::Parts,
+    ) -> Result<Option<ai_memory_wiki::AdmissionContext>, McpError> {
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Ok(None);
+        };
+        // Forward the caller's webhook skip-list, exactly like the write and
+        // admin admission paths do. Dropping it breaks the documented
+        // loop-prevention header: a webhook that reacts to one of these ops by
+        // calling back into the engine would re-trigger itself forever.
+        wiki.authorize_operation(
+            ws,
+            proj,
+            op,
+            crate::actor::actor_from_parts(parts),
+            crate::actor::skip_webhooks_from_parts(parts),
+        )
+        .await
+        .map_err(|e| McpError::invalid_request(e.to_string(), None))
+    }
+
+    /// Fire-and-forget the observer webhooks for an operation that landed.
+    fn notify_operation_observers(&self, ctx: Option<&ai_memory_wiki::AdmissionContext>) {
+        if let (Some(wiki), Some(ctx)) = (self.wiki.as_ref(), ctx) {
+            wiki.notify_operation_observers(ctx);
+        }
+    }
+
+    /// Which slots this request may see, per `[slots] per_user`.
+    ///
+    /// Same rule the session brief uses, so a snapshot and the brief that
+    /// follows it cannot disagree about who owns a slot. Viewer identity is
+    /// [`ai_memory_core::ActorContext::identity_key`] — the same accessor
+    /// [`Self::place_slot_write`] keys the write on, because a slot the write
+    /// door files under one key and this filter admits under another is
+    /// force-pinned, write-only and invisible to its own owner.
+    fn slot_visibility_for(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> ai_memory_core::SlotVisibility {
+        ai_memory_core::SlotVisibility::for_viewer(
+            self.per_user_slots,
+            crate::actor::actor_from_parts(parts).identity_key(),
+        )
+    }
+
+    /// Where a hand-written slot page belongs, by the SAME rule the engine's
+    /// own write path applies ([`ai_memory_core::slot_placement`]).
+    ///
+    /// `_slots/<user>/…` bodies are injected verbatim into that operator's next
+    /// session brief, so a slot write is a way to put chosen text into an agent
+    /// context — the direction the ownership boundary does not otherwise cover,
+    /// because the boundary is about reads. Several doors reach that hazard —
+    /// this tool, the consolidator, auto-improve approval — and they must
+    /// answer the same for the same operator and the same string, or the door
+    /// with the looser answer is the only one that matters: an agent that
+    /// cannot write `_slots/x.md` through the engine would simply call this
+    /// tool instead, and the shared slot goes into EVERY operator's brief.
+    ///
+    /// So the shared slot is namespaced into the caller's own prefix rather
+    /// than written as given, and the two refusals are the engine's refusals.
+    /// The effective path is returned to the caller in the tool response.
+    ///
+    /// Only enforced with `[slots] per_user` on: with it off a nested slot path
+    /// means nothing in particular and every slot write keeps working exactly
+    /// as it always has. Admins may still curate any namespace, the shared slot
+    /// included, on the same rung ladder as every other admin operation — which
+    /// also means a single-operator server (no users, no trusted proxy) is
+    /// unaffected.
+    async fn place_slot_write(
+        &self,
+        path: PagePath,
+        parts: &axum::http::request::Parts,
+    ) -> Result<PagePath, McpError> {
+        if !self.per_user_slots {
+            return Ok(path);
+        }
+        // Paired with `slot_visibility_for` — see there.
+        let caller = crate::actor::actor_from_parts(parts);
+        match ai_memory_core::slot_placement(path.as_str(), caller.identity_key()) {
+            ai_memory_core::SlotPlacement::AsGiven => Ok(path),
+            ai_memory_core::SlotPlacement::Personal(personal) => {
+                if self.require_admin_capability(parts).await.is_ok() {
+                    return Ok(path);
+                }
+                PagePath::new(personal).map_err(|e| {
+                    McpError::internal_error(format!("invalid personal slot path: {e}"), None)
+                })
+            }
+            ai_memory_core::SlotPlacement::ForeignNamespace => {
+                if self.require_admin_capability(parts).await.is_ok() {
+                    return Ok(path);
+                }
+                Err(McpError::invalid_request(
+                    format!(
+                        "path '{}' belongs to another operator's slot namespace; \
+                         write your own slot instead",
+                        path.as_str()
+                    ),
+                    None,
+                ))
+            }
+            ai_memory_core::SlotPlacement::Unnamespaceable => {
+                if self.require_admin_capability(parts).await.is_ok() {
+                    return Ok(path);
+                }
+                Err(McpError::invalid_request(
+                    format!(
+                        "your operator name cannot be a slot namespace, so there is no \
+                         personal slot to write '{}' into, and the path as given is not \
+                         yours to take",
+                        path.as_str()
+                    ),
+                    None,
+                ))
+            }
+        }
+    }
+
+    /// Does this deployment tell its operators apart?
+    ///
+    /// "Several operators" is not the same question as "are there `users` rows".
+    /// A trusted proxy asserts usernames that never get a row, so a deployment
+    /// on that rung would report `users_exist() == false` forever.
+    ///
+    /// One notion, several call sites: both admin gates and the per-author
+    /// bucketing of pending auto-improve proposals ask it, so a single-operator
+    /// server behaves exactly as it did before either route existed.
+    async fn deployment_distinguishes_operators(&self) -> ai_memory_store::StoreResult<bool> {
+        self.reader
+            .distinguishes_operators(self.trusted_proxy_identity)
+            .await
+    }
+
+    /// Gate an operation behind [`Capability::Admin`].
+    ///
+    /// Mirrors the `/admin/*` middleware: operator topology is resolved per
+    /// call rather than cached, so committing a first user immediately tightens
+    /// access without a restart, and a deployment that distinguishes nobody
+    /// keeps its historical single-operator behaviour — see
+    /// [`Self::deployment_distinguishes_operators`].
+    async fn require_admin_capability(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<(), McpError> {
+        // An absent AuthLevel means no auth middleware ran at all — the stdio /
+        // in-process transport, where the caller already has the data directory.
+        // Over HTTP `require_bearer` always inserts a level (rung 0 inserts
+        // Anonymous), so this cannot mask a real unauthenticated request.
+        // Treating "absent" as Anonymous instead would make this tool
+        // permanently unusable over stdio the moment any user row exists.
+        let Some(level) = parts.extensions.get::<ai_memory_core::AuthLevel>().copied() else {
+            return Ok(());
+        };
+        let multi_user_enabled = self
+            .deployment_distinguishes_operators()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        level
+            .authorize(ai_memory_core::Capability::Admin, multi_user_enabled)
+            .map_err(|e| McpError::invalid_request(e.message().to_string(), None))
     }
 
     /// Record an explicit quality signal for one recalled page.
@@ -1839,6 +2102,13 @@ impl AiMemoryServer {
         Parameters(args): Parameters<SweepArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        // The sweep permanently removes page versions, and the `ForgetSweep`
+        // admission op below cannot stand in for this gate: the chain only
+        // refuses when the operator configured a reject-policy webhook for it,
+        // so on a deployment with none every caller would be admitted. On a
+        // server with real users that makes it an admin operation; with no
+        // users configured this is a no-op, preserving single-user behaviour.
+        self.require_admin_capability(&parts).await?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
             .effective_ids_for_read_args_with_actor(
@@ -1847,6 +2117,13 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        let dry_run = args.dry_run.unwrap_or(false);
+        // The deciders are asked even for a preview: a scope guard may
+        // legitimately refuse to have a project scored at all, and refusing the
+        // preview while permitting the real sweep would be the wrong way round.
+        let admission = self
+            .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::ForgetSweep, &parts)
+            .await?;
         let report = run_sweep(
             &self.reader,
             &self.writer,
@@ -1854,10 +2131,16 @@ impl AiMemoryServer {
             ws,
             proj,
             &self.decay_params,
-            args.dry_run.unwrap_or(false),
+            dry_run,
         )
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // A dry run touches no page version, so there is no sweep for a mirror
+        // to reconcile — telling it one happened is the same lie as announcing
+        // an accept that found nothing pending.
+        if !dry_run {
+            self.notify_operation_observers(admission.as_ref());
+        }
         ok_json(&report)
     }
 
@@ -2048,11 +2331,59 @@ impl AiMemoryServer {
             run_auto_improve_review(&self.reader, &**llm, ws, proj, session_id, cfg.clone())
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Whose suggestion this is; it also scopes the one-pending-per-target
+        // rule (V42). Only meaningful where operators are actually told apart:
+        // on a single-operator server the caller would otherwise stage into
+        // bucket `<root_username>` while the scheduler and the report handlers
+        // stage into the unattributed one, so two proposals could be pending
+        // for the same page — the collision V42 promises cannot happen. The
+        // schema stays able to express per-author; this rule decides when that
+        // matters.
+        //
+        // Resolved before the loop because it also decides WHICH page a slot
+        // proposal is for; see `staged_slot_target`.
+        let staged_by_actor_user = ai_memory_core::owner_stamp(
+            crate::actor::actor_from_parts(&parts).identity_key(),
+            self.deployment_distinguishes_operators()
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        );
         let mut proposals = Vec::with_capacity(report.proposals.len());
+        // Targets refused before staging, reported beside the store's own
+        // skips: a run that silently returns N-1 proposals is indistinguishable
+        // from a clean run of N-1.
+        let mut refused: Vec<ai_memory_store::SkippedProposal> = Vec::new();
         for p in &report.proposals {
-            let path = PagePath::new(p.path.clone()).map_err(|e| {
+            let mut path = PagePath::new(p.path.clone()).map_err(|e| {
                 McpError::invalid_params(format!("invalid proposal path: {e}"), None)
             })?;
+            // Which page this proposal is even for, decided before the target is
+            // read: the reviewer is told to name `_slots/current-focus.md`, and
+            // with per-user slots on that page belongs to nobody, so a body
+            // derived from one operator's session is namespaced into that
+            // operator's own slot here. This is the last point at which it can
+            // be — the store binds an approval to the recorded target and its
+            // stage-time snapshot.
+            match ai_memory_core::staged_slot_target(
+                self.per_user_slots,
+                path.as_str(),
+                staged_by_actor_user.as_deref(),
+                &p.edit_mode,
+            ) {
+                ai_memory_core::StagedSlotTarget::AsGiven => {}
+                ai_memory_core::StagedSlotTarget::Rehomed(personal) => {
+                    path = PagePath::new(personal).map_err(|e| {
+                        McpError::internal_error(format!("invalid personal slot path: {e}"), None)
+                    })?;
+                }
+                ai_memory_core::StagedSlotTarget::Refused(reason) => {
+                    refused.push(ai_memory_store::SkippedProposal {
+                        target_path: path.as_str().to_string(),
+                        reason,
+                    });
+                    continue;
+                }
+            }
             let target_exists = self
                 .reader
                 .page_body_by_ids(ws, proj, path.as_str())
@@ -2060,7 +2391,8 @@ impl AiMemoryServer {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
                 .is_some();
             let operation = if p.edit_mode == "patch"
-                || (target_exists && path.as_str() == "_slots/current-focus.md")
+                || (target_exists
+                    && ai_memory_core::is_slot_named(path.as_str(), "current-focus.md"))
             {
                 AutoImproveProposalOperation::Update
             } else {
@@ -2131,6 +2463,7 @@ impl AiMemoryServer {
                     ..ai_memory_core::ActorContext::default()
                 },
                 proposals,
+                staged_by_actor_user,
             })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2186,8 +2519,20 @@ impl AiMemoryServer {
                         "page_id": null,
                     }));
                 }
+                // Per-proposal, so the run's other approvals still happen: the
+                // wiki refused this one target, not the batch.
+                ai_memory_store::ApproveAutoImproveProposalResult::Refused { reason } => {
+                    outcomes.push(serde_json::json!({
+                        "id": proposal_id.to_string(),
+                        "sidecar_path": sidecar_path,
+                        "status": "refused",
+                        "reason": reason,
+                        "page_id": null,
+                    }));
+                }
             }
         }
+        refused.extend(staged.skipped);
         ok_json(&serde_json::json!({
             "run_id": staged.run_id.to_string(),
             "approval_required": self.auto_improve_require_approval,
@@ -2197,6 +2542,14 @@ impl AiMemoryServer {
             "warnings": report.warnings,
             "rejected_candidates_count": report.rejected_candidates.len(),
             "proposals": outcomes,
+            // Proposals the reviewer produced but that were never staged —
+            // refused targets and store-level collisions — with the target path
+            // and the reason. Without this the agent sees a successful run of
+            // N-1 proposals and nothing saying the Nth ever existed, the silent
+            // drop the per-proposal skip set out to end. Always present (empty
+            // on a clean run), and additive: a consumer that ignores the key
+            // reads the response exactly as before.
+            "skipped": refused,
         }))
     }
 
@@ -2209,10 +2562,12 @@ impl AiMemoryServer {
         relative path such as `notes/<topic>.md`, `concepts/<topic>.md`, \
         `decisions/<topic>.md`, or `_rules/<topic>.md`. `tier` defaults \
         to `semantic`; set `pinned=true` for facts that should never decay. \
-        For standing user/team preferences that apply to EVERY project \
-        (tech choices, code style, durable personal rules), pass \
-        `scope: \"global\"` — the page lands in the reserved `_global` \
-        scope and default memory_query calls surface it in every project. \
+        For standing preferences that apply to EVERY project (tech choices, \
+        code style, durable conventions), pass `scope: \"global\"` — the page \
+        lands in the reserved `_global` scope and default memory_query calls \
+        surface it in every project. That scope is **server-wide**, not \
+        private: on a shared server everyone reads and writes the same pages, \
+        so a rule saved there replaces the one every other operator sees. \
         \
         **Title convention:** start `body` with a `# Some Title` line — \
         ai-memory derives the title from that H1 automatically. Do NOT \
@@ -2238,6 +2593,7 @@ impl AiMemoryServer {
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+        let path = self.place_slot_write(path, &parts).await?;
         let (ws, proj) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => {
                 self.write_target_ids_with_actor(
@@ -2589,7 +2945,11 @@ impl AiMemoryServer {
         the next agent reads those first; long prose summaries make the \
         TUI rendering ugly. `files_touched` is a hint, not exhaustive. \
         \
-        Use `cwd` to scope the handoff to a specific working directory.")]
+        By default the handoff BELONGS TO YOU: on a server shared by several \
+        operators, a teammate's session will not consume it. Pass \
+        `shared: true` to hand the baton to whoever opens the project next. \
+        `cwd` is recorded for reference; it does not restrict who receives a \
+        handoff created here.")]
     async fn memory_handoff_begin(
         &self,
         Parameters(args): Parameters<HandoffBeginArgs>,
@@ -2635,6 +2995,11 @@ impl AiMemoryServer {
             "handoff file",
             "handoff files_touched",
         );
+        let creator = crate::actor::actor_from_parts(&parts);
+        let distinguishes = self
+            .deployment_distinguishes_operators()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let handoff = NewHandoff {
             workspace_id: ws,
             project_id: proj,
@@ -2650,12 +3015,27 @@ impl AiMemoryServer {
             open_questions,
             next_steps,
             files_touched,
+            // A handoff belongs to whoever created it unless it is explicitly
+            // published. With no actor, or on a deployment that does not tell
+            // its operators apart, this stays None and the handoff is
+            // project-wide, exactly as it behaved before ownership existed —
+            // see [`ai_memory_core::owner_stamp`] for why naming the single
+            // operator would split them across transports.
+            owner_user: if args.shared.unwrap_or(false) {
+                None
+            } else {
+                ai_memory_core::owner_stamp(creator.identity_key(), distinguishes)
+            },
         };
+        let admission = self
+            .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffBegin, &parts)
+            .await?;
         let id = self
             .writer
             .insert_handoff(handoff)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.notify_operation_observers(admission.as_ref());
         ok_json(&serde_json::json!({ "handoff_id": id.to_string() }))
     }
 
@@ -2691,20 +3071,65 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        let actor_user = crate::actor::actor_from_parts(&parts)
+            .identity_key()
+            .map(str::to_owned);
+        let owner_filter = if args.any_owner.unwrap_or(false) {
+            // Reading another operator's baton consumes it and hands over text
+            // synthesised from their prompts, so this opt-out is an operator
+            // action — gated exactly like `all_owners` on /admin/open-sessions,
+            // rather than being a free argument any caller can set.
+            self.require_admin_capability(&parts).await?;
+            ai_memory_core::OwnerFilter::Any
+        } else {
+            ai_memory_core::OwnerFilter::for_actor(actor_user.as_deref())
+        };
         let receiving_cwd = args.cwd;
         let handoff = self
             .reader
-            .latest_open_handoff(ws, proj, receiving_cwd.clone())
+            .latest_open_handoff(ws, proj, receiving_cwd.clone(), owner_filter.clone())
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match handoff {
             None => ok_json(&serde_json::json!({ "handoff": null })),
             Some(h) => {
-                self.writer
-                    .accept_handoff(h.id, AgentKind::Other, None, receiving_cwd)
+                // Admission is asked here, not before the lookup: the routine
+                // outcome of this tool is `{"handoff": null}` — the tool's own
+                // description says so, because the SessionStart hook has
+                // usually already consumed the baton — and asking up front
+                // announces an accept on every one of those calls. A webhook
+                // is only worth asking once there is a handoff to accept.
+                let admission = self
+                    .authorize_operation(
+                        ws,
+                        proj,
+                        ai_memory_wiki::AdmissionOp::HandoffAccept,
+                        &parts,
+                    )
+                    .await?;
+                // Deliver the body only when THIS call is the one that claimed
+                // it. The accept is an atomic compare-and-set, so a racing
+                // session (or a caller the owner does not admit) gets `false`
+                // here; returning the handoff anyway would hand the same baton
+                // to two agents.
+                let claimed = self
+                    .writer
+                    .accept_handoff(
+                        h.id,
+                        AgentKind::Other,
+                        None,
+                        actor_user.clone(),
+                        owner_filter,
+                        receiving_cwd,
+                    )
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                ok_json(&serde_json::json!({ "handoff": h }))
+                if claimed {
+                    self.notify_operation_observers(admission.as_ref());
+                    ok_json(&serde_json::json!({ "handoff": h }))
+                } else {
+                    ok_json(&serde_json::json!({ "handoff": null }))
+                }
             }
         }
     }
@@ -2752,16 +3177,46 @@ impl AiMemoryServer {
                 "state": handoff.state.as_str(),
             }));
         }
+        // Cancelling is scoped the same way as accepting: you can discard your
+        // own handoff or one published to the project, not a teammate's — with
+        // the same admin-gated opt-out, so a handoff whose owner no longer
+        // matches any reachable identity (renamed root_username, a stdio
+        // caller, a departed teammate) stays cancellable instead of becoming
+        // permanently stuck.
+        //
+        // Resolved BEFORE the chain is consulted, the order
+        // `memory_handoff_accept` uses: a caller refused this escape hatch has
+        // no operation to admit, so the server must not POST one out to every
+        // reject-policy webhook on their behalf.
+        let cancel_owner_filter = if args.any_owner.unwrap_or(false) {
+            self.require_admin_capability(&parts).await?;
+            ai_memory_core::OwnerFilter::Any
+        } else {
+            ai_memory_core::OwnerFilter::for_actor_context(&crate::actor::actor_from_parts(&parts))
+        };
+        let admission = self
+            .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffCancel, &parts)
+            .await?;
         let cancelled = self
             .writer
-            .cancel_handoff(handoff_id)
+            .cancel_handoff(handoff_id, cancel_owner_filter)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_json(&serde_json::json!({
+        if cancelled {
+            self.notify_operation_observers(admission.as_ref());
+        }
+        let mut result = serde_json::json!({
             "handoff_id": handoff_id.to_string(),
             "cancelled": cancelled,
             "state": if cancelled { "expired" } else { "open" },
-        }))
+        });
+        if !cancelled && handoff.owner_user.is_some() {
+            // Otherwise this reads as a plain no-op and the caller cannot tell
+            // that ownership is what refused it.
+            result["reason"] =
+                serde_json::json!("handoff belongs to another operator; retry with any_owner=true");
+        }
+        ok_json(&result)
     }
 
     /// Report aggregate counts (pages, sessions, observations).
@@ -2817,7 +3272,15 @@ impl AiMemoryServer {
             .await?;
         let snapshot = self
             .reader
-            .briefing_for_project(ws, proj, limit)
+            .briefing_for_project(
+                ws,
+                proj,
+                limit,
+                ai_memory_core::OwnerFilter::for_actor_context(&crate::actor::actor_from_parts(
+                    &parts,
+                )),
+                &self.slot_visibility_for(&parts),
+            )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         ok_json(&snapshot)
@@ -2853,7 +3316,15 @@ impl AiMemoryServer {
             .await?;
         let snapshot = self
             .reader
-            .briefing_for_project(ws, proj, limit)
+            .briefing_for_project(
+                ws,
+                proj,
+                limit,
+                ai_memory_core::OwnerFilter::for_actor_context(&crate::actor::actor_from_parts(
+                    &parts,
+                )),
+                &self.slot_visibility_for(&parts),
+            )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -3064,6 +3535,12 @@ fn moonshot_safe_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
 /// day/week-scale retention scoring.
 const ACCESS_BUMP_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Throttle bookkeeping for access-count bumps, keyed by page AND operator.
+///
+/// The operator half is what stops one person's read from swallowing everyone
+/// else's reinforcement for the whole window.
+type AccessBumpSeen = HashMap<(PageId, Option<String>), Instant>;
+
 /// Pick the page ids due for an access bump, updating the cooldown clock in
 /// place: a page is due when it has not been bumped within `cooldown`.
 /// Entries that have aged past `cooldown` are pruned in the same pass, so the
@@ -3071,8 +3548,9 @@ const ACCESS_BUMP_COOLDOWN: Duration = Duration::from_secs(60);
 /// distinct page ever searched. Kept pure and synchronous so the throttle
 /// policy is unit-testable without a store or async runtime.
 fn select_bumpable(
-    seen: &mut HashMap<PageId, Instant>,
+    seen: &mut AccessBumpSeen,
     ids: Vec<PageId>,
+    actor: Option<&str>,
     now: Instant,
     cooldown: Duration,
 ) -> Vec<PageId> {
@@ -3081,12 +3559,13 @@ fn select_bumpable(
     seen.retain(|_, last| now.duration_since(*last) < cooldown);
     let mut fresh = Vec::new();
     for id in ids {
+        let id = (id, actor.map(str::to_string));
         // After the prune, an occupied slot means "still within cooldown" —
         // skip it, and do not refresh its timestamp: refreshing would starve
         // a continuously-hot page of its once-per-window bump entirely.
-        if let Entry::Vacant(slot) = seen.entry(id) {
+        if let Entry::Vacant(slot) = seen.entry(id.clone()) {
             slot.insert(now);
-            fresh.push(id);
+            fresh.push(id.0);
         }
     }
     fresh
@@ -3094,10 +3573,14 @@ fn select_bumpable(
 
 impl AiMemoryServer {
     /// Fire-and-forget access-counter bump for the M8 reinforcement term,
-    /// throttled to at most one bump per page per [`ACCESS_BUMP_COOLDOWN`]
-    /// (see [`select_bumpable`]). Failures are logged at warn but never
-    /// surfaced to the caller.
-    fn spawn_access_bump(&self, ids: Vec<PageId>) {
+    /// throttled to at most one bump per page PER OPERATOR per
+    /// [`ACCESS_BUMP_COOLDOWN`] (see [`select_bumpable`]). Keyed per operator
+    /// on purpose: a throttle keyed on the page alone would let whoever read
+    /// it first swallow everybody else's reinforcement inside the window, so
+    /// breadth — the signal `[decay] breadth_weight` exists to read — would
+    /// under-count exactly on the busy pages it matters for. Failures are
+    /// logged at warn but never surfaced to the caller.
+    fn spawn_access_bump(&self, ids: Vec<PageId>, actor: Option<&str>) {
         if ids.is_empty() {
             return;
         }
@@ -3106,14 +3589,17 @@ impl AiMemoryServer {
                 .access_bump_seen
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            select_bumpable(&mut seen, ids, Instant::now(), ACCESS_BUMP_COOLDOWN)
+            select_bumpable(&mut seen, ids, actor, Instant::now(), ACCESS_BUMP_COOLDOWN)
         };
         if fresh.is_empty() {
             return;
         }
         let writer = self.writer.clone();
+        // Carried into the write so reinforcement is recorded per operator as
+        // well as in the shared counter.
+        let actor = actor.map(str::to_string);
         tokio::spawn(async move {
-            if let Err(e) = writer.bump_access(fresh).await {
+            if let Err(e) = writer.bump_access(fresh, actor).await {
                 tracing::warn!(error = %e, "access bump failed");
             }
         });
@@ -3812,6 +4298,7 @@ mod tests {
                 project_id,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3923,6 +4410,23 @@ mod tests {
 
         assert_eq!(actor.user.as_deref(), Some("alice"));
         assert_eq!(actor.session_id.as_deref(), Some("context-session"));
+    }
+
+    /// The hook ingress publishes into the `ActiveProject` map under the whole
+    /// identity the request names; a read tool must look under the same key. A
+    /// sub-only proxy is where the two would part company, so `per_actor`
+    /// isolation would miss on every read for exactly the deployment it serves.
+    #[test]
+    fn actor_key_uses_the_asserted_subject_when_no_username_was_forwarded() {
+        let mut parts = test_parts_default();
+        parts.extensions.insert(ai_memory_core::ActorContext {
+            sub: Some("oidc-subject-alice".into()),
+            ..ai_memory_core::ActorContext::default()
+        });
+
+        let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+
+        assert_eq!(actor.user.as_deref(), Some("oidc-subject-alice"));
     }
 
     #[tokio::test]
@@ -4316,6 +4820,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The admin gates ask "does this deployment distinguish operators", and a
+    /// trusted proxy makes that true without ever writing a `users` row. Left
+    /// keyed on `users_exist()` alone the answer is "no" forever, and every
+    /// proxied human walks through `any_owner` and `memory_forget_sweep`.
+    #[tokio::test]
+    async fn admin_capability_denies_a_proxied_caller_with_no_users_rows() {
+        let (_tmp, store, server, _ws, _pj) = setup_server().await;
+        assert!(
+            !store.reader.users_exist().await.unwrap(),
+            "the hole only exists while the users table is empty"
+        );
+
+        let mut proxied_human = test_parts_default();
+        proxied_human.extensions.insert(AuthLevel::User);
+
+        // Default config (no proxy secret, no users): the historical
+        // single-operator escape hatch is untouched.
+        server
+            .require_admin_capability(&proxied_human)
+            .await
+            .expect("default config must keep its pre-branch single-operator behaviour");
+
+        let proxied = server.clone().with_trusted_proxy_identity(true);
+        assert!(
+            proxied
+                .require_admin_capability(&proxied_human)
+                .await
+                .is_err(),
+            "a proxy-asserted human must not hold admin just because no users rows exist"
+        );
+
+        // The operator the proxy names as root keeps admin, or the deployment
+        // would have no administrator at all.
+        let mut proxied_root = test_parts_default();
+        proxied_root.extensions.insert(AuthLevel::Root);
+        proxied
+            .require_admin_capability(&proxied_root)
+            .await
+            .expect("the configured root operator must still administer the server");
+
+        // stdio injects no AuthLevel; that escape hatch stays exactly as it was.
+        proxied
+            .require_admin_capability(&test_parts_default())
+            .await
+            .expect("stdio callers already hold the data directory");
     }
 
     #[tokio::test]
@@ -5477,6 +6028,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -5551,6 +6103,7 @@ mod tests {
                 project_id: scoped,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -7513,6 +8066,7 @@ mod tests {
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],
+                    shared: None,
                     cwd: Some(r"C:\GIT\ai-memory".into()),
                     project: None,
                     workspace: None,
@@ -7555,6 +8109,7 @@ mod tests {
                     open_questions: vec!["what max channel size?".into()],
                     next_steps: vec!["finish supersession path".into()],
                     files_touched: vec!["crates/ai-memory-store/src/writer.rs".into()],
+                    shared: None,
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
@@ -7576,6 +8131,7 @@ mod tests {
             .memory_handoff_accept(
                 Parameters(HandoffAcceptArgs {
                     cwd: Some("/tmp/aim".into()),
+                    any_owner: None,
                     project: None,
                     workspace: None,
                 }),
@@ -7597,6 +8153,7 @@ mod tests {
             .memory_handoff_accept(
                 Parameters(HandoffAcceptArgs {
                     cwd: Some("/tmp/aim".into()),
+                    any_owner: None,
                     project: None,
                     workspace: None,
                 }),
@@ -7623,6 +8180,7 @@ mod tests {
                     open_questions: vec!["q".repeat(HANDOFF_ITEM_MAX_CHARS + 20)],
                     next_steps: vec!["n".repeat(HANDOFF_ITEM_MAX_CHARS + 20)],
                     files_touched: vec!["f".repeat(HANDOFF_FILE_MAX_CHARS + 20)],
+                    shared: None,
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
@@ -7636,6 +8194,7 @@ mod tests {
             .memory_handoff_accept(
                 Parameters(HandoffAcceptArgs {
                     cwd: Some("/tmp/aim".into()),
+                    any_owner: None,
                     project: None,
                     workspace: None,
                 }),
@@ -7667,6 +8226,7 @@ mod tests {
                     open_questions,
                     next_steps: vec![],
                     files_touched: vec![],
+                    shared: None,
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
@@ -7680,6 +8240,7 @@ mod tests {
             .memory_handoff_accept(
                 Parameters(HandoffAcceptArgs {
                     cwd: Some("/tmp/aim".into()),
+                    any_owner: None,
                     project: None,
                     workspace: None,
                 }),
@@ -7726,6 +8287,7 @@ mod tests {
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],
+                    shared: None,
                     cwd: None,
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
@@ -7740,6 +8302,7 @@ mod tests {
             .memory_handoff_accept(
                 Parameters(HandoffAcceptArgs {
                     cwd: None,
+                    any_owner: None,
                     project: None,
                     workspace: None,
                 }),
@@ -7763,6 +8326,7 @@ mod tests {
             .memory_handoff_accept(
                 Parameters(HandoffAcceptArgs {
                     cwd: None,
+                    any_owner: None,
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
                 }),
@@ -7792,6 +8356,7 @@ mod tests {
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],
+                    shared: None,
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
@@ -7832,6 +8397,7 @@ mod tests {
             .memory_handoff_cancel(
                 Parameters(HandoffCancelArgs {
                     handoff_id: handoff_id.clone(),
+                    any_owner: None,
                     project: None,
                     workspace: None,
                 }),
@@ -7871,6 +8437,7 @@ mod tests {
             .memory_handoff_accept(
                 Parameters(HandoffAcceptArgs {
                     cwd: Some("/tmp/aim".into()),
+                    any_owner: None,
                     project: None,
                     workspace: None,
                 }),
@@ -7993,6 +8560,378 @@ mod tests {
         );
     }
 
+    /// Reviewer that always proposes the same two pages, so one of them can be
+    /// made to collide with an already-pending proposal.
+    struct TwoProposalAutoImproveLlm;
+
+    #[async_trait::async_trait]
+    impl ai_memory_llm::LlmProvider for TwoProposalAutoImproveLlm {
+        fn name(&self) -> &'static str {
+            "fake-auto-improve"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            Ok(ai_memory_llm::ChatResponse {
+                text: String::new(),
+                usage: None,
+                model: self.model().to_string(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "summary": "two staged proposals",
+                "proposals": [
+                    {
+                        "operation": "create_or_update",
+                        "path": "notes/collides.md",
+                        "title": "Colliding Lesson",
+                        "kind": "note",
+                        "confidence": 0.93,
+                        "rationale": "A proposal for this page is already pending.",
+                        "evidence": [{"page":"session", "quote":"durable lesson"}],
+                        "body_markdown": "# Colliding Lesson\n\nsecond proposal"
+                    },
+                    {
+                        "operation": "create_or_update",
+                        "path": "notes/fresh.md",
+                        "title": "Fresh Lesson",
+                        "kind": "note",
+                        "confidence": 0.91,
+                        "rationale": "The session contains a durable lesson worth adding.",
+                        "evidence": [{"page":"session", "quote":"durable lesson"}],
+                        "body_markdown": "# Fresh Lesson\n\nfirst proposal"
+                    }
+                ],
+                "rejected_candidates": []
+            }))
+        }
+    }
+
+    /// A proposal the store refuses to stage must reach the agent. Reporting
+    /// only `proposal_ids` shows a successful run of N-1 proposals with nothing
+    /// saying the Nth ever existed — the silent drop the per-proposal skip was
+    /// introduced to end.
+    #[tokio::test]
+    async fn memory_auto_improve_reports_a_collided_proposal_instead_of_dropping_it() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson worth capturing".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        // Something is already pending for one of the two targets. The default
+        // parts carry no operator, matching the unattributed bucket this
+        // pending proposal was staged into.
+        store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: Some("test".into()),
+                model: Some("model".into()),
+                summary: Some("earlier run".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                staged_by_actor_user: None,
+                proposal_actor: ai_memory_core::ActorContext::default(),
+                proposals: vec![NewAutoImproveProposal {
+                    operation: AutoImproveProposalOperation::Create,
+                    target_path: PagePath::new("notes/collides.md").unwrap(),
+                    kind: "note".into(),
+                    title: "Colliding Lesson".into(),
+                    confidence: 0.9,
+                    rationale: "staged earlier".into(),
+                    evidence_json: serde_json::json!([]),
+                    body_markdown: "# Colliding Lesson\n\nfirst proposal".into(),
+                    artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(TwoProposalAutoImproveLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator)
+            .with_auto_improve_require_approval(true);
+
+        let json = call_tool_json(
+            server
+                .memory_auto_improve(
+                    Parameters(AutoImproveArgs {
+                        session_id: Some(session_id.to_string()),
+                        dry_run: None,
+                        stage: None,
+                        mode: None,
+                        project: None,
+                        workspace: None,
+                        min_observations: Some(1),
+                        min_session_duration_secs: Some(0),
+                        min_confidence: Some(0.75),
+                        max_input_tokens: None,
+                        max_proposals: Some(5),
+                        include_raw_fallback: None,
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .expect("a collision must not fail the run"),
+        );
+
+        let proposals = json["proposals"].as_array().expect("proposals array");
+        assert_eq!(proposals.len(), 1, "the sibling proposal still stages");
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(skipped.len(), 1, "the collided proposal must be reported");
+        assert_eq!(skipped[0]["target_path"], "notes/collides.md");
+        assert!(
+            skipped[0]["reason"]
+                .as_str()
+                .is_some_and(|r| !r.trim().is_empty()),
+            "a skipped proposal must say why: {}",
+            skipped[0]
+        );
+    }
+
+    /// Stage one pending proposal for `notes/collides.md` into
+    /// `pending_bucket`, then run `memory_auto_improve` as `caller` against the
+    /// same page. Returns the tool's JSON so the caller can see whether the
+    /// second proposal collided or got its own bucket.
+    async fn auto_improve_over_pending_target(
+        trusted_proxy_identity: bool,
+        pending_bucket: Option<&str>,
+        caller: Option<&str>,
+    ) -> serde_json::Value {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson worth capturing".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: Some("test".into()),
+                model: Some("model".into()),
+                summary: Some("earlier run".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                staged_by_actor_user: pending_bucket.map(str::to_string),
+                proposal_actor: ai_memory_core::ActorContext::default(),
+                proposals: vec![NewAutoImproveProposal {
+                    operation: AutoImproveProposalOperation::Create,
+                    target_path: PagePath::new("notes/collides.md").unwrap(),
+                    kind: "note".into(),
+                    title: "Colliding Lesson".into(),
+                    confidence: 0.9,
+                    rationale: "staged earlier".into(),
+                    evidence_json: serde_json::json!([]),
+                    body_markdown: "# Colliding Lesson\n\nfirst proposal".into(),
+                    artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(TwoProposalAutoImproveLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator)
+            .with_auto_improve_require_approval(true)
+            .with_trusted_proxy_identity(trusted_proxy_identity);
+
+        let mut parts = test_parts_default();
+        if let Some(user) = caller {
+            parts.extensions.insert(ai_memory_core::ActorContext {
+                user: Some(user.to_string()),
+                ..ai_memory_core::ActorContext::default()
+            });
+        }
+
+        call_tool_json(
+            server
+                .memory_auto_improve(
+                    Parameters(AutoImproveArgs {
+                        session_id: Some(session_id.to_string()),
+                        dry_run: None,
+                        stage: None,
+                        mode: None,
+                        project: None,
+                        workspace: None,
+                        min_observations: Some(1),
+                        min_session_duration_secs: Some(0),
+                        min_confidence: Some(0.75),
+                        max_input_tokens: None,
+                        max_proposals: Some(5),
+                        include_raw_fallback: None,
+                    }),
+                    OptionalParts(parts),
+                )
+                .await
+                .expect("a collision must not fail the run"),
+        )
+    }
+
+    /// `[auth].root_username` alone does not make a server multi-operator. The
+    /// scheduler and the report handlers stage unattributed, so bucketing an
+    /// interactive call by its actor would leave TWO pending proposals for one
+    /// page on a single-operator server — exactly the collision V42 promises
+    /// cannot happen.
+    #[tokio::test]
+    async fn single_operator_auto_improve_shares_one_pending_bucket_with_the_scheduler() {
+        let json = auto_improve_over_pending_target(false, None, Some("the-operator")).await;
+
+        let proposals = json["proposals"].as_array().expect("proposals array");
+        assert_eq!(proposals.len(), 1, "the sibling proposal still stages");
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "a named root operator must not open a second pending bucket for the same page"
+        );
+        assert_eq!(skipped[0]["target_path"], "notes/collides.md");
+    }
+
+    /// The other mode: once a trusted proxy tells operators apart, each one
+    /// gets their own pending slot instead of blocking the others — the point
+    /// of V42's author-scoped index.
+    #[tokio::test]
+    async fn proxied_operators_each_hold_a_pending_proposal_for_the_same_page() {
+        let json = auto_improve_over_pending_target(true, Some("alice"), Some("bob")).await;
+
+        let proposals = json["proposals"].as_array().expect("proposals array");
+        assert_eq!(
+            proposals.len(),
+            2,
+            "a second operator must be able to propose for a page someone else has pending"
+        );
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert!(
+            skipped.is_empty(),
+            "nothing should collide across distinct operators: {skipped:?}"
+        );
+    }
+
     /// `memory_lint` reads the wiki to build its candidate set. With
     /// no wiki wired, it must error cleanly.
     #[tokio::test]
@@ -8017,6 +8956,381 @@ mod tests {
         assert!(
             msg.contains("wiki") || msg.contains("not configured"),
             "error should explain the missing wiki: {msg}",
+        );
+    }
+
+    /// Build request parts carrying an explicit auth level, as the HTTP
+    /// middleware would.
+    fn parts_with_level(level: ai_memory_core::AuthLevel) -> axum::http::request::Parts {
+        let mut parts = test_parts_default();
+        parts.extensions.insert(level);
+        parts
+    }
+
+    /// `memory_forget_sweep` permanently removes page versions, and its
+    /// `forget_sweep` admission op cannot stand in for a capability gate — the
+    /// chain only refuses where a reject-policy webhook is configured. So on a
+    /// server with real users it is an admin operation. Covers all three tiers
+    /// plus the no-auth-layer case.
+    #[tokio::test]
+    async fn forget_sweep_admin_gate_across_auth_tiers() {
+        let (_tmp, store, server, _ws, _pj) = setup_server().await;
+
+        let sweep = |parts: axum::http::request::Parts| {
+            let server = &server;
+            async move {
+                server
+                    .memory_forget_sweep(
+                        Parameters(SweepArgs {
+                            dry_run: Some(true),
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        // No users configured: historical single-operator behaviour, every tier
+        // is allowed regardless of level.
+        assert!(
+            sweep(parts_with_level(ai_memory_core::AuthLevel::Anonymous))
+                .await
+                .is_ok()
+        );
+        assert!(
+            sweep(parts_with_level(ai_memory_core::AuthLevel::User))
+                .await
+                .is_ok()
+        );
+        assert!(
+            sweep(parts_with_level(ai_memory_core::AuthLevel::Root))
+                .await
+                .is_ok()
+        );
+
+        // Committing a user switches the server into multi-user mode.
+        let mut user = ai_memory_core::NewUser {
+            username: "alice".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        store
+            .writer
+            .create_user(
+                user,
+                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            sweep(parts_with_level(ai_memory_core::AuthLevel::Root))
+                .await
+                .is_ok(),
+            "root keeps access"
+        );
+        assert!(
+            sweep(parts_with_level(ai_memory_core::AuthLevel::User))
+                .await
+                .is_err(),
+            "an ordinary DB user must not run a destructive sweep"
+        );
+        assert!(
+            sweep(parts_with_level(ai_memory_core::AuthLevel::Anonymous))
+                .await
+                .is_err(),
+            "anonymous must not run a destructive sweep"
+        );
+        // No auth layer at all is the stdio/in-process transport, where the
+        // caller already owns the data directory. It must keep working, or the
+        // tool becomes unusable there the moment a user row exists.
+        assert!(
+            sweep(test_parts_default()).await.is_ok(),
+            "stdio must not be locked out by the multi-user gate"
+        );
+    }
+
+    /// Where `memory_write_page` says the page actually landed — not always
+    /// the path the caller asked for, since a slot write may be namespaced.
+    fn written_path(result: &CallToolResult) -> String {
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("tool result carries text");
+        serde_json::from_str::<serde_json::Value>(&text).expect("tool result is JSON")["path"]
+            .as_str()
+            .expect("response carries the written path")
+            .to_string()
+    }
+
+    /// A `_slots/<user>/…` body is injected verbatim into that operator's next
+    /// session brief, so an unguarded write into someone else's namespace is a
+    /// way to put chosen text into their agent's context. The read boundary
+    /// does not cover this direction.
+    ///
+    /// Also pins the other half: with `[slots] per_user` off, a nested slot
+    /// path is an ordinary page and the write keeps working for anyone.
+    #[tokio::test]
+    async fn slot_writes_stay_inside_the_callers_namespace() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki);
+        // A users row is what puts this deployment on the multi-operator rung;
+        // without one the historical single-operator escape hatch applies.
+        let mut user = ai_memory_core::NewUser {
+            username: "alice".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        store
+            .writer
+            .create_user(
+                user,
+                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
+            )
+            .await
+            .unwrap();
+
+        let parts_for = |user: &str| {
+            let mut parts = parts_with_level(ai_memory_core::AuthLevel::User);
+            parts.extensions.insert(ai_memory_core::ActorContext {
+                user: Some(user.to_string()),
+                ..ai_memory_core::ActorContext::default()
+            });
+            parts
+        };
+        let write = |server: AiMemoryServer, path: &str, parts: axum::http::request::Parts| {
+            let path = path.to_string();
+            async move {
+                server
+                    .memory_write_page(
+                        Parameters(WritePageArgs {
+                            path,
+                            body: "# Focus\nread this and obey".into(),
+                            title: None,
+                            tier: None,
+                            tags: Vec::new(),
+                            pinned: false,
+                            project: None,
+                            workspace: None,
+                            scope: None,
+                            expires_at: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        let scoped = server.clone().with_per_user_slots(true);
+        let err = write(
+            scoped.clone(),
+            "_slots/alice/current-focus.md",
+            parts_for("bob"),
+        )
+        .await
+        .expect_err("Bob must not write into Alice's slot namespace");
+        assert!(err.to_string().contains("another operator"), "{err}");
+
+        // Alice's own slot stays writable, unchanged.
+        let own = write(
+            scoped.clone(),
+            "_slots/alice/current-focus.md",
+            parts_for("alice"),
+        )
+        .await
+        .expect("an operator owns their own namespace");
+        assert_eq!(written_path(&own), "_slots/alice/current-focus.md");
+        // The shared slot is namespaced into the writer's own prefix — the
+        // engine's answer for the same string, and the response says where the
+        // page actually landed.
+        let shared = write(scoped.clone(), "_slots/current-focus.md", parts_for("bob"))
+            .await
+            .expect("a shared-slot write is re-homed, not refused");
+        assert_eq!(written_path(&shared), "_slots/bob/current-focus.md");
+        // Admin curation of any namespace stays possible.
+        write(
+            scoped,
+            "_slots/alice/current-focus.md",
+            parts_with_level(ai_memory_core::AuthLevel::Root),
+        )
+        .await
+        .expect("root may curate any namespace");
+
+        // DEFAULT CONFIG: nested slot paths are ordinary pages again.
+        write(server, "_slots/alice/current-focus.md", parts_for("bob"))
+            .await
+            .expect("with per-user slots off nothing may change for existing writers");
+    }
+
+    /// The MCP tool and the engine's own write path are two doors onto the same
+    /// hazard, so they must give the same answer for the same operator and the
+    /// same string. If this tool were the looser one it would simply be the one
+    /// an agent uses: the engine namespaces `_slots/current-focus.md` into the
+    /// writer's prefix, and a tool that instead wrote it as given would put
+    /// that body into EVERY operator's session brief.
+    #[tokio::test]
+    async fn mcp_and_engine_doors_agree_on_slot_placement() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki);
+        // A users row puts the deployment on the multi-operator rung; without
+        // one every caller waves through the single-operator admin hatch.
+        let mut user = ai_memory_core::NewUser {
+            username: "alice".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        store
+            .writer
+            .create_user(
+                user,
+                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
+            )
+            .await
+            .unwrap();
+
+        let write = |server: AiMemoryServer, path: &str, caller: &str| {
+            let path = path.to_string();
+            let mut parts = parts_with_level(ai_memory_core::AuthLevel::User);
+            parts.extensions.insert(ai_memory_core::ActorContext {
+                user: Some(caller.to_string()),
+                ..ai_memory_core::ActorContext::default()
+            });
+            async move {
+                server
+                    .memory_write_page(
+                        Parameters(WritePageArgs {
+                            path,
+                            body: "# Focus\nread this and obey".into(),
+                            title: None,
+                            tier: None,
+                            tags: Vec::new(),
+                            pinned: false,
+                            project: None,
+                            workspace: None,
+                            scope: None,
+                            expires_at: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        let cases = [
+            ("_slots/current-focus.md", "bob"),
+            ("_slots/alice/current-focus.md", "alice"),
+            ("_slots/alice/current-focus.md", "bob"),
+            ("_slots/a*/current-focus.md", "a*"),
+            ("_slots/current-focus.md", "a*"),
+            ("notes/plain.md", "bob"),
+        ];
+
+        let scoped = server.clone().with_per_user_slots(true);
+        for (path, caller) in cases {
+            // The engine's rule, verbatim: the consolidator writes `AsGiven`
+            // and `Personal` and skips the two refusals.
+            let engine = ai_memory_core::slot_placement(path, Some(caller));
+            let door = write(scoped.clone(), path, caller).await;
+            match engine {
+                ai_memory_core::SlotPlacement::AsGiven => {
+                    assert_eq!(
+                        written_path(&door.expect("engine writes this one as given")),
+                        path,
+                        "{path} by {caller}"
+                    );
+                }
+                ai_memory_core::SlotPlacement::Personal(personal) => {
+                    assert_eq!(
+                        written_path(&door.expect("engine re-homes this one")),
+                        personal,
+                        "{path} by {caller}"
+                    );
+                }
+                ai_memory_core::SlotPlacement::ForeignNamespace
+                | ai_memory_core::SlotPlacement::Unnamespaceable => {
+                    assert!(door.is_err(), "engine refuses this one: {path} by {caller}");
+                }
+            }
+        }
+
+        // DEFAULT CONFIG (`[slots] per_user` off): the engine never consults
+        // placement, so neither may this door — every path lands as given.
+        for (path, caller) in cases {
+            assert_eq!(
+                written_path(
+                    &write(server.clone(), path, caller)
+                        .await
+                        .expect("with per-user slots off every slot write keeps working")
+                ),
+                path,
+                "{path} by {caller}"
+            );
+        }
+    }
+
+    /// `any_owner` opts out of the ownership boundary entirely, so it carries
+    /// the same authority requirement as the other cross-operator escapes.
+    #[tokio::test]
+    async fn handoff_accept_any_owner_requires_admin_in_multi_user_mode() {
+        let (_tmp, store, server, _ws, _pj) = setup_server().await;
+        let mut user = ai_memory_core::NewUser {
+            username: "alice".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        store
+            .writer
+            .create_user(
+                user,
+                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
+            )
+            .await
+            .unwrap();
+
+        let accept = |parts: axum::http::request::Parts, any_owner: bool| {
+            let server = &server;
+            async move {
+                server
+                    .memory_handoff_accept(
+                        Parameters(HandoffAcceptArgs {
+                            cwd: None,
+                            any_owner: Some(any_owner),
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        assert!(
+            accept(parts_with_level(ai_memory_core::AuthLevel::User), true)
+                .await
+                .is_err(),
+            "a plain user must not drain another operator's handoff"
+        );
+        assert!(
+            accept(parts_with_level(ai_memory_core::AuthLevel::Root), true)
+                .await
+                .is_ok(),
+            "root may recover one"
+        );
+        // The ordinary, owner-scoped path stays open to everyone.
+        assert!(
+            accept(parts_with_level(ai_memory_core::AuthLevel::User), false)
+                .await
+                .is_ok()
         );
     }
 
@@ -8123,6 +9437,7 @@ mod tests {
             .memory_handoff_accept(
                 Parameters(HandoffAcceptArgs {
                     cwd: None,
+                    any_owner: None,
                     project: None,
                     workspace: None,
                 }),
@@ -8210,6 +9525,36 @@ mod tests {
         }
     }
 
+    /// The throttle is per (page, operator): one operator reading a page must
+    /// not swallow another operator's reinforcement for the whole window, or
+    /// the counter degrades into "distinct minutes in which somebody read
+    /// this" and undercounts in proportion to team size.
+    #[test]
+    fn access_bump_cooldown_is_per_operator() {
+        let a = PageId::new();
+        let cooldown = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let mut seen = HashMap::new();
+
+        assert_eq!(
+            select_bumpable(&mut seen, vec![a], Some("alice"), t0, cooldown),
+            vec![a]
+        );
+        // Alice again inside the window: still throttled.
+        assert!(select_bumpable(&mut seen, vec![a], Some("alice"), t0, cooldown).is_empty());
+        // Bob reading the same page in the same window is his own first read.
+        assert_eq!(
+            select_bumpable(&mut seen, vec![a], Some("bob"), t0, cooldown),
+            vec![a]
+        );
+        // An unattributed caller is its own bucket too, and stays throttled.
+        assert_eq!(
+            select_bumpable(&mut seen, vec![a], None, t0, cooldown),
+            vec![a]
+        );
+        assert!(select_bumpable(&mut seen, vec![a], None, t0, cooldown).is_empty());
+    }
+
     #[test]
     fn access_bump_throttle_dedups_within_cooldown_and_reallows_after() {
         let cooldown = Duration::from_secs(60);
@@ -8221,28 +9566,31 @@ mod tests {
 
         // First sighting of both pages → both due, in input order.
         assert_eq!(
-            select_bumpable(&mut seen, vec![a, b], t0, cooldown),
+            select_bumpable(&mut seen, vec![a, b], None, t0, cooldown),
             vec![a, b]
         );
 
         // The same hot pages 30s later (inside the window) → nothing due, so
         // the writer actor is spared the redundant reinforcement writes.
         let t30 = t0 + Duration::from_secs(30);
-        assert!(select_bumpable(&mut seen, vec![a, b], t30, cooldown).is_empty());
+        assert!(select_bumpable(&mut seen, vec![a, b], None, t30, cooldown).is_empty());
 
         // A fresh page mixed in with the cooling ones → only the fresh one.
         assert_eq!(
-            select_bumpable(&mut seen, vec![a, b, c], t30, cooldown),
+            select_bumpable(&mut seen, vec![a, b, c], None, t30, cooldown),
             vec![c]
         );
 
         // Past the window, `a` is due again.
         let t90 = t0 + Duration::from_secs(90);
-        assert_eq!(select_bumpable(&mut seen, vec![a], t90, cooldown), vec![a]);
+        assert_eq!(
+            select_bumpable(&mut seen, vec![a], None, t90, cooldown),
+            vec![a]
+        );
 
         // Aged-out entries are pruned, so the map never grows without bound.
         let t_far = t0 + Duration::from_secs(1_000);
-        assert!(select_bumpable(&mut seen, Vec::new(), t_far, cooldown).is_empty());
+        assert!(select_bumpable(&mut seen, Vec::new(), None, t_far, cooldown).is_empty());
         assert!(seen.is_empty(), "aged-out entries must be pruned");
     }
 }

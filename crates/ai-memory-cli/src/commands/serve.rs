@@ -87,6 +87,44 @@ fn validate_existing_users_auth(users_exist: bool, auth: &AuthSettings) -> Resul
     }
 }
 
+fn configured(value: Option<&String>) -> bool {
+    value.is_some_and(|v| !v.trim().is_empty())
+}
+
+/// A trusted proxy that asserts end-user identities needs an operator to be
+/// root.
+///
+/// `require_bearer` downgrades every proxy-named caller to `AuthLevel::User`
+/// unless the asserted username matches `[auth].root_username`. With no root
+/// username configured that comparison can never succeed, so no request through
+/// the proxy — the only ingress such a deployment has — could ever reach a
+/// root-only capability: `/admin/users` would 403, the first DB user could
+/// never be created, and the server would come up permanently locked out of its
+/// own administration. Refuse to start instead of failing later, per request.
+fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
+    if configured(auth.actor_proxy_secret.as_ref()) && !configured(auth.root_username.as_ref()) {
+        anyhow::bail!(
+            "[auth].actor_proxy_secret is set but [auth].root_username is not: every identity the \
+             proxy asserts is downgraded to a non-root user except the configured root operator, \
+             so with no root_username nothing could ever perform a root-only operation (user \
+             management, admin routes). Set [auth].root_username to the operator who administers \
+             this server, or unset [auth].actor_proxy_secret"
+        );
+    }
+    Ok(())
+}
+
+/// Can a trusted proxy actually assert identities on this server?
+///
+/// Both halves are required: the overlay only runs on requests that
+/// authenticated with the root bearer, so a proxy secret without
+/// `[auth].bearer_token` asserts nothing (and only warns, below). The MCP admin
+/// gates read this to know that distinct operators are in play even though a
+/// proxied deployment never writes a `users` row.
+fn trusted_proxy_identity_enabled(auth: &AuthSettings) -> bool {
+    configured(auth.actor_proxy_secret.as_ref()) && configured(auth.bearer_token.as_ref())
+}
+
 struct ConsolidatorSetup {
     server: AiMemoryServer,
     consolidator: Option<Arc<Consolidator>>,
@@ -168,6 +206,7 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
 }
 
 async fn run_session_consolidation_worker(
+    reader: ai_memory_store::ReaderPool,
     writer: WriterHandle,
     consolidator: Arc<Consolidator>,
     notify: Arc<tokio::sync::Notify>,
@@ -205,10 +244,25 @@ async fn run_session_consolidation_worker(
         let session_id = job.session_id();
         let generation = job.generation();
         let attempts = job.attempts();
+        // Attribute the consolidated pages to whoever OWNED the session, not
+        // to the worker that happened to drain the queue — the queue is shared
+        // and the draining task has no operator identity of its own. A session
+        // with no recorded owner (single-operator or unauthenticated server)
+        // stays anonymous, as it always was.
+        let session_owner = match reader.session_actor_user(session_id).await {
+            Ok(owner) => owner,
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "session owner lookup failed; consolidating unattributed");
+                None
+            }
+        };
         let consolidation = consolidator.consolidate_session(
             session_id,
             false,
-            ai_memory_core::ActorContext::anonymous(),
+            ai_memory_core::ActorContext {
+                user: session_owner,
+                ..ai_memory_core::ActorContext::default()
+            },
             None,
             None,
         );
@@ -318,6 +372,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     }
 
     validate_existing_users_auth(store.reader.users_exist().await?, &config.auth)?;
+    validate_trusted_proxy_auth(&config.auth)?;
 
     // Run any outstanding wiki-structure migrations before the watcher starts
     // so file moves and renames are never raced by the reconciler.
@@ -346,6 +401,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .context("compiling sanitizer.extra_patterns from config")?;
     let wiki = Wiki::new(&config.data_dir, store.writer.clone())?
         .with_sanitizer(sanitizer.clone())
+        // Same switch the MCP server and the consolidator get: the wiki has a
+        // slot writer of its own (auto-improve approval), and a feature that
+        // holds at two of three doors holds nowhere.
+        .with_per_user_slots(config.slots.per_user)
         // Reader attached unconditionally: admission name-resolution uses it
         // when a chain is configured, and the startup scope-manifest backfill
         // (below) always needs it to enumerate scopes.
@@ -417,7 +476,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             &config.auto_improve,
         ))
         .with_active_project(active_project.clone())
-        .with_sanitizer(sanitizer.clone());
+        .with_sanitizer(sanitizer.clone())
+        .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth))
+        .with_per_user_slots(config.slots.per_user);
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
@@ -452,6 +513,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     if let Some(consolidator) = consolidator.clone() {
                         let notify = Arc::new(tokio::sync::Notify::new());
                         let task = tokio::spawn(run_session_consolidation_worker(
+                            store.reader.clone(),
                             store.writer.clone(),
                             consolidator,
                             notify.clone(),
@@ -539,6 +601,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
                 capture_assistant_enabled: config.capture_assistant,
+                per_user_slots: config.slots.per_user,
+                trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                     ai_memory_hooks::SubagentSessionSet::default(),
                 )),
@@ -585,6 +649,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     .map(|p| ai_memory_store::TokenPepper::new(p.clone())),
                 active_project: active_project.clone(),
                 scope_invalidator: Some(scope_invalidator),
+                trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -604,6 +669,30 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     email: config.auth.root_email.clone(),
                     ..ai_memory_core::ActorContext::default()
                 });
+            }
+            if let Some(secret) = config
+                .auth
+                .actor_proxy_secret
+                .as_ref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                // The overlay is only reachable from the root-bearer rung, so
+                // a proxy secret without a bearer token silently does nothing.
+                // Say so rather than leaving the operator believing per-user
+                // attribution is on.
+                if config
+                    .auth
+                    .bearer_token
+                    .as_deref()
+                    .is_none_or(|token| token.trim().is_empty())
+                {
+                    tracing::warn!(
+                        "[auth].actor_proxy_secret is set but [auth].bearer_token is not; \
+                         trusted-proxy identity is inactive because it only applies to \
+                         requests authenticated with the root bearer token"
+                    );
+                }
+                auth_state = auth_state.with_trusted_proxy(secret.clone());
             }
             if let Some(pepper) = config
                 .auth
@@ -760,7 +849,10 @@ async fn start_maintenance_scheduler(
     if maintenance_enabled && forget_sweep_interval_secs > 0 {
         let reader = reader.clone();
         let writer = writer.clone();
-        let wiki = wiki.clone();
+        // Announce each swept scope to the admission chain, same as the
+        // operator-triggered sweep does — and give the sweep the handle its
+        // TTL pass needs to delete the markdown file alongside the rows.
+        let sweep_wiki = Some(wiki.clone());
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
             run_persisted_maintenance_job(
@@ -784,29 +876,15 @@ async fn start_maintenance_scheduler(
                 move || {
                     let reader = reader.clone();
                     let writer = writer.clone();
-                    let wiki = wiki.clone();
                     let decay = decay;
+                    let sweep_wiki = sweep_wiki.clone();
                     async move {
-                        let started = std::time::Instant::now();
-                        let outcome =
-                            run_scheduled_sweep_tick(&reader, &writer, &wiki, &decay).await?;
-                        if outcome.errors > 0 {
-                            anyhow::bail!(
-                                "scheduled forget sweep had {} scope errors",
-                                outcome.errors
-                            );
-                        }
-                        info!(
-                            scopes = outcome.scopes,
-                            candidates_evaluated = outcome.candidates_evaluated,
-                            evicted = outcome.evicted,
-                            expired = outcome.expired,
-                            hard_deleted = outcome.hard_deleted,
-                            errors = outcome.errors,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "scheduled forget sweep completed"
-                        );
-                        Ok(())
+                        // `run_scheduled_sweep_job_tick` already does upstream's
+                        // bail-on-scope-errors and completion log (including the
+                        // TTL `expired` count); it additionally keeps refusals
+                        // out of the retry-sooner path.
+                        run_scheduled_sweep_job_tick(&reader, &writer, &decay, sweep_wiki.as_ref())
+                            .await
                     }
                 },
             )
@@ -1014,13 +1092,58 @@ struct ScheduledSweepTickOutcome {
     expired: usize,
     hard_deleted: usize,
     errors: usize,
+    /// Scopes an admission webhook declined to have swept.
+    ///
+    /// Counted apart from `errors` because the two need opposite retry
+    /// behaviour: a store failure is transient and worth retrying soon, while a
+    /// scope guard answering "not this project" is a permanent, designed answer
+    /// — the case [`ai_memory_wiki::AdmissionOp::ForgetSweep`] exists for.
+    /// Retrying it would re-run the whole sweep (and its webhook round-trips)
+    /// for every OTHER scope at the retry cadence, forever.
+    refusals: usize,
+}
+
+/// One scheduled forget-sweep tick, as the maintenance loop sees it.
+///
+/// `Err` means "retry sooner than the interval", so only genuine scope errors
+/// produce one; a tick whose scopes were merely refused is a completed tick and
+/// records success. The refusal count is reported either way so an operator can
+/// see the sweep is being declined rather than silently doing nothing.
+async fn run_scheduled_sweep_job_tick(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    decay: &ai_memory_store::DecayParams,
+    wiki: Option<&ai_memory_wiki::Wiki>,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let outcome = run_scheduled_sweep_tick(reader, writer, decay, wiki).await?;
+    if outcome.errors > 0 {
+        anyhow::bail!("scheduled forget sweep had {} scope errors", outcome.errors);
+    }
+    info!(
+        scopes = outcome.scopes,
+        candidates_evaluated = outcome.candidates_evaluated,
+        evicted = outcome.evicted,
+        expired = outcome.expired,
+        hard_deleted = outcome.hard_deleted,
+        errors = outcome.errors,
+        refused = outcome.refusals,
+        elapsed_ms = started.elapsed().as_millis(),
+        "scheduled forget sweep completed"
+    );
+    Ok(())
 }
 
 async fn run_scheduled_sweep_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
-    wiki: &Wiki,
     decay: &ai_memory_store::DecayParams,
+    // One handle serves both sides: it announces the scope to the admission
+    // chain AND routes TTL deletes through the wiki so the markdown file goes
+    // with the rows. `None` (bare-store tests) therefore means no announce and
+    // no TTL delete — an expired page is reported and left intact rather than
+    // half-deleted into a file the watcher would re-index.
+    wiki: Option<&ai_memory_wiki::Wiki>,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1029,10 +1152,42 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
+        // The scheduled sweep evicts and hard-deletes just like the manual one,
+        // so it announces itself to the admission chain as well — otherwise a
+        // webhook only ever sees the operator-triggered minority.
+        //
+        // Deciders first, observers only after the scope has actually been
+        // swept: a scope whose sweep then failed is one no mirror should have
+        // been told about. Same order every other path raising this op uses.
+        let mut admission_ctx = None;
+        if let Some(wiki) = wiki {
+            match wiki
+                .authorize_operation(
+                    scope.workspace_id,
+                    scope.project_id,
+                    ai_memory_wiki::AdmissionOp::ForgetSweep,
+                    ai_memory_core::ActorContext::anonymous(),
+                    Vec::new(),
+                )
+                .await
+            {
+                Ok(ctx) => admission_ctx = ctx,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        error = %e,
+                        "scheduled sweep refused by admission chain; skipping this scope"
+                    );
+                    outcome.refusals += 1;
+                    continue;
+                }
+            }
+        }
         match run_sweep(
             reader,
             writer,
-            Some(wiki),
+            wiki,
             scope.workspace_id,
             scope.project_id,
             decay,
@@ -1041,6 +1196,9 @@ async fn run_scheduled_sweep_tick(
         .await
         {
             Ok(report) => {
+                if let (Some(wiki), Some(ctx)) = (wiki, admission_ctx.as_ref()) {
+                    wiki.notify_operation_observers(ctx);
+                }
                 outcome.candidates_evaluated += report.candidates_evaluated;
                 outcome.evicted += report.evicted.len();
                 outcome.expired += report.expired.len();
@@ -1301,14 +1459,17 @@ fn configure_consolidator(
         model = llm.model(),
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
-    let consolidator = Arc::new(Consolidator::new(
-        store.reader.clone(),
-        store.writer.clone(),
-        wiki.clone(),
-        llm.clone(),
-        workspace_id,
-        project_id,
-    ));
+    let consolidator = Arc::new(
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            workspace_id,
+            project_id,
+        )
+        .with_per_user_slots(config.slots.per_user),
+    );
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
     // Optional post-RRF reranking rides on the same provider, so it is
     // only reachable once an LLM is configured at all. Off unless the
@@ -1520,6 +1681,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A proxy that asserts identities with nobody configured as root cannot
+    /// designate an administrator: every asserted operator is downgraded, so
+    /// `/admin/*` and user management become unreachable through the server's
+    /// only ingress. Refuse at boot rather than serve something locked out.
+    #[test]
+    fn trusted_proxy_requires_a_configured_root_operator() {
+        let with = |secret: Option<&str>, root: Option<&str>| {
+            validate_trusted_proxy_auth(&AuthSettings {
+                actor_proxy_secret: secret.map(str::to_string),
+                root_username: root.map(str::to_string),
+                ..AuthSettings::default()
+            })
+        };
+
+        assert!(
+            with(Some("proxy-secret"), None).is_err(),
+            "a proxy secret with no root_username must refuse to start"
+        );
+        assert!(
+            with(Some("proxy-secret"), Some("   ")).is_err(),
+            "a blank root_username names nobody either"
+        );
+        let message = with(Some("proxy-secret"), None).unwrap_err().to_string();
+        assert!(
+            message.contains("actor_proxy_secret") && message.contains("root_username"),
+            "the error must name both settings: {message}"
+        );
+
+        assert!(with(Some("proxy-secret"), Some("boss")).is_ok());
+        // Default config, and every deployment that never enables the proxy,
+        // is untouched — including one that names a root operator on its own.
+        assert!(with(None, None).is_ok());
+        assert!(with(Some("  "), None).is_ok());
+        assert!(with(None, Some("boss")).is_ok());
+    }
+
+    /// The MCP admin gates read this to learn that distinct operators exist
+    /// without any `users` rows. It must stay false at default config, and
+    /// false for a secret that can never take effect.
+    #[test]
+    fn trusted_proxy_identity_needs_both_the_secret_and_a_root_bearer() {
+        let flag = |secret: Option<&str>, bearer: Option<&str>| {
+            trusted_proxy_identity_enabled(&AuthSettings {
+                actor_proxy_secret: secret.map(str::to_string),
+                bearer_token: bearer.map(str::to_string),
+                ..AuthSettings::default()
+            })
+        };
+
+        assert!(!flag(None, None), "default config distinguishes nobody");
+        assert!(!flag(None, Some("root-token")));
+        // The overlay only runs on root-bearer requests, so a secret without
+        // one asserts nothing and must not tighten the admin gates.
+        assert!(!flag(Some("proxy-secret"), None));
+        assert!(!flag(Some("   "), Some("root-token")));
+        assert!(flag(Some("proxy-secret"), Some("root-token")));
     }
 
     #[test]
@@ -2063,6 +2282,7 @@ mod tests {
                 project_id,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2103,6 +2323,7 @@ mod tests {
         let notify = Arc::new(tokio::sync::Notify::new());
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_session_consolidation_worker(
+            store.reader.clone(),
             store.writer.clone(),
             consolidator,
             notify.clone(),
@@ -2208,7 +2429,10 @@ mod tests {
             cold_threshold: 2.0,
             ..ai_memory_store::DecayParams::default()
         };
-        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &wiki, &decay)
+        // Wiki-backed, as the real scheduler is: the handle is what makes the
+        // TTL delete reach the markdown file, and this fixture installs no
+        // admission guard, so nothing is refused.
+        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &decay, Some(&wiki))
             .await
             .unwrap();
 
@@ -2226,6 +2450,202 @@ mod tests {
                     .is_empty(),
                 "sweep should evict the eligible page in every project"
             );
+        }
+    }
+
+    /// A scope guard that declines a project is a permanent, designed answer —
+    /// unlike a store failure, which is transient. Counting it as an error made
+    /// the tick fail, so the loop retried at the failure cadence and a daily
+    /// sweep became a 60-second hot loop over every scope that was fine.
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_sweep_refused_by_admission_is_a_successful_tick() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Episodic,
+            )
+            .await;
+        }
+        // A blocking `Reject` webhook on an address nothing answers: to a reject
+        // chain that is the same answer as an explicit "not this scope".
+        let wiki = wiki.with_admission_chain(
+            ai_memory_wiki::AdmissionChain::new(vec![ai_memory_wiki::WebhookConfig {
+                name: "scope-guard".into(),
+                url: "http://127.0.0.1:1/admission".into(),
+                timeout_ms: 50,
+                failure_policy: ai_memory_wiki::FailurePolicy::Reject,
+                events: vec![ai_memory_wiki::AdmissionOp::ForgetSweep],
+                blocking: true,
+            }])
+            .unwrap(),
+        );
+        let decay = ai_memory_store::DecayParams {
+            cold_threshold: 2.0,
+            ..ai_memory_store::DecayParams::default()
+        };
+
+        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &decay, Some(&wiki))
+            .await
+            .unwrap();
+        assert_eq!(outcome.scopes, 2);
+        assert_eq!(outcome.refusals, 2, "both scopes were declined");
+        assert_eq!(
+            outcome.errors, 0,
+            "a policy refusal is not a store failure and must not be counted as one"
+        );
+        assert_eq!(outcome.evicted, 0, "a declined scope must not be swept");
+
+        // The maintenance loop therefore records success and waits the full
+        // interval instead of retrying at the failure cadence. The interval must
+        // be the shipped `forget_sweep_interval_secs` (a day) for the waits below
+        // to tell the two cadences apart at all: the failure retry delay is
+        // `interval.min(MAINTENANCE_STARTUP_DELAY_CAP)`, so with any interval at
+        // or under that 60s cap both paths sleep for exactly the same duration
+        // and no timing assertion could discriminate.
+        let interval = Duration::from_secs(86_400);
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let reader_for_state = store.reader.clone();
+        let reader = store.reader.clone();
+        let writer = store.writer.clone();
+        let ticks_for_tick = ticks.clone();
+        let task = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            interval,
+            move || {
+                let reader = reader_for_state.clone();
+                async move {
+                    Ok(reader
+                        .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                        .await?)
+                }
+            },
+            || jiff::Timestamp::now().as_microsecond(),
+            move || {
+                let reader = reader.clone();
+                let writer = writer.clone();
+                let wiki = wiki.clone();
+                let ticks = ticks_for_tick.clone();
+                let events = events.clone();
+                async move {
+                    // Stamp the mocked clock inside the tick so the gap between
+                    // consecutive ticks is the delay the loop actually chose.
+                    let at = tokio::time::Instant::now();
+                    let result =
+                        run_scheduled_sweep_job_tick(&reader, &writer, &decay, Some(&wiki)).await;
+                    events
+                        .send((ticks.fetch_add(1, Ordering::SeqCst) + 1, at))
+                        .unwrap();
+                    result
+                }
+            },
+        ));
+
+        // Startup delay is `interval.min(MAINTENANCE_STARTUP_DELAY_CAP)` = 60s.
+        tokio::time::advance(MAINTENANCE_STARTUP_DELAY_CAP).await;
+        let (first_tick, first_at) = received.recv().await.expect("first tick");
+        assert_eq!(first_tick, 1);
+
+        // Cadence assertion. Five 60s hops, each yielding, so a loop retrying at
+        // the failure cadence has fired several times over by the end no matter
+        // where inside the first hop its sleep was armed. Stepping (rather than
+        // one jump) is what makes the absence of an event proof of a long sleep
+        // instead of proof that the sleep was armed after the clock moved.
+        for _ in 0..5 {
+            tokio::time::advance(MAINTENANCE_STARTUP_DELAY_CAP).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            received.try_recv().is_err(),
+            "a refused tick must wait the full interval, not the failure retry delay"
+        );
+        wait_for_maintenance_success(&store, ai_memory_store::MaintenanceJob::ForgetSweep).await;
+
+        tokio::time::advance(interval).await;
+        let (second_tick, second_at) = received.recv().await.expect("second tick");
+        assert_eq!(second_tick, 2);
+        assert!(
+            second_at.duration_since(first_at) >= interval,
+            "consecutive refused ticks must be a full interval apart, got {:?}",
+            second_at.duration_since(first_at)
+        );
+        task.abort();
+    }
+
+    /// The scheduled sweep raises the same `forget_sweep` event the MCP tool
+    /// does, so a `blocking = false` observer subscribed to it must hear from
+    /// both — and only for a scope that was actually swept.
+    #[tokio::test]
+    async fn scheduled_sweep_notifies_observers_of_the_scopes_it_swept() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let app = axum::Router::new().route(
+            "/admission",
+            axum::routing::post(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Episodic,
+            )
+            .await;
+        }
+        let wiki = wiki.with_admission_chain(
+            ai_memory_wiki::AdmissionChain::new(vec![ai_memory_wiki::WebhookConfig {
+                name: "mirror".into(),
+                url: format!("http://{addr}/admission"),
+                timeout_ms: 2_000,
+                failure_policy: ai_memory_wiki::FailurePolicy::Ignore,
+                events: vec![ai_memory_wiki::AdmissionOp::ForgetSweep],
+                blocking: false,
+            }])
+            .unwrap(),
+        );
+
+        let outcome = run_scheduled_sweep_tick(
+            &store.reader,
+            &store.writer,
+            &ai_memory_store::DecayParams::default(),
+            Some(&wiki),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.scopes, 2);
+        assert_eq!(outcome.errors, 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while hits.load(Ordering::SeqCst) < outcome.scopes {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the observer must be told about every swept scope; saw {}",
+                hits.load(Ordering::SeqCst),
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 

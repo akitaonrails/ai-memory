@@ -142,6 +142,15 @@ pub struct StageAutoImproveRun {
     pub config_json: serde_json::Value,
     /// Actor attribution recorded on the run and its `staged` events.
     pub proposal_actor: ActorContext,
+    /// Operator that staged this run, as the username the request authenticated
+    /// or was proxy-asserted under.
+    ///
+    /// A username rather than a `users(id)`: the majority of identified callers
+    /// on a shared server are asserted by an authenticating proxy and have no
+    /// row. `None` for a single-operator server and for any unattributed
+    /// caller, which keeps the one-pending-per-target rule behaving exactly as
+    /// before (see V42).
+    pub staged_by_actor_user: Option<String>,
     /// Page edits to stage as pending proposals.
     pub proposals: Vec<NewAutoImproveProposal>,
 }
@@ -183,6 +192,26 @@ pub struct StagedAutoImproveRun {
     pub run_id: AutoImproveRunId,
     /// Ids of the staged proposals, in input order.
     pub proposal_ids: Vec<AutoImproveProposalId>,
+    /// Proposals that could not be staged because something is already pending
+    /// for the same target, reported instead of silently dropped.
+    ///
+    /// A colliding proposal used to abort the whole transaction, losing the run
+    /// row, the non-colliding proposals beside it, and the (paid) LLM call that
+    /// produced them.
+    pub skipped: Vec<SkippedProposal>,
+}
+
+/// One proposal that was not staged, and why.
+///
+/// `Deserialize` because the HTTP clients (the CLI) have to read this back off
+/// the wire to show it; a report the operator never sees is the silent drop
+/// again, one hop further out.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkippedProposal {
+    /// Wiki path the proposal targeted.
+    pub target_path: String,
+    /// Human-readable reason, safe to surface to an operator.
+    pub reason: String,
 }
 
 /// List-view projection of a proposal (no bodies or event history).
@@ -257,6 +286,15 @@ pub struct AutoImproveProposalDetail {
     pub expected_base_body_sha256: Option<[u8; 32]>,
     /// Base body hash the staged `body_markdown` was materialized from.
     pub materialized_base_body_sha256: Option<[u8; 32]>,
+    /// Operator whose session produced this proposal, `None` for an
+    /// unattributed run (single-operator server, or the unattended scheduler on
+    /// a session nobody was named on).
+    ///
+    /// Reviewer-facing — V42 added the column so a reviewer could tell whose
+    /// suggestion they were looking at — and load-bearing: it is the attribution
+    /// the approval-side slot guard checks the target against, because the
+    /// approver is a reviewer, not the owner of the page.
+    pub staged_by_actor_user: Option<String>,
     /// Status history, oldest first.
     pub events: Vec<AutoImproveProposalEvent>,
 }
@@ -416,6 +454,19 @@ pub enum ApproveAutoImproveProposalResult {
     /// The target changed since staging; the proposal was marked `conflict`
     /// and nothing was written.
     Conflict,
+    /// The proposal may not be applied at all — the write policy of the door
+    /// that would apply it refuses this target. The proposal is marked `failed`
+    /// and nothing was written.
+    ///
+    /// A verdict, not an error: [`approve_proposal`] never returns it, but the
+    /// wiki's approval does (a slot target that is not the proposal owner's),
+    /// and it must not abort the remaining approvals in the same run — the
+    /// per-proposal channel staging collisions already use.
+    Refused {
+        /// Reviewer-facing reason, also stored as the proposal's
+        /// `decision_reason`.
+        reason: String,
+    },
 }
 
 /// `_pending/auto-improve/<id>.md` — where a staged proposal's body artifact
@@ -572,7 +623,21 @@ pub fn stage_run(
     )?;
     insert_rejected_candidates_in_tx(&tx, input, run_id, now)?;
     let mut proposal_ids = Vec::with_capacity(input.proposals.len());
+    let mut skipped: Vec<SkippedProposal> = Vec::new();
+    // Two proposals in ONE run targeting the same path mean the batch itself is
+    // malformed — the model emitted contradictory suggestions for one page, and
+    // silently keeping an arbitrary one would be worse than refusing. That
+    // stays a hard error (see `auto_improve_duplicate_pending_target_rolls_back_run`).
+    // A collision with a proposal already PENDING from an earlier run is a
+    // different situation, handled per-proposal below.
+    let mut seen_targets: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for proposal in &input.proposals {
+        if !seen_targets.insert(proposal.target_path.as_str()) {
+            return Err(StoreError::InvalidState(format!(
+                "two proposals in the same run target {}",
+                proposal.target_path
+            )));
+        }
         let id = AutoImproveProposalId::new();
         let artifact_path = artifact_path_for(id);
         let evidence_json = serde_json::to_string(&proposal.evidence_json)?;
@@ -648,15 +713,16 @@ pub fn stage_run(
                 }
             }
         }
-        tx.execute(
+        let insert = tx.execute(
             "INSERT INTO auto_improve_proposals \
              (id, run_id, workspace_id, project_id, status, operation, target_path, kind, title, \
               confidence, rationale, evidence_json, body_markdown, body_sha256, artifact_path, \
               artifact_sha256, target_latest_page_id_at_stage, target_body_sha256_at_stage, \
               target_updated_at_at_stage, staged_at, edit_mode, patch_json, \
-              expected_base_body_sha256, materialized_base_body_sha256) \
+              expected_base_body_sha256, materialized_base_body_sha256, \
+              staged_by_actor_user) \
              VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 id.as_bytes(),
                 run_id.as_bytes(),
@@ -681,8 +747,24 @@ pub fn stage_run(
                 patch_json,
                 proposal.expected_base_body_sha256.map(|h| h.to_vec()),
                 proposal.expected_base_body_sha256.map(|h| h.to_vec()),
+                input.staged_by_actor_user.as_deref(),
             ],
-        )?;
+        );
+        // A pending proposal already exists for this target. Skip just this
+        // one: aborting here would discard the run row and every sibling
+        // proposal, which is a strictly worse outcome than not staging one
+        // duplicate. Same tolerated-constraint shape as `get_or_create_project`.
+        match insert {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _)) if is_pending_target_collision(&err) => {
+                skipped.push(SkippedProposal {
+                    target_path: proposal.target_path.to_string(),
+                    reason: "a proposal is already pending review for this path".into(),
+                });
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
         insert_event_in_tx(
             &tx,
             id,
@@ -698,6 +780,7 @@ pub fn stage_run(
     Ok(StagedAutoImproveRun {
         run_id,
         proposal_ids,
+        skipped,
     })
 }
 
@@ -1218,6 +1301,19 @@ fn hex_sha256(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+/// Is this insert failure the one-pending-proposal-per-target collision that
+/// [`stage_run`] is allowed to swallow?
+///
+/// Only the UNIQUE extended code qualifies. `ErrorCode::ConstraintViolation` is
+/// the PRIMARY code shared by NOT NULL, CHECK, FK and `RAISE(ABORT)` failures,
+/// and `auto_improve_proposals` has CHECKs on `status`/`operation`, FKs to four
+/// tables, and a workspace/project pairing trigger — accepting the primary code
+/// would relabel any of those "a proposal is already pending review for this
+/// path" and drop the proposal instead of surfacing a schema-contract bug.
+fn is_pending_target_collision(err: &rusqlite::ffi::Error) -> bool {
+    err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {

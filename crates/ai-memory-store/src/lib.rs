@@ -33,11 +33,12 @@ pub use auto_improve::{
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
     AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun, artifact_path_for,
+    RejectAutoImproveProposal, SkippedProposal, StageAutoImproveRun, StagedAutoImproveRun,
+    artifact_path_for,
 };
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
-    salience_after_feedback,
+    retention_score_with_breadth, salience_after_feedback,
 };
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
@@ -203,6 +204,7 @@ mod tests {
                 ..ActorContext::default()
             },
             proposals,
+            staged_by_actor_user: None,
         }
     }
 
@@ -551,20 +553,29 @@ mod tests {
         migrations::run_to(&mut conn, 23).unwrap();
         let ws = ops::get_or_create_workspace(&mut conn, "default").unwrap();
         let proj = ops::get_or_create_project(&mut conn, &ws, "app", None).unwrap();
-        let id = auto_improve::stage_run(
-            &mut conn,
-            &stage_input(
-                ws,
-                proj,
-                vec![proposal(
-                    "notes/old.md",
-                    AutoImproveProposalOperation::Create,
-                    "old",
-                )],
-            ),
+        // Era-appropriate raw insert: this fixture stops at V23 on purpose,
+        // while `stage_run` writes whatever columns the CURRENT schema has.
+        let id = ai_memory_core::AutoImproveProposalId::new();
+        let run_id = ai_memory_core::AutoImproveRunId::new();
+        let now = jiff::Timestamp::now().as_microsecond();
+        conn.execute(
+            "INSERT INTO auto_improve_runs (id, workspace_id, project_id, warnings_json, rejected_candidates_json, config_json, proposal_actor_json, created_at) VALUES (?1, ?2, ?3, '[]', '[]', '{}', '{}', ?4)",
+            params![run_id.as_bytes(), ws.as_bytes(), proj.as_bytes(), now],
         )
-        .unwrap()
-        .proposal_ids[0];
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_proposals              (id, run_id, workspace_id, project_id, status, operation, target_path, kind,               title, confidence, rationale, evidence_json, body_markdown, body_sha256,               artifact_path, staged_at)              VALUES (?1, ?2, ?3, ?4, 'pending', 'create', 'notes/old.md', 'note', 'old',                      0.9, 'r', '[]', 'body', ?5, ?6, ?7)",
+            params![
+                id.as_bytes(),
+                run_id.as_bytes(),
+                ws.as_bytes(),
+                proj.as_bytes(),
+                &sha256("body")[..],
+                auto_improve::artifact_path_for(id),
+                now,
+            ],
+        )
+        .unwrap();
         drop(conn);
 
         let store = Store::open(tmp.path()).unwrap();
@@ -691,6 +702,7 @@ mod tests {
                 project_id: other,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -1590,6 +1602,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -1721,7 +1734,7 @@ mod tests {
 
         let (core, recent) = store
             .reader
-            .session_brief_pages(ws, proj, 24, 10)
+            .session_brief_pages(ws, proj, 24, 10, ai_memory_core::SlotVisibility::default())
             .await
             .unwrap();
 
@@ -1802,12 +1815,28 @@ mod tests {
         assert_eq!(edges[0].to_project, "infra");
 
         // Briefing degree: app depends on 1 project; infra has 1 dependent.
-        let app_brief = store.reader.briefing_for_project(ws, app, 5).await.unwrap();
+        let app_brief = store
+            .reader
+            .briefing_for_project(
+                ws,
+                app,
+                5,
+                ai_memory_core::OwnerFilter::Any,
+                &ai_memory_core::SlotVisibility::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(app_brief.cross_project_dependencies, 1);
         assert_eq!(app_brief.cross_project_dependents, 0);
         let infra_brief = store
             .reader
-            .briefing_for_project(ws, infra, 5)
+            .briefing_for_project(
+                ws,
+                infra,
+                5,
+                ai_memory_core::OwnerFilter::Any,
+                &ai_memory_core::SlotVisibility::default(),
+            )
             .await
             .unwrap();
         assert_eq!(infra_brief.cross_project_dependents, 1);
@@ -1938,6 +1967,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::AntigravityCli,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2534,6 +2564,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2593,6 +2624,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2663,6 +2695,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2776,6 +2809,7 @@ mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2820,6 +2854,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2834,6 +2869,7 @@ mod tests {
             open_questions: Vec::new(),
             next_steps: Vec::new(),
             files_touched: Vec::new(),
+            owner_user: None,
         };
 
         assert!(
@@ -2910,6 +2946,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3047,6 +3084,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3077,6 +3115,7 @@ mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -3151,6 +3190,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3177,6 +3217,7 @@ mod tests {
                     ..ActorContext::default()
                 },
                 proposals: Vec::new(),
+                staged_by_actor_user: None,
             })
             .await
             .unwrap();
@@ -3225,6 +3266,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -3251,6 +3293,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -3293,6 +3336,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3339,6 +3383,7 @@ mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -3412,6 +3457,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3469,15 +3515,20 @@ mod tests {
                 &conn,
                 &sample_page(ws, proj, "notes/v103.md", "v1.0.3 upgrade fixture"),
             );
-            super::ops::begin_session(
-                &mut conn,
-                &NewSession {
-                    id: session_id,
-                    workspace_id: ws,
-                    project_id: proj,
-                    agent_kind: AgentKind::OpenCode,
-                    cwd: None,
-                },
+            // Era-appropriate raw insert: this fixture stops at V19 on
+            // purpose, while `begin_session` writes whatever columns the
+            // CURRENT schema has — including V40's `actor_user`, which a
+            // v19-era `sessions` table does not have.
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+                 VALUES (?1, ?2, ?3, 'open-code', NULL, ?4)",
+                params![
+                    session_id.as_bytes(),
+                    ws.as_bytes(),
+                    proj.as_bytes(),
+                    jiff::Timestamp::now().as_microsecond(),
+                ],
             )
             .unwrap();
             super::ops::insert_observation(
@@ -3733,18 +3784,40 @@ mod tests {
             "explicit kind must win"
         );
 
-        assert_briefing_kinds(&store.reader.briefing(100).await.unwrap().recent_pages);
         assert_briefing_kinds(
             &store
                 .reader
-                .briefing_for_workspace(ws, 100)
+                .briefing(
+                    100,
+                    ai_memory_core::OwnerFilter::Any,
+                    &ai_memory_core::SlotVisibility::default(),
+                )
+                .await
+                .unwrap()
+                .recent_pages,
+        );
+        assert_briefing_kinds(
+            &store
+                .reader
+                .briefing_for_workspace(
+                    ws,
+                    100,
+                    ai_memory_core::OwnerFilter::Any,
+                    &ai_memory_core::SlotVisibility::default(),
+                )
                 .await
                 .unwrap()
                 .recent_pages,
         );
         let project_briefing = store
             .reader
-            .briefing_for_project(ws, proj, 100)
+            .briefing_for_project(
+                ws,
+                proj,
+                100,
+                ai_memory_core::OwnerFilter::Any,
+                &ai_memory_core::SlotVisibility::default(),
+            )
             .await
             .unwrap();
         assert_briefing_kinds(&project_briefing.recent_pages);
@@ -3752,7 +3825,13 @@ mod tests {
         assert_eq!(project_briefing.slots[0].kind, "slot");
         let (_, session_recent) = store
             .reader
-            .session_brief_pages(ws, proj, 100, 100)
+            .session_brief_pages(
+                ws,
+                proj,
+                100,
+                100,
+                ai_memory_core::SlotVisibility::default(),
+            )
             .await
             .unwrap();
         assert_briefing_kinds(&session_recent);
@@ -4923,6 +5002,7 @@ mod tests {
             open_questions: Vec::new(),
             next_steps: Vec::new(),
             files_touched: Vec::new(),
+            owner_user: None,
         };
 
         let first_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
@@ -4932,6 +5012,8 @@ mod tests {
                 Some(first_handoff),
                 AgentKind::Codex,
                 None,
+                None,
+                ai_memory_core::OwnerFilter::Any,
                 Some(run.run_id),
                 None,
             )
@@ -4947,7 +5029,7 @@ mod tests {
         assert!(
             store
                 .reader
-                .latest_open_handoff(ws, proj, None)
+                .latest_open_handoff(ws, proj, None, ai_memory_core::OwnerFilter::Any)
                 .await
                 .unwrap()
                 .is_none()
@@ -4960,6 +5042,8 @@ mod tests {
                 Some(second_handoff),
                 AgentKind::Codex,
                 None,
+                None,
+                ai_memory_core::OwnerFilter::Any,
                 Some(run.run_id),
                 None,
             )
@@ -4973,7 +5057,7 @@ mod tests {
         assert_eq!(
             store
                 .reader
-                .latest_open_handoff(ws, proj, None)
+                .latest_open_handoff(ws, proj, None, ai_memory_core::OwnerFilter::Any)
                 .await
                 .unwrap()
                 .map(|handoff| handoff.id),
@@ -4996,6 +5080,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: Some(cwd.into()),
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -5012,6 +5097,7 @@ mod tests {
                     open_questions: Vec::new(),
                     next_steps: Vec::new(),
                     files_touched: Vec::new(),
+                    owner_user: None,
                 })
                 .await
                 .unwrap()
@@ -5026,6 +5112,8 @@ mod tests {
                 Some(selected_auto),
                 AgentKind::Codex,
                 None,
+                None,
+                ai_memory_core::OwnerFilter::Any,
                 Some(run.run_id),
                 Some("/repo/api/src".into()),
             )

@@ -35,6 +35,7 @@ async fn make_state(tmp: &TempDir) -> AdminState {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     }
 }
 

@@ -341,6 +341,7 @@ mod tests {
                 project_id,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();

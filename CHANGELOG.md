@@ -7,6 +7,460 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Memory slots may be namespaced per operator (`_slots/<user>/…`). Slots are
+  injected into every session start for their project, so on a shared server one
+  person's working context silently became everybody's. A slot with NO namespace
+  is shared and stays visible to everyone — the shape of every slot written
+  before this — so enabling it hides nothing already stored. `[slots] per_user`
+  (default off) governs the whole regime: with it on, the engine namespaces the
+  slots it writes, session briefs and consolidation prompts carry the shared
+  slots plus the requesting operator's own, and a write into another operator's
+  namespace is refused (admins may still curate). With it off, a nested slot path
+  carries no ownership meaning and every slot reaches every brief exactly as it
+  did before, so turning the flag back off restores the old behaviour in full
+  ([#286]).
+- Auto-improvement proposals record who staged them, and the one-pending-per-
+  target rule is scoped to that person (migration V42). One operator's pending
+  suggestion for a page used to block everybody else's. Correct in both modes
+  from a single index, with no runtime switch: the operator is folded in through
+  `COALESCE(staged_by_actor_user, '')`, so unattributed rows (single operator, or
+  any caller the server cannot name) collapse into one bucket and keep the
+  original invariant exactly. A plain `UNIQUE (…, staged_by_actor_user)` would
+  not — SQLite treats NULLs as distinct, so every existing single-operator
+  database would silently start accepting unlimited pending proposals per page.
+  The column holds the actor username rather than a `users(id)`, matching
+  `handoffs.owner_user` / `sessions.actor_user` / `page_access.actor`: operators
+  named by a trusted proxy have no row, and keying on the id would leave every
+  one of them NULL and collapse them back into a single bucket. A caller is
+  recorded only where the deployment actually distinguishes operators — the same
+  question the admin gates ask — because the scheduler and the report handlers
+  stage unattributed by design, so bucketing an interactive call by
+  `[auth].root_username` on a single-operator server would leave two proposals
+  pending for one page ([#286]).
+- Page reinforcement is recorded per operator in a new `page_access` table
+  (migration V43), alongside — not replacing — `pages.access_count`. The scalar
+  cannot distinguish "50 reads by one person" from "one read by each of 50
+  people", though only the second says a page is load-bearing for a team. The
+  retention formula gains an optional breadth term weighted by `[decay]
+  breadth_weight`, which defaults to `0.0` and is provably identity: at the
+  default weight, and at 0 or 1 distinct readers under any weight, scores are
+  unchanged. So there is no eviction cliff and no backfill. The forget sweep
+  reads the distinct-operator count for its candidates in one grouped query —
+  and skips that query entirely while the weight is `0.0`, so a deployment that
+  never enables the term never pays for it. A read whose page was deleted in the
+  meantime records nothing for that page and leaves the rest of the batch's
+  reinforcement intact ([#286]).
+- Zed editor as an MCP-only client. `install-mcp --client zed` renders,
+  and `--apply` idempotently merges, a native remote HTTP entry under the
+  top-level `context_servers` map in Zed's platform user `settings.json`,
+  with optional bearer headers. The JSONC-aware apply and uninstall paths
+  preserve user comments, trailing commas, unrelated settings, and sibling
+  servers while changing only the matching ai-memory entry. Zed does not
+  provide lifecycle hooks or managed-workstream continuity. (#321)
+- Entity-match retrieval as a fourth RRF stream (V38 `entities` +
+  `entity_page_links`). Consolidation emits up to 10 normalized technologies,
+  components, services, files, or domain nouns per page into frontmatter;
+  manually edited `entities` use the same index path, and reindex rebuilds the
+  derived tables from markdown. Project-scoped query tokens match exact names,
+  name prefixes, or word prefixes inside compound names and are weighted by
+  inverse entity frequency before RRF fusion and the existing authority and
+  optional LLM reranking stages. Empty entity indexes contribute no candidates
+  or score, and entity matching makes no LLM call. `explain: true` reports the
+  entity stream's rank, raw inverse-frequency weight, contribution, and matched
+  names. (#320)
+- Optional post-RRF reranking for project and explicit-scope
+  `memory_query`, off by default. Set `AI_MEMORY_RERANKER=llm` (requires
+  `AI_MEMORY_LLM_PROVIDER`) to over-fetch candidates, fuse scopes, and
+  make at most one structured-output call through any existing LLM
+  provider. The prompt JSON-encodes untrusted input and sends the query
+  (up to 1,000 bytes) plus at most 30 page titles (200 bytes each) and
+  snippets (600 bytes each) to that provider. The requested result limit
+  is preserved even above 30; only the first 30 candidates are judged.
+  A partial/duplicate/unknown id set, invalid score, timeout, provider error,
+  or four-call concurrency saturation preserves the pre-rerank order.
+  `global=true` and supplemental
+  global-preference hits keep their existing non-RRF ranking. With
+  `explain: true`, judged hits include `rerank_score`. Unknown reranker
+  values and `llm` without a provider fail at startup. (#319)
+- New MCP tool `memory_feedback` (17th tool) — the "finer-grained
+  reinforcement beyond access counts" P2 item. Record how useful a
+  recalled page actually was by exact path: `helpful` / `not_helpful`
+  step the page's new `pages.salience` column (V37, bounded to
+  `[0.25, 2.0]` in 0.25 steps), which now scales the retention formula's
+  time term for sweep-eligible episodic pages instead of a single global
+  `salience_default`; `stale` /
+  `wrong` floor the salience AND surface the page as a
+  `feedback_flagged` finding in the next `memory_lint` report. Signals
+  land in a new append-only `page_feedback` table with an optional
+  sanitized, bounded single-line reason, the resulting salience needed to
+  rebuild derived state, and a full audit-log entry. Nothing is ever
+  deleted by feedback. The exact path resolves to the current page version
+  in the feedback transaction, so rewriting a flagged page later retires
+  both its salience and its lint findings — there is no separate dismissal
+  state. Pages without feedback keep `salience = NULL`, which reads as
+  exactly the previous behaviour. Retrieved content cannot authorize a
+  feedback call; agents treat it as untrusted data. (#318)
+- `memory_query` gained an optional `explain: true` mode for project and
+  explicit-scope searches. Each compiled-page hit then includes its 1-based
+  FTS5, vector, and graph ranks; raw BM25/cosine values; graph seed and link
+  direction; per-stream RRF contributions; fused score; and bounded authority
+  multiplier. `streams_active` makes vector degradation visible. Global
+  cross-project search reports its distinct FTS-only stream but does not attach
+  RRF details to `global_hits`. Explain provenance is computed only when
+  requested. (#317)
+- Per-project consolidation instructions: write a reserved
+  `_prompts/consolidation.md` wiki page (via `memory_write_page` or on
+  disk - no config key) and its body is appended to both single-page and
+  multi-page consolidation prompts as advisory preferences ("prefer
+  Portuguese titles", "skip CI noise", ...). The block is scrubbed
+  through the configured sanitizer, capped at 2,000 characters, JSON-encoded,
+  and injected into the LLM user message under an explicitly untrusted,
+  schema-subordinate system-prompt contract. `memory_consolidate` also gained
+  an optional `instructions` argument that overrides the page for one call;
+  TTL-expired standing pages are ignored. (#316)
+
+### Fixed
+- Per-user slots now key on the same identity as the rest of the engine, so an
+  operator an OIDC-terminating ingress names by `sub` alone owns a slot
+  namespace. Both slot doors read `actor.user` directly instead of
+  `ActorContext::identity_key`, and the two halves failed in opposite
+  directions: the WRITE door saw nobody and left a "personal" slot on the SHARED
+  path, whose body is injected verbatim into every other operator's session
+  brief, while the READ filter admitted only shared slots — so such an operator
+  was also refused their own namespace outright (`ForeignNamespace`) and could
+  not see a page written under it. `memory_write_page`/`memory_briefing` and the
+  consolidator's write/snapshot pair now both go through `identity_key`, keyed
+  together so a page always lands where its owner reads. `identity_key` returns
+  `user` whenever it is present, so an operator with a username is unaffected,
+  and with `[slots] per_user` off (the default) placement is never consulted at
+  all. A subject that cannot be a path segment still refuses rather than falling
+  back to the shared slot — `is_valid_slot_namespace` is unchanged ([#286]).
+- The session brief no longer drops a pre-existing nested slot page when
+  per-user slots are off. The brief excluded `_slots/*/*` unconditionally and
+  narrowed its `pinned` arm to match, so upgrading a deployment that had never
+  enabled the feature silently removed a page like `_slots/backend/context.md`
+  from every brief. Slot visibility is now an explicit rule (`SlotVisibility`)
+  rather than an optional viewer name that meant two different things, and with
+  `[slots] per_user` off it is exactly the pre-branch predicate ([#286]).
+- The consolidation prompt no longer carries another operator's slot bodies.
+  The snapshot it embeds was assembled with a bare `_slots/*` query, so with
+  per-user slots on one person's working context was transmitted to the LLM
+  provider under someone else's session and could return as pages written under
+  their name. Snapshots now go through the same visibility rule as the brief,
+  as do the other briefing queries ([#286]).
+- The per-user slot guard no longer fails open. A username that username
+  validation accepts but that cannot be a path segment (`a*`, `.`) made the
+  rewrite return "leave it shared", sending that operator's slot write onto the
+  project-wide slot every other operator is handed at session start — the exact
+  damage the feature prevents, reached through its own guard. The rewrite now
+  distinguishes "leave shared, by design" from "cannot namespace", and the
+  latter skips the write with a warning and a reported `skipped_reason` ([#286]).
+- `memory_write_page` and the engine's own consolidation write path both refuse
+  a write into another operator's slot namespace when per-user slots are on.
+  `_slots/<user>/…` bodies are injected verbatim into that operator's next
+  session brief, so an unguarded write was a way to place chosen text in someone
+  else's agent context — the direction the ownership boundary, which is about
+  reads, does not cover. The consolidator matters most here because the path
+  comes from the model: anything that reaches a session's observations could ask
+  for a page under somebody else's prefix. Such an update is now skipped with a
+  reported `skipped_reason` rather than re-homed, so injected text cannot clobber
+  the writer's own slot either. Admins may still curate any namespace, and with
+  the flag off nested slot paths keep working for everyone exactly as before
+  ([#286]).
+- The slot guard covers every door onto a slot, and the doors give the same
+  answer. A rule enforced at two writers of three is enforced nowhere: an agent
+  refused `_slots/x.md` by the engine would simply have called
+  `memory_write_page`, which wrote the project-wide slot — read by everybody at
+  session start — verbatim. That tool now places a slot write by the engine's
+  own rule: the shared slot is namespaced into the caller's own prefix and the
+  response reports where the page landed. Auto-improvement approval was the
+  third writer, invisible to the earlier audit because it builds its own page
+  and reaches neither `write_page` nor `apply_batch` while force-pinning slot
+  paths; a proposal derived from one operator's session is now namespaced to
+  THAT operator when it is staged, and approval refuses any slot target that is
+  not the one the proposal is attributed to (see the auto-improve entry below).
+  And a name that cannot BE a namespace
+  no longer gets to own one: `slot_placement` returned "write it as given" for
+  `_slots/a*/…` written by `a*`, handing that operator an unrestricted prefix
+  whose pages the read rule — which filters the viewer through the very same
+  predicate — then hid from everyone, its writer included. With `[slots]
+  per_user` off, all three doors behave exactly as they did before the feature
+  existed ([#286]).
+- A colliding auto-improvement proposal no longer destroys the run it arrived
+  with. `stage_run` inserted every proposal blind inside one transaction, so a
+  collision with an already-pending proposal from an EARLIER run aborted the
+  whole thing — the run row, the unrelated proposals beside it, and the paid LLM
+  call that produced them. It fires with a single operator, in a supported
+  configuration, through the path the prompt itself recommends. Such a collision
+  is now skipped per-proposal and reported to the caller — an additive `skipped`
+  list of target path plus reason on the `memory_auto_improve` response and on
+  the admin auto-improve, telemetry-report and curator responses, so a run of
+  N-1 proposals no longer looks like a clean run of N-1. It reaches the operator
+  on every route out: `ai-memory auto-improve`, `curator --stage` and
+  `auto-improve-report --stage` print it and carry it in `--json` (a consumer
+  that ignores the new key is unaffected), and the unattended scheduler — where
+  no human reads a response at all — carries it in its run outcome and names the
+  dropped target in its log. Two proposals for one path within a single run
+  still fail the run, since that batch contradicts itself ([#286]).
+- An auto-improvement proposal's slot page now belongs to the operator whose
+  SESSION produced it, decided when the proposal is staged. Auto-improve derives
+  a proposal from one operator's session and the reviewer is told to target
+  `_slots/current-focus.md`, so under `[slots] per_user` a slot proposal was
+  either applied to the project-wide slot every operator's brief injects verbatim
+  or refused outright, depending on who happened to approve it — the approver,
+  not the author. The unattended scheduler approves with no user at all, so the
+  automated path applied it and every named operator was refused: exactly
+  inverted. Staging now namespaces such a proposal into the session owner's own
+  slot (`_slots/<user>/current-focus.md`) at every staging door — MCP
+  `memory_auto_improve`, `POST /admin/auto-improve`, and the scheduler, which
+  reads the reviewed session's operator — and approval accepts precisely that
+  target, whoever approves. A proposal no owner can be named for is refused
+  rather than left on the shared slot, and reported like any other drop:
+  `_slots/current-focus.md` reads as shared for EVERYONE, but it is nobody's
+  destination for one session's output. The refusal is per-proposal — the run's
+  other approvals still land, as with a staging collision — and retrying a
+  refused id repeats the refusal instead of reporting "proposal is not pending".
+  With `[slots] per_user` off, nothing is moved, nothing is refused, and every
+  staging and approval path behaves exactly as before ([#286]).
+- The reviewer-facing proposal record now carries who staged it. V42 added
+  `staged_by_actor_user` so a reviewer could tell whose suggestion they were
+  looking at, but nothing ever read the column back; it now appears on the
+  proposal detail and in the `_pending/auto-improve/<id>.md` sidecar ([#286]).
+- A schema-contract failure while staging a proposal is no longer reported as
+  "a proposal is already pending review for this path". The per-proposal skip
+  matched `ErrorCode::ConstraintViolation`, the primary SQLite code that NOT
+  NULL, CHECK, FK and `RAISE(ABORT)` failures all share, and
+  `auto_improve_proposals` has CHECKs on `status`/`operation`, FKs to four
+  tables and a workspace/project pairing trigger — so a genuine schema bug was
+  relabelled as ordinary contention and the proposal quietly dropped. Only the
+  UNIQUE extended code, which is what the one-pending-per-target index raises,
+  is tolerated now ([#286]).
+- The curator scores `cold_episodic` with the same breadth-aware formula the
+  forget sweep now uses, reading the same per-page distinct-operator lookup.
+  `CuratorParams` carries a full `DecayParams`, so with `breadth_weight` raised
+  the curator reported pages as cold that the sweep — on those very parameters —
+  will never evict, turning a report that exists to predict evictions into a
+  list of pages nothing will ever act on. At the default `breadth_weight = 0.0`
+  the scores are unchanged ([#286]).
+- The consolidator silently dropped a slot update when the stored slot is marked
+  `slot_kind: invariant` — on a shared server that slot may belong to somebody
+  else, and the caller was told nothing. It now warns and reports the skip
+  through an additive `skipped_reason` field ([#286]).
+- The access-bump throttle was keyed by page alone, so one operator's read
+  swallowed everyone else's reinforcement for the whole window and the counter
+  degraded into "distinct minutes in which somebody read this". It is keyed by
+  operator now — by user, not the full actor key, since that also carries a
+  client-supplied session id whose inclusion would let parallel sessions
+  multiply bumps and defeat the throttle's purpose ([#286]).
+- The reserved `_global` scope was described to users as "personal" /
+  "user-level" standing context in the MCP tool descriptions, the routing
+  snippet and AGENTS.md. It is server-wide: on a shared instance a rule saved
+  there replaces the one every other operator sees ([#286]).
+
+### Added
+- Handoffs now belong to the operator that created them (migration V39). On a
+  server shared by several people the open-handoff lookup was scoped by
+  `(workspace, project, state)` alone, so the next session to start — whoever it
+  belonged to — consumed the pending baton, and delivery is destructive, so the
+  author simply lost it. `cwd` did not help: a handoff created through
+  `memory_handoff_begin` is always manual (`from_session_id = NULL`), and manual
+  handoffs bypass the cwd check and outrank automatic ones, so the deliberate
+  artefact was exactly the one that crossed operators. Ownership is now checked
+  before those rules. `memory_handoff_begin` gains `shared: true` to publish a
+  baton to the whole project on purpose; `memory_handoff_accept` gains
+  `any_owner: true` for recovery. A NULL owner still means "shared", so every
+  stored row and every caller without an authenticated actor behaves exactly as
+  before ([#286]).
+- Sessions record their operator (migration V40), and the open-session lookup
+  behind `GET /admin/open-sessions` is scoped to the caller unless
+  `all_owners=true`. `finalize-session` drives off that lookup and acts
+  destructively on the result — ending the session, synthesising a page from its
+  observations and minting a handoff carrying its raw prompts — so picking "the
+  newest open session in the scope" could do all of that to a colleague's live
+  session ([#286]).
+- New `GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs` lists a
+  project's handoffs, filtered by `state` and scoped by owner. There was no
+  handoff listing anywhere in the system: readers only ever fetched the single
+  pending one and consumed it, so a mis-delivered baton could not be inspected
+  or recovered. On a server that authenticates, the prompt-derived fields
+  (`summary`, `open_questions`, `next_steps`) are served to a caller the server
+  can name and to the root operator, and are omitted with `redacted: true` for a
+  caller it can place as neither — unowned rows are shared, so such a caller
+  matches every one of them, and unlike the overview's single newest card this
+  returns the project's whole history. Cross-owner reads are root-only. The
+  metadata is served either way, which is what makes the listing useful; a server
+  with no auth configured serves the bodies too, since it already serves every
+  page body unauthenticated ([#286]).
+- New `[auth].actor_proxy_secret` lets a trusted authenticating proxy name the
+  real end user in `X-Memory-Actor-*` headers. A proxy that terminates SSO
+  cannot forward the user's own credential upstream — it authenticates with the
+  root bearer and describes the human in headers — and those headers were
+  deliberately ignored, so every human behind such a proxy collapsed into one
+  root actor. The secret is the switch: there is no separate boolean to enable
+  header trust without one, a blank value counts as unset, and the comparison is
+  constant-time. Unset (the default) keeps headers ignored. A proxy-asserted
+  identity is resolved at the **user** tier, not root — only a caller the proxy
+  names as `[auth].root_username` keeps root capability — and the asserted
+  user/name/email/sub replace the root template as a block, so a proxy that
+  forwards only a subject yields an unattributed actor rather than silently
+  reusing the root username. A request the proxy authenticates but on which it
+  asserts NO identity at all (health checks, machine-to-machine traffic) stays
+  root, since there is no human whose authority it could be standing in for;
+  an ingress that forwards only the subject claim has named a human — one who
+  can never match `root_username` — and resolves at the user tier like any
+  other. The secret
+  requires `[auth].root_username`: without one no asserted identity could ever
+  match root, so every root-only operation — user management included — would be
+  permanently unreachable, and the server now refuses to start rather than come
+  up locked out. Because the whole overlay assumes the `X-Memory-Actor-*` values
+  on the wire are the proxy's, a request carrying any of them twice (an ingress
+  that appends rather than replaces, which would let a client's own value win)
+  is rejected with `400` instead of resolving to one of the two ([#286]).
+- New admission-chain operations `forget_sweep`, `handoff_begin`,
+  `handoff_accept` and `handoff_cancel`. Handoffs live in their own table and
+  the sweep works on rows, so neither ever passed through `Wiki::write_page` and
+  both were invisible to admission webhooks — leaving the two most destructive
+  operations on a shared server unauthorizable ([#286]).
+
+### Fixed
+- `memory_forget_sweep` requires the `Admin` capability. It permanently removes
+  page versions and defaults to `dry_run = false`, so the capability gate is the
+  only thing standing between an unprivileged caller and the destruction; the
+  new `forget_sweep` admission op above is an operator-configured policy hook,
+  not a substitute for it — a deployment with no webhook subscribed to
+  `forget_sweep` has no second line of defence. The gate asks whether the
+  deployment distinguishes operators, which is true when `users` rows exist OR
+  `[auth].actor_proxy_secret`
+  is configured — a trusted proxy never writes a row, so counting only rows would
+  leave every proxied caller on the single-operator escape hatch. The `/admin/*`
+  route layer asks the same question, so a proxy-asserted non-root caller no
+  longer reaches purge, delete-page, move-project, rename/merge-workspace,
+  backup or write-page on a deployment that has no `users` rows. Servers with
+  neither are unaffected, and the stdio/in-process transport — which has no auth
+  layer and whose caller already owns the data directory — is not gated ([#286]).
+- The cross-operator escape hatches require the same authority as the other
+  admin operations: `any_owner` on `memory_handoff_accept` (and now
+  `memory_handoff_cancel`, which previously had no recovery path at all, so a
+  handoff whose owner no longer matched any reachable identity could not be
+  discarded), and `--all-owners` on `ai-memory finalize-session`, which exposes
+  the `all_owners` switch the server gained ([#286]).
+- Briefings and both read-only overviews — workspace and project — scope
+  handoffs to the requesting actor instead of showing only unowned ones, and
+  `pending_handoff_count` applies the same filter as the fetch — otherwise a
+  briefing advertises a pending baton the same caller can never retrieve, and on
+  any server with `[auth].root_username` set the overview's handoff card would go
+  permanently empty while the count beside it kept reporting the row ([#286]).
+- The automatic SessionEnd handoff, the session page and both consolidation
+  paths attribute to the operator recorded on the **session**, not to whoever
+  delivered the event — a spool drain, a shared hook token or an operator
+  finalizing a stuck session all carry a different identity ([#286]).
+- Handoff and session ownership is stamped only where the deployment actually
+  distinguishes operators, and it is keyed on the same identity the auth tier
+  uses. Two consequences, both of which broke a single promise — that a caller
+  can read back what it wrote:
+  - A server with `[auth].bearer_token` + `[auth].root_username`, no `users`
+    rows and no proxy has one operator and two transports. Stamping that one
+    name on every HTTP write while the stdio / in-process MCP transport and the
+    local CLI carry no actor made those transports filter as unattributed, so
+    one person's handoffs and sessions were invisible to their own other
+    transport on the same data directory. With nobody to separate, the stamp is
+    now the pre-ownership `NULL` and both transports agree again. Reads are
+    deliberately not gated the same way, so rows stamped while a deployment did
+    distinguish operators stay readable by that operator afterwards.
+  - An ingress that terminates OIDC and forwards only the subject claim
+    (`X-Memory-Actor-Sub`, no `preferred_username`) names a human and already
+    resolved to the user tier, but ownership read `actor.user` and saw nobody.
+    Every operator behind such a proxy therefore shared one bucket: they could
+    consume each other's batons, and — because the same predicate feeds the
+    read-only handoff listing's redaction gate — every one of them lost every
+    handoff body in the web UI, including their own. "Which human is this" is
+    now one accessor (`ActorContext::identity_key`, username first, subject
+    claim as the fallback so rows already stamped under a username are never
+    re-bucketed), and the ownership and redaction decisions route through it
+    instead of each reaching for `actor.user` ([#286]).
+- The automatic SessionEnd handoff, the session-start claim and the scheduled
+  sweep run through the admission chain like their operator-triggered
+  counterparts; previously a webhook saw only the MCP-initiated minority of that
+  traffic. Admission also forwards the caller's webhook skip-list — on
+  the hook ingress too, gated by the same root-only rule as every other
+  transport — so the documented loop-prevention header keeps working. None of
+  the three can cost an operator anything beyond the operation the webhook
+  declined: SessionEnd asks BEFORE `end_session` commits and, whatever the
+  answer, still writes the summary page, runs the opt-in consolidation and
+  commits (a refusal skips the baton and is logged); the session-start claim
+  leaves the handoff open for the next session when it is refused, times out, or
+  the policy host is down; and a refused sweep scope is counted apart from a
+  store error, so the tick still records success and waits its full interval
+  instead of retrying every 60 seconds forever ([#286]).
+- Every path raising one of the four new lifecycle ops asks and announces in the
+  same order: the webhooks that can refuse are awaited before the operation, the
+  observers are dispatched fire-and-forget after it, and only if it happened.
+  The MCP tools announced up front instead, so `memory_handoff_accept` — whose
+  routine answer is `{"handoff": null}`, because the SessionStart hook has
+  usually already consumed the baton — fired `handoff_accept` at a webhook on
+  every one of those calls; a `handoff_cancel` another operator's ownership
+  refused, and a sweep scope whose sweep then failed, were announced the same
+  way.
+  A non-blocking observer was the mirror image: subscribed to these ops it heard
+  from the session-start claim and from nowhere else, since the other paths ran
+  only the blocking webhooks. On the hook path only deciding webhooks are
+  awaited, and sequentially, so what bounds the session-start claim is the sum of
+  those webhooks' own `timeout_ms` (default 2000 ms each), not the ≤200 ms hook
+  budget the docs claimed.
+  A `memory_forget_sweep` with `dry_run = true` is covered by the same rule: it
+  skips both the soft-delete and the hard-delete, so it now announces nothing to
+  the observers, while still asking the deciders — a scope guard may refuse to
+  have its project scored at all, and refusing the preview while permitting the
+  real sweep would be the wrong way round. And `memory_handoff_cancel` resolves
+  the `any_owner` capability before consulting the chain, like its `accept`
+  sibling: a caller who is refused that escape hatch never permitted an
+  operation, so the server no longer POSTs one out to every reject-policy webhook
+  on their behalf ([#286]).
+- A fire-and-forget webhook dropped because the 256-request in-flight budget is
+  saturated is logged at ERROR when the operator configured it `blocking`, and
+  the op is named in either log line. On the four lifecycle ops only a `reject`
+  policy is awaited, so a `blocking = true, failure_policy = "ignore"` hook is
+  dispatched fire-and-forget there and shares that budget. The cap's own doc
+  comment claimed it bounded non-blocking requests only; it and the `blocking`
+  reference in `docs/admission-webhooks.md` now say what actually shares it
+  ([#286]).
+- The handoff listing pushes its owner predicate and limit into SQL and is
+  backed by a new non-partial index (migration V41); every pre-existing handoffs
+  index is partial on `state = 'open'`, so the all-states listing had none and
+  scanned the project's entire handoff history per request ([#286]).
+- The hook router attributes its writes — the session page, the checkpoint page
+  and both consolidation paths — to the operator whose session it was, instead
+  of writing everything as anonymous. Without an authenticated request the actor
+  stays anonymous exactly as before ([#286]).
+- `ops::accept_handoff` propagates whether the claim actually succeeded, so
+  `memory_handoff_accept` no longer returns the handoff body when the atomic
+  claim was lost — previously two agents could be handed the same baton
+  ([#286]).
+- The read-only `/api/v1` overview no longer surfaces handoffs that belong to a
+  specific operator, including the raw prompt text an automatic handoff is
+  synthesised from, to a browser the server cannot attribute ([#286]).
+- Retiring superseded automatic handoffs no longer crosses an operator
+  boundary. Both sweeps — the same-cwd expiry on a new SessionEnd handoff and
+  the post-claim cleanup after an accept — match on the acting handoff's
+  `owner_user`, so one person starting or ending a session in a directory
+  cannot expire another person's pending baton. A shared handoff (no owner) is
+  visible to everyone, so it is only ever superseded by another shared one; on
+  a single-operator or unauthenticated server every row is unowned and the
+  sweeps behave exactly as they did ([#286]).
+- Retrieved `_rules/`, `gotchas/`, `procedures/`, and `decisions/` pages are now
+  described consistently across MCP and installed skill prompts as untrusted
+  historical evidence, removing contradictory language that elevated stored
+  prose into operating policy or constraints. (#325)
+- A project-scoped forget sweep now purges aged decay tombstones only from its
+  resolved workspace/project instead of deleting eligible derived rows across
+  every project. Entity-index rows orphaned by the scoped purge are removed in
+  the same transaction, and `hard_deleted` reports only the target scope. (#323)
+- Zero-LLM `memory_query` now keeps graph-neighbour expansion active instead
+  of falling back to FTS5 alone when no query embedding exists. Equal adjusted
+  hybrid and explicit multi-scope scores now use a deterministic path
+  tiebreak. (#317)
+
 ## [1.21.0] - 2026-07-31
 
 ### Added

@@ -163,6 +163,8 @@ impl MultiUserHarness {
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
             capture_assistant_enabled: false,
+            per_user_slots: false,
+            trusted_proxy_identity: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(
                 ai_memory_hooks::IngestRateLimiter::disabled(),

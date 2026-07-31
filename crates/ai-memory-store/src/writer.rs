@@ -12,7 +12,8 @@ use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
     AgentKind, HandoffId, ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewUser,
-    ObservationId, PageId, PagePath, ProjectId, Sanitized, SessionId, UserId, WorkspaceId,
+    ObservationId, OwnerFilter, PageId, PagePath, ProjectId, Sanitized, SessionId, UserId,
+    WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -165,11 +166,14 @@ pub(crate) enum WriteCmd {
         handoff_id: HandoffId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
+        accepting_user: Option<String>,
+        owner_filter: OwnerFilter,
         receiving_cwd: Option<String>,
-        reply: oneshot::Sender<StoreResult<()>>,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     CancelHandoff {
         handoff_id: HandoffId,
+        owner_filter: OwnerFilter,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     /// Retro-fit sessions + observations to per-cwd projects and graveyard
@@ -183,6 +187,7 @@ pub(crate) enum WriteCmd {
     },
     BumpAccess {
         page_ids: Vec<PageId>,
+        actor: Option<String>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     RecordPageFeedback {
@@ -366,6 +371,8 @@ pub(crate) enum WriteCmd {
         handoff_id: Option<HandoffId>,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
+        accepting_user: Option<String>,
+        owner_filter: OwnerFilter,
         managed_run_id: Option<ManagedRunId>,
         receiving_cwd: Option<String>,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
@@ -751,6 +758,12 @@ impl WriterHandle {
 
     /// Mark a handoff accepted by the given agent / session.
     ///
+    /// Returns whether this call is the one that claimed it; `false` means the
+    /// row was already taken or its owner does not admit this caller, and the
+    /// body must not reach the agent. `receiving_cwd` is where the claiming
+    /// session is starting, and bounds the sweep of superseded automatic
+    /// handoffs.
+    ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
     pub async fn accept_handoff(
@@ -758,13 +771,17 @@ impl WriterHandle {
         handoff_id: HandoffId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
+        accepting_user: Option<String>,
+        owner_filter: OwnerFilter,
         receiving_cwd: Option<String>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptHandoff {
             handoff_id,
             accepting_agent,
             accepting_session,
+            accepting_user,
+            owner_filter,
             receiving_cwd,
             reply: tx,
         })
@@ -779,10 +796,15 @@ impl WriterHandle {
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn cancel_handoff(&self, handoff_id: HandoffId) -> StoreResult<bool> {
+    pub async fn cancel_handoff(
+        &self,
+        handoff_id: HandoffId,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::CancelHandoff {
             handoff_id,
+            owner_filter,
             reply: tx,
         })
         .await?;
@@ -859,10 +881,15 @@ impl WriterHandle {
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn bump_access(&self, page_ids: Vec<PageId>) -> StoreResult<()> {
+    pub async fn bump_access(
+        &self,
+        page_ids: Vec<PageId>,
+        actor: Option<String>,
+    ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::BumpAccess {
             page_ids,
+            actor,
             reply: tx,
         })
         .await?;
@@ -1440,11 +1467,14 @@ impl WriterHandle {
     ///
     /// When a managed run was requested but is no longer claimable, the
     /// handoff remains open and both result fields are false.
+    #[allow(clippy::too_many_arguments)]
     pub async fn accept_startup_context(
         &self,
         handoff_id: Option<HandoffId>,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
+        accepting_user: Option<String>,
+        owner_filter: OwnerFilter,
         managed_run_id: Option<ManagedRunId>,
         receiving_cwd: Option<String>,
     ) -> StoreResult<StartupContextAcceptance> {
@@ -1453,6 +1483,8 @@ impl WriterHandle {
             handoff_id,
             accepting_agent,
             accepting_session,
+            accepting_user,
+            owner_filter,
             managed_run_id,
             receiving_cwd,
             reply: tx,
@@ -1703,6 +1735,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 handoff_id,
                 accepting_agent,
                 accepting_session,
+                accepting_user,
+                owner_filter,
                 receiving_cwd,
                 reply,
             } => {
@@ -1711,12 +1745,18 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &handoff_id,
                     accepting_agent,
                     accepting_session.as_ref(),
+                    accepting_user.as_deref(),
+                    &owner_filter,
                     receiving_cwd.as_deref(),
                 );
                 send_or_warn(reply, result, "accept_handoff");
             }
-            WriteCmd::CancelHandoff { handoff_id, reply } => {
-                let result = ops::cancel_handoff(&mut conn, &handoff_id);
+            WriteCmd::CancelHandoff {
+                handoff_id,
+                owner_filter,
+                reply,
+            } => {
+                let result = ops::cancel_handoff(&mut conn, &handoff_id, &owner_filter);
                 send_or_warn(reply, result, "cancel_handoff");
             }
             WriteCmd::Reorg {
@@ -1749,8 +1789,12 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "record_page_feedback");
             }
-            WriteCmd::BumpAccess { page_ids, reply } => {
-                let result = ops::bump_access_for_pages(&mut conn, &page_ids);
+            WriteCmd::BumpAccess {
+                page_ids,
+                actor,
+                reply,
+            } => {
+                let result = ops::bump_access_for_pages(&mut conn, &page_ids, actor.as_deref());
                 send_or_warn(reply, result, "bump_access_for_pages");
             }
             WriteCmd::SoftDeleteForDecay { page_ids, reply } => {
@@ -1997,6 +2041,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 handoff_id,
                 accepting_agent,
                 accepting_session,
+                accepting_user,
+                owner_filter,
                 managed_run_id,
                 receiving_cwd,
                 reply,
@@ -2018,6 +2064,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                             &handoff_id,
                             accepting_agent,
                             accepting_session.as_ref(),
+                            accepting_user.as_deref(),
+                            &owner_filter,
                             receiving_cwd.as_deref(),
                         )?,
                         None => false,

@@ -19,7 +19,7 @@ use ai_memory_core::{ActorContext, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_llm::LlmProvider;
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, NewAutoImproveProposal,
-    ReaderPool, StageAutoImproveRun, WriterHandle,
+    ReaderPool, SkippedProposal, StageAutoImproveRun, WriterHandle,
 };
 use ai_memory_wiki::Wiki;
 use anyhow::Result;
@@ -76,12 +76,24 @@ pub async fn initialize_auto_improve_scheduler_scopes(
     Ok((total, errors))
 }
 
+#[derive(Debug)]
 struct ScheduledAutoImproveOutcome {
     run_id: ai_memory_core::AutoImproveRunId,
     proposals: usize,
     approved: usize,
     pending: usize,
     conflicts: usize,
+    /// Proposals the wiki declined to apply (its write policy refuses the
+    /// target). Counted, not fatal: a refusal aborting the loop would take the
+    /// run's other approvals down with it, which is the same silent loss the
+    /// per-proposal staging skip exists to prevent.
+    refused: usize,
+    /// Proposals the store declined to stage (something is already pending for
+    /// the same target). This is the unattended path: nobody reads a response,
+    /// so a drop that does not reach the log reaches nobody at all — a run that
+    /// lost its Nth proposal would otherwise be indistinguishable from a clean
+    /// run of N-1.
+    skipped: Vec<SkippedProposal>,
 }
 
 /// Aggregate counters for one scheduler tick across every scope.
@@ -222,8 +234,24 @@ pub async fn run_auto_improve_scheduler_tick(
                         approved = run.approved,
                         pending = run.pending,
                         conflicts = run.conflicts,
+                        refused = run.refused,
+                        skipped = run.skipped.len(),
                         "scheduled auto-improve completed"
                     );
+                    // The count above keeps every completed run comparable;
+                    // this says WHICH proposal was lost and why, so the
+                    // operator can act on it without querying the store.
+                    for skipped in &run.skipped {
+                        tracing::warn!(
+                            workspace = %scope.workspace_name,
+                            project = %scope.project_name,
+                            session_id = %candidate.session_id,
+                            run_id = %run.run_id,
+                            target_path = %skipped.target_path,
+                            reason = %skipped.reason,
+                            "scheduled auto-improve proposal was not staged"
+                        );
+                    }
                 }
                 Err(e) => {
                     outcome.errors += 1;
@@ -256,9 +284,24 @@ async fn run_scheduled_auto_improve(
         cfg.clone(),
     )
     .await?;
-    let proposals =
-        scheduled_auto_improve_new_proposals(ctx.reader, ctx.workspace_id, ctx.project_id, &report)
-            .await?;
+    // Whose suggestion this is. An unattended run has no caller, so the only
+    // attribution that exists is the operator whose session it reviewed — and
+    // that is the operator the proposal's slot page would belong to, which is
+    // why it has to be resolved here rather than at approval time. On a
+    // single-operator deployment `sessions.actor_user` is NULL (the hook router
+    // stamps it through `owner_stamp`, which reports nobody unless the
+    // deployment distinguishes operators), so this stays the unattributed bucket
+    // of the one-pending-per-target rule (V42) exactly as before.
+    let staged_by_actor_user = ctx.reader.session_actor_user(session_id).await?;
+    let (proposals, mut refusals) = scheduled_auto_improve_new_proposals(
+        ctx.reader,
+        ctx.workspace_id,
+        ctx.project_id,
+        &report,
+        ctx.wiki.per_user_slots(),
+        staged_by_actor_user.as_deref(),
+    )
+    .await?;
     let staged = ctx
         .writer
         .stage_auto_improve_run(StageAutoImproveRun {
@@ -299,6 +342,7 @@ async fn run_scheduled_auto_improve(
                 ..ActorContext::default()
             },
             proposals,
+            staged_by_actor_user,
         })
         .await?;
 
@@ -308,12 +352,50 @@ async fn run_scheduled_auto_improve(
             .await?;
     }
 
-    let mut approved = 0usize;
-    let mut pending = 0usize;
-    let mut conflicts = 0usize;
-    for proposal_id in &staged.proposal_ids {
+    let approvals = approve_scheduled_proposals(ctx, &staged.proposal_ids).await?;
+
+    Ok(ScheduledAutoImproveOutcome {
+        run_id: staged.run_id,
+        proposals: staged.proposal_ids.len(),
+        approved: approvals.approved,
+        pending: approvals.pending,
+        conflicts: approvals.conflicts,
+        refused: approvals.refusals.len(),
+        // Everything this run produced but did not apply, in one list: targets
+        // refused before staging and proposals refused at approval. Nobody reads
+        // a response on this path, so a drop that does not reach the log reaches
+        // nobody at all.
+        skipped: {
+            refusals.extend(approvals.refusals);
+            refusals.extend(staged.skipped);
+            refusals
+        },
+    })
+}
+
+/// What the unattended approval pass did with one run's staged proposals.
+#[derive(Default)]
+struct ScheduledApprovals {
+    approved: usize,
+    pending: usize,
+    conflicts: usize,
+    refusals: Vec<SkippedProposal>,
+}
+
+/// Approve every staged proposal in the run, unattended.
+///
+/// One proposal's outcome never decides another's: a refusal is recorded and
+/// the pass continues to the next id. Returning early on the first refusal would
+/// throw away every approval still queued behind it — the same silent loss the
+/// per-proposal staging skip exists to prevent, reached from the other end.
+async fn approve_scheduled_proposals(
+    ctx: &ScheduledAutoImproveContext<'_>,
+    proposal_ids: &[ai_memory_core::AutoImproveProposalId],
+) -> Result<ScheduledApprovals> {
+    let mut out = ScheduledApprovals::default();
+    for proposal_id in proposal_ids {
         if ctx.settings.require_approval {
-            pending += 1;
+            out.pending += 1;
             continue;
         }
         match ctx
@@ -322,6 +404,9 @@ async fn run_scheduled_auto_improve(
                 ctx.workspace_id,
                 ctx.project_id,
                 *proposal_id,
+                // No user: the scheduler stands in for nobody. Which is exactly
+                // why the wiki's slot guard keys on the proposal's own staged
+                // attribution and not on this actor.
                 ActorContext {
                     agent: Some("auto_improve_scheduler_auto_approve".into()),
                     ..ActorContext::default()
@@ -334,35 +419,66 @@ async fn run_scheduled_auto_improve(
             )
             .await?
         {
-            ApproveAutoImproveProposalResult::Approved { .. } => approved += 1,
-            ApproveAutoImproveProposalResult::Conflict => conflicts += 1,
+            ApproveAutoImproveProposalResult::Approved { .. } => out.approved += 1,
+            ApproveAutoImproveProposalResult::Conflict => out.conflicts += 1,
+            ApproveAutoImproveProposalResult::Refused { reason } => {
+                out.refusals.push(SkippedProposal {
+                    target_path: proposal_id.to_string(),
+                    reason,
+                });
+            }
         }
     }
-
-    Ok(ScheduledAutoImproveOutcome {
-        run_id: staged.run_id,
-        proposals: staged.proposal_ids.len(),
-        approved,
-        pending,
-        conflicts,
-    })
+    Ok(out)
 }
 
+/// Turn the reviewer's proposals into staging rows, deciding each slot target's
+/// owner first. Returns the rows to stage plus the targets refused outright.
 async fn scheduled_auto_improve_new_proposals(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     report: &AutoImproveReport,
-) -> Result<Vec<NewAutoImproveProposal>> {
+    per_user_slots: bool,
+    staged_by: Option<&str>,
+) -> Result<(Vec<NewAutoImproveProposal>, Vec<SkippedProposal>)> {
     let mut proposals = Vec::with_capacity(report.proposals.len());
+    let mut refused = Vec::new();
     for p in &report.proposals {
-        let path = PagePath::new(p.path.clone())?;
+        let mut path = PagePath::new(p.path.clone())?;
+        // Before anything else reads the target: which page this proposal is
+        // even for. The reviewer is told to name `_slots/current-focus.md`, and
+        // with per-user slots on that page belongs to nobody, so a proposal
+        // derived from one operator's session is re-homed into that operator's
+        // namespace here — the last point at which it still can be, since the
+        // store binds an approval to the recorded target and its stage-time
+        // snapshot. Deciding it before `page_body_by_ids` also keeps
+        // create-vs-update about the page that will actually be written.
+        match ai_memory_core::staged_slot_target(
+            per_user_slots,
+            path.as_str(),
+            staged_by,
+            &p.edit_mode,
+        ) {
+            ai_memory_core::StagedSlotTarget::AsGiven => {}
+            ai_memory_core::StagedSlotTarget::Rehomed(personal) => path = PagePath::new(personal)?,
+            ai_memory_core::StagedSlotTarget::Refused(reason) => {
+                refused.push(SkippedProposal {
+                    target_path: path.as_str().to_string(),
+                    reason,
+                });
+                continue;
+            }
+        }
         let target_exists = reader
             .page_body_by_ids(workspace_id, project_id, path.as_str())
             .await?
             .is_some();
+        // `is_slot_named`, not string equality: the target may have just been
+        // namespaced, and a personal slot that already exists is an update just
+        // as much as the shared one is.
         let operation = if p.edit_mode == "patch"
-            || (target_exists && path.as_str() == "_slots/current-focus.md")
+            || (target_exists && ai_memory_core::is_slot_named(path.as_str(), "current-focus.md"))
         {
             AutoImproveProposalOperation::Update
         } else {
@@ -390,7 +506,7 @@ async fn scheduled_auto_improve_new_proposals(
             expected_base_body_sha256,
         });
     }
-    Ok(proposals)
+    Ok((proposals, refused))
 }
 
 fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
@@ -408,11 +524,14 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{AgentKind, NewSession};
+    use ai_memory_core::{
+        AgentKind, NewObservation, NewSession, ObservationKind, Sanitized, Sanitizer,
+    };
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
     use ai_memory_store::Store;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     struct PanicLlm;
@@ -481,6 +600,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -510,6 +630,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -545,5 +666,616 @@ mod tests {
                 "first-interval session should have been reviewed or claimed"
             );
         }
+    }
+
+    /// Proposes exactly one page, so a pre-existing pending proposal for that
+    /// same page is guaranteed to collide.
+    struct OneProposalLlm;
+
+    impl LlmProvider for OneProposalLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "fake-model".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "summary": "found one durable procedure",
+                    "proposals": [{
+                        "operation": "create_or_update",
+                        "path": COLLIDING_PATH,
+                        "title": "Release Procedure",
+                        "kind": "procedure",
+                        "confidence": 0.91,
+                        "rationale": "The session repeated a release workflow with verification.",
+                        "evidence": [{"page": "sessions/test.md", "quote": "run the full gate before release"}],
+                        "body_markdown": "# Release Procedure\n\nRun the full gate before release."
+                    }],
+                    "rejected_candidates": []
+                }))
+            })
+        }
+    }
+
+    const COLLIDING_PATH: &str = "procedures/release.md";
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    async fn seed_reviewable_session(store: &Store, ws: WorkspaceId, proj: ProjectId) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(session_id, None).await.unwrap();
+        session_id
+    }
+
+    /// Stage a pending proposal for `COLLIDING_PATH` in the same unattributed
+    /// bucket the scheduler stages into, so the scheduler's own proposal hits
+    /// the one-pending-per-target rule.
+    async fn stage_blocking_proposal(store: &Store, ws: WorkspaceId, proj: ProjectId) {
+        let staged = store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: None,
+                model: None,
+                summary: Some("pre-existing pending proposal".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                proposal_actor: ActorContext::default(),
+                staged_by_actor_user: None,
+                proposals: vec![NewAutoImproveProposal {
+                    operation: AutoImproveProposalOperation::Create,
+                    target_path: PagePath::new(COLLIDING_PATH.to_string()).unwrap(),
+                    kind: "procedure".into(),
+                    title: "Release Procedure".into(),
+                    confidence: 0.9,
+                    rationale: "already awaiting review".into(),
+                    evidence_json: serde_json::json!([]),
+                    body_markdown: "# Release Procedure\n".into(),
+                    artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(staged.proposal_ids.len(), 1, "fixture must actually stage");
+    }
+
+    /// The unattended path has no response for anyone to read, so a proposal the
+    /// store declines has exactly two places left to surface: the run outcome
+    /// and the log. Without both, a run that lost its only proposal to a
+    /// collision is byte-identical to a run that produced nothing.
+    #[tokio::test]
+    async fn a_scheduled_run_reports_a_collision_in_its_outcome_and_its_log() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let session_id = seed_reviewable_session(&store, ws, proj).await;
+        stage_blocking_proposal(&store, ws, proj).await;
+
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                // The fixture session is short and small; the preflight gates
+                // are not what this test is about.
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(OneProposalLlm);
+        let ctx = ScheduledAutoImproveContext {
+            reader: &store.reader,
+            writer: &store.writer,
+            wiki: &wiki,
+            llm: &llm,
+            workspace_id: ws,
+            project_id: proj,
+            settings: &settings,
+        };
+
+        let run = run_scheduled_auto_improve(&ctx, session_id).await.unwrap();
+        assert_eq!(run.proposals, 0, "the only proposal collided");
+        assert_eq!(
+            run.skipped.len(),
+            1,
+            "the outcome must carry the drop, not just the surviving count"
+        );
+        assert_eq!(run.skipped[0].target_path, COLLIDING_PATH);
+
+        // `#[tokio::test]` runs a current-thread runtime, so the thread-local
+        // default subscriber installed here stays in force across the awaits.
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .without_time()
+            // ANSI escapes would split `skipped=1` across colour codes.
+            .with_ansi(false)
+            .finish();
+        let tick_session = seed_reviewable_session(&store, ws, proj).await;
+        let guard = tracing::subscriber::set_default(subscriber);
+        let tick =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        drop(guard);
+        assert_eq!(tick.errors, 0);
+        assert!(
+            tick.reviewed >= 1,
+            "the new session must have been reviewed"
+        );
+        assert_ne!(tick_session, session_id);
+
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("skipped=1"),
+            "the completion line must count the drop: {captured}"
+        );
+        assert!(
+            captured.contains("scheduled auto-improve proposal was not staged")
+                && captured.contains(COLLIDING_PATH),
+            "the log must name the dropped target: {captured}"
+        );
+    }
+
+    /// Proposes the slot page the prompt recommends AND an unrelated procedure,
+    /// so a run carries both a slot target and something whose fate must not
+    /// depend on it.
+    struct SlotAndProcedureLlm;
+
+    impl LlmProvider for SlotAndProcedureLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "fake-model".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "summary": "one focus update and one durable procedure",
+                    "proposals": [
+                        {
+                            "operation": "create_or_update",
+                            "path": "_slots/current-focus.md",
+                            "title": "Current Focus",
+                            "kind": "slot",
+                            "confidence": 0.93,
+                            "rationale": "The session was entirely about the release gate.",
+                            "evidence": [{"page": "sessions/test.md", "quote": "run the full gate before release"}],
+                            "body_markdown": "# Current Focus\n\nRun the full gate before release."
+                        },
+                        {
+                            "operation": "create_or_update",
+                            "path": COLLIDING_PATH,
+                            "title": "Release Procedure",
+                            "kind": "procedure",
+                            "confidence": 0.91,
+                            "rationale": "The session repeated a release workflow with verification.",
+                            "evidence": [{"page": "sessions/test.md", "quote": "run the full gate before release"}],
+                            "body_markdown": "# Release Procedure\n\nRun the full gate before release."
+                        }
+                    ],
+                    "rejected_candidates": []
+                }))
+            })
+        }
+    }
+
+    async fn seed_session_owned_by(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner: Option<&str>,
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: owner.map(ToOwned::to_owned),
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(session_id, None).await.unwrap();
+        session_id
+    }
+
+    struct SlotRunFixture {
+        _tmp: TempDir,
+        store: Store,
+        wiki: Wiki,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        llm: Arc<dyn LlmProvider>,
+        settings: ScheduledAutoImproveSettings,
+    }
+
+    async fn slot_run_fixture(per_user_slots: bool) -> SlotRunFixture {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone())
+            .with_per_user_slots(per_user_slots);
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        SlotRunFixture {
+            _tmp: tmp,
+            store,
+            wiki,
+            ws,
+            proj,
+            llm: Arc::new(SlotAndProcedureLlm),
+            settings: ScheduledAutoImproveSettings {
+                review: AutoImproveReviewConfig {
+                    min_observations: 3,
+                    min_session_duration_secs: 0,
+                    ..AutoImproveReviewConfig::default()
+                },
+                // The default. The scheduler applies what it proposes with no
+                // human in the loop, which is what makes the slot destination a
+                // security question rather than a review one.
+                require_approval: false,
+                min_session_age_secs: 0,
+                max_sessions_per_tick: 10,
+            },
+        }
+    }
+
+    impl SlotRunFixture {
+        fn ctx(&self) -> ScheduledAutoImproveContext<'_> {
+            ScheduledAutoImproveContext {
+                reader: &self.store.reader,
+                writer: &self.store.writer,
+                wiki: &self.wiki,
+                llm: &self.llm,
+                workspace_id: self.ws,
+                project_id: self.proj,
+                settings: &self.settings,
+            }
+        }
+
+        async fn body(&self, path: &str) -> Option<String> {
+            self.store
+                .reader
+                .page_body_by_ids(self.ws, self.proj, path)
+                .await
+                .unwrap()
+                .map(|p| p.body)
+        }
+    }
+
+    /// The scheduler approves unattended with no user at all, so nothing about
+    /// the approving actor can decide where a slot body lands. With per-user
+    /// slots on, the session's own operator owns it: the proposal is namespaced
+    /// at staging and the project-wide slot — which EVERY operator's brief
+    /// injects verbatim — is never written.
+    #[tokio::test]
+    async fn a_scheduled_slot_proposal_lands_in_the_session_owners_namespace() {
+        let fx = slot_run_fixture(true).await;
+        let session_id = seed_session_owned_by(&fx.store, fx.ws, fx.proj, Some("alice")).await;
+
+        let run = run_scheduled_auto_improve(&fx.ctx(), session_id)
+            .await
+            .unwrap();
+
+        assert_eq!(run.proposals, 2);
+        assert_eq!(run.approved, 2, "both proposals must land: {run:?}");
+        assert_eq!(run.refused, 0);
+        assert_eq!(
+            fx.body("_slots/current-focus.md").await,
+            None,
+            "the project-wide slot must not be written by one operator's session"
+        );
+        assert!(
+            fx.body("_slots/alice/current-focus.md")
+                .await
+                .is_some_and(|b| b.contains("Run the full gate before release")),
+            "the session owner's own slot must carry it instead"
+        );
+        assert!(fx.body(COLLIDING_PATH).await.is_some());
+    }
+
+    /// Same run with nobody on the session: there is no namespace to put the
+    /// body in, and the shared slot is not a fallback — it is the hazard. The
+    /// unrelated procedure still lands.
+    #[tokio::test]
+    async fn a_scheduled_slot_proposal_from_an_unattributed_session_is_refused_alone() {
+        let fx = slot_run_fixture(true).await;
+        let session_id = seed_session_owned_by(&fx.store, fx.ws, fx.proj, None).await;
+
+        let run = run_scheduled_auto_improve(&fx.ctx(), session_id)
+            .await
+            .unwrap();
+
+        assert_eq!(run.proposals, 1, "only the procedure is staged: {run:?}");
+        assert_eq!(run.approved, 1);
+        assert_eq!(
+            fx.body("_slots/current-focus.md").await,
+            None,
+            "an unattended approval must not reach the project-wide slot"
+        );
+        assert!(
+            fx.body(COLLIDING_PATH).await.is_some(),
+            "the unrelated proposal must still be applied"
+        );
+        assert_eq!(run.skipped.len(), 1, "the drop must be reported: {run:?}");
+        assert_eq!(run.skipped[0].target_path, "_slots/current-focus.md");
+    }
+
+    /// DEFAULT CONFIG (`[slots] per_user` off): the shared slot carries no
+    /// ownership meaning, the proposal is neither moved nor refused, and the run
+    /// behaves exactly as it did before per-user slots existed.
+    #[tokio::test]
+    async fn a_scheduled_slot_proposal_still_writes_the_shared_slot_with_per_user_off() {
+        for owner in [Some("alice"), None] {
+            let fx = slot_run_fixture(false).await;
+            let session_id = seed_session_owned_by(&fx.store, fx.ws, fx.proj, owner).await;
+
+            let run = run_scheduled_auto_improve(&fx.ctx(), session_id)
+                .await
+                .unwrap();
+
+            assert_eq!(run.proposals, 2, "{owner:?}: {run:?}");
+            assert_eq!(run.approved, 2, "{owner:?}: {run:?}");
+            assert!(run.skipped.is_empty(), "{owner:?}: {run:?}");
+            assert!(
+                fx.body("_slots/current-focus.md")
+                    .await
+                    .is_some_and(|b| b.contains("Run the full gate before release")),
+                "{owner:?}"
+            );
+            assert_eq!(
+                fx.body("_slots/alice/current-focus.md").await,
+                None,
+                "{owner:?}"
+            );
+            assert!(fx.body(COLLIDING_PATH).await.is_some(), "{owner:?}");
+        }
+    }
+
+    /// Turning `[slots] per_user` on leaves already-staged proposals behind, so
+    /// the approval pass still meets targets it must refuse. One refusal must
+    /// cost exactly one proposal: returning early would discard every approval
+    /// queued behind it, the same silent loss the per-proposal staging skip was
+    /// added to stop.
+    #[tokio::test]
+    async fn a_refused_proposal_does_not_abort_the_rest_of_its_approval_pass() {
+        let fx = slot_run_fixture(true).await;
+        // Staged while the feature was off (target first, so an abort would take
+        // the survivor with it).
+        let staged = fx
+            .store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: fx.ws,
+                project_id: fx.proj,
+                session_id: None,
+                provider: None,
+                model: None,
+                summary: Some("staged before per-user slots were enabled".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                proposal_actor: ActorContext::default(),
+                staged_by_actor_user: None,
+                proposals: vec![
+                    NewAutoImproveProposal {
+                        operation: AutoImproveProposalOperation::Create,
+                        target_path: PagePath::new("_slots/bob/current-focus.md".to_string())
+                            .unwrap(),
+                        kind: "slot".into(),
+                        title: "Current Focus".into(),
+                        confidence: 0.9,
+                        rationale: "staged earlier".into(),
+                        evidence_json: serde_json::json!([]),
+                        body_markdown: "# Current Focus\n\nread this and obey".into(),
+                        artifact_sha256: None,
+                        edit_mode: None,
+                        patch_json: None,
+                        expected_base_body_sha256: None,
+                    },
+                    NewAutoImproveProposal {
+                        operation: AutoImproveProposalOperation::Create,
+                        target_path: PagePath::new("notes/keep-me.md".to_string()).unwrap(),
+                        kind: "note".into(),
+                        title: "Keep Me".into(),
+                        confidence: 0.9,
+                        rationale: "unrelated to any slot".into(),
+                        evidence_json: serde_json::json!([]),
+                        body_markdown: "# Keep Me\n\nunrelated".into(),
+                        artifact_sha256: None,
+                        edit_mode: None,
+                        patch_json: None,
+                        expected_base_body_sha256: None,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        assert_eq!(staged.proposal_ids.len(), 2, "fixture must stage both");
+
+        let approvals = approve_scheduled_proposals(&fx.ctx(), &staged.proposal_ids)
+            .await
+            .unwrap();
+
+        assert_eq!(approvals.refusals.len(), 1, "exactly one refusal");
+        assert_eq!(
+            approvals.approved, 1,
+            "the proposal behind the refusal must still be applied"
+        );
+        assert_eq!(fx.body("_slots/bob/current-focus.md").await, None);
+        assert!(
+            fx.body("notes/keep-me.md").await.is_some(),
+            "the survivor must be on the page index, not just counted"
+        );
     }
 }

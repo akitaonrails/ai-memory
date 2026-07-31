@@ -15,6 +15,7 @@ pub mod page;
 pub mod routing_skills;
 pub mod routing_snippet;
 pub mod sanitize;
+pub mod slots;
 pub mod user;
 mod workstream;
 
@@ -24,9 +25,17 @@ pub const DEFAULT_WORKSPACE_NAME: &str = "default";
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT_NAME: &str = "scratch";
 
-/// Reserved project holding user/team-level standing context — technology
+/// Reserved project holding **server-wide** standing context — technology
 /// preferences, code style, durable decisions that every project should
-/// inherit (issue #154). Lives in [`DEFAULT_WORKSPACE_NAME`]. Default
+/// inherit (issue #154).
+///
+/// Server-wide, not per-operator: there is one `_global` per server and every
+/// authenticated caller reads and writes the same pages. On a shared instance
+/// two people editing the same rule path collide on one row — the later write
+/// supersedes the earlier one, nothing is lost from the version chain, and
+/// neither is told. Do not describe this scope to users as "personal".
+///
+/// Lives in [`DEFAULT_WORKSPACE_NAME`]. Default
 /// `memory_query` reads union this scope with the current project; it is
 /// written only through explicit `scope: "global"` requests. The leading
 /// underscore follows the wiki's reserved-name convention (`_meta.md`,
@@ -37,9 +46,12 @@ pub const GLOBAL_SCOPE_PROJECT: &str = "_global";
 pub use active_project::{
     ActiveProject, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES, DEFAULT_PER_KEY_TTL,
 };
-pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
+pub use actor::{
+    ActorContext, AuthLevel, AuthzError, Capability, SKIP_ADMISSION_CHAIN_HEADER,
+    parse_skip_admission_chain, skip_admission_chain_for,
+};
 pub use error::{MemoryError, MemoryResult};
-pub use handoff::{Handoff, HandoffState, NewHandoff};
+pub use handoff::{Handoff, HandoffState, NewHandoff, OwnerFilter, owner_stamp};
 pub use ids::{
     AgentKind, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId, ManagedRunId,
     ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
@@ -53,6 +65,10 @@ pub use page::{
 pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, find_marker_line, full_block};
 pub use sanitize::{
     OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_utf8_bytes,
+};
+pub use slots::{
+    SLOT_PREFIX, SlotPlacement, SlotVisibility, StagedSlotTarget, is_slot_named, is_slot_path,
+    is_valid_slot_namespace, slot_owner, slot_placement, staged_slot_target,
 };
 pub use user::{MAX_EMAIL_LEN, MAX_USERNAME_LEN, NewUser, User, validate_email, validate_username};
 pub use workstream::{

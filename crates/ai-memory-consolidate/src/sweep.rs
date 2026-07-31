@@ -1,7 +1,7 @@
 //! M8 forget sweep — episodic-only retention pass.
 //!
-//! Walks the `is_latest = 1` pages for a project, computes the
-//! retention score for each via [`ai_memory_store::retention_score`],
+//! Walks the `is_latest = 1` pages for a project, computes the retention score
+//! for each via [`ai_memory_store::retention_score_with_breadth`],
 //! and soft-deletes those below threshold. Semantic / procedural /
 //! working tiers are skipped (M8 policy: semantic compounds, only
 //! episodic decays). Pinned pages (schema flag OR `pinned: true` in
@@ -18,8 +18,12 @@
 //! M7 supersession rows are safe: they have `supersedes IS NOT NULL`
 //! and therefore never match the hard-delete predicate.
 
+use std::collections::HashMap;
+
 use ai_memory_core::{PageId, ProjectId, Tier, WorkspaceId};
-use ai_memory_store::{DecayCandidate, DecayParams, ReaderPool, WriterHandle, retention_score};
+use ai_memory_store::{
+    DecayCandidate, DecayParams, ReaderPool, WriterHandle, retention_score_with_breadth,
+};
 use ai_memory_wiki::Wiki;
 use jiff::Timestamp;
 use serde::Serialize;
@@ -108,6 +112,7 @@ pub async fn run_sweep(
     dry_run: bool,
 ) -> Result<SweepReport, SweepError> {
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
+    let breadth = access_breadth_for_scoring(reader, workspace_id, project_id, params).await?;
     let now_us = Timestamp::now().as_microsecond();
 
     let mut evicted = Vec::new();
@@ -133,12 +138,13 @@ pub async fn run_sweep(
         }
         let age_days = elapsed_days(now_us, c.updated_at_us);
         let days_since_access = c.last_accessed_at_us.map(|us| elapsed_days(now_us, us));
-        let score = retention_score(
+        let score = retention_score_with_breadth(
             params,
             age_days,
             c.access_count,
             days_since_access,
             c.salience,
+            breadth.get(&c.id).copied().unwrap_or(0),
         );
         if score < params.cold_threshold {
             evicted.push(EvictedPage {
@@ -187,6 +193,10 @@ pub async fn run_sweep(
         if !to_evict_ids.is_empty() {
             writer.soft_delete_for_decay(to_evict_ids).await?;
         }
+        // Hard-delete within the swept scope only. This used to be an
+        // unscoped, database-wide DELETE issued on every non-dry sweep — even
+        // when this project had nothing to evict — so sweeping one project
+        // permanently removed other projects' evicted pages too.
         hard_deleted = writer
             .hard_delete_decayed(workspace_id, project_id, params.hard_delete_after_days)
             .await?;
@@ -199,6 +209,32 @@ pub async fn run_sweep(
         expired,
         hard_deleted,
     })
+}
+
+/// Distinct-actor counts keyed by page, for feeding
+/// [`retention_score_with_breadth`].
+///
+/// One grouped query for the whole candidate set, not one per page — and none
+/// at all while the breadth term is off, which is the default: the score is then
+/// identical whatever the breakdown says, so a deployment that never enables it
+/// never pays for reading it.
+///
+/// Shared with the curator rather than duplicated there: the curator's
+/// `cold_episodic` verdict is a prediction of what the sweep will evict, so the
+/// two must read the same input. A second lookup would be a second chance to
+/// drift.
+pub(crate) async fn access_breadth_for_scoring(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    params: &DecayParams,
+) -> ai_memory_store::StoreResult<HashMap<PageId, u32>> {
+    if params.breadth_weight == 0.0 {
+        return Ok(HashMap::new());
+    }
+    reader
+        .access_breadth_for_project(workspace_id, project_id)
+        .await
 }
 
 fn elapsed_days(now_us: i64, then_us: i64) -> f64 {

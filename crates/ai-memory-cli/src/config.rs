@@ -127,6 +127,8 @@ pub struct Config {
     pub decay: ai_memory_store::DecayParams,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Memory-slot behaviour.
+    pub slots: SlotSettings,
     /// Auto-improvement reviewer. The scheduler launches background review for
     /// newly completed sessions; manual CLI/admin/MCP runs remain available.
     /// Both approve validated proposals by default unless `require_approval` is
@@ -372,6 +374,20 @@ pub struct AuthSettings {
     /// token resolution even during first-user bootstrap; operational admin
     /// access becomes root-only once a user row exists.
     pub token_pepper: Option<String>,
+    /// Shared secret proving a request came from a trusted authenticating
+    /// proxy, allowing it to name the real end user in `X-Memory-Actor-*`
+    /// headers.
+    ///
+    /// A proxy that terminates SSO usually cannot forward the user's own
+    /// credential upstream — it authenticates with [`Self::bearer_token`] and
+    /// describes the human in headers. Those headers are ignored unless this
+    /// secret is set AND the proxy echoes it in `X-Memory-Actor-Proxy-Secret`,
+    /// because anything able to reach the port could otherwise claim any
+    /// identity. Leave unset (the default) and every proxied caller is
+    /// attributed to [`Self::root_username`], as before.
+    ///
+    /// Only set this when the server is reachable *only* through that proxy.
+    pub actor_proxy_secret: Option<String>,
 }
 
 /// `[auto_scope]` — controls how the hook-published "currently active
@@ -429,6 +445,7 @@ impl Default for Config {
             embedding_base_url: None,
             decay: ai_memory_store::DecayParams::default(),
             maintenance: MaintenanceSettings::default(),
+            slots: SlotSettings::default(),
             auto_improve: AutoImproveSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
@@ -589,6 +606,41 @@ impl Default for AutoImproveSettings {
             pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
         }
     }
+}
+
+/// `[slots]` memory-slot behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlotSettings {
+    /// Namespace engine-written slots under the operator that produced them
+    /// (`_slots/<user>/current-focus.md` instead of `_slots/current-focus.md`).
+    ///
+    /// Off by default, so nothing changes for an existing install: with the
+    /// flag off a nested slot path carries no ownership meaning at all, and
+    /// every slot goes into every brief exactly as it did before.
+    ///
+    /// Turning it ON also changes reads and writes, in both directions:
+    ///
+    /// * a session brief and the consolidation prompt see the shared slots
+    ///   plus the requesting operator's own — so a slot already stored under
+    ///   `_slots/<name>/…` becomes visible to `<name>` alone;
+    /// * writing into another operator's namespace is refused (admins aside);
+    /// * an operator whose name cannot be a path segment gets no slot write at
+    ///   all, rather than falling back to the project-wide one — including a
+    ///   write to `_slots/<that same name>/…`, which no reader could ever see;
+    /// * a write naming the SHARED slot is namespaced into the writer's own
+    ///   prefix, whether it comes from the engine or from `memory_write_page`,
+    ///   and approving an auto-improvement proposal for a slot outside the
+    ///   approver's namespace fails the proposal instead of applying it.
+    ///
+    /// Turning it back OFF restores the pre-feature rule everywhere: personal
+    /// slots become visible to everyone again and nested writes stop being
+    /// gated. Un-namespaced slots are shared under either setting, so nothing
+    /// already stored is ever hidden or reinterpreted.
+    ///
+    /// Only meaningful once requests carry distinct identities; with a single
+    /// shared credential every slot lands under the same namespace.
+    pub per_user: bool,
 }
 
 /// `[maintenance]` scheduled server jobs.

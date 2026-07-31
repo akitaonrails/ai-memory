@@ -63,6 +63,21 @@ pub enum AdmissionOp {
     /// project id. Carries source names in `workspace`/`project` and
     /// destination names in `destination_workspace`/`destination_project`.
     MoveProject,
+    /// The retention sweep is about to evict pages and hard-delete previously
+    /// evicted ones. Carries the swept workspace/project, no page path.
+    ///
+    /// Handoffs and the sweep are the destructive operations that never touched
+    /// `Wiki::write_page`, so an admission webhook could not see — let alone
+    /// refuse — either of them. A deployment that authorizes writes per operator
+    /// had a blind spot exactly where the damage is irreversible.
+    ForgetSweep,
+    /// A handoff is being created. Carries the workspace/project; no page path,
+    /// since handoffs live in their own table rather than the wiki tree.
+    HandoffBegin,
+    /// A pending handoff is being consumed.
+    HandoffAccept,
+    /// A pending handoff is being discarded.
+    HandoffCancel,
 }
 
 impl AdmissionOp {
@@ -76,6 +91,10 @@ impl AdmissionOp {
             AdmissionOp::PurgeProject => "purge_project",
             AdmissionOp::PurgeWorkspace => "purge_workspace",
             AdmissionOp::MoveProject => "move_project",
+            AdmissionOp::ForgetSweep => "forget_sweep",
+            AdmissionOp::HandoffBegin => "handoff_begin",
+            AdmissionOp::HandoffAccept => "handoff_accept",
+            AdmissionOp::HandoffCancel => "handoff_cancel",
         }
     }
 }
@@ -225,9 +244,17 @@ pub const MAX_ADMISSION_WEBHOOKS: usize = 16;
 /// pin write-path or async admission work indefinitely.
 pub const MAX_WEBHOOK_TIMEOUT_MS: u64 = 30_000;
 
-/// Maximum non-blocking webhook requests in flight for one process. Beyond this
-/// cap observer hooks are dropped with a warning; the durable wiki write has
-/// already completed, so backpressure here should never stall the caller.
+/// Maximum fire-and-forget webhook requests in flight for one process. Beyond
+/// this cap the request is dropped with a log line; the durable operation has
+/// already completed, so backpressure here never stalls the caller.
+///
+/// Every spawned webhook shares the permits, not just the `blocking = false`
+/// ones: [`AdmissionChain::dispatch_notify_observers`] spawns any subscriber
+/// that cannot refuse the op, which on the four lifecycle ops includes a
+/// `blocking = true, failure_policy = ignore` hook. So a hook an operator marked
+/// blocking can be dropped under load — it is an observer there whatever its
+/// `blocking` flag says, since only `reject` policy is awaited. Dropping one is
+/// logged at ERROR precisely because that configuration reads as "must run".
 pub const MAX_ASYNC_ADMISSION_IN_FLIGHT: usize = 256;
 
 /// Maximum bytes read from a single webhook response body. Webhooks
@@ -407,57 +434,120 @@ impl AdmissionChain {
     /// # Errors
     /// Returns an error only when a `Reject`-policy webhook fails.
     pub async fn notify(&self, page_path: Option<&str>, ctx: &AdmissionContext) -> WikiResult<()> {
-        let empty_frontmatter = serde_json::Value::Object(serde_json::Map::new());
         for hook in self.webhooks.iter() {
-            if ctx.skip_webhooks.iter().any(|n| n == &hook.name) {
-                tracing::debug!(webhook = %hook.name, "admission skip (caller opt-out)");
-                continue;
-            }
-            if !hook.events.contains(&ctx.op) {
+            if !self.subscribed(hook, ctx) {
                 continue;
             }
             if !hook.blocking {
                 continue;
             }
-            let payload = WebhookRequestBody {
-                page: WebhookPagePayload {
-                    path: page_path.unwrap_or(""),
-                    frontmatter: &empty_frontmatter,
-                    body: "",
-                },
-                ctx,
-            };
-            let result = self
-                .client
-                .post(&hook.url)
-                .header("X-Memory-Op", ctx.op.as_header_value())
-                .timeout(webhook_timeout(hook.timeout_ms))
-                .json(&payload)
-                .send()
-                .await;
-            match result {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::debug!(webhook = %hook.name, op = ctx.op.as_header_value(), "admission notify ok");
+            self.notify_once(hook, page_path, ctx).await?;
+        }
+        Ok(())
+    }
+
+    /// Run only the webhooks that can actually refuse `ctx.op` — the blocking
+    /// ones the operator set to [`FailurePolicy::Reject`].
+    ///
+    /// For a caller whose own latency is bounded (the session-start hook path),
+    /// an `Ignore` webhook is dead weight in front of the operation: its answer
+    /// cannot change the outcome, yet waiting for it spends the caller's whole
+    /// budget, and cutting it short mid-chain would abandon an operation a
+    /// webhook earlier in the chain has already been told succeeded. Those
+    /// hooks belong on [`Self::dispatch_notify_observers`], AFTER the operation
+    /// has actually landed.
+    ///
+    /// # Errors
+    /// Returns an error only when a `Reject`-policy webhook fails.
+    pub async fn authorize(
+        &self,
+        page_path: Option<&str>,
+        ctx: &AdmissionContext,
+    ) -> WikiResult<()> {
+        for hook in self.webhooks.iter() {
+            if !self.subscribed(hook, ctx) {
+                continue;
+            }
+            if !decides(hook) {
+                continue;
+            }
+            self.notify_once(hook, page_path, ctx).await?;
+        }
+        Ok(())
+    }
+
+    /// Fire-and-forget the notify-style webhooks [`Self::authorize`] did not
+    /// run: observers, which have nothing to decide. Call it once the operation
+    /// is durable, so no webhook is ever told about work the engine then
+    /// abandons.
+    pub fn dispatch_notify_observers(&self, page_path: Option<&str>, ctx: &AdmissionContext) {
+        let empty_frontmatter = serde_json::Value::Object(serde_json::Map::new());
+        for hook in self.webhooks.iter() {
+            if !self.subscribed(hook, ctx) {
+                continue;
+            }
+            if decides(hook) {
+                continue;
+            }
+            self.spawn_webhook(hook, page_path, &empty_frontmatter, "", ctx);
+        }
+    }
+
+    /// Shared filter: caller opt-out (loop prevention) plus op subscription.
+    fn subscribed(&self, hook: &WebhookConfig, ctx: &AdmissionContext) -> bool {
+        if ctx.skip_webhooks.iter().any(|n| n == &hook.name) {
+            tracing::debug!(webhook = %hook.name, "admission skip (caller opt-out)");
+            return false;
+        }
+        hook.events.contains(&ctx.op)
+    }
+
+    /// One notify-style POST (no body to send or mutate).
+    async fn notify_once(
+        &self,
+        hook: &WebhookConfig,
+        page_path: Option<&str>,
+        ctx: &AdmissionContext,
+    ) -> WikiResult<()> {
+        let empty_frontmatter = serde_json::Value::Object(serde_json::Map::new());
+        let payload = WebhookRequestBody {
+            page: WebhookPagePayload {
+                path: page_path.unwrap_or(""),
+                frontmatter: &empty_frontmatter,
+                body: "",
+            },
+            ctx,
+        };
+        let result = self
+            .client
+            .post(&hook.url)
+            .header("X-Memory-Op", ctx.op.as_header_value())
+            .timeout(webhook_timeout(hook.timeout_ms))
+            .json(&payload)
+            .send()
+            .await;
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!(webhook = %hook.name, op = ctx.op.as_header_value(), "admission notify ok");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body_txt = response_text_limited(resp).await;
+                tracing::warn!(webhook = %hook.name, status = %status, body = %body_txt, "admission notify error response");
+                if matches!(hook.failure_policy, FailurePolicy::Reject) {
+                    return Err(WikiError::Io(std::io::Error::other(format!(
+                        "admission webhook {} status {}: {}",
+                        hook.name, status, body_txt
+                    ))));
                 }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body_txt = response_text_limited(resp).await;
-                    tracing::warn!(webhook = %hook.name, status = %status, body = %body_txt, "admission notify error response");
-                    if matches!(hook.failure_policy, FailurePolicy::Reject) {
-                        return Err(WikiError::Io(std::io::Error::other(format!(
-                            "admission webhook {} status {}: {}",
-                            hook.name, status, body_txt
-                        ))));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(webhook = %hook.name, error = %e, "admission notify request failed");
-                    if matches!(hook.failure_policy, FailurePolicy::Reject) {
-                        return Err(WikiError::Io(std::io::Error::other(format!(
-                            "admission webhook {} request failed: {}",
-                            hook.name, e
-                        ))));
-                    }
+            }
+            Err(e) => {
+                tracing::warn!(webhook = %hook.name, error = %e, "admission notify request failed");
+                if matches!(hook.failure_policy, FailurePolicy::Reject) {
+                    return Err(WikiError::Io(std::io::Error::other(format!(
+                        "admission webhook {} request failed: {}",
+                        hook.name, e
+                    ))));
                 }
             }
         }
@@ -487,54 +577,89 @@ impl AdmissionChain {
             if !hook.events.contains(&ctx.op) {
                 continue;
             }
-            let Ok(permit) = self.async_semaphore.clone().try_acquire_owned() else {
+            self.spawn_webhook(hook, page_path, frontmatter, body, ctx);
+        }
+    }
+
+    /// Spawn one webhook POST off the caller's path, bounded by the shared
+    /// in-flight permit (hook paths must not fan out unboundedly).
+    fn spawn_webhook(
+        &self,
+        hook: &WebhookConfig,
+        page_path: Option<&str>,
+        frontmatter: &serde_json::Value,
+        body: &str,
+        ctx: &AdmissionContext,
+    ) {
+        let Ok(permit) = self.async_semaphore.clone().try_acquire_owned() else {
+            // A hook the operator marked `blocking` reaches this path too (see
+            // MAX_ASYNC_ADMISSION_IN_FLIGHT), and dropping one contradicts what
+            // that flag reads as, so it is not merely a warning: the operator
+            // has to be able to find it in the log.
+            if hook.blocking {
+                tracing::error!(
+                    webhook = %hook.name,
+                    op = ctx.op.as_header_value(),
+                    cap = MAX_ASYNC_ADMISSION_IN_FLIGHT,
+                    "admission async queue saturated; dropping a webhook configured blocking",
+                );
+            } else {
                 tracing::warn!(
                     webhook = %hook.name,
+                    op = ctx.op.as_header_value(),
                     cap = MAX_ASYNC_ADMISSION_IN_FLIGHT,
                     "admission async queue saturated; dropping observer webhook",
                 );
-                continue;
+            }
+            return;
+        };
+        let client = self.client.clone();
+        let url = hook.url.clone();
+        let name = hook.name.clone();
+        let timeout = hook.timeout_ms;
+        let op = ctx.op;
+        let owned_ctx = ctx.clone();
+        let path = page_path.map(str::to_string);
+        let frontmatter = frontmatter.clone();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let payload = WebhookRequestBody {
+                page: WebhookPagePayload {
+                    path: path.as_deref().unwrap_or(""),
+                    frontmatter: &frontmatter,
+                    body: &body,
+                },
+                ctx: &owned_ctx,
             };
-            let client = self.client.clone();
-            let url = hook.url.clone();
-            let name = hook.name.clone();
-            let timeout = hook.timeout_ms;
-            let op = ctx.op;
-            let owned_ctx = ctx.clone();
-            let path = page_path.map(str::to_string);
-            let frontmatter = frontmatter.clone();
-            let body = body.to_string();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let payload = WebhookRequestBody {
-                    page: WebhookPagePayload {
-                        path: path.as_deref().unwrap_or(""),
-                        frontmatter: &frontmatter,
-                        body: &body,
-                    },
-                    ctx: &owned_ctx,
-                };
-                match client
-                    .post(&url)
-                    .header("X-Memory-Op", op.as_header_value())
-                    .timeout(webhook_timeout(timeout))
-                    .json(&payload)
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        tracing::debug!(webhook = %name, op = op.as_header_value(), "admission async ok");
-                    }
-                    Ok(resp) => {
-                        tracing::warn!(webhook = %name, status = %resp.status(), "admission async error response");
-                    }
-                    Err(e) => {
-                        tracing::warn!(webhook = %name, error = %e, "admission async request failed");
-                    }
+            match client
+                .post(&url)
+                .header("X-Memory-Op", op.as_header_value())
+                .timeout(webhook_timeout(timeout))
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::debug!(webhook = %name, op = op.as_header_value(), "admission async ok");
                 }
-            });
-        }
+                Ok(resp) => {
+                    tracing::warn!(webhook = %name, status = %resp.status(), "admission async error response");
+                }
+                Err(e) => {
+                    tracing::warn!(webhook = %name, error = %e, "admission async request failed");
+                }
+            }
+        });
     }
+}
+
+/// `true` when this webhook's answer can change the outcome of an operation —
+/// the operator asked for it to block AND to refuse on failure. Everything else
+/// is an observer: under the default [`FailurePolicy::Ignore`] a non-2xx, a
+/// timeout and an unreachable host all continue the operation unchanged.
+fn decides(hook: &WebhookConfig) -> bool {
+    hook.blocking && matches!(hook.failure_policy, FailurePolicy::Reject)
 }
 
 fn webhook_timeout(timeout_ms: u64) -> Duration {

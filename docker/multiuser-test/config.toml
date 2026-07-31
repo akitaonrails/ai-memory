@@ -1,0 +1,28 @@
+# Two-operator simulation: an SSO-terminating proxy in front of one server.
+#
+# This is the posture the branch's multi-operator work targets and the one its
+# PR admits was never exercised: identities arrive as headers asserted by a
+# proxy that authenticates with the single root bearer, and no `users` row ever
+# exists.
+
+data_dir = "/data"
+bind = "0.0.0.0:49374"
+log_level = "ai_memory=debug,ai_memory_mcp=debug,ai_memory_store=info,ai_memory_wiki=info,ai_memory_hooks=debug"
+
+[auth]
+# The proxy authenticates to the server with this; end users never see it.
+bearer_token = "root-token-for-the-proxy-only"
+# Required alongside actor_proxy_secret — the server refuses to start without
+# it, because every asserted identity except this one is downgraded to a
+# non-root user and nothing could otherwise reach /admin/* .
+root_username = "operator-root"
+# The switch for rung 1b. The proxy echoes this in X-Memory-Actor-Proxy-Secret.
+actor_proxy_secret = "shared-with-the-proxy-only"
+
+[slots]
+# The feature under test. Default is false; a separate run covers that.
+per_user = true
+
+[decay]
+# Off by default; set here so the breadth term is actually exercised.
+breadth_weight = 1.5

@@ -45,12 +45,185 @@ Every HTTP request is resolved to one of four authentication tiers:
 |---|---|---|
 | **0 — Anonymous** | No `[auth].bearer_token` set. | Allowed, no identity. Same as pre-multi-user defaults. |
 | **1 — Root** | Bearer matches `[auth].bearer_token`. | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
+| **1b — Proxy-asserted user** | Bearer matches root **and** the request carries `X-Memory-Actor-Proxy-Secret` matching `[auth].actor_proxy_secret`. | Identity is taken from the `X-Memory-Actor-*` headers. When the proxy names somebody, the tier drops to **user** unless that somebody is `[auth].root_username`; when it names nobody (health checks, machine-to-machine calls) the request stays **root**, as it would without the overlay. See "Trusted proxy identity" below. |
 | **2 — DB user** | Bearer doesn't match root, matches a `users.token_hash` row (via SHA-256 of token + `[auth].token_pepper`). | Allowed as **that user** for normal read/write APIs. All `/admin/*` endpoints are root-only in multi-user mode. The audit log records the username/email/name. |
 | **3 — 401** | Bearer present but matches nothing. | Rejected. Closes the bypass — unknown bearers can't slip through as anonymous. |
 
 The rungs are sticky: a request is matched at the lowest tier that
 applies, never escalates. Root token always wins over any users-row
 collision; the two namespaces are intentionally distinct.
+
+## Trusted proxy identity
+
+A deployment that terminates SSO in front of the server usually cannot forward
+the end user's own credential upstream: the proxy validates the token and then
+authenticates to ai-memory with the single root bearer, describing the human in
+`X-Memory-Actor-*` headers. Those headers are **ignored by default** — anything
+that can reach the port could otherwise claim any identity — so without extra
+configuration every human behind such a proxy collapses into one root actor.
+
+Set `[auth].actor_proxy_secret` and have the proxy echo it in
+`X-Memory-Actor-Proxy-Secret` to change that:
+
+```toml
+[auth]
+bearer_token = "…"        # required: the overlay only applies to root-bearer requests
+actor_proxy_secret = "…"  # shared with the proxy; compared in constant time
+```
+
+- The secret **is** the switch. There is no separate "trust headers" flag, so
+  the feature cannot be enabled without one; a blank value counts as unset.
+- Only set it when the server is reachable *only* through that proxy.
+- **The proxy MUST strip client-supplied `X-Memory-Actor-*` headers before
+  setting its own.** Use a directive that *replaces* the header rather than
+  appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`) —
+  with an appending ingress the client's value arrives first and would be the
+  one read. A request that carries any `X-Memory-Actor-*` header twice is
+  rejected with `400` rather than resolved to one of the two identities, so a
+  misconfigured ingress fails loudly instead of letting callers impersonate
+  each other.
+- `[auth].root_username` is **required** alongside the secret; the server
+  refuses to start without it. Every asserted identity except that one is
+  downgraded to a non-root user, so with no root operator named, nothing could
+  ever reach `/admin/*` or create the first DB user.
+- The asserted identity **replaces** the root template's user/name/email/sub as
+  a block. A proxy that names nobody yields an unattributed actor rather than
+  silently reusing the root username.
+- The tier drops to **user**, so proxied humans do not inherit root capability.
+  Only a caller the proxy names as `[auth].root_username` stays root. "Names
+  somebody" covers any asserted identity field: an ingress that forwards only
+  the subject claim (no `preferred_username`, so no `X-Memory-Actor-User`) has
+  named a human who can never match `root_username`, and resolves at the user
+  tier. Only a request asserting no identity at all stays root.
+- Setting the secret without `bearer_token` logs a warning and does nothing.
+
+## Ownership of handoffs and sessions
+
+Handoffs and sessions record the operator they belong to (`owner_user` /
+`actor_user`). On a shared server this stops one operator's pending handoff
+from being delivered to — and consumed by — the next session to start, whoever
+it belongs to.
+
+- A `NULL` owner means **shared with the project**: every row written before
+  ownership existed, and anything written without an authenticated actor, stays
+  visible to everyone.
+- **An owner is only stamped where the deployment distinguishes operators.**
+  Single-operator servers are unaffected even when they name their operator via
+  `[auth].root_username`: with no `users` rows and no proxy secret there is
+  nobody to separate, and stamping the one name would separate that operator's
+  *transports* instead — HTTP requests carry the name, while the stdio /
+  in-process MCP transport and the local CLI carry no actor at all and would
+  stop seeing what the HTTP side wrote. Reads are deliberately **not** gated the
+  same way, so a row stamped while the deployment did distinguish operators
+  stays readable by that operator afterwards.
+- The owner is the identity the request names, which is the username when there
+  is one and the asserted subject claim otherwise — the same rule that decides
+  the auth tier, so a proxy that forwards only `X-Memory-Actor-Sub` gets real
+  per-operator isolation rather than one shared bucket.
+- `memory_handoff_begin` takes `shared: true` to publish a baton deliberately.
+- `memory_handoff_accept` / `memory_handoff_cancel` take `any_owner: true` to
+  act on somebody else's baton; that opt-out requires admin authority in
+  multi-user mode.
+- `ai-memory finalize-session --all-owners` does the same for sessions, and
+  `GET /admin/open-sessions?all_owners=true` is the underlying switch.
+- `memory_forget_sweep` requires admin authority in multi-user mode: it removes
+  page versions permanently. It does fire the `forget_sweep` admission op, but
+  the chain only refuses when an operator configured a reject-policy webhook for
+  it, so it cannot stand in for the capability gate.
+- The read-only handoff listing (`GET
+  /api/v1/workspaces/{ws}/projects/{p}/handoffs`) serves its prompt-derived
+  fields — `summary`, `open_questions`, `next_steps` — to a caller the server
+  can name (their own rows plus the shared ones) and to the root operator, who
+  reads every page body through the wiki API anyway. A caller an authenticating
+  server can place as neither gets the metadata with `redacted: true`. A server
+  with no auth configured is unaffected: it already serves every page body
+  unauthenticated.
+
+"Multi-user mode" here means *the deployment distinguishes operators*: either
+`users` rows exist, or `[auth].actor_proxy_secret` is configured. A trusted
+proxy never writes a `users` row, so counting only rows would leave every
+proxied caller on the single-operator escape hatch that waves admin through.
+One question, every gate: the MCP admin tools, the `/admin/*` route layer, the
+ownership stamped on handoffs and sessions, and the per-operator bucketing of
+pending auto-improvement proposals all ask it.
+
+## Other per-operator state
+
+The same "absent means shared" rule extends to three more places, so a
+single-operator server behaves exactly as it always has:
+
+- **Memory slots.** `_slots/current-focus.md` is injected into every operator's
+  context; `_slots/<user>/current-focus.md` is injected only into that
+  operator's. What the feature scopes is INJECTION, not access: a slot is an
+  ordinary wiki page, so `memory_read_page`, `memory_query` and
+  `memory_explore` return anyone's slot body to anyone who names its path, the
+  same as every other page on the server. Every slot written before this is
+  unnamespaced, therefore shared. `[slots] per_user`
+  (default off) is the switch for the whole regime: with it ON the engine
+  namespaces the slots it writes, session briefs and consolidation prompts show
+  you the shared slots plus your own, and writing into someone else's namespace
+  is refused (admins may still curate) — including a page the consolidator
+  proposes, since that path comes from the model and anything reaching your
+  observations can dictate it; such an update is skipped and reported back
+  rather than re-homed. Every door onto a slot answers the same way, because a
+  rule that holds at two doors of three holds nowhere: a `memory_write_page`
+  call naming the SHARED slot is namespaced into your own prefix, exactly as
+  the engine would (the response reports the path the page actually got), and an
+  auto-improvement proposal that targets a slot is namespaced to the operator
+  whose SESSION produced it — a proposal body is model output from one session,
+  and a slot body is injected verbatim into a brief. With it OFF a nested slot
+  path means nothing in particular — every
+  slot goes into every brief, exactly as before the feature existed — so
+  turning it back off makes personal slots visible to everyone again rather
+  than stranding them.
+
+  The `<user>` segment is whatever names you on this server — your username
+  when there is one, otherwise the `sub` an OIDC-terminating ingress forwards,
+  the same key that owns your handoffs and sessions. One consequence is worth
+  stating: a subject that cannot be a path segment (an issuer URL, say) cannot
+  own a namespace, so with the feature ON your slot writes are REFUSED rather
+  than dropped onto the shared slot every other operator reads. If your ingress
+  forwards subjects of that shape, forward a `preferred_username` beside it (see
+  `X-Memory-Actor-User` above) before turning `[slots] per_user` on. A username
+  always wins over a subject, so adding one later does not re-bucket the slots
+  already written under it.
+
+  One gap is deliberate and documented rather than closed: `ai-memory bootstrap`
+  writes pages at paths the model picks from the repository's own README, docs
+  and code, with no operator to attribute them to, so a repo carrying injected
+  instructions can make it write a `_slots/…` page. It is an admin-only
+  operation on a repository the admin chose to ingest, and the behaviour is the
+  same with the flag off; review `bootstrap.md` — it lists every path written.
+- **Auto-improvement proposals.** Each records the operator who staged it (the
+  actor username, so proxy-asserted humans count too, and it shows up on the
+  proposal detail and its `_pending/auto-improve/<id>.md` sidecar), and the "one
+  pending proposal per page" rule applies per operator, so they stop blocking
+  each other. Only where the deployment distinguishes operators, though:
+  elsewhere proposals stay unattributed and the original one-per-page rule holds
+  unchanged. A scheduled run has no caller, so it is attributed to the operator
+  of the session it reviewed; the telemetry report and the curator describe the
+  project rather than a person and stay unattributed, so they neither block nor
+  are blocked by any named operator's pending proposal for the same page.
+
+  That attribution is also what decides where a slot proposal goes with
+  `[slots] per_user` on, and it has to be decided at staging: an approval is
+  bound to the proposal's recorded target page and the snapshot taken of it at
+  staging, so nothing can re-home it later. The reviewer is allowed to name
+  `_slots/current-focus.md` and only that, so with the feature on the proposal is
+  rewritten to `_slots/<staging operator>/current-focus.md` and approval accepts
+  exactly that target — whoever approves, including the unattended scheduler,
+  which is nobody. A slot proposal that cannot be attributed to an operator is
+  refused rather than left on the shared slot: `_slots/current-focus.md` stays
+  readable by everyone, but it is not a destination for one session's output.
+  Refusals cost that one proposal — the run's others still apply — and are
+  reported in the same `skipped` list as a staging collision.
+- **Page reinforcement.** Reads are counted per operator as well as in the
+  shared counter. `[decay] breadth_weight` (default `0.0`) optionally lets a
+  page reinforced by many different people outrank one read repeatedly by a
+  single person — the forget sweep reads the per-page count of distinct
+  operators and feeds it into the retention score. At the default, and for pages
+  with fewer than two distinct readers at any weight, retention scores are
+  unchanged.
 
 ## Implementation contract
 

@@ -55,6 +55,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -101,6 +102,7 @@ fn telemetry_stage_input(
         warnings_json: serde_json::json!([]),
         rejected_candidates_json: serde_json::json!([]),
         config_json: serde_json::json!({}),
+        staged_by_actor_user: None,
         proposal_actor: ActorContext::default(),
         proposals: vec![NewAutoImproveProposal {
             operation: AutoImproveProposalOperation::Create,
@@ -341,6 +343,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             project_id: scratch,
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/alpha-repo")),
+            actor_user: None,
         })
         .await
         .unwrap();
@@ -372,6 +375,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             project_id: scratch,
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/beta-repo")),
+            actor_user: None,
         })
         .await
         .unwrap();

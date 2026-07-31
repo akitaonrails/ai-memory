@@ -1,5 +1,6 @@
 //! `ai-memory auto-improve` — review one session and apply durable wiki edits through the auto-improvement approval path.
 
+use ai_memory_store::SkippedProposal;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +46,12 @@ struct StageResponse {
     warnings: Vec<String>,
     rejected_candidates_count: usize,
     proposals: Vec<ProposalOutcome>,
+    /// Proposals the server staged nothing for, with the reason. Re-declared
+    /// here because `--json` prints THIS struct, not the server's body: a key
+    /// missing from it is dropped by serde and never reaches the operator.
+    /// `default` keeps an older server (which sends no such key) parsing.
+    #[serde(default)]
+    skipped: Vec<SkippedProposal>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -102,28 +109,105 @@ pub async fn run(config: &Config, args: AutoImproveArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
-        if response.approval_required {
-            println!(
-                "Staged auto-improve run {} for manual approval",
-                response.run_id
-            );
-        } else {
-            println!("Auto-approved auto-improve run {}", response.run_id);
-        }
-        println!("Approval policy: {}", response.approval_policy);
-        for proposal in &response.proposals {
-            if let Some(page_id) = &proposal.page_id {
-                println!(
-                    "  - {} [{}] page {} ({})",
-                    proposal.id, proposal.status, page_id, proposal.sidecar_path
-                );
-            } else {
-                println!(
-                    "  - {} [{}] ({})",
-                    proposal.id, proposal.status, proposal.sidecar_path
-                );
-            }
-        }
+        println!("{}", render_human(&response));
     }
     Ok(())
+}
+
+fn render_human(response: &StageResponse) -> String {
+    let mut lines = Vec::new();
+    if response.approval_required {
+        lines.push(format!(
+            "Staged auto-improve run {} for manual approval",
+            response.run_id
+        ));
+    } else {
+        lines.push(format!(
+            "Auto-approved auto-improve run {}",
+            response.run_id
+        ));
+    }
+    lines.push(format!("Approval policy: {}", response.approval_policy));
+    for proposal in &response.proposals {
+        if let Some(page_id) = &proposal.page_id {
+            lines.push(format!(
+                "  - {} [{}] page {} ({})",
+                proposal.id, proposal.status, page_id, proposal.sidecar_path
+            ));
+        } else {
+            lines.push(format!(
+                "  - {} [{}] ({})",
+                proposal.id, proposal.status, proposal.sidecar_path
+            ));
+        }
+    }
+    lines.extend(super::skipped_proposal_lines(&response.skipped));
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire(skipped: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "run_id": "run-1",
+            "approval_required": true,
+            "approval_policy": "manual",
+            "session_id": "sess-1",
+            "summary": "one durable procedure",
+            "warnings": [],
+            "rejected_candidates_count": 0,
+            "proposals": [],
+            "skipped": skipped,
+        })
+    }
+
+    #[test]
+    fn skipped_survives_the_response_round_trip_into_json_output() {
+        let response: StageResponse = serde_json::from_value(wire(serde_json::json!([{
+            "target_path": "procedures/release.md",
+            "reason": "a proposal is already pending review for this path",
+        }])))
+        .expect("server body parses");
+
+        // `--json` prints this struct, so the assertion has to be on what the
+        // struct serialises back to, not on what arrived.
+        let printed = serde_json::to_value(&response).expect("re-serialise");
+        assert_eq!(
+            printed["skipped"][0]["target_path"], "procedures/release.md",
+            "--json dropped the skipped proposals: {printed}"
+        );
+        assert_eq!(
+            printed["skipped"][0]["reason"],
+            "a proposal is already pending review for this path"
+        );
+    }
+
+    #[test]
+    fn skipped_reaches_human_output_too() {
+        let response: StageResponse = serde_json::from_value(wire(serde_json::json!([{
+            "target_path": "procedures/release.md",
+            "reason": "a proposal is already pending review for this path",
+        }])))
+        .expect("server body parses");
+        let human = render_human(&response);
+        assert!(human.contains("procedures/release.md"), "{human}");
+        assert!(human.contains("already pending review"), "{human}");
+    }
+
+    #[test]
+    fn a_clean_run_prints_no_skipped_section() {
+        let response: StageResponse =
+            serde_json::from_value(wire(serde_json::json!([]))).expect("server body parses");
+        assert!(!render_human(&response).contains("Skipped"));
+    }
+
+    #[test]
+    fn a_server_without_the_field_still_parses() {
+        let mut body = wire(serde_json::json!([]));
+        body.as_object_mut().unwrap().remove("skipped");
+        let response: StageResponse = serde_json::from_value(body).expect("older server body");
+        assert!(response.skipped.is_empty());
+    }
 }

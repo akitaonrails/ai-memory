@@ -57,6 +57,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -86,6 +87,7 @@ async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminSt
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -467,6 +469,7 @@ async fn move_project_carries_source_embedding() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
 
     // Seed source page (gets a synthetic embedding on write).
@@ -595,6 +598,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
             project_id: src_proj,
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
+            actor_user: None,
         })
         .await
         .unwrap();
@@ -754,6 +758,7 @@ async fn true_move_notifies_admission_with_destination_names() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
 
@@ -808,6 +813,7 @@ async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     (state, store)
 }
@@ -1035,6 +1041,7 @@ fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     }
 }
 
@@ -1531,6 +1538,7 @@ async fn true_move_aborts_when_admission_rejects() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
 
@@ -1626,6 +1634,7 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     // Pre-seed BOTH sides so move-project takes the copy-purge path (merge
     // into existing dst/proj), not the lossless true-move path.
@@ -1738,6 +1747,7 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
+        trusted_proxy_identity: false,
     };
     // Pre-seed BOTH sides so the move takes the copy-purge (merge) path.
     seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;

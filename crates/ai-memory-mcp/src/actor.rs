@@ -24,7 +24,7 @@
 //! bypass a reject-policy admission webhook by setting a client-controlled
 //! header.
 
-use ai_memory_core::{ActorContext, AuthLevel, Capability, UserId};
+use ai_memory_core::{ActorContext, AuthLevel, UserId};
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
 
@@ -72,6 +72,12 @@ pub fn author_id_from_parts(parts: &Parts) -> Option<UserId> {
     parts.extensions.get::<UserId>().copied()
 }
 
+fn header_value(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(ai_memory_core::SKIP_ADMISSION_CHAIN_HEADER)
+        .and_then(|v| v.to_str().ok())
+}
+
 /// Parse the admission-chain loop-prevention skip list from the
 /// `X-Memory-Skip-Admission-Chain` request header (comma-separated
 /// webhook names). A webhook that writes back into the engine (e.g. via
@@ -82,17 +88,7 @@ pub fn author_id_from_parts(parts: &Parts) -> Option<UserId> {
 /// and empty tokens dropped, so `"a, ,b,"` → `["a", "b"]`.
 #[must_use]
 pub fn skip_webhooks_from_headers(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get("x-memory-skip-admission-chain")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    ai_memory_core::parse_skip_admission_chain(header_value(headers))
 }
 
 /// Parse the skip-list header only for trusted re-entry contexts.
@@ -103,14 +99,7 @@ pub fn skip_webhooks_from_parts(parts: &Parts) -> Vec<String> {
         .get::<AuthLevel>()
         .copied()
         .unwrap_or(AuthLevel::Anonymous);
-    if level
-        .authorize(Capability::SkipAdmissionChain, true)
-        .is_ok()
-    {
-        skip_webhooks_from_headers(&parts.headers)
-    } else {
-        Vec::new()
-    }
+    ai_memory_core::skip_admission_chain_for(level, header_value(&parts.headers))
 }
 
 #[cfg(test)]

@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use ai_memory_core::{
     AgentKind, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffId, HandoffState,
-    ManagedRunId, Observation, ObservationId, ObservationKind, PageId, PagePath, ProjectId,
-    SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
+    ManagedRunId, Observation, ObservationId, ObservationKind, OwnerFilter, PageId, PagePath,
+    ProjectId, SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -1660,26 +1660,42 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         agent_kind: AgentKind,
+        owner_filter: OwnerFilter,
         limit: Option<usize>,
     ) -> StoreResult<Vec<OpenSession>> {
         let agent = agent_kind.as_str().to_string();
         self.with_conn(move |conn| {
             let limit_clause = limit.map_or(String::new(), |n| format!(" LIMIT {}", n.max(1)));
+            // Without the owner predicate this returns whichever session in the
+            // scope started last — frequently a teammate's live one — and the
+            // callers act on it destructively.
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = ?4)",
+                OwnerFilter::Unattributed => " AND actor_user IS NULL",
+            };
             let sql = format!(
                 "SELECT id, cwd FROM sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
-                   AND agent_kind = ?3 AND ended_at IS NULL \
+                   AND agent_kind = ?3 AND ended_at IS NULL{owner_clause} \
                  ORDER BY started_at DESC, id DESC{limit_clause}"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let cwd: Option<String> = row.get(1)?;
-                    Ok((id_bytes, cwd))
-                },
-            )?;
+            let row_map = |row: &rusqlite::Row<'_>| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let cwd: Option<String> = row.get(1)?;
+                Ok((id_bytes, cwd))
+            };
+            let rows = match &owner_filter {
+                OwnerFilter::User(user) => stmt.query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), agent, user],
+                    row_map,
+                )?,
+                _ => stmt.query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
+                    row_map,
+                )?,
+            };
             let mut out = Vec::new();
             for row in rows {
                 let (id_bytes, cwd) = row?;
@@ -1901,6 +1917,30 @@ impl ReaderPool {
             let proj = ProjectId::from_slice(&proj_bytes)
                 .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
             Ok(Some((ws, proj)))
+        })
+        .await
+    }
+
+    /// The operator a session belongs to, as recorded at session start.
+    ///
+    /// The identity carrying a SessionEnd is not necessarily the identity that
+    /// owned the session: a spool drain, an operator finalizing a stuck
+    /// session, or a shared static hook token can all deliver it. Attribution
+    /// for the session's page and the baton it leaves must follow the session,
+    /// not the request.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_actor_user(&self, session_id: SessionId) -> StoreResult<Option<String>> {
+        self.with_conn(move |conn| {
+            let owner: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT actor_user FROM sessions WHERE id = ?1",
+                    params![session_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(owner.flatten())
         })
         .await
     }
@@ -2192,6 +2232,49 @@ impl ReaderPool {
             let mut out = Vec::new();
             for r in rows {
                 out.push(r??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Return the number of DISTINCT operators that reinforced each
+    /// `is_latest = 1` page of a project, for the sweep's breadth term.
+    ///
+    /// Scoped and grouped exactly like [`decay_candidates`](Self::decay_candidates)
+    /// so the sweep pays for one query per run, never one per candidate. Pages
+    /// with no per-operator rows (everything read anonymously, and everything
+    /// that predates `page_access`) are simply absent from the map, which the
+    /// caller reads as breadth 0 — scored identically to breadth 1 by
+    /// [`retention_score_with_breadth`](crate::retention_score_with_breadth).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn access_breadth_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<std::collections::HashMap<PageId, u32>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT pa.page_id, COUNT(DISTINCT pa.actor) \
+                 FROM page_access pa \
+                 JOIN pages p ON p.id = pa.page_id \
+                 WHERE p.workspace_id = ?1 AND p.project_id = ?2 AND p.is_latest = 1 \
+                 GROUP BY pa.page_id",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    let actors: i64 = row.get(1)?;
+                    Ok((id, u32::try_from(actors).unwrap_or(u32::MAX)))
+                },
+            )?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (id, actors) = r?;
+                out.insert(PageId::from_slice(&id)?, actors);
             }
             Ok(out)
         })
@@ -2924,12 +3007,14 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         cwd_filter: Option<String>,
+        owner_filter: OwnerFilter,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
-                        created_at, accepted_by, accepted_at, accepted_by_session \
+                        created_at, accepted_by, accepted_at, accepted_by_session, \
+                        owner_user, accepted_by_user \
                  FROM handoffs \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open' \
                  ORDER BY created_at DESC",
@@ -2941,7 +3026,7 @@ impl ReaderPool {
             let mut selected: Option<Handoff> = None;
             for r in rows {
                 let handoff = r??;
-                if is_handoff_candidate(&handoff, cwd_filter.as_deref())
+                if is_handoff_candidate(&handoff, cwd_filter.as_deref(), &owner_filter)
                     && selected
                         .as_ref()
                         .is_none_or(|current| prefer_handoff(&handoff, current).is_gt())
@@ -2950,6 +3035,71 @@ impl ReaderPool {
                 }
             }
             Ok(selected)
+        })
+        .await
+    }
+
+    /// List a project's handoffs, newest first.
+    ///
+    /// The system had no handoff listing at all: every reader fetched "the
+    /// single open one" and consumed it. That made a mis-delivered or
+    /// prematurely consumed baton unrecoverable and invisible — there was no
+    /// way to ask what happened to it. `state = None` returns every state so an
+    /// operator can find an already-accepted handoff and read it back.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_handoffs(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        state: Option<HandoffState>,
+        owner_filter: OwnerFilter,
+        limit: usize,
+    ) -> StoreResult<Vec<Handoff>> {
+        let state = state.map(|s| s.as_str().to_string());
+        self.with_conn(move |conn| {
+            let state_clause = if state.is_some() {
+                " AND state = ?3"
+            } else {
+                ""
+            };
+            // Push the owner predicate and the limit into SQL rather than
+            // filtering a fully materialised result set in Rust: without them
+            // this reads (and sorts) every handoff the project has ever
+            // accumulated, and the caller's limit provides no protection
+            // because it is applied after the rows are already loaded.
+            // The owner name takes the first index the state filter left free, so
+            // the two optional predicates cannot claim the same slot.
+            let owner_index = if state.is_some() { 4 } else { 3 };
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, owner_index);
+            // Bounded even when the caller asks for a large page.
+            let sql_limit = limit.clamp(1, 500);
+            let sql = format!(
+                "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
+                        cwd, summary, open_questions, next_steps, files_touched, state, \
+                        created_at, accepted_by, accepted_at, accepted_by_session, \
+                        owner_user, accepted_by_user \
+                 FROM handoffs \
+                 WHERE workspace_id = ?1 AND project_id = ?2{state_clause}{owner_clause} \
+                 ORDER BY created_at DESC \
+                 LIMIT {sql_limit}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> =
+                vec![workspace_id.as_bytes(), project_id.as_bytes()];
+            if let Some(state) = state.as_ref() {
+                binds.push(state);
+            }
+            if let Some(owner) = owner_param.as_ref() {
+                binds.push(owner);
+            }
+            let rows = stmt.query_map(binds.as_slice(), row_to_handoff)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row??);
+            }
+            Ok(out)
         })
         .await
     }
@@ -2964,7 +3114,8 @@ impl ReaderPool {
                 .query_row(
                     "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                             cwd, summary, open_questions, next_steps, files_touched, state, \
-                            created_at, accepted_by, accepted_at, accepted_by_session \
+                            created_at, accepted_by, accepted_at, accepted_by_session, \
+                            owner_user, accepted_by_user \
                      FROM handoffs WHERE id = ?1",
                     params![handoff_id.as_bytes()],
                     row_to_handoff,
@@ -2996,11 +3147,24 @@ impl ReaderPool {
     /// small number (5-20) — this is meant to be skimmed, not paged
     /// through.
     ///
+    /// `slot_visibility` decides which `_slots/…` pages the snapshot lists;
+    /// the default rule lists every one of them, as it always did.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     #[allow(clippy::too_many_lines)]
-    pub async fn briefing(&self, recent_pages_limit: usize) -> StoreResult<BriefingSnapshot> {
+    pub async fn briefing(
+        &self,
+        recent_pages_limit: usize,
+        owner_filter: OwnerFilter,
+        slot_visibility: &ai_memory_core::SlotVisibility,
+    ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        // The slot GLOB is the only OPTIONAL bind in these statements, so it
+        // goes LAST in every one of them: a fixed parameter placed after it
+        // would shift by one whenever the visibility rule needs no pattern.
+        let (slot_sql, slot_glob) = slot_visibility_sql(slot_visibility, 2);
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(slot_visibility, 3);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -3028,8 +3192,16 @@ impl ReaderPool {
                 .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                 .map(|ts| ts.to_string());
 
-            let pending_handoff_count: u64 =
-                count(conn, "SELECT COUNT(*) FROM handoffs WHERE state = 'open'")?;
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 1);
+            let mut owner_binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+            if let Some(owner) = owner_param.as_ref() {
+                owner_binds.push(owner);
+            }
+            let pending_handoff_count: u64 = count_bound(
+                conn,
+                &format!("SELECT COUNT(*) FROM handoffs WHERE state = 'open'{owner_clause}"),
+                &owner_binds,
+            )?;
 
             // Rules: any `is_latest = 1` page under `_rules/`.
             // Routed there automatically by the consolidator when
@@ -3052,12 +3224,21 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  WHERE is_latest = 1 AND ({slot_sql}){not_expired} \
                   ORDER BY path ASC",
                 not_expired = not_expired("pages", "?1"),
             ))?;
-            let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(params![now_us], briefing_page_from_row)?
+            // A slot must clear BOTH gates: unexpired, and visible to this
+            // operator. The two rules are independent — an expired slot of
+            // your own is still gone, a live slot of somebody else's is still
+            // not yours.
+            let slot_rows = match slot_glob.as_deref() {
+                Some(glob) => {
+                    slots_stmt.query_map(params![now_us, glob], briefing_page_from_row)?
+                }
+                None => slots_stmt.query_map(params![now_us], briefing_page_from_row)?,
+            };
+            let slots: Vec<BriefingPage> = slot_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3066,13 +3247,19 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE is_latest = 1{not_expired} \
+                 WHERE is_latest = 1 AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?1",
                 not_expired = not_expired("pages", "?2"),
             ))?;
-            let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(params![recent_limit, now_us], briefing_page_from_row)?
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt
+                    .query_map(params![recent_limit, now_us, glob], briefing_page_from_row)?,
+                None => {
+                    recent_stmt.query_map(params![recent_limit, now_us], briefing_page_from_row)?
+                }
+            };
+            let recent_pages: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3095,6 +3282,11 @@ impl ReaderPool {
 
     /// Assemble a project-scoped [`BriefingSnapshot`].
     ///
+    /// `slot_visibility` decides which `_slots/…` pages the snapshot lists.
+    /// Callers that feed a per-operator surface — a session brief, an LLM
+    /// prompt — must pass the rule for that operator; the default lists every
+    /// slot, as it always did.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     #[allow(clippy::too_many_lines)]
@@ -3103,8 +3295,13 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         recent_pages_limit: usize,
+        owner_filter: OwnerFilter,
+        slot_visibility: &ai_memory_core::SlotVisibility,
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        // Glob last, after the expiry cutoff: see `briefing`.
+        let (slot_sql, slot_glob) = slot_visibility_sql(slot_visibility, 4);
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(slot_visibility, 5);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -3154,11 +3351,19 @@ impl ReaderPool {
                 .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                 .map(|ts| ts.to_string());
 
-            let pending_handoff_count = count_project(
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 3);
+            let mut owner_binds: Vec<&dyn rusqlite::ToSql> =
+                vec![workspace_id.as_bytes(), project_id.as_bytes()];
+            if let Some(owner) = owner_param.as_ref() {
+                owner_binds.push(owner);
+            }
+            let pending_handoff_count = count_bound(
                 conn,
-                "SELECT COUNT(*) FROM handoffs WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'",
-                workspace_id,
-                project_id,
+                &format!(
+                    "SELECT COUNT(*) FROM handoffs \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'{owner_clause}"
+                ),
+                &owner_binds,
             )?;
 
             let mut rules_stmt = conn.prepare_cached(&format!(
@@ -3179,12 +3384,27 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND ({slot_sql}){not_expired} \
                   ORDER BY path ASC",
                 not_expired = not_expired("pages", "?3"),
             ))?;
-            let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), now_us], briefing_page_from_row)?
+            // Unexpired AND visible to this operator — independent gates.
+            let slot_rows = match slot_glob.as_deref() {
+                Some(glob) => slots_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        now_us,
+                        glob
+                    ],
+                    briefing_page_from_row,
+                )?,
+                None => slots_stmt.query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), now_us],
+                    briefing_page_from_row,
+                )?,
+            };
+            let slots: Vec<BriefingPage> = slot_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3193,13 +3413,34 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
                 not_expired = not_expired("pages", "?4"),
             ))?;
-            let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit, now_us], briefing_page_from_row)?
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us,
+                        glob
+                    ],
+                    briefing_page_from_row,
+                )?,
+                None => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us
+                    ],
+                    briefing_page_from_row,
+                )?,
+            };
+            let recent_pages: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3241,40 +3482,82 @@ impl ReaderPool {
         project_id: ProjectId,
         core_pages_limit: usize,
         recent_pages_limit: usize,
+        slots: ai_memory_core::SlotVisibility,
     ) -> StoreResult<(Vec<BriefPageBody>, Vec<BriefingPage>)> {
         let core_limit = core_pages_limit.clamp(1, 100) as i64;
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        // Slots namespaced under `_slots/<user>/` belong to that operator once
+        // `[slots] per_user` is on; an unprefixed slot is shared and stays
+        // visible to everyone. With the feature off nothing is filtered at all
+        // — see `slot_visibility_sql`.
+        //
+        // The `pinned = 1` arm has to exclude slots explicitly: every write
+        // path force-pins slot pages, so filtering only the `_slots/*` arm
+        // would change nothing — the personal slots would come straight back
+        // through `pinned`. The slot arm then puts back exactly what the
+        // visibility rule admits, which for the default rule is every slot.
+        //
+        // Both statements bind the expiry cutoff at ?4 and put the optional
+        // glob last, at ?5: the glob disappears from the SQL entirely when the
+        // visibility rule needs no pattern, so a fixed parameter after it would
+        // silently shift by one.
+        let (slot_sql, mine) = slot_visibility_sql(&slots, 5);
+        // The `recent` pointer list below is a separate statement with its own
+        // parameter numbering, so its glob is ?5 there too.
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(&slots, 5);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
+            // The expiry guard sits OUTSIDE the arm group, so it also overrules
+            // the `pinned = 1` arm: a pin means "don't decay this", not "keep
+            // this past the date its author set".
             let core_sql = format!(
                 "SELECT path, title, body, pinned, updated_at \
-                 FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
-                   AND (pinned = 1 OR path GLOB '_rules/*' OR path GLOB '_slots/*') \
-                 ORDER BY pinned DESC, path ASC \
-                 LIMIT ?3",
+                     FROM pages \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
+                       AND ( \
+                             path GLOB '_rules/*' \
+                          OR (pinned = 1 AND path NOT GLOB '_slots/*') \
+                          OR ({slot_sql}) \
+                       ) \
+                     ORDER BY pinned DESC, path ASC \
+                     LIMIT ?3",
                 not_expired = not_expired("pages", "?4"),
             );
             let mut core_stmt = conn.prepare_cached(&core_sql)?;
-            let core: Vec<BriefPageBody> = core_stmt
-                .query_map(
+            // The `?5` placeholder only exists when there is a viewer to match,
+            // so the bindings branch with it.
+            let core_row = |row: &rusqlite::Row<'_>| {
+                let updated_us: i64 = row.get(4)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    updated_us,
+                ))
+            };
+            let core_rows = match mine.as_deref() {
+                Some(mine) => core_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        core_limit,
+                        now_us(),
+                        mine
+                    ],
+                    core_row,
+                )?,
+                None => core_stmt.query_map(
                     params![
                         workspace_id.as_bytes(),
                         project_id.as_bytes(),
                         core_limit,
                         now_us()
                     ],
-                    |row| {
-                        let updated_us: i64 = row.get(4)?;
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)? != 0,
-                            updated_us,
-                        ))
-                    },
-                )?
+                    core_row,
+                )?,
+            };
+            let core: Vec<BriefPageBody> = core_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(|(path, title, body, pinned, updated_us)| {
@@ -3298,13 +3581,24 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
                 not_expired = not_expired("pages", "?4"),
             ))?;
-            let recent: Vec<BriefingPage> = recent_stmt
-                .query_map(
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us(),
+                        glob
+                    ],
+                    briefing_page_from_row,
+                )?,
+                None => recent_stmt.query_map(
                     params![
                         workspace_id.as_bytes(),
                         project_id.as_bytes(),
@@ -3312,7 +3606,9 @@ impl ReaderPool {
                         now_us()
                     ],
                     briefing_page_from_row,
-                )?
+                )?,
+            };
+            let recent: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3330,20 +3626,36 @@ impl ReaderPool {
     pub async fn latest_open_handoff_for_workspace(
         &self,
         workspace_id: WorkspaceId,
+        owner_filter: OwnerFilter,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
-            let row_opt = conn
-                .query_row(
-                    "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
-                            cwd, summary, open_questions, next_steps, files_touched, state, \
-                            created_at, accepted_by, accepted_at, accepted_by_session \
-                     FROM handoffs \
-                     WHERE workspace_id = ?1 AND state = 'open' \
-                     ORDER BY created_at DESC LIMIT 1",
-                    params![workspace_id.as_bytes()],
-                    row_to_handoff,
-                )
-                .optional()?;
+            // The owner predicate is pushed into SQL (rather than filtered after
+            // the fact like the project-scoped lookup) because this query keeps
+            // its `LIMIT 1`: filtering afterwards would return nothing whenever
+            // the newest open handoff in the workspace happened to belong to
+            // somebody else.
+            let owner_clause = match &owner_filter {
+                OwnerFilter::Any => "",
+                OwnerFilter::User(_) => " AND (owner_user IS NULL OR owner_user = ?2)",
+                OwnerFilter::Unattributed => " AND owner_user IS NULL",
+            };
+            let sql = format!(
+                "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
+                        cwd, summary, open_questions, next_steps, files_touched, state, \
+                        created_at, accepted_by, accepted_at, accepted_by_session, \
+                        owner_user, accepted_by_user \
+                 FROM handoffs \
+                 WHERE workspace_id = ?1 AND state = 'open'{owner_clause} \
+                 ORDER BY created_at DESC LIMIT 1"
+            );
+            let row_opt = match &owner_filter {
+                OwnerFilter::User(user) => conn
+                    .query_row(&sql, params![workspace_id.as_bytes(), user], row_to_handoff)
+                    .optional()?,
+                _ => conn
+                    .query_row(&sql, params![workspace_id.as_bytes()], row_to_handoff)
+                    .optional()?,
+            };
             row_opt.transpose()
         })
         .await
@@ -3403,7 +3715,8 @@ impl ReaderPool {
     /// workspace.
     ///
     /// Mirrors [`ReaderPool::briefing_for_project`] but scopes every query
-    /// to the workspace only (no `project_id` filter).
+    /// to the workspace only (no `project_id` filter), including the same
+    /// `slot_visibility` rule.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -3411,8 +3724,13 @@ impl ReaderPool {
         &self,
         workspace_id: WorkspaceId,
         recent_pages_limit: usize,
+        owner_filter: OwnerFilter,
+        slot_visibility: &ai_memory_core::SlotVisibility,
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        // Glob last, after the expiry cutoff: see `briefing`.
+        let (slot_sql, slot_glob) = slot_visibility_sql(slot_visibility, 3);
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(slot_visibility, 4);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -3458,10 +3776,18 @@ impl ReaderPool {
                 .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                 .map(|ts| ts.to_string());
 
-            let pending_handoff_count = count_workspace(
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 2);
+            let mut owner_binds: Vec<&dyn rusqlite::ToSql> = vec![workspace_id.as_bytes()];
+            if let Some(owner) = owner_param.as_ref() {
+                owner_binds.push(owner);
+            }
+            let pending_handoff_count = count_bound(
                 conn,
-                "SELECT COUNT(*) FROM handoffs WHERE workspace_id = ?1 AND state = 'open'",
-                workspace_id,
+                &format!(
+                    "SELECT COUNT(*) FROM handoffs \
+                     WHERE workspace_id = ?1 AND state = 'open'{owner_clause}"
+                ),
+                &owner_binds,
             )?;
 
             let mut rules_stmt = conn.prepare_cached(&format!(
@@ -3485,15 +3811,22 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND ({slot_sql}){not_expired} \
                   ORDER BY path ASC",
                 not_expired = not_expired("pages", "?2"),
             ))?;
-            let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(
+            // Unexpired AND visible to this operator — independent gates.
+            let slot_rows = match slot_glob.as_deref() {
+                Some(glob) => slots_stmt.query_map(
+                    params![workspace_id.as_bytes(), now_us, glob],
+                    briefing_page_from_row,
+                )?,
+                None => slots_stmt.query_map(
                     params![workspace_id.as_bytes(), now_us],
                     briefing_page_from_row,
-                )?
+                )?,
+            };
+            let slots: Vec<BriefingPage> = slot_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3502,16 +3835,22 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND is_latest = 1{not_expired} \
+                 WHERE workspace_id = ?1 AND is_latest = 1 AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?2",
                 not_expired = not_expired("pages", "?3"),
             ))?;
-            let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt.query_map(
+                    params![workspace_id.as_bytes(), recent_limit, now_us, glob],
+                    briefing_page_from_row,
+                )?,
+                None => recent_stmt.query_map(
                     params![workspace_id.as_bytes(), recent_limit, now_us],
                     briefing_page_from_row,
-                )?
+                )?,
+            };
+            let recent_pages: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -4491,7 +4830,8 @@ impl ReaderPool {
                             target_body_sha256_at_stage, target_updated_at_at_stage, \
                             decision_reason, decided_by_author_id, decided_by_actor_json, \
                             applied_page_id, checkpoint, edit_mode, patch_json, \
-                            expected_base_body_sha256, materialized_base_body_sha256 \
+                            expected_base_body_sha256, materialized_base_body_sha256, \
+                            staged_by_actor_user \
                      FROM auto_improve_proposals \
                      WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
                     params![
@@ -4551,6 +4891,7 @@ impl ReaderPool {
                                 .map_err(to_sql_err)?,
                             materialized_base_body_sha256: opt_bytes32(row.get(29)?)
                                 .map_err(to_sql_err)?,
+                            staged_by_actor_user: row.get(30)?,
                             events: Vec::new(),
                         })
                     },
@@ -5348,6 +5689,31 @@ impl ReaderPool {
         self.with_conn(crate::users::users_exist).await
     }
 
+    /// Does this deployment tell its operators apart?
+    ///
+    /// Two independent routes produce distinct operators: rows in `users`, and
+    /// usernames asserted by a trusted authenticating proxy. Only the first is
+    /// visible from the store, so the caller passes the second in — a
+    /// proxy-only deployment reports `users_exist() == false` forever.
+    ///
+    /// One notion, several gates: the admin authorization boundaries and the
+    /// per-author bucketing of pending auto-improve proposals all key on this,
+    /// so a single-operator server keeps the exact behaviour it had before
+    /// either route existed.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error so callers can fail closed.
+    pub async fn distinguishes_operators(&self, trusted_proxy_identity: bool) -> StoreResult<bool> {
+        // Short-circuits the DB round-trip when the static config bit already
+        // settles it. The users table is otherwise consulted per call rather
+        // than cached, so committing a first user tightens access without a
+        // restart.
+        if trusted_proxy_identity {
+            return Ok(true);
+        }
+        self.users_exist().await
+    }
+
     /// Return the last successful global maintenance completion for `job`.
     pub async fn maintenance_job_last_success(
         &self,
@@ -5794,7 +6160,104 @@ pub(crate) fn cwd_within(ancestor: &str, descendant: &str) -> bool {
     d.starts_with(a.as_ref()) && d.as_bytes().get(a.len()) == Some(&b'/')
 }
 
-fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>) -> bool {
+/// SQL fragment restricting a handoff query to what `filter` can actually see,
+/// plus the owner name it expects bound at `?{param_index}` — the first free
+/// positional parameter of the statement it is spliced into.
+///
+/// The count and the fetch must agree: a briefing that advertises a pending
+/// baton the same caller cannot retrieve is worse than no count at all, because
+/// the agent keeps asking for something that will always come back empty.
+///
+/// The name is BOUND, never interpolated. It is not a validated identifier: on a
+/// server behind a trusted proxy it is whatever `X-Memory-Actor-Sub` carried —
+/// an OIDC subject the engine never parses — so nothing upstream constrains its
+/// characters. Same reason [`slot_visibility_sql`] binds its GLOB.
+fn handoff_owner_sql(filter: &OwnerFilter, param_index: usize) -> (String, Option<String>) {
+    match filter {
+        OwnerFilter::Any => (String::new(), None),
+        OwnerFilter::Unattributed => (" AND owner_user IS NULL".to_string(), None),
+        OwnerFilter::User(user) => (
+            format!(" AND (owner_user IS NULL OR owner_user = ?{param_index})"),
+            Some(user.clone()),
+        ),
+    }
+}
+
+/// SQL predicate selecting the slot pages `visibility` admits over a `path`
+/// column, plus the `GLOB` pattern it expects bound at `?{param_index}` — the
+/// first free positional parameter of the statement it is spliced into.
+///
+/// One rule, one implementation: the session brief and every briefing snapshot
+/// go through this, so a viewer predicate cannot be right on one read path and
+/// missing on the next. Note what [`SlotVisibility::All`] produces — the bare
+/// pre-feature pattern, with no nesting exclusion — because with `[slots]
+/// per_user` off a page like `_slots/backend/context.md` is an ordinary shared
+/// slot that a brief must keep showing.
+fn slot_visibility_sql(
+    visibility: &ai_memory_core::SlotVisibility,
+    param_index: usize,
+) -> (String, Option<String>) {
+    if !visibility.hides_other_namespaces() {
+        return ("path GLOB '_slots/*'".to_string(), None);
+    }
+    match visibility.own_namespace() {
+        Some(user) => (
+            format!(
+                "path GLOB '_slots/*' AND (path NOT GLOB '_slots/*/*' OR path GLOB ?{param_index})"
+            ),
+            Some(format!("{}{user}/*", ai_memory_core::SLOT_PREFIX)),
+        ),
+        // Nobody to attribute the request to: the shared slots, and nothing
+        // that belongs to a named operator.
+        None => (
+            "path GLOB '_slots/*' AND path NOT GLOB '_slots/*/*'".to_string(),
+            None,
+        ),
+    }
+}
+
+/// The same visibility rule as [`slot_visibility_sql`], phrased for a query
+/// that selects pages GENERALLY rather than slots specifically.
+///
+/// The briefing queries return two lists: a `slots` array, filtered by
+/// [`slot_visibility_sql`], and a `recent_pages` pointer list of every recently
+/// touched page. Filtering only the first leaks the second: a personal slot is
+/// still a page, so another operator's `_slots/<user>/…` path and title arrive
+/// in the pointer list and get rendered into the session brief. Bodies stay
+/// withheld, but a path and a title are already somebody's working context.
+///
+/// So this admits everything that is not a slot at all, plus the slots the
+/// viewer may see — i.e. it excludes exactly the namespaced slots belonging to
+/// somebody else. With the feature off it admits everything, so the pointer
+/// list is byte-identical to what it was before slots could be namespaced.
+fn slot_exclusion_sql(
+    visibility: &ai_memory_core::SlotVisibility,
+    param_index: usize,
+) -> (String, Option<String>) {
+    if !visibility.hides_other_namespaces() {
+        return ("1".to_string(), None);
+    }
+    match visibility.own_namespace() {
+        Some(user) => (
+            format!("(path NOT GLOB '_slots/*/*' OR path GLOB ?{param_index})"),
+            Some(format!("{}{user}/*", ai_memory_core::SLOT_PREFIX)),
+        ),
+        // Nobody to attribute the request to: no namespaced slot is theirs.
+        None => ("path NOT GLOB '_slots/*/*'".to_string(), None),
+    }
+}
+
+fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>, owner_filter: &OwnerFilter) -> bool {
+    // Ownership is checked FIRST, before the manual short-circuit below.
+    // Order matters: a manual handoff is project-wide by cwd, so checking the
+    // owner afterwards would let one operator's `memory_handoff_begin` be
+    // claimed by the next session to start, whoever it belongs to — the exact
+    // cross-operator mixing this filter exists to stop. Handoffs with no owner
+    // (every pre-V39 row, and anything written without an actor) stay visible
+    // to everyone, which preserves single-operator behaviour untouched.
+    if !owner_filter.admits(h.owner_user.as_deref()) {
+        return false;
+    }
     // Manual handoffs (memory_handoff_begin always sets from_session_id = None)
     // are project-wide and always candidates, whatever cwd they carry. Only auto
     // SessionEnd handoffs are cwd-path-boundary scoped. This makes "a manual
@@ -5871,10 +6334,15 @@ fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
 fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Option<Handoff> {
     candidates
         .into_iter()
-        .filter(|h| is_handoff_candidate(h, cwd_filter))
+        .filter(|h| is_handoff_candidate(h, cwd_filter, &OwnerFilter::Any))
         .max_by(prefer_handoff)
 }
 
+/// Build a [`Handoff`] from a row selected with [`HANDOFF_COLUMNS`].
+///
+/// Reading the row here (instead of destructuring it into a long positional
+/// argument list) keeps the column order defined in exactly one place next to
+/// the `SELECT` that produces it.
 fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {
     let id_bytes: Vec<u8> = row.get(0)?;
     let ws_bytes: Vec<u8> = row.get(1)?;
@@ -5892,85 +6360,53 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
     let accepted_by: Option<String> = row.get(13)?;
     let accepted_at_us: Option<i64> = row.get(14)?;
     let accepted_by_session_bytes: Option<Vec<u8>> = row.get(15)?;
-    Ok(materialise_handoff(
-        id_bytes,
-        ws_bytes,
-        pj_bytes,
-        from_session_bytes,
-        from_agent,
-        to_agent,
-        cwd,
-        summary,
-        open_q_json,
-        next_s_json,
-        files_json,
-        state,
-        created_us,
-        accepted_by,
-        accepted_at_us,
-        accepted_by_session_bytes,
-    ))
-}
+    let owner_user: Option<String> = row.get(16)?;
+    let accepted_by_user: Option<String> = row.get(17)?;
 
-#[allow(clippy::too_many_arguments)]
-fn materialise_handoff(
-    id_bytes: Vec<u8>,
-    ws_bytes: Vec<u8>,
-    pj_bytes: Vec<u8>,
-    from_session_bytes: Option<Vec<u8>>,
-    from_agent: String,
-    to_agent: Option<String>,
-    cwd: Option<String>,
-    summary: String,
-    open_q_json: String,
-    next_s_json: String,
-    files_json: String,
-    state: String,
-    created_us: i64,
-    accepted_by: Option<String>,
-    accepted_at_us: Option<i64>,
-    accepted_by_session_bytes: Option<Vec<u8>>,
-) -> StoreResult<Handoff> {
-    let open_questions: Vec<String> = serde_json::from_str(&open_q_json)?;
-    let next_steps: Vec<String> = serde_json::from_str(&next_s_json)?;
-    let files_touched: Vec<String> = serde_json::from_str(&files_json)?;
-    let from_session = from_session_bytes
-        .as_deref()
-        .map(SessionId::from_slice)
-        .transpose()?;
-    let accepted_session = accepted_by_session_bytes
-        .as_deref()
-        .map(SessionId::from_slice)
-        .transpose()?;
-    Ok(Handoff {
-        id: HandoffId::from_slice(&id_bytes)?,
-        workspace_id: WorkspaceId::from_slice(&ws_bytes)?,
-        project_id: ProjectId::from_slice(&pj_bytes)?,
-        from_session_id: from_session,
-        from_agent: parse_agent(&from_agent),
-        to_agent: to_agent.as_deref().map(parse_agent),
-        cwd,
-        summary,
-        open_questions,
-        next_steps,
-        files_touched,
-        state: state.parse::<HandoffState>().map_err(StoreError::from)?,
-        created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
-            StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
-                "bad created_at: {e}"
-            )))
-        })?,
-        accepted_by: accepted_by.as_deref().map(parse_agent),
-        accepted_at: accepted_at_us
-            .map(jiff::Timestamp::from_microsecond)
-            .transpose()
-            .map_err(|e| {
+    Ok((|| {
+        let open_questions: Vec<String> = serde_json::from_str(&open_q_json)?;
+        let next_steps: Vec<String> = serde_json::from_str(&next_s_json)?;
+        let files_touched: Vec<String> = serde_json::from_str(&files_json)?;
+        let from_session = from_session_bytes
+            .as_deref()
+            .map(SessionId::from_slice)
+            .transpose()?;
+        let accepted_session = accepted_by_session_bytes
+            .as_deref()
+            .map(SessionId::from_slice)
+            .transpose()?;
+        Ok(Handoff {
+            id: HandoffId::from_slice(&id_bytes)?,
+            workspace_id: WorkspaceId::from_slice(&ws_bytes)?,
+            project_id: ProjectId::from_slice(&pj_bytes)?,
+            from_session_id: from_session,
+            from_agent: parse_agent(&from_agent),
+            to_agent: to_agent.as_deref().map(parse_agent),
+            cwd,
+            summary,
+            open_questions,
+            next_steps,
+            files_touched,
+            state: state.parse::<HandoffState>().map_err(StoreError::from)?,
+            created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
                 StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
-                    "bad accepted_at: {e}"
+                    "bad created_at: {e}"
                 )))
             })?,
-        accepted_by_session: accepted_session,
-    })
+            accepted_by: accepted_by.as_deref().map(parse_agent),
+            accepted_at: accepted_at_us
+                .map(jiff::Timestamp::from_microsecond)
+                .transpose()
+                .map_err(|e| {
+                    StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                        "bad accepted_at: {e}"
+                    )))
+                })?,
+            accepted_by_session: accepted_session,
+            owner_user,
+            accepted_by_user,
+        })
+    })())
 }
 
 fn parse_agent(s: &str) -> AgentKind {
@@ -5978,7 +6414,17 @@ fn parse_agent(s: &str) -> AgentKind {
 }
 
 fn count(conn: &Connection, sql: &str) -> StoreResult<u64> {
-    let n: Option<i64> = conn.query_row(sql, [], |row| row.get(0)).optional()?;
+    count_bound(conn, sql, &[])
+}
+
+/// `COUNT(*)` with an explicit parameter list.
+///
+/// The scope-less [`count`] and the scoped `count_project` / `count_workspace`
+/// helpers each bind a fixed shape; a predicate spliced in by the caller (the
+/// handoff owner filter) adds one more parameter to whichever shape it lands in,
+/// so it needs a helper that takes the whole list.
+fn count_bound(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> StoreResult<u64> {
+    let n: Option<i64> = conn.query_row(sql, params, |row| row.get(0)).optional()?;
     Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
 }
 
@@ -6242,6 +6688,8 @@ mod tests {
             accepted_by: None,
             accepted_at: None,
             accepted_by_session: None,
+            owner_user: None,
+            accepted_by_user: None,
         }
     }
 
@@ -6440,6 +6888,7 @@ mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                owner_user: None,
             })
             .await
             .unwrap();
@@ -6456,13 +6905,19 @@ mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                owner_user: None,
             })
             .await
             .unwrap();
 
         let handoff = store
             .reader
-            .latest_open_handoff(ws_a, proj_a, Some("/repo".into()))
+            .latest_open_handoff(
+                ws_a,
+                proj_a,
+                Some("/repo".into()),
+                ai_memory_core::OwnerFilter::Any,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -6500,6 +6955,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: Some(cwd.into()),
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -6516,6 +6972,7 @@ mod tests {
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],
+                    owner_user: None,
                 })
                 .await
                 .unwrap()
@@ -6542,7 +6999,12 @@ mod tests {
 
         let selected = store
             .reader
-            .latest_open_handoff(ws, proj, Some("/repo/api/src".into()))
+            .latest_open_handoff(
+                ws,
+                proj,
+                Some("/repo/api/src".into()),
+                ai_memory_core::OwnerFilter::Any,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -6563,6 +7025,7 @@ mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                owner_user: None,
             })
             .await
             .unwrap();
@@ -6572,6 +7035,8 @@ mod tests {
                 selected.id,
                 AgentKind::Codex,
                 None,
+                None,
+                ai_memory_core::OwnerFilter::Any,
                 Some("/repo/api/src".into()),
             )
             .await

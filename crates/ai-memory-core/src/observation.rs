@@ -148,6 +148,10 @@ pub struct NewSession {
     pub agent_kind: AgentKind,
     /// Working directory at session start.
     pub cwd: Option<PathBuf>,
+    /// Operator this session belongs to. `None` (no authenticated actor) keeps
+    /// the session shared, which is the single-operator behaviour.
+    #[serde(default)]
+    pub actor_user: Option<String>,
 }
 
 #[cfg(test)]

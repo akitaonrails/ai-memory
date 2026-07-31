@@ -296,6 +296,55 @@ pages. No LLM, deterministic.
 ```http
 GET /api/v1/workspaces/{workspace}/overview?limit=10
 GET /api/v1/workspaces/{workspace}/projects/{project}/overview?limit=10
+GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs?state=open&limit=50
+```
+
+### Handoff listing
+
+`state` accepts `open` | `accepted` | `expired`; omit it to list every state,
+which is how you find a baton that was already consumed. Results are scoped by
+owner: an authenticated caller sees their own plus the shared handoffs, an
+anonymous browser sees only shared ones — an owned handoff (and the prompt-
+derived text inside it) is never rendered to someone it does not belong to.
+The same scoping applies to the `handoff` field of both overview endpoints and
+to `pending_handoff_count`, so the count and the fetch always agree.
+
+On a server that authenticates, the listing's prompt-derived fields —
+`summary`, `open_questions`, `next_steps` — are served to a caller the server
+can name and to the root operator; an automatic handoff synthesises them
+verbatim from the operator's prompts, and the listing returns the project's
+whole history rather than the single newest open row. A caller that is neither
+named nor root gets the fields absent and `redacted` set to `true`; the metadata
+(state, timestamps, agent, cwd, touched files, ownership) is always served. A
+server with no auth configured serves the bodies, since it already serves every
+page body unauthenticated.
+
+"Can name" means the identity the auth tier itself resolved: the username when
+one was forwarded, otherwise the asserted subject claim. An ingress that
+terminates OIDC and forwards only `X-Memory-Actor-Sub` therefore reads its own
+handoffs and the shared ones with `redacted: false`, and no rung of the auth
+chain produces an authenticated-but-unnameable caller today — the redacting arm
+is a fail-safe floor, not a live tier.
+
+```json
+{
+  "handoffs": [
+    {
+      "id": "01930…",
+      "agent": "claude-code",
+      "at": "2026-07-28T12:00:00Z",
+      "state": "accepted",
+      "summary": "…",
+      "open_questions": [],
+      "next_steps": [],
+      "redacted": false,
+      "files_touched": [],
+      "owner": "alice",
+      "accepted_by": "alice",
+      "accepted_at": "2026-07-28T13:00:00Z"
+    }
+  ]
+}
 ```
 
 Bundles what a frontend usually needs on its home view in one round-trip.

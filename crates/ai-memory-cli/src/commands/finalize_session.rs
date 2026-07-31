@@ -56,7 +56,15 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let sessions = fetch_open_sessions(&endpoint, &workspace, &project, agent, args.all).await?;
+    let sessions = fetch_open_sessions(
+        &endpoint,
+        &workspace,
+        &project,
+        agent,
+        args.all,
+        args.all_owners,
+    )
+    .await?;
     if sessions.is_empty() {
         return print_report(args, workspace, project, agent, Vec::new());
     }
@@ -91,8 +99,10 @@ async fn fetch_open_sessions(
     project: &str,
     agent: AgentKind,
     all: bool,
+    all_owners: bool,
 ) -> Result<Vec<OpenSessionEntry>> {
     let all = if all { "true" } else { "false" };
+    let all_owners = if all_owners { "true" } else { "false" };
     let result = get_json::<OpenSessionsResponse>(
         endpoint,
         "/admin/open-sessions",
@@ -101,6 +111,7 @@ async fn fetch_open_sessions(
             ("project", project),
             ("agent", agent.as_str()),
             ("all", all),
+            ("all_owners", all_owners),
         ],
     )
     .await;
@@ -269,6 +280,7 @@ mod tests {
                     project_id,
                     agent_kind: agent,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -276,7 +288,13 @@ mod tests {
 
         let selected = store
             .reader
-            .open_sessions_for_scope_agent(ws, target, AgentKind::AntigravityCli, Some(1))
+            .open_sessions_for_scope_agent(
+                ws,
+                target,
+                AgentKind::AntigravityCli,
+                ai_memory_core::OwnerFilter::Any,
+                Some(1),
+            )
             .await
             .unwrap();
 
