@@ -9264,7 +9264,18 @@ mod tests {
 
         // DEFAULT CONFIG (`[slots] per_user` off): the engine never consults
         // placement, so neither may this door — every path lands as given.
+        //
+        // The `a*` case is skipped on Windows, and only here. With the flag ON
+        // it is refused before any write, which is the assertion that matters;
+        // with the flag off the path is passed through to the filesystem, and
+        // `*` is a legal byte in a POSIX filename but forbidden in a Windows
+        // one. That passthrough is upstream's behaviour for every page path,
+        // not something per-user slots introduce, so this test declines to be
+        // the place that litigates it.
         for (path, caller) in cases {
+            if cfg!(windows) && path.contains(['*', '?', ':', '<', '>', '"', '|']) {
+                continue;
+            }
             assert_eq!(
                 written_path(
                     &write(server.clone(), path, caller)
