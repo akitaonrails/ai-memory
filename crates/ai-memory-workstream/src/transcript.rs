@@ -83,6 +83,17 @@ pub async fn export_transcript(
     if harness == ManagedHarness::Crush {
         return export_crush(cwd, session_dir, native_session_id, source_cursor);
     }
+    if harness == ManagedHarness::Antigravity {
+        // The conversation store keeps every step as an undocumented protobuf
+        // blob whose step-type enum is unversioned, so message text cannot be
+        // decoded without guessing at a schema that changes between `agy`
+        // releases. Conversation identity and workspace are read (they are
+        // stable, self-describing fields); the visible-event ledger for this
+        // harness comes from lifecycle-hook capture instead.
+        return Err(anyhow!(
+            "antigravity conversations expose no decodable transcript;              this session's events come from hook capture"
+        ));
+    }
     let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
         .ok_or_else(|| anyhow!("native transcript for {native_session_id} was not found"))?;
     export_jsonl(harness, &path, native_session_id, source_cursor)
@@ -331,7 +342,7 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
-            ManagedHarness::OpenCode | ManagedHarness::Crush => {
+            ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Antigravity => {
                 return Err(anyhow!(
                     "{} transcripts must use their SQLite adapter",
                     harness.as_str()
@@ -1562,6 +1573,11 @@ fn locate_session_file(
     id: &str,
 ) -> Result<Option<PathBuf>> {
     let root = session_root(harness, home, session_dir);
+    if harness == ManagedHarness::Antigravity {
+        // The conversation id is the file name, so no scan is ever needed.
+        let exact = root.join(format!("{id}.db"));
+        return Ok(exact.is_file().then_some(exact));
+    }
     if harness == ManagedHarness::Claude {
         let encoded = cwd.to_string_lossy().replace('/', "-");
         let exact = root.join(encoded).join(format!("{id}.jsonl"));
@@ -1614,6 +1630,10 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .and_then(|name| name.to_str())
                 == Some("main");
     }
+    if harness == ManagedHarness::Antigravity {
+        // One SQLite database per conversation, named by its id.
+        return path.extension().is_some_and(|ext| ext == "db");
+    }
     path.extension().is_some_and(|ext| ext == "jsonl")
         || matches!(harness, ManagedHarness::Pi | ManagedHarness::Omp) && temporary_transcript(path)
 }
@@ -1632,6 +1652,9 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
     }
     if harness == ManagedHarness::Grok {
         return grok_session_header(path);
+    }
+    if harness == ManagedHarness::Antigravity {
+        return antigravity_session_header(path);
     }
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = String::new();
@@ -1662,7 +1685,8 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
             ManagedHarness::OpenCode
             | ManagedHarness::Crush
             | ManagedHarness::Kimi
-            | ManagedHarness::Grok => (None, None),
+            | ManagedHarness::Grok
+            | ManagedHarness::Antigravity => (None, None),
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
             return Ok(Some((id.to_string(), PathBuf::from(cwd))));
@@ -1720,6 +1744,125 @@ fn grok_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
+}
+
+/// Antigravity keeps one SQLite database per conversation, named
+/// `<conversation-id>.db`, so the id comes from the file name. The workspace it
+/// was opened on lives in `trajectory_metadata_blob`, a protobuf message whose
+/// first field holds a nested message whose first field is the workspace
+/// `file://` URI. Only those two fields are read: every other field is a step
+/// payload with an undocumented, unversioned schema.
+///
+/// A database that does not carry both is unusable for checkout matching, not
+/// an error — the conversations directory may hold databases from an `agy`
+/// version whose metadata is shaped differently.
+fn antigravity_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    if !valid_native_session_id(id) {
+        return Ok(None);
+    }
+    let Ok(connection) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Ok(None);
+    };
+    let blob = connection.query_row(
+        "SELECT data FROM trajectory_metadata_blob LIMIT 1",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    );
+    let Ok(blob) = blob else {
+        return Ok(None);
+    };
+    let Some(workspace) = protobuf_field(&blob, 1)
+        .and_then(|nested| protobuf_field(nested, 1))
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(path_from_file_uri)
+    else {
+        return Ok(None);
+    };
+    Ok(Some((id.to_string(), workspace)))
+}
+
+/// Bytes of the first length-delimited field numbered `field`, or `None` when
+/// the message does not contain one. Non-matching fields are skipped by wire
+/// type; an unknown wire type ends the walk rather than guessing a length.
+fn protobuf_field(message: &[u8], field: u64) -> Option<&[u8]> {
+    let mut cursor = 0usize;
+    while cursor < message.len() {
+        let (key, used) = protobuf_varint(&message[cursor..])?;
+        cursor += used;
+        match key & 0b111 {
+            0 => cursor += protobuf_varint(&message[cursor..])?.1,
+            1 => cursor = cursor.checked_add(8)?,
+            2 => {
+                let (length, used) = protobuf_varint(&message[cursor..])?;
+                cursor += used;
+                let end = cursor.checked_add(usize::try_from(length).ok()?)?;
+                let bytes = message.get(cursor..end)?;
+                if key >> 3 == field {
+                    return Some(bytes);
+                }
+                cursor = end;
+            }
+            5 => cursor = cursor.checked_add(4)?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Decode one base-128 varint, returning its value and the bytes consumed.
+fn protobuf_varint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    for (index, byte) in bytes.iter().take(10).enumerate() {
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Some((value, index + 1));
+        }
+    }
+    None
+}
+
+/// Local path behind a `file://` URI, or `None` for any other scheme.
+///
+/// Windows records `file:///C:/dir`, whose leading slash is part of the URI
+/// grammar and not of the path; POSIX records `file:///home/dir`, where it is.
+/// The drive-letter shape tells them apart without a `#[cfg]` split, so a
+/// database copied between platforms still parses.
+fn path_from_file_uri(uri: &str) -> Option<PathBuf> {
+    let rest = percent_decode(uri.strip_prefix("file://")?);
+    let bytes = rest.as_bytes();
+    let drive_prefixed = bytes.first() == Some(&b'/')
+        && bytes.get(2) == Some(&b':')
+        && bytes.get(1).is_some_and(u8::is_ascii_alphabetic);
+    let path = if drive_prefixed { &rest[1..] } else { &rest };
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Decode `%XX` escapes; invalid escapes are kept verbatim so a path that was
+/// never encoded survives unchanged.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(hex) = bytes.get(index + 1..index + 3)
+            && let Ok(hex) = std::str::from_utf8(hex)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn discover_opencode(
@@ -1910,6 +2053,7 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Omp => home.join(".omp/agent/sessions"),
         ManagedHarness::Kimi => home.join(".kimi-code/sessions"),
         ManagedHarness::Grok => home.join(".grok/sessions"),
+        ManagedHarness::Antigravity => home.join(".gemini/antigravity-cli/conversations"),
     }
 }
 
@@ -2073,7 +2217,8 @@ mod tests {
                     ManagedHarness::OpenCode
                     | ManagedHarness::Crush
                     | ManagedHarness::Kimi
-                    | ManagedHarness::Grok => {
+                    | ManagedHarness::Grok
+                    | ManagedHarness::Antigravity => {
                         unreachable!()
                     }
                 },
@@ -3087,5 +3232,170 @@ mod tests {
             third.events[0].event_id, first.events[0].event_id,
             "identical lines must keep identical event ids across rewrites"
         );
+    }
+
+    /// Build the two protobuf layers `agy` writes: an outer message whose
+    /// field 1 holds a nested message whose field 1 is the workspace URI.
+    fn antigravity_metadata(uri: &str) -> Vec<u8> {
+        let mut nested = vec![0x0a];
+        nested.push(u8::try_from(uri.len()).unwrap());
+        nested.extend_from_slice(uri.as_bytes());
+        let mut outer = vec![0x0a];
+        outer.push(u8::try_from(nested.len()).unwrap());
+        outer.extend_from_slice(&nested);
+        outer
+    }
+
+    /// `file://` URI for a local path, the way `agy` records its workspace.
+    /// Windows paths carry a drive letter and need the extra leading slash.
+    fn file_uri(path: &Path) -> String {
+        let text = path.to_string_lossy().replace('\\', "/");
+        if text.starts_with('/') {
+            format!("file://{text}")
+        } else {
+            format!("file:///{text}")
+        }
+    }
+
+    fn write_antigravity_conversation(root: &Path, id: &str, uri: &str) -> PathBuf {
+        let path = root.join(format!("{id}.db"));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE trajectory_metadata_blob (id text DEFAULT \"main\", data blob, PRIMARY KEY (id))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+                params![antigravity_metadata(uri)],
+            )
+            .unwrap();
+        path
+    }
+
+    /// The conversation id is the file name and the workspace comes from the
+    /// metadata blob, so a checkout only sees its own conversations.
+    #[tokio::test]
+    async fn antigravity_lists_only_conversations_from_this_workspace() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&root).unwrap();
+        let cwd = temp.path().join("checkout");
+        fs::create_dir_all(&cwd).unwrap();
+        let mine = "a0d5ac62-2501-4780-b783-76d159c56cb3";
+        let theirs = "9576275f-7c4e-4709-b372-22d1ad2a0af8";
+        write_antigravity_conversation(&root, mine, &file_uri(&cwd));
+        write_antigravity_conversation(&root, theirs, "file:///somewhere/else");
+
+        let sessions =
+            list_native_sessions(ManagedHarness::Antigravity, temp.path(), &cwd, None, 8)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|s| s.native_session_id.as_str())
+                .collect::<Vec<_>>(),
+            [mine]
+        );
+        assert!(
+            native_session_exists(ManagedHarness::Antigravity, temp.path(), &cwd, None, mine)
+                .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Antigravity,
+                temp.path(),
+                &cwd,
+                None,
+                "11111111-1111-1111-1111-111111111111"
+            )
+            .unwrap()
+        );
+    }
+
+    /// A database whose metadata is shaped differently — an older or newer
+    /// `agy` — is skipped, never an error: it would otherwise take the whole
+    /// listing down with it.
+    #[tokio::test]
+    async fn antigravity_skips_conversations_without_readable_metadata() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&root).unwrap();
+        let cwd = temp.path().join("checkout");
+        fs::create_dir_all(&cwd).unwrap();
+        // Right name, no metadata table at all.
+        Connection::open(root.join("53fb8b64-76c5-4fd8-91d2-dfabe2be4188.db")).unwrap();
+        fs::write(root.join("not-a-database.db"), b"garbage").unwrap();
+
+        let sessions =
+            list_native_sessions(ManagedHarness::Antigravity, temp.path(), &cwd, None, 8)
+                .await
+                .unwrap();
+
+        assert!(sessions.is_empty());
+    }
+
+    /// Every step payload is an undocumented protobuf blob, so the ledger for
+    /// this harness comes from hook capture. The failure has to say so.
+    #[tokio::test]
+    async fn antigravity_transcript_export_explains_why_it_is_unavailable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let error = export_transcript(
+            ManagedHarness::Antigravity,
+            temp.path(),
+            temp.path(),
+            None,
+            "a0d5ac62-2501-4780-b783-76d159c56cb3",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("hook capture"), "{error}");
+    }
+
+    #[test]
+    fn file_uris_decode_on_both_platform_shapes() {
+        assert_eq!(
+            path_from_file_uri("file:///C:/Users/me/Projetos"),
+            Some(PathBuf::from("C:/Users/me/Projetos"))
+        );
+        assert_eq!(
+            path_from_file_uri("file:///home/me/projects"),
+            Some(PathBuf::from("/home/me/projects"))
+        );
+        assert_eq!(
+            path_from_file_uri("file:///C:/Users/me/My%20Projects"),
+            Some(PathBuf::from("C:/Users/me/My Projects"))
+        );
+        // A stray percent that is not an escape must not eat the next bytes.
+        assert_eq!(
+            path_from_file_uri("file:///tmp/100%done"),
+            Some(PathBuf::from("/tmp/100%done"))
+        );
+        assert_eq!(path_from_file_uri("https://example.com/x"), None);
+        assert_eq!(path_from_file_uri("file://"), None);
+    }
+
+    #[test]
+    fn protobuf_walk_skips_other_fields_and_wire_types() {
+        // field 1 varint, field 2 length-delimited, field 3 fixed64,
+        // then field 4 length-delimited — only field 4 must come back.
+        let mut message = vec![0x08, 0x96, 0x01];
+        message.extend_from_slice(&[0x12, 0x02, b'h', b'i']);
+        message.extend_from_slice(&[0x19, 0, 0, 0, 0, 0, 0, 0, 0]);
+        message.extend_from_slice(&[0x22, 0x03, b'y', b'e', b's']);
+
+        assert_eq!(protobuf_field(&message, 4), Some(&b"yes"[..]));
+        assert_eq!(protobuf_field(&message, 2), Some(&b"hi"[..]));
+        // A varint field is not length-delimited, so it is never returned.
+        assert_eq!(protobuf_field(&message, 1), None);
+        assert_eq!(protobuf_field(&message, 9), None);
+        // Truncated input ends the walk instead of panicking on a slice.
+        assert_eq!(protobuf_field(&[0x22, 0x10, b'x'], 4), None);
     }
 }

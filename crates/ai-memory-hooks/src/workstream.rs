@@ -137,6 +137,7 @@ async fn prepare_run(
             | AgentKind::Omp
             | AgentKind::KimiCode
             | AgentKind::Grok
+            | AgentKind::AntigravityCli
     ) {
         return error(
             StatusCode::BAD_REQUEST,
@@ -949,6 +950,72 @@ mod tests {
                 agent: AgentKind::Grok,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::Grok],
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "automatic".into(),
+            }),
+        )
+        .await;
+        assert_eq!(automatic.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The launcher offers `agy` explicitly, so the server has to accept it —
+    /// a missing arm here rejects the launch with "requires a supported
+    /// command-line harness" after the user already picked the harness.
+    #[tokio::test]
+    async fn antigravity_is_accepted_explicitly_but_not_in_the_automatic_pool() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+
+        let explicit = prepare_run(
+            State(state.clone()),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::AntigravityCli,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "explicit".into(),
+            }),
+        )
+        .await;
+        assert_eq!(explicit.status(), StatusCode::OK);
+        let body = to_bytes(explicit.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prepared.resolved_agent, Some(AgentKind::AntigravityCli));
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: prepared.run_id,
+                native_session_id: Some("a0d5ac62-2501-4780-b783-76d159c56cb3".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+
+        let automatic = prepare_run(
+            State(state),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::AntigravityCli,
+                automatic_harness: true,
+                available_agents: vec![AgentKind::AntigravityCli],
                 workstream: None,
                 new_workstream: None,
                 lease_owner: "automatic".into(),

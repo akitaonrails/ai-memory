@@ -1,8 +1,8 @@
 # Managed cross-harness workstreams
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
-between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok
-Build CLI. Direct agent launches
+between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok
+Build CLI, and Antigravity CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
@@ -37,7 +37,8 @@ file, and the current checkout remain authoritative.
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh]
-              [claude|codex|opencode|pi|crush|omp|kimi|grok] [native arguments...]
+              [claude|codex|opencode|pi|crush|omp|kimi|grok|antigravity]
+              [native arguments...]
 ```
 
 The default is the most recently selected workstream for the current repository
@@ -130,8 +131,8 @@ it resumes
 the newest session automatically. For an established workstream, server state
 takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
-another harness merely because that file has a later timestamp. OMP and Grok
-remain available explicitly but are not in the automatic pool.
+another harness merely because that file has a later timestamp. OMP, Grok, and
+Antigravity remain available explicitly but are not in the automatic pool.
 
 Bare mode accepts wrapper options but not harness-native arguments or
 `--executable`, because their meaning depends on the selected harness. In a new
@@ -325,6 +326,26 @@ internals and are never read as transcripts; discovery reads
 managed launcher accepts `grok` and `grok-build`. The native contract was
 verified against Grok Build CLI v0.2.111.
 
+Antigravity keeps one SQLite database per conversation at
+`~/.gemini/antigravity-cli/conversations/<conversation-id>.db`, so the id is the
+file name and no scan is needed to locate one. The workspace a conversation was
+opened on comes from `trajectory_metadata_blob`, a protobuf message whose first
+field holds a nested message whose first field is the workspace `file://` URI;
+only those two fields are read. A database that does not carry them — an older
+or newer `agy` — is skipped rather than failing the listing. Note the recorded
+workspace is the directory `agy` was launched from, not a checkout root, so a
+conversation started one level up is not offered inside a subdirectory.
+
+`agy` accepts no caller-chosen id for a new conversation, so a fresh launch
+injects nothing and the id is linked by the hooks or discovered after exit; a
+linked resume passes `--conversation <id>`. `--continue` / `-c` is treated as an
+explicit user choice and is never overridden. `--yolo` maps to
+`--dangerously-skip-permissions`. Step payloads are undocumented, unversioned
+protobuf blobs, so ai-memory does not decode conversation text: the visible-event
+ledger for this harness comes from lifecycle-hook capture, and transcript export
+fails with a message saying so. The managed launcher accepts `antigravity`,
+`antigravity-cli`, and `agy`. Antigravity is not part of the no-argument
+auto-detection set; name it explicitly or pick it from `ai-memory show`.
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
 its one-time context from the server, copies the existing global Crush JSON into

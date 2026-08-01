@@ -234,6 +234,9 @@ pub enum RunHarnessChoice {
     /// Grok Build CLI (xAI).
     #[value(alias = "grok-build")]
     Grok,
+    /// Google Antigravity CLI (`agy`).
+    #[value(name = "antigravity", alias = "antigravity-cli", alias = "agy")]
+    Antigravity,
 }
 
 /// Arguments for `show`.

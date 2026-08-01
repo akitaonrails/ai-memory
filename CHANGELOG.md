@@ -45,6 +45,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--fresh`, and trailing native arguments are forwarded to `run` unchanged.
   (#NNN)
 
+- `run` and `show` accept `antigravity` (aliases `antigravity-cli`, `agy`) as a
+  managed harness, so an Antigravity session joins the same workstream as the
+  Claude Code or Codex sessions on the same checkout. `agy` accepts no
+  caller-chosen id for a new conversation, so a fresh launch injects nothing and
+  the id is linked by the hooks or discovered afterwards; a linked resume passes
+  `--conversation <id>`, and `--continue` / `-c` is respected as an explicit user
+  choice. `--yolo` maps to `--dangerously-skip-permissions`, and the utility
+  subcommands (`models`, `plugin`, `update`, …) pass through without a selector.
+  Conversation discovery reads the per-conversation SQLite databases under
+  `~/.gemini/antigravity-cli/conversations/`: the id is the file name and the
+  workspace comes from two self-describing protobuf fields, so only conversations
+  opened on the current directory are offered and a database from another `agy`
+  version is skipped instead of failing the listing. Step payloads are
+  undocumented, unversioned protobuf, so conversation text is deliberately not
+  decoded — the visible-event ledger for this harness comes from lifecycle-hook
+  capture, and transcript export fails with a message saying so. Antigravity is
+  not part of the no-argument auto-detection pool. (#NNN)
+
 ### Fixed
 - `run` on Windows no longer reports a harness as installed and then fails to
   start it. npm-style installs drop three files side by side — `opencode`,
