@@ -396,19 +396,20 @@ the explicit `install-mcp --client claude-code --session-aware` option.
 
 ```
 init                 status               run
-workstream-search    audit-contamination  search
-read-page            write-page           delete-page
-serve                reset                backup
-restore              reindex              install-hooks
-hook                 install-mcp          commit
-checkpoints          restore-page         llm-test
-forget-sweep         lint                 curator
-auto-improve-report  auto-improve         finalize-session
-pending-writes       embed                generate-auth-token
-setup-agent          bootstrap            install-instructions
-install-skills       reorg                purge-project
-rename-project       move-project         uninstall
-auth                 user                 completions
+show                 workstream-search    audit-contamination
+search               read-page            write-page
+delete-page          serve                reset
+backup               restore              reindex
+install-hooks        hook                 install-mcp
+commit               checkpoints          restore-page
+llm-test             forget-sweep         lint
+curator              auto-improve-report  auto-improve
+finalize-session     pending-writes       embed
+generate-auth-token  setup-agent          bootstrap
+install-instructions install-skills       reorg
+purge-project        rename-project       move-project
+uninstall            auth                 user
+completions
 ```
 
 Run `ai-memory --help` for the full tree.

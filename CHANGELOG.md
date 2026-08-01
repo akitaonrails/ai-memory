@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ai-memory show`: an interactive launcher that lists projects, asks which
+  harness to start, enters that project's directory, and delegates to
+  `ai-memory run`. It exists because project scope is derived from the working
+  directory, so opening an agent from a parent directory holding many checkouts
+  resolved all of them into that parent's basename and piled unrelated sessions
+  into one scope. The menu merges two sources: projects the server already
+  tracks (newest activity first, with page counts, from a new `repo_path` field
+  on `/api/v1/projects` rows), and a depth-1 scan of the current directory for
+  directories carrying a recognised project marker — so the picker is useful on
+  a machine where ai-memory has not run yet, instead of staying empty until
+  every project has been opened the long way once. Dependency, build, and
+  dot-directories are skipped, and the scan is disabled with `--no-scan`. A
+  scanned directories are ordered by mtime, newest first, matching the tracked
+  half's activity ordering — alphabetical order buried a just-created project
+  under every checkout whose name sorted earlier. A
+  tracked pick pins both scope halves; a scanned pick passes neither, so `run`
+  derives the scope from the checkout exactly as the lifecycle hooks would. The
+  The list always leads with a **new-project** entry that asks for a name,
+  creates the directory, pins both scope halves in a `.ai-memory.toml` marker,
+  and installs the routing block plus the managed Agent Skills into the
+  instruction file the chosen harness actually reads (`CLAUDE.md` for Claude
+  Code, `AGENTS.md` otherwise) by delegating to `install-instructions`. The name
+  is validated against the server's own `^[a-z0-9][a-z0-9._-]*$` rule and
+  against the directory before anything is written, so a rejection is corrected
+  by typing instead of surfacing later as a hook warning on a session that
+  already started. Both marker keys are pinned because the defaults follow the
+  directory name, so a rename or a subdirectory `cd` would otherwise fork the
+  memory into a second, empty project. The
+  harness menu is filtered to the harnesses actually present in `PATH`, reusing
+  the same lookup `run` enforces at launch, so the picker cannot offer an agent
+  that would fail to start once a project has already been chosen. A failed
+  listing degrades to scan-only results with a warning rather than aborting. With stdin or stdout redirected it prints the same candidates as
+  tab-separated `label`/`path`/`detail` lines instead of drawing a menu, so the
+  list stays greppable. `--workspace` narrows the tracked list, and `--yolo`,
+  `--fresh`, and trailing native arguments are forwarded to `run` unchanged.
+  (#NNN)
+
 ### Fixed
 - `run` on Windows no longer reports a harness as installed and then fails to
   start it. npm-style installs drop three files side by side — `opencode`,
@@ -16,10 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `program not found`. Availability now resolves to a concrete file, counting
   only `PATHEXT` matches (or a path whose extension was given explicitly), and
   the spawn uses that resolved path instead of the bare name, so the check and
-  the launch can no longer disagree. Spawning the resolved path also stops
-  `CreateProcess` from searching the working directory before `PATH`, so a
-  binary planted in the launched checkout can no longer take the harness's
-  place. Unix behaviour is unchanged. (#NNN)
+  the launch can no longer disagree. Unix behaviour is unchanged. (#NNN)
 
 ## [1.21.0] - 2026-07-31
 

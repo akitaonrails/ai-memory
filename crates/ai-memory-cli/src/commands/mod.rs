@@ -50,6 +50,7 @@ pub mod run;
 pub mod search;
 pub mod serve;
 pub mod setup_agent;
+pub mod show;
 pub mod status;
 pub mod uninstall;
 pub mod user;

@@ -37,6 +37,9 @@ pub enum Command {
     /// Native arguments are forwarded except exact wrapper flags such as
     /// `--yolo` and `--fresh`.
     Run(RunArgs),
+    /// Pick a known project and harness from an interactive menu, then launch
+    /// it there. Removes the `cd` step `run` requires.
+    Show(ShowArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
     /// Audit the store for likely cross-project contamination (read-only,
@@ -231,6 +234,29 @@ pub enum RunHarnessChoice {
     /// Grok Build CLI (xAI).
     #[value(alias = "grok-build")]
     Grok,
+}
+
+/// Arguments for `show`.
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    /// Only list projects from this workspace. Defaults to every workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// List only projects the server already tracks, skipping the depth-1
+    /// scan of the current directory for untracked project directories.
+    #[arg(long)]
+    pub no_scan: bool,
+    /// Disable native permission prompts using the selected harness's
+    /// equivalent dangerous-mode option. Forwarded to `run`.
+    #[arg(long)]
+    pub yolo: bool,
+    /// Start a new native session instead of resuming or adopting an existing
+    /// harness session. Forwarded to `run`.
+    #[arg(long)]
+    pub fresh: bool,
+    /// Native harness arguments, forwarded byte-for-byte and in order.
+    #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+    pub native_args: Vec<OsString>,
 }
 
 /// Arguments for `workstream-search`.

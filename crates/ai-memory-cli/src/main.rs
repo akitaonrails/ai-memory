@@ -81,6 +81,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Show(args) => {
+            let exit_code = commands::show::run(&config, args).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Command::WorkstreamSearch(args) => commands::workstream_search::run(&config, args).await,
         Command::AuditContamination(args) => {
             commands::audit_contamination::run(&config, args).await

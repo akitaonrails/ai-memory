@@ -768,6 +768,10 @@ pub struct ProjectSummary {
     /// ISO-8601 timestamp of the newest `updated_at`, or `None` when
     /// the project has no pages yet.
     pub last_updated: Option<String>,
+    /// Absolute checkout path recorded for cwd matching, or `None` when the
+    /// project was created without one (the `scratch` fallback, explicit
+    /// scope creation, or a checkout that has since moved).
+    pub repo_path: Option<String>,
 }
 
 /// One workspace scope with the id + name needed to write its
@@ -4053,7 +4057,8 @@ impl ReaderPool {
                 "SELECT w.name AS workspace_name, \
                         p.name AS project_name, \
                         COUNT(pg.id) AS page_count, \
-                        MAX(pg.updated_at) AS last_updated_us \
+                        MAX(pg.updated_at) AS last_updated_us, \
+                        p.repo_path AS repo_path \
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
                  LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1 \
@@ -4066,11 +4071,18 @@ impl ReaderPool {
                 let project_name: String = row.get(1)?;
                 let page_count: i64 = row.get(2)?;
                 let last_updated_us: Option<i64> = row.get(3)?;
-                Ok((workspace_name, project_name, page_count, last_updated_us))
+                let repo_path: Option<String> = row.get(4)?;
+                Ok((
+                    workspace_name,
+                    project_name,
+                    page_count,
+                    last_updated_us,
+                    repo_path,
+                ))
             })?;
             let mut out = Vec::new();
             for r in rows {
-                let (workspace_name, project_name, page_count, last_updated_us) = r?;
+                let (workspace_name, project_name, page_count, last_updated_us, repo_path) = r?;
                 let last_updated = last_updated_us
                     .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
                     .map(|ts| ts.to_string());
@@ -4079,6 +4091,7 @@ impl ReaderPool {
                     project_name,
                     page_count: u64::try_from(page_count).unwrap_or(0),
                     last_updated,
+                    repo_path,
                 });
             }
             Ok(out)

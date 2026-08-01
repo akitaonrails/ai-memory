@@ -75,6 +75,12 @@ clap = { version = "4", features = ["derive", "env"] }
 # same derived `Command` the parser uses, so completions can never drift
 # from the actual CLI surface.
 clap_complete = "4"
+# Raw-mode key reading for `ai-memory show`'s interactive picker. The CLI had
+# no terminal crate before this: `anstyle` arrives transitively through clap
+# and only styles text, it cannot read arrow keys. crossterm is the portable
+# option that keeps one code path across Linux, macOS, and Windows consoles
+# instead of a `#[cfg]` split over termios and the Win32 console API.
+crossterm = "0.28"
 dirs = "5"
 # Format-preserving TOML editor for install-mcp --apply against
 # Codex's config.toml. Plain `toml` round-trips destroy comments;

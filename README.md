@@ -177,6 +177,39 @@ priors are at the [bottom](#influences-and-prior-art).
   ai-memory run --fresh codex
   ```
 
+- **"Pick the project instead of remembering where it lives."** Project scope
+  comes from the working directory, so launching from a parent directory that
+  holds many checkouts resolves all of them into that parent's basename. Start
+  from the menu instead, from anywhere:
+
+  ```bash
+  ai-memory show
+  ```
+
+  The menu merges two sources: projects ai-memory already tracks (newest
+  activity first, with page counts) and a fast depth-1 scan of the current
+  directory for anything carrying a project marker (`.git`, `Cargo.toml`,
+  `package.json`, `go.mod`, `pyproject.toml`, and friends). Dependency and build
+  directories are skipped. So running it from a folder full of checkouts works
+  on day one, before ai-memory has seen any of them — pick one, pick a harness,
+  and it enters that directory and hands off to `ai-memory run`.
+
+  The list always leads with **`+ New project`**: type a name and ai-memory
+  creates the directory, pins the workspace and project in a `.ai-memory.toml`
+  marker, and installs the routing block and managed Agent Skills into the
+  instruction file the agent you picked actually reads — then launches it there.
+  So a brand-new project starts with its memory context already wired, without a
+  `mkdir` / `install-instructions` detour.
+
+  The harness menu only offers agents actually installed on the host, using the
+  same `PATH` lookup `run` enforces at launch.
+
+  `--no-scan` restricts the list to tracked projects; `--workspace` narrows that
+  half; `--yolo`, `--fresh`, and any trailing native arguments are forwarded
+  unchanged. With output redirected it prints the same candidates as
+  tab-separated lines instead of drawing a menu, so `ai-memory show | grep …`
+  works; launching from a script stays the job of `ai-memory run <harness>`.
+
   The first explicit run can offer an existing session from this exact checkout
   or start a new one. Switching harnesses starts or resumes the native session
   linked to the shared workstream, so an obsolete local session cannot replace

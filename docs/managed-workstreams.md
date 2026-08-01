@@ -45,6 +45,83 @@ and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
 branching controls, not harness-switch controls.
 
+## Choosing the project first
+
+`run` resolves its project from the working directory, which is why the synopsis
+above starts with `cd`. Launching from a parent directory that holds many
+checkouts resolves every one of them to that parent's basename, so unrelated
+sessions accumulate in a single scope.
+
+`ai-memory show` inverts the order: it presents a menu, enters the chosen
+project's directory, and delegates to `run`.
+
+```text
+ai-memory show [--workspace NAME] [--no-scan] [--yolo] [--fresh]
+               [native arguments...]
+```
+
+The list always leads with a **new-project** entry. It asks for a name, creates
+the directory under the current one, writes a `.ai-memory.toml` marker pinning
+both scope halves, and delegates to `install-instructions` for the routing block
+and the managed Agent Skills — into `CLAUDE.md` when the chosen harness is
+Claude Code and `AGENTS.md` for every other, since that is the file each one
+reads. `--workspace` names the workspace the project is filed under; without it
+the marker uses `default`.
+
+The name is checked against the server's `^[a-z0-9][a-z0-9._-]*$` rule and
+against the parent directory before anything is written, so a rejection is
+corrected by typing rather than surfacing later as a hook warning on a session
+that already started. Both marker keys are pinned deliberately: the defaults
+follow the directory name, so a rename or a `cd` into a subdirectory would
+otherwise start a second, empty project. An existing directory is never adopted
+— it may hold an unrelated project whose own marker the creation would replace.
+
+Below that entry the menu merges two sources:
+
+- **Tracked projects** — every project with a recorded `repo_path`, newest
+  activity first, annotated with page counts. `--workspace` narrows this half.
+  Rows without a checkout path are omitted; there is no directory to enter.
+- **Scanned directories** — a depth-1 pass over the current directory for
+  entries carrying a project marker (`.git`, `.ai-memory.toml`, `Cargo.toml`,
+  `package.json`, `pyproject.toml`, `requirements.txt`, `go.mod`, `Gemfile`,
+  `composer.json`, `pom.xml`, `docker-compose.yml`, `compose.yml`), including
+  the current directory itself. Dot-directories and dependency/build trees
+  (`node_modules`, `target`, `dist`, `build`, `vendor`, `venv`, `.venv`,
+  `__pycache__`) are skipped, so the cost is one `exists()` per marker per
+  candidate and never a directory walk. Ordered by directory mtime, newest
+  first, so both halves of the menu answer the same question — what was touched
+  most recently — and a project created a moment ago is not buried under every
+  checkout whose name sorts earlier. Directories with no readable timestamp sort
+  last, and equal timestamps fall back to path order so the list is stable
+  across runs. `--no-scan` turns this half off.
+
+Duplicates are resolved by canonical path, so a tracked project inside the
+scanned directory appears once, with its tracked annotation.
+
+The harness menu is filtered to what is actually installed, using the same
+`PATH` lookup `run` enforces at launch — offering an agent that is not on the
+host only moves the failure to after the user has committed to a project. When
+no supported harness resolves, `show` says so and names every one it looked
+for. Harnesses reachable only through `--executable` are not offered, since the
+picker has no way to ask for that path.
+
+Scope handling differs by source, deliberately. A **tracked** pick pins both
+`--workspace` and `--project`, so a marker in the target tree cannot retarget a
+launch the listing already resolved. A **scanned** pick passes neither: `run`
+derives the scope from the checkout itself, honouring its `.ai-memory.toml`, so
+the first session lands in the same scope the lifecycle hooks would have chosen
+on their own.
+
+A failed listing is not fatal — it prints a warning and falls back to scan-only
+results, which is the state a machine is in before the server has ever run.
+
+With stdin or stdout redirected there is nobody to press a key, so instead of
+drawing a menu `show` prints the same candidates as tab-separated
+`label`, `path`, `detail` lines and exits, leaving the list greppable. Creating
+a project needs a name nobody can type there, so that entry is interactive-only
+and the printed list stays exactly the launchable set. Launching from a script
+stays the job of `run` from the project directory.
+
 ## Automatic harness selection
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for
@@ -247,6 +324,7 @@ internals and are never read as transcripts; discovery reads
 `summary.json`'s `info.cwd` and never parses the URL-encoded bucket name. The
 managed launcher accepts `grok` and `grok-build`. The native contract was
 verified against Grok Build CLI v0.2.111.
+
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
 its one-time context from the server, copies the existing global Crush JSON into

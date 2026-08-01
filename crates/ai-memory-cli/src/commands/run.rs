@@ -693,6 +693,16 @@ fn ensure_executable_available(harness: ManagedHarness, executable: Option<&OsSt
     ))
 }
 
+/// Whether this harness's default executable resolves through `PATH`.
+///
+/// Shared with `show`, so the picker offers exactly the harnesses that
+/// [`ensure_executable_available`] would accept a moment later. Harnesses
+/// reached only through `--executable` are not covered: the picker has no way
+/// to ask for that path.
+pub(super) fn harness_available(choice: RunHarnessChoice) -> bool {
+    executable_available(OsStr::new(managed_harness(choice).executable()))
+}
+
 fn executable_available(program: &OsStr) -> bool {
     resolve_program(program).is_some()
 }
@@ -1227,8 +1237,8 @@ mod tests {
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
 
-    /// A false positive here reports a harness as installed and then fails to
-    /// spawn it, which is the bug this resolution exists to prevent.
+    /// `show` filters its harness menu with this, so a false positive would
+    /// offer an agent that cannot start.
     #[test]
     fn executable_available_rejects_a_program_that_is_not_installed() {
         assert!(!executable_available(OsStr::new(
