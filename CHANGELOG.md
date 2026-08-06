@@ -1155,6 +1155,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of being indistinguishable from "no pending handoff" — exit code
   stays 0, hooks never break the agent. Malformed-payload/BOM diagnostics are
   tracked separately in [#197] ([#188]).
+- The generated OpenCode plugin now captures user prompts from current
+  `message.updated` bus events as well as the legacy `chat.message` hook, and
+  deduplicates by message id. This keeps automatic SessionEnd handoffs from
+  degrading into generic "N observations recorded" summaries when newer
+  OpenCode versions stop delivering prompt text through `chat.message` output.
 - `install-mcp --server-url` now appends the `/mcp` path when given a base
   URL (the same value `install-hooks --server-url` takes), instead of
   rendering a client config that points at the server root and 404s. The

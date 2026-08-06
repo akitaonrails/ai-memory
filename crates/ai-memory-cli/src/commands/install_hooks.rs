@@ -2551,10 +2551,16 @@ function textFromParts(parts: unknown): string {{
     .trim();
 }}
 
+function textFromMessage(value: unknown): string {{
+  const message = value as any;
+  return textFromParts(message?.parts ?? message?.message?.parts ?? message?.info?.parts ?? message?.message?.info?.parts);
+}}
+
 const sessionCwds = new Map<string, string>();
 const startedSessions = new Set<string>();
 const handoffFetches = new Map<string, Promise<string | undefined>>();
 const preCompactLast = new Map<string, number>();
+const postedUserMessages = new Set<string>();
 
 function cwdFor(id: string | undefined, directory: string): string {{
   return (id && sessionCwds.get(id)) || directory;
@@ -2583,6 +2589,25 @@ function endSession(id: string | undefined, directory: string, cwd?: string): vo
   sessionCwds.delete(id);
   handoffFetches.delete(id);
   preCompactLast.delete(id);
+  for (const key of Array.from(postedUserMessages)) {{
+    if (key.startsWith(`${{id}}:`)) postedUserMessages.delete(key);
+  }}
+}}
+
+function postUserPrompt(id: string | undefined, cwd: string, messageID: unknown, prompt: string, extra: Record<string, unknown> = {{}}): void {{
+  if (!prompt) return;
+  const key = typeof messageID === "string" && id ? `${{id}}:${{messageID}}` : undefined;
+  if (key) {{
+    if (postedUserMessages.has(key)) return;
+    postedUserMessages.add(key);
+  }}
+  postHook("user-prompt", {{
+    sessionID: id,
+    cwd,
+    messageID,
+    prompt,
+    ...extra,
+  }});
 }}
 
 function postPreCompact(id: string | undefined, directory: string): void {{
@@ -2661,18 +2686,23 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
         const id = properties.sessionID;
         postPreCompact(id, directory);
       }}
+      if (event?.type === "message.updated") {{
+        const info = properties.info ?? {{}};
+        if (info.role === "user") {{
+          const id = properties.sessionID ?? info.sessionID ?? info.metadata?.sessionID;
+          const cwd = cwdFor(id, directory);
+          startSession(id, cwd);
+          postUserPrompt(id, cwd, info.id, textFromMessage(info));
+        }}
+      }}
     }},
     "chat.message": async (input, output) => {{
       const id = sessionID(input);
       const cwd = cwdFor(id, directory);
       startSession(id, cwd, {{ agent: (input as any).agent, model: (input as any).model }});
-      postHook("user-prompt", {{
-        sessionID: id,
-        cwd,
+      postUserPrompt(id, cwd, (input as any).messageID, textFromMessage(input) || textFromMessage(output), {{
         agent: (input as any).agent,
         model: (input as any).model,
-        messageID: (input as any).messageID,
-        prompt: textFromParts((output as any).parts),
       }});
     }},
     "tool.execute.before": async (input, output) => {{
@@ -5450,6 +5480,8 @@ model = "gpt-5"
         assert!(!plugin.contains("handoffChecked"));
         assert!(plugin.contains("function startSession"));
         assert!(plugin.contains("function endSession"));
+        assert!(plugin.contains("function textFromMessage"));
+        assert!(plugin.contains("function postUserPrompt"));
         assert!(plugin.contains("fetchHandoff"));
         assert!(plugin.contains("function applyMarkerParams"));
         assert!(plugin.contains("readFileSync(marker, \"utf8\")"));
@@ -5487,6 +5519,11 @@ model = "gpt-5"
         assert!(plugin.contains("sessionCwds.delete(id);"));
         assert!(plugin.contains("handoffFetches.delete(id);"));
         assert!(plugin.contains("preCompactLast.delete(id);"));
+        assert!(plugin.contains("const postedUserMessages = new Set<string>();"));
+        assert!(plugin.contains("postedUserMessages.delete(key);"));
+        assert!(plugin.contains(r#"event?.type === "message.updated""#));
+        assert!(plugin.contains("info.role === \"user\""));
+        assert!(plugin.contains("postUserPrompt(id, cwd, info.id, textFromMessage(info));"));
         assert!(plugin.contains("postHook(\"user-prompt\""));
         assert!(plugin.contains("Bearer ${TOKEN}"));
         assert!(plugin.contains("tok"));
@@ -5517,7 +5554,9 @@ model = "gpt-5"
         assert!(plugin.contains("const TOKEN: string | null = null;"));
         assert!(plugin.contains("sessionID: id,"));
         assert!(plugin.contains("cwd,"));
-        assert!(plugin.contains("prompt: textFromParts"));
+        assert!(plugin.contains("prompt,"));
+        assert!(plugin.contains("textFromMessage(input) || textFromMessage(output)"));
+        assert!(plugin.contains("message?.parts ?? message?.message?.parts"));
         assert!(plugin.contains("output: (output as any).output"));
         assert!(plugin.contains("if (typeof AbortSignal === \"undefined\")"));
         assert!(
