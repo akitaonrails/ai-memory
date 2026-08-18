@@ -35,6 +35,13 @@ log_level = "info"
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
 
+# Serve restricted tool schemas on every tools/list (strips root-level
+# anyOf/oneOf/allOf) even without a `?flavor=moonshot`/`?flavor=bedrock`
+# marker. For strict upstream validators (Moonshot/Bedrock dialect) reached
+# through generic MCP clients that forward schemas verbatim. Env:
+# `AI_MEMORY_STRICT_SCHEMA=true`
+# strict_schema = false
+
 # Optional final LLM relevance pass for project/scopes memory_query calls.
 # Requires an LLM provider and adds at most one provider call per eligible
 # query. The bounded query, page titles, and search snippets are sent to that

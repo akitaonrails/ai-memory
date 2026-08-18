@@ -401,6 +401,12 @@ pub struct AiMemoryServer {
     /// otherwise it immediately approves validated proposals through the normal
     /// wiki write path.
     auto_improve_require_approval: bool,
+    /// Force restricted tool schemas on every `tools/list`, regardless of
+    /// the client's `?flavor=` marker (issue #412). Generic MCP clients
+    /// (OpenCode, Cursor, …) never send the marker, yet forward tool
+    /// schemas verbatim to strict validators (Moonshot/Bedrock dialect)
+    /// that reject root-level combinators.
+    strict_schema: bool,
     /// Server-configured defaults used by manual MCP auto-improvement. This
     /// keeps manual runs at least as strict as the operator's configured
     /// Phase 1/2 budgets instead of falling back to compiled defaults.
@@ -1247,6 +1253,7 @@ impl AiMemoryServer {
             wiki: None,
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
+            strict_schema: false,
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
@@ -1277,6 +1284,14 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
         self.per_user_slots = enabled;
+        self
+    }
+
+    /// Force restricted tool schemas on every `tools/list` (issue #412);
+    /// see [`Self::strict_schema`].
+    #[must_use]
+    pub fn with_strict_schema(mut self, enabled: bool) -> Self {
+        self.strict_schema = enabled;
         self
     }
 
@@ -3853,12 +3868,15 @@ impl ServerHandler for AiMemoryServer {
         let tools = self.tool_router.list_all();
         // rmcp injects `http::request::Parts` into request extensions in
         // both stateless and stateful modes, so the flavor marker is
-        // available even without peer clientInfo.
-        let restricted_schema = context
-            .extensions
-            .get::<http::request::Parts>()
-            .and_then(|parts| parts.uri.query())
-            .is_some_and(has_restricted_schema_flavor);
+        // available even without peer clientInfo. `strict_schema` forces
+        // the restricted form for every client, not just flavored ones
+        // (issue #412).
+        let restricted_schema = self.strict_schema
+            || context
+                .extensions
+                .get::<http::request::Parts>()
+                .and_then(|parts| parts.uri.query())
+                .is_some_and(has_restricted_schema_flavor);
         if restricted_schema {
             Ok(ListToolsResult::with_all_items(
                 restricted_schema_tool_list(tools),

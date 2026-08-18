@@ -140,6 +140,12 @@ pub struct Config {
     /// already supplies its own schema. Set
     /// `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint.
     pub llm_compat_strict: bool,
+    /// Serve restricted (combinator-stripped) tool schemas on every
+    /// `tools/list`, even when the client sends no `?flavor=` marker, for
+    /// strict upstream validators that forward tool schemas verbatim
+    /// (Moonshot/Bedrock dialect) from generic MCP clients (issue #412).
+    /// Set with `AI_MEMORY_STRICT_SCHEMA=true`.
+    pub strict_schema: bool,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -543,6 +549,7 @@ impl Default for Config {
             llm_compat_strict: true,
             consolidate_on_session_end: false,
             capture_assistant: false,
+            strict_schema: false,
             reranker: None,
             embedding_provider: None,
             embedding_model: None,

@@ -251,3 +251,46 @@ async fn stateless_tools_list_without_flavor_keeps_root_any_of() {
         "unflavored tools/list must keep the upstream root anyOf: {schema}"
     );
 }
+
+/// `strict_schema=true` serves the restricted tool list to every client —
+/// including generic ones that never send `?flavor=` (issue #412: OpenCode,
+/// Cursor etc. forward schemas verbatim to strict validators).
+#[tokio::test]
+async fn stateless_strict_schema_strips_root_any_of_without_flavor() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+    let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+        .with_strict_schema(true);
+    let svc = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true),
+    );
+    let router = Router::new().nest_service("/mcp", svc);
+
+    let resp = router.clone().oneshot(post(TOOLS_LIST)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = read_page_input_schema(&body_string(resp).await);
+    for key in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            schema.get(key).is_none(),
+            "strict schema must strip root `{key}` with no flavor marker: {schema}"
+        );
+    }
+    assert!(
+        schema.get("properties").is_some(),
+        "the flat schema must keep describing the args: {schema}"
+    );
+}
