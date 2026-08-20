@@ -103,6 +103,37 @@ pub fn spool_len(spool: &Path) -> usize {
     list_entries(spool).map_or(0, |f| f.len())
 }
 
+/// Enqueue time of the oldest queued spool entry, or `None` when the spool is
+/// missing/empty. Derived solely from the Unix-ms prefix baked into each file
+/// name at [`enqueue`] time — the same zero-padded ordering key [`drain`] sorts
+/// on — so it never opens a spool file. That keeps status telemetry off the
+/// captured payload entirely (a spool body must never surface in status output)
+/// and makes the scan pure metadata: one `read_dir`, no deserialization.
+///
+/// A `.json` file whose name has no parseable millisecond prefix (i.e. one
+/// [`enqueue`] never wrote) has no usable age, so it is skipped here even though
+/// [`spool_len`] still counts it — an unrelated file can make `pending` and the
+/// oldest age disagree, matching `spool_len`'s existing count-every-`*.json`
+/// policy rather than inventing a stricter one.
+#[must_use]
+pub fn oldest_spool_entry_time(spool: &Path) -> Option<SystemTime> {
+    let oldest_ms = list_entries(spool)?
+        .iter()
+        .filter_map(|path| entry_created_ms_from_name(path))
+        .min()?;
+    Some(UNIX_EPOCH + Duration::from_millis(oldest_ms))
+}
+
+/// Parse the leading Unix-ms `created_ms` field from a spool file name
+/// (`<ms>-<pid>-<seq>.json`). Returns `None` for any name that field is absent
+/// or non-numeric in, so a stray file can never poison the oldest-age scan.
+fn entry_created_ms_from_name(path: &Path) -> Option<u64> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split('-').next())
+        .and_then(|prefix| prefix.parse::<u64>().ok())
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -865,6 +896,70 @@ mod tests {
 
         assert_eq!(static_bearer.as_deref(), Some("static-token"));
         assert!(absent_bearer.is_none());
+    }
+
+    /// Enqueue an entry whose `created_ms` (and therefore file-name prefix) is
+    /// fixed, so oldest-selection tests are deterministic without sleeps.
+    fn enqueue_at(spool: &Path, created_ms: u64) {
+        let mut entry = entry_for("https://x/hook?event=stop".into(), "{}".into(), None, false);
+        entry.created_ms = created_ms;
+        enqueue(spool, &entry).unwrap();
+    }
+
+    #[test]
+    fn oldest_spool_entry_time_none_when_empty_or_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Directory never created — behaves like an empty spool, no error.
+        assert!(oldest_spool_entry_time(&spool_dir(tmp.path())).is_none());
+
+        let spool = spool_dir(tmp.path());
+        create_spool_dir(&spool).unwrap();
+        assert!(oldest_spool_entry_time(&spool).is_none());
+    }
+
+    #[test]
+    fn oldest_spool_entry_time_matches_single_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        enqueue_at(&spool, 1_700_000_000_000);
+
+        assert_eq!(spool_len(&spool), 1);
+        assert_eq!(
+            oldest_spool_entry_time(&spool),
+            Some(UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)),
+        );
+    }
+
+    #[test]
+    fn oldest_spool_entry_time_selects_earliest_regardless_of_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        // Enqueued newest-first so the answer can't come from enumeration order.
+        enqueue_at(&spool, 3_000);
+        enqueue_at(&spool, 1_000); // oldest
+        enqueue_at(&spool, 2_000);
+
+        assert_eq!(spool_len(&spool), 3);
+        assert_eq!(
+            oldest_spool_entry_time(&spool),
+            Some(UNIX_EPOCH + Duration::from_millis(1_000)),
+        );
+    }
+
+    #[test]
+    fn oldest_spool_entry_time_skips_unparseable_name_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        enqueue_at(&spool, 5_000);
+        // A stray `.json` with no numeric prefix: counted by spool_len, but it
+        // has no usable timestamp, so the oldest age still reflects the real entry.
+        std::fs::write(spool.join("not-a-spool-entry.json"), b"{}").unwrap();
+
+        assert_eq!(spool_len(&spool), 2);
+        assert_eq!(
+            oldest_spool_entry_time(&spool),
+            Some(UNIX_EPOCH + Duration::from_millis(5_000)),
+        );
     }
 
     #[test]

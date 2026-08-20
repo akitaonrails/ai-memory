@@ -4,10 +4,14 @@
 //! server; renders the response as human text or JSON. Never opens
 //! the store directly — the server is the source of truth.
 
+use std::path::Path;
+use std::time::{Duration, SystemTime};
+
 use ai_memory_llm::{ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::hook_spool;
 use crate::cli::StatusArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -72,6 +76,10 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     let report: Report = get_json(&ep, "/admin/status", &[]).await?;
 
+    // Local hook-spool health is read from the client-side data dir (the spool
+    // is always local, unlike the server-reported paths above). Metadata only.
+    let spool = SpoolHealth::gather(&config.data_dir);
+
     if args.json {
         println!(
             "{}",
@@ -88,6 +96,10 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 },
                 "derived": report.derived,
                 "providers": report.providers,
+                "hook_spool": {
+                    "pending": spool.pending,
+                    "oldest_age_secs": spool.oldest_age.map(|age| age.as_secs()),
+                },
                 "client": { "server_url": ep.url, "auth": ep.auth_token.is_some() },
             }))?
         );
@@ -134,8 +146,65 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         {
             println!("    retry:     {hint}");
         }
+        println!("  hook spool:");
+        println!("    pending:        {}", spool.pending);
+        println!("    oldest pending: {}", spool.oldest_display());
     }
     Ok(())
+}
+
+/// Local hook-spool backlog for status output: how many captured events are
+/// still queued on this machine and how long the oldest has waited. Only the
+/// count and age are ever exposed — the spool bodies (prompts, tool payloads,
+/// captured observations) are never opened, per the status privacy rule.
+struct SpoolHealth {
+    /// Events currently queued in the local spool.
+    pending: usize,
+    /// Wall-clock age of the oldest queued event, or `None` when the spool is
+    /// empty. Saturates to zero if the entry's timestamp is in the future
+    /// (clock skew), so status never reports a negative age.
+    oldest_age: Option<Duration>,
+}
+
+impl SpoolHealth {
+    /// Read the local spool metadata. Degrades to an empty backlog when the
+    /// spool directory is missing/unreadable — status must stay useful (and
+    /// never panic) when one component can't be read.
+    fn gather(data_dir: &Path) -> Self {
+        let spool = hook_spool::spool_dir(data_dir);
+        let pending = hook_spool::spool_len(&spool);
+        let oldest_age = hook_spool::oldest_spool_entry_time(&spool).map(|created| {
+            SystemTime::now()
+                .duration_since(created)
+                .unwrap_or_default()
+        });
+        Self {
+            pending,
+            oldest_age,
+        }
+    }
+
+    /// Human-readable oldest-pending age, or `none` when the spool is empty.
+    fn oldest_display(&self) -> String {
+        self.oldest_age
+            .map_or_else(|| "none".to_string(), format_age)
+    }
+}
+
+/// Render a backlog age as a compact `3s` / `2m` / `1h` / `4d` string, matching
+/// the terse style of the surrounding status lines. Coarsens to the largest
+/// whole unit; sub-second ages read as `0s`.
+fn format_age(age: Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 60 * 60 {
+        format!("{}m", secs / 60)
+    } else if secs < 24 * 60 * 60 {
+        format!("{}h", secs / (60 * 60))
+    } else {
+        format!("{}d", secs / (24 * 60 * 60))
+    }
 }
 
 fn provider_health_line(role: &ProviderRoleHealthSnapshot) -> String {
@@ -192,6 +261,76 @@ fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
 mod tests {
     use super::*;
     use jiff::Timestamp;
+
+    fn enqueue_at(data_dir: &Path, created_ms: u64) {
+        let spool = hook_spool::spool_dir(data_dir);
+        let mut entry =
+            hook_spool::entry_for("https://x/hook?event=stop".into(), "{}".into(), None, false);
+        entry.created_ms = created_ms;
+        hook_spool::enqueue(&spool, &entry).unwrap();
+    }
+
+    #[test]
+    fn format_age_coarsens_to_largest_whole_unit() {
+        assert_eq!(format_age(Duration::from_millis(400)), "0s");
+        assert_eq!(format_age(Duration::from_secs(8)), "8s");
+        assert_eq!(format_age(Duration::from_secs(59)), "59s");
+        assert_eq!(format_age(Duration::from_secs(60)), "1m");
+        assert_eq!(format_age(Duration::from_secs(3599)), "59m");
+        assert_eq!(format_age(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_age(Duration::from_secs(24 * 3600)), "1d");
+    }
+
+    #[test]
+    fn spool_health_empty_spool_reports_zero_and_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let health = SpoolHealth::gather(tmp.path());
+        assert_eq!(health.pending, 0);
+        assert!(health.oldest_age.is_none());
+        assert_eq!(health.oldest_display(), "none");
+    }
+
+    #[test]
+    fn spool_health_counts_pending_and_ages_oldest() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two entries; the older is well in the past so its age is non-trivial
+        // and its display is a real duration rather than `none`.
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        enqueue_at(tmp.path(), now_ms - 5_000);
+        enqueue_at(tmp.path(), now_ms - 90_000); // oldest → ~90s
+
+        let health = SpoolHealth::gather(tmp.path());
+        assert_eq!(health.pending, 2);
+        let age = health.oldest_age.expect("oldest age present");
+        assert!(age.as_secs() >= 90, "age tracks the oldest entry: {age:?}");
+        assert_eq!(health.oldest_display(), format_age(age));
+    }
+
+    #[test]
+    fn spool_health_future_timestamp_saturates_to_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        // Clock skew: a timestamp far in the future must not yield a negative
+        // age or panic.
+        enqueue_at(tmp.path(), now_ms + 10 * 60 * 1000);
+
+        let health = SpoolHealth::gather(tmp.path());
+        assert_eq!(health.pending, 1);
+        assert_eq!(health.oldest_age, Some(Duration::ZERO));
+        assert_eq!(health.oldest_display(), "0s");
+    }
 
     #[test]
     fn provider_health_line_renders_unknown_and_disabled() {
