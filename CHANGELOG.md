@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *wants* one of them kept visible (for example a public bot id) can add it
   to `[sanitize].allowlist`.
 
+### Fixed
+- The AUR `PKGBUILD` (`packaging/aur/PKGBUILD`) still declared `pkgver=0.3.2`,
+  roughly a hundred releases behind the `1.28.0` that `Cargo.toml` and the
+  latest tag actually ship. Anyone building the AUR package as published
+  would fetch the `v0.3.2` source tarball instead of current `main`,
+  silently missing every feature and fix since. Bumped `pkgver` to `1.28.0`
+  to match the current release; `pkgrel` stays at `1` since this is a fresh
+  version bump, not a rebuild of the same upstream version.
+
 ## [1.28.0] - 2026-08-17
 
 ### Fixed
