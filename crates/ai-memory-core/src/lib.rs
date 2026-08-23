@@ -9,6 +9,8 @@ pub mod active_project;
 pub mod actor;
 pub mod error;
 pub mod handoff;
+pub mod ingest_metrics;
+pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
 pub mod observation;
 pub mod page;

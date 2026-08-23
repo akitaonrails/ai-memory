@@ -641,7 +641,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     },
                 )
             };
+            // One shared counter set: the hook path writes it, /admin/status
+            // reads it. Two instances would report zeros to the operator
+            // while the real counts accumulated somewhere unreachable.
+            let ingest_metrics = std::sync::Arc::new(ai_memory_core::IngestMetrics::default());
             let hooks = hook_router(HookState {
+                ingest_metrics: ingest_metrics.clone(),
                 workspace_id: ws,
                 project_id: proj,
                 writer: store.writer.clone(),
@@ -684,6 +689,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             });
             let admin = admin_router_with_decay_breadth(
                 AdminState {
+                    ingest_metrics: ingest_metrics.clone(),
                     writer: store.writer.clone(),
                     reader: store.reader.clone(),
                     wiki: wiki.clone(),

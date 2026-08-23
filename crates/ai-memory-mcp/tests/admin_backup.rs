@@ -24,6 +24,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,

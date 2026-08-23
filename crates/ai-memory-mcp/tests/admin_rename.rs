@@ -23,6 +23,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -312,6 +313,7 @@ async fn rename_project_pages_still_searchable() {
     // the single-writer invariant is preserved. We need two states because
     // axum's `oneshot` consumes the router.
     let state2 = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: state.wiki.clone(),
@@ -385,6 +387,7 @@ async fn rename_project_after_purge_returns_404_not_silent_200() {
 
     // Purge the row out from under any in-flight rename.
     let purge_state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: state.writer.clone(),
         reader: state.reader.clone(),
         wiki: state.wiki.clone(),

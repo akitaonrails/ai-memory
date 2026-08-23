@@ -446,6 +446,8 @@ pub struct HookState {
     /// of their own) default to the project the user is actually in
     /// rather than the server's static `--project` (issue #2).
     pub active_project: ActiveProject,
+    /// Process-lifetime ingestion counters for operator status reporting.
+    pub ingest_metrics: Arc<ai_memory_core::IngestMetrics>,
     /// In-flight hook processing limiter. Requests acquire one permit before
     /// spawning work and return 429 immediately when saturated.
     pub ingest_semaphore: Arc<tokio::sync::Semaphore>,
@@ -599,6 +601,7 @@ async fn handle_hook(
     // Any gate failure leaves an empty Stop with the same 202 "queued" response.
     crate::assistant_capture::apply_assistant_backstop(&mut env, state.capture_assistant_enabled);
     let Some(env) = inspect_capture_envelope(env) else {
+        state.ingest_metrics.record_dropped_by_policy();
         return (StatusCode::ACCEPTED, "capture policy dropped");
     };
     // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
@@ -616,9 +619,11 @@ async fn handle_hook(
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     if should_drop_subagent(&state, &env).await {
+        state.ingest_metrics.record_dropped_by_policy();
         return (StatusCode::ACCEPTED, "subagent capture dropped");
     }
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
+        state.ingest_metrics.record_shed_saturated();
         warn!("hook ingest saturated; dropping event with 429");
         return (StatusCode::TOO_MANY_REQUESTS, "hook queue full");
     };
@@ -629,11 +634,14 @@ async fn handle_hook(
         .await
         .try_take(&rate_key, std::time::Instant::now())
     {
+        state.ingest_metrics.record_shed_rate_limited();
         warn!(source = %log_rate_key(&rate_key), "hook ingest rate limit exceeded for source; dropping event with 429");
         return (StatusCode::TOO_MANY_REQUESTS, "hook source rate limited");
     }
+    state.ingest_metrics.record_accepted();
     tokio::spawn(async move {
         let _permit = permit;
+        let metrics = state.ingest_metrics.clone();
         process_envelope(
             state,
             env,
@@ -642,6 +650,16 @@ async fn handle_hook(
             skip_webhooks,
         )
         .await;
+        // Stamped after `process_envelope` returns, which is the point the
+        // event has been through the writer. This is the signal an operator
+        // uses to tell "hooks are arriving but nothing is landing" from
+        // "nothing is arriving" — the two look identical from the accepted
+        // count alone.
+        metrics.record_persisted(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+        );
     });
     (StatusCode::ACCEPTED, "queued")
 }
@@ -3326,6 +3344,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let sanitizer = Sanitizer::default();
         HookState {
+            ingest_metrics: Arc::new(ai_memory_core::IngestMetrics::default()),
             workspace_id: ws,
             project_id: proj,
             writer: store.writer.clone(),

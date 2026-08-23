@@ -107,6 +107,9 @@ pub struct AdminState {
     pub embedder: Option<Arc<dyn Embedder>>,
     /// Passive process-scoped health recorder for configured providers.
     pub provider_health: ProviderHealth,
+    /// Shared hook-ingestion counters, written by the hook path and read
+    /// here for status reporting.
+    pub ingest_metrics: std::sync::Arc<ai_memory_core::IngestMetrics>,
     /// Retention-decay parameters forwarded from server config.
     pub decay_params: DecayParams,
     /// Server's resolved data directory (e.g. `/data` in the docker
@@ -826,6 +829,9 @@ pub struct StatusReport {
     pub derived: ai_memory_store::DerivedIndexStatus,
     /// Passive process-scoped provider health.
     pub providers: ProviderHealthSnapshot,
+    /// Hook-ingestion counters for this server process. Counts and one
+    /// timestamp only — never captured content (#428).
+    pub ingest: ai_memory_core::IngestMetricsSnapshot,
 }
 
 /// `GET /admin/projects` — the authoritative list of `(workspace, project)`
@@ -858,6 +864,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     counts,
                     derived,
                     providers: state.provider_health.snapshot(),
+                    ingest: state.ingest_metrics.snapshot(),
                 };
                 (
                     StatusCode::OK,
@@ -6247,6 +6254,7 @@ mod tests {
             .unwrap()
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -6307,6 +6315,7 @@ mod tests {
             .unwrap();
 
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -6429,6 +6438,7 @@ mod tests {
         }
 
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -6662,6 +6672,7 @@ mod tests {
         }
 
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -6855,6 +6866,7 @@ mod tests {
         store.writer.end_session(ended, None).await.unwrap();
 
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -7034,6 +7046,7 @@ mod tests {
             .unwrap()
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -7067,6 +7080,7 @@ mod tests {
         llm: Option<Arc<dyn LlmProvider>>,
     ) -> AdminState {
         AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -8510,6 +8524,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -8619,6 +8634,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -8721,6 +8737,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -8829,6 +8846,7 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9376,6 +9394,7 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9730,6 +9749,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
@@ -9861,6 +9881,7 @@ mod tests {
         let missing_db_reader =
             ai_memory_store::ReaderPool::new(&tmp.path().join("missing.sqlite"), 1).unwrap();
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: missing_db_reader,
             wiki,
@@ -10167,6 +10188,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,

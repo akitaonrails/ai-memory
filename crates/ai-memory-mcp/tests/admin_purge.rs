@@ -31,6 +31,7 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -412,6 +413,7 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         .with_admission_chain(chain)
         .with_store_reader(store.reader.clone());
     let state = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
@@ -514,6 +516,7 @@ async fn purge_project_idempotent_second_call_is_404() {
     let tmp = TempDir::new().unwrap();
     let (state_a, store) = make_state(&tmp).await;
     let state_b = AdminState {
+        ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: state_a.wiki.clone(),

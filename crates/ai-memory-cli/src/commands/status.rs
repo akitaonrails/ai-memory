@@ -13,6 +13,18 @@ use crate::cli::StatusArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
 
+/// Server-side hook-ingestion counters. `Option` at the call site so a
+/// newer CLI pointed at an older server renders the rest of `status`
+/// instead of failing to deserialise the whole report.
+#[derive(Debug, Deserialize, Serialize)]
+struct IngestReport {
+    accepted: u64,
+    dropped_by_policy: u64,
+    shed_saturated: u64,
+    shed_rate_limited: u64,
+    last_persisted_ms: Option<u64>,
+}
+
 /// Server-shaped response. Mirrors `ai_memory_mcp::admin::StatusReport`.
 #[derive(Debug, Deserialize, Serialize)]
 struct Report {
@@ -29,6 +41,9 @@ struct Report {
     /// Derived-index diagnostics.
     #[serde(default)]
     derived: Derived,
+    /// Hook-ingestion counters from the server process.
+    #[serde(default)]
+    ingest: Option<IngestReport>,
     /// Passive process-scoped provider health.
     #[serde(default)]
     providers: ProviderHealthSnapshot,
@@ -73,6 +88,20 @@ struct EmbeddingTriple {
 /// single object on stdout and get a non-zero exit here anyway. The
 /// unreachable-server error still propagates unchanged; this only adds the
 /// local half of the picture that the caller can actually act on.
+/// Render the last-persisted stamp as an age, or `-` when this server
+/// process has not written an event yet.
+///
+/// An age rather than a wall-clock time: the useful question is "how long
+/// since anything landed", and the server may be in another timezone.
+fn last_write_line(unix_ms: Option<u64>) -> String {
+    let Some(ms) = unix_ms else {
+        return "-".to_string();
+    };
+    let now = jiff::Timestamp::now().as_millisecond();
+    let now_ms = u64::try_from(now).unwrap_or(0);
+    spool_age_line(Some(now_ms.saturating_sub(ms)))
+}
+
 fn report_offline_spool(spool: &SpoolHealth, json: bool) {
     if json {
         if let Ok(rendered) = serde_json::to_string(spool) {
@@ -133,6 +162,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 "derived": report.derived,
                 "providers": report.providers,
                 "spool": spool,
+                "ingest": report.ingest,
                 "client": { "server_url": ep.url, "auth": ep.auth_token.is_some() },
             }))?
         );
@@ -169,6 +199,22 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         println!("    pending:    {}", spool.pending);
         println!("    oldest:     {}", spool_age_line(spool.oldest_age_ms));
         println!("    retries:    {}", spool.retries_total);
+        if let Some(ingest) = &report.ingest {
+            println!("  ingest (server, this process):");
+            println!("    accepted:   {}", ingest.accepted);
+            println!(
+                "    dropped:    {} (capture policy)",
+                ingest.dropped_by_policy
+            );
+            println!(
+                "    shed:       {} saturated, {} rate-limited",
+                ingest.shed_saturated, ingest.shed_rate_limited
+            );
+            println!(
+                "    last write: {}",
+                last_write_line(ingest.last_persisted_ms)
+            );
+        }
         println!("  providers:");
         println!(
             "    llm:       {}",

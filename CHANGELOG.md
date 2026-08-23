@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ai-memory status` now reports server-side hook-ingestion counters
+  alongside the client spool section: events accepted, accepted-but-dropped
+  by capture policy, shed because ingest capacity was exhausted, shed by the
+  per-source rate limiter, and how long since the last event reached the
+  writer (#428). Together with the spool numbers this distinguishes the three
+  states that previously looked alike from the outside — hooks not arriving,
+  hooks arriving but shed, and hooks arriving but not landing.
+
+  Deliberately a fixed set of scalars rather than a per-source breakdown:
+  keying counters on a client-supplied value would put unbounded,
+  network-reachable state behind the very queue that exists to bound it. The
+  counters are relaxed atomics, so the hook path pays no lock, and the
+  snapshot is content-free by construction — counts and one timestamp, with a
+  test asserting the field set so a future change cannot quietly add captured
+  text. A newer CLI against an older server renders the rest of `status` and
+  omits the section rather than failing to parse.
+
 ## [1.31.1] - 2026-08-23
 
 ### Fixed
