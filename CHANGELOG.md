@@ -8,33 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Session pages now carry a `summary` in their frontmatter, which the
-  retrieval layer already prefers over the page body when describing a
-  non-FTS hit (#473). #463 made that `COALESCE` prefer a summary, but nothing
-  wrote one for a session page: measured against a live 1.31.1 instance, 0 of
-  25 substantive pages had the field, so every descriptor came from the body
-  fallback. Both write paths now fill it — the zero-LLM `SessionEnd` synthesis
-  and the LLM consolidator — because zero-LLM is the documented default and a
-  fix in the consolidator alone would miss the pages most installs have.
+- Gave session pages a `summary` in their frontmatter, which the retrieval
+  layer already preferred over the page body when describing a non-FTS hit.
+  #463 made that `COALESCE` prefer a summary, but no write path produced one:
+  measured against a live 1.31.1 instance, 0 of 25 substantive pages had the
+  field, so every descriptor fell back to the body. All three writers now fill
+  it — the zero-LLM `SessionEnd` synthesis, the single-page consolidator, and
+  the batch one — because zero-LLM is the documented default and `multi_page`
+  defaults to false, so covering either alone would have missed the pages most
+  installs actually hold. (#473)
 
-  On the zero-LLM path the summary is built from counts the renderer already
-  had and was discarding: prompts, completed tool calls per tool, and elapsed
-  time ("2 prompts, 34 completed tool calls across Bash, Edit and Read, over
-  18m"). That is what the body cannot state about itself — a reader deciding
-  whether to open a page can now see how much work it holds, not only what it
-  opened with. The tallying is computed once and shared with the body
-  renderer rather than parsed back out of the markdown, and it still counts
-  `PostToolUse` only, so a completed call is not double-counted.
+  On the zero-LLM path the summary came from counts the renderer already had
+  and was discarding: prompts, completed tool calls per tool, and elapsed time
+  ("2 prompts, 34 completed tool calls across Bash, Edit and Read, over 18m").
+  That is what a page cannot state about itself — a reader deciding whether to
+  open it now sees how much work it holds, not only what it opened with. The
+  page is tallied once and the count lent to both the body renderer and the
+  summary, and `PostToolUse` stays the only counted kind so a completed call is
+  not double-counted.
 
-  On the LLM path it is a new optional field on the consolidator's structured
-  output, so it costs no additional model call — the call already happens.
-  `#[serde(default)]` keeps stored outputs from older runs deserialising, and
-  a blank or whitespace-only value is dropped rather than written, since an
-  empty summary would still win the `COALESCE` and cost the page its
-  body-derived descriptor.
+  On the LLM paths it became an optional field on the consolidator's structured
+  output, costing no additional model call since the call already happens, with
+  `#[serde(default)]` so stored outputs from earlier runs still deserialise.
+  Both system prompts now request it and describe the shape it has to keep; the
+  batch prompt previously forbade the key outright.
 
-  The fallback is unchanged and still serves hand-written pages and
-  everything written before this. New writes only: no backfill, no migration.
+  A model-supplied summary is validated before it is written, because the
+  reader prefers `summary` over the body and then drops headings, metadata
+  bullets, list items and title repeats — falling back to echoing its raw
+  input when nothing survives. A structurally wrong summary is therefore not
+  ignored but reproduced verbatim as the descriptor, displacing usable body
+  text with no error anywhere. Anything the reader would discard is dropped at
+  the boundary instead, leaving the page on its body-derived descriptor.
+
+  The fallback is unchanged and still serves hand-written pages and everything
+  written before this. New writes only: no backfill, no migration.
 
 - `ai-memory status` now reports server-side hook-ingestion counters
   alongside the client spool section: events accepted, accepted-but-dropped

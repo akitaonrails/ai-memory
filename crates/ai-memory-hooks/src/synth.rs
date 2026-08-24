@@ -28,14 +28,17 @@ pub fn synthesize_session_page(
     session_id: SessionId,
     observations: &[Observation],
 ) -> NewPage {
+    // One tally for the whole page: the body renderer and the summary builder
+    // describe the same session and must not scan it twice to do so.
+    let tally = tally_session(observations);
     let title = derive_title(observations);
-    let body = render_body(session_id, observations, &title);
+    let body = render_body(session_id, observations, &title, &tally);
     let mut frontmatter_json = serde_json::json!({
         "title": title,
         "session_id": session_id.to_string(),
         "tier": "episodic",
     });
-    let summary = session_summary(observations);
+    let summary = session_summary(&tally);
     if !summary.is_empty() {
         // Insert only when there is something to say. The store's hit
         // descriptor prefers `summary` over the body, so writing a blank one
@@ -89,9 +92,12 @@ struct SessionTally<'a> {
 
 /// Tally a session's observations once.
 ///
-/// [`render_body`] and [`session_summary`] both need these counts. Computing
-/// them here keeps the two from drifting, and keeps the summary from having to
-/// parse them back out of the markdown the body just rendered them into.
+/// [`render_body`] and [`session_summary`] both need these counts, and
+/// [`synthesize_session_page`] computes them once and lends them to both — so
+/// a page costs one pass over its observations, not two, and the body and the
+/// summary cannot describe the same session differently. It also keeps the
+/// summary from having to parse the counts back out of the markdown the body
+/// just rendered them into.
 fn tally_session(observations: &[Observation]) -> SessionTally<'_> {
     let mut tally = SessionTally {
         tool_counts: BTreeMap::new(),
@@ -136,8 +142,7 @@ const SUMMARY_MAX_NAMED_TOOLS: usize = 3;
 /// silently and with no error anywhere.
 ///
 /// Hence: one line, plain prose, no leading marker.
-fn session_summary(observations: &[Observation]) -> String {
-    let tally = tally_session(observations);
+fn session_summary(tally: &SessionTally<'_>) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     if !tally.prompts.is_empty() {
@@ -223,13 +228,18 @@ fn format_duration(seconds: i64) -> Option<String> {
     })
 }
 
-fn render_body(session_id: SessionId, observations: &[Observation], title: &str) -> String {
+fn render_body(
+    session_id: SessionId,
+    observations: &[Observation],
+    title: &str,
+    tally: &SessionTally<'_>,
+) -> String {
     let SessionTally {
         tool_counts,
         prompts,
         start,
         end,
-    } = tally_session(observations);
+    } = tally;
 
     let mut buf = String::with_capacity(2048);
     buf.push_str(&format!("# {title}\n\n"));
@@ -254,7 +264,7 @@ fn render_body(session_id: SessionId, observations: &[Observation], title: &str)
 
     if !tool_counts.is_empty() {
         buf.push_str("## Tool calls\n\n");
-        for (name, count) in &tool_counts {
+        for (name, count) in tool_counts {
             buf.push_str(&format!("- `{name}`: {count}\n"));
         }
         buf.push('\n');
@@ -364,7 +374,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            session_summary(&observations),
+            session_summary(&tally_session(&observations)),
             "2 prompts, 3 completed tool calls across Bash and Edit, over 18m."
         );
     }
@@ -393,7 +403,7 @@ mod tests {
                 "2026-08-24T10:05:00Z",
             ),
         ];
-        let summary = session_summary(&observations);
+        let summary = session_summary(&tally_session(&observations));
 
         assert!(!summary.contains('\n'), "must stay one line: {summary:?}");
         assert!(
@@ -423,11 +433,22 @@ mod tests {
         // An empty summary must stay out of the frontmatter entirely: a blank
         // one still wins the store's COALESCE and would cost the page its
         // body-derived descriptor.
+        // Fixed, equal timestamps: `obs` stamps `Timestamp::now()`, so two
+        // calls straddling a second boundary would make this a session that
+        // lasted `1s` and give it a summary after all.
         let lifecycle_only = vec![
-            obs(ObservationKind::SessionStart, "session-start"),
-            obs(ObservationKind::SessionEnd, "session-end"),
+            obs_at(
+                ObservationKind::SessionStart,
+                "session-start",
+                "2026-08-24T10:00:00Z",
+            ),
+            obs_at(
+                ObservationKind::SessionEnd,
+                "session-end",
+                "2026-08-24T10:00:00Z",
+            ),
         ];
-        assert_eq!(session_summary(&lifecycle_only), "");
+        assert_eq!(session_summary(&tally_session(&lifecycle_only)), "");
 
         let page = synthesize_session_page(
             WorkspaceId::new(),
@@ -481,7 +502,7 @@ mod tests {
             }
         }
         assert_eq!(
-            session_summary(&observations),
+            session_summary(&tally_session(&observations)),
             "1 prompt, 15 completed tool calls across Bash, Edit and Read and 2 more."
         );
     }

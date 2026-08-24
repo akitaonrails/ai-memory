@@ -100,13 +100,20 @@ schema, and nothing else:
 {
   "title": "<page title>",
   "body_markdown": "<markdown body>",
-  "tags": ["tag-1", "tag-2"]
+  "tags": ["tag-1", "tag-2"],
+  "summary": "<one line of plain prose>"
 }
 ```
 
 - Field names are EXACT and case-sensitive. Use `body_markdown`,
   not `body` or `content`. `tags` may be `[]` but the key must
   be present.
+- `summary` is ONE line of plain prose saying what the page covers, for
+  readers who see it beside the title in a listing. It must NOT be a
+  heading, a `- **key:** value` bullet, a list item, or a repeat of the
+  title — a summary shaped like any of those is discarded and the page is
+  described worse than if you had omitted it. Omit the key rather than
+  guessing.
 
 ## Output format
 
