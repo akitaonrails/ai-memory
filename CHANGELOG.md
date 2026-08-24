@@ -76,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `capture_mode`, `marker_present` and `admits_capture` so an opt-out can be
   verified without sending anything. Default behaviour is unchanged, and
   `--capture-mode denylist` restores it.
+- Corrected the allowlist-mode documentation, which claimed "every agent's
+  hook honours it". The gate runs inside the native `ai-memory hook` binary
+  before the spool write, so script-based installs — the
+  `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper, and
+  `setup-agent` snippets — POST directly and never read the mode. That is the
+  same boundary `[capture] ignore_paths` already documents. `install-hooks
+  --apply` now warns when the install it is writing cannot enforce the mode it
+  just stored, so the gap is visible where it matters rather than only in a
+  doc (#446).
 - `ai-memory status` now reports the capture mode when it is `allowlist`, in
   both the human and `--json` renderings. Without it the new ingest counters
   read identically whether hooks are broken or a repository simply never opted

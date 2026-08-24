@@ -374,6 +374,17 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         println!("capture mode: {capture_mode}");
         if capture_mode == "allowlist" {
             println!("  repositories without a .ai-memory.toml marker emit no lifecycle events");
+            // The gate lives inside the native hook binary, immediately before
+            // the spool write. A script install POSTs to the server directly
+            // and never runs it, so the mode is stored but unenforced. Saying
+            // nothing would leave an operator trusting a protection this
+            // install does not have — the exact failure #446 is about.
+            if !local_hook_policy_v1_supported() {
+                println!(
+                    "  WARNING: this install uses script hooks, which POST directly and \
+                     cannot enforce the mode. Allowlist is stored but NOT in force here."
+                );
+            }
         }
         // Preserve a project-strategy an earlier `--apply` baked when this run
         // did not pass `--project-strategy`. Without this, a bare re-apply —

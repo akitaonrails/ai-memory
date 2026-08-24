@@ -493,8 +493,22 @@ never opted in. Opting a repository in is just placing a `.ai-memory.toml`
 marker in it, which is the same file that already configures routing and
 `ignore_paths`.
 
-Unlike the flags above, this is not per-agent: the mode is stored once in the
-data directory and every agent's hook honours it. That also means a later bare
+**It is enforced by native `ai-memory hook` commands only** — the same
+boundary that already applies to `[capture] ignore_paths`, and for the same
+reason: the gate runs inside the hook binary, immediately before it spools.
+
+That is what a normal `install-hooks --apply` writes on Linux, macOS and
+Windows, so the usual install is covered. It is the *script* installs that are
+not: the bundled shell/PowerShell hooks POST to the server directly and never
+execute the binary, so nothing reads the mode. In practice that means the
+legacy `posix`/`windows` platform override (`AI_MEMORY_HOOK_PLATFORM`), the
+Docker host wrapper, and `setup-agent` snippets, which emit script commands by
+design. `install-hooks --apply` prints the mode and warns when the install it
+is writing cannot enforce it.
+
+Within that boundary the mode is not per-agent: it is stored once in the data
+directory and every native hook command reads it, whichever agent invoked it.
+That also means a later bare
 `install-hooks --apply` — including the auto-refresh inside `ai-memory upgrade`
 — leaves it alone by construction rather than by re-detecting it. Every
 `--apply` prints the mode in force. Return to the default with
