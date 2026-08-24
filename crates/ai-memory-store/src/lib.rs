@@ -2526,6 +2526,88 @@ mod tests {
         );
     }
 
+    /// The body a session page is synthesised with, minus the frontmatter.
+    /// Written out in full because the point of the test below is what a
+    /// reader can learn from this page *without* opening it.
+    const SESSION_BODY: &str = concat!(
+        "# Bound the scheduler queue\n",
+        "\n",
+        "## Session metadata\n",
+        "\n",
+        "- **session_id:** `9f2c1d0e`\n",
+        "- **started_at:** 2026-08-24T10:00:00Z\n",
+        "- **ended_at:** 2026-08-24T10:18:00Z\n",
+        "- **observations:** 41\n",
+        "\n",
+        "## Prompts\n",
+        "\n",
+        "1. Bound the scheduler queue\n",
+        "2. Make the backpressure test deterministic\n",
+    );
+
+    #[tokio::test]
+    async fn a_written_summary_changes_what_the_descriptor_tells_the_reader() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        // Same page twice. The only difference is that one was written by a
+        // path that fills `summary` and the other by one that does not.
+        let mut without = sample_page(ws, proj, "without-summary.md", SESSION_BODY);
+        without.title = "Bound the scheduler queue".into();
+        store.writer.upsert_page(without).await.unwrap();
+
+        let mut with = sample_page(ws, proj, "with-summary.md", SESSION_BODY);
+        with.title = "Bound the scheduler queue".into();
+        with.frontmatter_json = serde_json::json!({
+            "summary": "2 prompts, 34 completed tool calls across Bash, Edit and Read, over 18m.",
+        });
+        store.writer.upsert_page(with).await.unwrap();
+
+        let hits = store
+            .reader
+            .recent_pages_for_project(ws, proj, 10)
+            .await
+            .unwrap();
+        let descriptor = |path: &str| {
+            hits.iter()
+                .find(|h| h.path.as_str() == path)
+                .map(|h| h.snippet.clone())
+                .unwrap_or_else(|| panic!("{path} should be listed"))
+        };
+        let without = descriptor("without-summary.md");
+        let with = descriptor("with-summary.md");
+
+        assert_ne!(without, with);
+
+        // Without a summary the descriptor is the best the body affords: the
+        // prompts after the first, since the first repeats the title. That is
+        // real signal, and it is what #463 already delivers.
+        assert!(
+            without.contains("Make the backpressure test deterministic"),
+            "body-derived descriptor should reach the prompts: {without:?}"
+        );
+        // What it cannot say is how much work the session was. Those counts
+        // exist only at write time, and the summary is what carries them.
+        assert!(
+            !without.contains("34 completed tool calls"),
+            "the body never states the totals: {without:?}"
+        );
+        assert!(
+            with.contains("2 prompts") && with.contains("34 completed tool calls"),
+            "summary-derived descriptor should state the session's shape: {with:?}"
+        );
+    }
+
     #[tokio::test]
     async fn frontmatter_summary_wins_over_the_body_lede() {
         let tmp = TempDir::new().unwrap();
