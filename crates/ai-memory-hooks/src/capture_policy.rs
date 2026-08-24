@@ -28,6 +28,41 @@ pub struct CaptureConfig {
     pub ignore_paths: Vec<String>,
 }
 
+/// Whether a repository is captured unless excluded, or only when it opts in.
+///
+/// This is the failure-mode switch requested in #446. Under [`Self::Denylist`]
+/// — the historical behaviour and still the default — a repository with no
+/// marker is captured, so forgetting a marker leaks. Under
+/// [`Self::Allowlist`] the same omission captures nothing.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureMode {
+    /// Absence of a marker means capture normally.
+    #[default]
+    Denylist,
+    /// Absence of a marker means capture nothing at all.
+    Allowlist,
+}
+
+/// Whether this repository may emit *any* lifecycle event, decided before the
+/// per-event policy in [`CapturePolicy::inspect`] and before anything is
+/// spooled.
+///
+/// Deliberately independent of the event kind. `inspect` is reached only for
+/// tool events (`is_tool_event` in the CLI hook), so a gate expressed through
+/// [`CaptureDisposition`] alone would leave `UserPromptSubmit`,
+/// `SessionStart`/`SessionEnd`, and `Stop` bodies flowing while reporting the
+/// repository as opted out — the precise false guarantee #446 is about. Prompt
+/// text is the field that issue cares about most, so this must gate every
+/// event or it gates nothing that matters.
+#[must_use]
+pub const fn repository_admits_capture(mode: CaptureMode, marker_present: bool) -> bool {
+    match mode {
+        CaptureMode::Denylist => true,
+        CaptureMode::Allowlist => marker_present,
+    }
+}
+
 /// Typed result of marker discovery and parsing, supplied by the IO-owning caller.
 pub enum CaptureSource<'a> {
     /// No nearest marker exists.
@@ -923,6 +958,24 @@ fn char_equal(left: char, right: char, insensitive: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denylist_admits_every_repository() {
+        assert!(repository_admits_capture(CaptureMode::Denylist, false));
+        assert!(repository_admits_capture(CaptureMode::Denylist, true));
+    }
+
+    #[test]
+    fn allowlist_admits_only_a_marked_repository() {
+        assert!(!repository_admits_capture(CaptureMode::Allowlist, false));
+        assert!(repository_admits_capture(CaptureMode::Allowlist, true));
+    }
+
+    #[test]
+    fn default_mode_is_the_historical_one() {
+        // A new field must not silently tighten capture for existing installs.
+        assert_eq!(CaptureMode::default(), CaptureMode::Denylist);
+    }
     #[test]
     fn fixture_vectors() {
         let fixture: Value =

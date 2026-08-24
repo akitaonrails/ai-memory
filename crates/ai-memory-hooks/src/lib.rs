@@ -39,8 +39,9 @@ pub use assistant_capture::{
     ClientAssistantTransform, strip_assistant_message_raw, transform_for_client,
 };
 pub use capture_policy::{
-    CaptureConfig, CaptureDecision, CaptureDisposition, CapturePolicy, CaptureProtocol,
-    CaptureSource, ExtractionState, PolicyState, ToolFamily,
+    CaptureConfig, CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy,
+    CaptureProtocol, CaptureSource, ExtractionState, PolicyState, ToolFamily,
+    repository_admits_capture,
 };
 pub use payload::{
     HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,

@@ -476,6 +476,45 @@ it would break continuity. Disabling prompt capture reduces session summaries
 and recall quality because user intent is no longer part of the observation
 stream; tool and session-boundary capture continues unchanged.
 
+**Capture only repositories that opt in.** The controls above narrow *what* is
+captured; this one narrows *where*. By default a repository with no
+`.ai-memory.toml` marker is still captured, so a machine that works across many
+checkouts captures every new one automatically — forgetting a marker means
+capturing more, not less. Allowlist mode inverts that:
+
+```bash
+ai-memory install-hooks --apply --capture-mode allowlist
+```
+
+A repository without a marker then emits **no lifecycle event at all** — not a
+trimmed one. The event is dropped in the hook process before it can reach the
+local spool or the wire, so nothing is written to disk for a repository that
+never opted in. Opting a repository in is just placing a `.ai-memory.toml`
+marker in it, which is the same file that already configures routing and
+`ignore_paths`.
+
+Unlike the flags above, this is not per-agent: the mode is stored once in the
+data directory and every agent's hook honours it. That also means a later bare
+`install-hooks --apply` — including the auto-refresh inside `ai-memory upgrade`
+— leaves it alone by construction rather than by re-detecting it. Every
+`--apply` prints the mode in force. Return to the default with
+`--capture-mode denylist`.
+
+Verify it on any repository without changing anything:
+
+```bash
+printf '{"cwd":"%s"}' "$PWD" | ai-memory hook --event user-prompt-submit \
+    --agent claude-code --server-url "$AI_MEMORY_SERVER_URL" --check-capture
+```
+
+`--check-capture` inspects policy without spooling, draining, or contacting the
+server, and needs a JSON payload naming the directory to test. In the output,
+`"admits_capture": false` means that repository captures nothing;
+`"marker_present"` shows whether a marker was found by the upward walk.
+
+Note the trade: recall is lost for every repository you do not mark, and a
+repository you *intended* to capture stays silent until you add its marker.
+
 Some agent harnesses attach the assistant's final turn to their `Stop` event —
 Claude Code sends it as a raw `last_assistant_message`. By default that text is
 never persisted: the native hook binary strips the raw field before it can reach

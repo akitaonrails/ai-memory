@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test asserting the field set so a future change cannot quietly add captured
   text. A newer CLI against an older server renders the rest of `status` and
   omits the section rather than failing to parse.
+- `install-hooks --capture-mode allowlist` inverts capture scope: a repository
+  with no `.ai-memory.toml` marker emits no lifecycle event at all — prompts,
+  tool calls and session boundaries alike — dropped in the hook process before
+  anything reaches the local spool or the wire. Previously the marker could
+  only narrow what an already-captured repository sent, so forgetting one
+  captured *more*; under this mode forgetting one captures less (#446).
+
+  The gate is deliberately independent of the per-event capture policy, which
+  runs only for tool events: expressing it as a capture disposition would have
+  left prompt text spooling from a repository the CLI reported as opted out.
+  The mode is stored once per install rather than baked into each agent's hook
+  command, so every agent honours it and a bare `--apply` — including the
+  refresh inside `upgrade` — cannot revert it. `--check-capture` now reports
+  `capture_mode`, `marker_present` and `admits_capture` so an opt-out can be
+  verified without sending anything. Default behaviour is unchanged, and
+  `--capture-mode denylist` restores it.
 
 ### Docs
 - Documented the order of magnitude reported for lifecycle-hook overhead,

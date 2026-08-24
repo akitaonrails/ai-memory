@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
-use ai_memory_hooks::{CaptureDisposition, HookEvent, PolicyState};
+use ai_memory_hooks::{
+    CaptureDisposition, CaptureMode, HookEvent, PolicyState, repository_admits_capture,
+};
 use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
@@ -484,9 +486,24 @@ where
             inspection_cwd.as_deref().unwrap_or(""),
         )
     });
+    // Precedence: an explicit flag (tests, one-off runs) wins; otherwise the
+    // persisted per-install mode; otherwise the historical default.
+    let capture_mode = args.capture_mode.map_or_else(
+        || persisted_capture_mode(&resolve_data_dir(data_dir.as_deref())),
+        crate::cli::CaptureModeArg::mode,
+    );
+    // Marker presence is the opt-in signal under allowlist mode. Resolved from
+    // the same upward walk the policy uses, so opting in needs no new file.
+    let marker_present = policy_cwd
+        .as_deref()
+        .is_some_and(|cwd| crate::marker::find_marker(cwd).is_some());
+    let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
         let output = serde_json::json!({
+            "capture_mode": capture_mode,
+            "marker_present": marker_present,
+            "admits_capture": admits_capture,
             "version": protocol.map_or(1, |protocol| protocol.version()),
             "policy_state": protocol.map_or(PolicyState::Inactive, |protocol| protocol.policy_state()),
             "tool_family": protocol.map_or(ai_memory_hooks::ToolFamily::Unknown, |protocol| protocol.tool_family()),
@@ -495,6 +512,15 @@ where
             "extraction_state": protocol.map_or(ai_memory_hooks::ExtractionState::NotApplicable, |protocol| protocol.extraction_state()),
         });
         writeln!(stdout, "{output}")?;
+        return Ok(());
+    }
+    // #446: under allowlist mode a repository that never opted in emits
+    // nothing. This sits outside the `tool_event` path on purpose — `decision`
+    // is `None` for UserPromptSubmit, SessionStart/End and Stop, so gating via
+    // `CaptureDisposition` alone would still spool prompt text from an
+    // opted-out repository while reporting it as excluded.
+    if !admits_capture {
+        write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
     if let Some(decision) = decision {
@@ -767,6 +793,26 @@ fn canonical_capture_cwd(cwd: &str) -> String {
         .unwrap_or_else(|| cwd.to_owned())
 }
 
+/// File under the data dir holding the per-install capture mode (#446).
+///
+/// Deliberately a standalone file rather than a flag baked into each agent's
+/// hook command: the mode then covers every agent and every render path at
+/// once, and `install-hooks --apply` cannot regenerate it away. The reporter's
+/// binding requirement was that the protection survive an upgrade — here it
+/// does so by construction rather than by preservation logic that a new render
+/// path could forget.
+pub(crate) const CAPTURE_MODE_FILE: &str = "capture-mode";
+
+/// Read the persisted capture mode. Anything unreadable, absent, or
+/// unrecognised means the historical default: this file can only ever tighten
+/// capture, never silently loosen it below what the operator already had.
+fn persisted_capture_mode(data_dir: &Path) -> CaptureMode {
+    match std::fs::read_to_string(data_dir.join(CAPTURE_MODE_FILE)) {
+        Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => CaptureMode::Allowlist,
+        _ => CaptureMode::Denylist,
+    }
+}
+
 fn is_tool_event(event: &str) -> bool {
     matches!(
         event.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
@@ -799,6 +845,50 @@ fn resolve_data_dir(data_dir: Option<&Path>) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The regression this whole change exists for. `inspect` runs only for
+    /// tool events, so a gate expressed through `CaptureDisposition` would
+    /// leave prompt bodies spooling from a repository that never opted in —
+    /// reporting it as excluded while writing the text to disk. Pin the fact
+    /// that the gate is event-independent.
+    #[test]
+    fn allowlist_gate_covers_events_that_never_reach_capture_policy() {
+        for event in ["user-prompt-submit", "session-start", "session-end", "stop"] {
+            assert!(
+                !is_tool_event(event),
+                "{event} must not be a tool event, or this test proves nothing"
+            );
+        }
+        // With no marker present, allowlist mode admits none of them.
+        assert!(!repository_admits_capture(CaptureMode::Allowlist, false));
+    }
+
+    #[test]
+    fn persisted_mode_defaults_to_denylist_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            persisted_capture_mode(tmp.path()),
+            CaptureMode::Denylist,
+            "a missing file must not change existing installs"
+        );
+    }
+
+    #[test]
+    fn persisted_mode_reads_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(CAPTURE_MODE_FILE), "allowlist\n").unwrap();
+        assert_eq!(persisted_capture_mode(tmp.path()), CaptureMode::Allowlist);
+    }
+
+    #[test]
+    fn unreadable_or_unknown_mode_falls_back_to_denylist_not_allowlist() {
+        // Failing "closed" here would be a denial of service: a corrupt file
+        // would silently stop all capture. Tightening is the operator's
+        // explicit choice, so garbage must read as the historical default.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(CAPTURE_MODE_FILE), "\u{0}not-a-mode").unwrap();
+        assert_eq!(persisted_capture_mode(tmp.path()), CaptureMode::Denylist);
+    }
+
     fn devin_hook_args(event: &str) -> HookArgs {
         HookArgs {
             event: event.into(),
@@ -808,6 +898,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         }
     }
 
@@ -1450,6 +1541,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         };
 
         run_with_payload(
@@ -1492,6 +1584,7 @@ mod tests {
                 project_strategy: None,
                 check_capture: false,
                 capture_assistant: false,
+                capture_mode: None,
             };
 
             run_with_payload(
@@ -1533,6 +1626,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         };
 
         run_with_payload(Some(data_dir), args, "{}".into(), &mut stdout, |_path| {
@@ -1560,6 +1654,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         };
 
         run_with_payload(
@@ -1777,7 +1872,30 @@ mod tests {
         let mut stdout = Vec::new();
         run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL"}}).to_string(), &mut stdout, |_| Err(std::io::Error::other("must not spawn"))).await.unwrap();
         let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
-        assert_eq!(output.as_object().unwrap().len(), 6);
+        // Pin the exact key set, not just its size: `--check-capture` is how an
+        // operator verifies an opt-out, so a field silently appearing or
+        // vanishing here is a defect in its own right.
+        let mut keys: Vec<&str> = output
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "admits_capture",
+                "capture_mode",
+                "disposition",
+                "extraction_state",
+                "marker_present",
+                "path_count",
+                "policy_state",
+                "tool_family",
+                "version",
+            ]
+        );
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
         assert!(!String::from_utf8(stdout).unwrap().contains("SENTINEL"));
     }
@@ -1901,6 +2019,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         }
     }
 
@@ -1913,6 +2032,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         }
     }
 
@@ -1925,6 +2045,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            capture_mode: None,
         }
     }
 

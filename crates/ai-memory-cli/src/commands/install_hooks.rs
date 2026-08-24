@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::cli::{AgentChoice, InstallHooksArgs, McpClient, ProjectStrategyArg};
+use crate::cli::{AgentChoice, CaptureModeArg, InstallHooksArgs, McpClient, ProjectStrategyArg};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
@@ -367,6 +367,14 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         );
     }
     if args.apply {
+        // #446: settle the capture failure mode before any agent-specific
+        // work, and say which mode is in force. A protection the operator
+        // cannot see is one they cannot trust.
+        let capture_mode = persist_capture_mode(&config.data_dir, args.capture_mode)?;
+        println!("capture mode: {capture_mode}");
+        if capture_mode == "allowlist" {
+            println!("  repositories without a .ai-memory.toml marker emit no lifecycle events");
+        }
         // Preserve a project-strategy an earlier `--apply` baked when this run
         // did not pass `--project-strategy`. Without this, a bare re-apply —
         // notably the auto-refresh in `ai-memory upgrade` — re-renders the hook
@@ -584,6 +592,32 @@ fn install_project_strategy(args: &InstallHooksArgs) -> Option<ProjectStrategyAr
     existing_agent_config(args)
         .as_deref()
         .and_then(|existing| baked_project_strategy(args.agent, existing))
+}
+
+/// Settle and persist the capture failure mode (#446), returning the mode now
+/// in force.
+///
+/// An explicit flag writes the file. Omitting the flag *reads* the stored
+/// value rather than defaulting to it, so a bare `--apply` — including the
+/// auto-refresh inside `ai-memory upgrade` — can never quietly downgrade an
+/// existing opt-in back to capture-by-default.
+fn persist_capture_mode(data_dir: &Path, requested: Option<CaptureModeArg>) -> Result<String> {
+    let path = data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE);
+    let Some(requested) = requested else {
+        return Ok(match fs::read_to_string(&path) {
+            Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => "allowlist".to_string(),
+            _ => "denylist".to_string(),
+        });
+    };
+    let value = match requested {
+        CaptureModeArg::Allowlist => "allowlist",
+        CaptureModeArg::Denylist => "denylist",
+    };
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+    fs::write(&path, format!("{value}\n"))
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(value.to_string())
 }
 
 /// Whether the Claude Code install should include its prompt-capture hook.
@@ -4586,6 +4620,47 @@ fn render_kiro_cli_v3(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #446's binding requirement: "a protection that disappears on upgrade
+    /// without saying so is worse than no protection". A bare `--apply` — what
+    /// `ai-memory upgrade` runs — must leave an existing opt-in alone.
+    #[test]
+    fn bare_apply_preserves_an_existing_allowlist_optin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mode = persist_capture_mode(tmp.path(), Some(CaptureModeArg::Allowlist)).unwrap();
+        assert_eq!(mode, "allowlist");
+
+        // The upgrade path: no flag at all.
+        let after = persist_capture_mode(tmp.path(), None).unwrap();
+        assert_eq!(
+            after, "allowlist",
+            "a bare re-apply must not revert the opt-in"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(crate::commands::hook::CAPTURE_MODE_FILE))
+                .unwrap()
+                .trim(),
+            "allowlist"
+        );
+    }
+
+    #[test]
+    fn absent_file_reports_the_historical_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(persist_capture_mode(tmp.path(), None).unwrap(), "denylist");
+    }
+
+    #[test]
+    fn explicit_denylist_downgrades_an_earlier_optin() {
+        // The opt-in must be reversible, or operators cannot undo a mistake.
+        let tmp = tempfile::tempdir().unwrap();
+        persist_capture_mode(tmp.path(), Some(CaptureModeArg::Allowlist)).unwrap();
+        assert_eq!(
+            persist_capture_mode(tmp.path(), Some(CaptureModeArg::Denylist)).unwrap(),
+            "denylist"
+        );
+        assert_eq!(persist_capture_mode(tmp.path(), None).unwrap(), "denylist");
+    }
     use crate::cli::ProjectStrategyArg;
     use crate::commands::render_shared::KIRO_CLI_V2_SESSION_START_MAX_OUTPUT;
     use std::collections::BTreeMap;
@@ -4908,6 +4983,7 @@ mod tests {
             agent: AgentChoice::OpenCode,
             capture_assistant: false,
             no_capture_prompts: false,
+            capture_mode: None,
             capture_prompts: false,
             hooks_dir: None,
             server_url: None,
@@ -6544,6 +6620,7 @@ model = "gpt-5"
             agent: AgentChoice::Omp,
             capture_assistant: false,
             no_capture_prompts: false,
+            capture_mode: None,
             capture_prompts: false,
             hooks_dir: None,
             server_url: Some("http://127.0.0.1:49374".into()),
@@ -6576,6 +6653,7 @@ model = "gpt-5"
             agent: AgentChoice::Pi,
             capture_assistant: false,
             no_capture_prompts: false,
+            capture_mode: None,
             capture_prompts: false,
             hooks_dir: None,
             server_url: Some("http://127.0.0.1:49374".into()),
@@ -6942,6 +7020,7 @@ model = "gpt-5"
                 agent: AgentChoice::Codex,
                 capture_assistant: false,
                 no_capture_prompts: false,
+                capture_mode: None,
                 capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -7428,6 +7507,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 agent: AgentChoice::ClaudeCode,
                 capture_assistant: false,
                 no_capture_prompts: false,
+                capture_mode: None,
                 capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -7502,6 +7582,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             agent: AgentChoice::ClaudeCode,
             config_file: Some(config_path.clone()),
             no_capture_prompts: true,
+            capture_mode: None,
             ..default_hook_args()
         };
         apply_to_claude_code_settings_in(
@@ -7987,6 +8068,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
                 no_capture_prompts: false,
+                capture_mode: None,
                 capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -8053,6 +8135,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
                 no_capture_prompts: false,
+                capture_mode: None,
                 capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -8108,6 +8191,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             agent: AgentChoice::Devin,
             capture_assistant: false,
             no_capture_prompts: false,
+            capture_mode: None,
             capture_prompts: false,
             hooks_dir: Some(hooks_tmp.path().to_path_buf()),
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -8156,6 +8240,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             agent: AgentChoice::Devin,
             capture_assistant: false,
             no_capture_prompts: false,
+            capture_mode: None,
             capture_prompts: false,
             hooks_dir: Some(hooks_tmp.path().to_path_buf()),
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -8229,6 +8314,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
                 no_capture_prompts: false,
+                capture_mode: None,
                 capture_prompts: false,
                 hooks_dir: Some(hooks_tmp.path().to_path_buf()),
                 server_url: Some("http://127.0.0.1:49374".to_string()),

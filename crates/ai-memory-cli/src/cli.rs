@@ -1499,6 +1499,28 @@ pub struct LlmTestArgs {
 /// resolves its project from the main git repo root (collapsing
 /// subdirectories and worktrees) without a per-repo `.ai-memory.toml`
 /// marker. A marker's own `project_strategy` still wins.
+/// Which way capture fails when a repository has no `.ai-memory.toml`
+/// marker (#446).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CaptureModeArg {
+    /// Capture unless a marker excludes it — the historical default.
+    Denylist,
+    /// Capture only repositories that carry a marker. A repository without
+    /// one emits no lifecycle events at all.
+    Allowlist,
+}
+
+impl CaptureModeArg {
+    /// The policy value this flag selects.
+    #[must_use]
+    pub const fn mode(self) -> ai_memory_hooks::CaptureMode {
+        match self {
+            Self::Denylist => ai_memory_hooks::CaptureMode::Denylist,
+            Self::Allowlist => ai_memory_hooks::CaptureMode::Allowlist,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProjectStrategyArg {
     /// `project = basename(cwd)` — the default; bakes nothing.
@@ -1544,6 +1566,12 @@ pub struct HookArgs {
     /// Inspect capture policy without spooling, draining, or contacting the server.
     #[arg(long)]
     pub check_capture: bool,
+    /// Capture failure mode baked in by `install-hooks --capture-mode`.
+    /// Under `allowlist`, a repository with no `.ai-memory.toml` marker emits
+    /// no lifecycle event at all — the event is dropped before it can reach
+    /// the local spool or the wire.
+    #[arg(long, value_enum)]
+    pub capture_mode: Option<CaptureModeArg>,
     /// Opt in to assistant/Stop capture: on a Claude Code `stop` event, attach a
     /// sanitized, capped excerpt of the assistant's final turn as the Stop body.
     /// Baked onto the native `stop` command by
@@ -1629,6 +1657,14 @@ pub struct InstallHooksArgs {
     /// without this flag removes it (idempotent). Default off.
     #[arg(long)]
     pub capture_assistant: bool,
+    /// Persist the capture failure mode for this install (#446). Under
+    /// `allowlist`, a repository with no `.ai-memory.toml` marker emits no
+    /// lifecycle event at all, for every agent. Stored in the data dir, so a
+    /// later bare `--apply` — including the auto-refresh inside `upgrade` —
+    /// cannot regenerate it away. Omitting the flag leaves the stored mode
+    /// untouched; `--capture-mode denylist` restores the default.
+    #[arg(long, value_enum)]
+    pub capture_mode: Option<CaptureModeArg>,
     /// Do not install Claude Code's `UserPromptSubmit` capture hook. Prompt
     /// text is then excluded before it can enter the local spool or wire.
     /// A bare `--apply` re-run preserves an existing opt-out; use
