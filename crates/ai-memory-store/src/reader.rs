@@ -7727,6 +7727,24 @@ mod tests {
     };
     use crate::Store;
 
+    #[test]
+    fn a_metadata_styled_descriptor_source_is_echoed_verbatim() {
+        // Every line here is a metadata bullet, so all of them are skipped
+        // and nothing accumulates. The fallback then echoes the raw input —
+        // the result is not empty, it is the unusable input reproduced whole.
+        //
+        // This is the failure mode for a writer that fills frontmatter
+        // `summary` in the same house style it renders a session page's
+        // metadata block in. Because `summary` wins the COALESCE, such a
+        // page trades a usable body-derived descriptor for this, and nothing
+        // anywhere reports an error. Writers must emit plain prose.
+        let metadata_styled = "- **session_id:** `9f2c`\n- **observations:** 2";
+        assert_eq!(
+            page_descriptor(metadata_styled, "Some title"),
+            metadata_styled
+        );
+    }
+
     use ai_memory_core::{
         AgentKind, Handoff, HandoffContent, HandoffId, HandoffLifecycle, HandoffOrigin,
         HandoffScope, HandoffState, NewHandoff, NewSession, OwnerFilter, ProjectId, SessionId,

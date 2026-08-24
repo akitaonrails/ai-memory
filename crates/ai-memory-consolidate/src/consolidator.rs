@@ -609,6 +609,9 @@ fn build_update(
         "kind".into(),
         serde_json::Value::String(upd.kind.as_str().into()),
     );
+    if let Some(summary) = usable_summary(upd.summary.as_deref(), &upd.title) {
+        fm.insert("summary".into(), serde_json::Value::String(summary));
+    }
     if !upd.tags.is_empty() {
         fm.insert(
             "tags".into(),
@@ -847,7 +850,8 @@ fn build_batch_request_with_slots(
          - \"tags\"            (array of string)  required — may be empty `[]`, but the key must be present\n\
          - \"entities\"        (array of string)  required — may be empty `[]`, but the key must be present; see below\n\
          - \"slot_kind\"       (string) optional — ONLY for `_slots/*`; one of \"state\" or \"invariant\"; this is the SLOT WRITE REGIME, NOT a tier value\n\
-         No other keys except optional `slot_kind` on `_slots/*`. No `body`, no `content`, no `summary`. Field names \
+         - \"summary\"         (string) optional — ONE line of plain prose saying what the page covers, shown beside the title in listings. NOT a heading, NOT a `- **key:** value` bullet, NOT a list item, NOT a repeat of the title: a summary shaped like any of those is discarded and the page ends up described worse than if you had omitted it. Omit the key rather than guessing.\n\
+         No other keys except optional `slot_kind` on `_slots/*` and optional `summary`. No `body`, no `content`. Field names \
          are case-sensitive and the `_markdown` suffix matters.\n\
          \n## `entities` field — the specific nouns the page is about\n\
          Up to 10 short names (max 64 chars each), lowercase, taken from \
@@ -1183,6 +1187,40 @@ fn clip_current_body_for_prompt(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// Accept a model-supplied `summary` only when the reader can actually use it.
+///
+/// The store prefers `summary` over the page body and then runs it through the
+/// same line filter it applies to a body: headings, `- **key:** value`
+/// metadata bullets, other list markers, and lines repeating the title are all
+/// dropped, and when nothing survives the filter echoes its raw input. So a
+/// structurally wrong summary is not ignored — it is reproduced verbatim as
+/// the descriptor, in place of the body text that would otherwise have been
+/// used, and nothing reports an error.
+///
+/// A JSON schema cannot express that constraint, and this value is
+/// model-controlled, so it is enforced here: anything the reader would discard
+/// is dropped at the boundary and the page keeps its body-derived descriptor.
+fn usable_summary(raw: Option<&str>, title: &str) -> Option<String> {
+    let text = raw?.trim();
+    if text.is_empty() || text.contains('\n') {
+        return None;
+    }
+    if text.starts_with('#')
+        || text.starts_with("---")
+        || text.starts_with("___")
+        || text.starts_with("***")
+        || text.starts_with("- ")
+        || text.starts_with("* ")
+        || text.starts_with("+ ")
+    {
+        return None;
+    }
+    if text == title.trim() {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
 fn build_frontmatter(page: &ConsolidatedPage) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -1197,6 +1235,9 @@ fn build_frontmatter(page: &ConsolidatedPage) -> serde_json::Value {
             .map(|t| serde_json::Value::String(t.clone()))
             .collect();
         map.insert("tags".into(), serde_json::Value::Array(tags));
+    }
+    if let Some(summary) = usable_summary(page.summary.as_deref(), &page.title) {
+        map.insert("summary".into(), serde_json::Value::String(summary));
     }
     map.insert("consolidated".into(), serde_json::Value::Bool(true));
     serde_json::Value::Object(map)
@@ -1582,6 +1623,105 @@ mod tests {
         assert!(!slug.ends_with('-'));
     }
 
+    fn update_with_summary(summary: Option<&str>) -> crate::types::ConsolidatedPageUpdate {
+        crate::types::ConsolidatedPageUpdate {
+            path: "concepts/queue.md".into(),
+            tier: Tier::Semantic,
+            kind: crate::types::PageKind::Fact,
+            title: "Bound the scheduler queue".into(),
+            body_markdown: "Body prose.".into(),
+            summary: summary.map(str::to_owned),
+            tags: Vec::new(),
+            slot_kind: SlotKind::State,
+            entities: Vec::new(),
+        }
+    }
+
+    fn frontmatter_for(summary: Option<&str>) -> serde_json::Value {
+        let (req, _) = build_update(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            &update_with_summary(summary),
+            true,
+            &ai_memory_core::ActorContext::default(),
+            None,
+        )
+        .expect("build_update");
+        req.frontmatter
+    }
+
+    #[test]
+    fn a_usable_summary_reaches_the_frontmatter_trimmed() {
+        let fm = frontmatter_for(Some("  Bounded the queue so backpressure is testable.  "));
+        assert_eq!(
+            fm["summary"],
+            "Bounded the queue so backpressure is testable."
+        );
+    }
+
+    #[test]
+    fn summaries_the_reader_would_discard_are_not_written() {
+        // Each of these is legal JSON and legal per the schema, and each one
+        // would be echoed verbatim as the descriptor — replacing the page's
+        // body-derived one — because the reader's filter drops every line and
+        // then falls back to its raw input. Dropping them here keeps the page
+        // on the body text instead.
+        for bad in [
+            "",
+            "   ",
+            "- **session_id:** `9f2c`",
+            "## What this page covers",
+            "- bounded the queue",
+            "* bounded the queue",
+            "first line\nsecond line",
+            "Bound the scheduler queue", // identical to the title
+        ] {
+            assert!(
+                frontmatter_for(Some(bad)).get("summary").is_none(),
+                "should not have been written: {bad:?}"
+            );
+        }
+        assert!(frontmatter_for(None).get("summary").is_none());
+    }
+
+    #[test]
+    fn the_single_page_builder_surfaces_a_summary_too() {
+        // `consolidate_session` — the default path, and the one the serve
+        // worker uses — goes through `ConsolidatedPage`, not the batch type.
+        let page = ConsolidatedPage {
+            title: "Bound the scheduler queue".into(),
+            body_markdown: "Body prose.".into(),
+            tags: Vec::new(),
+            summary: Some("Bounded the queue so backpressure is testable.".into()),
+        };
+        assert_eq!(
+            build_frontmatter(&page)["summary"],
+            "Bounded the queue so backpressure is testable."
+        );
+
+        let unusable = ConsolidatedPage {
+            summary: Some("- **session_id:** `9f2c`".into()),
+            ..page
+        };
+        assert!(build_frontmatter(&unusable).get("summary").is_none());
+    }
+
+    #[test]
+    fn both_prompts_ask_for_the_summary_and_describe_its_shape() {
+        // The batch prompt used to say "no `summary`" outright; a model
+        // obeying that never supplies the field, and the whole write path is
+        // dead code. Assert both prompts request it, so that cannot regress
+        // back into silence.
+        for prompt in [BATCH_SYSTEM_PROMPT, SYSTEM_PROMPT] {
+            assert!(prompt.contains("summary"), "prompt must request `summary`");
+            assert!(
+                !prompt.contains("no `summary`"),
+                "prompt must not forbid `summary`"
+            );
+        }
+        assert!(SYSTEM_PROMPT.contains("ONE line of plain prose"));
+    }
+
     #[test]
     fn slot_update_defaults_to_state_frontmatter() {
         let update = crate::types::ConsolidatedPageUpdate {
@@ -1590,6 +1730,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "Current focus".into(),
             body_markdown: "Ship the slot-kind PR.".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
             entities: Vec::new(),
@@ -1614,6 +1755,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "X".into(),
             body_markdown: "body".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
             entities: Vec::new(),
@@ -1651,6 +1793,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "Entities".into(),
             body_markdown: "body".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
             entities: vec![
@@ -1686,6 +1829,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "Project context".into(),
             body_markdown: "This repo uses a markdown wiki as source of truth.".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::Invariant,
             entities: Vec::new(),

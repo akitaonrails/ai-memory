@@ -8,6 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Gave session pages a `summary` in their frontmatter, which the retrieval
+  layer already preferred over the page body when describing a non-FTS hit.
+  #463 made that `COALESCE` prefer a summary, but no write path produced one:
+  measured against a live 1.31.1 instance, 0 of 25 substantive pages had the
+  field, so every descriptor fell back to the body. All three writers now fill
+  it — the zero-LLM `SessionEnd` synthesis, the single-page consolidator, and
+  the batch one — because zero-LLM is the documented default and `multi_page`
+  defaults to false, so covering either alone would have missed the pages most
+  installs actually hold. (#473)
+
+  On the zero-LLM path the summary came from counts the renderer already had
+  and was discarding: prompts, completed tool calls per tool, and elapsed time
+  ("2 prompts, 34 completed tool calls across Bash, Edit and Read, over 18m").
+  That is what a page cannot state about itself — a reader deciding whether to
+  open it now sees how much work it holds, not only what it opened with. The
+  page is tallied once and the count lent to both the body renderer and the
+  summary, and `PostToolUse` stays the only counted kind so a completed call is
+  not double-counted.
+
+  On the LLM paths it became an optional field on the consolidator's structured
+  output, costing no additional model call since the call already happens, with
+  `#[serde(default)]` so stored outputs from earlier runs still deserialise.
+  Both system prompts now request it and describe the shape it has to keep; the
+  batch prompt previously forbade the key outright.
+
+  A model-supplied summary is validated before it is written, because the
+  reader prefers `summary` over the body and then drops headings, metadata
+  bullets, list items and title repeats — falling back to echoing its raw
+  input when nothing survives. A structurally wrong summary is therefore not
+  ignored but reproduced verbatim as the descriptor, displacing usable body
+  text with no error anywhere. Anything the reader would discard is dropped at
+  the boundary instead, leaving the page on its body-derived descriptor.
+
+  The fallback is unchanged and still serves hand-written pages and everything
+  written before this. New writes only: no backfill, no migration.
 - Pool (Poolside Agent CLI) is a first-class agent kind. Hook ingestion
   recognizes `agent=pool` (alias `poolside`) and Pool's documented snake_case
   `session_id` / `cwd` / `tool_name` / `tool_input` payload for concrete
@@ -44,6 +79,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test asserting the field set so a future change cannot quietly add captured
   text. A newer CLI against an older server renders the rest of `status` and
   omits the section rather than failing to parse.
+- `install-hooks --capture-mode allowlist` inverts capture scope: a repository
+  with no `.ai-memory.toml` marker emits no lifecycle event at all — prompts,
+  tool calls and session boundaries alike — dropped in the hook process before
+  anything reaches the local spool or the wire. Previously the marker could
+  only narrow what an already-captured repository sent, so forgetting one
+  captured *more*; under this mode forgetting one captures less (#446).
+
+  The gate is deliberately independent of the per-event capture policy, which
+  runs only for tool events: expressing it as a capture disposition would have
+  left prompt text spooling from a repository the CLI reported as opted out.
+  The mode is stored once per install rather than baked into each agent's hook
+  command, so every agent honours it and a bare `--apply` — including the
+  refresh inside `upgrade` — cannot revert it. `--check-capture` now reports
+  `capture_mode`, `marker_present` and `admits_capture` so an opt-out can be
+  verified without sending anything. Default behaviour is unchanged, and
+  `--capture-mode denylist` restores it.
+- `ai-memory status` now reports the capture mode when it is `allowlist`, in
+  both the human and `--json` renderings. Without it the new ingest counters
+  read identically whether hooks are broken or a repository simply never opted
+  in — the exact ambiguity those counters were added to remove (#428, #446).
 
 ### Docs
 - Documented the order of magnitude reported for lifecycle-hook overhead,

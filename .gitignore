@@ -25,6 +25,9 @@
 
 # Local debugging.
 *.log
+# Runtime logs are `ai-memory.log.<date>`, so `.log` is not the final
+# extension and `*.log` does not match them. Ignore the directory.
+logs/
 flamegraph.svg
 perf.data*
 

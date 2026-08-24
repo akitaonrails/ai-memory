@@ -127,6 +127,29 @@ always stored regardless. This is per-project on purpose: there is no
 server-global switch, so opting one noisy project in never sheds subagent
 captures for the others on a shared instance.
 
+## Allowlist mode: the marker as an opt-in
+
+By default this file is optional — a repository without one is still captured,
+and the marker only *narrows* what is taken. An install can invert that:
+
+```bash
+ai-memory install-hooks --apply --capture-mode allowlist
+```
+
+Under allowlist mode the presence of a `.ai-memory.toml` **is** the opt-in. A
+repository without one emits no lifecycle event at all — prompts, tool calls
+and session boundaries alike — dropped in the hook process before anything
+reaches the local spool or the wire. No extra key is needed: an existing marker
+already opts its repository in, whatever else it configures.
+
+This changes what forgetting the file costs. Under the default, forgetting
+means a repository is captured that you may not have intended; under allowlist
+mode it means a repository stays silent that you may have wanted. Pick the
+direction whose failure you would rather explain.
+
+The mode is stored per install rather than per agent, and a later bare
+`install-hooks --apply` (including an upgrade refresh) leaves it in place.
+
 ## Capture exclusions
 
 Use the exact per-repository shape `[capture]` plus `ignore_paths = [...]`
