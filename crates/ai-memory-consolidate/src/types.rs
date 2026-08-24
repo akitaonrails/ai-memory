@@ -117,6 +117,14 @@ pub struct ConsolidatedPageUpdate {
     pub title: String,
     /// New markdown body.
     pub body_markdown: String,
+    /// One line of plain prose saying what this page covers, shown beside
+    /// the title in retrieval listings. Write a complete sentence: not a
+    /// heading, not a `- **key:** value` bullet, and not a repeat of the
+    /// title — the reader drops all three and would fall back to echoing
+    /// this field verbatim. Omit it rather than guessing. Defaults to absent
+    /// so existing structured outputs still deserialise.
+    #[serde(default)]
+    pub summary: Option<String>,
     /// Optional tags surfaced into frontmatter.
     #[serde(default)]
     pub tags: Vec<String>,

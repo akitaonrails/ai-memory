@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Session pages now carry a `summary` in their frontmatter, which the
+  retrieval layer already prefers over the page body when describing a
+  non-FTS hit (#473). #463 made that `COALESCE` prefer a summary, but nothing
+  wrote one for a session page: measured against a live 1.31.1 instance, 0 of
+  25 substantive pages had the field, so every descriptor came from the body
+  fallback. Both write paths now fill it — the zero-LLM `SessionEnd` synthesis
+  and the LLM consolidator — because zero-LLM is the documented default and a
+  fix in the consolidator alone would miss the pages most installs have.
+
+  On the zero-LLM path the summary is built from counts the renderer already
+  had and was discarding: prompts, completed tool calls per tool, and elapsed
+  time ("2 prompts, 34 completed tool calls across Bash, Edit and Read, over
+  18m"). That is what the body cannot state about itself — a reader deciding
+  whether to open a page can now see how much work it holds, not only what it
+  opened with. The tallying is computed once and shared with the body
+  renderer rather than parsed back out of the markdown, and it still counts
+  `PostToolUse` only, so a completed call is not double-counted.
+
+  On the LLM path it is a new optional field on the consolidator's structured
+  output, so it costs no additional model call — the call already happens.
+  `#[serde(default)]` keeps stored outputs from older runs deserialising, and
+  a blank or whitespace-only value is dropped rather than written, since an
+  empty summary would still win the `COALESCE` and cost the page its
+  body-derived descriptor.
+
+  The fallback is unchanged and still serves hand-written pages and
+  everything written before this. New writes only: no backfill, no migration.
+
 - `ai-memory status` now reports server-side hook-ingestion counters
   alongside the client spool section: events accepted, accepted-but-dropped
   by capture policy, shed because ingest capacity was exhausted, shed by the

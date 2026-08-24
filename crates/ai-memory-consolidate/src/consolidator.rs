@@ -609,6 +609,20 @@ fn build_update(
         "kind".into(),
         serde_json::Value::String(upd.kind.as_str().into()),
     );
+    // The store's hit descriptor prefers `summary` over the page body, so a
+    // blank one would trade real text for nothing. Insert only a usable
+    // value, and never a JSON null.
+    if let Some(summary) = upd
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        fm.insert(
+            "summary".into(),
+            serde_json::Value::String(summary.to_owned()),
+        );
+    }
     if !upd.tags.is_empty() {
         fm.insert(
             "tags".into(),
@@ -1590,6 +1604,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "Current focus".into(),
             body_markdown: "Ship the slot-kind PR.".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
             entities: Vec::new(),
@@ -1614,6 +1629,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "X".into(),
             body_markdown: "body".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
             entities: Vec::new(),
@@ -1651,6 +1667,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "Entities".into(),
             body_markdown: "body".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
             entities: vec![
@@ -1686,6 +1703,7 @@ mod tests {
             kind: crate::types::PageKind::Fact,
             title: "Project context".into(),
             body_markdown: "This repo uses a markdown wiki as source of truth.".into(),
+            summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::Invariant,
             entities: Vec::new(),
