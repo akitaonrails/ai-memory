@@ -599,6 +599,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Pi
             | AgentKind::AntigravityCli
             | AgentKind::Hermes
+            | AgentKind::Pool
     )
 }
 
@@ -1562,6 +1563,8 @@ mod tests {
         assert_eq!(parse_agent("oh-my-pi"), AgentKind::Omp);
         assert_eq!(parse_agent("hermes"), AgentKind::Hermes);
         assert_eq!(parse_agent("hermes-agent"), AgentKind::Hermes);
+        assert_eq!(parse_agent("pool"), AgentKind::Pool);
+        assert_eq!(parse_agent("poolside"), AgentKind::Pool);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -1621,6 +1624,29 @@ mod tests {
         );
         assert_eq!(unknown.agent, AgentKind::Other);
         assert!(unknown.title_hint.is_none());
+    }
+
+    #[test]
+    fn pool_tool_title_uses_the_documented_snake_case_shape() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "edit",
+            "tool_input": {"path": "src/lib.rs", "old_string": "a", "new_string": "b"},
+            "session_id": "pool-session",
+            "cwd": "/repo"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("pool".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Pool);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("pool-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
     }
 
     /// Body is well-formed JSON but the expected `session_id` /

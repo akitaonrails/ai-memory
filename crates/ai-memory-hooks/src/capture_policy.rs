@@ -150,6 +150,11 @@ pub(crate) fn tool_observation_metadata(
                 .and_then(|extra| extra.get("tool_call_id"))
                 .and_then(Value::as_str),
         ),
+        // Pool (Poolside Agent CLI) tool hooks use snake_case `tool_name` +
+        // `tool_input` (hooks api 1.0, verified against Poolside CLI v1.0.16);
+        // no tool-call id is documented. Unknown payload shapes fail safe to
+        // metadata-only under an active policy.
+        AgentKind::Pool => (object.get("tool_name")?.as_str()?, None),
         _ => return None,
     };
     // PreToolUse needs a proven input shape. PostToolUse deliberately does
@@ -165,6 +170,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::CommandCode
                             | AgentKind::Hermes
                             | AgentKind::KiroCli
+                            | AgentKind::Pool
                     ) {
                         "tool_input"
                     } else {
@@ -538,7 +544,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         | AgentKind::GeminiCli
         | AgentKind::Devin
         | AgentKind::Hermes
-        | AgentKind::KiroCli => object
+        | AgentKind::KiroCli
+        | AgentKind::Pool => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -595,6 +602,7 @@ fn family(name: &str) -> ToolFamily {
         | "notebook_edit"
         | "create_file"
         | "delete_file"
+        | "remove"
         | "rename_file"
         | "move_file"
         | "multi_edit"
@@ -1076,6 +1084,51 @@ mod tests {
             ("patch", ToolFamily::File),
             ("search_files", ToolFamily::SearchList),
             ("terminal", ToolFamily::NonFile),
+        ] {
+            assert_eq!(family(tool), expected, "tool: {tool}");
+        }
+    }
+
+    #[test]
+    fn pool_documented_tool_shape_is_closed_and_honors_exclusions() {
+        let raw = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "write",
+            "tool_input": {"path": "secret/token.txt", "content": "do not retain"},
+            "session_id": "pool-session",
+            "cwd": "/repo"
+        });
+        let metadata = tool_observation_metadata(AgentKind::Pool, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id, None);
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let decision = policy.inspect(AgentKind::Pool, &raw, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        let unknown = policy.inspect(AgentKind::Other, &raw, "/repo");
+        assert_eq!(
+            unknown.protocol().extraction_state(),
+            ExtractionState::UnsupportedSchema
+        );
+        assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    #[test]
+    fn pool_documented_tool_names_map_to_canonical_families() {
+        for (tool, expected) in [
+            ("read", ToolFamily::File),
+            ("edit", ToolFamily::File),
+            ("write", ToolFamily::File),
+            ("remove", ToolFamily::File),
+            ("shell", ToolFamily::NonFile),
         ] {
             assert_eq!(family(tool), expected, "tool: {tool}");
         }

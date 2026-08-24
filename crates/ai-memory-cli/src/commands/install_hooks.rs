@@ -27,9 +27,10 @@ use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
-    build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
+    POOL_EVENTS, build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
     build_devin_payload_with_data_dir, build_grok_payload_with_data_dir,
-    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value, build_profile_payload_for_agent,
+    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
+    build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_script_for_claude_code, hook_script_for_current_platform, kimi_code_hook_commands,
     local_hook_policy_v1_supported, ts_capture_policy_v1, ts_string_literal,
 };
@@ -450,6 +451,10 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
                 apply_to_kiro_cli_v3_hooks(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::Pool => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_pool(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -558,6 +563,10 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
             render_kiro_cli_v3(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
+        AgentChoice::Pool => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_pool(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+        }
     }
 }
 
@@ -650,6 +659,9 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Devin => devin_hooks_path().ok()?,
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
             AgentChoice::KiroCli => return None,
+            // Pool's hook config is per-repo (`.poolside/settings.yaml`), not a
+            // user-global file the installer could re-read a baked strategy from.
+            AgentChoice::Pool => return None,
             AgentChoice::KiroCliV3 => kiro_cli_v3_hooks_path().ok()?,
         }
     };
@@ -1005,6 +1017,9 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // mcp.json the installer can scrape.
         AgentChoice::Pi => None,
         AgentChoice::KiroCli | AgentChoice::KiroCliV3 => Some(McpClient::KiroCli),
+        // No first-party Pool MCP installer ships yet, so there is no
+        // config file to infer a server URL or token from.
+        AgentChoice::Pool => None,
     }
 }
 
@@ -4583,6 +4598,107 @@ fn render_kiro_cli_v3(
     Ok(())
 }
 
+/// Print Pool's `.poolside/settings.yaml` `hooks:` block to stdout. Pool's
+/// hook config lives at the root of each repository the agent runs in, so
+/// there is no user-global file for an atomic merge — the snippet is pasted
+/// per project. `--apply` still stages the scripts to the stable user-global
+/// location first so the printed commands reference paths that outlive the
+/// source checkout / docker image (see [`apply_to_pool`]).
+fn render_pool(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    // Soft check (same rationale as render_claude_code): warn, don't bail,
+    // so the docker host-path flow still works.
+    for (_, script) in POOL_EVENTS {
+        let script = hook_script_for_current_platform(script);
+        let abs = hooks_dir.join(script.as_ref());
+        if !abs.exists() {
+            eprintln!(
+                "# warning: {} not present on this filesystem. \
+                 If this command is running inside docker against a \
+                 host path, you can ignore this; otherwise extract \
+                 the scripts first with `ai-memory setup-agent`.",
+                abs.display()
+            );
+        }
+    }
+    print!(
+        "{}",
+        render_pool_output(
+            hooks_dir,
+            server_url,
+            auth_token,
+            data_dir,
+            project_strategy
+        )
+    );
+    Ok(())
+}
+
+fn render_pool_output(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> String {
+    let snippet = build_pool_settings_yaml_with_data_dir(
+        hooks_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let mut out = String::new();
+    out.push_str("# Pool (Poolside Agent CLI) hook config — merge into the repo-root\n");
+    out.push_str("# .poolside/settings.yaml of each project Pool runs in. ai-memory\n");
+    out.push_str("# does not write project-local files, so paste this snippet manually\n");
+    out.push_str("# (re-run with --apply first to stage the scripts to a stable path).\n");
+    out.push_str(&format!("# Hook scripts: {}\n", hooks_dir.display()));
+    out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
+    if auth_token.is_some() {
+        out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
+        out.push_str("#       Treat .poolside/settings.yaml as sensitive (chmod 600).\n");
+    }
+    out.push_str("# NOTE: Pool's SessionStart stdout injection is not demonstrated —\n");
+    out.push_str("#       capture works, but handoff injection does not. Recover a prior\n");
+    out.push_str("#       session's handoff via the MCP `memory_handoff_accept` tool.\n");
+    out.push_str("# NOTE: Pool has no true session-end event; `Stop` is a turn boundary.\n");
+    out.push_str(
+        "#       Close a finished session with `ai-memory finalize-session --agent pool`.\n",
+    );
+    out.push('\n');
+    out.push_str(&snippet);
+    out
+}
+
+/// `--apply` for Pool: stage the hook scripts to the stable user-global
+/// location (the same step every other script agent's apply performs), then
+/// print the ready-to-paste snippet pointing at the staged copies. The
+/// project-local `.poolside/settings.yaml` itself is deliberately NOT
+/// written: install-hooks is a user-scoped operation and must not mutate
+/// files inside the user's repositories.
+fn apply_to_pool(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "pool")?;
+    let command_dir = staged_command_dir(&staged, "pool");
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    print!(
+        "{}",
+        render_pool_output(&command_dir, server_url, auth_token, data_dir, strategy)
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4615,6 +4731,7 @@ mod tests {
             KimiCode,
             KiroCli,
             KiroCliV3,
+            Pool,
         ] {
             assert!(
                 !capture_assistant_allowed(agent),
@@ -4648,6 +4765,7 @@ mod tests {
             KimiCode,
             KiroCli,
             KiroCliV3,
+            Pool,
         ] {
             assert!(!prompt_capture_options_allowed(agent), "{agent:?}");
         }
@@ -5397,6 +5515,75 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
 
         let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Grok).unwrap();
         assert_eq!(resolved, tmp.path().join("grok"));
+    }
+
+    #[test]
+    fn resolve_hooks_dir_uses_pool_bundle_for_pool() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("pool")).unwrap();
+        fs::create_dir_all(tmp.path().join("claude-code")).unwrap();
+
+        let resolved = resolve_hooks_dir(Some(tmp.path()), AgentChoice::Pool).unwrap();
+        assert_eq!(resolved, tmp.path().join("pool"));
+    }
+
+    #[test]
+    fn pool_settings_yaml_covers_all_events_with_bounded_entries() {
+        let snippet = super::super::render_shared::build_pool_settings_yaml_with_data_dir(
+            Path::new("/staging/pool"),
+            "http://127.0.0.1:49374",
+            Some("tok-test"),
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+        assert!(snippet.starts_with("hooks:\n"), "snippet: {snippet}");
+        for (event, script) in POOL_EVENTS {
+            assert!(
+                snippet.contains(&format!("  {event}:\n")),
+                "missing {event} in: {snippet}"
+            );
+            let stem = script.strip_suffix(".sh").unwrap();
+            assert!(
+                snippet.contains(&format!("- name: ai-memory-{stem}\n")),
+                "missing name for {event} in: {snippet}"
+            );
+        }
+        assert_eq!(
+            snippet.matches("matcher: \"*\"").count(),
+            POOL_EVENTS.len(),
+            "one wildcard matcher per event"
+        );
+        assert_eq!(
+            snippet.matches("timeout: 20").count(),
+            POOL_EVENTS.len(),
+            "one bounded timeout per event"
+        );
+        // Every command is a YAML single-quoted scalar so the embedded POSIX
+        // quoting survives; the auth token rides inside the command.
+        assert_eq!(
+            snippet.matches("command: '").count(),
+            POOL_EVENTS.len(),
+            "one single-quoted command per event"
+        );
+        assert!(snippet.contains("tok-test"), "auth token must be embedded");
+    }
+
+    #[test]
+    fn render_pool_output_states_manual_paste_and_finalize_path() {
+        let out = render_pool_output(
+            Path::new("/staging/pool"),
+            "http://127.0.0.1:49374",
+            None,
+            Path::new("/data"),
+            None,
+        );
+        assert!(out.contains(".poolside/settings.yaml"));
+        assert!(out.contains("does not write project-local files"));
+        assert!(out.contains("finalize-session --agent pool"));
+        assert!(out.contains("memory_handoff_accept"));
+        assert!(out.contains("hooks:\n"));
+        // No token was passed, so none of the auth caution lines render.
+        assert!(!out.contains("AI_MEMORY_AUTH_TOKEN embedded"));
     }
 
     // Issue #156: Zero hook install writes exec-form entries into Zero's

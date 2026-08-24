@@ -123,6 +123,24 @@ pub(crate) const DEVIN_EVENTS: [(&str, &str); 7] = [
     ("SessionEnd", "session-end.sh"),
 ];
 
+/// Pool (Poolside Agent CLI) lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-.poolside-settings, POSIX hook-script-filename)`.
+///
+/// Pool's hook vocabulary uses Claude-shaped PascalCase names but is exactly
+/// these five events (verified against Poolside CLI v1.0.16, hooks api 1.0):
+/// no `SessionEnd`, no `PreCompact`, no subagent events. `Stop` is a turn
+/// boundary, not a session end — `ai-memory finalize-session --agent pool`
+/// is the close path. Adding a hook event means updating this list AND
+/// adding the matching `.sh` and `.ps1` files under `hooks/pool/`; the
+/// install-hooks parity test fails if the bundle drifts.
+pub(crate) const POOL_EVENTS: [(&str, &str); 5] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("Stop", "stop.sh"),
+];
+
 /// Format an `Authorization: Bearer <token>` header value, or `None`
 /// when no token is supplied. Used by every MCP client renderer in
 /// `install-mcp` and every hook-config renderer that wants to
@@ -512,6 +530,85 @@ pub(crate) fn build_devin_payload_with_data_dir(
             project_strategy,
         ),
     )
+}
+
+/// Pool (Poolside Agent CLI) `.poolside/settings.yaml` `hooks:` block for
+/// install-hooks' print path. Pool's hook config is a project-scoped YAML
+/// file at the repo root — there is no user-global hook file for ai-memory
+/// to merge, so the installer renders a ready-to-paste snippet instead of
+/// writing into the user's project checkouts.
+///
+/// One entry per event, shell command string on `command:`, `matcher: "*"`
+/// and a bounded `timeout` per Pool's documented schema. YAML single-quote
+/// escaping (`'` → `''`) keeps the embedded shell quoting intact.
+#[must_use]
+pub(crate) fn build_pool_settings_yaml_with_data_dir(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> String {
+    build_pool_settings_yaml_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        HookCommandContext::new(
+            HookCommandPlatform::for_bash_runner(),
+            "pool",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// Script-fallback variant for `setup-agent` / docker-host snippets: the
+/// copied `.sh` scripts are the artifact, so the commands reference them
+/// rather than a host-local native binary.
+#[must_use]
+pub(crate) fn build_pool_settings_yaml(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> String {
+    build_pool_settings_yaml_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        HookCommandContext::new(
+            HookCommandPlatform::for_bash_script_runner(),
+            "pool",
+            None,
+            None,
+        ),
+    )
+}
+
+fn build_pool_settings_yaml_for_platform(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> String {
+    let mut out = String::from("hooks:\n");
+    for (event, script) in &POOL_EVENTS {
+        let resolved = script_for_platform(script, context.platform);
+        let abs = emit_root.join(resolved.as_ref());
+        let command = hook_command(&abs, server_url, auth_token, context);
+        let stem = script.strip_suffix(".sh").unwrap_or(script);
+        out.push_str(&format!(
+            "  {event}:\n    - name: ai-memory-{stem}\n      matcher: \"*\"\n      command: {}\n      timeout: 20\n",
+            yaml_single_quote(&command)
+        ));
+    }
+    out
+}
+
+/// Emit a YAML single-quoted scalar: wrap in `'…'`, doubling any embedded
+/// `'`. Single-quote style is the only YAML form in which the POSIX shell
+/// quoting inside the hook command survives byte-for-byte.
+fn yaml_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Different agents nest hook entries differently. Two shapes

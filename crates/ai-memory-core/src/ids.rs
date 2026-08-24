@@ -243,6 +243,8 @@ pub enum AgentKind {
     CommandCode,
     /// Hermes Agent (Nous Research).
     Hermes,
+    /// Pool (Poolside Agent CLI).
+    Pool,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -253,7 +255,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -272,6 +274,7 @@ impl AgentKind {
         Self::KiroCli,
         Self::CommandCode,
         Self::Hermes,
+        Self::Pool,
         Self::Other,
     ];
 
@@ -297,6 +300,7 @@ impl AgentKind {
             Self::KiroCli => "kiro-cli",
             Self::CommandCode => "command-code",
             Self::Hermes => "hermes",
+            Self::Pool => "pool",
             Self::Other => "other",
         }
     }
@@ -325,6 +329,7 @@ impl AgentKind {
             "kiro-cli" | "kiro" => Self::KiroCli,
             "command-code" | "commandcode" | "cmdc" | "cmd" => Self::CommandCode,
             "hermes" | "hermes-agent" => Self::Hermes,
+            "pool" | "poolside" => Self::Pool,
             _ => Self::Other,
         }
     }
@@ -350,11 +355,23 @@ impl AgentKind {
     /// dispatch return, verified in the v0.28.1 source), so the handoff is
     /// delivered on `UserPromptSubmit` instead — see
     /// [`Self::user_prompt_injects_handoff`].
+    ///
+    /// Pool (Poolside Agent CLI) tolerates plain hook stdout, but model-visible
+    /// context injection from `SessionStart` stdout is not demonstrated
+    /// (verified against Poolside CLI v1.0.16), so Pool fails safe like other
+    /// unproven agents: the handoff stays available on demand via the MCP
+    /// `memory_handoff_accept` tool.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
         !matches!(
             self,
-            Self::Crush | Self::Grok | Self::Zero | Self::KimiCode | Self::Hermes | Self::Other
+            Self::Crush
+                | Self::Grok
+                | Self::Zero
+                | Self::KimiCode
+                | Self::Hermes
+                | Self::Pool
+                | Self::Other
         )
     }
 
@@ -475,6 +492,23 @@ mod tests {
         );
         assert!(!AgentKind::Hermes.session_start_injects_handoff());
         assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_pool_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::Pool.as_str(), "pool");
+        assert_eq!(AgentKind::from_wire("pool"), AgentKind::Pool);
+        assert_eq!(AgentKind::from_wire("poolside"), AgentKind::Pool);
+        assert_eq!(serde_json::to_string(&AgentKind::Pool).unwrap(), "\"pool\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"pool\"").unwrap(),
+            AgentKind::Pool
+        );
+        assert_eq!(AgentKind::from_wire("pool-2"), AgentKind::Other);
+        // Pool's SessionStart stdout injection is not demonstrated, so the
+        // destructive handoff fetch must not happen from its native hook.
+        assert!(!AgentKind::Pool.session_start_injects_handoff());
+        assert!(!AgentKind::Pool.user_prompt_injects_handoff());
     }
 
     #[test]

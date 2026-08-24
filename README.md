@@ -41,6 +41,7 @@
 | Zero | Supported | `install-mcp --client zero` (native HTTP + bearer in `~/.config/zero/config.json`) + lifecycle hooks via `install-hooks --agent zero --apply` (exec-form native commands in `~/.config/zero/hooks.json`, JSON payload on stdin, no shell). Capture works incl. specialist (subagent) events; no handoff injection — Zero discards `sessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `UserPromptSubmit` stdout (Kimi Code discards `SessionStart` hook stdout); `ai-memory run kimi` adds managed workstream resume. |
 | Kiro CLI | Supported | MCP config uses `install-mcp --client kiro-cli` (alias `kiro`) and Kiro's Bedrock-compatible schema flavor. `install-hooks --agent kiro-cli` merges v2 hooks into existing agent configs; the explicit `--agent kiro-cli-v3` target writes the incompatible standalone v3 registration. Both preserve unrelated entries, honor `$KIRO_HOME`, enforce capture exclusions, and inject pending handoffs at session start. Kiro has no true SessionEnd hook; use `ai-memory finalize-session --agent kiro-cli`, with `--session-id <uuid>` for concurrent sessions. `ai-memory run kiro` manages v2; add `--v3`, `--mode`, or `--agent-engine v3` for version-safe v3 resume. |
+| Pool | Hooks-only | Poolside Agent CLI (`pool`). Lifecycle-hook capture via `install-hooks --agent pool` (alias `poolside`): Pool reads project-scoped hooks from the repo-root `.poolside/settings.yaml`, so ai-memory stages the scripts and prints a ready-to-paste `hooks:` snippet rather than writing project-local files; native commands enforce capture exclusions. Five Claude-shaped events (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`) and no true session-end — `Stop` is a turn boundary, so run `ai-memory finalize-session --agent pool` after the final turn. `SessionStart` stdout injection is not demonstrated, so capture works but handoff injection does not — recover handoffs via MCP `memory_handoff_accept`. No first-party `install-mcp` client and no managed workstream (`ai-memory run pool`) are claimed: Pool's native session-store contract is not demonstrated (see [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md)). Verified against Poolside CLI v1.0.16. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | Zed | MCP-only | Native remote MCP under `context_servers` in Zed's user `settings.json`; no lifecycle hooks or managed-workstream support. |
 | Hermes Agent | Community | Core hook ingestion recognizes `agent=hermes` and Hermes' documented shell-hook `tool_name` / `tool_input` payload for concrete session attribution, tool-family titles, and capture exclusions. A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available, but no first-party installer is shipped; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. Hermes ignores session-start hook stdout, so recover handoffs through MCP. |
@@ -164,7 +165,8 @@ priors are at the [bottom](#influences-and-prior-art).
   Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, OpenClaw, Oh My Pi
   / OMP (`omp` / `oh-my-pi`), Pi via generated bridge extension, VS Code
   GitHub Copilot agent mode (MCP-only, workspace `.vscode/mcp.json`), Kiro CLI
-  (MCP + v2 lifecycle hooks), and Zed (MCP-only, user `settings.json`).
+  (MCP + v2 lifecycle hooks), Pool (hooks-only, project
+  `.poolside/settings.yaml` snippet), and Zed (MCP-only, user `settings.json`).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth. Shared servers can opt into
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
@@ -491,6 +493,9 @@ ai-memory install-hooks --agent  claude-code --apply
 # Command Code stable MCP + lifecycle example:
 # ai-memory install-mcp   --client command-code --apply
 # ai-memory install-hooks --agent  command-code --apply
+# Pool (Poolside Agent CLI) example — stages scripts and prints the
+# .poolside/settings.yaml snippet to paste into each repo (no MCP client yet):
+# ai-memory install-hooks --agent  pool --apply
 ```
 
 On Linux/macOS, that's it. Start a Claude Code session as usual - every

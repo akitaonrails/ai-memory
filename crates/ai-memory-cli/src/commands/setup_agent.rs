@@ -39,7 +39,7 @@ use crate::commands::install_mcp;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
-    build_claude_code_payload, build_devin_payload, build_grok_payload,
+    build_claude_code_payload, build_devin_payload, build_grok_payload, build_pool_settings_yaml,
     hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -159,6 +159,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         AgentChoice::KiroCliV3 => {
             emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
         }
+        AgentChoice::Pool => emit_pool(&emit_root, &args),
         AgentChoice::OpenCode
         | AgentChoice::Pi
         | AgentChoice::Omp
@@ -313,6 +314,29 @@ fn emit_grok(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
     println!();
     println!("{serialized}");
     Ok(())
+}
+
+/// Print Pool's `.poolside/settings.yaml` `hooks:` block. The staged `.sh`
+/// scripts are the artifact — Pool's hook config is a project-scoped YAML
+/// file at the repo root, so the snippet is pasted into each repository
+/// rather than written by ai-memory.
+fn emit_pool(emit_root: &Path, args: &SetupAgentArgs) {
+    let snippet = build_pool_settings_yaml(emit_root, &args.server_url, args.auth_token.as_deref());
+    println!("# Pool (Poolside Agent CLI) — merge into the repo-root .poolside/settings.yaml");
+    println!("# of each project Pool runs in; ai-memory does not write project-local files.");
+    println!("# Hook scripts (must be reachable from the host that runs Pool):");
+    println!("#   {}", emit_root.display());
+    println!("# AI-memory server: {}", args.server_url);
+    if args.auth_token.is_some() {
+        println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
+        println!("#       Treat .poolside/settings.yaml as sensitive (chmod 600).");
+    }
+    println!("# NOTE: Pool's SessionStart stdout injection is not demonstrated — capture");
+    println!("#       works, but handoff injection does not. Recover handoffs via the");
+    println!("#       MCP memory_handoff_accept tool, and close finished sessions with");
+    println!("#       `ai-memory finalize-session --agent pool` (no true session-end event).");
+    println!();
+    print!("{snippet}");
 }
 
 fn emit_devin(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {

@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -939,6 +939,48 @@ linked, a later plain Kiro launch recovers the stored engine transparently, and
 bare `ai-memory run` considers checkout-local sessions from both incompatible
 stores. See
 [managed workstreams](managed-workstreams.md#native-adapter-behavior).
+
+### Pool (Poolside Agent CLI)
+
+Pool reads lifecycle hooks from a project-scoped `.poolside/settings.yaml` at
+the root of each repository it runs in — there is no user-global hook file for
+ai-memory to merge. `install-hooks --agent pool` (alias `poolside`) therefore
+stages the hook scripts to the stable user-global location and prints a
+ready-to-paste `hooks:` snippet; ai-memory deliberately does not write files
+inside your repositories.
+
+```bash
+# Stage the scripts and print the snippet to paste into
+# <repo>/.poolside/settings.yaml:
+ai-memory install-hooks --agent pool --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+The snippet wires Pool's five documented events — `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop` (Claude-shaped
+names, snake_case JSON payload on stdin, verified against Poolside CLI
+v1.0.16). Local installs use the native `ai-memory hook` command, so Pool's
+documented `tool_name`/`tool_input` file operations honor `[capture]
+ignore_paths` and unknown file-tool payload shapes degrade to metadata-only
+capture.
+
+Pool has no true session-end event; `Stop` is a turn boundary. After the final
+turn, close the session explicitly; use the exact id when several Pool
+sessions are open in the same project:
+
+```bash
+ai-memory finalize-session --agent pool
+ai-memory finalize-session --agent pool --session-id <uuid>
+```
+
+Pool tolerates hook stdout, but model-visible context injection from
+`SessionStart` stdout is not demonstrated, so the session-start hook captures
+only and never fetches the (single-use) handoff — recover a prior session's
+handoff via the MCP `memory_handoff_accept` tool. No first-party
+`install-mcp` client and no managed workstream (`ai-memory run pool`) are
+claimed: Pool's native session-store contract is not demonstrated, per
+[managed-harness contributions](managed-harness-contributions.md).
 
 ### OpenCode
 

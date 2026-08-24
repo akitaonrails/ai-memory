@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Pool (Poolside Agent CLI) is a first-class agent kind. Hook ingestion
+  recognizes `agent=pool` (alias `poolside`) and Pool's documented snake_case
+  `session_id` / `cwd` / `tool_name` / `tool_input` payload for concrete
+  session attribution and tool-family titles, and Pool's five events
+  (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` —
+  verified against Poolside CLI v1.0.16) ship as a `hooks/pool/` bundle.
+  `install-hooks --agent pool` stages the scripts and prints a ready-to-paste
+  `.poolside/settings.yaml` `hooks:` snippet — Pool's hook config is
+  project-scoped YAML at each repo root, so the installer deliberately does
+  not write project-local files. Native hook commands enforce `[capture]
+  ignore_paths` for Pool's `read`/`edit`/`write`/`remove` file tools, with
+  unknown payload shapes degrading to metadata-only capture. Pool has no true
+  session-end event, so `ai-memory finalize-session --agent pool` closes the
+  session (the same class as Codex and Antigravity CLI); a forward migration
+  (V50) rebuilds the sessions constraint and pairing triggers to accept the
+  `pool` kind without losing rows. `SessionStart` stdout injection is not
+  demonstrated, so the session-start hook never fetches the single-use
+  handoff — recover it via MCP `memory_handoff_accept`. No managed
+  workstream (`ai-memory run pool`) is claimed: Pool's native session-store
+  contract is not demonstrated, per docs/managed-harness-contributions.md.
 - `ai-memory status` now reports server-side hook-ingestion counters
   alongside the client spool section: events accepted, accepted-but-dropped
   by capture policy, shed because ingest capacity was exhausted, shed by the

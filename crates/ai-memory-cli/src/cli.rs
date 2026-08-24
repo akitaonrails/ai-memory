@@ -1089,6 +1089,17 @@ pub enum AgentChoice {
     /// `~/.commandcode/settings.json`.
     #[value(alias = "commandcode", alias = "cmdc", alias = "cmd")]
     CommandCode,
+    /// Pool (Poolside Agent CLI, `pool`) — project-scoped YAML hooks in
+    /// the repo-root `.poolside/settings.yaml`. ai-memory stages the hook
+    /// scripts and prints a ready-to-paste `hooks:` snippet; it does not
+    /// write project-local files. NOTE: Pool's `SessionStart` stdout
+    /// injection is not demonstrated, so capture works but handoff
+    /// injection does not — recover the prior session's handoff via the
+    /// MCP `memory_handoff_accept` tool, and close sessions with
+    /// `ai-memory finalize-session --agent pool` (Pool has no true
+    /// session-end event).
+    #[value(alias = "poolside")]
+    Pool,
 }
 
 impl AgentChoice {
@@ -1116,6 +1127,7 @@ impl AgentChoice {
             Self::KimiCode => AgentKind::KimiCode,
             Self::KiroCli | Self::KiroCliV3 => AgentKind::KiroCli,
             Self::CommandCode => AgentKind::CommandCode,
+            Self::Pool => AgentKind::Pool,
         }
     }
 
@@ -1137,7 +1149,7 @@ impl AgentChoice {
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
     /// Agent kind to finalize. Defaults to Codex for backward compatibility;
-    /// Codex and Antigravity CLI have no reliable true SessionEnd hook.
+    /// Codex, Antigravity CLI, and Pool have no reliable true SessionEnd hook.
     #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
     pub agent: AgentChoice,
     /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
@@ -2354,6 +2366,33 @@ mod tests {
             assert_eq!(args.agent, AgentChoice::KiroCliV3);
             assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::KiroCli);
         }
+    }
+
+    #[test]
+    fn pool_hook_and_finalize_aliases_parse() {
+        for alias in ["pool", "poolside"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse Pool alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for Pool alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::Pool);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Pool);
+            assert_eq!(args.agent.script_hook_subdir(), Some("pool"));
+        }
+        let cli = Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "pool"])
+            .expect("failed to parse finalize-session --agent pool");
+        let Command::FinalizeSession(args) = cli.command else {
+            panic!("expected finalize-session for pool");
+        };
+        assert_eq!(args.agent, AgentChoice::Pool);
     }
 
     #[test]
