@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text. A newer CLI against an older server renders the rest of `status` and
   omits the section rather than failing to parse.
 
+### Docs
+- Documented the order of magnitude reported for lifecycle-hook overhead,
+  including the fact that a completed tool call normally pays for both pre- and
+  post-tool hooks, the measured native-versus-script figures, and the host
+  factors that make them reference data rather than a performance guarantee
+  (#446).
+
 ## [1.31.1] - 2026-08-23
 
 ### Fixed

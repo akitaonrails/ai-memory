@@ -421,6 +421,24 @@ then stages runnable copies under `~/.local/share/ai-memory/hooks/<agent>/` so
 the agent can execute files owned by your user. Re-run `install-hooks --apply`
 after package upgrades to refresh those staged copies.
 
+### Hook latency expectations
+
+Hook-capable agents launch one short-lived hook process per lifecycle event. A
+successful tool call normally fires both a pre-tool and a post-tool event, so
+per-invocation overhead is paid twice. As an order-of-magnitude reference, one
+independent v1.29.0 evaluation on native macOS aarch64 measured about 145 ms per
+`posix-native` invocation (about 290 ms per completed tool call) and about 172
+ms per legacy `.sh` invocation.
+
+Those figures are one host's measurements, not a benchmark or performance
+guarantee. Process startup, filesystem and security software, the selected
+data directory, authentication, and host load can all change the result. The
+native hook fast path skips full config loading and tracing, and normally
+spools locally instead of waiting for the server, so keep the installer's
+native default where supported. Latency-sensitive deployments should measure
+their own agent host before opting into additional captured events or choosing
+a script fallback.
+
 ### Capture-policy capability and refresh
 
 `[capture] ignore_paths` is enforced only by native `ai-memory hook` commands
