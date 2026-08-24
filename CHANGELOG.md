@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `capture_mode`, `marker_present` and `admits_capture` so an opt-out can be
   verified without sending anything. Default behaviour is unchanged, and
   `--capture-mode denylist` restores it.
+- `ai-memory status` now reports the capture mode when it is `allowlist`, in
+  both the human and `--json` renderings. Without it the new ingest counters
+  read identically whether hooks are broken or a repository simply never opted
+  in — the exact ambiguity those counters were added to remove (#428, #446).
 
 ### Docs
 - Documented the order of magnitude reported for lifecycle-hook overhead,
