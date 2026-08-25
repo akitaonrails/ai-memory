@@ -2753,6 +2753,15 @@ mod tests {
         assert_eq!(source_details.fts_rank, Some(1));
         assert!(source_details.vector_rank.is_none());
         assert!(source_details.graph_rank.is_none());
+        // #486: the hydrate must fill only what is empty. An FTS hit carries
+        // a `snippet()` excerpt centred on the matched term, which is more
+        // useful than the generic page descriptor — re-describing every hit
+        // would quietly downgrade it, so the fix keys on an empty title.
+        assert!(
+            source_hit.snippet.contains("needle"),
+            "an FTS hit must keep its term-centred excerpt, got {:?}",
+            source_hit.snippet
+        );
 
         let (target_hit, target_details) = explained
             .iter()
@@ -2805,6 +2814,28 @@ mod tests {
         assert_eq!(target_vector_details.vector_rank, Some(1));
         assert_eq!(target_vector_details.cosine, Some(1.0));
         assert!(target_vector_details.rrf.vector > 0.0);
+
+        // #486: a hit the vector stream ranked must still be describable.
+        // The fusion map is built with `or_insert_with` and the vector loop
+        // has only `(PageId, PagePath, f32)` to insert, so before the
+        // post-fusion hydrate these came back as empty strings — and with a
+        // reranker enabled an empty candidate is scored as an empty document
+        // and can be truncated away. This test previously asserted the rank
+        // and nothing about what the caller actually receives.
+        let (target_vector_hit, _) = vector_explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "target.md")
+            .unwrap();
+        assert!(
+            !target_vector_hit.title.is_empty(),
+            "a vector-ranked hit must carry a title, got {:?}",
+            target_vector_hit.title
+        );
+        assert!(
+            !target_vector_hit.snippet.is_empty(),
+            "a vector-ranked hit must carry a snippet, got {:?}",
+            target_vector_hit.snippet
+        );
     }
 
     #[tokio::test]

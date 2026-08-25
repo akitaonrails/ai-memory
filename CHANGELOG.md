@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Hits ranked by the vector stream returned an empty `title` and `snippet`,
+  even when the entity or graph stream had also found the page and already
+  computed a real descriptor for it. The fusion map is built with
+  `or_insert_with` and the vector loop only has `(PageId, PagePath, f32)` to
+  insert, so first-writer-wins left the entry empty and nothing downstream
+  repaired it. Beyond the empty display, `title` and `snippet` are the
+  reranker's candidate text, so an affected page was scored as an empty
+  document and could then be truncated out of the results a reranker was
+  meant to improve. Fused hits that still lack a title are now hydrated in
+  one bounded lookup; hits another stream already described keep that
+  stream's snippet, so an FTS excerpt centred on the matched term is not
+  downgraded to a generic descriptor. Affects instances with an embedding
+  provider configured. Reported by @samirhvbr (#486).
+
 ## [1.32.0] - 2026-08-24
 
 ### Added
