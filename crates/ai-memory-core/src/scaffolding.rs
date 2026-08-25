@@ -14,6 +14,17 @@
 //! silently, because a bad title just looks like a title. `transcript.rs`
 //! already carries a narrower version of this idea for `<system-reminder>`
 //! and `<user_info>` on the workstream path.
+//!
+//! **A bare model id is not tested for here, on purpose.** It has the same
+//! shape as a terse human reference — `gpt-5` and `pr-477` differ only in
+//! meaning — so any lexical rule that catches one catches the other, and this
+//! predicate errs toward keeping text. Every model id that reached a title
+//! in the surveyed corpus arrived on a `SessionStart` observation, which is
+//! the only kind whose title `best_title_hint` fills from the harness's
+//! `model` field, so `derive_title` skips that kind outright instead.
+//!
+//! That is narrower than a shape rule, deliberately: a model id somebody
+//! *typed* is now kept, because at that point it is what the user wrote.
 
 /// Characters that open a decorated shell prompt rather than prose.
 /// Box-drawing and the powerline separators commonly echoed into a paste.
@@ -61,19 +72,6 @@ pub fn looks_like_scaffolding(candidate: &str) -> bool {
         return true;
     }
 
-    // A bare identifier rather than a sentence: no whitespace anywhere, and
-    // carrying identifier punctuation. Real prompts essentially always
-    // contain a space; requiring the punctuation too keeps a one-word prompt
-    // like "help" or "continue" as a legitimate title.
-    if !trimmed.contains(char::is_whitespace)
-        && trimmed
-            .chars()
-            .any(|c| c.is_ascii_digit() || c == '[' || c == ']')
-        && trimmed.chars().any(|c| c == '-' || c == '_' || c == '[')
-    {
-        return true;
-    }
-
     false
 }
 
@@ -82,16 +80,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_three_observed_classes_are_scaffolding() {
-        // From the #484 corpus survey: 16 IDE blocks, 4 prompt echoes, 1
-        // model id across 330 real session pages.
+    fn the_two_shape_classes_are_scaffolding() {
+        // From the #484 corpus survey: 16 IDE blocks and 4 prompt echoes
+        // across 330 real session pages. The survey's third class, a bare
+        // model id, is excluded at its source instead — see below.
         assert!(looks_like_scaffolding(
             "<ide_opened_file>The user opened the file /home/samir/x/main.rs"
         ));
         assert!(looks_like_scaffolding(
             "┌─[samir@samirb3 12:56:36] ~/x/ai-usagebar/gnome-extension"
         ));
-        assert!(looks_like_scaffolding("claude-opus-5[1m]"));
+    }
+
+    #[test]
+    fn a_bare_identifier_is_not_judged_by_shape() {
+        // A model id and a terse human reference are the same string shape,
+        // so a rule catching `claude-opus-5[1m]` also catches every entry
+        // below. Measured against the corpus survey's two populations, one
+        // such rule matched 10 of 10 model ids and 7 of 11 references.
+        // Keeping text is the cheaper error: `derive_title` excludes model
+        // ids by observation kind, and nothing excludes a lost title.
+        for reference in [
+            "pr-477",
+            "issue-484",
+            "fix-484",
+            "commit-a0bc43d",
+            "main-2.rs",
+            "step-1",
+            "task_7",
+        ] {
+            assert!(
+                !looks_like_scaffolding(reference),
+                "{reference:?} is a plausible terse prompt and must survive"
+            );
+        }
     }
 
     #[test]

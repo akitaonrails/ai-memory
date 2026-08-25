@@ -68,13 +68,29 @@ pub fn synthesize_session_page(
 ///
 /// Prefers the first user prompt that reads as something a person wrote.
 /// A prompt payload is whatever the harness put there, so IDE context
-/// blocks, an echoed shell prompt, or a bare model id can arrive in the
-/// same field (#484) — those are skipped rather than becoming the title the
-/// page is indexed and displayed under.
+/// blocks and an echoed shell prompt can arrive in the same field (#484) —
+/// those are skipped rather than becoming the title the page is indexed and
+/// displayed under.
+///
+/// A `SessionStart` is skipped as a source outright. `best_title_hint`
+/// fills its title from `model` before `title` (`payload.rs`), so a bare
+/// model id became the page title whenever the prompts were unusable — and
+/// by the time it is a string it is indistinguishable from a terse human
+/// reference like `pr-477`, so it is excluded here by kind instead.
+///
+/// The skipped field is `["model", "title"]`, so this drops more than a
+/// model id: OpenCode's `session.created` puts `info.title` in the same
+/// slot. Its plugin subscribes to `created`/`idle`/`deleted`/`compacted`
+/// and never `session.updated`, and starts a session once per id, so the
+/// only value that can arrive is the creation-time name — in practice the
+/// shared literal "New session", never a rename. What a `SessionStart`
+/// carries is whatever the harness *named the session*, and no harness
+/// names it with something a person typed.
 ///
 /// Falls through in decreasing order of confidence: a usable prompt, then
-/// any usable observation title, then the session's own path. The literal
-/// "session" remains only for the case where there is nothing else at all.
+/// any other usable observation title, then the session's own path. The
+/// literal "session" remains only for the case where there is nothing else
+/// at all.
 fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
     for obs in observations {
         if obs.kind == ObservationKind::UserPrompt
@@ -85,6 +101,9 @@ fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
         }
     }
     for obs in observations {
+        if obs.kind == ObservationKind::SessionStart {
+            continue;
+        }
         if !obs.title.is_empty() && !looks_like_scaffolding(&obs.title) {
             return obs.title.clone();
         }
@@ -541,9 +560,8 @@ mod tests {
         for scaffold in [
             "<ide_opened_file>The user opened the file /home/samir/x/main.rs",
             "\u{250c}\u{2500}[samir@samirb3 12:56:36] ~/x/ai-usagebar",
-            "claude-opus-5[1m]",
         ] {
-            let obs = vec![
+            let candidates = vec![
                 obs(ObservationKind::UserPrompt, scaffold),
                 obs(
                     ObservationKind::UserPrompt,
@@ -551,7 +569,7 @@ mod tests {
                 ),
             ];
             assert_eq!(
-                derive_title(&obs, test_session_id()),
+                derive_title(&candidates, test_session_id()),
                 "Make the backpressure test deterministic",
                 "{scaffold:?} must be skipped in favour of the next real prompt"
             );
@@ -563,13 +581,77 @@ mod tests {
     #[test]
     fn an_all_scaffolding_session_falls_back_to_its_identity() {
         let sid = test_session_id();
-        let obs = vec![
+        // The model id arrives on the `SessionStart`, which is where
+        // `best_title_hint` puts the harness's `model` field — not as a
+        // prompt somebody typed.
+        let candidates = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
             obs(ObservationKind::UserPrompt, "<ide_opened_file>x"),
-            obs(ObservationKind::UserPrompt, "claude-opus-5[1m]"),
         ];
-        let title = derive_title(&obs, sid);
+        let title = derive_title(&candidates, sid);
         assert_eq!(title, format!("Session {sid}"));
         assert_ne!(title, "session", "must not collapse to a shared literal");
+    }
+
+    /// The shape measured in production on 2026-08-21: a 17-observation
+    /// session whose `UserPrompt` carried an **empty** title, so the fallback
+    /// loop reached the `SessionStart` and the harness's model id became the
+    /// page title. The prompt was never scaffolding — it was absent, which is
+    /// why no filter on the string could have caught this.
+    #[test]
+    fn a_model_id_on_session_start_never_becomes_the_title() {
+        let sid = test_session_id();
+        let with_a_later_title = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, ""),
+            obs(ObservationKind::PostToolUse, "tool non-file"),
+        ];
+        assert_eq!(derive_title(&with_a_later_title, sid), "tool non-file");
+
+        let nothing_else = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, ""),
+        ];
+        assert_eq!(
+            derive_title(&nothing_else, sid),
+            format!("Session {sid}"),
+            "the session's identity, never the model it ran on"
+        );
+    }
+
+    /// Skipping the kind also excludes what the router writes when a harness
+    /// sends neither `model` nor `title`: `title_hint.unwrap_or(kind)`, i.e.
+    /// the literal "session-start". The shape predicate never caught that,
+    /// and it is a string every such page would share.
+    #[test]
+    fn the_routers_default_session_start_title_is_not_a_page_title() {
+        let sid = test_session_id();
+        for stored in ["session-start", "New session"] {
+            let candidates = vec![
+                obs(ObservationKind::SessionStart, stored),
+                obs(ObservationKind::UserPrompt, ""),
+            ];
+            assert_eq!(
+                derive_title(&candidates, sid),
+                format!("Session {sid}"),
+                "{stored:?} is what the harness named the session, not a title"
+            );
+        }
+    }
+
+    /// The cost of the rule this replaces: a terse reference is the same
+    /// string shape as a model id, so filtering one filtered the other.
+    #[test]
+    fn a_terse_reference_is_still_a_usable_title() {
+        let sid = test_session_id();
+        for prompt in ["pr-477", "issue-484", "commit-a0bc43d"] {
+            let candidates = vec![obs(ObservationKind::UserPrompt, prompt)];
+            assert_eq!(
+                derive_title(&candidates, sid),
+                prompt,
+                "{prompt:?} is a plausible prompt and must survive as a title"
+            );
+        }
     }
 
     /// The title is also what `page_descriptor` filters against — a body line
