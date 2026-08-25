@@ -295,7 +295,9 @@ should be proposed from a completed session, or at explicit wrap-up \
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
-  pages (idempotent, supports dry-run).\n\
+  pages. Three passes: expired pages are hard-deleted even when \
+  pinned, cold episodic pages decay to tombstones (pinned exempt), \
+  old tombstones are purged (idempotent, supports dry-run).\n\
 - `memory_install_self_routing` — when the user asks to 'install \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
@@ -2373,12 +2375,19 @@ impl AiMemoryServer {
     }
 
     /// Run the M8 forget sweep over episodic pages.
-    #[tool(description = "Run the retention sweep: walk is_latest=1 \
-        episodic pages, score them with the agentmemory-style retention \
-        formula (salience * exp(-lambda * age) + sigma * log(1 + accesses) \
-        * exp(-mu * days_since_access)), and evict those below the cold \
-        threshold through the wiki layer. Semantic / procedural / pinned pages are exempt. \
-        Pass dry_run=true to preview.")]
+    #[tool(description = "Run the retention sweep. THREE passes, and they \
+        differ on what they will delete. (1) TTL: pages whose frontmatter \
+        expires_at is in the past are hard-deleted (file + rows) REGARDLESS \
+        OF TIER OR PIN — an explicit expiry overrides a pin, so a pinned \
+        page CAN be deleted by this pass. (2) Decay: is_latest=1 episodic \
+        pages are scored with the agentmemory-style retention formula \
+        (salience * exp(-lambda * age) + sigma * log(1 + accesses) * \
+        exp(-mu * days_since_access)) and those below the cold threshold are \
+        evicted to a tombstone; only this pass exempts semantic / procedural \
+        / pinned pages. (3) Hard-delete: tombstones older than \
+        hard_delete_after_days and their supersession ancestry are removed \
+        permanently. The report's expired / hard_deleted counts come from \
+        passes 1 and 3. Pass dry_run=true to preview.")]
     async fn memory_forget_sweep(
         &self,
         Parameters(args): Parameters<SweepArgs>,
@@ -5940,6 +5949,67 @@ mod tests {
                 "{label} handoff guidance must restrict explicit workspace scope to named siblings"
             );
         });
+    }
+
+    /// `memory_forget_sweep` is admin-gated and destructive, and the surface
+    /// an agent reads is the only place it can learn what the tool will
+    /// delete. Both surfaces must name all three passes and must not claim a
+    /// blanket pin exemption.
+    ///
+    /// The description previously said "Semantic / procedural / pinned pages
+    /// are exempt" full stop, which is true of the decay pass and false of
+    /// the TTL pass: `sweep.rs` pushes any candidate whose `expires_at` has
+    /// passed into `expired` and `continue`s three lines *before* the only
+    /// pin check. An agent asked "is it safe to run, I have pinned pages?"
+    /// had no way to answer anything but yes (#485). The behaviour is
+    /// deliberate — an explicit expiry is a more specific instruction than a
+    /// pin, pinned by `lifecycle.rs` — so the surface is what had to change.
+    #[tokio::test]
+    async fn forget_sweep_surfaces_name_every_pass_and_scope_the_pin_exemption() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let sweep = tools
+            .iter()
+            .find(|t| t.name == "memory_forget_sweep")
+            .expect("memory_forget_sweep must be registered");
+        let desc = sweep
+            .description
+            .as_deref()
+            .expect("memory_forget_sweep must carry a description");
+
+        // The TTL pass must be named, and named as pin-overriding. This is
+        // the deletion-safety claim that was wrong.
+        assert!(
+            desc.contains("expires_at"),
+            "description must name the TTL pass trigger; got: {desc}"
+        );
+        assert!(
+            desc.contains("REGARDLESS OF TIER OR PIN"),
+            "description must state that TTL overrides a pin; got: {desc}"
+        );
+        // The decay pass keeps its exemption, but scoped to itself.
+        assert!(
+            desc.contains("only this pass exempts"),
+            "the pin exemption must be scoped to the decay pass; got: {desc}"
+        );
+        // The third pass, so `hard_deleted` in the report is interpretable.
+        assert!(
+            desc.contains("hard_delete_after_days"),
+            "description must name the hard-delete pass; got: {desc}"
+        );
+        // A bare unqualified exemption sentence is exactly the regression
+        // this guards, so reject the old wording verbatim.
+        assert!(
+            !desc.contains("Semantic / procedural / pinned pages are exempt."),
+            "the unscoped pin-exemption claim must not come back; got: {desc}"
+        );
+
+        // MEMORY_INSTRUCTIONS is read before an agent ever inspects
+        // `tools/list`, so it carries the same obligation.
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("hard-deleted even when"),
+            "MEMORY_INSTRUCTIONS must warn that expired pages delete despite a pin"
+        );
     }
 
     /// All three prompt surfaces must steer agents toward the H1-in-body

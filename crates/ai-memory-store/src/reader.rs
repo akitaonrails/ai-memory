@@ -3522,6 +3522,73 @@ impl ReaderPool {
         .await
     }
 
+    /// Title and descriptor for a bounded set of already-fused page ids
+    /// (#486).
+    ///
+    /// The vector stream returns `(PageId, PagePath, f32)` and nothing else,
+    /// so a page it reaches first is inserted into the fusion map with empty
+    /// strings and — because every fusion site uses `or_insert_with` — stays
+    /// empty even when entity or graph later find it with a real descriptor
+    /// already computed.
+    ///
+    /// Deliberately a post-fusion lookup rather than a wider embedding query.
+    /// `top_embedding_hits_for_project` has no SQL `LIMIT`: it scores every
+    /// embedded page in the project in Rust and takes top-k afterwards, so a
+    /// descriptor column there would compute one for the whole corpus on
+    /// every search. Here the input is only the handful of ids that survived
+    /// fusion and still lack a title.
+    async fn page_descriptors_for_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_ids: Vec<PageId>,
+    ) -> StoreResult<std::collections::HashMap<PageId, (String, String)>> {
+        if page_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.with_conn(move |conn| {
+            let mut values_clause = String::with_capacity(page_ids.len() * 5);
+            let mut sql_params = Vec::with_capacity(page_ids.len() + 2);
+            for (idx, page_id) in page_ids.iter().enumerate() {
+                if idx > 0 {
+                    values_clause.push_str(", ");
+                }
+                values_clause.push_str("(?)");
+                sql_params.push(Value::Blob(page_id.as_bytes().to_vec()));
+            }
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+
+            let sql = format!(
+                "WITH requested(id) AS (VALUES {values_clause}) \
+                 SELECT pages.id, pages.title, {descriptor} AS descriptor \
+                 FROM requested \
+                 JOIN pages ON pages.id = requested.id \
+                 WHERE pages.workspace_id = ? \
+                   AND pages.project_id = ? \
+                   AND pages.is_latest = 1",
+                descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let title: String = row.get(1)?;
+                let descriptor: String = row.get(2)?;
+                Ok((id_bytes, title, descriptor))
+            })?;
+
+            let mut out = std::collections::HashMap::new();
+            for row in rows {
+                let (id_bytes, title, descriptor) = row?;
+                if let Ok(id) = PageId::from_slice(&id_bytes) {
+                    out.insert(id, (title, descriptor));
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn page_authorities_for_project(
         &self,
         workspace_id: WorkspaceId,
@@ -3872,6 +3939,26 @@ impl ReaderPool {
                 )
             })
             .collect();
+        // #486: fill in hits the vector stream reached first. Only those with
+        // an empty title are looked up — a page fts, entity or graph already
+        // described keeps the descriptor those streams computed, which is the
+        // whole reason not to recompute it here.
+        let undescribed: Vec<PageId> = out
+            .iter()
+            .filter_map(|(hit, _)| hit.title.is_empty().then_some(hit.id))
+            .collect();
+        if !undescribed.is_empty() {
+            let descriptors = self
+                .page_descriptors_for_ids(workspace_id, project_id, undescribed)
+                .await?;
+            for (hit, _) in &mut out {
+                if let Some((title, descriptor)) = descriptors.get(&hit.id) {
+                    hit.title = title.clone();
+                    hit.snippet = descriptor.clone();
+                }
+            }
+        }
+
         let missing_authorities: Vec<PageId> = out
             .iter()
             .filter_map(|(hit, _)| (!authorities.contains_key(&hit.id)).then_some(hit.id))
