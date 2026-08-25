@@ -21,9 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written whenever a harness sends neither `model` nor `title`. The trade is
   narrower than a shape rule and stated as such: a model id a user *typed* is
   now kept, because at that point it is what they wrote. Where the prompts
-  are unusable a page falls to the next observation title, usually the shared
-  literal `tool file`, and to `Session {id}` only when there is no tool
-  observation at all. (#484)
+  are unusable a page falls to the next observation title, which the router
+  defaults to the observation's own kind, so `Session {id}` is reached only
+  by a session carrying nothing else at all — measured over 332 real sessions
+  it never was, and 5 of them landed on `tool file` / `tool non-file` against
+  327 keeping a real title. `looks_like_scaffolding` is re-exported from
+  `ai-memory-core`, so its narrowing is a public-API behaviour change even
+  though `derive_title` is its only caller in tree. (#484)
 
 ### Docs
 - Documented why registering ai-memory through Kimi Code's own

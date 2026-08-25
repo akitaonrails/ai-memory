@@ -83,9 +83,13 @@ pub fn synthesize_session_page(
 /// slot. Its plugin subscribes to `created`/`idle`/`deleted`/`compacted`
 /// and never `session.updated`, and starts a session once per id, so the
 /// only value that can arrive is the creation-time name — in practice the
-/// shared literal "New session", never a rename. What a `SessionStart`
-/// carries is whatever the harness *named the session*, and no harness
-/// names it with something a person typed.
+/// shared literal "New session", never a rename. **That last part is an
+/// assumption about an external component, not an invariant:** it is read
+/// off OpenCode's subscription list as of v1.32.1, and if a future release
+/// surfaces a renamed session here, this would discard a good title with
+/// nothing in the tree failing. What a `SessionStart` carries is whatever
+/// the harness *named the session*, and no harness names it with something
+/// a person typed.
 ///
 /// Falls through in decreasing order of confidence: a usable prompt, then
 /// any other usable observation title, then the session's own path. The
