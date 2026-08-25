@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `memory_forget_sweep`'s tool description claimed "Semantic / procedural /
+  pinned pages are exempt" without qualification. That is true of the decay
+  pass and false of the TTL pass, which hard-deletes any page whose
+  `expires_at` has passed regardless of tier or pin — the check runs three
+  lines before the only pin test. Since the tool is admin-gated and
+  destructive and its description is the only thing an agent can consult, a
+  model asked "is it safe to run, I have pinned pages?" had no way to answer
+  anything but yes. Both surfaces — the `tools/list` description and the
+  `MEMORY_INSTRUCTIONS` line — now name all three passes and scope the pin
+  exemption to the one that honours it. Behaviour is unchanged: an explicit
+  expiry remains a more specific instruction than a pin. A `tools/list`
+  assertion pins the wording so a fourth pass cannot silently make it stale
+  again. Reported by @samirhvbr (#485).
+
 ## [1.32.0] - 2026-08-24
 
 ### Added
