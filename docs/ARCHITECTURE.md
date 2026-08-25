@@ -597,8 +597,12 @@ when `LLM_API_KEY` is absent and stores vectors under the distinct
 * **Richer curator actions.** The shipped curator stages only one report page;
   future work can add individual merge/supersession/link-fix proposals while
   keeping deletes and semantic rewrites review-gated.
-* **Multi-workspace UI / web dashboard.** Out of scope for v1; revisit
-  once the headless server has been load-tested.
+* **Write surface for the web UI.** The multi-workspace read-only wiki
+  browser shipped in `ai-memory-web` (`/web` — project list, page tree,
+  page view, search). Browsers still can't mutate anything (notes,
+  consolidate, lint, purge stay CLI/MCP-only); an authenticated "edit
+  this page" surface is a deliberate v2 conversation. See
+  [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-planned-iterations-not-blockers).
 * **Real LongMemEval-S harness.** The recall-eval framework exists
   ([`crates/ai-memory-consolidate/tests/recall_eval.rs`](../crates/ai-memory-consolidate/tests/recall_eval.rs));
   porting LongMemEval-S itself requires the dataset.
