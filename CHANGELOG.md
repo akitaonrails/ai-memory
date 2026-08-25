@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Session page titles were the first user prompt taken verbatim, so whatever
+  the harness put in that payload became the title the page is indexed and
+  displayed under — IDE context blocks, a shell prompt echoed into a paste, a
+  bare model id. Measured across one live instance: 21 of 330 real session
+  pages (6.4%), at a flat rate month over month rather than a decaying legacy
+  population. Titles that read as harness scaffolding are now skipped in
+  favour of the next real prompt, and a session whose every candidate is
+  scaffolding falls back to its own identity rather than a shared literal.
+  The predicate tests the *shape* of the text rather than matching a list of
+  known offenders, since three classes from one corpus is a sample of that
+  operator's harnesses and a blocklist would fail silently on the fourth.
+  New writes only — existing titles are unchanged. Reported by @samirhvbr
+  (#484).
+
 ## [1.32.0] - 2026-08-24
 
 ### Added

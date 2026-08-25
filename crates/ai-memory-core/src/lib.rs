@@ -15,6 +15,8 @@ pub mod ids;
 pub mod observation;
 pub mod page;
 pub mod routing_skills;
+pub mod scaffolding;
+pub use scaffolding::looks_like_scaffolding;
 pub mod routing_snippet;
 pub mod sanitize;
 pub mod slots;

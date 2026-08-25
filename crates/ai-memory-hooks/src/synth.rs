@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use ai_memory_core::{
     NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    looks_like_scaffolding,
 };
 use jiff::tz::TimeZone;
 
@@ -31,7 +32,7 @@ pub fn synthesize_session_page(
     // One tally for the whole page: the body renderer and the summary builder
     // describe the same session and must not scan it twice to do so.
     let tally = tally_session(observations);
-    let title = derive_title(observations);
+    let title = derive_title(observations, session_id);
     let body = render_body(session_id, observations, &title, &tally);
     let mut frontmatter_json = serde_json::json!({
         "title": title,
@@ -63,18 +64,38 @@ pub fn synthesize_session_page(
     }
 }
 
-fn derive_title(observations: &[Observation]) -> String {
+/// Title for a synthesised session page.
+///
+/// Prefers the first user prompt that reads as something a person wrote.
+/// A prompt payload is whatever the harness put there, so IDE context
+/// blocks, an echoed shell prompt, or a bare model id can arrive in the
+/// same field (#484) — those are skipped rather than becoming the title the
+/// page is indexed and displayed under.
+///
+/// Falls through in decreasing order of confidence: a usable prompt, then
+/// any usable observation title, then the session's own path. The literal
+/// "session" remains only for the case where there is nothing else at all.
+fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
     for obs in observations {
-        if obs.kind == ObservationKind::UserPrompt && !obs.title.is_empty() {
+        if obs.kind == ObservationKind::UserPrompt
+            && !obs.title.is_empty()
+            && !looks_like_scaffolding(&obs.title)
+        {
             return obs.title.clone();
         }
     }
     for obs in observations {
-        if !obs.title.is_empty() {
+        if !obs.title.is_empty() && !looks_like_scaffolding(&obs.title) {
             return obs.title.clone();
         }
     }
-    "session".to_string()
+    // Every candidate was scaffolding. The page still needs a title, and its
+    // own identity is more use to a reader than the word "session" repeated
+    // across every such page.
+    if observations.is_empty() {
+        return "session".to_string();
+    }
+    format!("Session {session_id}")
 }
 
 /// The per-session counts that both the rendered body and the frontmatter
@@ -325,6 +346,12 @@ fn human_ts(ts: &jiff::Timestamp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One id per call is fine: assertions here never depend on its value,
+    /// only on whether the fallback path was taken at all.
+    fn test_session_id() -> SessionId {
+        SessionId::new()
+    }
     use ai_memory_core::{ObservationId, SessionId};
     use jiff::Timestamp;
 
@@ -423,7 +450,7 @@ mod tests {
         );
         assert_ne!(
             summary,
-            derive_title(&observations),
+            derive_title(&observations, test_session_id()),
             "a summary equal to the title is dropped as a repeat"
         );
     }
@@ -507,19 +534,86 @@ mod tests {
         );
     }
 
+    /// The #484 defect: the three classes measured across a live corpus must
+    /// not become titles, and the page must still get a usable one.
+    #[test]
+    fn harness_scaffolding_does_not_become_the_title() {
+        for scaffold in [
+            "<ide_opened_file>The user opened the file /home/samir/x/main.rs",
+            "\u{250c}\u{2500}[samir@samirb3 12:56:36] ~/x/ai-usagebar",
+            "claude-opus-5[1m]",
+        ] {
+            let obs = vec![
+                obs(ObservationKind::UserPrompt, scaffold),
+                obs(
+                    ObservationKind::UserPrompt,
+                    "Make the backpressure test deterministic",
+                ),
+            ];
+            assert_eq!(
+                derive_title(&obs, test_session_id()),
+                "Make the backpressure test deterministic",
+                "{scaffold:?} must be skipped in favour of the next real prompt"
+            );
+        }
+    }
+
+    /// Every candidate is scaffolding. The page still needs a title, and
+    /// "session" repeated across every such page is not one.
+    #[test]
+    fn an_all_scaffolding_session_falls_back_to_its_identity() {
+        let sid = test_session_id();
+        let obs = vec![
+            obs(ObservationKind::UserPrompt, "<ide_opened_file>x"),
+            obs(ObservationKind::UserPrompt, "claude-opus-5[1m]"),
+        ];
+        let title = derive_title(&obs, sid);
+        assert_eq!(title, format!("Session {sid}"));
+        assert_ne!(title, "session", "must not collapse to a shared literal");
+    }
+
+    /// The title is also what `page_descriptor` filters against — a body line
+    /// equal to it is dropped as a repeat. Changing which string becomes the
+    /// title therefore changes which body lines survive, so a filtered page
+    /// must still render a body whose prompts are intact.
+    #[test]
+    fn a_filtered_title_still_leaves_the_prompts_in_the_body() {
+        let obs = vec![
+            obs(ObservationKind::UserPrompt, "<ide_opened_file>noise"),
+            obs(
+                ObservationKind::UserPrompt,
+                "Make the backpressure test deterministic",
+            ),
+        ];
+        let title = derive_title(&obs, test_session_id());
+        let tally = tally_session(&obs);
+        let body = render_body(test_session_id(), &obs, &title, &tally);
+        assert!(
+            body.contains("Make the backpressure test deterministic"),
+            "the promoted prompt must still appear in the body: {body}"
+        );
+        assert!(
+            body.contains("<ide_opened_file>noise"),
+            "the skipped prompt is still session history and must be recorded"
+        );
+    }
+
     #[test]
     fn title_falls_back_through_kinds() {
         let no_prompt = vec![obs(ObservationKind::PostToolUse, "Edit")];
-        assert_eq!(derive_title(&no_prompt), "Edit");
+        assert_eq!(derive_title(&no_prompt, test_session_id()), "Edit");
 
         let empty: Vec<Observation> = vec![];
-        assert_eq!(derive_title(&empty), "session");
+        assert_eq!(derive_title(&empty, test_session_id()), "session");
 
         let with_prompt = vec![
             obs(ObservationKind::PostToolUse, "Edit"),
             obs(ObservationKind::UserPrompt, "fix the auth bug"),
         ];
-        assert_eq!(derive_title(&with_prompt), "fix the auth bug");
+        assert_eq!(
+            derive_title(&with_prompt, test_session_id()),
+            "fix the auth bug"
+        );
     }
 
     #[test]
