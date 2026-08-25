@@ -760,7 +760,10 @@ Useful entry points:
   browser view of the markdown wiki. `--enable-web` also mounts a
   read-only JSON frontend API at `/api/v1` (workspaces, projects, pages,
   recent, briefing, search) so custom web UIs can read the memory without
-  opening SQLite or wiki files directly:
+  opening SQLite or wiki files directly. Rendered pages keep external links
+  clickable, but image sources must be relative or root-relative; absolute
+  external images are neutralized so viewing stored Markdown cannot act as a
+  remote beacon:
 
   ```text
   GET  /api/v1/workspaces

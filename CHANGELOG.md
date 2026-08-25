@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text. A newer CLI against an older server renders the rest of `status` and
   omits the section rather than failing to parse.
 
+### Fixed
+- Prevented stored Markdown from automatically fetching external image URLs
+  when viewed in the web UI, while preserving clickable external links and
+  same-origin relative images (#491).
+
 ### Docs
 - Documented the order of magnitude reported for lifecycle-hook overhead,
   including the fact that a completed tool call normally pays for both pre- and
