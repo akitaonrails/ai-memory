@@ -51,6 +51,19 @@ and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
 branching controls, not harness-switch controls.
 
+List the workstreams available to those selectors without launching a harness:
+
+```bash
+ai-memory workstreams [--workspace NAME] [--project NAME]
+ai-memory workstreams --limit 50 --json
+```
+
+The list is scoped to the same `(workspace, project, repository, worktree)`
+identity as `run`, puts the current selection first, then orders by recent
+activity. Each row includes the linked harnesses and stable workstream id; the
+response does not expose checkout paths, repository fingerprints, or native
+session ids.
+
 ## Project-first launcher
 
 `ai-memory show` reverses the usual `cd` then `run` flow: choose a local
@@ -414,14 +427,14 @@ original config is not modified. ai-memory opens the project database read-only;
 the launched Crush process continues its normal native session writes.
 
 The Linux/macOS Docker shell wrapper cannot inspect host projects or execute a
-host agent from inside its helper container. For `run`, `show`, and `continue`,
-it downloads the matching native release into
+host agent from inside its helper container. For `run`, `show`, `continue`, and
+`workstreams`, it downloads the matching native release into
 `~/.cache/ai-memory/native-runner`, verifies the published SHA-256 checksum, and
 executes that host client. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
 specific native build. Native package, release, and source installs need no
 shim. On native Windows, use the published `ai-memory.exe` or a source build.
 
-The wrapper intercepts all three commands before Docker and preserves the host
+The wrapper intercepts all four commands before Docker and preserves the host
 `PATH`, `AI_MEMORY_SERVER_URL`, and authentication environment. The native client's
 startup log shows `server_url` as well as its local config paths; `data_dir` and
 `bind` describe local defaults and do not override a configured remote server.

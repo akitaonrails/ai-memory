@@ -835,6 +835,7 @@ fn managed_host_commands_use_native_path_and_remote_server_without_docker() {
         &["run", "codex", "--yolo", "resume"],
         &["show", "--json", "--no-scan"],
         &["continue", "--workspace", "work", "--yolo"],
+        &["workstreams", "--limit", "5", "--json"],
     ];
     for args in commands {
         let output = shell_script_command(&repo_root().join("bin/ai-memory"))

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `ai-memory workstreams`, a read-only checkout-local list of recent
+  managed workstreams with the current selection first, linked harnesses,
+  timestamps, and stable ids. Human-readable and `--json` output share the same
+  bounded POST query, which follows `run`'s exact workspace, project,
+  repository, and worktree identity without returning checkout paths,
+  fingerprints, or native session ids. The Docker shell wrapper routes the
+  command through its native host client so repository identity remains
+  correct. (#499)
+
+
 ## [1.33.1] - 2026-08-28
 
 ### Fixed
