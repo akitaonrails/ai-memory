@@ -130,7 +130,15 @@ regex = "1"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 # LLM provider HTTP.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# `rustls-tls` bundles the Mozilla webpki root store and ignores the OS trust
+# store, so a CA an operator installed locally — Caddy's `tls internal`, a
+# corporate MITM appliance, any private PKI — is invisible to this client even
+# though `curl` and the agent CLIs trust it. That made lifecycle capture fail
+# with `UnknownIssuer` on every install following the project's own
+# HTTPS-via-proxy Path 2 (#492). `rustls-tls-native-roots` reads the platform
+# store instead; the runtime image installs `ca-certificates`, so the server
+# path keeps a populated store.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
 futures-util = "0.3"
 async-trait = "0.1"
 

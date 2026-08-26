@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The native client now trusts CAs from the platform trust store. It was built
+  with reqwest's `rustls-tls`, which bundles the Mozilla webpki roots and
+  ignores the OS store, so a CA the operator had installed locally — Caddy's
+  `tls internal`, a corporate MITM appliance, any private PKI — was invisible
+  to `ai-memory` even though `curl` and the agent CLIs trusted it. Every HTTPS
+  request failed with `invalid peer certificate: UnknownIssuer`, including
+  `ai-memory hook`, so following this project's own HTTPS-via-proxy Path 2
+  guide left lifecycle capture failing end to end: events spooled locally
+  (queuing touches no network) and the drain could never deliver them.
+  Switched to `rustls-tls-native-roots`; the runtime image installs
+  `ca-certificates`, so the server path keeps a populated store. Reported by
+  @alanmatiasdev (#492).
+
 - Made `hook-drain` say what a pass actually did. The drain already returned
   `sent`/`remaining`/`dropped` counts and `run_drain` discarded all three, so
   three passes that mean opposite things — everything delivered, every queued
