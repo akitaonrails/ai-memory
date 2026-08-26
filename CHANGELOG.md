@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Made managed routing `SKILL.md` payloads byte-identical across release
+  platforms. Windows builds previously embedded CRLF from the runner checkout
+  while Linux and macOS builds embedded LF, so one tag returned different
+  bytes through CLI installs and `memory_install_self_routing`. The embedded
+  assets now use LF everywhere without rewriting user-authored files. (#502)
 - The native client now trusts CAs from the platform trust store. It was built
   with reqwest's `rustls-tls`, which bundles the Mozilla webpki roots and
   ignores the OS store, so a CA the operator had installed locally — Caddy's

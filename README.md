@@ -629,6 +629,8 @@ one matching entry.
   (`ai-memory install-instructions`, or `--target AGENTS.md` for AGENTS-based
   projects) when you want new tool guidance. The refresh writes the slim
   markered snippet and managed Agent Skills from the same binary-owned assets.
+  Managed skill payloads use LF line endings on every release platform, while
+  user-authored files keep their existing line endings.
 
 For every client in the [Support Matrix](#support-matrix), plus curl-based hook
 installs, source builds, CLI environment variables, and the full subcommand
