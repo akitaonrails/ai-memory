@@ -1618,7 +1618,16 @@ mod tests {
         let prepared = prepare_managed_run_with_retry(
             &endpoint,
             &request,
-            Duration::from_millis(100),
+            // A wall-clock give-up deadline, not a latency assertion. This
+            // test is about the retry loop reaching the third attempt, and at
+            // 100ms it was really asserting that three HTTP round-trips fit
+            // inside 100ms — which a loaded CI runner does not guarantee, so
+            // it failed intermittently on both ubuntu and macOS with the
+            // 409 the mock is supposed to retry past. The window is generous
+            // because nothing here should depend on its size; the loop still
+            // returns the instant the third attempt succeeds, so the fast
+            // path stays a few milliseconds.
+            Duration::from_secs(5),
             Duration::from_millis(1),
         )
         .await
