@@ -341,10 +341,14 @@ fn write_drain_report<W: std::io::Write>(
     outcome: &hook_spool::LockedDrainResult,
 ) -> std::io::Result<()> {
     match outcome {
+        // Says what this pass did, not what the spool holds: `LockBusy` is
+        // returned before `drain_until_quiescent` lists anything, so the count
+        // of queued events is unknown here. Asserting one would repeat, inside
+        // the fix, the confusion the fix is for.
         hook_spool::LockedDrainResult::LockBusy => writeln!(
             w,
             "ai-memory hook-drain warning: another drainer holds the spool lock; \
-             this pass delivered nothing and left queued events untouched"
+             this pass attempted no delivery and left the spool untouched"
         ),
         hook_spool::LockedDrainResult::Drained(result) => {
             if result.remaining == 0 && result.dropped == 0 {
@@ -1115,6 +1119,11 @@ mod tests {
         assert!(
             lossy.contains("DROPPED") && lossy.contains('7'),
             "a pass that discarded 7 undelivered events must name the loss: {lossy}"
+        );
+        assert!(
+            !busy.contains("queued"),
+            "LockBusy is returned before the spool is listed, so the report must \
+             not claim anything about queued events: {busy}"
         );
         assert!(
             busy.contains("lock"),
