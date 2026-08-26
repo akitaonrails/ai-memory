@@ -317,11 +317,53 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
     )
     .await
     {
-        Ok(hook_spool::LockedDrainResult::Drained(_))
-        | Ok(hook_spool::LockedDrainResult::LockBusy) => {}
+        Ok(outcome) => {
+            let _ = write_drain_report(&mut std::io::stderr(), &outcome);
+        }
         Err(err) => eprintln!("ai-memory hook-drain warning: failed to acquire drain lock: {err}"),
     }
     Ok(())
+}
+
+/// Report a drain pass on stderr when it ended with events undelivered.
+///
+/// Silent on a clean pass (nothing queued, or everything delivered) so
+/// `hook-drain.log` stays warning-only, matching the rotation budget in
+/// [`hook_drain_process`]. stderr, never stdout: the drainer's stdout is
+/// contractually empty and the detached helper redirects stderr into the log.
+///
+/// Without this the drain discarded its own [`hook_spool::DrainResult`], so a
+/// pass that dropped every queued event without sending it was byte-identical,
+/// on both streams and in the exit code, to one that delivered them all — and
+/// so was a pass that did nothing because another drainer held the lock (#493).
+fn write_drain_report<W: std::io::Write>(
+    w: &mut W,
+    outcome: &hook_spool::LockedDrainResult,
+) -> std::io::Result<()> {
+    match outcome {
+        hook_spool::LockedDrainResult::LockBusy => writeln!(
+            w,
+            "ai-memory hook-drain warning: another drainer holds the spool lock; \
+             this pass delivered nothing and left queued events untouched"
+        ),
+        hook_spool::LockedDrainResult::Drained(result) => {
+            if result.remaining == 0 && result.dropped == 0 {
+                return Ok(());
+            }
+            // "acknowledged", not "delivered": `sent` counts what the server
+            // ACKed, and an ack also covers an item the server accepted and then
+            // dropped by capture policy (`accepted_indices` includes protocol
+            // drops). Reporting those as delivered would assert storage the
+            // drain cannot observe — the precise confusion #493 was written in.
+            writeln!(
+                w,
+                "ai-memory hook-drain warning: {} event(s) acknowledged by the server, \
+                 {} still queued, {} DROPPED undelivered (past the retry cap or \
+                 older than the spool TTL)",
+                result.sent, result.remaining, result.dropped
+            )
+        }
+    }
 }
 
 fn env_lookup(name: &str) -> Option<String> {
@@ -1020,6 +1062,83 @@ mod tests {
             write_success_response(&mut output, agent, event).unwrap();
             assert_eq!(output, expected, "{agent:?} {event:?}");
         }
+    }
+
+    fn drain_report(outcome: &hook_spool::LockedDrainResult) -> String {
+        let mut out = Vec::new();
+        write_drain_report(&mut out, outcome).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// A pass with nothing left behind says nothing, so `hook-drain.log` keeps
+    /// receiving only warnings and a healthy instance never grows it.
+    #[test]
+    fn drain_report_is_silent_on_a_clean_pass() {
+        for result in [
+            hook_spool::DrainResult::default(),
+            hook_spool::DrainResult {
+                sent: 12,
+                remaining: 0,
+                dropped: 0,
+            },
+        ] {
+            let report = drain_report(&hook_spool::LockedDrainResult::Drained(result));
+            assert!(report.is_empty(), "clean pass emitted: {report}");
+        }
+    }
+
+    /// The regression #493 exists for. Three passes that mean opposite things —
+    /// everything delivered, everything discarded undelivered, and nothing even
+    /// attempted because another drainer held the lock — used to produce the
+    /// same empty output and the same exit 0, which is what left the reporter
+    /// unable to tell a working drain from a silently lossy one. Pin that each
+    /// one is now distinguishable from the other two.
+    #[test]
+    fn drain_report_separates_loss_and_contention_from_a_clean_pass() {
+        let clean = drain_report(&hook_spool::LockedDrainResult::Drained(
+            hook_spool::DrainResult {
+                sent: 5,
+                remaining: 0,
+                dropped: 0,
+            },
+        ));
+        let lossy = drain_report(&hook_spool::LockedDrainResult::Drained(
+            hook_spool::DrainResult {
+                sent: 0,
+                remaining: 0,
+                dropped: 7,
+            },
+        ));
+        let busy = drain_report(&hook_spool::LockedDrainResult::LockBusy);
+
+        assert!(clean.is_empty());
+        assert!(
+            lossy.contains("DROPPED") && lossy.contains('7'),
+            "a pass that discarded 7 undelivered events must name the loss: {lossy}"
+        );
+        assert!(
+            busy.contains("lock"),
+            "a contended pass must say it delivered nothing: {busy}"
+        );
+        assert_ne!(lossy, busy);
+        assert_ne!(lossy, clean);
+        assert_ne!(busy, clean);
+    }
+
+    /// Events merely still queued (server down, or the budget ran out) are a
+    /// warning too — they are the state that precedes the drop — but they must
+    /// not be reported as lost.
+    #[test]
+    fn drain_report_distinguishes_still_queued_from_dropped() {
+        let report = drain_report(&hook_spool::LockedDrainResult::Drained(
+            hook_spool::DrainResult {
+                sent: 1,
+                remaining: 4,
+                dropped: 0,
+            },
+        ));
+        assert!(report.contains("4 still queued"), "{report}");
+        assert!(report.contains("0 DROPPED"), "{report}");
     }
 
     #[test]

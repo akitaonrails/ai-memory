@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Made `hook-drain` say what a pass actually did. The drain already returned
+  `sent`/`remaining`/`dropped` counts and `run_drain` discarded all three, so
+  three passes that mean opposite things — everything delivered, every queued
+  event discarded undelivered at the retry cap or the spool TTL, and nothing
+  attempted at all because another drainer held the lock — were byte-identical
+  on both streams and in the exit code. A drain that silently loses capture was
+  therefore indistinguishable in the field from one that works, which is how
+  #493 was reported: exit 0, no output, an empty `hook-drain.log`, and no way
+  to tell which of the three had happened. A pass that leaves nothing behind
+  stays silent, so `hook-drain.log` keeps receiving only warnings and a healthy
+  instance never grows it; a pass that leaves events queued or drops them, and
+  a pass that found the lock held, now each emit one stderr line. stderr, not
+  stdout: the drainer's stdout is contractually empty and the detached helper
+  already redirects stderr into the log. This changes no delivery behaviour —
+  it only stops the existing behaviour being unfalsifiable. (#493)
 - Stopped the scaffolding filter discarding terse prompts. The identifier
   branch added in #484 fired on any single token carrying a digit and a
   hyphen, underscore or bracket, which is the shape of a bare model id and
