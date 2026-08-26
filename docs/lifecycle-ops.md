@@ -14,7 +14,7 @@ on a homelab box where mistakes are harder to undo.
 | `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
-| `backup --output-path` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
+| `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
 | `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
@@ -567,7 +567,7 @@ What it does not recover:
 ### `backup`
 
 ```bash
-ai-memory backup --output-path /tmp/ai-memory-backup.tar.gz
+ai-memory backup --to /tmp/ai-memory-backup.tar.gz
 ```
 
 What happens on the server:
@@ -578,7 +578,7 @@ What happens on the server:
 3. Response body IS the gzipped tarball
    (`Content-Type: application/gzip`).
 
-CLI writes the response body to `--output-path`. For a homelab user
+CLI writes the response body to `--to`. For a homelab user
 this is the standard "snapshot before doing something dangerous"
 move - `ai-memory backup` first, then proceed.
 
@@ -588,7 +588,7 @@ Restoring a backup follows the inverse:
 # Stop the server first.
 docker compose -f ~/deploy/ai-memory/docker-compose.yml down
 # Restore (sysinfo refuses if the container is still running).
-ai-memory restore --from /tmp/ai-memory-backup.tar.gz --data-dir /var/opt/docker/utils/ai-memory/data --confirm
+ai-memory restore --from /tmp/ai-memory-backup.tar.gz --data-dir /var/opt/docker/utils/ai-memory/data --force
 # Start back up.
 docker compose -f ~/deploy/ai-memory/docker-compose.yml up -d
 ```
@@ -600,7 +600,7 @@ HTTP admin API).
 ### `restore`
 
 ```bash
-ai-memory restore --from <tarball> --data-dir <path> --confirm
+ai-memory restore --from <tarball> --data-dir <path> --force
 ```
 
 Direct-disk operation. Refuses if any other `ai-memory` process is
@@ -697,11 +697,11 @@ docker start ai-memory
 ### "Snapshot before risky op"
 
 ```bash
-ai-memory backup --output-path "/tmp/ai-memory-$(date +%Y%m%d-%H%M).tar.gz"
+ai-memory backup --to "/tmp/ai-memory-$(date +%Y%m%d-%H%M).tar.gz"
 # … do the risky thing …
 # … oh no something broke …
 docker compose down
-ai-memory restore --from /tmp/ai-memory-2026-05-23-1530.tar.gz --confirm
+ai-memory restore --from /tmp/ai-memory-2026-05-23-1530.tar.gz --force
 docker compose up -d
 ```
 
