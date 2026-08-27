@@ -85,7 +85,10 @@ from hook paths.
    use `ai-memory finalize-session` for Codex, or
    `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI.
    The command selects the latest matching open session and enters the same
-   canonical SessionEnd path as a native hook.
+   canonical SessionEnd path as a native hook. Generated session-page
+   frontmatter records `session_id` plus the immutable `sessions.agent_kind`
+   as `agent`; it describes the page's harness origin, not the later writer.
+   Manual page writes do not receive inferred agent metadata.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation

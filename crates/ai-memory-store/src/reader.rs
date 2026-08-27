@@ -2796,6 +2796,33 @@ impl ReaderPool {
         .await
     }
 
+    /// Look up the immutable harness identity stored for a session.
+    ///
+    /// Machine-generated session pages use this as their origin metadata.
+    /// Reading it from the session row, rather than from the request that
+    /// happens to trigger consolidation, keeps spool drains and later
+    /// superseding writes attributed to the harness that created the session.
+    /// Returns `None` when no such session row exists.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_agent_kind(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<AgentKind>> {
+        self.with_conn(move |conn| {
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT agent_kind FROM sessions WHERE id = ?1",
+                    params![session_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(stored.map(|value| AgentKind::from_wire(&value)))
+        })
+        .await
+    }
+
     /// The operator a session belongs to (an
     /// [`ai_memory_core::IdentityKey::storage_key`] string), as recorded at
     /// session start.

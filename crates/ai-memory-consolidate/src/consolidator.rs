@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
+use ai_memory_core::{AgentKind, Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
 use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
 use ai_memory_store::{ReaderPool, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
@@ -141,6 +141,7 @@ impl Consolidator {
         }
 
         let (ws, proj) = self.resolve_target(session_id).await?;
+        let agent_kind = self.resolve_agent_origin(session_id).await?;
         let path = PagePath::new(format!("sessions/{session_id}.md"))?;
 
         // Run the blocking admission chain BEFORE the LLM so a rejected
@@ -188,7 +189,7 @@ impl Consolidator {
         );
         let page: ConsolidatedPage = complete_structured(&*self.llm, request).await?;
 
-        let frontmatter = build_frontmatter(&page);
+        let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
             .wiki
             .write_page(WritePageRequest {
@@ -276,6 +277,16 @@ impl Consolidator {
             .session_project_ids(session_id)
             .await?
             .unwrap_or((self.workspace_id, self.project_id)))
+    }
+
+    /// Resolve the session's creating harness from the persisted session row.
+    /// This is deliberately independent of the actor or client performing the
+    /// consolidation: `agent` in page frontmatter means origin, not writer.
+    async fn resolve_agent_origin(&self, session_id: SessionId) -> ConsolidatorResult<AgentKind> {
+        self.reader
+            .session_agent_kind(session_id)
+            .await?
+            .ok_or(ConsolidatorError::SessionNotFound(session_id))
     }
 
     fn should_skip_high_resistance_slot_update(
@@ -426,6 +437,7 @@ impl Consolidator {
         // Resolve the target from where the observations landed — see
         // `resolve_target` / `consolidate_session` for the rationale.
         let (ws, proj) = self.resolve_target(session_id).await?;
+        let agent_kind = self.resolve_agent_origin(session_id).await?;
 
         // Preflight admission BEFORE the LLM (see `consolidate_session`). The
         // session page is the canonical episodic anchor, so it stands in for
@@ -477,6 +489,9 @@ impl Consolidator {
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
             let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
+            if req.path == anchor {
+                stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
+            }
             // A slot the engine writes belongs to the operator whose session
             // produced it, and `build_update` keeps the model's path verbatim
             // for every non-Rule kind — so the path here is attacker-reachable
@@ -1221,13 +1236,18 @@ fn usable_summary(raw: Option<&str>, title: &str) -> Option<String> {
     Some(text.to_owned())
 }
 
-fn build_frontmatter(page: &ConsolidatedPage) -> serde_json::Value {
+fn build_frontmatter(
+    page: &ConsolidatedPage,
+    session_id: SessionId,
+    agent_kind: AgentKind,
+) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     map.insert(
         "title".into(),
         serde_json::Value::String(page.title.clone()),
     );
     map.insert("tier".into(), serde_json::Value::String("episodic".into()));
+    stamp_session_origin_map(&mut map, session_id, agent_kind);
     if !page.tags.is_empty() {
         let tags = page
             .tags
@@ -1241,6 +1261,31 @@ fn build_frontmatter(page: &ConsolidatedPage) -> serde_json::Value {
     }
     map.insert("consolidated".into(), serde_json::Value::Bool(true));
     serde_json::Value::Object(map)
+}
+
+fn stamp_session_origin(
+    frontmatter: &mut serde_json::Value,
+    session_id: SessionId,
+    agent_kind: AgentKind,
+) {
+    if let Some(map) = frontmatter.as_object_mut() {
+        stamp_session_origin_map(map, session_id, agent_kind);
+    }
+}
+
+fn stamp_session_origin_map(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    session_id: SessionId,
+    agent_kind: AgentKind,
+) {
+    map.insert(
+        "session_id".into(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    map.insert(
+        "agent".into(),
+        serde_json::Value::String(agent_kind.as_str().into()),
+    );
 }
 
 fn one_line(s: &str) -> String {
@@ -1694,16 +1739,24 @@ mod tests {
             tags: Vec::new(),
             summary: Some("Bounded the queue so backpressure is testable.".into()),
         };
+        let session_id = SessionId::new();
+        let frontmatter = build_frontmatter(&page, session_id, AgentKind::Codex);
         assert_eq!(
-            build_frontmatter(&page)["summary"],
+            frontmatter["summary"],
             "Bounded the queue so backpressure is testable."
         );
+        assert_eq!(frontmatter["session_id"], session_id.to_string());
+        assert_eq!(frontmatter["agent"], "codex");
 
         let unusable = ConsolidatedPage {
             summary: Some("- **session_id:** `9f2c`".into()),
             ..page
         };
-        assert!(build_frontmatter(&unusable).get("summary").is_none());
+        assert!(
+            build_frontmatter(&unusable, SessionId::new(), AgentKind::Codex)
+                .get("summary")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2151,6 +2204,103 @@ mod tests {
         seed_session(store.db_path(), session, ws, proj);
         let wiki = Wiki::new(tmp, store.writer.clone()).unwrap();
         (store, wiki, session, ws, proj)
+    }
+
+    /// Attribution follows the persisted session, not the operator or client
+    /// that happens to request consolidation. Re-running the write supersedes
+    /// the page with the same immutable origin.
+    #[tokio::test]
+    async fn single_page_consolidation_stamps_and_preserves_session_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "title": "Queue decision",
+            "body_markdown": "The queue is bounded.",
+            "tags": [],
+        });
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+
+        for actor in [actor_named("alice"), actor_named("bob")] {
+            Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(ScriptedLlm(response.clone())),
+                ws,
+                proj,
+            )
+            .consolidate_session(session, false, actor, None, None)
+            .await
+            .unwrap();
+
+            let stored = wiki.read_page(ws, proj, &path).unwrap();
+            assert_eq!(stored.frontmatter["session_id"], session.to_string());
+            assert_eq!(
+                stored.frontmatter["agent"], "claude-code",
+                "origin comes from sessions.agent_kind, never the requesting actor"
+            );
+        }
+    }
+
+    /// The multi-page provider path uses the same provenance contract for its
+    /// canonical session anchor, while non-session pages remain outside item 1
+    /// of #494.
+    #[tokio::test]
+    async fn batch_consolidation_stamps_only_the_session_anchor_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let session_path = format!("sessions/{session}.md");
+        let response = serde_json::json!({
+            "rationale": "test provenance",
+            "updates": [
+                {
+                    "path": session_path,
+                    "tier": "episodic",
+                    "kind": "fact",
+                    "title": "Session narrative",
+                    "body_markdown": "Session body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts/queue.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Queue",
+                    "body_markdown": "Concept body.",
+                    "tags": []
+                }
+            ]
+        });
+
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let session_page = wiki
+            .read_page(ws, proj, &PagePath::new(session_path).unwrap())
+            .unwrap();
+        assert_eq!(session_page.frontmatter["session_id"], session.to_string());
+        assert_eq!(session_page.frontmatter["agent"], "claude-code");
+
+        let concept = wiki
+            .read_page(ws, proj, &PagePath::new("concepts/queue.md").unwrap())
+            .unwrap();
+        assert!(concept.frontmatter.get("agent").is_none());
+        assert!(concept.frontmatter.get("session_id").is_none());
     }
 
     /// A batch whose single update targets `path` — the model chooses this

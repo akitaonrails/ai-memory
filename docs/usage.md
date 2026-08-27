@@ -68,6 +68,13 @@ When Claude Code or Codex compact their working context, the
 compaction, the agent can recover the summary via `memory_recent` even
 though its raw chat history was compacted away.
 
+Generated session pages carry `session_id` and `agent` in frontmatter. The
+`agent` value is the originating harness stored on the session (for example,
+`claude-code` or `codex`), not the client or operator that later requested a
+consolidation. Checkpoints and superseding versions therefore keep the same
+origin. Manual `memory_write_page` and `ai-memory write-page` calls do not
+infer an agent.
+
 ## Proactive memory queries
 
 Hooks handle capture without prompting. Proactive querying depends on
