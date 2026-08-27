@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+### Added
+- Generated `sessions/<id>.md` pages now surface the originating harness as
+  `agent` frontmatter alongside `session_id`. The value comes from the
+  persisted session row, so LLM rewrites, compaction checkpoints, spool
+  drains, and superseding versions do not mistake the later writer for the
+  origin; manual page writes remain unattributed. (#494)
 - PowerShell compatibility hooks no longer assign to a local `$home` variable.
   PowerShell names are case-insensitive, so that collided with the automatic
   read-only `$HOME` variable and emitted `VariableNotWritable` for every hook
@@ -18,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.32.2] - 2026-08-26
 
 ### Fixed
+- Made managed routing `SKILL.md` payloads byte-identical across release
+  platforms. Windows builds previously embedded CRLF from the runner checkout
+  while Linux and macOS builds embedded LF, so one tag returned different
+  bytes through CLI installs and `memory_install_self_routing`. The embedded
+  assets now use LF everywhere without rewriting user-authored files. (#502)
 - The native client now trusts CAs from the platform trust store. It was built
   with reqwest's `rustls-tls`, which bundles the Mozilla webpki roots and
   ignores the OS store, so a CA the operator had installed locally — Caddy's
@@ -234,6 +245,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the human and `--json` renderings. Without it the new ingest counters
   read identically whether hooks are broken or a repository simply never opted
   in — the exact ambiguity those counters were added to remove (#428, #446).
+
+### Fixed
+- Prevented stored Markdown from automatically fetching external image URLs
+  when viewed in the web UI, while preserving clickable external links and
+  same-origin relative images (#491).
 
 ### Docs
 - Documented the order of magnitude reported for lifecycle-hook overhead,

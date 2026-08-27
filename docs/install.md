@@ -1752,6 +1752,9 @@ with the slim snippet, leaves unrelated instructions before and after it alone,
 and writes a timestamped `.bak-*` backup before changing an existing file.
 Managed skill files contain an ai-memory ownership marker; same-name user skills
 without that marker are preserved unless you explicitly force replacement.
+Their embedded payloads use LF line endings on every release platform, so CLI
+installs and `memory_install_self_routing` return the same bytes on Windows,
+Linux, and macOS. This does not rewrite line endings in user-authored files.
 `install-instructions --print` previews only the instruction snippet; run
 `install-skills --print` when you want to preview the managed skill payloads.
 

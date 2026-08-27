@@ -258,7 +258,7 @@ fn sanitize_event(event: Event<'_>) -> Event<'_> {
             id,
         }) => Event::Start(Tag::Image {
             link_type,
-            dest_url: safe_url(dest_url),
+            dest_url: safe_image_url(dest_url),
             title,
             id,
         }),
@@ -276,6 +276,29 @@ fn safe_url(url: CowStr<'_>) -> CowStr<'_> {
         || lower.starts_with('#')
         || !lower.contains(':')
     {
+        url
+    } else {
+        CowStr::Boxed("#".into())
+    }
+}
+
+/// Allow images only from the current origin.
+///
+/// Unlike links, images are fetched as soon as untrusted markdown is viewed.
+/// An absolute or network-path URL would therefore disclose the viewer's IP,
+/// user agent, and view timing without a click. Keep ordinary external links
+/// clickable, but neutralise every non-relative image target. Backslashes are
+/// rejected because browsers can interpret them as URL path separators.
+fn safe_image_url(url: CowStr<'_>) -> CowStr<'_> {
+    let trimmed = url.trim_start();
+    let is_network_path = trimmed.starts_with("//")
+        || trimmed.starts_with("\\\\")
+        || trimmed.starts_with("/\\")
+        || trimmed.starts_with("\\/");
+    let is_relative =
+        trimmed.starts_with('/') || trimmed.starts_with('#') || !trimmed.contains(':');
+
+    if !trimmed.is_empty() && is_relative && !is_network_path && !trimmed.contains('\\') {
         url
     } else {
         CowStr::Boxed("#".into())
@@ -386,6 +409,49 @@ mod tests {
         let html = render("[x](javascript:alert(1))", "default", "scratch");
         assert!(html.contains("href=\"#\""));
         assert!(!html.contains("javascript:"));
+    }
+
+    #[test]
+    fn preserves_clickable_external_links() {
+        let html = render("[docs](https://example.com/docs)", "default", "scratch");
+        assert!(html.contains(r#"href="https://example.com/docs""#));
+    }
+
+    #[test]
+    fn neutralises_external_images_without_hiding_alt_text() {
+        for target in [
+            "https://example.invalid/pixel.png",
+            "http://example.invalid/pixel.png",
+            "//example.invalid/pixel.png",
+            r"\\example.invalid\pixel.png",
+            r"/\example.invalid/pixel.png",
+            "data:image/png;base64,AA==",
+        ] {
+            let markdown = format!("![remote pixel]({target})");
+            let html = render(&markdown, "default", "scratch");
+            assert!(html.contains("src=\"#\""), "target {target}: {html}");
+            assert!(
+                html.contains("alt=\"remote pixel\""),
+                "target {target}: {html}"
+            );
+            assert!(!html.contains("example.invalid"), "target {target}: {html}");
+        }
+    }
+
+    #[test]
+    fn preserves_relative_images() {
+        for target in [
+            "images/diagram.png",
+            "../shared/diagram.png",
+            "/static/logo.svg",
+        ] {
+            let markdown = format!("![local]({target})");
+            let html = render(&markdown, "default", "scratch");
+            assert!(
+                html.contains(&format!(r#"src="{target}""#)),
+                "target {target}: {html}"
+            );
+        }
     }
 
     #[test]
