@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 
 use ai_memory_core::{
-    NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
-    looks_like_scaffolding,
+    AgentKind, NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier,
+    WorkspaceId, looks_like_scaffolding,
 };
 use jiff::tz::TimeZone;
 
@@ -27,6 +27,7 @@ pub fn synthesize_session_page(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     session_id: SessionId,
+    agent_kind: AgentKind,
     observations: &[Observation],
 ) -> NewPage {
     // One tally for the whole page: the body renderer and the summary builder
@@ -37,6 +38,10 @@ pub fn synthesize_session_page(
     let mut frontmatter_json = serde_json::json!({
         "title": title,
         "session_id": session_id.to_string(),
+        // Origin, not writer: callers pass the immutable value persisted on
+        // the session row, so checkpoints and later superseding versions keep
+        // naming the harness that produced the session.
+        "agent": agent_kind.as_str(),
         "tier": "episodic",
     });
     let summary = session_summary(&tally);
@@ -504,6 +509,7 @@ mod tests {
             WorkspaceId::new(),
             ProjectId::new(),
             SessionId::new(),
+            AgentKind::Codex,
             &lifecycle_only,
         );
         assert!(page.frontmatter_json.get("summary").is_none());
@@ -529,8 +535,10 @@ mod tests {
             WorkspaceId::new(),
             ProjectId::new(),
             SessionId::new(),
+            AgentKind::Codex,
             &observations,
         );
+        assert_eq!(page.frontmatter_json["agent"], "codex");
         assert_eq!(
             page.frontmatter_json["summary"],
             serde_json::json!("1 prompt, 1 completed tool call across Bash, over 5m.")
@@ -722,6 +730,7 @@ mod tests {
             WorkspaceId::new(),
             ProjectId::new(),
             SessionId::new(),
+            AgentKind::Codex,
             &observations,
         );
         assert!(page.title.contains("build the thing"));
@@ -744,6 +753,7 @@ mod tests {
             WorkspaceId::new(),
             ProjectId::new(),
             SessionId::new(),
+            AgentKind::Codex,
             &observations,
         );
         assert!(page.body.contains("`Bash`: 1"));
@@ -759,6 +769,7 @@ mod tests {
             WorkspaceId::new(),
             ProjectId::new(),
             SessionId::new(),
+            AgentKind::Codex,
             &[custom],
         );
 
@@ -775,6 +786,7 @@ mod tests {
             WorkspaceId::new(),
             ProjectId::new(),
             SessionId::new(),
+            AgentKind::Codex,
             &observations,
         );
 
@@ -794,6 +806,7 @@ mod tests {
             WorkspaceId::new(),
             ProjectId::new(),
             SessionId::new(),
+            AgentKind::Codex,
             &observations,
         );
 

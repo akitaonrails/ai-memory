@@ -2630,6 +2630,7 @@ async fn process_authorized(
             session_id,
             ws,
             proj,
+            admitted.agent_kind(),
             checkpoint_label,
             session_actor.clone(),
         )
@@ -2680,7 +2681,8 @@ async fn process_authorized(
                 }
             }
         }
-        let new_page = synthesize_session_page(ws, proj, session_id, &observations);
+        let new_page =
+            synthesize_session_page(ws, proj, session_id, admitted.agent_kind(), &observations);
         let page_id = state
             .wiki
             .write_page(ai_memory_wiki::WritePageRequest {
@@ -3138,6 +3140,7 @@ async fn consolidate_or_synth(
     session_id: SessionId,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    agent_kind: AgentKind,
     checkpoint_label: &str,
     actor: ai_memory_core::ActorContext,
 ) -> anyhow::Result<()> {
@@ -3194,7 +3197,13 @@ async fn consolidate_or_synth(
     if observations.is_empty() {
         return Ok(());
     }
-    let new_page = synthesize_session_page(workspace_id, project_id, session_id, &observations);
+    let new_page = synthesize_session_page(
+        workspace_id,
+        project_id,
+        session_id,
+        agent_kind,
+        &observations,
+    );
     state
         .wiki
         .write_page(ai_memory_wiki::WritePageRequest {
@@ -3433,6 +3442,7 @@ mod tests {
             session_id,
             state.workspace_id,
             state.project_id,
+            AgentKind::ClaudeCode,
             "pre-compact",
             ai_memory_core::ActorContext::anonymous(),
         )
@@ -3515,6 +3525,7 @@ mod tests {
             session_id,
             state.workspace_id,
             state.project_id,
+            AgentKind::ClaudeCode,
             "pre-compact",
             ai_memory_core::ActorContext::anonymous(),
         )
@@ -3551,6 +3562,7 @@ mod tests {
             session_id,
             state.workspace_id,
             state.project_id,
+            AgentKind::ClaudeCode,
             "pre-compact",
             ai_memory_core::ActorContext::anonymous(),
         )
@@ -9077,7 +9089,13 @@ mod tests {
             .observations_for_session(session_id)
             .await
             .unwrap();
-        let page = synthesize_session_page(workspace_id, project_id, session_id, &observations);
+        let page = synthesize_session_page(
+            workspace_id,
+            project_id,
+            session_id,
+            AgentKind::Codex,
+            &observations,
+        );
         let page_id = state
             .wiki
             .write_page(ai_memory_wiki::WritePageRequest {
