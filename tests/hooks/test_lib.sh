@@ -144,6 +144,11 @@ PS_ANTIGRAVITY_STATIC=$(grep -q 'function Test-AiMemoryAntigravityInitialInvocat
     && printf 'ok' || printf 'missing')
 assert_eq "powershell antigravity hook has invocation guard" "ok" "$PS_ANTIGRAVITY_STATIC"
 
+PS_HOME_STATIC=$(grep -Fq '$userHome = if ($env:HOME)' hooks/lib/ai-memory-hook.ps1 \
+    && ! grep -Eq '\$home[[:space:]]*=' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell marker helper avoids read-only HOME" "ok" "$PS_HOME_STATIC"
+
 # --- json_string -------------------------------------------------------
 JSON_INPUT='quoted "thing" \ path
 next line'

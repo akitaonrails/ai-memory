@@ -39,16 +39,16 @@ function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
     $dir = $Cwd
-    $home = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    $userHome = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
     $boundary = $null
-    if ($home) {
-        $homePrefix = $home.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
-        $insideHome = ($dir -eq $home) -or $dir.StartsWith(
-            $homePrefix,
+    if ($userHome) {
+        $userHomePrefix = $userHome.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
+        $insideHome = ($dir -eq $userHome) -or $dir.StartsWith(
+            $userHomePrefix,
             [StringComparison]::OrdinalIgnoreCase
         )
         if ($insideHome) {
-            $boundary = $home
+            $boundary = $userHome
         } else {
             $probe = $dir
             while ($probe -and (Test-Path $probe)) {
