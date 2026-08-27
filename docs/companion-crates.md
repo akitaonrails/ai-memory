@@ -73,6 +73,10 @@ every source format and migration workflow.
 Initial source support is intentionally narrow:
 
 - oh-my-claudecode / OMC flat markdown wiki directories.
+- generic external-conversation JSON envelopes (`project`, `source`,
+  `session_id`, and bounded `role`/`content` messages), replayed through the
+  public ordered hook-batch surface. Product-specific export adapters remain
+  outside this repository.
 
 Future sources can include:
 
@@ -151,6 +155,10 @@ Re-home by kind:
   preservation in companion imports.
 - Carry idempotency keys or source fingerprints in companion-side state so failed
   imports can be resumed safely.
+- Validate and sanitize a complete external-conversation envelope before the
+  first HTTP request; use a stable imported session identity and per-event
+  idempotency keys, and send the dedicated `external-import` wire identity
+  rather than impersonating a live coding harness.
 - Surface all destructive actions in dry-run output before live mode.
 - Treat non-overwrite checks as best-effort unless/until core exposes a generic
   compare-and-write seam; companion v1 re-checks before each write but cannot make

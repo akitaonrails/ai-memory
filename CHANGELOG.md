@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The standalone `ai-memory-importer` companion can now replay bounded generic
+  external-conversation JSON into the existing observation/consolidation
+  pipeline. It is dry-run by default; `--apply` sends one ordered `/hook/batch`
+  with the dedicated `external-import` wire identity (stored in core's closed
+  `other` bucket), with extension provenance for assistant and system messages.
+  Full-envelope validation, client-side credential redaction,
+  stable session/event idempotency keys, event/byte caps, and a durable partial
+  failure manifest make interrupted imports safely resumable. Product-specific
+  ChatGPT/Claude export adapters and watch folders remain out of tree. (#483)
+
 ## [1.32.2] - 2026-08-26
 
 ### Fixed
