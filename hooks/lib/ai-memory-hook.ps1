@@ -324,6 +324,7 @@ function Invoke-AiMemoryHook {
         $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
     }
 
+    $BodyBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
     try {
         Invoke-WebRequest `
             -UseBasicParsing `
@@ -331,8 +332,8 @@ function Invoke-AiMemoryHook {
             -Method Post `
             -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
             -Headers $Headers `
-            -ContentType "application/json" `
-            -Body $Payload | Out-Null
+            -ContentType "application/json; charset=utf-8" `
+            -Body $BodyBytes | Out-Null
     } catch {
     }
     if ($Agent -eq "devin" -and $Event -eq "session-end") {

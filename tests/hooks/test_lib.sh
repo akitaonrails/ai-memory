@@ -144,6 +144,12 @@ PS_ANTIGRAVITY_STATIC=$(grep -q 'function Test-AiMemoryAntigravityInitialInvocat
     && printf 'ok' || printf 'missing')
 assert_eq "powershell antigravity hook has invocation guard" "ok" "$PS_ANTIGRAVITY_STATIC"
 
+PS_UTF8_STATIC=$(grep -Fq '$BodyBytes = [Text.Encoding]::UTF8.GetBytes($Payload)' hooks/lib/ai-memory-hook.ps1 \
+    && grep -Fq 'application/json; charset=utf-8' hooks/lib/ai-memory-hook.ps1 \
+    && grep -Fq -- '-Body $BodyBytes' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell hook posts explicit UTF-8 JSON bytes" "ok" "$PS_UTF8_STATIC"
+
 # --- json_string -------------------------------------------------------
 JSON_INPUT='quoted "thing" \ path
 next line'
