@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ScheduledAutoImproveSettings,
-    run_auto_improve_scheduler_tick, run_embedding_backfill, run_lint, run_sweep_with_breadth,
+    AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
+    ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
+    run_lint, run_sweep_with_options,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -17,7 +18,7 @@ use ai_memory_hooks::{
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
 use ai_memory_mcp::{
-    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_decay_breadth,
+    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
 };
 use ai_memory_store::{ReaderPool, Store, WriterHandle};
 use ai_memory_web::{WebMountSpec, mount_web_router, normalize_prefix, web_base_href};
@@ -525,6 +526,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_wiki(wiki.clone())
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
+        .with_observation_retention(config.decay.observation_retention())
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
@@ -687,7 +689,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 sanitizer: sanitizer.clone(),
                 data_dir: config.data_dir.clone(),
             });
-            let admin = admin_router_with_decay_breadth(
+            let admin = admin_router_with_sweep_tuning(
                 AdminState {
                     ingest_metrics: ingest_metrics.clone(),
                     writer: store.writer.clone(),
@@ -717,6 +719,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 },
                 config.decay.breadth_weight,
+                config.decay.observation_retention(),
             );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -966,6 +969,7 @@ async fn start_maintenance_scheduler(
                             &wiki,
                             &decay.decay_params(),
                             decay.breadth_weight,
+                            decay.observation_retention(),
                         )
                         .await?;
                         if outcome.errors > 0 {
@@ -980,6 +984,7 @@ async fn start_maintenance_scheduler(
                             evicted = outcome.evicted,
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
+                            observations_pruned = outcome.observations_pruned,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
                             "scheduled forget sweep completed"
@@ -1195,6 +1200,7 @@ struct ScheduledSweepTickOutcome {
     evicted: usize,
     expired: usize,
     hard_deleted: usize,
+    observations_pruned: usize,
     errors: usize,
 }
 
@@ -1204,6 +1210,7 @@ async fn run_scheduled_sweep_tick(
     wiki: &Wiki,
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
+    retention: ObservationRetention,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1212,7 +1219,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep_with_breadth(
+        match run_sweep_with_options(
             reader,
             writer,
             Some(wiki),
@@ -1220,6 +1227,7 @@ async fn run_scheduled_sweep_tick(
             scope.project_id,
             decay,
             breadth_weight,
+            retention,
             false,
         )
         .await
@@ -1229,6 +1237,7 @@ async fn run_scheduled_sweep_tick(
                 outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
+                outcome.observations_pruned += report.observations_pruned;
             }
             Err(e) => {
                 outcome.errors += 1;
@@ -2521,9 +2530,16 @@ mod tests {
             cold_threshold: 2.0,
             ..ai_memory_store::DecayParams::default()
         };
-        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &wiki, &decay, 0.0)
-            .await
-            .unwrap();
+        let outcome = run_scheduled_sweep_tick(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &decay,
+            0.0,
+            ObservationRetention::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.scopes, 2);
         assert_eq!(outcome.errors, 0);

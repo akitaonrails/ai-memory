@@ -64,7 +64,10 @@ pub use embed::{
     EmbedBackfillCounts, EmbedBackfillError, EmbedBackfillOptions, run_embedding_backfill,
 };
 pub use lint::{LintError, LintFinding, LintOptions, LintReport, run_lint, stale_days_for};
-pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep, run_sweep_with_breadth};
+pub use sweep::{
+    DEFAULT_OBSERVATION_PRUNE_BATCH, EvictedPage, ObservationRetention, SweepError, SweepReport,
+    run_sweep, run_sweep_with_breadth, run_sweep_with_options,
+};
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,
     SlotKind,

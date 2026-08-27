@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Bounded raw-observation retention as an opt-in fourth pass of the M8 forget
+  sweep, disabled by default. Nothing in the tree could delete an `observations`
+  row for age: the sweep acts on pages only, so raw capture grew without limit.
+  Measured on a three-month-old install, `observations` plus its FTS shadow and
+  four indexes were ~5.4 GB of a 5.53 GB store (5,236,232 rows), against 0.03 GB
+  of `pages` — the 2,365 compiled pages that hold the durable value. The nightly
+  backup tarball was 2.7 GB, almost all of it capture already distilled into
+  30 MB of Markdown. `decay.observation_retention_days` (default `0` = disabled)
+  now lets an operator bound that, and `decay.observation_prune_batch` (default
+  `5000`) bounds each transaction. (#508)
+
+  The pass deletes an observation only when its session was already consolidated
+  into a summary page that is still live, and the row is older than the
+  configured age. That is three gates on columns the schema already maintains:
+  `sessions.summary_page_id` is written only by the session-end path, so it
+  already implies `ended_at IS NOT NULL`; `pages.superseded_at IS NULL` excludes
+  a session whose page decay has evicted, because that session's raw rows are
+  now the only surviving copy; and a hard-deleted page has already NULLed the
+  pointer through `ON DELETE SET NULL`, so the join finds nothing. The prune
+  therefore runs LAST, after this same run's evictions and hard-deletes, rather
+  than letting raw capture outlive its distillation by one sweep. A session with
+  no `sessions` row, or one still running, matches nothing and can never lose a
+  row.
+
+  Each batch is one transaction sent as its own message to the single-writer
+  actor, so every other pending write interleaves between batches and a
+  multi-million row prune never holds the write lock across the run. Measured on
+  a 300,000-row store built from the shipped migrations: ~23-27 ms per 5,000-row
+  batch including the FTS trigger work, plus ~2-4 ms to commit. The session-end
+  observation watermark (`sessions.ended_observation_count`) is repaired in the
+  same transaction and only downward, so a resumed session's genuinely new work
+  is still read as new work instead of `AlreadyEnded`. One `prune_observations`
+  audit row is written per batch that actually deleted, inside that batch's
+  transaction. Zero migrations: every access is an index seek on
+  `idx_observations_project_created` and `idx_observations_session`, both of
+  which predate this change.
+
+  The cost is stated rather than hidden: for a pruned session the raw transcript
+  view returns empty, `raw_hits` can no longer match the exact original wording,
+  a manual auto-improve rerun rejects with `too_few_observations`, and a
+  `move_session` with `PagesMode::Regenerate` has nothing left to rebuild the
+  page from. All of it is reachable only by setting a positive age. Note that
+  SQLite does not return freed pages to the OS without `VACUUM`, so the `.db`
+  file will not shrink after the first prune — the `ai-memory backup` tarball
+  will, because it is a fresh online copy.
+
 ## [1.32.2] - 2026-08-26
 
 ### Fixed

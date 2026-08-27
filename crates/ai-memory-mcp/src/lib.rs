@@ -16,5 +16,6 @@ mod server;
 pub use actor::actor_from_headers;
 pub use admin::{
     AdminState, ScopeInvalidation, ScopeInvalidator, admin_router, admin_router_with_decay_breadth,
+    admin_router_with_sweep_tuning,
 };
 pub use server::{AiMemoryServer, MEMORY_INSTRUCTIONS};

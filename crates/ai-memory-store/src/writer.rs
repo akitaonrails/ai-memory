@@ -26,8 +26,8 @@ use crate::auto_improve::{
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
     self, AdmittedSession, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary, PagesMode,
-    PurgeSummary, ReorgSummary,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary,
+    ObservationPruneOutcome, PagesMode, PurgeSummary, ReorgSummary,
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
@@ -245,6 +245,13 @@ pub(crate) enum WriteCmd {
         expected_latest_id: Option<PageId>,
         cutoff_us: i64,
         reply: oneshot::Sender<StoreResult<usize>>,
+    },
+    PruneConsolidatedObservations {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+        batch: usize,
+        reply: oneshot::Sender<StoreResult<ObservationPruneOutcome>>,
     },
     HealCatchAllRepoPaths {
         home: Option<String>,
@@ -1130,6 +1137,35 @@ impl WriterHandle {
             tombstone_id,
             expected_latest_id,
             cutoff_us,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete one bounded batch of raw observations whose session was already
+    /// consolidated into a live summary page, repairing the session end
+    /// watermark in the same transaction.
+    ///
+    /// One batch is one transaction and one mailbox message, so a multi-million
+    /// row prune never holds the write lock across the whole run — every other
+    /// pending write interleaves between batches.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn prune_consolidated_observations(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+        batch: usize,
+    ) -> StoreResult<ObservationPruneOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PruneConsolidatedObservations {
+            workspace_id,
+            project_id,
+            cutoff_us,
+            batch,
             reply: tx,
         })
         .await?;
@@ -2096,6 +2132,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     cutoff_us,
                 );
                 send_or_warn(reply, result, "hard_delete_decayed_page_chain");
+            }
+            WriteCmd::PruneConsolidatedObservations {
+                workspace_id,
+                project_id,
+                cutoff_us,
+                batch,
+                reply,
+            } => {
+                let result = ops::prune_consolidated_observations(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    cutoff_us,
+                    batch,
+                );
+                send_or_warn(reply, result, "prune_consolidated_observations");
             }
             WriteCmd::HealCatchAllRepoPaths { home, reply } => {
                 let result = ops::heal_catch_all_repo_paths(&mut conn, home.as_deref());

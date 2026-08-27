@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, projection::cap_text_with_marker,
-    run_auto_improve_review, run_lint, run_sweep_with_breadth,
+    AutoImproveReviewConfig, Consolidator, ObservationRetention, projection::cap_text_with_marker,
+    run_auto_improve_review, run_lint, run_sweep_with_options,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -381,6 +381,9 @@ pub struct AiMemoryServer {
     decay_params: DecayParams,
     /// Optional distinct-reader reinforcement coefficient.
     decay_breadth_weight: f64,
+    /// Opt-in bound on how long raw observations outlive their consolidation.
+    /// Default is disabled, so `memory_forget_sweep` deletes no raw capture.
+    observation_retention: ObservationRetention,
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
@@ -1258,6 +1261,7 @@ impl AiMemoryServer {
             wiki: None,
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
+            observation_retention: ObservationRetention::default(),
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
@@ -1767,6 +1771,14 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_decay_breadth_weight(mut self, breadth_weight: f64) -> Self {
         self.decay_breadth_weight = breadth_weight;
+        self
+    }
+
+    /// Set the opt-in observation prune bound used by `memory_forget_sweep`.
+    /// Unset, the sweep never deletes a raw observation.
+    #[must_use]
+    pub fn with_observation_retention(mut self, retention: ObservationRetention) -> Self {
+        self.observation_retention = retention;
         self
     }
 
@@ -2375,7 +2387,7 @@ impl AiMemoryServer {
     }
 
     /// Run the M8 forget sweep over episodic pages.
-    #[tool(description = "Run the retention sweep. THREE passes, and they \
+    #[tool(description = "Run the retention sweep. FOUR passes, and they \
         differ on what they will delete. (1) TTL: pages whose frontmatter \
         expires_at is in the past are hard-deleted (file + rows) REGARDLESS \
         OF TIER OR PIN — an explicit expiry overrides a pin, so a pinned \
@@ -2386,8 +2398,15 @@ impl AiMemoryServer {
         evicted to a tombstone; only this pass exempts semantic / procedural \
         / pinned pages. (3) Hard-delete: tombstones older than \
         hard_delete_after_days and their supersession ancestry are removed \
-        permanently. The report's expired / hard_deleted counts come from \
-        passes 1 and 3. Pass dry_run=true to preview.")]
+        permanently. (4) Observation prune: raw observations older than \
+        decay.observation_retention_days are deleted permanently, in bounded \
+        batches, but ONLY for sessions already consolidated into a summary \
+        page that is still live — an unconsolidated session, or one whose \
+        page pass 2 or 3 just removed, keeps every row. This pass is DISABLED \
+        by default (observation_retention_days = 0) and deletes nothing until \
+        an operator opts in; when off, observations_pruned is 0. The report's \
+        expired / hard_deleted / observations_pruned counts come from passes \
+        1, 3 and 4. Pass dry_run=true to preview.")]
     async fn memory_forget_sweep(
         &self,
         Parameters(args): Parameters<SweepArgs>,
@@ -2405,7 +2424,7 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
-        let report = run_sweep_with_breadth(
+        let report = run_sweep_with_options(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
@@ -2413,6 +2432,7 @@ impl AiMemoryServer {
             proj,
             &self.decay_params,
             self.decay_breadth_weight,
+            self.observation_retention,
             args.dry_run.unwrap_or(false),
         )
         .await
@@ -5953,7 +5973,7 @@ mod tests {
 
     /// `memory_forget_sweep` is admin-gated and destructive, and the surface
     /// an agent reads is the only place it can learn what the tool will
-    /// delete. Both surfaces must name all three passes and must not claim a
+    /// delete. Both surfaces must name all four passes and must not claim a
     /// blanket pin exemption.
     ///
     /// The description previously said "Semantic / procedural / pinned pages
@@ -5996,6 +6016,28 @@ mod tests {
         assert!(
             desc.contains("hard_delete_after_days"),
             "description must name the hard-delete pass; got: {desc}"
+        );
+        // The fourth pass deletes raw capture, not pages, and can remove
+        // millions of rows on a real install. An agent that cannot read it
+        // here cannot know the tool touches observations at all — which is the
+        // exact regression this test was written to stop.
+        assert!(
+            desc.contains("observation_retention_days"),
+            "description must name the observation prune pass; got: {desc}"
+        );
+        assert!(
+            desc.contains("consolidated") && desc.contains("still live"),
+            "description must state that only consolidated sessions with a live \
+             page are pruned; got: {desc}"
+        );
+        assert!(
+            desc.contains("DISABLED"),
+            "description must state that observation pruning is off by default; \
+             got: {desc}"
+        );
+        assert!(
+            !desc.contains("THREE passes"),
+            "the three-pass wording must not come back now there are four; got: {desc}"
         );
         // A bare unqualified exemption sentence is exactly the regression
         // this guards, so reject the old wording verbatim.
