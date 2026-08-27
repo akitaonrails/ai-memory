@@ -149,6 +149,10 @@ PS_UTF8_STATIC=$(grep -Fq '$BodyBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
     && grep -Fq -- '-Body $BodyBytes' hooks/lib/ai-memory-hook.ps1 \
     && printf 'ok' || printf 'missing')
 assert_eq "powershell hook posts explicit UTF-8 JSON bytes" "ok" "$PS_UTF8_STATIC"
+PS_HOME_STATIC=$(grep -Fq '$userHome = if ($env:HOME)' hooks/lib/ai-memory-hook.ps1 \
+    && ! grep -Eq '\$home[[:space:]]*=' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell marker helper avoids read-only HOME" "ok" "$PS_HOME_STATIC"
 
 # --- json_string -------------------------------------------------------
 JSON_INPUT='quoted "thing" \ path

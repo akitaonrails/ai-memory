@@ -7,13 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
 ### Added
 - Generated `sessions/<id>.md` pages now surface the originating harness as
   `agent` frontmatter alongside `session_id`. The value comes from the
   persisted session row, so LLM rewrites, compaction checkpoints, spool
   drains, and superseding versions do not mistake the later writer for the
   origin; manual page writes remain unattributed. (#494)
+
+### Fixed
+- Made managed routing `SKILL.md` payloads byte-identical across release
+  platforms. Windows builds previously embedded CRLF from the runner checkout
+  while Linux and macOS builds embedded LF, so one tag returned different
+  bytes through CLI installs and `memory_install_self_routing`. The embedded
+  assets now use LF everywhere without rewriting user-authored files. (#502)
+- PowerShell compatibility hooks no longer assign to a local `$home` variable.
+  PowerShell names are case-insensitive, so that collided with the automatic
+  read-only `$HOME` variable and emitted `VariableNotWritable` for every hook
+  payload carrying a cwd. The marker-boundary helper now uses `$userHome`, with
+  native Windows and static shell regressions covering the error stream and
+  reserved-name contract (#498).
 - PowerShell compatibility hooks now encode JSON request bodies as explicit
   UTF-8 bytes and declare `charset=utf-8`. Windows PowerShell 5.1 otherwise
   encoded string bodies using a host-dependent legacy code page, so prompts,
@@ -25,11 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.32.2] - 2026-08-26
 
 ### Fixed
-- Made managed routing `SKILL.md` payloads byte-identical across release
-  platforms. Windows builds previously embedded CRLF from the runner checkout
-  while Linux and macOS builds embedded LF, so one tag returned different
-  bytes through CLI installs and `memory_install_self_routing`. The embedded
-  assets now use LF everywhere without rewriting user-authored files. (#502)
 - The native client now trusts CAs from the platform trust store. It was built
   with reqwest's `rustls-tls`, which bundles the Mozilla webpki roots and
   ignores the OS store, so a CA the operator had installed locally — Caddy's
@@ -42,7 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Switched to `rustls-tls-native-roots`; the runtime image installs
   `ca-certificates`, so the server path keeps a populated store. Reported by
   @alanmatiasdev (#492).
-
 - Made `hook-drain` say what a pass actually did. The drain already returned
   `sent`/`remaining`/`dropped` counts and `run_drain` discarded all three, so
   three passes that mean opposite things — everything delivered, every queued
@@ -78,8 +84,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   327 keeping a real title. `looks_like_scaffolding` is re-exported from
   `ai-memory-core`, so its narrowing is a public-API behaviour change even
   though `derive_title` is its only caller in tree. (#484)
-
-### Docs
 - Documented why registering ai-memory through Kimi Code's own
   `kimi mcp add` breaks every model turn: that command writes the plain
   `/mcp` URL with no `?flavor=moonshot`, so Moonshot rejects
