@@ -143,6 +143,23 @@ pub struct StoredManagedRunStatus {
     pub state: String,
 }
 
+/// Checkout-local workstream metadata used by read-only discovery surfaces.
+#[derive(Debug, Clone)]
+pub struct StoredWorkstreamSummary {
+    /// Stable workstream identifier.
+    pub workstream_id: WorkstreamId,
+    /// Human-readable workstream name.
+    pub name: String,
+    /// Creation timestamp in microseconds since the Unix epoch.
+    pub created_at: i64,
+    /// Most recent selection or import timestamp in microseconds.
+    pub last_active_at: i64,
+    /// Whether this is the checkout's most recently selected workstream.
+    pub current: bool,
+    /// Harnesses with a current native session, newest link first.
+    pub linked_harnesses: Vec<AgentKind>,
+}
+
 struct FinishRunRow {
     workstream: Vec<u8>,
     agent_wire: String,
@@ -323,7 +340,7 @@ fn select_workstream(
                     "SELECT id, name FROM workstreams \
                      WHERE workspace_id = ?1 AND project_id = ?2 \
                        AND repo_fingerprint = ?3 AND worktree_fingerprint = ?4 \
-                     ORDER BY selected_at DESC LIMIT 1",
+                     ORDER BY selected_at DESC, id DESC LIMIT 1",
                     params![
                         input.workspace_id.as_bytes(),
                         input.project_id.as_bytes(),
@@ -781,6 +798,85 @@ pub(crate) fn run_status(
         },
     )
     .transpose()
+}
+
+/// List recent workstreams selectable from one exact repository/worktree.
+pub(crate) fn list_recent(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    repo_fingerprint: &str,
+    worktree_fingerprint: &str,
+    limit: usize,
+) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+    let limit = i64::try_from(limit.clamp(1, 100)).unwrap_or(100);
+    let mut statement = conn.prepare(
+        "WITH scoped AS ( \
+             SELECT id, name, created_at, selected_at, updated_at \
+             FROM workstreams \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND repo_fingerprint = ?3 AND worktree_fingerprint = ?4 \
+         ), current_workstream AS ( \
+             SELECT id FROM scoped ORDER BY selected_at DESC, id DESC LIMIT 1 \
+         ), recent AS ( \
+             SELECT scoped.id, scoped.name, scoped.created_at, scoped.updated_at, \
+                    EXISTS(SELECT 1 FROM current_workstream \
+                           WHERE current_workstream.id = scoped.id) AS is_current \
+             FROM scoped \
+              ORDER BY is_current DESC, scoped.updated_at DESC, scoped.id DESC LIMIT ?5 \
+         ) \
+         SELECT recent.id, recent.name, recent.created_at, recent.updated_at, \
+                recent.is_current, native.agent_kind \
+         FROM recent \
+         LEFT JOIN workstream_native_sessions native \
+           ON native.workstream_id = recent.id AND native.is_current = 1 \
+          ORDER BY recent.is_current DESC, recent.updated_at DESC, recent.id DESC, \
+                  native.updated_at DESC, native.agent_kind ASC",
+    )?;
+    let rows = statement.query_map(
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            repo_fingerprint,
+            worktree_fingerprint,
+            limit,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        },
+    )?;
+
+    let mut summaries: Vec<StoredWorkstreamSummary> = Vec::new();
+    for row in rows {
+        let (raw_id, name, created_at, last_active_at, current, agent) = row?;
+        let workstream_id = WorkstreamId::from_slice(&raw_id)?;
+        let is_new = summaries
+            .last()
+            .is_none_or(|summary| summary.workstream_id != workstream_id);
+        if is_new {
+            summaries.push(StoredWorkstreamSummary {
+                workstream_id,
+                name,
+                created_at,
+                last_active_at,
+                current,
+                linked_harnesses: Vec::new(),
+            });
+        }
+        if let Some(agent) = agent
+            && let Some(summary) = summaries.last_mut()
+        {
+            summary.linked_harnesses.push(AgentKind::from_wire(&agent));
+        }
+    }
+    Ok(summaries)
 }
 
 /// Reader-side context range assigned to one managed run.

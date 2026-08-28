@@ -58,6 +58,7 @@ pub mod status;
 pub mod uninstall;
 pub mod user;
 pub mod workstream_search;
+pub mod workstreams;
 pub mod write_page;
 
 /// Resolve the effective `(workspace, project)` pair for a client command.

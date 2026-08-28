@@ -1177,6 +1177,73 @@ mapfile -t adoption_claude_argv <"$TMP/adoption-claude-argv.log"
   exit 1
 }
 
+# `ai-memory workstreams` must answer from the same checkout identity `run`
+# selects with, without turning that identity into readable output. The list is
+# taken from the repository the previous legs launched in, so `edge-adopt` --
+# the workstream the Claude adoption leg selected last -- has to lead it.
+workstreams_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams --json)
+jq -e '(type == "array") and (length > 1)' <<<"$workstreams_json" >/dev/null || {
+  printf 'workstreams did not list this checkout\n' >&2
+  printf '%s\n' "$workstreams_json" >&2
+  exit 1
+}
+jq -e '[.[] | select(.current)] | length == 1' <<<"$workstreams_json" >/dev/null || {
+  printf 'workstreams did not mark exactly one current selection\n' >&2
+  printf '%s\n' "$workstreams_json" >&2
+  exit 1
+}
+jq -e '.[0].current and .[0].name == "edge-adopt"' <<<"$workstreams_json" >/dev/null || {
+  printf 'workstreams did not lead with the checkout current workstream\n' >&2
+  printf '%s\n' "$workstreams_json" >&2
+  exit 1
+}
+jq -e --arg name edge-kimi \
+  '[.[] | select(.name == $name and (.linked_harnesses | index("kimi-code")))] | length == 1' \
+  <<<"$workstreams_json" >/dev/null || {
+  printf 'workstreams did not report the harnesses linked to edge-kimi\n' >&2
+  printf '%s\n' "$workstreams_json" >&2
+  exit 1
+}
+# Discovery is a read of workstream metadata only: the checkout path, its
+# fingerprints, and native session ids must never travel back to the client.
+for leaked in "$REPO" "$kimi_session_id" adoption-codex-id; do
+  ! grep -qF -- "$leaked" <<<"$workstreams_json" || {
+    printf 'workstreams leaked private checkout or native session data: %s\n' \
+      "$leaked" >&2
+    exit 1
+  }
+done
+limited_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams --limit 1 --json)
+jq -e 'length == 1 and .[0].current' <<<"$limited_json" >/dev/null || {
+  printf 'workstreams --limit did not keep the current selection\n' >&2
+  printf '%s\n' "$limited_json" >&2
+  exit 1
+}
+workstreams_human=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams)
+grep -q '^\* edge-adopt' <<<"$workstreams_human" || {
+  printf 'human workstreams output did not mark the current selection\n' >&2
+  printf '%s\n' "$workstreams_human" >&2
+  exit 1
+}
+
+# A different worktree of the same project shares the workspace and project
+# names but must not inherit the first checkout list.
+OTHER_REPO="$TMP/repo-elsewhere"
+mkdir -p "$OTHER_REPO"
+git -C "$OTHER_REPO" init -q
+git -C "$OTHER_REPO" config user.name "ai-memory acceptance"
+git -C "$OTHER_REPO" config user.email "acceptance@localhost"
+printf '# elsewhere\n' >"$OTHER_REPO/README.md"
+git -C "$OTHER_REPO" add README.md
+git -C "$OTHER_REPO" commit -qm "acceptance fixture"
+other_json=$(cd "$OTHER_REPO" && "$BIN" --data-dir "$DATA" workstreams \
+  --project "$(basename "$REPO")" --json)
+jq -e 'length == 0' <<<"$other_json" >/dev/null || {
+  printf 'workstreams returned another checkout workstreams\n' >&2
+  printf '%s\n' "$other_json" >&2
+  exit 1
+}
+
 if [ "$DETERMINISTIC_ONLY" = 1 ]; then
   printf 'deterministic managed-workstream acceptance passed\n'
   exit 0
