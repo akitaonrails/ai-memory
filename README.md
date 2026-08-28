@@ -1007,9 +1007,12 @@ Embeddings are optional and separate from the LLM provider. Set
 graph-neighbor retrieval. `openai-compat` targets self-hosted engines
 (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
-`AI_MEMORY_EMBEDDING_DIM`. Both the FTS-only and hybrid paths apply the same
-bounded page-authority adjustment after candidate generation; embeddings
-improve relevance recall but do not decide which source is canonical.
+`AI_MEMORY_EMBEDDING_DIM`. The optional `EMBEDDING_API_KEY` credentials the
+embedder alone and is checked before `OPENAI_API_KEY` and `LLM_API_KEY`, so
+embeddings can run on a different provider than the LLM. Both the FTS-only and
+hybrid paths apply the same bounded page-authority adjustment after candidate
+generation; embeddings improve relevance recall but do not decide which source
+is canonical.
 
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter examples, and

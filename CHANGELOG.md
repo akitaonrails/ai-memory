@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `EMBEDDING_API_KEY`, an optional embedding-only credential resolved ahead of
+  `OPENAI_API_KEY` and `LLM_API_KEY`. Embeddings are already independently
+  configurable — `AI_MEMORY_EMBEDDING_PROVIDER`, `_MODEL`, `_DIM` and
+  `_BASE_URL` each have their own setting — but there was no key to go with
+  them, so pointing `AI_MEMORY_EMBEDDING_BASE_URL` at a second provider sent it
+  whichever credential the chat model happened to use. `openai_embedding_api_key`
+  returned `OPENAI_API_KEY` before the base-URL check ran, and the `LLM_API_KEY`
+  fallback only fired when `OPENAI_API_KEY` was absent — which also takes the
+  `openai` chat provider down, since it reads that same variable. `voyage` and
+  `google`/`gemini` were unaffected: they already name their own key.
+  Scoped to the two embedders that borrowed another role's key. `openai` now
+  resolves `EMBEDDING_API_KEY` → `OPENAI_API_KEY` → `LLM_API_KEY` (the last still
+  only with a custom base URL); `openai-compat` resolves `EMBEDDING_API_KEY` →
+  `LLM_API_KEY` and stays keyless when neither is set. With the new variable
+  absent, resolution is byte-identical to before. Both `NotConfigured` messages
+  name it, since that error is where an operator hits the missing-key path.
+  Unprefixed to match the other credentials read from the process environment
+  (`LLM_API_KEY`, `OPENAI_API_KEY`, `VOYAGE_API_KEY`). (#514)
 - Generated `sessions/<id>.md` pages now surface the originating harness as
   `agent` frontmatter alongside `session_id`. The value comes from the
   persisted session row, so LLM rewrites, compaction checkpoints, spool

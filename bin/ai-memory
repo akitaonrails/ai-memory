@@ -498,6 +498,7 @@ for var in \
   COPILOT_API_URL \
   VOYAGE_API_KEY \
   LLM_API_KEY \
+  EMBEDDING_API_KEY \
   RUST_LOG
 do
   if [ -n "${!var:-}" ]; then

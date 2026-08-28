@@ -578,12 +578,23 @@ AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI), 1024 (Voyage), 768 (Google);
 OPENAI_API_KEY / VOYAGE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
 LLM_API_KEY                    accepted for openai with a custom base URL and as
                                optional bearer auth for openai-compat
+EMBEDDING_API_KEY              optional embedding-only key; checked before
+                               OPENAI_API_KEY and LLM_API_KEY for the openai and
+                               openai-compat embedders
 ```
+
+`EMBEDDING_API_KEY` credentials the embedding role alone, so the embedder can
+target a different provider than the chat model — `openai` on `api.openai.com`
+for the LLM, a cheaper or self-hosted OpenAI-compatible endpoint for vectors.
+Without it the `openai` embedder takes `OPENAI_API_KEY`, then `LLM_API_KEY`
+when a custom embedding base URL is set, exactly as before. `voyage` and
+`google`/`gemini` keep reading only their own `VOYAGE_API_KEY` and
+`GEMINI_API_KEY`/`GOOGLE_API_KEY`.
 
 `openai-compat` also requires an explicit model because self-hosted engines have
 no safe shared model or dimensionality default. It sends no authorization header
-when `LLM_API_KEY` is absent and stores vectors under the distinct
-`provider="openai-compat"` identity.
+when both `EMBEDDING_API_KEY` and `LLM_API_KEY` are absent and stores vectors
+under the distinct `provider="openai-compat"` identity.
 
 ## Future work
 

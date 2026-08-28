@@ -313,6 +313,7 @@ pub struct RuntimeEnv {
     gemini_api_key: Option<SecretString>,
     llm_api_key: Option<SecretString>,
     llm_base_url: Option<String>,
+    embedding_api_key: Option<SecretString>,
     copilot_github_token: Option<SecretString>,
     github_copilot_api_token: Option<SecretString>,
     copilot_api_url: Option<String>,
@@ -350,6 +351,10 @@ impl RuntimeEnv {
             gemini_api_key: env_secret("GEMINI_API_KEY").or_else(|| env_secret("GOOGLE_API_KEY")),
             llm_api_key: env_secret("LLM_API_KEY"),
             llm_base_url: env_string("LLM_BASE_URL"),
+            // The embedding counterpart of LLM_API_KEY: it credentials the
+            // embedding role alone, so the embedder can target a different
+            // provider than the chat model instead of borrowing its key.
+            embedding_api_key: env_secret("EMBEDDING_API_KEY"),
             copilot_github_token: env_secret("COPILOT_GITHUB_TOKEN")
                 .or_else(|| env_secret("GH_TOKEN"))
                 .or_else(|| env_secret("GITHUB_TOKEN")),
@@ -1024,10 +1029,15 @@ impl Config {
         }))
     }
 
-    /// OpenAI-compatible embedding key. Direct OpenAI keeps requiring
-    /// `OPENAI_API_KEY`; a custom embedding base URL may reuse `LLM_API_KEY`
-    /// for gateways such as OpenRouter.
+    /// OpenAI-compatible embedding key. `EMBEDDING_API_KEY` is checked first
+    /// so an operator can point the embedder at one provider while the LLM
+    /// uses another; without it, direct OpenAI keeps requiring
+    /// `OPENAI_API_KEY` and a custom embedding base URL may reuse
+    /// `LLM_API_KEY` for gateways such as OpenRouter.
     fn openai_embedding_api_key(&self) -> LlmResult<SecretString> {
+        if let Some(key) = self.runtime_env.embedding_api_key.clone() {
+            return Ok(key);
+        }
         if let Some(key) = self.runtime_env.openai_api_key.clone() {
             return Ok(key);
         }
@@ -1036,10 +1046,14 @@ impl Config {
                 return Ok(key);
             }
             return Err(LlmError::NotConfigured(
-                "OPENAI_API_KEY or LLM_API_KEY required for openai-compatible embeddings".into(),
+                "EMBEDDING_API_KEY, OPENAI_API_KEY or LLM_API_KEY required for \
+                 openai-compatible embeddings"
+                    .into(),
             ));
         }
-        Err(LlmError::NotConfigured("OPENAI_API_KEY".into()))
+        Err(LlmError::NotConfigured(
+            "EMBEDDING_API_KEY or OPENAI_API_KEY".into(),
+        ))
     }
 
     /// Whether the operator opted into post-RRF reranking.
@@ -1126,11 +1140,13 @@ impl Config {
                 LlmError::NotConfigured("GEMINI_API_KEY or GOOGLE_API_KEY".into())
             })?,
             // Keyless engines (Ollama, LM Studio) are the norm; a
-            // gateway key rides on LLM_API_KEY when present.
+            // gateway key rides on EMBEDDING_API_KEY, or on LLM_API_KEY
+            // when the chat model shares that gateway.
             EmbedderChoice::OpenAiCompat => self
                 .runtime_env
-                .llm_api_key
+                .embedding_api_key
                 .clone()
+                .or_else(|| self.runtime_env.llm_api_key.clone())
                 .unwrap_or_else(|| SecretString::from(String::new())),
         };
         let base_url = self.embedding_base_url.clone();
@@ -1728,6 +1744,73 @@ mod tests {
             embedder.base_url.as_deref(),
             Some("https://openrouter.ai/api/v1")
         );
+
+        // A dedicated embedding key outranks the borrowed LLM one.
+        let cfg = Config {
+            runtime_env: RuntimeEnv {
+                embedding_api_key: Some(SecretString::from("sk-embed-key")),
+                ..cfg.runtime_env.clone()
+            },
+            ..cfg
+        };
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.api_key.expose_secret(), "sk-embed-key");
+    }
+
+    #[test]
+    fn openai_embedding_prefers_dedicated_embedding_api_key() {
+        // The LLM runs on api.openai.com (OPENAI_API_KEY) while embeddings
+        // run somewhere else; without a dedicated key the OpenAI one would
+        // be sent to the embedding base URL and rejected.
+        let cfg = Config {
+            embedding_provider: Some("openai".into()),
+            embedding_base_url: Some("https://api.cheap-embeddings.example/v1".into()),
+            runtime_env: RuntimeEnv {
+                embedding_api_key: Some(SecretString::from("sk-embed-key")),
+                openai_api_key: Some(SecretString::from("sk-openai-key")),
+                llm_api_key: Some(SecretString::from("sk-llm-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.api_key.expose_secret(), "sk-embed-key");
+
+        // It also works without a custom base URL, i.e. against OpenAI
+        // itself, where OPENAI_API_KEY was previously the only accepted key.
+        let direct = Config {
+            embedding_base_url: None,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            direct
+                .embedder_config()
+                .unwrap()
+                .unwrap()
+                .api_key
+                .expose_secret(),
+            "sk-embed-key"
+        );
+
+        // Absent, the previous precedence is untouched: OPENAI_API_KEY
+        // still beats LLM_API_KEY.
+        let without = Config {
+            runtime_env: RuntimeEnv {
+                embedding_api_key: None,
+                ..cfg.runtime_env.clone()
+            },
+            ..cfg
+        };
+        assert_eq!(
+            without
+                .embedder_config()
+                .unwrap()
+                .unwrap()
+                .api_key
+                .expose_secret(),
+            "sk-openai-key"
+        );
     }
 
     #[test]
@@ -1760,6 +1843,18 @@ mod tests {
         };
         let embedder = cfg_with_key.embedder_config().unwrap().unwrap();
         assert_eq!(embedder.api_key.expose_secret(), "sk-or-key");
+
+        // EMBEDDING_API_KEY takes precedence over that borrowed key, and
+        // still leaves the keyless path keyless when it is unset.
+        let cfg_with_embedding_key = Config {
+            runtime_env: RuntimeEnv {
+                embedding_api_key: Some(SecretString::from("sk-embed-key")),
+                ..cfg_with_key.runtime_env.clone()
+            },
+            ..cfg_with_key
+        };
+        let embedder = cfg_with_embedding_key.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.api_key.expose_secret(), "sk-embed-key");
 
         // Missing model / dim / base URL each fail closed.
         let missing_model = Config {
@@ -1808,7 +1903,28 @@ mod tests {
         };
 
         let err = cfg.embedder_config().unwrap_err();
-        assert!(matches!(err, LlmError::NotConfigured(msg) if msg == "OPENAI_API_KEY"));
+        assert!(
+            matches!(err, LlmError::NotConfigured(msg) if msg == "EMBEDDING_API_KEY or OPENAI_API_KEY")
+        );
+
+        // The error names the dedicated key, and setting it resolves the
+        // same configuration.
+        let with_embedding_key = Config {
+            runtime_env: RuntimeEnv {
+                embedding_api_key: Some(SecretString::from("sk-embed-key")),
+                ..cfg.runtime_env.clone()
+            },
+            ..cfg
+        };
+        assert_eq!(
+            with_embedding_key
+                .embedder_config()
+                .unwrap()
+                .unwrap()
+                .api_key
+                .expose_secret(),
+            "sk-embed-key"
+        );
     }
 
     #[test]
