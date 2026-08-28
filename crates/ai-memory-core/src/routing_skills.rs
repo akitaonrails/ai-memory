@@ -147,6 +147,22 @@ mod tests {
     }
 
     #[test]
+    fn managed_skill_payloads_use_lf_line_endings() {
+        for skill in MANAGED_SKILLS {
+            assert!(
+                !skill.content.contains('\r'),
+                "{} must use LF line endings",
+                skill.name
+            );
+            assert!(
+                skill.content.ends_with('\n'),
+                "{} must end with a newline",
+                skill.name
+            );
+        }
+    }
+
+    #[test]
     fn relative_paths_are_safe_relative_skill_markdown_files() {
         for skill in MANAGED_SKILLS {
             let expected_suffix = format!("{}/SKILL.md", skill.name);
@@ -197,8 +213,7 @@ mod tests {
     }
 
     fn parse_frontmatter(skill: &ManagedSkill) -> Frontmatter {
-        let content = skill.content.replace("\r\n", "\n");
-        let Some(rest) = content.strip_prefix("---\n") else {
+        let Some(rest) = skill.content.strip_prefix("---\n") else {
             panic!("{} must start with frontmatter", skill.name);
         };
         let Some((frontmatter, _body)) = rest.split_once("\n---\n") else {

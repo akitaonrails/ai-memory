@@ -1,0 +1,3 @@
+# These files are embedded verbatim by include_str!, so checkout EOLs become
+# part of the CLI and MCP payload contract.
+crates/ai-memory-core/src/routing_skills/*/SKILL.md text eol=lf

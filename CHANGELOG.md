@@ -18,6 +18,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure manifest make interrupted imports safely resumable. Product-specific
   ChatGPT/Claude export adapters and watch folders remain out of tree. (#483)
 
+## [1.33.1] - 2026-08-28
+
+### Fixed
+- CI now rejects a change that writes into an already-released CHANGELOG
+  section. `bin/release` renames `## [Unreleased]` to `## [X.Y.Z]`, so a branch
+  opened before a release carries a diff anchored at the old line numbers and
+  git merges it into whatever section now occupies them — silently, with no
+  conflict. Three entries landed in the wrong release this way (#491 into
+  1.32.0, #502 into 1.32.2, #517 into 1.33.0), each claiming a fix shipped in a
+  version that did not contain it while the version that did listed nothing.
+  `scripts/check-changelog-frozen.sh` compares a branch against its merge base
+  and fails on any touched line below `[Unreleased]`.
+- The `ingest (server, this process)` counters in `ai-memory status` now move
+  for events delivered over `POST /hook/batch`. They were instrumented only in
+  the per-event `POST /hook` handler, while the spool drain posts batches and
+  falls back to `/hook` only against a pre-upgrade server, so a current client
+  against a current server left the whole section reading `accepted 0`,
+  `last write: -` and zero sheds while observations were landing normally — the
+  section exists precisely to tell "hooks are not arriving" apart from "hooks
+  are arriving but nothing is stored", and it reported the same thing for both.
+  A batch 429 also now counts every item it rejects, not just the one that
+  found no permit, so shed volume is comparable between the two routes instead
+  of understated by up to the batch size (#516).
+- `last write` in the same section now advances only when an event actually
+  cleared the writer. `handle_hook` stamped it unconditionally after processing
+  returned, and processing swallows its errors, so a store rejecting every
+  event — read-only database, exhausted disk, a failed migration — still
+  reported a fresh write time and looked healthy (#516).
+
+
+## [1.33.0] - 2026-08-28
+
+### Added
+- Generated `sessions/<id>.md` pages now surface the originating harness as
+  `agent` frontmatter alongside `session_id`. The value comes from the
+  persisted session row, so LLM rewrites, compaction checkpoints, spool
+  drains, and superseding versions do not mistake the later writer for the
+  origin; manual page writes remain unattributed. (#494)
+
+### Fixed
+- Prevented stored Markdown from automatically fetching external image URLs
+  when viewed in the web UI, while preserving clickable external links and
+  same-origin relative images (#491).
+- Made managed routing `SKILL.md` payloads byte-identical across release
+  platforms. Windows builds previously embedded CRLF from the runner checkout
+  while Linux and macOS builds embedded LF, so one tag returned different
+  bytes through CLI installs and `memory_install_self_routing`. The embedded
+  assets now use LF everywhere without rewriting user-authored files. (#502)
+- PowerShell compatibility hooks no longer assign to a local `$home` variable.
+  PowerShell names are case-insensitive, so that collided with the automatic
+  read-only `$HOME` variable and emitted `VariableNotWritable` for every hook
+  payload carrying a cwd. The marker-boundary helper now uses `$userHome`, with
+  native Windows and static shell regressions covering the error stream and
+  reserved-name contract (#498).
+- PowerShell compatibility hooks now encode JSON request bodies as explicit
+  UTF-8 bytes and declare `charset=utf-8`. Windows PowerShell 5.1 otherwise
+  encoded string bodies using a host-dependent legacy code page, so prompts,
+  paths, or tool content containing non-ASCII text could make `/hook` return
+  HTTP 400 and disappear from memory while ASCII events still worked. A native
+  Windows loopback test now round-trips Chinese and Portuguese text byte for
+  byte (#500).
 ## [1.32.2] - 2026-08-26
 
 ### Fixed
@@ -33,7 +94,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Switched to `rustls-tls-native-roots`; the runtime image installs
   `ca-certificates`, so the server path keeps a populated store. Reported by
   @alanmatiasdev (#492).
-
 - Made `hook-drain` say what a pass actually did. The drain already returned
   `sent`/`remaining`/`dropped` counts and `run_drain` discarded all three, so
   three passes that mean opposite things — everything delivered, every queued
@@ -69,8 +129,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   327 keeping a real title. `looks_like_scaffolding` is re-exported from
   `ai-memory-core`, so its narrowing is a public-API behaviour change even
   though `derive_title` is its only caller in tree. (#484)
-
-### Docs
 - Documented why registering ai-memory through Kimi Code's own
   `kimi mcp add` breaks every model turn: that command writes the plain
   `/mcp` URL with no `?flavor=moonshot`, so Moonshot rejects
@@ -237,6 +295,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the human and `--json` renderings. Without it the new ingest counters
   read identically whether hooks are broken or a repository simply never opted
   in — the exact ambiguity those counters were added to remove (#428, #446).
+
 
 ### Docs
 - Documented the order of magnitude reported for lifecycle-hook overhead,
@@ -3830,7 +3889,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.32.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.33.1...HEAD
+[1.33.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.1
+[1.33.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.0
 [1.32.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.2
 [1.32.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.1
 [1.32.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.0

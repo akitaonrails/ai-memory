@@ -629,6 +629,8 @@ one matching entry.
   (`ai-memory install-instructions`, or `--target AGENTS.md` for AGENTS-based
   projects) when you want new tool guidance. The refresh writes the slim
   markered snippet and managed Agent Skills from the same binary-owned assets.
+  Managed skill payloads use LF line endings on every release platform, while
+  user-authored files keep their existing line endings.
 
 For every client in the [Support Matrix](#support-matrix), plus curl-based hook
 installs, source builds, CLI environment variables, and the full subcommand
@@ -770,7 +772,10 @@ Useful entry points:
   browser view of the markdown wiki. `--enable-web` also mounts a
   read-only JSON frontend API at `/api/v1` (workspaces, projects, pages,
   recent, briefing, search) so custom web UIs can read the memory without
-  opening SQLite or wiki files directly:
+  opening SQLite or wiki files directly. Rendered pages keep external links
+  clickable, but image sources must be relative or root-relative; absolute
+  external images are neutralized so viewing stored Markdown cannot act as a
+  remote beacon:
 
   ```text
   GET  /api/v1/workspaces

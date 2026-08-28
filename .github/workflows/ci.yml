@@ -145,7 +145,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `check-changelog-frozen.sh` diffs against the merge base, so it
+          # needs history rather than a shallow clone.
+          fetch-depth: 0
       - run: scripts/check-changelog-sections.sh
+      - name: released sections stay frozen
+        run: scripts/check-changelog-frozen.sh "origin/${{ github.base_ref || github.event.repository.default_branch }}"
 
   # End-to-end docker smoke: packages the release-build binary and confirms
   # the image runs. Catches Dockerfile drift (missing COPY, bad ENTRYPOINT)

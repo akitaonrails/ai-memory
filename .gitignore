@@ -28,6 +28,10 @@
 # Runtime logs are `ai-memory.log.<date>`, so `.log` is not the final
 # extension and `*.log` does not match them. Ignore the directory.
 logs/
+# Runtime spool, created in the CWD when a hook runs without an explicit
+# --data-dir. Same class as logs/: a runtime artifact that is trivially
+# committed by a wide `git add`.
+hook-spool/
 flamegraph.svg
 perf.data*
 
