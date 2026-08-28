@@ -782,6 +782,7 @@ async fn handle_hook_batch(
     let actor = actor_identity(actor_ext);
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
+    let total_items = items.len();
     let mut accepted_indices = Vec::new();
     for (idx, mut item) in items.into_iter().enumerate() {
         // Same unconditional assistant-message backstop as `handle_hook`, applied
@@ -810,10 +811,16 @@ async fn handle_hook_batch(
             continue;
         }
         let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
-            state.ingest_metrics.record_shed_saturated();
+            // The 429 rejects this item AND every item behind it, so count all
+            // of them: on `/hook` one 429 is one shed event, and a batch that
+            // sheds 200 events must not read as 1.
+            let shed = total_items.saturating_sub(idx);
+            for _ in 0..shed {
+                state.ingest_metrics.record_shed_saturated();
+            }
             warn!(
                 accepted = accepted_indices.len(),
-                "hook batch ingest saturated; rejecting with 429"
+                shed, "hook batch ingest saturated; rejecting with 429"
             );
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -5125,6 +5132,41 @@ mod tests {
         assert_eq!(
             snap.accepted, 0,
             "a dropped item spends no ingress capacity"
+        );
+    }
+
+    /// A saturated batch answers 429 for the item that found no permit AND
+    /// every item behind it. Counting one shed event for a rejection that
+    /// dropped many understates the shed rate by the batch size — on the
+    /// `/hook/batch` path the native drain actually uses.
+    #[tokio::test]
+    async fn handle_hook_batch_counts_every_item_the_429_sheds() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let metrics = state.ingest_metrics.clone();
+
+        let items = (0..4)
+            .map(|i| HookBatchItem {
+                url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                body: serde_json::json!({ "session_id": format!("shed-{i}") }),
+            })
+            .collect::<Vec<_>>();
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        assert_eq!(
+            metrics.snapshot().shed_saturated,
+            4,
+            "the 429 rejected all four items, not just the first"
         );
     }
 
