@@ -36,7 +36,7 @@ use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
 use crate::maintenance::MaintenanceJob;
 use crate::users::TOKEN_HASH_LEN;
-use crate::workstream::{ManagedRunContext, StoredManagedRunStatus};
+use crate::workstream::{ManagedRunContext, StoredManagedRunStatus, StoredWorkstreamSummary};
 
 /// TTL guard for retrieval surfaces (search / recent / embedding hits /
 /// graph neighbours / briefing lists): appended to a WHERE clause that
@@ -1324,6 +1324,28 @@ impl ReaderPool {
     ) -> StoreResult<Vec<WorkstreamEvent>> {
         self.with_conn(move |conn| {
             crate::workstream::search_events(conn, workstream_id, &query, limit)
+        })
+        .await
+    }
+
+    /// List recent managed workstreams for one exact repository/worktree.
+    pub async fn recent_workstreams(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+        self.with_conn(move |conn| {
+            crate::workstream::list_recent(
+                conn,
+                workspace_id,
+                project_id,
+                &repo_fingerprint,
+                &worktree_fingerprint,
+                limit,
+            )
         })
         .await
     }
@@ -2792,6 +2814,33 @@ impl ReaderPool {
             let proj = ProjectId::from_slice(&proj_bytes)
                 .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?;
             Ok(Some((ws, proj)))
+        })
+        .await
+    }
+
+    /// Look up the immutable harness identity stored for a session.
+    ///
+    /// Machine-generated session pages use this as their origin metadata.
+    /// Reading it from the session row, rather than from the request that
+    /// happens to trigger consolidation, keeps spool drains and later
+    /// superseding writes attributed to the harness that created the session.
+    /// Returns `None` when no such session row exists.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_agent_kind(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<AgentKind>> {
+        self.with_conn(move |conn| {
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT agent_kind FROM sessions WHERE id = ?1",
+                    params![session_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(stored.map(|value| AgentKind::from_wire(&value)))
         })
         .await
     }

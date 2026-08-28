@@ -222,6 +222,9 @@ priors are at the [bottom](#influences-and-prior-art).
 
   # Kiro defaults to v2; select its incompatible v3 engine explicitly once.
   ai-memory run kiro --v3
+
+  # List the workstreams that can be selected from this checkout.
+  ai-memory workstreams
   ```
 
 - **"Pick the project instead of remembering where it lives."** Start from a
@@ -611,11 +614,11 @@ one matching entry.
   MCP/hooks. Explicit `--server-url` flags still work, but are no longer
   required when the env vars are set. Any non-loopback server should use
   bearer auth.
-- **Managed-launch wrapper:** `ai-memory run`, `ai-memory show`, and
-  `ai-memory continue` must be intercepted by the current host wrapper so local
-  checkouts, native harnesses, and session stores remain accessible. An old
-  wrapper may pass these commands into Docker and fail to find a checkout or
-  host executable. Run
+- **Managed-launch wrapper:** `ai-memory run`, `ai-memory show`,
+  `ai-memory continue`, and `ai-memory workstreams` must be intercepted by the
+  current host wrapper so local checkouts, native harnesses, and session stores
+  remain accessible. An old wrapper may pass these commands into Docker and
+  fail to find a checkout or host executable. Run
   `ai-memory upgrade` on the agent machine to refresh it. The host-native runner
   inherits `AI_MEMORY_SERVER_URL`, `AI_MEMORY_AUTH_TOKEN`, and the host `PATH`.
 - **Upgrades:** for Docker-wrapper installs, run `ai-memory upgrade` on each
@@ -629,6 +632,8 @@ one matching entry.
   (`ai-memory install-instructions`, or `--target AGENTS.md` for AGENTS-based
   projects) when you want new tool guidance. The refresh writes the slim
   markered snippet and managed Agent Skills from the same binary-owned assets.
+  Managed skill payloads use LF line endings on every release platform, while
+  user-authored files keep their existing line endings.
 
 For every client in the [Support Matrix](#support-matrix), plus curl-based hook
 installs, source builds, CLI environment variables, and the full subcommand
@@ -770,7 +775,10 @@ Useful entry points:
   browser view of the markdown wiki. `--enable-web` also mounts a
   read-only JSON frontend API at `/api/v1` (workspaces, projects, pages,
   recent, briefing, search) so custom web UIs can read the memory without
-  opening SQLite or wiki files directly:
+  opening SQLite or wiki files directly. Rendered pages keep external links
+  clickable, but image sources must be relative or root-relative; absolute
+  external images are neutralized so viewing stored Markdown cannot act as a
+  remote beacon:
 
   ```text
   GET  /api/v1/workspaces
@@ -1002,9 +1010,12 @@ Embeddings are optional and separate from the LLM provider. Set
 graph-neighbor retrieval. `openai-compat` targets self-hosted engines
 (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
-`AI_MEMORY_EMBEDDING_DIM`. Both the FTS-only and hybrid paths apply the same
-bounded page-authority adjustment after candidate generation; embeddings
-improve relevance recall but do not decide which source is canonical.
+`AI_MEMORY_EMBEDDING_DIM`. The optional `EMBEDDING_API_KEY` credentials the
+embedder alone and is checked before `OPENAI_API_KEY` and `LLM_API_KEY`, so
+embeddings can run on a different provider than the LLM. Both the FTS-only and
+hybrid paths apply the same bounded page-authority adjustment after candidate
+generation; embeddings improve relevance recall but do not decide which source
+is canonical.
 
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter examples, and

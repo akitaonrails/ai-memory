@@ -1418,7 +1418,7 @@ ai-memory works in three intensity tiers:
 | **+ ChatGPT/Codex OAuth** | Same LLM features using a ChatGPT Pro/Plus login instead of an OpenAI Platform key | `AI_MEMORY_LLM_PROVIDER=openai-oauth` + `ai-memory auth login openai-oauth` | Uses your ChatGPT subscription |
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider | One LLM call per eligible query, at most four concurrently |
-| **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` | ~$0.0001 / page on backfill |
+| **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` (or `EMBEDDING_API_KEY`) | ~$0.0001 / page on backfill |
 
 ### Recommended models (chosen as defaults)
 
@@ -1434,16 +1434,47 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode Zen/Go](https://opencode.ai) cloud API — OpenAI-compatible endpoint at `opencode.ai/zen/go/v1`. Set `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen`. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
-| `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Reuses `LLM_API_KEY` or `OPENAI_API_KEY` with the OpenAI-compatible embedding client. |
-| `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://api.orcarouter.ai/v1` | `openai/text-embedding-3-small` via [OrcaRouter](https://www.orcarouter.ai) | Reuses `LLM_API_KEY` with the OpenAI-compatible embedding client. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY` or `OPENAI_API_KEY`, with the OpenAI-compatible embedding client. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://api.orcarouter.ai/v1` | `openai/text-embedding-3-small` via [OrcaRouter](https://www.orcarouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY`, with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=voyage` | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=google` / `gemini` | `gemini-embedding-001` (768-dim) | Google-hosted embeddings via `embedContent`. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
-| `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `LLM_API_KEY` is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `EMBEDDING_API_KEY`, else `LLM_API_KEY`, is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. |
 
 > **What we don't recommend:** reasoning-mode models (Claude with extended
 > thinking, GPT-o3, Gemini "thinking" variants) — they burn token budget on
 > internal reasoning and hang or emit empty responses with the strict-JSON
 > consolidation prompt. Turn reasoning off if you must use one.
+
+#### Embedding credentials (`EMBEDDING_API_KEY`)
+
+`EMBEDDING_API_KEY` is optional and credentials the embedding role alone. Set
+it when the embedder should authenticate against a different provider than the
+LLM — the `openai` and `openai-compat` embedders otherwise borrow the chat
+model's `OPENAI_API_KEY` or `LLM_API_KEY`, which is then sent to whatever
+`AI_MEMORY_EMBEDDING_BASE_URL` points at and rejected with a 401.
+
+Precedence for `AI_MEMORY_EMBEDDING_PROVIDER=openai`:
+
+1. `EMBEDDING_API_KEY`
+2. `OPENAI_API_KEY`
+3. `LLM_API_KEY`, only when `AI_MEMORY_EMBEDDING_BASE_URL` is set
+
+`openai-compat` checks `EMBEDDING_API_KEY`, then `LLM_API_KEY`, and stays
+keyless when neither is set. `voyage` and `google`/`gemini` are unaffected:
+they read their own `VOYAGE_API_KEY` and `GEMINI_API_KEY`/`GOOGLE_API_KEY` and
+never borrow another role's key. With `EMBEDDING_API_KEY` unset, key
+resolution is exactly what it was before the variable existed.
+
+```bash
+# Chat on api.openai.com — `openai` is the provider that sends
+# `max_completion_tokens`, which gpt-5 / o-series models require and
+# `openai-compat` never emits — with embeddings on another endpoint.
+export AI_MEMORY_LLM_PROVIDER=openai
+export OPENAI_API_KEY=sk-...
+export AI_MEMORY_EMBEDDING_PROVIDER=openai
+export AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1
+export EMBEDDING_API_KEY=sk-or-v1-...
+```
 
 ### Anthropic via Claude subscription (OAuth)
 
@@ -1709,6 +1740,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
+| `workstreams [--workspace NAME] [--project NAME] [--limit N] [--json]` | host wrapper or native binary | List recent workstreams selectable from the current checkout, including current selection and linked harnesses, without exposing paths or native session ids |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki FTS5 search + bounded source authority; use MCP `memory_query` for entity/graph/vector RRF |
@@ -1752,6 +1784,9 @@ with the slim snippet, leaves unrelated instructions before and after it alone,
 and writes a timestamped `.bak-*` backup before changing an existing file.
 Managed skill files contain an ai-memory ownership marker; same-name user skills
 without that marker are preserved unless you explicitly force replacement.
+Their embedded payloads use LF line endings on every release platform, so CLI
+installs and `memory_install_self_routing` return the same bytes on Windows,
+Linux, and macOS. This does not rewrite line endings in user-authored files.
 `install-instructions --print` previews only the instruction snippet; run
 `install-skills --print` when you want to preview the managed skill payloads.
 
@@ -1998,11 +2033,11 @@ warns that relabeling system directories such as `/home` can make the host
 inoperable. Docker documents `label=disable` in the
 [`docker run` security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt).
 
-`ai-memory run`, `ai-memory show`, and `ai-memory continue` are the exceptions:
-the current wrapper intercepts them and starts a cached checksum-verified native
-client on the host, where local checkouts, harness executables, and session
-stores exist. It preserves an explicit remote `AI_MEMORY_SERVER_URL`. If one of
-these commands logs
+`ai-memory run`, `ai-memory show`, `ai-memory continue`, and
+`ai-memory workstreams` are the exceptions: the current wrapper intercepts them
+and starts a cached checksum-verified native client on the host, where local
+checkouts, harness executables, and session stores exist. It preserves an
+explicit remote `AI_MEMORY_SERVER_URL`. If one of these commands logs
 `data_dir=/data`, cannot find a checkout, or cannot find `codex`, `claude`, or
 another host executable, refresh the stale wrapper with `ai-memory upgrade` on
 that client machine.

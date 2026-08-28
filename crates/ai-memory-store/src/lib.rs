@@ -69,7 +69,7 @@ pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConso
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, StoredManagedRunStatus, WorkstreamSelection,
+    PreparedWorkstreamRun, StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamSelection,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -5732,6 +5732,172 @@ mod tests {
                 "invalid name '{invalid}' must be rejected: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn recent_workstreams_are_checkout_local_and_include_linked_harnesses() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-list").await;
+        let prepare = |name: &str, agent| PrepareWorkstreamRun {
+            agent,
+            selection: WorkstreamSelection::New(name.into()),
+            ..managed_prepare_input(ws, proj, name)
+        };
+
+        let older = store
+            .writer
+            .prepare_workstream_run(prepare("older", AgentKind::OpenCode))
+            .await
+            .unwrap();
+        let current = store
+            .writer
+            .prepare_workstream_run(prepare("current", AgentKind::Codex))
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: current.run_id,
+                native_session_id: Some("codex-native".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        let claude = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                agent: AgentKind::ClaudeCode,
+                selection: WorkstreamSelection::Named("current".into()),
+                ..managed_prepare_input(ws, proj, "claude")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: claude.run_id,
+                native_session_id: Some("claude-native".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        // A non-current workstream may finish later and therefore be more
+        // recently active; the selected workstream must still lead the list.
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: older.run_id,
+                native_session_id: Some("open-code-native".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+
+        let hidden = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                repo_fingerprint: "other-repo".into(),
+                worktree_fingerprint: "other-worktree".into(),
+                selection: WorkstreamSelection::New("hidden".into()),
+                ..managed_prepare_input(ws, proj, "hidden")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(hidden.run_id)
+            .await
+            .unwrap();
+
+        let rows = store
+            .reader
+            .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["current", "older"]
+        );
+        assert!(rows[0].current);
+        assert!(!rows[1].current);
+        assert_eq!(
+            rows[0].linked_harnesses,
+            [AgentKind::ClaudeCode, AgentKind::Codex]
+        );
+        assert_eq!(rows[1].linked_harnesses, [AgentKind::OpenCode]);
+        assert!(rows[0].last_active_at >= rows[0].created_at);
+        let limited = store
+            .reader
+            .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 1)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].workstream_id, current.workstream_id);
+        assert!(limited[0].current);
+        assert_eq!(
+            limited[0].linked_harnesses,
+            [AgentKind::ClaudeCode, AgentKind::Codex]
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_workstreams_do_not_leak_across_workspaces() {
+        // Two workspaces can hold a project of the same name over the very
+        // same clone, so repo/worktree identity alone does not separate them:
+        // only the scope columns do.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (mine, mine_proj) = open_managed_scope(&store, "shared-name").await;
+        let theirs = store
+            .writer
+            .get_or_create_workspace("other-workspace")
+            .await
+            .unwrap();
+        let theirs_proj = store
+            .writer
+            .get_or_create_project(theirs, "shared-name", None)
+            .await
+            .unwrap();
+
+        for (ws, proj, name) in [(mine, mine_proj, "mine"), (theirs, theirs_proj, "theirs")] {
+            store
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    selection: WorkstreamSelection::New(name.into()),
+                    ..managed_prepare_input(ws, proj, name)
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn visible(store: &Store, ws: WorkspaceId, proj: ProjectId) -> Vec<String> {
+            store
+                .reader
+                .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.name)
+                .collect()
+        }
+        assert_eq!(visible(&store, mine, mine_proj).await, ["mine"]);
+        assert_eq!(visible(&store, theirs, theirs_proj).await, ["theirs"]);
+        // A real workspace paired with the other one's project must not fall
+        // back to either list.
+        assert!(visible(&store, mine, theirs_proj).await.is_empty());
     }
 
     #[tokio::test]

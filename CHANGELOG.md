@@ -54,6 +54,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file will not shrink after the first prune — the `ai-memory backup` tarball
   will, because it is a fresh online copy.
 
+## [1.34.0] - 2026-08-28
+
+### Added
+- `EMBEDDING_API_KEY`, an optional embedding-only credential resolved ahead of
+  `OPENAI_API_KEY` and `LLM_API_KEY`. Embeddings are already independently
+  configurable — `AI_MEMORY_EMBEDDING_PROVIDER`, `_MODEL`, `_DIM` and
+  `_BASE_URL` each have their own setting — but there was no key to go with
+  them, so pointing `AI_MEMORY_EMBEDDING_BASE_URL` at a second provider sent it
+  whichever credential the chat model happened to use. `voyage` and
+  `google`/`gemini` were unaffected: they already name their own key. `openai`
+  now resolves `EMBEDDING_API_KEY` → `OPENAI_API_KEY` → `LLM_API_KEY` (the last
+  still only with a custom base URL); `openai-compat` resolves
+  `EMBEDDING_API_KEY` → `LLM_API_KEY` and stays keyless when neither is set.
+  With the new variable absent, resolution is byte-identical to before. Both
+  `NotConfigured` messages name it, since that error is where an operator hits
+  the missing-key path. (#514)
+- The standalone `ai-memory-importer` companion can now replay bounded generic
+  external-conversation JSON into the existing observation/consolidation
+  pipeline. It is dry-run by default; `--apply` sends one ordered `/hook/batch`
+  with the dedicated `external-import` wire identity (stored in core's closed
+  `other` bucket), with extension provenance for assistant and system messages.
+  Full-envelope validation, client-side credential redaction,
+  stable session/event idempotency keys, event/byte caps, and a durable partial
+  failure manifest make interrupted imports safely resumable. Product-specific
+  ChatGPT/Claude export adapters and watch folders remain out of tree. (#483)
+- Added `ai-memory workstreams`, a read-only checkout-local list of recent
+  managed workstreams with the current selection first, linked harnesses,
+  timestamps, and stable ids. Human-readable and `--json` output share the same
+  bounded POST query, which follows `run`'s exact workspace, project,
+  repository, and worktree identity without returning checkout paths,
+  fingerprints, or native session ids. The Docker shell wrapper routes the
+  command through its native host client so repository identity remains
+  correct. (#499)
+### Fixed
+- OpenCode subagent session pages no longer use the fixed `You are a subagent
+  spawned by another session.` preamble as their title. The zero-LLM
+  synthesizer now promotes the first usable task line from the prompt body and
+  falls back to the session identity when the prompt contains only the
+  preamble. Repeated real user requests still remain separate session pages.
+  (#518)
+
+## [1.33.1] - 2026-08-28
+
+### Fixed
+- CI now rejects a change that writes into an already-released CHANGELOG
+  section. `bin/release` renames `## [Unreleased]` to `## [X.Y.Z]`, so a branch
+  opened before a release carries a diff anchored at the old line numbers and
+  git merges it into whatever section now occupies them — silently, with no
+  conflict. Three entries landed in the wrong release this way (#491 into
+  1.32.0, #502 into 1.32.2, #517 into 1.33.0), each claiming a fix shipped in a
+  version that did not contain it while the version that did listed nothing.
+  `scripts/check-changelog-frozen.sh` compares a branch against its merge base
+  and fails on any touched line below `[Unreleased]`.
+- The `ingest (server, this process)` counters in `ai-memory status` now move
+  for events delivered over `POST /hook/batch`. They were instrumented only in
+  the per-event `POST /hook` handler, while the spool drain posts batches and
+  falls back to `/hook` only against a pre-upgrade server, so a current client
+  against a current server left the whole section reading `accepted 0`,
+  `last write: -` and zero sheds while observations were landing normally — the
+  section exists precisely to tell "hooks are not arriving" apart from "hooks
+  are arriving but nothing is stored", and it reported the same thing for both.
+  A batch 429 also now counts every item it rejects, not just the one that
+  found no permit, so shed volume is comparable between the two routes instead
+  of understated by up to the batch size (#516).
+- `last write` in the same section now advances only when an event actually
+  cleared the writer. `handle_hook` stamped it unconditionally after processing
+  returned, and processing swallows its errors, so a store rejecting every
+  event — read-only database, exhausted disk, a failed migration — still
+  reported a fresh write time and looked healthy (#516).
+
+
+## [1.33.0] - 2026-08-28
+
+### Added
+- Generated `sessions/<id>.md` pages now surface the originating harness as
+  `agent` frontmatter alongside `session_id`. The value comes from the
+  persisted session row, so LLM rewrites, compaction checkpoints, spool
+  drains, and superseding versions do not mistake the later writer for the
+  origin; manual page writes remain unattributed. (#494)
+
+### Fixed
+- Prevented stored Markdown from automatically fetching external image URLs
+  when viewed in the web UI, while preserving clickable external links and
+  same-origin relative images (#491).
+- Made managed routing `SKILL.md` payloads byte-identical across release
+  platforms. Windows builds previously embedded CRLF from the runner checkout
+  while Linux and macOS builds embedded LF, so one tag returned different
+  bytes through CLI installs and `memory_install_self_routing`. The embedded
+  assets now use LF everywhere without rewriting user-authored files. (#502)
+- PowerShell compatibility hooks no longer assign to a local `$home` variable.
+  PowerShell names are case-insensitive, so that collided with the automatic
+  read-only `$HOME` variable and emitted `VariableNotWritable` for every hook
+  payload carrying a cwd. The marker-boundary helper now uses `$userHome`, with
+  native Windows and static shell regressions covering the error stream and
+  reserved-name contract (#498).
+- PowerShell compatibility hooks now encode JSON request bodies as explicit
+  UTF-8 bytes and declare `charset=utf-8`. Windows PowerShell 5.1 otherwise
+  encoded string bodies using a host-dependent legacy code page, so prompts,
+  paths, or tool content containing non-ASCII text could make `/hook` return
+  HTTP 400 and disappear from memory while ASCII events still worked. A native
+  Windows loopback test now round-trips Chinese and Portuguese text byte for
+  byte (#500).
 ## [1.32.2] - 2026-08-26
 
 ### Fixed
@@ -69,7 +171,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Switched to `rustls-tls-native-roots`; the runtime image installs
   `ca-certificates`, so the server path keeps a populated store. Reported by
   @alanmatiasdev (#492).
-
 - Made `hook-drain` say what a pass actually did. The drain already returned
   `sent`/`remaining`/`dropped` counts and `run_drain` discarded all three, so
   three passes that mean opposite things — everything delivered, every queued
@@ -105,8 +206,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   327 keeping a real title. `looks_like_scaffolding` is re-exported from
   `ai-memory-core`, so its narrowing is a public-API behaviour change even
   though `derive_title` is its only caller in tree. (#484)
-
-### Docs
 - Documented why registering ai-memory through Kimi Code's own
   `kimi mcp add` breaks every model turn: that command writes the plain
   `/mcp` URL with no `?flavor=moonshot`, so Moonshot rejects
@@ -273,6 +372,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the human and `--json` renderings. Without it the new ingest counters
   read identically whether hooks are broken or a repository simply never opted
   in — the exact ambiguity those counters were added to remove (#428, #446).
+
 
 ### Docs
 - Documented the order of magnitude reported for lifecycle-hook overhead,
@@ -3866,7 +3966,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.32.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.34.0...HEAD
+[1.34.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.34.0
+[1.33.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.1
+[1.33.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.0
 [1.32.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.2
 [1.32.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.1
 [1.32.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.0

@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # Native roots, matching the workspace: the importer POSTs to the same server
 # an operator may front with a private CA (#492).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

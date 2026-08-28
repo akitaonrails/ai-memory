@@ -143,6 +143,7 @@ foreach ($Name in @(
     "OPENAI_API_KEY",
     "VOYAGE_API_KEY",
     "LLM_API_KEY",
+    "EMBEDDING_API_KEY",
     "RUST_LOG"
 )) {
     if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($Name))) {

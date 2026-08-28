@@ -12,6 +12,7 @@
 #   ai-memory run ...       Use a cached native client so it can exec host agents.
 #   ai-memory show ...      Use that client for host project/harness discovery.
 #   ai-memory continue ...  Use that client to resume the newest linked checkout.
+#   ai-memory workstreams   Use that client to inspect the host checkout identity.
 #
 # Env overrides:
 #   AI_MEMORY_IMAGE         docker image (default: akitaonrails/ai-memory:latest)
@@ -28,7 +29,7 @@
 #                           likewise
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
-#   AI_MEMORY_NATIVE_BIN    native binary used for `run`/`show`/`continue` (optional)
+#   AI_MEMORY_NATIVE_BIN    native binary used for managed host commands (optional)
 #   AI_MEMORY_WRAPPER_URL   wrapper release asset override (optional; its
 #                           .sha256 companion is required)
 #   AI_MEMORY_WRAPPER_SHA256_URL  wrapper checksum URL override (optional)
@@ -350,7 +351,7 @@ cmd_upgrade() {
   touch "${VERSION_CHECK_FILE}"
 }
 
-# `ai-memory run`, `show`, and `continue` must execute on the host: checkouts, harnesses,
+# Managed launch/discovery commands must execute on the host: checkouts, harnesses,
 # and native transcript stores are host resources, not contents of the helper
 # container. Keep a checksum-verified release client beside the wrapper cache.
 native_host_binary() {
@@ -369,7 +370,7 @@ native_host_binary() {
     Darwin) os="macos" ;;
     *)
       echo "ai-memory: the Docker wrapper cannot provide managed host launches on this OS" >&2
-      echo "install the native release binary to use ai-memory run/show/continue" >&2
+      echo "install the native release binary to use ai-memory run/show/continue/workstreams" >&2
       return 1
       ;;
   esac
@@ -444,7 +445,7 @@ case "${1:-}" in
     cmd_upgrade
     exit 0
     ;;
-  run | show | continue)
+  run | show | continue | workstreams)
     NATIVE_HOST_COMMAND=$1
     shift
     NATIVE_HOST_BIN=$(native_host_binary)
@@ -498,6 +499,7 @@ for var in \
   COPILOT_API_URL \
   VOYAGE_API_KEY \
   LLM_API_KEY \
+  EMBEDDING_API_KEY \
   RUST_LOG
 do
   if [ -n "${!var:-}" ]; then
