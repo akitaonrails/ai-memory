@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- OpenCode subagent session pages no longer use the fixed `You are a subagent
+  spawned by another session.` preamble as their title. The zero-LLM
+  synthesizer now promotes the first usable task line from the prompt body and
+  falls back to the session identity when the prompt contains only the
+  preamble. Repeated real user requests still remain separate session pages.
+  (#518)
+
 ## [1.33.1] - 2026-08-28
 
 ### Fixed

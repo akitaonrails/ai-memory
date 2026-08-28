@@ -886,7 +886,7 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
     }
 }
 
-fn truncate_for_title(s: &str) -> String {
+pub(crate) fn truncate_for_title(s: &str) -> String {
     const MAX: usize = 80;
     let one_line: String = s.chars().take_while(|c| *c != '\n').collect();
     if one_line.chars().count() <= MAX {

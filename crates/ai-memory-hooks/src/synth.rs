@@ -14,9 +14,12 @@ use ai_memory_core::{
 };
 use jiff::tz::TimeZone;
 
+use crate::payload::truncate_for_title;
+
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
 const RAW_OBSERVATION_TAIL_LINES: usize = RAW_OBSERVATION_MAX_LINES - RAW_OBSERVATION_HEAD_LINES;
+const SUBAGENT_PROMPT_PREAMBLE: &str = "You are a subagent spawned by another session.";
 
 /// Build a [`NewPage`] from the observations collected during a session.
 ///
@@ -101,19 +104,35 @@ pub fn synthesize_session_page(
 /// literal "session" remains only for the case where there is nothing else
 /// at all.
 fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
+    let mut rejected_subagent_preamble = false;
     for obs in observations {
-        if obs.kind == ObservationKind::UserPrompt
-            && !obs.title.is_empty()
-            && !looks_like_scaffolding(&obs.title)
-        {
+        if obs.kind != ObservationKind::UserPrompt {
+            continue;
+        }
+        if obs.title.trim() == SUBAGENT_PROMPT_PREAMBLE {
+            rejected_subagent_preamble = true;
+            if let Some(title) = obs
+                .body
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !looks_like_title_scaffolding(line))
+            {
+                return truncate_for_title(title);
+            }
+            continue;
+        }
+        if !obs.title.is_empty() && !looks_like_scaffolding(&obs.title) {
             return obs.title.clone();
         }
+    }
+    if rejected_subagent_preamble {
+        return format!("Session {session_id}");
     }
     for obs in observations {
         if obs.kind == ObservationKind::SessionStart {
             continue;
         }
-        if !obs.title.is_empty() && !looks_like_scaffolding(&obs.title) {
+        if !obs.title.is_empty() && !looks_like_title_scaffolding(&obs.title) {
             return obs.title.clone();
         }
     }
@@ -124,6 +143,10 @@ fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
         return "session".to_string();
     }
     format!("Session {session_id}")
+}
+
+fn looks_like_title_scaffolding(candidate: &str) -> bool {
+    candidate.trim() == SUBAGENT_PROMPT_PREAMBLE || looks_like_scaffolding(candidate)
 }
 
 /// The per-session counts that both the rendered body and the frontmatter
@@ -586,6 +609,68 @@ mod tests {
                 "{scaffold:?} must be skipped in favour of the next real prompt"
             );
         }
+    }
+
+    #[test]
+    fn subagent_preamble_promotes_the_first_task_line() {
+        let preamble = "You are a subagent spawned by another session.";
+        let task = "Review the audit runbook and identify stale checks.";
+        let mut prompt = obs(ObservationKind::UserPrompt, preamble);
+        prompt.body = format!("{preamble}\n\n{task}");
+
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            AgentKind::OpenCode,
+            &[prompt],
+        );
+
+        assert_eq!(page.title, task);
+    }
+
+    #[test]
+    fn subagent_preamble_without_a_task_falls_back_to_session_identity() {
+        let session_id = SessionId::new();
+        let preamble = "You are a subagent spawned by another session.";
+        let mut prompt = obs(ObservationKind::UserPrompt, preamble);
+        prompt.body = preamble.into();
+        let observations = vec![prompt, obs(ObservationKind::PostToolUse, "tool file")];
+
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            session_id,
+            AgentKind::OpenCode,
+            &observations,
+        );
+
+        assert_eq!(page.title, format!("Session {session_id}"));
+    }
+
+    #[test]
+    fn repeated_user_requests_remain_separate_session_pages() {
+        let first_session = SessionId::new();
+        let second_session = SessionId::new();
+        let observations = vec![obs(ObservationKind::UserPrompt, "Review the audit runbook")];
+
+        let first = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            first_session,
+            AgentKind::OpenCode,
+            &observations,
+        );
+        let second = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            second_session,
+            AgentKind::OpenCode,
+            &observations,
+        );
+
+        assert_eq!(first.title, second.title);
+        assert_ne!(first.path, second.path);
     }
 
     /// Every candidate is scaffolding. The page still needs a title, and
