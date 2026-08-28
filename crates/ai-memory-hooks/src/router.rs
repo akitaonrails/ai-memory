@@ -583,6 +583,14 @@ pub fn hook_router(state: HookState) -> Router {
         .with_state(Arc::new(state))
 }
 
+/// Unix milliseconds for an ingest metric stamp, saturating rather than
+/// failing: a clock before the epoch or past `u64` must not cost an event.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 async fn handle_hook(
     State(state): State<Arc<HookState>>,
     Query(query): Query<HookQuery>,
@@ -655,11 +663,7 @@ async fn handle_hook(
         // uses to tell "hooks are arriving but nothing is landing" from
         // "nothing is arriving" — the two look identical from the accepted
         // count alone.
-        metrics.record_persisted(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
-        );
+        metrics.record_persisted(now_unix_ms());
     });
     (StatusCode::ACCEPTED, "queued")
 }
@@ -793,6 +797,7 @@ async fn handle_hook_batch(
             // A protocol-directed drop is committed from the spool's point of
             // view, but intentionally spends neither ingress capacity nor a
             // source-rate token.
+            state.ingest_metrics.record_dropped_by_policy();
             accepted_indices.push(idx);
             continue;
         };
@@ -800,10 +805,12 @@ async fn handle_hook_batch(
         // as committed so the client clears it from its spool, but do not store
         // it. Keeps the contiguous-prefix ack contract intact.
         if should_drop_subagent(&state, &env).await {
+            state.ingest_metrics.record_dropped_by_policy();
             accepted_indices.push(idx);
             continue;
         }
         let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
+            state.ingest_metrics.record_shed_saturated();
             warn!(
                 accepted = accepted_indices.len(),
                 "hook batch ingest saturated; rejecting with 429"
@@ -821,10 +828,12 @@ async fn handle_hook_batch(
             .try_take(&rate_key, std::time::Instant::now())
         {
             drop(permit);
+            state.ingest_metrics.record_shed_rate_limited();
             warn!(accepted = accepted_indices.len(), source = %log_rate_key(&rate_key), "hook batch source rate limited; skipping item and continuing");
             continue;
         }
         let _permit = permit;
+        state.ingest_metrics.record_accepted();
         if let Err(e) = process_authorized(
             &state,
             env,
@@ -848,6 +857,9 @@ async fn handle_hook_batch(
                 Json(HookBatchAck::indexed_failed(accepted_indices, idx)),
             );
         }
+        // Stamped per item, for the same reason `handle_hook` stamps after
+        // `process_envelope`: this is the point the event cleared the writer.
+        state.ingest_metrics.record_persisted(now_unix_ms());
         accepted_indices.push(idx);
     }
     (
@@ -4978,6 +4990,142 @@ mod tests {
             .unwrap();
         let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(ack["accepted"], 2, "both events committed, oldest-first");
+    }
+
+    /// The ingest counters exist to answer "are hooks arriving, is anything
+    /// being shed, is the writer keeping up" (#428). The native drain delivers
+    /// via `/hook/batch`, so a counter only wired into `handle_hook` answers
+    /// that question wrong on the path clients actually use.
+    #[tokio::test]
+    async fn handle_hook_batch_records_accepted_and_persisted() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let metrics = state.ingest_metrics.clone();
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![
+                HookBatchItem {
+                    url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "metrics-s1" }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "metrics-s1", "prompt": "hi" }),
+                },
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.accepted, 2, "both batch items were admitted");
+        assert!(
+            snap.last_persisted_ms.is_some(),
+            "a batch that reached the writer must stamp a write time"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_records_shed_when_saturated() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let metrics = state.ingest_metrics.clone();
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![HookBatchItem {
+                url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                body: serde_json::json!({}),
+            }]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.shed_saturated, 1);
+        assert_eq!(snap.accepted, 0, "a shed item was never admitted");
+    }
+
+    #[tokio::test]
+    async fn handle_hook_batch_records_shed_when_rate_limited() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let mut limiter = IngestRateLimiter::new(0.001, 1.0);
+        assert!(limiter.try_take("u:\ns:flooder", std::time::Instant::now()));
+        state.ingest_rate = Arc::new(tokio::sync::Mutex::new(limiter));
+        let metrics = state.ingest_metrics.clone();
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![HookBatchItem {
+                url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                body: serde_json::json!({ "session_id": "flooder" }),
+            }]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.shed_rate_limited, 1);
+        assert_eq!(snap.accepted, 0);
+    }
+
+    /// Both accept-but-drop branches, in one batch: a client-protocol Drop and
+    /// the subagent tail-drop. They are separate call sites in
+    /// `handle_hook_batch`, so a single-branch case would leave the other
+    /// silently uncounted — the exact failure this change exists to fix.
+    #[tokio::test]
+    async fn handle_hook_batch_records_dropped_by_policy() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let metrics = state.ingest_metrics.clone();
+
+        let response = handle_hook_batch(
+            State(Arc::new(state)),
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![
+                HookBatchItem {
+                    url: "http://h/hook?event=post-tool-use&agent=claude-code".into(),
+                    body: serde_json::json!({
+                        "session_id": "drop-s1", "tool_name": "Write",
+                        "_ai_memory_capture":
+                            capture_protocol("drop", "inactive", "file", 1, "extracted"),
+                    }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
+                    body: serde_json::json!({
+                        "sessionId": "sub-s1", "subagentType": "general-purpose", "toolName": "x"
+                    }),
+                },
+            ]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dropped_by_policy, 2, "accept-but-drop is still a drop");
+        assert_eq!(
+            snap.accepted, 0,
+            "a dropped item spends no ingress capacity"
+        );
     }
 
     /// Recursively scan every file under `dir` for a byte pattern. Used to prove
