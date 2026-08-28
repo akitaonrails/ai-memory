@@ -153,7 +153,11 @@ from hook paths.
    work. It runs last so this run's own evictions and hard-deletes already
    exclude their sessions, deletes in `observation_prune_batch` transactions so
    a multi-million row prune cannot hold the write lock, and repairs
-   `sessions.ended_observation_count` downward in the same transaction. Freed
+   `sessions.ended_observation_count` downward in the same transaction. The
+   prune is irreversible in a specific sense: observations are the input to
+   consolidation, so a pruned session can never be re-consolidated — not with
+   a better model, a better prompt, or a fixed consolidator bug — and its
+   summary page becomes the only surviving account of that session. Freed
    SQLite pages are reused, not returned to the OS: the `.db` file does not
    shrink, the backup tarball does.
    Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks

@@ -2062,7 +2062,7 @@ pub fn prune_consolidated_observations(
                 params![session_id],
             )?;
         }
-        audit(
+        audit_with_detail(
             &tx,
             "prune_observations",
             Some(workspace_id.as_bytes()),
@@ -2070,6 +2070,7 @@ pub fn prune_consolidated_observations(
             None,
             None,
             Timestamp::now().as_microsecond(),
+            &format!("{{\"deleted\":{deleted}}}"),
         )?;
     }
     tx.commit()?;
@@ -2582,9 +2583,35 @@ fn audit(
     author_id: Option<&[u8; 16]>,
     at: i64,
 ) -> StoreResult<()> {
+    audit_with_detail(
+        tx,
+        op,
+        workspace_id,
+        project_id,
+        page_id,
+        author_id,
+        at,
+        "{}",
+    )
+}
+
+/// `audit`, but with a caller-supplied JSON `detail` payload. Exists so a
+/// destructive batch can record what it did (e.g. the observation prune's
+/// deleted-row count) instead of leaving a gap only inferable from timestamps.
+#[allow(clippy::too_many_arguments)]
+fn audit_with_detail(
+    tx: &rusqlite::Transaction<'_>,
+    op: &str,
+    workspace_id: Option<&[u8; 16]>,
+    project_id: Option<&[u8; 16]>,
+    page_id: Option<&[u8; 16]>,
+    author_id: Option<&[u8; 16]>,
+    at: i64,
+    detail: &str,
+) -> StoreResult<()> {
     tx.execute(
         "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, author_id, detail) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}')",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             at,
             op,
@@ -2592,6 +2619,7 @@ fn audit(
             project_id.map(|b| &b[..]),
             page_id.map(|b| &b[..]),
             author_id.map(|b| &b[..]),
+            detail,
         ],
     )?;
     Ok(())

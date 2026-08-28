@@ -286,6 +286,16 @@ async fn only_a_consolidated_session_with_a_live_page_loses_its_observations() {
         3,
         "raw capture whose summary page decay already evicted is the last copy"
     );
+    assert_eq!(
+        conn.query_row(
+            "SELECT detail FROM audit_log WHERE op = 'prune_observations'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .expect("exactly one audit row for the single deleting batch"),
+        "{\"deleted\":3}",
+        "the audit row must record how many rows the batch deleted"
+    );
 }
 
 /// `observations_fts` is `content='observations'`, so a stale index would keep

@@ -45,7 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `idx_observations_project_created` and `idx_observations_session`, both of
   which predate this change.
 
-  The cost is stated rather than hidden: for a pruned session the raw transcript
+  The cost is stated rather than hidden, and it is not just disk: observations
+  are the input to consolidation, so pruning is irreversible — a pruned session
+  can never be re-consolidated (not with a better model, a better prompt, or a
+  fixed consolidator bug) and its summary page becomes the only surviving
+  account of that session. Concretely: the raw transcript
   view returns empty, `raw_hits` can no longer match the exact original wording,
   a manual auto-improve rerun rejects with `too_few_observations`, and a
   `move_session` with `PagesMode::Regenerate` has nothing left to rebuild the
