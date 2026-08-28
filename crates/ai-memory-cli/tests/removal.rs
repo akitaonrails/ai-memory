@@ -472,7 +472,7 @@ fn uninstall_antigravity_hooks_preserves_user_entries() {
 fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();
-    let config = home.path().join(".gemini/antigravity-cli");
+    let config = home.path().join(".gemini/config");
     std::fs::create_dir_all(&config).unwrap();
     let mcp = config.join("mcp_config.json");
     std::fs::write(

@@ -1233,7 +1233,7 @@ pub enum McpClient {
     /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`.
     #[value(alias = "oh-my-pi")]
     Omp,
-    /// Google Antigravity CLI (`agy`) — `~/.gemini/antigravity-cli/mcp_config.json`.
+    /// Google Antigravity CLI (`agy`) — `~/.gemini/config/mcp_config.json`.
     #[value(alias = "antigravity", alias = "agy")]
     AntigravityCli,
     /// Zero coding agent (Gitlawb/zero) — `~/.config/zero/config.json`,
