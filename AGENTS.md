@@ -178,7 +178,7 @@ crates/
 ├── ai-memory-workstream/  read-only native transcript + launch adapters (`ai-memory run`).
 └── ai-memory-cli/         `ai-memory` binary entry point + thin HTTP subcommands.
 evals/                     live A/B harness; workspace member, not shipped.
-companions/ai-memory-importer/  standalone OMC wiki importer; NOT a root
+companions/ai-memory-importer/  standalone OMC + external-conversation importer; NOT a root
                            workspace member — build/test it with
                            `--manifest-path companions/ai-memory-importer/Cargo.toml`.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
