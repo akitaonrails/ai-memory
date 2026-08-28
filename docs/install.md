@@ -1709,6 +1709,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
+| `workstreams [--workspace NAME] [--project NAME] [--limit N] [--json]` | host wrapper or native binary | List recent workstreams selectable from the current checkout, including current selection and linked harnesses, without exposing paths or native session ids |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki FTS5 search + bounded source authority; use MCP `memory_query` for entity/graph/vector RRF |
@@ -2001,11 +2002,11 @@ warns that relabeling system directories such as `/home` can make the host
 inoperable. Docker documents `label=disable` in the
 [`docker run` security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt).
 
-`ai-memory run`, `ai-memory show`, and `ai-memory continue` are the exceptions:
-the current wrapper intercepts them and starts a cached checksum-verified native
-client on the host, where local checkouts, harness executables, and session
-stores exist. It preserves an explicit remote `AI_MEMORY_SERVER_URL`. If one of
-these commands logs
+`ai-memory run`, `ai-memory show`, `ai-memory continue`, and
+`ai-memory workstreams` are the exceptions: the current wrapper intercepts them
+and starts a cached checksum-verified native client on the host, where local
+checkouts, harness executables, and session stores exist. It preserves an
+explicit remote `AI_MEMORY_SERVER_URL`. If one of these commands logs
 `data_dir=/data`, cannot find a checkout, or cannot find `codex`, `claude`, or
 another host executable, refresh the stale wrapper with `ai-memory upgrade` on
 that client machine.

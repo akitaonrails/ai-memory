@@ -251,6 +251,39 @@ pub struct ManagedRunStatus {
     pub state: String,
 }
 
+/// Checkout identity used by read-only managed-workstream discovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListManagedWorkstreamsRequest {
+    /// Workspace name resolved by the host CLI.
+    pub workspace: String,
+    /// Project name resolved by the host CLI.
+    pub project: String,
+    /// Stable repository identity hash.
+    pub repo_fingerprint: String,
+    /// Stable worktree identity hash (distinct across linked worktrees).
+    pub worktree_fingerprint: String,
+    /// Maximum number of workstreams to return.
+    pub limit: usize,
+}
+
+/// One checkout-local managed workstream returned by discovery reads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedWorkstreamSummary {
+    /// Stable workstream identifier used by explicit ledger search.
+    pub workstream_id: WorkstreamId,
+    /// Human-readable name accepted by `ai-memory run --workstream`.
+    pub name: String,
+    /// Creation timestamp in RFC 3339 form.
+    pub created_at: String,
+    /// Most recent selection or transcript-import timestamp in RFC 3339 form.
+    pub last_active_at: String,
+    /// Whether bare `ai-memory run` currently selects this workstream.
+    pub current: bool,
+    /// Harnesses with a current native session linked to this workstream.
+    #[serde(default)]
+    pub linked_harnesses: Vec<AgentKind>,
+}
+
 /// Stored workstream event returned by history reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkstreamEvent {
