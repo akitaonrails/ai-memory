@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP 400 and disappear from memory while ASCII events still worked. A native
   Windows loopback test now round-trips Chinese and Portuguese text byte for
   byte (#500).
+- The `ingest (server, this process)` counters in `ai-memory status` now move
+  for events delivered over `POST /hook/batch`. They were instrumented only in
+  the per-event `POST /hook` handler, while the spool drain posts batches and
+  falls back to `/hook` only against a pre-upgrade server, so a current client
+  against a current server left the whole section reading `accepted 0`,
+  `last write: -` and zero sheds while observations were landing normally — the
+  section exists precisely to tell "hooks are not arriving" apart from "hooks
+  are arriving but nothing is stored", and it reported the same thing for both.
+  A batch 429 also now counts every item it rejects, not just the one that
+  found no permit, so shed volume is comparable between the two routes instead
+  of understated by up to the batch size (#516).
+- `last write` in the same section now advances only when an event actually
+  cleared the writer. `handle_hook` stamped it unconditionally after processing
+  returned, and processing swallows its errors, so a store rejecting every
+  event — read-only database, exhausted disk, a failed migration — still
+  reported a fresh write time and looked healthy (#516).
 
 ## [1.32.2] - 2026-08-26
 

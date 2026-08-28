@@ -650,7 +650,7 @@ async fn handle_hook(
     tokio::spawn(async move {
         let _permit = permit;
         let metrics = state.ingest_metrics.clone();
-        process_envelope(
+        let persisted = process_envelope(
             state,
             env,
             actor,
@@ -658,12 +658,15 @@ async fn handle_hook(
             skip_webhooks,
         )
         .await;
-        // Stamped after `process_envelope` returns, which is the point the
-        // event has been through the writer. This is the signal an operator
-        // uses to tell "hooks are arriving but nothing is landing" from
-        // "nothing is arriving" — the two look identical from the accepted
-        // count alone.
-        metrics.record_persisted(now_unix_ms());
+        // Stamped only when `process_envelope` actually cleared the writer.
+        // This is the signal an operator uses to tell "hooks are arriving but
+        // nothing is landing" from "nothing is arriving" — the two look
+        // identical from the accepted count alone — so a failed write must
+        // NOT advance it, or a store that is rejecting every event still
+        // reads as a healthy writer in `ai-memory status`.
+        if persisted {
+            metrics.record_persisted(now_unix_ms());
+        }
     });
     (StatusCode::ACCEPTED, "queued")
 }
@@ -782,8 +785,8 @@ async fn handle_hook_batch(
     let actor = actor_identity(actor_ext);
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
-    let total_items = items.len();
     let mut accepted_indices = Vec::new();
+    let total_items = items.len();
     for (idx, mut item) in items.into_iter().enumerate() {
         // Same unconditional assistant-message backstop as `handle_hook`, applied
         // per item before the envelope is built (#196).
@@ -2209,13 +2212,17 @@ fn sticky_cwd_admits(
             && meaningful_session_anchor(session_cwd, home_dir).is_some())
 }
 
+/// Returns `true` when the event cleared the writer, so the caller can stamp
+/// the ingest "last write" metric. A rejected or failed event returns `false`:
+/// nothing was persisted, and pretending otherwise hides exactly the outage
+/// the metric exists to expose.
 async fn process_envelope(
     state: Arc<HookState>,
     env: HookEnvelope,
     actor: Option<IdentityKey>,
     level: ai_memory_core::AuthLevel,
     skip_webhooks: Vec<String>,
-) {
+) -> bool {
     if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks).await {
         if matches!(
             e.downcast_ref::<StoreError>(),
@@ -2225,7 +2232,9 @@ async fn process_envelope(
         } else {
             warn!(error = %e, "hook processing failed");
         }
+        return false;
     }
+    true
 }
 
 async fn enqueue_session_end_consolidation(
@@ -5132,6 +5141,78 @@ mod tests {
         assert_eq!(
             snap.accepted, 0,
             "a dropped item spends no ingress capacity"
+        );
+    }
+
+    /// `last_persisted_ms` is the one signal that separates "hooks are
+    /// arriving but nothing is landing" from "nothing is arriving". Stamping
+    /// it for an event that failed inside the writer collapses those two
+    /// states again: a store rejecting every event would still report a fresh
+    /// last write in `ai-memory status`.
+    #[tokio::test]
+    async fn handle_hook_does_not_stamp_last_write_when_processing_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        // One permit, so re-acquiring it below blocks until the spawned task
+        // has finished (and therefore past the metric stamp).
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let metrics = state.ingest_metrics.clone();
+        let semaphore = state.ingest_semaphore.clone();
+
+        // A UserPrompt with no session id fails inside `process_authorized`.
+        let response = handle_hook(
+            State(Arc::new(state)),
+            Query(HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            HeaderMap::new(),
+            Json(serde_json::json!({ "prompt": "missing session fails" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        drop(semaphore.acquire().await.unwrap());
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.accepted, 1, "the event was admitted");
+        assert_eq!(
+            snap.last_persisted_ms, None,
+            "an event that failed in the writer never reached durable storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_hook_stamps_last_write_when_processing_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let metrics = state.ingest_metrics.clone();
+        let semaphore = state.ingest_semaphore.clone();
+
+        let response = handle_hook(
+            State(Arc::new(state)),
+            Query(HookQuery {
+                event: "session-start".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            HeaderMap::new(),
+            Json(serde_json::json!({ "session_id": "persist-s1" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        drop(semaphore.acquire().await.unwrap());
+
+        assert!(
+            metrics.snapshot().last_persisted_ms.is_some(),
+            "a stored event must stamp a write time"
         );
     }
 
