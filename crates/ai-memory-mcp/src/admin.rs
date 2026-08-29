@@ -388,6 +388,19 @@ struct CuratorStageResponse {
     report: CuratorReport,
 }
 
+/// Query for `GET /admin/handoffs` (#513).
+#[derive(Debug, Deserialize)]
+struct OpenHandoffsQuery {
+    workspace: String,
+    project: String,
+    #[serde(default = "default_open_handoffs_limit")]
+    limit: usize,
+}
+
+const fn default_open_handoffs_limit() -> usize {
+    50
+}
+
 #[derive(Debug, Deserialize)]
 struct PendingWritesQuery {
     workspace: String,
@@ -551,6 +564,7 @@ pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -
             post(handle_auto_improve_report),
         )
         .route("/admin/curator", post(handle_curator))
+        .route("/admin/handoffs", get(handle_open_handoffs_list))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
             "/admin/pending-writes/{id}",
@@ -2222,6 +2236,38 @@ fn curator_target_path() -> String {
 fn auto_improve_report_target_path() -> String {
     let stamp = jiff::Timestamp::now().as_microsecond();
     format!("notes/auto-improve-report-{stamp}.md")
+}
+
+/// List open handoffs so an operator can cancel one (#513).
+///
+/// `memory_handoff_cancel` requires an exact id and nothing exposed one, so a
+/// backlog showed up as a count in `status` and could not be addressed.
+/// Read-only, oldest first, and content-free: identity, provenance and age,
+/// never the handoff body.
+async fn handle_open_handoffs_list(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<OpenHandoffsQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let limit = query.limit.clamp(1, 500);
+    match state
+        .reader
+        .open_handoffs_for_project(ws, proj, limit)
+        .await
+    {
+        Ok(handoffs) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "handoffs": handoffs })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
 }
 
 async fn handle_pending_writes_list(

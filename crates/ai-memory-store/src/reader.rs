@@ -3586,6 +3586,63 @@ impl ReaderPool {
     /// descriptor column there would compute one for the whole corpus on
     /// every search. Here the input is only the handful of ids that survived
     /// fusion and still lack a title.
+    /// Open handoffs for a project, oldest first (#513).
+    ///
+    /// `memory_handoff_cancel` takes an exact id and nothing exposed one, so a
+    /// backlog could be observed in `status` counts but never addressed. Oldest
+    /// first because the operator's question is "what is stale", and the
+    /// automatic expiry deliberately spares manual and sibling-directory
+    /// handoffs — which is how a months-old entry survives to be listed here.
+    pub async fn open_handoffs_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<OpenHandoff>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, from_agent, to_agent, cwd, created_at \
+                 FROM handoffs \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open' \
+                 ORDER BY created_at ASC, id ASC \
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                ],
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    Ok((
+                        id,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, from_agent, to_agent, cwd, created_at) = row?;
+                let Ok(id) = HandoffId::from_slice(&id) else {
+                    continue;
+                };
+                out.push(OpenHandoff {
+                    id: id.to_string(),
+                    from_agent,
+                    to_agent,
+                    cwd,
+                    created_at_ms: created_at / 1_000,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn page_descriptors_for_ids(
         &self,
         workspace_id: WorkspaceId,
@@ -7427,6 +7484,20 @@ fn slot_exclusion_sql(
 /// a server behind a trusted proxy what follows the prefix is whatever
 /// `X-Memory-Actor-Sub` carried — an OIDC subject the engine never parses — so
 /// nothing upstream constrains its characters.
+/// One open handoff, as an operator needs to see it to decide what to cancel.
+///
+/// Content-free by construction: identity, provenance and age only. The
+/// summary body is deliberately absent — this exists so
+/// `memory_handoff_cancel` has an id to be given, not to render the handoff.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpenHandoff {
+    pub id: String,
+    pub from_agent: String,
+    pub to_agent: Option<String>,
+    pub cwd: Option<String>,
+    pub created_at_ms: i64,
+}
+
 fn handoff_owner_sql(filter: &OwnerFilter, param_index: usize) -> (String, Option<String>) {
     match filter {
         OwnerFilter::Any => (String::new(), None),

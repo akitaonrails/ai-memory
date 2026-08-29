@@ -43,6 +43,8 @@ pub enum Command {
     /// Resume the most recently launched managed checkout from anywhere,
     /// without `cd` and without picking from a list.
     Continue(ContinueArgs),
+    /// List open cross-agent handoffs so a stale one can be cancelled by id.
+    Handoffs(HandoffsArgs),
     /// List recent managed workstreams selectable from the current checkout.
     Workstreams(WorkstreamsArgs),
     /// Search the complete visible event ledger for a managed workstream.
@@ -307,6 +309,23 @@ pub struct ContinueArgs {
 }
 
 /// Arguments for `workstreams`.
+/// Arguments for `handoffs`.
+#[derive(Debug, Args)]
+pub struct HandoffsArgs {
+    /// Workspace to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Maximum handoffs to list.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=500))]
+    pub limit: u16,
+    /// Emit JSON instead of the human listing.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Debug, Args)]
 pub struct WorkstreamsArgs {
     /// Workspace containing the managed workstreams. Defaults to the nearest

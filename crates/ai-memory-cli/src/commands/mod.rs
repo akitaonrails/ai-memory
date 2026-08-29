@@ -22,6 +22,7 @@ pub mod embed;
 pub mod finalize_session;
 pub mod forget_sweep;
 pub mod generate_auth_token;
+pub mod handoffs;
 pub mod hook;
 pub mod hook_capture;
 pub mod hook_drain_process;

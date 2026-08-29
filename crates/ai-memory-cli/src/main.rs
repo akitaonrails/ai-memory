@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Handoffs(args) => commands::handoffs::run(&config, args).await,
         Command::Workstreams(args) => commands::workstreams::run(&config, args).await,
         Command::WorkstreamSearch(args) => commands::workstream_search::run(&config, args).await,
         Command::AuditContamination(args) => {

@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path now targets `~/.gemini/config/mcp_config.json`, which also matches the
   hooks integration (`~/.gemini/config/hooks.json`) (#510).
 
+### Added
+- `ai-memory handoffs` lists the open cross-agent handoffs for a project,
+  oldest first, with the id `memory_handoff_cancel` requires. A backlog was
+  previously visible only as a count in `status`: nothing exposed an id, so the
+  one available remedy could not be used. Read-only and content-free —
+  identity, provenance and age, never the handoff body. Automatic expiry
+  deliberately spares manual and sibling-directory handoffs, so a months-old
+  entry appearing here is that policy working as intended; the listing exists
+  so an operator can see it and decide (#513).
+
 ## [1.34.0] - 2026-08-28
 
 ### Added
