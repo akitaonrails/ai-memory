@@ -198,7 +198,7 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         McpClient::Omp => home()?.join(".omp").join("agent").join("mcp.json"),
         McpClient::AntigravityCli => home()?
             .join(".gemini")
-            .join("antigravity-cli")
+            .join("config")
             .join("mcp_config.json"),
         // Zero resolves its user config under $XDG_CONFIG_HOME falling back
         // to ~/.config; we target the default and --config-file covers
@@ -1147,7 +1147,7 @@ fn render_omp(args: &InstallMcpArgs) -> Result<String> {
 
 fn render_antigravity_cli(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
-        "# Antigravity CLI (`agy`) — merge into ~/.gemini/antigravity-cli/mcp_config.json:\n\
+        "# Antigravity CLI (`agy`) — merge into ~/.gemini/config/mcp_config.json:\n\
          #\n\
          # Antigravity CLI uses `serverUrl` (not `url` or `httpUrl`) for\n\
          # streamable-HTTP endpoints. The `timeout` is in milliseconds.\n\
@@ -1887,6 +1887,12 @@ mod tests {
         assert!(pi.contains("~/.pi/agent/extensions/ai-memory.ts"));
         assert!(!pi.contains("~/.omp"));
         assert!(render_for_test(McpClient::AntigravityCli).contains("\"serverUrl\""));
+        // The snippet must point at the documented global config, not the
+        // internal ~/.gemini/antigravity-cli/ data dir (#510).
+        assert!(
+            render_for_test(McpClient::AntigravityCli).contains("~/.gemini/config/mcp_config.json")
+        );
+        assert!(!render_for_test(McpClient::AntigravityCli).contains("~/.gemini/antigravity-cli/"));
         let devin = render_for_test(McpClient::Devin);
         assert!(devin.contains("\"mcpServers\""));
         assert!(devin.contains("\"url\""));
@@ -1955,6 +1961,23 @@ mod tests {
         let default = home_dir().unwrap().join(".kiro");
         assert_eq!(kiro_home(Some("".into())).unwrap(), default);
         assert_eq!(kiro_home(None).unwrap(), default);
+    }
+
+    /// Pin the Antigravity CLI config destination to the documented global
+    /// config at ~/.gemini/config/mcp_config.json. ~/.gemini/antigravity-cli/
+    /// is Antigravity's internal data dir and only holds a copy Antigravity
+    /// itself writes, so a registration there works by coincidence on an
+    /// established install and is silently ignored on a fresh one (#510).
+    #[test]
+    fn antigravity_cli_mcp_config_path_pins_documented_location() {
+        assert_eq!(
+            mcp_config_path(McpClient::AntigravityCli).unwrap(),
+            home_dir()
+                .unwrap()
+                .join(".gemini")
+                .join("config")
+                .join("mcp_config.json")
+        );
     }
 
     /// Pin the append rules: `?` on a bare endpoint, `&` with an existing

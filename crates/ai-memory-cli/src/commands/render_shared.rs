@@ -1399,7 +1399,8 @@ fn hook_command(
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
             let mut cmd = format!(
-                "{}{} hook --event {event} --agent {agent} --server-url {}",
+                "{}{}{} hook --event {event} --agent {agent} --server-url {}",
+                powershell_call_operator(context.agent),
                 win_double_quote(&exe),
                 native_data_dir_arg(context.data_dir, NativeQuote::Windows),
                 win_double_quote(server_url),
@@ -1587,8 +1588,70 @@ fn powershell_quote(s: &str) -> String {
 /// Bash. The quoted values (binary path, URL, hex auth token) never
 /// contain a literal `"`; any is stripped defensively rather than risk a
 /// broken command line.
+/// `& ` when this agent's Windows hook command is evaluated by PowerShell,
+/// otherwise empty.
+///
+/// `win_double_quote` wraps the executable path because cmd.exe needs it —
+/// see the note on that function. PowerShell parses a quoted literal in
+/// command position as a *string expression* rather than an invocation, so
+/// the same quoting that makes the command correct under cmd.exe makes it a
+/// no-op that exits 1 with a ParserError under PowerShell. Every Codex hook
+/// died that way on Windows (#515).
+///
+/// Deliberately an allowlist keyed on the agent, not a global change. The
+/// call operator is **not** valid under cmd.exe, where `&` separates
+/// commands — emitting it for Claude Code would break the integration that
+/// works today. An agent joins this list only once its runner has been
+/// observed, because both the failure and the false fix are silent: a wrong
+/// answer either way produces a hook that installs cleanly and captures
+/// nothing.
+fn powershell_call_operator(agent: &str) -> &'static str {
+    // Codex evaluates `~/.codex/hooks.json` command strings with PowerShell
+    // on Windows (#515, reproduced against Codex CLI on a native install).
+    if agent == "codex" { "& " } else { "" }
+}
+
 fn win_double_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', ""))
+}
+
+/// #515: Codex evaluates its Windows hook command with PowerShell, where a
+/// quoted path in command position is a string expression rather than an
+/// invocation — every hook exited 1 with a ParserError. The call operator
+/// fixes that, and must NOT appear for a cmd.exe runner, where `&`
+/// separates commands and would break a working integration.
+#[test]
+fn codex_windows_command_invokes_rather_than_quotes() {
+    let cmd = hook_command(
+        Path::new("stop.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(HookCommandPlatform::WindowsNative, "codex", None, None),
+    );
+    assert!(
+        cmd.starts_with("& \""),
+        "codex must use the call operator: {cmd}"
+    );
+}
+
+#[test]
+fn claude_code_windows_command_is_unchanged_by_the_codex_fix() {
+    let cmd = hook_command(
+        Path::new("stop.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "claude-code",
+            None,
+            None,
+        ),
+    );
+    assert!(
+        !cmd.starts_with("&"),
+        "cmd.exe treats `&` as a separator; claude-code must keep the bare quoted path: {cmd}"
+    );
+    assert!(cmd.starts_with('"'), "expected a quoted exe path: {cmd}");
 }
 
 #[cfg(test)]

@@ -2545,6 +2545,90 @@ mod tests {
         "2. Make the backpressure test deterministic\n",
     );
 
+    /// #513: `memory_handoff_cancel` takes an exact id and nothing exposed
+    /// one, so an accumulated backlog was visible as a count and impossible
+    /// to address. Oldest-first because the operator's question is which are
+    /// stale.
+    #[tokio::test]
+    async fn open_handoffs_are_listed_oldest_first_and_exclude_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let new_handoff = |agent: AgentKind| NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: agent,
+            to_agent: None,
+            cwd: None,
+            summary: "continue".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: None,
+        };
+        let first = store
+            .writer
+            .insert_handoff(new_handoff(AgentKind::ClaudeCode))
+            .await
+            .unwrap();
+        let second = store
+            .writer
+            .insert_handoff(new_handoff(AgentKind::Codex))
+            .await
+            .unwrap();
+
+        let open = store
+            .reader
+            .open_handoffs_for_project(ws, proj, 50)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 2, "both handoffs are open");
+        assert_eq!(
+            open[0].id,
+            first.to_string(),
+            "oldest first: {:?}",
+            open.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+        assert_eq!(open[1].id, second.to_string());
+        assert_eq!(open[0].from_agent, "claude-code");
+        assert_eq!(open[1].from_agent, "codex");
+
+        // The listing must answer "what is still pending", so an accepted
+        // handoff has to drop out — otherwise it re-proposes work already
+        // taken, which is the failure the backlog already causes.
+        store
+            .writer
+            .accept_handoff(HandoffAcceptance {
+                handoff_id: first,
+                workspace_id: ws,
+                project_id: proj,
+                accepting_agent: AgentKind::Codex,
+                accepting_session: None,
+                accepting_user: None,
+                owner_filter: ai_memory_core::OwnerFilter::Any,
+                receiving_cwd: None,
+            })
+            .await
+            .unwrap();
+        let open = store
+            .reader
+            .open_handoffs_for_project(ws, proj, 50)
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1, "the accepted handoff must not be listed");
+        assert_eq!(open[0].id, second.to_string());
+    }
+
     #[tokio::test]
     async fn a_written_summary_changes_what_the_descriptor_tells_the_reader() {
         let tmp = TempDir::new().unwrap();

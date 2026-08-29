@@ -58,6 +58,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file will not shrink after the first prune — the `ai-memory backup` tarball
   will, because it is a fresh online copy.
 
+### Fixed
+- The CHANGELOG frozen-section check no longer fires on a branch that merged
+  `main` after a release. It compared line ranges since the merge base, so a
+  newly released section arriving through the merge read as lines the branch
+  had touched. It now compares the released half of the file directly against
+  the base branch, which is the question it was always asking. Two pipelines
+  also exited 141 under `pipefail` when `head -1` and `grep -q` closed a pipe
+  early, so the check reported "HEAD predates" on a branch that did not.
+
+## [1.35.0] - 2026-08-29
+
+### Added
+- `ai-memory handoffs` lists the open cross-agent handoffs for a project,
+  oldest first, with the id `memory_handoff_cancel` requires. A backlog was
+  previously visible only as a count in `status`: nothing exposed an id, so the
+  one available remedy could not be used. Read-only and content-free —
+  identity, provenance and age, never the handoff body. Automatic expiry
+  deliberately spares manual and sibling-directory handoffs, so a months-old
+  entry appearing here is that policy working as intended; the listing exists
+  so an operator can see it and decide (#513).
+
+### Fixed
+- Documented `ai-memory handoffs`. It shipped listed only in the
+  ARCHITECTURE subcommand block, which a guard test enforces — so the command
+  satisfied the check for being *present* without anyone being told what it
+  does. README and the MCP tool table now name it beside
+  `memory_handoff_cancel`, which is the tool it exists to make usable.
+- Made every "how long ago" in the CLI read the same way. Four separate
+  renderers had accumulated — `show`, `run`, `workstreams` and `handoffs` —
+  so the same elapsed time appeared as `3 hours ago`, `3h ago` or `74 days
+  ago` depending on which command produced it. They now share one helper, and
+  a long-idle native session reads `2 months ago` in `run` as it already did
+  elsewhere. `status`'s spool line is deliberately untouched: it renders a
+  duration (`oldest: 2h 10m`), not an "ago", and answers a different question.
+- `install-mcp --client antigravity-cli` wrote to `~/.gemini/antigravity-cli/mcp_config.json`,
+  but the Antigravity CLI documents its global MCP config at
+  `~/.gemini/config/mcp_config.json`; the `antigravity-cli/` directory is its
+  internal data dir and only holds an internal copy of the file. The default
+  path now targets `~/.gemini/config/mcp_config.json`, which also matches the
+  hooks integration (`~/.gemini/config/hooks.json`) (#510).
+- `install-hooks --agent codex --apply` produced a Windows command every Codex
+  hook rejected. Codex evaluates its `hooks.json` command strings with
+  PowerShell, where a quoted path in command position is a string expression
+  rather than an invocation, so each hook exited 1 with a ParserError and
+  captured nothing. The command now carries PowerShell's `&` call operator.
+  Scoped to Codex deliberately: `&` separates commands under cmd.exe, which is
+  what Claude Code's runner uses, so applying it everywhere would break the
+  integration that works today. A rendering test pins both directions, and
+  `uninstall` still recognises the new form (#515).
+
 ## [1.34.0] - 2026-08-28
 
 ### Added
@@ -3970,7 +4020,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.34.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.35.0...HEAD
+[1.35.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.35.0
 [1.34.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.34.0
 [1.33.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.1
 [1.33.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.0

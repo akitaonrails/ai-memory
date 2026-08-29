@@ -225,6 +225,10 @@ priors are at the [bottom](#influences-and-prior-art).
 
   # List the workstreams that can be selected from this checkout.
   ai-memory workstreams
+
+  # List open cross-agent handoffs, oldest first, with the id
+  # `memory_handoff_cancel` needs to clear a stale one.
+  ai-memory handoffs
   ```
 
 - **"Pick the project instead of remembering where it lives."** Start from a
