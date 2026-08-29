@@ -1102,6 +1102,7 @@ async fn start_maintenance_scheduler(
                         Ok(outcome) => info!(
                             scopes = outcome.scopes,
                             embedded = outcome.embedded,
+                            skipped = outcome.skipped,
                             failed = outcome.failed,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
@@ -1299,6 +1300,10 @@ async fn run_scheduled_lint_tick(
 struct ScheduledEmbeddingBackfillTickOutcome {
     scopes: usize,
     embedded: usize,
+    /// Pages that already had a current embedding. Reported because a
+    /// tick that skipped everything and a tick that had nothing to do
+    /// are otherwise indistinguishable in the log.
+    skipped: usize,
     failed: usize,
     errors: usize,
 }
@@ -1329,6 +1334,7 @@ async fn run_scheduled_embedding_backfill_tick(
         {
             Ok(counts) => {
                 outcome.embedded += counts.embedded;
+                outcome.skipped += counts.skipped;
                 outcome.failed += counts.failed;
             }
             Err(e) => {
@@ -2636,6 +2642,58 @@ mod tests {
                 .unwrap();
             assert_eq!(embedded.len(), 1, "each project should get embeddings");
         }
+    }
+
+    /// A tick that skipped every page and a tick that had nothing to do
+    /// both embed zero pages. Without `skipped` in the completion line
+    /// they are the same log entry, so a page being passed over every
+    /// hour reads as a quiet, healthy scheduler (#509).
+    #[tokio::test]
+    async fn scheduled_embedding_tick_distinguishes_skipped_work_from_an_idle_pass() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        let embedder: Arc<dyn Embedder> = Arc::new(SyntheticEmbedder::new(16));
+
+        let idle =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!(
+            (idle.embedded, idle.skipped),
+            (0, 0),
+            "no pages yet: nothing embedded and nothing skipped"
+        );
+
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Semantic,
+            )
+            .await;
+        }
+
+        let first_pass =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!((first_pass.embedded, first_pass.skipped), (2, 0));
+
+        let second_pass =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!(
+            (second_pass.embedded, second_pass.failed),
+            (0, 0),
+            "the work is done, so the tick embeds nothing"
+        );
+        assert_eq!(
+            second_pass.skipped, 2,
+            "but it must still say it passed over two pages, or it is              indistinguishable from the idle tick above"
+        );
     }
 
     #[test]

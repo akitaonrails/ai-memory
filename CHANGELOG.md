@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The scheduled embedding backfill now reports how many pages it skipped.
+  It logged `embedded`, `failed` and `errors`, so a tick that passed over
+  every page and a tick with nothing to do produced the same completion
+  line — a page being skipped once an hour was indistinguishable from a
+  quiet, healthy scheduler. The count was already being returned by the
+  backfill and discarded at the caller. Reported by @barrosohub, who also
+  read the source to narrow it down (#509).
+
 ## [1.35.0] - 2026-08-29
 
 ### Added
