@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- `install-mcp --client antigravity-cli` wrote to `~/.gemini/antigravity-cli/mcp_config.json`,
-  but the Antigravity CLI documents its global MCP config at
-  `~/.gemini/config/mcp_config.json`; the `antigravity-cli/` directory is its
-  internal data dir and only holds an internal copy of the file. The default
-  path now targets `~/.gemini/config/mcp_config.json`, which also matches the
-  hooks integration (`~/.gemini/config/hooks.json`) (#510).
-
 ### Added
 - `ai-memory handoffs` lists the open cross-agent handoffs for a project,
   oldest first, with the id `memory_handoff_cancel` requires. A backlog was
@@ -24,6 +16,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately spares manual and sibling-directory handoffs, so a months-old
   entry appearing here is that policy working as intended; the listing exists
   so an operator can see it and decide (#513).
+
+### Fixed
+- `install-mcp --client antigravity-cli` wrote to `~/.gemini/antigravity-cli/mcp_config.json`,
+  but the Antigravity CLI documents its global MCP config at
+  `~/.gemini/config/mcp_config.json`; the `antigravity-cli/` directory is its
+  internal data dir and only holds an internal copy of the file. The default
+  path now targets `~/.gemini/config/mcp_config.json`, which also matches the
+  hooks integration (`~/.gemini/config/hooks.json`) (#510).
+- `install-hooks --agent codex --apply` produced a Windows command every Codex
+  hook rejected. Codex evaluates its `hooks.json` command strings with
+  PowerShell, where a quoted path in command position is a string expression
+  rather than an invocation, so each hook exited 1 with a ParserError and
+  captured nothing. The command now carries PowerShell's `&` call operator.
+  Scoped to Codex deliberately: `&` separates commands under cmd.exe, which is
+  what Claude Code's runner uses, so applying it everywhere would break the
+  integration that works today. A rendering test pins both directions, and
+  `uninstall` still recognises the new form (#515).
 
 ## [1.34.0] - 2026-08-28
 
