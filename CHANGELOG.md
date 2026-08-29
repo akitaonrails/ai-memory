@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so an operator can see it and decide (#513).
 
 ### Fixed
+- The CHANGELOG frozen-section check no longer fires on a branch that merged
+  `main` after a release. It compared line ranges since the merge base, so a
+  newly released section arriving through the merge read as lines the branch
+  had touched. It now compares the released half of the file directly against
+  the base branch, which is the question it was always asking. Two pipelines
+  also exited 141 under `pipefail` when `head -1` and `grep -q` closed a pipe
+  early, so the check reported "HEAD predates" on a branch that did not.
 - Documented `ai-memory handoffs`. It shipped listed only in the
   ARCHITECTURE subcommand block, which a guard test enforces — so the command
   satisfied the check for being *present* without anyone being told what it
