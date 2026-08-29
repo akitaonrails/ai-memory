@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- ZCode (z.ai) lifecycle-hook integration as `install-hooks --agent zcode`
+  (alias `zai`), following the Zero model: exec-form native commands
+  (`type: "process"`, no shell) merged into the root `hooks` block of
+  `~/.zcode/cli/config.json` around third-party hooks, covering the six
+  documented triggers (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `Stop`) with capture exclusions
+  enforced natively (#512). `PermissionRequest` is deliberately not
+  installed — its hook chain races the interactive permission client, so
+  passive capture of that event is unreliable — and there is no true
+  session-end, so finished sessions are closed with
+  `ai-memory finalize-session --agent zcode`. Unlike Pool and Zero,
+  `SessionStart` stdout injection works
+  (`hookSpecificOutput.additionalContext`, verified live against the
+  embedded engine v0.16.5), so the prior session's handoff is delivered
+  automatically.
+
 ## [1.36.0] - 2026-08-29
 
 ### Added

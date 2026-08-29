@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, Pool, ZCode, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -1034,6 +1034,56 @@ handoff via the MCP `memory_handoff_accept` tool. No first-party
 `install-mcp` client and no managed workstream (`ai-memory run pool`) are
 claimed: Pool's native session-store contract is not demonstrated, per
 [managed-harness contributions](managed-harness-contributions.md).
+
+### ZCode (z.ai)
+
+ZCode wires lifecycle hooks in the root `hooks` block of
+`~/.zcode/cli/config.json` — the same file that holds its other CLI
+registration. `install-hooks --agent zcode` (alias `zai`) merges ai-memory's
+entries into that block around any third-party hooks you already have, and is
+idempotent: re-running strips only ai-memory's own entries (marked by
+`statusMessage: "ai-memory capture"`) and rewrites them in place.
+
+```bash
+ai-memory install-hooks --agent zcode --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+
+# Preview the exact hooks block without writing anything:
+ai-memory install-hooks --agent zcode \
+    --server-url "http://homelab:49374"
+```
+
+Entries are exec-form `{"type": "process", "command": <ai-memory>, "args":
+[…]}` — ZCode spawns them with the event JSON on stdin and no shell, which the
+native `ai-memory hook` command reads directly, so the local spool, bearer
+auth, and `[capture] ignore_paths` exclusions all apply. Every emitted key is
+from ZCode's documented hook schema (`type`, `command`, `args`, `enabled`,
+`timeoutMs`, `statusMessage`); ZCode drops entries carrying undocumented keys,
+so none are emitted. Six documented triggers are wired: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and
+`Stop` (verified live against the embedded engine v0.16.5).
+`PostToolUseFailure` fires *instead of* `PostToolUse` when a tool throws and
+is forwarded onto the same capture channel with the error preserved as the
+observation outcome. `PermissionRequest` is deliberately not installed: its
+hook chain races the interactive permission client, and a fast client decision
+aborts the losing hook, so passive capture of that event is unreliable by
+design.
+
+ZCode injects `SessionStart` stdout as model context
+(`hookSpecificOutput.additionalContext`), so unlike Pool, Zero, and Grok the
+prior session's handoff is delivered automatically at session start. There is
+no true session-end event — `Stop` fires at the end of every turn — so close
+finished sessions explicitly; use the exact id when several ZCode sessions are
+open in the same project:
+
+```bash
+ai-memory finalize-session --agent zcode
+ai-memory finalize-session --agent zcode --session-id <uuid>
+```
+
+No first-party `install-mcp` client and no managed workstream
+(`ai-memory run zcode`) are claimed yet.
 
 ### OpenCode
 

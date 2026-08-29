@@ -806,6 +806,73 @@ mod tests {
     }
 
     #[test]
+    fn v50_to_v51_preserves_session_state_and_accepts_zcode() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 50).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, ended_at, \
+              ended_observation_count, actor_user) \
+             VALUES (?1, ?2, ?3, 'pool', '/repo', 1, 2, 7, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, ended_observation_count, actor_user \
+                 FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("pool".into(), "/repo".into(), 7, Some("user:alice".into()))
+        );
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Zcode,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
+
+        for name in [
+            "idx_sessions_open_owner",
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            let kind = if name.starts_with("idx_") {
+                "index"
+            } else {
+                "trigger"
+            };
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+    }
+
+    #[test]
     fn v48_to_v49_replaces_the_decay_tombstone_index_predicate() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, 48).unwrap();
