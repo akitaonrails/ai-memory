@@ -100,7 +100,7 @@ pub fn spool_dir(data_dir: &Path) -> PathBuf {
 /// gate a mid-session drain on backlog size without building a client.
 #[must_use]
 pub fn spool_len(spool: &Path) -> usize {
-    list_entries(spool).map_or(0, |f| f.len())
+    list_entries(spool).map_or(0, |(files, _)| files.len())
 }
 
 /// Snapshot of local hook-spool health for operator status reporting.
@@ -124,7 +124,7 @@ pub struct SpoolHealth {
 /// command, never on the hook hot path).
 #[must_use]
 pub fn spool_health(spool: &Path) -> SpoolHealth {
-    let Some(files) = list_entries(spool) else {
+    let Ok((files, _)) = list_entries(spool) else {
         return SpoolHealth::default();
     };
     if files.is_empty() {
@@ -509,10 +509,26 @@ pub async fn drain(
     total_budget: Duration,
     per_event_timeout: Duration,
 ) -> DrainResult {
-    let mut files = match list_entries(spool) {
-        Some(f) => f,
-        None => return DrainResult::default(),
+    let (mut files, unreadable) = match list_entries(spool) {
+        Ok(listed) => listed,
+        Err(e) => {
+            // Never silent: a spool we cannot read is an outage, not an idle
+            // pass, and the difference is invisible from the exit code.
+            eprintln!(
+                "ai-memory hook-drain warning: could not list the spool directory {}: {e}; \
+                 no events were attempted",
+                spool.display()
+            );
+            return DrainResult::default();
+        }
     };
+    if unreadable > 0 {
+        eprintln!(
+            "ai-memory hook-drain warning: skipped {unreadable} unreadable spool entr{} in {}",
+            if unreadable == 1 { "y" } else { "ies" },
+            spool.display()
+        );
+    }
     files.sort();
 
     let client = build_client();
@@ -892,7 +908,7 @@ pub async fn resolve_bearer(
 }
 
 fn prune_spool_file_count(spool: &Path) {
-    let Some(mut files) = list_entries(spool) else {
+    let Ok((mut files, _)) = list_entries(spool) else {
         return;
     };
     let excess = files.len().saturating_sub(MAX_SPOOL_FILES);
@@ -915,16 +931,34 @@ fn prune_spool_file_count(spool: &Path) {
 
 /// List `*.json` spool files (ignoring in-flight `*.json.tmp`), or None when the
 /// directory doesn't exist yet.
-fn list_entries(spool: &Path) -> Option<Vec<PathBuf>> {
-    let read = std::fs::read_dir(spool).ok()?;
+/// Spool files awaiting delivery, or the IO error that prevented listing them.
+///
+/// This used to be `read_dir(spool).ok()?`, which turned *any* failure —
+/// permissions, a missing directory, a transient FS error — into "no entries".
+/// `drain` then returned an empty result: nothing sent, nothing dropped,
+/// nothing remaining, exit 0, spool files untouched, and not one byte on the
+/// wire. Indistinguishable from a healthy idle pass, and unfalsifiable from
+/// outside the process (#493).
+///
+/// A per-entry error is still skipped rather than fatal — one unreadable
+/// dirent must not strand the rest of the queue — but it is counted so the
+/// caller can say so instead of silently shortening the queue.
+fn list_entries(spool: &Path) -> std::io::Result<(Vec<PathBuf>, usize)> {
+    let read = std::fs::read_dir(spool)?;
     let mut out = Vec::new();
-    for ent in read.flatten() {
-        let path = ent.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            out.push(path);
+    let mut unreadable = 0usize;
+    for ent in read {
+        match ent {
+            Ok(ent) => {
+                let path = ent.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    out.push(path);
+                }
+            }
+            Err(_) => unreadable += 1,
         }
     }
-    Some(out)
+    Ok((out, unreadable))
 }
 
 #[cfg(test)]
@@ -968,7 +1002,7 @@ mod tests {
             false,
         );
         enqueue(&spool, &entry).unwrap();
-        let files = list_entries(&spool).unwrap();
+        let (files, _) = list_entries(&spool).unwrap();
         assert_eq!(files.len(), 1);
         let loaded: SpoolEntry =
             serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
@@ -993,7 +1027,7 @@ mod tests {
             false,
         );
         enqueue(&spool, &dirty).unwrap();
-        let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+        let path = list_entries(&spool).unwrap().0.into_iter().next().unwrap();
 
         let mut result = DrainResult::default();
         let loaded = load_live_entry(&path, &mut result).expect("entry is live");
@@ -1027,7 +1061,7 @@ mod tests {
             false,
         );
         enqueue(&spool, &clean).unwrap();
-        let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+        let path = list_entries(&spool).unwrap().0.into_iter().next().unwrap();
 
         let mut result = DrainResult::default();
         let loaded = load_live_entry(&path, &mut result).expect("entry is live");
@@ -1049,7 +1083,7 @@ mod tests {
             false,
         );
         enqueue(&spool, &entry).unwrap();
-        let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+        let path = list_entries(&spool).unwrap().0.into_iter().next().unwrap();
 
         let mut result = DrainResult::default();
         let loaded = load_live_entry(&path, &mut result).expect("entry is live");
@@ -1098,7 +1132,7 @@ mod tests {
             enqueue(&spool, &entry).unwrap();
         }
 
-        let files = list_entries(&spool).unwrap();
+        let (files, _) = list_entries(&spool).unwrap();
         assert_eq!(files.len(), MAX_SPOOL_FILES);
     }
 
@@ -1117,7 +1151,7 @@ mod tests {
             enqueue(&spool, &entry).unwrap();
         }
 
-        let mut files = list_entries(&spool).unwrap();
+        let (mut files, _) = list_entries(&spool).unwrap();
         files.sort();
         assert_eq!(files.len(), MAX_SPOOL_FILES);
         let bodies: Vec<SpoolEntry> = files
@@ -1151,7 +1185,36 @@ mod tests {
         assert_eq!(r.sent, 0);
         assert_eq!(r.remaining, 2);
         // Files survive for the next boundary.
-        assert_eq!(list_entries(&spool).unwrap().len(), 2);
+        assert_eq!(list_entries(&spool).unwrap().0.len(), 2);
+    }
+
+    /// #493: an unreadable spool must not read as an idle pass.
+    ///
+    /// `list_entries` used to be `read_dir(spool).ok()?`, so a permissions or
+    /// IO failure produced "no entries" and `drain` returned an empty result —
+    /// zero sent, zero remaining, zero dropped, exit 0, files untouched, no
+    /// socket opened. Indistinguishable from a healthy queue, and invisible
+    /// from outside the process.
+    #[test]
+    fn an_unreadable_spool_is_an_error_not_an_empty_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-spool");
+        let err = list_entries(&missing).expect_err("a missing spool must not list as empty");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// The happy path still works, so the error case above cannot be satisfied
+    /// by breaking listing outright.
+    #[test]
+    fn a_readable_spool_lists_json_entries_and_no_unreadable_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = tmp.path().join("hook-spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        std::fs::write(spool.join("0000000000001-1-0000.json"), b"{}").unwrap();
+        std::fs::write(spool.join("notes.txt"), b"ignored").unwrap();
+        let (files, unreadable) = list_entries(&spool).unwrap();
+        assert_eq!(files.len(), 1, "only .json entries are queue files");
+        assert_eq!(unreadable, 0);
     }
 
     #[tokio::test]
@@ -1293,7 +1356,7 @@ mod tests {
         assert_eq!(result.sent, 2);
         assert_eq!(result.remaining, 0);
         assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert!(list_entries(&spool).unwrap().is_empty());
+        assert!(list_entries(&spool).unwrap().0.is_empty());
     }
 
     #[tokio::test]
@@ -1345,7 +1408,7 @@ mod tests {
             "the dead event is dropped once it hits MAX_ATTEMPTS"
         );
         assert!(
-            list_entries(&spool).unwrap().is_empty(),
+            list_entries(&spool).unwrap().0.is_empty(),
             "spool is empty after the drop"
         );
     }
@@ -1372,7 +1435,7 @@ mod tests {
         .await;
         assert_eq!(r.dropped, 1);
         assert_eq!(r.sent, 0);
-        assert!(list_entries(&spool).unwrap().is_empty());
+        assert!(list_entries(&spool).unwrap().0.is_empty());
     }
 
     #[tokio::test]
@@ -1420,7 +1483,7 @@ mod tests {
             assert_eq!(r.dropped, 0, "a 429 must never drop the event");
             assert_eq!(r.remaining, 1);
         }
-        let files = list_entries(&spool).unwrap();
+        let (files, _) = list_entries(&spool).unwrap();
         assert_eq!(files.len(), 1, "event still queued after many 429s");
         let loaded: SpoolEntry =
             serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
@@ -1455,7 +1518,7 @@ mod tests {
         assert_eq!(r.dropped, 0);
         assert_eq!(r.remaining, 2);
         assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let mut files = list_entries(&spool).unwrap();
+        let (mut files, _) = list_entries(&spool).unwrap();
         files.sort();
         assert_eq!(files.len(), 2);
         assert!(files[0].ends_with("evt-1.json"));
@@ -1509,7 +1572,7 @@ mod tests {
         assert_eq!(r.sent, 1);
         assert_eq!(r.dropped, 0);
         assert_eq!(r.remaining, 1);
-        let mut files = list_entries(&spool).unwrap();
+        let (mut files, _) = list_entries(&spool).unwrap();
         files.sort();
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("evt-0.json"));
@@ -1558,7 +1621,7 @@ mod tests {
         assert_eq!(r.sent, 0);
         assert_eq!(r.dropped, 0);
         assert_eq!(r.remaining, 3);
-        let mut files = list_entries(&spool).unwrap();
+        let (mut files, _) = list_entries(&spool).unwrap();
         files.sort();
         assert_eq!(files.len(), 3);
         let attempts: Vec<u32> = files
@@ -1719,7 +1782,7 @@ mod tests {
     }
 
     fn sorted_attempts(spool: &Path) -> Vec<u32> {
-        let mut files = list_entries(spool).unwrap();
+        let (mut files, _) = list_entries(spool).unwrap();
         files.sort();
         files
             .iter()
@@ -1749,7 +1812,7 @@ mod tests {
         );
         assert_eq!(r.remaining, 2);
         assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(list_entries(&spool).unwrap().len(), 2);
+        assert_eq!(list_entries(&spool).unwrap().0.len(), 2);
     }
 
     #[tokio::test]
@@ -1776,7 +1839,7 @@ mod tests {
 
         assert_eq!(r.sent, 3, "all three events delivered");
         assert_eq!(r.remaining, 0);
-        assert!(list_entries(&spool).unwrap().is_empty(), "spool emptied");
+        assert!(list_entries(&spool).unwrap().0.is_empty(), "spool emptied");
         assert_eq!(
             req_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1808,7 +1871,7 @@ mod tests {
 
         assert_eq!(r.sent, 3);
         assert_eq!(r.remaining, 0);
-        assert!(list_entries(&spool).unwrap().is_empty());
+        assert!(list_entries(&spool).unwrap().0.is_empty());
 
         let second = drain(
             &spool,
@@ -1850,7 +1913,7 @@ mod tests {
 
         assert_eq!(r.sent, 2, "both events delivered via per-event fallback");
         assert_eq!(r.remaining, 0);
-        assert!(list_entries(&spool).unwrap().is_empty());
+        assert!(list_entries(&spool).unwrap().0.is_empty());
         // 1 rejected batch probe + 2 per-event POSTs.
         assert_eq!(
             req_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -1886,7 +1949,7 @@ mod tests {
         assert_eq!(r.remaining, 3);
         assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        let mut files = list_entries(&spool).unwrap();
+        let (mut files, _) = list_entries(&spool).unwrap();
         files.sort();
         let attempts: Vec<u32> = files
             .iter()
@@ -1925,7 +1988,7 @@ mod tests {
         assert_eq!(r.dropped, 0);
         assert_eq!(r.remaining, 2);
         assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let mut files = list_entries(&spool).unwrap();
+        let (mut files, _) = list_entries(&spool).unwrap();
         files.sort();
         assert_eq!(files.len(), 2);
         assert!(files[0].ends_with("evt-1.json"));
@@ -1965,7 +2028,7 @@ mod tests {
 
         assert_eq!(r.sent, 3);
         assert_eq!(r.remaining, 0);
-        assert!(list_entries(&spool).unwrap().is_empty());
+        assert!(list_entries(&spool).unwrap().0.is_empty());
         assert_eq!(
             req_count.load(std::sync::atomic::Ordering::SeqCst),
             3,
@@ -2002,7 +2065,7 @@ mod tests {
 
         assert_eq!(r.sent, 2);
         assert_eq!(r.remaining, 0);
-        assert!(list_entries(&spool).unwrap().is_empty());
+        assert!(list_entries(&spool).unwrap().0.is_empty());
         assert_eq!(
             req_count.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -2052,7 +2115,7 @@ mod tests {
             "only valid bodies are sent in the batch"
         );
 
-        let files = list_entries(&spool).unwrap();
+        let (files, _) = list_entries(&spool).unwrap();
         assert_eq!(files.len(), 1);
         let remaining: SpoolEntry =
             serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
@@ -2130,7 +2193,7 @@ mod tests {
         // `<name>.json.tmp` path with a directory, so `rewrite_entry`'s temp-file
         // write (an `OpenOptions` create) can't be created. `list_entries` matches
         // only `*.json`, so the `.json.tmp` directory is ignored by the drain.
-        let entry_path = list_entries(&spool).unwrap().into_iter().next().unwrap();
+        let entry_path = list_entries(&spool).unwrap().0.into_iter().next().unwrap();
         let mut blocker = entry_path.into_os_string();
         blocker.push(".tmp");
         std::fs::create_dir(PathBuf::from(blocker)).unwrap();
@@ -2151,7 +2214,7 @@ mod tests {
             "the event stays queued for the next boundary"
         );
         assert_eq!(
-            list_entries(&spool).unwrap().len(),
+            list_entries(&spool).unwrap().0.len(),
             1,
             "the spool entry survives a failed rewrite"
         );

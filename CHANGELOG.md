@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `hook-drain` no longer reports a clean pass when it could not read the spool
+  at all. `list_entries` was `read_dir(spool).ok()?`, so any IO failure —
+  permissions, a missing directory, a transient error — became "no entries" and
+  the drain returned zero sent, zero queued, zero dropped, exit 0, spool files
+  untouched, and not one byte on the wire. That is indistinguishable from a
+  healthy idle queue and cannot be diagnosed from outside the process. The
+  listing error is now reported on stderr, which the detached drainer
+  redirects into `logs/hook-drain.log`, and individual unreadable entries are
+  counted and reported rather than silently shortening the queue (#493).
+
 ## [1.35.0] - 2026-08-29
 
 ### Added
