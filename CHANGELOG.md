@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `install-mcp --client antigravity-cli` wrote to `~/.gemini/antigravity-cli/mcp_config.json`,
+  but the Antigravity CLI documents its global MCP config at
+  `~/.gemini/config/mcp_config.json`; the `antigravity-cli/` directory is its
+  internal data dir and only holds an internal copy of the file. The default
+  path now targets `~/.gemini/config/mcp_config.json`, which also matches the
+  hooks integration (`~/.gemini/config/hooks.json`) (#510).
 - `install-hooks --agent codex --apply` produced a Windows command every Codex
   hook rejected. Codex evaluates its `hooks.json` command strings with
   PowerShell, where a quoted path in command position is a string expression
