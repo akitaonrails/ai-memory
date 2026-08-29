@@ -120,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed
 > ```
 
 ---
@@ -601,6 +601,45 @@ ai-memory's subagent events). Zero discards `sessionStart` hook stdout, so
 capture and session-end handoff *creation* work, but handoff *injection*
 does not — ask Zero to call `memory_handoff_accept` at the start of a
 resumed session.
+
+## ZCode (z.ai)
+
+**Status:** MCP supported. Lifecycle hooks are not installed by this command;
+they are tracked in issue #512, so until then capture is not active and
+ai-memory only sees the sessions where an agent calls its MCP tools.
+
+**Config file:** ZCode keeps its user-scope config at
+`~/.zcode/cli/config.json`, with servers under the nested `mcp.servers` map
+(the same shape Zero and OpenClaw use). Workspace scopes
+(`.zcode/config.json`, `zcode.json`, `.agents/mcp.json`) also exist; pass
+`--config-file` to target one of them explicitly.
+
+```bash
+ai-memory install-mcp --client zcode --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+```
+
+which merges:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "ai-memory": {
+        "type": "http",
+        "url": "http://homelab:49374/mcp",
+        "headers": { "Authorization": "Bearer <token>" }
+      }
+    }
+  }
+}
+```
+
+The entry schema is strict: an entry carrying any key outside
+`type`/`url`/`headers`/`enabled`/`timeoutMs` is dropped silently, so the
+generated registration carries exactly those keys. The default stateless
+`/mcp` endpoint needs no flavor marker; auth goes in the `headers` map.
+Servers from every scope auto-connect at session start.
 
 ## Swival CLI
 

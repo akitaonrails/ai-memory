@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `install-mcp --client zcode` registers ai-memory as an MCP server in the
+  ZCode CLI (z.ai). The user-scope config lives at `~/.zcode/cli/config.json`
+  with servers under the nested `mcp.servers` map, and the generated entry is
+  a native streamable-HTTP registration — `type: "http"`, `url`, and an
+  `Authorization` bearer header when a token is configured. ZCode's entry
+  schema is strict (unknown keys make it drop the server silently), so the
+  entry carries exactly those keys and nothing else. `--apply` merges in place
+  preserving sibling servers and is idempotent; uninstall sweeps the same
+  file. MCP-only for now — lifecycle hooks are tracked separately in #512.
+  (#511)
+
 ## [1.36.0] - 2026-08-29
 
 ### Added

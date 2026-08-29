@@ -1258,6 +1258,11 @@ pub enum McpClient {
     /// Zero coding agent (Gitlawb/zero) — `~/.config/zero/config.json`,
     /// `mcp.servers` map with native HTTP transport + bearer headers.
     Zero,
+    /// ZCode (z.ai) — `~/.zcode/cli/config.json`, nested `mcp.servers`
+    /// map with `type: "http"` + `url` + optional `headers`. ZCode's
+    /// entry schema is strict: unknown keys make it drop the server
+    /// silently, so the generated entry carries nothing else.
+    Zcode,
     /// Devin CLI — `~/.devin/config.json`.
     Devin,
     /// xAI Grok Build CLI — `~/.grok/config.toml` under
@@ -2518,6 +2523,23 @@ mod tests {
             panic!("expected install-mcp for swival");
         };
         assert_eq!(args.client, McpClient::Swival);
+    }
+
+    #[test]
+    fn zcode_mcp_client_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "zcode",
+            "--server-url",
+            "http://memory.example:49374",
+        ])
+        .unwrap_or_else(|error| panic!("failed to parse MCP client zcode: {error}"));
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp for zcode");
+        };
+        assert_eq!(args.client, McpClient::Zcode);
     }
 
     #[test]

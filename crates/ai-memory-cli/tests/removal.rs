@@ -512,6 +512,51 @@ fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
 }
 
 #[test]
+fn zcode_mcp_install_and_uninstall_round_trip_preserves_siblings() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let mcp = home.path().join(".zcode/cli/config.json");
+    write_file(
+        &mcp,
+        r#"{"mcp":{"servers":{"other":{"type":"http","url":"https://other.example/mcp"}}}}"#,
+    );
+
+    let install = command_with_home(home.path())
+        .args(["install-mcp", "--client", "zcode", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert_eq!(installed["mcp"]["servers"]["ai-memory"]["type"], "http");
+    assert_eq!(
+        installed["mcp"]["servers"]["other"]["url"], "https://other.example/mcp",
+        "install must preserve sibling servers"
+    );
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "mcp", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let removed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+    assert!(removed["mcp"]["servers"].get("ai-memory").is_none());
+    assert_eq!(
+        removed["mcp"]["servers"]["other"]["url"], "https://other.example/mcp",
+        "uninstall must preserve sibling servers"
+    );
+}
+
+#[test]
 fn swival_mcp_install_and_uninstall_round_trip_from_nested_directory() {
     let _guard = cli_test_lock();
     let project = tempfile::tempdir().unwrap();

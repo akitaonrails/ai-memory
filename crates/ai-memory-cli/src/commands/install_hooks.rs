@@ -972,6 +972,11 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["mcp", "servers", "ai-memory"],
             "url",
         )),
+        McpClient::Zcode => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp", "servers", "ai-memory"],
+            "url",
+        )),
         McpClient::Pi => Ok(None),
         McpClient::AntigravityCli => Ok(infer_json_mcp_config(
             &content,
