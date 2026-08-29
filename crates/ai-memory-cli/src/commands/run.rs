@@ -1135,18 +1135,13 @@ fn display_session_id(value: &str) -> String {
     output
 }
 
+/// Age of a native session, rendered the way every other read-only listing
+/// renders one. Gains a "months" tier over the previous day-capped form, so a
+/// long-idle session reads as `2 months ago` here and in `show` / `workstreams`
+/// / `handoffs` rather than `74 days ago` in this one command.
 fn session_age(updated_at: SystemTime, now: SystemTime) -> String {
-    let age = now.duration_since(updated_at).unwrap_or_default().as_secs();
-    match age {
-        0..60 => "just now".into(),
-        60..3_600 => plural_age(age / 60, "minute"),
-        3_600..86_400 => plural_age(age / 3_600, "hour"),
-        _ => plural_age(age / 86_400, "day"),
-    }
-}
-
-fn plural_age(value: u64, unit: &str) -> String {
-    format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
+    let secs = now.duration_since(updated_at).unwrap_or_default().as_secs();
+    super::humanize_age_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
 async fn export_after_flush(

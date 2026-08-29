@@ -618,18 +618,7 @@ fn humanize_age(timestamp: Option<&str>) -> String {
     let Ok(then) = raw.parse::<jiff::Timestamp>() else {
         return "unknown activity".to_owned();
     };
-    let seconds = (jiff::Timestamp::now() - then).get_seconds();
-    if seconds < 0 {
-        return "just now".to_owned();
-    }
-    let (value, unit) = match seconds {
-        value if value < 60 => return "just now".to_owned(),
-        value if value < 3_600 => (value / 60, "minute"),
-        value if value < 86_400 => (value / 3_600, "hour"),
-        value if value < 2_592_000 => (value / 86_400, "day"),
-        value => (value / 2_592_000, "month"),
-    };
-    format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
+    super::humanize_age_secs((jiff::Timestamp::now() - then).get_seconds())
 }
 
 fn harness_name(harness: RunHarnessChoice) -> String {

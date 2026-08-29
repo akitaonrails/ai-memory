@@ -71,7 +71,7 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
         let _ = writeln!(
             out,
             "  {}  from {} -> {}",
-            age(now_ms.saturating_sub(h.created_at_ms)),
+            super::humanize_age_secs(now_ms.saturating_sub(h.created_at_ms) / 1_000),
             h.from_agent,
             target
         );
@@ -88,37 +88,25 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Coarse age, because the operator's question is "is this stale", not "when
-/// exactly".
-fn age(ms: i64) -> String {
-    let secs = ms.max(0) / 1_000;
-    let days = secs / 86_400;
-    if days > 0 {
-        return format!("{days}d ago");
-    }
-    let hours = secs / 3_600;
-    if hours > 0 {
-        return format!("{hours}h ago");
-    }
-    format!("{}m ago", secs / 60)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::humanize_age_secs;
 
+    /// Both read-only listings render ages through one helper now; these pin
+    /// the rendering the handoff listing depends on.
     #[test]
     fn age_reports_the_coarsest_useful_unit() {
-        assert_eq!(age(0), "0m ago");
-        assert_eq!(age(5 * 60 * 1_000), "5m ago");
-        assert_eq!(age(3 * 3_600 * 1_000), "3h ago");
-        assert_eq!(age(9 * 86_400 * 1_000), "9d ago");
+        assert_eq!(humanize_age_secs(0), "just now");
+        assert_eq!(humanize_age_secs(5 * 60), "5 minutes ago");
+        assert_eq!(humanize_age_secs(3_600), "1 hour ago");
+        assert_eq!(humanize_age_secs(3 * 3_600), "3 hours ago");
+        assert_eq!(humanize_age_secs(9 * 86_400), "9 days ago");
     }
 
-    /// A clock skew between server and client must not render as a huge
-    /// positive age from a negative difference.
+    /// Server and client clocks can disagree; a future timestamp must not
+    /// render as an enormous age.
     #[test]
-    fn a_future_timestamp_clamps_to_zero() {
-        assert_eq!(age(-5_000), "0m ago");
+    fn a_future_timestamp_clamps_to_just_now() {
+        assert_eq!(humanize_age_secs(-5), "just now");
     }
 }
