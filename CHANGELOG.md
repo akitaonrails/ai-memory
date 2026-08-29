@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The CHANGELOG frozen-section check no longer fires on a branch that merged
+  `main` after a release. It compared line ranges since the merge base, so a
+  newly released section arriving through the merge read as lines the branch
+  had touched. It now compares the released half of the file directly against
+  the base branch, which is the question it was always asking. Two pipelines
+  also exited 141 under `pipefail` when `head -1` and `grep -q` closed a pipe
+  early, so the check reported "HEAD predates" on a branch that did not.
 - `hook-drain` no longer reports a clean pass when it could not read the spool
   at all. `list_entries` was `read_dir(spool).ok()?`, so any IO failure —
   permissions, a missing directory, a transient error — became "no entries" and
