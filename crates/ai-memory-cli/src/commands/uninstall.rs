@@ -1485,6 +1485,16 @@ mod tests {
         assert!(hook_command_is_ours(cmd));
     }
 
+    /// #515 gave Codex's Windows command a leading `& ` call operator.
+    /// `hook_command_is_ours` matches on substrings, so the prefix is
+    /// harmless — but if that ever became a prefix match, uninstall would
+    /// silently stop finding Codex hooks and leave them behind.
+    #[test]
+    fn hook_signature_matches_a_powershell_call_operator_command() {
+        let cmd = r#"& "C:\Users\alice\bin\ai-memory.exe" --data-dir "C:\Users\alice\AppData\Local\ai-memory" hook --event session-start --agent codex --server-url "http://h:49374""#;
+        assert!(hook_command_is_ours(cmd));
+    }
+
     #[test]
     fn hook_signature_rejects_third_party_with_generic_name() {
         // A user's own hook that happens to be named stop.sh — no prefix.
