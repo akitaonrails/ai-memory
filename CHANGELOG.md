@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so an operator can see it and decide (#513).
 
 ### Fixed
+- Documented `ai-memory handoffs`. It shipped listed only in the
+  ARCHITECTURE subcommand block, which a guard test enforces — so the command
+  satisfied the check for being *present* without anyone being told what it
+  does. README and the MCP tool table now name it beside
+  `memory_handoff_cancel`, which is the tool it exists to make usable.
 - Made every "how long ago" in the CLI read the same way. Four separate
   renderers had accumulated — `show`, `run`, `workstreams` and `handoffs` —
   so the same elapsed time appeared as `3 hours ago`, `3h ago` or `74 days
