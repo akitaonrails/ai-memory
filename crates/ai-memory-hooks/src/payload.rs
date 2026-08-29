@@ -1011,18 +1011,32 @@ mod tests {
     use super::*;
 
     /// The predicate must accept exactly what `safe_tool_title` emits, for
-    /// every `ToolFamily` variant — including any added later. Building the
-    /// input through the writer rather than by hand is what keeps the two
-    /// from drifting; a hand-written list would pass while a new variant
-    /// silently escaped.
+    /// every `ToolFamily` variant. Inputs are built *through* the writer
+    /// rather than written by hand, so the two cannot drift apart on what a
+    /// family title looks like.
+    ///
+    /// The list below is checked by the compiler, not by trust: the
+    /// wildcard-free `match` stops compiling the moment a variant is added,
+    /// which routes whoever adds it here. Without that this test would keep
+    /// passing while the new variant went uncovered — the comment would be
+    /// making a promise the enumeration does not keep.
     #[test]
     fn the_predicate_recognises_every_title_the_writer_can_emit() {
-        for family in [
+        let every_variant = [
             ToolFamily::File,
             ToolFamily::SearchList,
             ToolFamily::NonFile,
             ToolFamily::Unknown,
-        ] {
+        ];
+        for family in every_variant {
+            match family {
+                ToolFamily::File
+                | ToolFamily::SearchList
+                | ToolFamily::NonFile
+                | ToolFamily::Unknown => {}
+            }
+        }
+        for family in every_variant {
             let written = safe_tool_title(&ToolObservationMetadata {
                 tool_family: family,
                 tool_call_id: None,
