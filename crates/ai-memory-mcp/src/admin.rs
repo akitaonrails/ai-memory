@@ -46,10 +46,10 @@ use std::pin::Pin;
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
     BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
-    EmbedBackfillCounts, EmbedBackfillOptions, SourceCounts, prune_sources_to_budget,
-    render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
-    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report_with_breadth,
-    run_embedding_backfill, run_lint, run_sweep_with_breadth,
+    EmbedBackfillCounts, EmbedBackfillOptions, ObservationRetention, SourceCounts,
+    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
+    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
+    run_curator_report_with_breadth, run_embedding_backfill, run_lint, run_sweep_with_options,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
@@ -81,8 +81,13 @@ use tracing::{info, warn};
 
 const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 
-#[derive(Clone, Copy)]
-struct DecayBreadthWeight(f64);
+/// Sweep knobs that live beside `DecayParams` rather than inside it, injected
+/// as one Extension so adding the next one is not a third router constructor.
+#[derive(Clone, Copy, Default)]
+struct SweepTuning {
+    breadth_weight: f64,
+    retention: ObservationRetention,
+}
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -554,6 +559,16 @@ pub fn admin_router(state: AdminState) -> Router {
 
 /// Build the admin router with the optional distinct-reader retention weight.
 pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -> Router {
+    admin_router_with_sweep_tuning(state, breadth_weight, ObservationRetention::default())
+}
+
+/// Build the admin router with every sweep knob that lives outside
+/// `DecayParams`, including the opt-in observation prune (disabled by default).
+pub fn admin_router_with_sweep_tuning(
+    state: AdminState,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+) -> Router {
     let state = Arc::new(state);
     let operational = Router::new()
         .route("/admin/backup", post(handle_backup))
@@ -627,7 +642,10 @@ pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -
             require_root_for_multiuser_admin,
         ))
         .with_state(state)
-        .layer(axum::Extension(DecayBreadthWeight(breadth_weight)))
+        .layer(axum::Extension(SweepTuning {
+            breadth_weight,
+            retention,
+        }))
 }
 
 async fn require_root_for_multiuser_admin(
@@ -2110,7 +2128,7 @@ async fn handle_auto_improve_report(
 
 async fn handle_curator(
     State(state): State<Arc<AdminState>>,
-    axum::Extension(breadth): axum::Extension<DecayBreadthWeight>,
+    axum::Extension(tuning): axum::Extension<SweepTuning>,
     Json(req): Json<CuratorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let mode = req.mode.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -2141,7 +2159,7 @@ async fn handle_curator(
         &req.workspace,
         &req.project,
         params.clone(),
-        breadth.0,
+        tuning.breadth_weight,
     )
     .await
     .map_err(|e| internal_err(e.to_string()))?;
@@ -2803,19 +2821,20 @@ struct ForgetSweepRequest {
 
 async fn handle_forget_sweep(
     State(state): State<Arc<AdminState>>,
-    axum::Extension(breadth): axum::Extension<DecayBreadthWeight>,
+    axum::Extension(tuning): axum::Extension<SweepTuning>,
     Json(req): Json<ForgetSweepRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
-    run_sweep_with_breadth(
+    run_sweep_with_options(
         &state.reader,
         &state.writer,
         Some(&state.wiki),
         ws,
         proj,
         &state.decay_params,
-        breadth.0,
+        tuning.breadth_weight,
+        tuning.retention,
         req.dry_run,
     )
     .await

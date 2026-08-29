@@ -1957,6 +1957,130 @@ pub fn hard_delete_decayed_page_chain(
     Ok(n)
 }
 
+/// One batch of an observation prune, as reported by
+/// [`prune_consolidated_observations`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ObservationPruneOutcome {
+    /// Observation rows permanently deleted by this batch.
+    pub deleted: usize,
+    /// Distinct sessions that lost rows in this batch. Returned rather than
+    /// counted so a caller looping over batches can deduplicate a session whose
+    /// rows straddle a batch boundary.
+    pub sessions_touched: Vec<SessionId>,
+    /// Sessions whose `ended_observation_count` watermark was lowered back onto
+    /// the surviving row count.
+    pub sessions_resynced: usize,
+}
+
+/// Permanently delete one bounded batch of raw observations belonging to
+/// sessions that were already distilled into a live summary page.
+///
+/// Raw capture is the store's growth driver, but it is also the only input
+/// consolidation, auto-improvement and the `raw_hits` fallback have. Deleting
+/// it is safe exactly when its durable distillation still exists, so the
+/// predicate joins through `sessions.summary_page_id` — the marker
+/// [`end_session_row`] writes — and requires the page it points at to still be
+/// live. `superseded_at IS NOT NULL` means decay already evicted that page, so
+/// its session's raw capture is the last copy and must stay; a page hard-deleted
+/// by the same sweep is excluded for free, because the `ON DELETE SET NULL`
+/// foreign key has already cleared the pointer. A session with no `sessions`
+/// row, or one that never ended, matches nothing and can never be pruned.
+///
+/// `ORDER BY created_at` makes the batching deterministic: a run interrupted
+/// halfway leaves a clean age boundary rather than holes, so the next run
+/// resumes on a store whose invariant ("everything older than X is gone for
+/// consolidated sessions") is still one comparison.
+///
+/// The watermark resync is not optional. `session_end_disposition` compares a
+/// live `COUNT(*)` against the persisted `sessions.ended_observation_count`;
+/// leaving the watermark above reality would make a resumed session's genuinely
+/// new work read as `AlreadyEnded` and never be re-consolidated. The
+/// `ended_observation_count > (…)` guard keeps the repair idempotent and
+/// one-directional — it can only lower a watermark that is now above reality.
+/// Bounding it to the ids the delete returned also repairs sessions whose row
+/// lives in a different scope than the observations being pruned.
+pub fn prune_consolidated_observations(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    cutoff_us: i64,
+    batch: usize,
+) -> StoreResult<ObservationPruneOutcome> {
+    if batch == 0 {
+        return Ok(ObservationPruneOutcome::default());
+    }
+    let tx = conn.transaction()?;
+    let mut deleted = 0usize;
+    let mut sessions: BTreeSet<Vec<u8>> = BTreeSet::new();
+    {
+        let mut stmt = tx.prepare(
+            "DELETE FROM observations \
+             WHERE id IN ( \
+                 SELECT o.id FROM observations o \
+                 WHERE o.workspace_id = ?1 \
+                   AND o.project_id = ?2 \
+                   AND o.created_at < ?3 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM sessions s \
+                       JOIN pages p ON p.id = s.summary_page_id \
+                       WHERE s.id = o.session_id \
+                         AND p.superseded_at IS NULL \
+                   ) \
+                 ORDER BY o.created_at \
+                 LIMIT ?4 \
+             ) \
+             RETURNING session_id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                cutoff_us,
+                u64::try_from(batch).unwrap_or(u64::MAX),
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        for row in rows {
+            sessions.insert(row?);
+            deleted += 1;
+        }
+    }
+    let mut sessions_touched = Vec::with_capacity(sessions.len());
+    let mut sessions_resynced = 0usize;
+    if deleted > 0 {
+        for session_id in &sessions {
+            sessions_touched.push(SessionId::from_slice(session_id)?);
+            sessions_resynced += tx.execute(
+                "UPDATE sessions \
+                 SET ended_observation_count = ( \
+                         SELECT COUNT(*) FROM observations o WHERE o.session_id = sessions.id \
+                     ) \
+                 WHERE id = ?1 \
+                   AND ended_observation_count > ( \
+                         SELECT COUNT(*) FROM observations o WHERE o.session_id = sessions.id \
+                     )",
+                params![session_id],
+            )?;
+        }
+        audit_with_detail(
+            &tx,
+            "prune_observations",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            None,
+            None,
+            Timestamp::now().as_microsecond(),
+            &format!("{{\"deleted\":{deleted}}}"),
+        )?;
+    }
+    tx.commit()?;
+    Ok(ObservationPruneOutcome {
+        deleted,
+        sessions_touched,
+        sessions_resynced,
+    })
+}
+
 /// Insert a new handoff in state=open.
 pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
     let tx = conn.transaction()?;
@@ -2459,9 +2583,35 @@ fn audit(
     author_id: Option<&[u8; 16]>,
     at: i64,
 ) -> StoreResult<()> {
+    audit_with_detail(
+        tx,
+        op,
+        workspace_id,
+        project_id,
+        page_id,
+        author_id,
+        at,
+        "{}",
+    )
+}
+
+/// `audit`, but with a caller-supplied JSON `detail` payload. Exists so a
+/// destructive batch can record what it did (e.g. the observation prune's
+/// deleted-row count) instead of leaving a gap only inferable from timestamps.
+#[allow(clippy::too_many_arguments)]
+fn audit_with_detail(
+    tx: &rusqlite::Transaction<'_>,
+    op: &str,
+    workspace_id: Option<&[u8; 16]>,
+    project_id: Option<&[u8; 16]>,
+    page_id: Option<&[u8; 16]>,
+    author_id: Option<&[u8; 16]>,
+    at: i64,
+    detail: &str,
+) -> StoreResult<()> {
     tx.execute(
         "INSERT INTO audit_log (at, op, workspace_id, project_id, page_id, author_id, detail) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '{}')",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             at,
             op,
@@ -2469,6 +2619,7 @@ fn audit(
             project_id.map(|b| &b[..]),
             page_id.map(|b| &b[..]),
             author_id.map(|b| &b[..]),
+            detail,
         ],
     )?;
     Ok(())

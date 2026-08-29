@@ -18,8 +18,16 @@
 //! `hard_delete_after_days` and their supersession ancestry. A page recreated
 //! at the same path is a separate live chain and is preserved. Ordinary
 //! supersession rows are safe because only decay writes `superseded_at`.
+//!
+//! Observation prune pass (opt-in, disabled unless
+//! `ObservationRetention::days > 0`) deletes raw observations older than the
+//! configured age, and only for sessions already distilled into a page that is
+//! still live. It runs LAST so both of this run's page deletions are already
+//! visible to its predicate: a session whose summary page was evicted or
+//! hard-deleted by the passes above keeps its raw capture, because that capture
+//! is now the only surviving copy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ai_memory_core::{PageId, ProjectId, Tier, WorkspaceId};
 use ai_memory_store::{
@@ -79,7 +87,55 @@ pub struct SweepReport {
     pub expired: Vec<ExpiredPage>,
     /// Number of page-version rows permanently deleted on this pass.
     pub hard_deleted: usize,
+    /// Observations the prune predicate matched. Reported in both modes; `0`
+    /// when observation retention is disabled, which is the default.
+    pub observations_prunable: usize,
+    /// Observation rows permanently deleted. Always `0` on `dry_run`, exactly
+    /// like the wiki-routed passes above.
+    pub observations_pruned: usize,
+    /// Distinct consolidated sessions that lost rows, so the blast radius is a
+    /// number in the response rather than a claim in a changelog.
+    pub observation_prune_sessions: usize,
+    /// Transactions the prune spent. Makes the batching bound observable.
+    pub observation_prune_batches: usize,
 }
+
+/// Opt-in bound on how long raw observations outlive their consolidation.
+///
+/// Deliberately a type of its own rather than two more
+/// [`DecayParams`] fields: the retention coefficients are a public struct that
+/// downstream Rust callers construct directly, and widening it would break
+/// them. Same reasoning the access-breadth coefficient already carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationRetention {
+    /// Age in days past which a consolidated session's observations may be
+    /// pruned. `0` disables the pass entirely — the default, so an existing
+    /// install behaves exactly as it did before this pass existed.
+    pub days: i64,
+    /// Rows deleted per transaction.
+    pub batch: usize,
+}
+
+/// Disabled: nothing is ever pruned until an operator sets a positive age.
+impl Default for ObservationRetention {
+    fn default() -> Self {
+        Self {
+            days: 0,
+            batch: DEFAULT_OBSERVATION_PRUNE_BATCH,
+        }
+    }
+}
+
+impl ObservationRetention {
+    /// `true` when the pass is enabled and can delete something.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        self.days > 0 && self.batch > 0
+    }
+}
+
+/// Default rows per prune transaction.
+pub const DEFAULT_OBSERVATION_PRUNE_BATCH: usize = 5_000;
 
 /// Errors raised by the sweep.
 #[derive(Debug, Error)]
@@ -91,6 +147,9 @@ pub enum SweepError {
     /// The optional access-breadth coefficient was negative or non-finite.
     #[error("decay breadth_weight must be a finite number greater than or equal to zero")]
     InvalidBreadthWeight,
+    /// The opt-in observation retention age was negative.
+    #[error("decay observation_retention_days must be greater than or equal to zero")]
+    InvalidObservationRetention,
 }
 
 const US_PER_DAY: f64 = 86_400_000_000.0;
@@ -139,7 +198,7 @@ pub async fn run_sweep(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sweep_with_breadth(
     reader: &ReaderPool,
-    _writer: &WriterHandle,
+    writer: &WriterHandle,
     wiki: Option<&Wiki>,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -147,8 +206,45 @@ pub async fn run_sweep_with_breadth(
     breadth_weight: f64,
     dry_run: bool,
 ) -> Result<SweepReport, SweepError> {
+    run_sweep_with_options(
+        reader,
+        writer,
+        wiki,
+        workspace_id,
+        project_id,
+        params,
+        breadth_weight,
+        ObservationRetention::default(),
+        dry_run,
+    )
+    .await
+}
+
+/// Run a sweep with the breadth coefficient and the opt-in observation prune.
+///
+/// The prune is the only pass that can delete raw capture, and it is off unless
+/// `retention.days` is positive.
+///
+/// # Errors
+/// Returns [`SweepError::InvalidObservationRetention`] for a negative age, in
+/// addition to the errors documented by [`run_sweep_with_breadth`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_sweep_with_options(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: Option<&Wiki>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    params: &DecayParams,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+    dry_run: bool,
+) -> Result<SweepReport, SweepError> {
     if !breadth_weight.is_finite() || breadth_weight < 0.0 {
         return Err(SweepError::InvalidBreadthWeight);
+    }
+    if retention.days < 0 {
+        return Err(SweepError::InvalidObservationRetention);
     }
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
     let breadth =
@@ -199,6 +295,18 @@ pub async fn run_sweep_with_breadth(
     }
 
     let mut hard_deleted = 0usize;
+    let mut observations_prunable = 0usize;
+    let mut observations_pruned = 0usize;
+    let mut observation_prune_sessions = 0usize;
+    let mut observation_prune_batches = 0usize;
+    let observation_cutoff_us = Timestamp::now()
+        .as_microsecond()
+        .saturating_sub(retention.days.saturating_mul(US_PER_DAY_I64));
+    if retention.is_enabled() {
+        observations_prunable = reader
+            .prunable_observation_count(workspace_id, project_id, observation_cutoff_us)
+            .await?;
+    }
     if !dry_run {
         for page in &mut expired {
             let path = match ai_memory_core::PagePath::new(page.path.clone()) {
@@ -284,6 +392,37 @@ pub async fn run_sweep_with_breadth(
                 }
             }
         }
+
+        // LAST on purpose. Both passes above can strip a session of its
+        // distillation — decay stamps `superseded_at`, hard-delete removes the
+        // row and the `ON DELETE SET NULL` foreign key clears the pointer — and
+        // the prune predicate reads exactly those two columns. Running here
+        // means this run's own evictions already exclude their sessions,
+        // instead of a batch of raw capture outliving its page by one sweep.
+        //
+        // Unlike the wiki-routed passes this one runs without a `wiki` handle:
+        // observations have no Markdown file, so there is no source of truth
+        // for reconciliation to re-index and no store-only-mutation hazard.
+        if retention.is_enabled() {
+            let mut touched: HashSet<ai_memory_core::SessionId> = HashSet::new();
+            loop {
+                let outcome = writer
+                    .prune_consolidated_observations(
+                        workspace_id,
+                        project_id,
+                        observation_cutoff_us,
+                        retention.batch,
+                    )
+                    .await?;
+                observation_prune_batches += 1;
+                observations_pruned += outcome.deleted;
+                touched.extend(outcome.sessions_touched.iter().copied());
+                if outcome.deleted < retention.batch {
+                    break;
+                }
+            }
+            observation_prune_sessions = touched.len();
+        }
     }
 
     Ok(SweepReport {
@@ -292,6 +431,10 @@ pub async fn run_sweep_with_breadth(
         evicted,
         expired,
         hard_deleted,
+        observations_prunable,
+        observations_pruned,
+        observation_prune_sessions,
+        observation_prune_batches,
     })
 }
 

@@ -61,6 +61,11 @@ pub struct DecaySettings {
     pub hard_delete_after_days: i64,
     /// Optional weight for the number of distinct authenticated readers.
     pub breadth_weight: f64,
+    /// Age past which a consolidated session's raw observations may be pruned.
+    /// `0` disables the pass; nothing is deleted until an operator opts in.
+    pub observation_retention_days: i64,
+    /// Observation rows deleted per prune transaction.
+    pub observation_prune_batch: usize,
 }
 
 impl Default for DecaySettings {
@@ -74,6 +79,8 @@ impl Default for DecaySettings {
             cold_threshold: base.cold_threshold,
             hard_delete_after_days: base.hard_delete_after_days,
             breadth_weight: 0.0,
+            observation_retention_days: 0,
+            observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
         }
     }
 }
@@ -89,6 +96,19 @@ impl DecaySettings {
             salience_default: self.salience_default,
             cold_threshold: self.cold_threshold,
             hard_delete_after_days: self.hard_delete_after_days,
+        }
+    }
+
+    /// Opt-in observation prune bound consumed by the M8 sweep.
+    ///
+    /// Deliberately separate from [`Self::decay_params`]: keeping it out of the
+    /// public `DecayParams` struct is what lets every downstream Rust caller
+    /// that builds one directly keep compiling — and keep today's behaviour.
+    #[must_use]
+    pub fn observation_retention(self) -> ai_memory_consolidate::ObservationRetention {
+        ai_memory_consolidate::ObservationRetention {
+            days: self.observation_retention_days,
+            batch: self.observation_prune_batch,
         }
     }
 }
@@ -929,6 +949,19 @@ impl Config {
             );
         }
 
+        // Fail closed at load rather than at 3am inside a destructive pass: a
+        // negative age would be a nonsensical cutoff, and a zero batch would
+        // spin the prune loop forever without deleting anything.
+        if config.decay.observation_retention_days < 0 {
+            anyhow::bail!(
+                "decay.observation_retention_days must be greater than or equal to zero \
+                 (0 disables observation pruning)"
+            );
+        }
+        if config.decay.observation_prune_batch == 0 {
+            anyhow::bail!("decay.observation_prune_batch must be greater than zero");
+        }
+
         // Fail at startup rather than shipping a prompt that is all scaffolding
         // and no observations: below this floor the fixed system prompt and page
         // conventions consume the entire budget, so every consolidation would
@@ -1365,6 +1398,11 @@ mod tests {
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
         assert_eq!(cfg.decay.breadth_weight, 0.0);
+        // Observation pruning must stay OFF by default: an install that never
+        // opts in keeps every raw observation it has today.
+        assert_eq!(cfg.decay.observation_retention_days, 0);
+        assert_eq!(cfg.decay.observation_prune_batch, 5_000);
+        assert!(!cfg.decay.observation_retention().is_enabled());
         assert!(!cfg.slots.per_user);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
@@ -1429,6 +1467,27 @@ mod tests {
             assert!(
                 error.to_string().contains("breadth_weight"),
                 "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// A negative retention age or a zero batch is rejected at load, beside
+    /// the breadth-weight guard, so a destructive pass can never be configured
+    /// into a nonsensical shape.
+    #[test]
+    fn load_rejects_destructive_invalid_observation_retention() {
+        for (key, value) in [
+            ("observation_retention_days", "-1"),
+            ("observation_prune_batch", "0"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, format!("[decay]\n{key} = {value}\n")).unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("invalid observation retention must fail closed");
+            assert!(
+                error.to_string().contains(key),
+                "unexpected error for {key} = {value}: {error:#}"
             );
         }
     }

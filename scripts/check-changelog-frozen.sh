@@ -32,40 +32,54 @@ git rev-parse --verify "$BASE_REF" >/dev/null 2>&1 || {
     exit 0
 }
 
-MERGE_BASE="$(git merge-base "$BASE_REF" HEAD)"
-if [[ "$MERGE_BASE" == "$(git rev-parse HEAD)" ]]; then
-    echo "check-changelog-frozen: HEAD is an ancestor of $BASE_REF; nothing to check."
+# Compare the released half of the file directly against the base branch,
+# rather than diffing line ranges since the merge base.
+#
+# The line-range form fired falsely on any branch that merged the base after a
+# release: from the old merge base, the whole new `## [X.Y.Z]` section reads as
+# lines this branch touched, even though it arrived through the merge. The
+# question that matters is simpler — does this branch's copy of an
+# already-released section differ from the base branch's copy?
+#
+# A section the base has and this branch does not is fine (a stale branch, not
+# a rewrite), so only sections present in both are compared.
+
+released_half() {
+    git show "$1:CHANGELOG.md" 2>/dev/null | awk '/^## \[[0-9]/{f=1} f'
+}
+
+BASE_RELEASED="$(released_half "$BASE_REF")"
+HEAD_RELEASED="$(released_half HEAD)"
+
+if [[ -z "$BASE_RELEASED" ]]; then
+    echo "check-changelog-frozen: base has no released section yet."
     exit 0
 fi
 
-# First line number of the first released section in the *new* file.
-FROZEN_FROM="$(awk '/^## \[[0-9]/{print NR; exit}' CHANGELOG.md)"
-if [[ -z "$FROZEN_FROM" ]]; then
-    echo "check-changelog-frozen: no released section yet."
+# The newest released heading on the base. Anything at or below it in HEAD must
+# match the base byte for byte.
+# `head -1` under `pipefail` exits 141 on SIGPIPE, so read the first line
+# without a pipe.
+NEWEST="${BASE_RELEASED%%$'\n'*}"
+# Substring tests, not pipes: `grep -q` closes the pipe on its first match and
+# `pipefail` reports that SIGPIPE as failure, which made this branch look like
+# it predated the release.
+if [[ "$HEAD_RELEASED" != *"$NEWEST"* ]]; then
+    echo "check-changelog-frozen: HEAD predates $NEWEST; nothing to compare."
     exit 0
 fi
 
-# Every new-file line number this diff touches, via the unified hunk headers.
-TOUCHED="$(git diff --unified=0 "$MERGE_BASE" HEAD -- CHANGELOG.md \
-    | awk '/^@@/{ split($3, a, ","); start = a[1] + 0; if (start < 0) start = -start;
-                  count = (a[2] == "" ? 1 : a[2] + 0);
-                  for (i = 0; i < count; i++) print start + i }')"
+HEAD_FROM_NEWEST="${HEAD_RELEASED#*"$NEWEST"}"
+HEAD_FROM_NEWEST="${NEWEST}${HEAD_FROM_NEWEST}"
 
-BAD=""
-for ln in $TOUCHED; do
-    if (( ln >= FROZEN_FROM )); then
-        BAD+="  line $ln: $(sed -n "${ln}p" CHANGELOG.md)"$'\n'
-    fi
-done
-
-if [[ -z "$BAD" ]]; then
+if [[ "$HEAD_FROM_NEWEST" == "$BASE_RELEASED" ]]; then
     echo "CHANGELOG: no released section was modified."
     exit 0
 fi
 
 echo "error: this change modifies an already-released CHANGELOG section." >&2
 echo >&2
-printf '%s' "$BAD" >&2
+diff <(printf '%s\n' "$BASE_RELEASED") <(printf '%s\n' "$HEAD_FROM_NEWEST") | head -40 >&2
 cat >&2 <<'EOF'
 
 Released sections are frozen. An entry for unreleased work belongs under

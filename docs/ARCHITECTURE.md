@@ -146,7 +146,20 @@ from hook paths.
    version ancestry only within that sweep's resolved workspace/project,
    together with entity-index rows orphaned by the purge. A newer page recreated
    at the same path is preserved. Semantic / pinned / freshly-touched pages
-   survive.
+   survive. A fourth pass, disabled unless `[decay] observation_retention_days`
+   is positive, then deletes raw `observations` older than that age — but only
+   for sessions already consolidated into a summary page that is still live, so
+   raw capture is never removed while it is the last copy of that session's
+   work. It runs last so this run's own evictions and hard-deletes already
+   exclude their sessions, deletes in `observation_prune_batch` transactions so
+   a multi-million row prune cannot hold the write lock, and repairs
+   `sessions.ended_observation_count` downward in the same transaction. The
+   prune is irreversible in a specific sense: observations are the input to
+   consolidation, so a pruned session can never be re-consolidated — not with
+   a better model, a better prompt, or a fixed consolidator bug — and its
+   summary page becomes the only surviving account of that session. Freed
+   SQLite pages are reused, not returned to the OS: the `.db` file does not
+   shrink, the backup tarball does.
    Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
    enumerate every existing workspace/project scope before doing per-project
    work, matching the auto-improvement scheduler's store-wide scope model. A
@@ -513,6 +526,8 @@ mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → remove file + retain tombstone
 hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
+observation_retention_days = 0     # 0 = never prune raw observations
+observation_prune_batch = 5000     # rows per prune transaction
 
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context

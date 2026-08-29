@@ -3205,6 +3205,42 @@ impl ReaderPool {
         .await
     }
 
+    /// Count the observations the prune pass would delete for this scope.
+    ///
+    /// Same predicate as
+    /// [`prune_consolidated_observations`](crate::ops::prune_consolidated_observations),
+    /// read-only, so a dry run can report a number without any chance of a
+    /// write. Kept beside the delete rather than derived from it because the
+    /// dry run must never open a write transaction at all.
+    ///
+    /// # Errors
+    /// Propagates SQL errors.
+    pub async fn prunable_observation_count(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+    ) -> StoreResult<usize> {
+        self.with_conn(move |conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM observations o \
+                 WHERE o.workspace_id = ?1 \
+                   AND o.project_id = ?2 \
+                   AND o.created_at < ?3 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM sessions s \
+                       JOIN pages p ON p.id = s.summary_page_id \
+                       WHERE s.id = o.session_id \
+                         AND p.superseded_at IS NULL \
+                   )",
+                params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us],
+                |row| row.get(0),
+            )?;
+            Ok(usize::try_from(n).unwrap_or(0))
+        })
+        .await
+    }
+
     /// Return the number of DISTINCT operators that reinforced each
     /// `is_latest = 1` page of a project, for the sweep's breadth term.
     ///

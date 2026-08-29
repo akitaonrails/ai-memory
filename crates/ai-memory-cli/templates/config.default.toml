@@ -80,6 +80,22 @@ log_level = "info"
 #   - Bigger access boost (frequently-used stuff lasts longer): sigma = 1.0
 #   - Bigger time-pressure on access: mu = 0.08
 #   - Reward pages used by more identified operators: breadth_weight = 0.2
+#
+# Raw observations are the store's growth driver (a busy install can add
+# gigabytes a year), while the durable value is the compiled pages. Set
+# observation_retention_days to a positive number to let the sweep delete raw
+# observations older than that — but ONLY for sessions already consolidated into
+# a page that is still live. Unconsolidated sessions, and sessions whose page was
+# evicted by decay, keep every row. 0 (the default) disables the pass entirely.
+# Pruning is IRREVERSIBLE: observations are the input to consolidation, so a
+# pruned session can never be re-consolidated (a better model, a better prompt,
+# or a fixed consolidator bug make no difference) and its summary page becomes
+# the only surviving account of that session. The 0 default is a contract: this
+# pass never runs unless an operator sets a positive age here.
+# SQLite does not return freed pages to the OS without VACUUM, so the .db file
+# will not shrink after the first prune; the `ai-memory backup` tarball will.
+#   - A quarter of raw capture: observation_retention_days = 90
+#   - Smaller transactions on a slow disk: observation_prune_batch = 2000
 [decay]
 lambda = 0.02
 sigma = 0.6
@@ -88,6 +104,8 @@ salience_default = 1.0
 cold_threshold = 0.20
 hard_delete_after_days = 180
 breadth_weight = 0.0
+observation_retention_days = 0     # 0 = never prune raw observations
+observation_prune_batch = 5000     # rows per prune transaction
 
 # Privacy strip.
 #
