@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory user add-human|list|reset-password|disable|enable|patch` manages
   people, while `ai-memory api-key add|list|rotate|revoke` manages machine
   secrets. Existing 32-byte `users.token_hash` values copy losslessly into
-  `api_credentials`; rollback mirror triggers remain until the post-soak
-  migration removes them.
+  `api_credentials`. The mirror triggers remain load-bearing for the deprecated
+  1.x `user add|expire|revive|rotate-token` shims and may be removed only when
+  those shims are removed in 2.0.
 
 ### Changed
 - `/admin/*` and `/api/v1/*` accept a human web session or a machine Bearer.

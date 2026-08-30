@@ -494,6 +494,8 @@ If you're upgrading a machine-bearer-only install:
   `user rotate-token` commands remain available for compatibility. They manage
   the migrated `legacy-user-token` credential; new automation should use
   `api-key` commands, and new people should use `user add-human`.
+  The V53 mirror triggers are load-bearing for those shims and remain until the
+  shims are removed in 2.0.
 - Before any human password or completed bootstrap exists, GET-only browser
   routes continue to accept the root bearer through HTTP Basic and the
   HttpOnly `ai_memory_auth` cookie. Human activation disables that path

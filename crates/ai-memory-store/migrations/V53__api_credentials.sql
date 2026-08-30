@@ -1,9 +1,9 @@
 -- Native API credentials. Copy existing 32-byte users.token_hash
 -- values losslessly (id = user_id, label = legacy-user-token).
 -- Abort — no partial commit — if any non-NULL hash is the wrong length.
--- Keep users.token_hash / token_expired_at for rollback; runtime of
--- this binary never reads them. Mirror triggers copy create/rotate/
--- expire/revive from a restored pre-V52 binary.
+-- Keep users.token_hash / token_expired_at as the deprecated 1.x
+-- compatibility write path. These mirror triggers are load-bearing until
+-- the user token shims are removed in 2.0; auth lookup uses api_credentials.
 
 CREATE TABLE v53_token_hash_guard (
     ok INTEGER NOT NULL CHECK (ok = 0)
