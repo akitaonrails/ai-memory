@@ -25,9 +25,10 @@
 - Machine clients send `Authorization: Bearer <token>`. The static
   `AI_MEMORY_AUTH_TOKEN` is machine-root authority; native `aim_` API keys are
   always User-level. Bearers never authenticate `/auth/*`.
-- A recognized Bearer has precedence over a browser session. An invalid Bearer
-  fails closed rather than falling back to cookies. Basic and unknown schemes
-  are not credentials and do not suppress an otherwise valid web session.
+- A recognized Bearer has precedence over every browser credential. An invalid
+  Bearer fails closed rather than falling back. Before human auth activates,
+  deprecated Basic/cookie compatibility is evaluated for GET requests; after
+  activation, Basic and unknown schemes do not suppress a valid web session.
 - `/mcp`, hooks, handoffs, and workstream routes are machine-only. A web-session
   cookie cannot authenticate them.
 - A disallowed `Host` header receives `403 Forbidden` before auth evaluation
@@ -53,9 +54,11 @@ Content-Type: application/json
 ```
 
 Do not put `AI_MEMORY_AUTH_TOKEN`, `aim_` keys, session values, or CSRF values
-in `localStorage`. HTTP Basic browser login is unsupported. See
-[`docs/users.md`](users.md) for bootstrap, password rotation, recovery, roles,
-session expiry, and API-key lifecycle.
+in `localStorage`. Before any human password or completed bootstrap exists,
+deprecated GET-only browser compatibility may accept the root bearer through
+HTTP Basic and an HttpOnly `ai_memory_auth` cookie. Human activation disables
+that path immediately. See [`docs/users.md`](users.md) for bootstrap, password
+rotation, recovery, roles, session expiry, and API-key lifecycle.
 
 ## 3. Error model
 

@@ -101,7 +101,8 @@ and actor-proxy bearer without logging the values. Operator runbook:
 
 `/admin/*` and `/api/v1/*` accept a machine Bearer **or** a web session.
 Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
-behind auth. The engine expires the legacy `ai_memory_auth` cookie.
+behind auth. Once human auth becomes active, the engine expires the deprecated
+`ai_memory_auth` compatibility cookie.
 
 ## Trusted proxy identity
 
@@ -398,13 +399,13 @@ rather than deleting identities or keys.
 
 ### 2. Add another human
 
-Each `ai-memory user add` creates a person with a temporary password,
+Each `ai-memory user add-human` creates a person with a temporary password,
 printed **exactly once**. The new user must change it on next login.
 This does **not** issue an API key.
 
 ```console
 $ AI_MEMORY_AUTH_TOKEN=<root-token> \
-  ai-memory user add --username alice --email alice@home --name "Alice Smith"
+  ai-memory user add-human --username alice --email alice@home --name "Alice Smith"
 
 ✓ created user 'alice'
   name:  Alice Smith
@@ -429,13 +430,14 @@ USERNAME  NAME         ROLE  STATUS
 alice     Alice Smith  user  must-change
 bob       -            user  active
 carol     -            user  disabled
-dave      -            user  api-only
+dave      -            user  active
+erin      -            user  expired
 ```
 
-`api-only` is a brownfield row that still has a native API credential
-but no password. Grant human login with `user reset-password`; that does
-not reveal or rotate the machine secret. The list never surfaces
-passwords, hashes, or API secrets.
+An `active` row without a password can be a deprecated 1.x compatibility-token
+identity. Grant human login with `user reset-password`; that does not reveal or
+rotate the machine secret. The list never surfaces passwords, hashes, or API
+secrets.
 
 ### 4. Disable human login (without losing attribution history)
 
@@ -488,6 +490,14 @@ If you're upgrading a machine-bearer-only install:
   state and creates `web_sessions`; V52 copies every valid legacy
   `users.token_hash` into `api_credentials` without changing its digest or
   owner id.
+- Deprecated 1.x `user add`, `user expire`, `user revive`, and
+  `user rotate-token` commands remain available for compatibility. They manage
+  the migrated `legacy-user-token` credential; new automation should use
+  `api-key` commands, and new people should use `user add-human`.
+- Before any human password or completed bootstrap exists, GET-only browser
+  routes continue to accept the root bearer through HTTP Basic and the
+  HttpOnly `ai_memory_auth` cookie. Human activation disables that path
+  immediately, without a restart. Machine routes remain Bearer-only.
 - Native API credentials require `[auth].token_pepper`. Human user creation,
   password reset, disable/enable, and session login do not create or depend
   on API keys.
@@ -552,7 +562,7 @@ Runtime lookup no longer reads the old columns.
 |---|---|
 | Auth middleware injects `Extension<ActorContext>` on every request | ✓ P1.3 |
 | All `/admin/*` routes gate on `Extension<AuthLevel>::Root` in multi-user mode | ✓ P1.4 |
-| `ai-memory user add/list/reset-password/disable/enable/patch` and `ai-memory api-key add/list/rotate/revoke` | ✓ |
+| `ai-memory user add-human/list/reset-password/disable/enable/patch`, deprecated `user add/expire/revive/rotate-token`, and `ai-memory api-key add/list/rotate/revoke` | ✓ |
 | `pages.author_id` populated, frontmatter `last_modified_by` block | ✓ P1.6 |
 | `/api/v1` page responses include `author: { username, name?, email? }` | ✓ P1.7 |
 | ETag invalidation on author change (so caches refresh attribution) | ✓ P1.7 |
@@ -599,11 +609,13 @@ the bearer authenticates, attribution flows from the token's owner
   multi-user mode. If you need data isolation, run separate
   ai-memory servers (per-user data dirs) and front them with a reverse
   proxy.
-- **Native keys are not passwords.** `user add` never issues an `aim_`
-  secret; `api-key add` never issues a login session. Disable/reset of
-  a human leaves API credentials untouched, and revoke/rotate of a key
-  leaves the password/session untouched. One identity may hold several
-  native keys with distinct labels.
+- **Native keys are not passwords.** `user add-human` never issues an `aim_`
+  secret; `api-key add` never issues a login session. The deprecated `user add`
+  command is the exception: it issues one compatibility token backed by the
+  reserved `legacy-user-token` credential. Disable/reset of a human leaves API
+  credentials untouched, and revoke/rotate of a native key leaves the
+  password/session untouched. One identity may hold several native keys with
+  distinct labels.
 - **Root token is single.** `[auth].bearer_token` is the programmatic
   admin credential for `/admin/*`. A native key attached to a
   `role=root` identity still authenticates as `AuthLevel::User`. Human

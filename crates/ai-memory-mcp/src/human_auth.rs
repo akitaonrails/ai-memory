@@ -30,7 +30,8 @@ use crate::auth::AuthState;
 pub const SESSION_COOKIE: &str = "ai_memory_session";
 /// Readable CSRF cookie.
 pub const CSRF_COOKIE: &str = "ai_memory_csrf";
-/// Legacy Basic-auth cookie. Never set a value; expire on login/logout.
+/// Deprecated Basic-auth compatibility cookie. Issued only before human auth
+/// activates, then expired on the next browser response.
 pub const LEGACY_AUTH_COOKIE: &str = "ai_memory_auth";
 /// CSRF header required on cookie-authenticated mutations.
 pub const CSRF_HEADER: &str = "x-csrf-token";
@@ -372,6 +373,61 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
+fn legacy_basic_password(headers: &HeaderMap) -> Option<String> {
+    use base64::Engine;
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, encoded) = value.split_once([' ', '\t'])?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    let credentials = std::str::from_utf8(&decoded).ok()?;
+    let (_, password) = credentials.split_once(':')?;
+    Some(password.to_string())
+}
+
+fn legacy_browser_credential(headers: &HeaderMap) -> Option<(String, bool)> {
+    legacy_basic_password(headers)
+        .map(|token| (token, true))
+        .or_else(|| cookie_value(headers, LEGACY_AUTH_COOKIE).map(|token| (token, false)))
+}
+
+fn legacy_cookie(token: &str, secure: bool) -> String {
+    set_cookie(LEGACY_AUTH_COOKIE, token, true, 2_592_000, secure)
+}
+
+fn unauthorized_legacy_browser() -> Response {
+    let mut response = crate::auth::unauthorized_bearer();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        "Basic realm=\"ai-memory\", Bearer realm=\"ai-memory\", error=\"invalid_token\""
+            .parse()
+            .expect("static challenge is a valid header value"),
+    );
+    response
+}
+
+async fn human_auth_configured(state: &AuthState) -> Result<bool, Response> {
+    let Some(runtime) = state.human.as_ref() else {
+        return Ok(false);
+    };
+    if runtime
+        .reader
+        .bootstrap_completed()
+        .await
+        .map_err(|error| json_err(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))?
+    {
+        return Ok(true);
+    }
+    runtime
+        .reader
+        .any_password_hash()
+        .await
+        .map_err(|error| json_err(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()))
+}
+
 fn set_cookie(name: &str, value: &str, http_only: bool, max_age: i64, secure: bool) -> String {
     let http = if http_only { "; HttpOnly" } else { "" };
     let sec = if secure { "; Secure" } else { "" };
@@ -415,14 +471,17 @@ fn attach_legacy_expire(resp: &mut Response, secure: bool) {
     }
 }
 
-/// Expire the legacy Basic-auth cookie on public HTML responses.
+/// Expire the deprecated Basic-auth cookie once human auth is active.
 pub async fn expire_legacy_cookie_mw(
     State(state): State<Arc<AuthState>>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let expire = human_auth_configured(&state).await.unwrap_or(true);
     let mut resp = next.run(req).await;
-    attach_legacy_expire(&mut resp, state.secure_cookie());
+    if expire {
+        attach_legacy_expire(&mut resp, state.secure_cookie());
+    }
     resp
 }
 
@@ -948,12 +1007,13 @@ pub async fn require_session_or_anonymous(
     next.run(req).await
 }
 
-/// Dual-auth for `/admin` and `/api/v1` (and builtin wiki).
+/// Dual-auth for `/admin`, `/api/v1`, and the builtin wiki.
 ///
-/// A recognized `Authorization: Bearer` wins. An *invalid* Bearer does
-/// not fall back to the session cookie. Basic / unknown / empty
-/// Authorization is ignored so a saved browser credential cannot block
-/// the session.
+/// Bearer always wins and never falls back. Before a human password or
+/// bootstrap marker exists, deprecated Basic / `ai_memory_auth` credentials
+/// remain valid for GET only. The persisted human-auth transition is read on
+/// every browser request, so completing bootstrap closes both legacy
+/// transports without a restart.
 pub async fn require_dual_auth(
     State(state): State<Arc<AuthState>>,
     mut req: Request<axum::body::Body>,
@@ -970,6 +1030,43 @@ pub async fn require_dual_auth(
         }
         Ok(crate::auth::BearerAuth::Absent) => {}
     }
+
+    let human_configured = match human_auth_configured(&state).await {
+        Ok(configured) => configured,
+        Err(response) => return response,
+    };
+    if !human_configured {
+        if !state.enabled() {
+            req.extensions_mut().insert(ActorContext::anonymous());
+            req.extensions_mut().insert(AuthLevel::Anonymous);
+            return next.run(req).await;
+        }
+        if req.method() != Method::GET {
+            return crate::auth::unauthorized_bearer();
+        }
+        let had_legacy_cookie = cookie_value(req.headers(), LEGACY_AUTH_COOKIE).is_some();
+        let Some((provided, from_basic)) = legacy_browser_credential(req.headers()) else {
+            return unauthorized_legacy_browser();
+        };
+        match crate::auth::authenticate_token(&state, &mut req, &provided, false).await {
+            Ok(crate::auth::BearerAuth::Authenticated) => {
+                req.extensions_mut().insert(state.clone());
+                let mut response = next.run(req).await;
+                if from_basic
+                    && !had_legacy_cookie
+                    && let Ok(cookie) = legacy_cookie(&provided, state.secure_cookie()).parse()
+                {
+                    response.headers_mut().append(header::SET_COOKIE, cookie);
+                }
+                return response;
+            }
+            Err(response) => return response,
+            Ok(crate::auth::BearerAuth::Absent | crate::auth::BearerAuth::Rejected) => {
+                return unauthorized_legacy_browser();
+            }
+        }
+    }
+
     match load_session(&state, req.headers(), req.method()).await {
         Ok(live) => {
             if live.user.must_change_password {
@@ -977,15 +1074,10 @@ pub async fn require_dual_auth(
             }
             inject_session(&mut req, live);
             req.extensions_mut().insert(state.clone());
-            return next.run(req).await;
+            next.run(req).await
         }
-        Err(resp) if state.enabled() => return resp,
-        Err(_) => {
-            req.extensions_mut().insert(ActorContext::anonymous());
-            req.extensions_mut().insert(AuthLevel::Anonymous);
-        }
+        Err(resp) => resp,
     }
-    next.run(req).await
 }
 
 fn inject_session(req: &mut Request<axum::body::Body>, live: LiveWebSession) {
@@ -1313,6 +1405,116 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK, "auth={auth:?}");
             let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
             assert_eq!(&body[..], b"root");
+        }
+    }
+
+    fn legacy_basic(token: &str) -> String {
+        use base64::Engine;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("ignored:{token}"))
+        )
+    }
+
+    async fn legacy_transition_fixture() -> (
+        tempfile::TempDir,
+        Arc<AuthState>,
+        ai_memory_store::WriterHandle,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+        let writer = store.writer.clone();
+        let runtime = HumanAuthRuntime {
+            reader: store.reader.clone(),
+            writer: store.writer.clone(),
+            recovery_token_hash: Some(hash_session_secret("break-glass-recovery-token")),
+            root_username: "root".into(),
+            root_name: None,
+            root_email: None,
+            reserved_passwords: vec!["legacy-root-token".into()],
+            trusted_proxy_cidrs: Vec::new(),
+            limiter: Arc::new(LoginLimiter::default()),
+        };
+        let state = Arc::new(AuthState::new(Some("legacy-root-token".into())).with_human(runtime));
+        (tmp, state, writer)
+    }
+
+    #[tokio::test]
+    async fn legacy_browser_credentials_stop_when_human_bootstrap_completes() {
+        let (_tmp, state, writer) = legacy_transition_fixture().await;
+        let router = dual_router(state);
+
+        let basic = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("authorization", legacy_basic("legacy-root-token"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(basic.status(), StatusCode::OK);
+        let legacy_cookie = set_cookie_value(basic.headers(), LEGACY_AUTH_COOKIE)
+            .expect("successful Basic auth must persist the legacy browser cookie");
+
+        let cookie = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("cookie", format!("{LEGACY_AUTH_COOKIE}={legacy_cookie}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cookie.status(), StatusCode::OK);
+
+        writer
+            .bootstrap_root(
+                "root".into(),
+                None,
+                None,
+                "$argon2id$v=19$m=19456,t=2,p=1$ZmFrZQ$ZmFrZQ".into(),
+            )
+            .await
+            .unwrap();
+
+        for (name, authorization, cookie) in [
+            ("basic", Some(legacy_basic("legacy-root-token")), None),
+            (
+                "cookie",
+                None,
+                Some(format!("{LEGACY_AUTH_COOKIE}={legacy_cookie}")),
+            ),
+        ] {
+            let mut request = axum::http::Request::builder().uri("/probe");
+            if let Some(value) = authorization {
+                request = request.header("authorization", value);
+            }
+            if let Some(value) = cookie {
+                request = request.header("cookie", value);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{name} must fail immediately after human bootstrap"
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(header::WWW_AUTHENTICATE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_none_or(|value| !value.contains("Basic")),
+                "human mode must not advertise the legacy Basic challenge"
+            );
         }
     }
 

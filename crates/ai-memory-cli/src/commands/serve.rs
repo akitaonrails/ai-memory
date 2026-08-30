@@ -1018,21 +1018,21 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     store.writer.clone(),
                 );
             }
-            if human_mode {
-                let recovery_token_hash = config
-                    .auth
-                    .recovery_token
-                    .as_ref()
-                    .map(ExposeSecret::expose_secret)
-                    .filter(|s| !s.trim().is_empty())
-                    .map(hash_session_secret);
-                let root_username = config
-                    .auth
-                    .root_username
-                    .clone()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "root".to_string());
-                auth_state = auth_state.with_human(HumanAuthRuntime {
+            let recovery_token_hash = config
+                .auth
+                .recovery_token
+                .as_ref()
+                .map(ExposeSecret::expose_secret)
+                .filter(|s| !s.trim().is_empty())
+                .map(hash_session_secret);
+            let root_username = config
+                .auth
+                .root_username
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "root".to_string());
+            auth_state = auth_state.with_human_runtime(
+                HumanAuthRuntime {
                     reader: store.reader.clone(),
                     writer: store.writer.clone(),
                     recovery_token_hash,
@@ -1042,8 +1042,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     reserved_passwords: reserved_human_passwords(&config.auth),
                     trusted_proxy_cidrs: trusted_proxy_cidrs.clone(),
                     limiter: Arc::new(LoginLimiter::default()),
-                });
-            }
+                },
+                human_mode,
+            );
             let auth_state = Arc::new(auth_state);
             let auth_enabled = auth_state.enabled();
             let machine = axum::Router::new()

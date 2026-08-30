@@ -136,17 +136,17 @@ pub fn find_active_user_by_token_hash(
     conn.query_row(
         "SELECT u.id, u.username, u.name, u.email, u.created_at, u.last_seen_at, \
                 u.role, u.must_change_password, u.disabled_at, u.password_hash, \
-                c.id \
+                u.token_expired_at, c.id \
          FROM api_credentials c \
          JOIN users u ON u.id = c.user_id \
          WHERE c.token_hash = ?1 AND c.revoked_at IS NULL \
            AND (c.expires_at IS NULL OR c.expires_at > ?2)",
         params![token_hash.as_slice(), now],
         |row| {
-            let cred_bytes: Vec<u8> = row.get(10)?;
+            let cred_bytes: Vec<u8> = row.get(11)?;
             let credential_id = ApiCredentialId::from_slice(&cred_bytes).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    10,
+                    11,
                     rusqlite::types::Type::Blob,
                     Box::new(std::io::Error::other(e.to_string())),
                 )

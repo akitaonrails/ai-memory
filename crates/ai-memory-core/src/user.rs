@@ -113,6 +113,11 @@ pub struct User {
     /// Microseconds since epoch; `None` until the first authenticated
     /// request from this user. Updated fire-and-forget per request.
     pub last_seen_at: Option<i64>,
+    /// Microseconds since epoch; `None` means the deprecated single-token
+    /// compatibility credential is active. Native `api_credentials` have
+    /// independent revocation metadata.
+    #[serde(default)]
+    pub token_expired_at: Option<i64>,
     /// Human role. Native API credentials ignore this for AuthLevel.
     pub role: UserRole,
     /// The next web login must change the password before `/admin` or
@@ -130,6 +135,13 @@ impl User {
     #[must_use]
     pub fn is_human_enabled(&self) -> bool {
         self.disabled_at.is_none() && self.has_password
+    }
+
+    /// `true` when the deprecated single-token compatibility credential is
+    /// active.
+    #[must_use]
+    pub fn is_token_active(&self) -> bool {
+        self.token_expired_at.is_none()
     }
 }
 

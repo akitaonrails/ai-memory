@@ -77,6 +77,77 @@ pub struct LoginUser {
     pub password_hash: Option<String>,
 }
 
+/// Insert a token-only compatibility identity. V52 mirrors
+/// `users.token_hash` into the reserved `legacy-user-token`
+/// `api_credentials` row in the same transaction.
+///
+/// # Errors
+/// Duplicate username/email/token or SQL.
+pub fn insert_user(
+    conn: &Connection,
+    new_user: &NewUser,
+    token_hash: &[u8; TOKEN_HASH_LEN],
+) -> StoreResult<UserId> {
+    let id = UserId::new();
+    let now = Timestamp::now().as_microsecond();
+    conn.execute(
+        "INSERT INTO users \
+         (id, username, name, email, token_hash, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            id.as_bytes(),
+            &new_user.username,
+            &new_user.name,
+            &new_user.email,
+            token_hash.as_slice(),
+            now,
+        ],
+    )
+    .map_err(map_unique_violation)?;
+    Ok(id)
+}
+
+/// Replace and reactivate the deprecated single-token credential.
+///
+/// # Errors
+/// SQL failures.
+pub fn rotate_user_token(
+    conn: &Connection,
+    id: UserId,
+    new_token_hash: &[u8; TOKEN_HASH_LEN],
+) -> StoreResult<bool> {
+    let rows = conn.execute(
+        "UPDATE users SET token_hash = ?1, token_expired_at = NULL WHERE id = ?2",
+        params![new_token_hash.as_slice(), id.as_bytes()],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Idempotently revoke the deprecated single-token credential.
+///
+/// # Errors
+/// SQL failures.
+pub fn expire_user_token(conn: &Connection, id: UserId) -> StoreResult<bool> {
+    let now = Timestamp::now().as_microsecond();
+    let rows = conn.execute(
+        "UPDATE users SET token_expired_at = COALESCE(token_expired_at, ?1) WHERE id = ?2",
+        params![now, id.as_bytes()],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Idempotently reactivate the deprecated single-token credential.
+///
+/// # Errors
+/// SQL failures.
+pub fn revive_user_token(conn: &Connection, id: UserId) -> StoreResult<bool> {
+    let rows = conn.execute(
+        "UPDATE users SET token_expired_at = NULL WHERE id = ?1",
+        params![id.as_bytes()],
+    )?;
+    Ok(rows > 0)
+}
+
 /// Insert a human identity. `password_hash` is already Argon2id PHC (or
 /// `None` for API-only brownfield-style rows). No API credential is created.
 ///
@@ -428,7 +499,7 @@ pub fn touch_user_last_seen(conn: &Connection, id: UserId) -> StoreResult<bool> 
 pub fn find_user_by_username(conn: &Connection, username: &str) -> StoreResult<Option<User>> {
     conn.query_row(
         "SELECT id, username, name, email, created_at, last_seen_at, \
-                role, must_change_password, disabled_at, password_hash \
+                role, must_change_password, disabled_at, password_hash, token_expired_at \
          FROM users WHERE username = ?1",
         params![username],
         |row| row_to_user(row, 0),
@@ -444,7 +515,7 @@ pub fn find_user_by_username(conn: &Connection, username: &str) -> StoreResult<O
 pub fn find_user_by_id(conn: &Connection, id: UserId) -> StoreResult<Option<User>> {
     conn.query_row(
         "SELECT id, username, name, email, created_at, last_seen_at, \
-                role, must_change_password, disabled_at, password_hash \
+                role, must_change_password, disabled_at, password_hash, token_expired_at \
          FROM users WHERE id = ?1",
         params![id.as_bytes()],
         |row| row_to_user(row, 0),
@@ -463,7 +534,7 @@ pub fn find_login_user_by_username(
 ) -> StoreResult<Option<LoginUser>> {
     conn.query_row(
         "SELECT id, username, name, email, created_at, last_seen_at, \
-                role, must_change_password, disabled_at, password_hash \
+                role, must_change_password, disabled_at, password_hash, token_expired_at \
          FROM users WHERE username = ?1",
         params![username],
         |row| {
@@ -485,7 +556,7 @@ pub fn find_login_user_by_username(
 pub fn list_users(conn: &Connection) -> StoreResult<Vec<User>> {
     let mut stmt = conn.prepare(
         "SELECT id, username, name, email, created_at, last_seen_at, \
-                role, must_change_password, disabled_at, password_hash \
+                role, must_change_password, disabled_at, password_hash, token_expired_at \
          FROM users ORDER BY created_at ASC",
     )?;
     let rows = stmt
@@ -596,7 +667,8 @@ pub(crate) fn map_unique_violation(e: rusqlite::Error) -> StoreError {
     StoreError::from(e)
 }
 
-/// Decode a user row starting at `offset`. Column 9 relative is password_hash.
+/// Decode a user row starting at `offset`. Relative columns 9 and 10 are
+/// `password_hash` and the deprecated `token_expired_at`.
 pub(crate) fn row_to_user(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<User> {
     let id_bytes: Vec<u8> = row.get(offset)?;
     let id = UserId::from_slice(&id_bytes).map_err(|e| {
@@ -623,6 +695,7 @@ pub(crate) fn row_to_user(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::R
         email: row.get(offset + 3)?,
         created_at: row.get(offset + 4)?,
         last_seen_at: row.get(offset + 5)?,
+        token_expired_at: row.get(offset + 10)?,
         role,
         must_change_password: must != 0,
         disabled_at: row.get(offset + 8)?,
@@ -912,6 +985,70 @@ mod tests {
         assert!(!bootstrap_completed(&conn).unwrap());
         assert!(!users_exist(&conn).unwrap());
         assert_foreign_keys_clean(&conn);
+    }
+
+    #[test]
+    fn human_auth_v51_rejects_orphaned_page_author_ids() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrations::run_to(&mut conn, 50).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+
+        let workspace = [1u8; 16];
+        let project = [2u8; 16];
+        let page = [3u8; 16];
+        let missing_author = UserId::new();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'ws', 1)",
+            params![workspace.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) \
+             VALUES (?1, ?2, 'p', 1)",
+            params![project.as_slice(), workspace.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+              frontmatter_json, is_latest, pinned, created_at, updated_at, author_id) \
+             VALUES (?1, ?2, ?3, 'notes/orphan.md', 'title', 'semantic', 'body', ?4, '{}', 1, 0, 1, 1, ?5)",
+            params![
+                page.as_slice(),
+                workspace.as_slice(),
+                project.as_slice(),
+                [0u8; 32].as_slice(),
+                missing_author.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        let error = crate::migrations::run_to(&mut conn, 51)
+            .expect_err("V51 must abort rather than preserve an orphaned page author");
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "unexpected V51 guard error: {error}"
+        );
+        assert_eq!(schema_version(&conn), 50, "failed V51 must roll back");
+    }
+
+    #[test]
+    fn human_auth_v51_ignores_unrelated_preexisting_foreign_key_violations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrations::run_to(&mut conn, 50).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, created_at) \
+             VALUES (?1, ?2, 'preexisting-orphan', 1)",
+            params![[1u8; 16].as_slice(), [2u8; 16].as_slice()],
+        )
+        .unwrap();
+
+        crate::migrations::run_to(&mut conn, 51)
+            .expect("V51 must guard only references affected by its users-table rebuild");
+        assert_eq!(schema_version(&conn), 51);
     }
 
     #[test]

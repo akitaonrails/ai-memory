@@ -9,15 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Human password login, web sessions, and native `aim_` API credentials, so the
-  console no longer requires a Bearer pasted into the browser. `POST
-  /auth/login` issues an `HttpOnly` `ai_memory_session` cookie plus CSRF;
-  `/mcp`, hooks, and workstreams stay Bearer-only. Greenfield bootstrap consumes
-  `AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD` once; break-glass recovery uses
-  `AI_MEMORY_AUTH__RECOVERY_TOKEN` and never opens a session. `ai-memory user
-  add|list|reset-password|disable|enable|patch` manages people, while
-  `ai-memory api-key add|list|rotate|revoke` manages machine secrets. Existing
-  32-byte `users.token_hash` values copy losslessly into `api_credentials`;
-  rollback mirror triggers remain until the post-soak migration removes them.
+  console can use short-lived human sessions instead of a Bearer pasted into
+  the browser. `POST /auth/login` issues an `HttpOnly` `ai_memory_session`
+  cookie plus CSRF; `/mcp`, hooks, and workstreams stay Bearer-only. Greenfield
+  bootstrap consumes `AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD` once; break-glass
+  recovery uses `AI_MEMORY_AUTH__RECOVERY_TOKEN` and never opens a session.
+  `ai-memory user add-human|list|reset-password|disable|enable|patch` manages
+  people, while `ai-memory api-key add|list|rotate|revoke` manages machine
+  secrets. Existing 32-byte `users.token_hash` values copy losslessly into
+  `api_credentials`; rollback mirror triggers remain until the post-soak
+  migration removes them.
+
+### Changed
+- `/admin/*` and `/api/v1/*` accept a human web session or a machine Bearer.
+  Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
+  authenticated. Human auth is additive during 1.x: until a human password or
+  completed bootstrap exists, deprecated GET-only HTTP Basic and
+  `ai_memory_auth` cookie authentication continue to work. The transition to
+  human auth disables both legacy browser credentials immediately.
+- Preserved `ai-memory user add|expire|revive|rotate-token` and their admin
+  endpoints as deprecated 1.x compatibility paths backed by the reserved
+  `legacy-user-token` API credential. New automation should use
+  `api-key add|rotate|revoke`.
 
 ## [1.37.0] - 2026-08-30
 
@@ -255,18 +268,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drains, and superseding versions do not mistake the later writer for the
   origin; manual page writes remain unattributed. (#494)
 
-### Changed
-- `/admin/*` and `/api/v1/*` accept a web session or a machine Bearer
-  (dual-auth). Custom SPA HTML at `/web` is public static; the builtin wiki
-  browser stays authenticated. HTTP Basic and the legacy `ai_memory_auth`
-  cookie no longer authenticate. Native API-key lookup reads
-  `api_credentials`, not `users.token_hash`.
-
-### Removed
-- `ai-memory user expire|revive|rotate-token` and the matching
-  `/admin/users/{username}/expire|revive|rotate-token` endpoints. Use
-  `user disable|enable` for human login and `api-key rotate|revoke` for
-  machine secrets.
 
 ### Fixed
 - Prevented stored Markdown from automatically fetching external image URLs

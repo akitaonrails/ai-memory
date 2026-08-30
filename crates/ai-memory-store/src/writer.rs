@@ -364,6 +364,24 @@ pub(crate) enum WriteCmd {
         password_hash: String,
         reply: oneshot::Sender<StoreResult<UserId>>,
     },
+    CreateUser {
+        new_user: NewUser,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<UserId>>,
+    },
+    RotateUserToken {
+        user_id: UserId,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    ExpireUserToken {
+        user_id: UserId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    ReviveUserToken {
+        user_id: UserId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     CreateHumanUser {
         new_user: NewUser,
         role: UserRole,
@@ -1594,6 +1612,66 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Insert a token-only compatibility identity.
+    ///
+    /// # Errors
+    /// Writer closed, duplicate username/email/token, SQL.
+    pub async fn create_user(
+        &self,
+        new_user: NewUser,
+        token_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<UserId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CreateUser {
+            new_user,
+            token_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Rotate and reactivate a user's deprecated single-token credential.
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn rotate_user_token(
+        &self,
+        user_id: UserId,
+        token_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RotateUserToken {
+            user_id,
+            token_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Revoke a user's deprecated single-token credential.
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn expire_user_token(&self, user_id: UserId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ExpireUserToken { user_id, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Reactivate a user's deprecated single-token credential.
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn revive_user_token(&self, user_id: UserId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReviveUserToken { user_id, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a human identity. `new_user` MUST already have been validated.
     /// No API credential is created.
     ///
@@ -2604,6 +2682,30 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &password_hash,
                 );
                 send_or_warn(reply, result, "recover_root");
+            }
+            WriteCmd::CreateUser {
+                new_user,
+                token_hash,
+                reply,
+            } => {
+                let result = users::insert_user(&conn, &new_user, &token_hash);
+                send_or_warn(reply, result, "create_user");
+            }
+            WriteCmd::RotateUserToken {
+                user_id,
+                token_hash,
+                reply,
+            } => {
+                let result = users::rotate_user_token(&conn, user_id, &token_hash);
+                send_or_warn(reply, result, "rotate_user_token");
+            }
+            WriteCmd::ExpireUserToken { user_id, reply } => {
+                let result = users::expire_user_token(&conn, user_id);
+                send_or_warn(reply, result, "expire_user_token");
+            }
+            WriteCmd::ReviveUserToken { user_id, reply } => {
+                let result = users::revive_user_token(&conn, user_id);
+                send_or_warn(reply, result, "revive_user_token");
             }
             WriteCmd::CreateHumanUser {
                 new_user,

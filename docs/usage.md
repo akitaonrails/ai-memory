@@ -380,10 +380,12 @@ stay literal too.
 With no authority configured on loopback, the built-in wiki remains
 anonymous. For human-authenticated administration, serve the compiled admin SPA
 with `--web-ui-dir`: it signs in through `/auth/login` and uses an HttpOnly web
-session plus CSRF protection. HTTP Basic and browser-stored Bearers are
-unsupported. `AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain machine-only
-credentials sent as `Authorization: Bearer <token>` by MCP, hook, handoff, and
-workstream clients.
+session plus CSRF protection. Before human auth is active, deprecated GET-only
+browser compatibility accepts the root bearer through HTTP Basic and an
+HttpOnly `ai_memory_auth` cookie; it stops immediately after a human password or
+completed bootstrap exists. Browser-stored Bearers remain unsupported.
+`AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain machine-only credentials sent
+as `Authorization: Bearer <token>` by MCP, hook, handoff, and workstream clients.
 
 To host the web UI under a URL subpath behind a reverse proxy, the
 `--base-path` / `--web-slug` flags do the work — see

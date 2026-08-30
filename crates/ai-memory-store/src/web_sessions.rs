@@ -184,7 +184,8 @@ pub fn find_live_session_by_hash(
     conn.query_row(
         "SELECT s.id, s.csrf_hash, s.expires_at, s.last_used_at, \
                 u.id, u.username, u.name, u.email, u.created_at, u.last_seen_at, \
-                u.role, u.must_change_password, u.disabled_at, u.password_hash \
+                u.role, u.must_change_password, u.disabled_at, u.password_hash, \
+                u.token_expired_at \
          FROM web_sessions s \
          JOIN users u ON u.id = s.user_id \
          WHERE s.session_hash = ?1 AND s.revoked_at IS NULL AND s.expires_at > ?2",

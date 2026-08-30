@@ -40,7 +40,7 @@ token_pepper = \"{pepper}\"
 # leaves it anonymous. Set them to label root-token writes in the
 # audit log + page frontmatter.
 #
-# Add human users with `ai-memory user add --username <name>`, then issue
+# Add human users with `ai-memory user add-human --username <name>`, then issue
 # programmatic access separately with `ai-memory api-key add`.
 #
 # root_username = \"boss\"

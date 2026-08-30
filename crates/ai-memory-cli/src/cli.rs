@@ -171,7 +171,7 @@ pub enum Command {
     Uninstall(UninstallArgs),
     /// Manage optional upstream LLM provider authentication.
     Auth(AuthArgs),
-    /// Manage human users (password login, roles, disable). All
+    /// Manage human users and deprecated 1.x compatibility tokens. All
     /// subcommands require the root bearer token.
     User(UserArgs),
     /// Manage native `aim_` API credentials. All subcommands require
@@ -380,12 +380,22 @@ pub struct CompletionsArgs {
 /// Subcommands for `user`.
 #[derive(Debug, Subcommand)]
 pub enum UserCommand {
-    /// Create a human user and print a temporary password once. The
-    /// user must change it on next login. Does not issue an API key.
+    /// Create a token-only compatibility user and print their token once.
     Add(UserAddArgs),
+    /// Create a human user and print a temporary password once. The user must
+    /// change it on next login. Does not issue an API key.
+    #[command(name = "add-human")]
+    AddHuman(UserAddHumanArgs),
     /// List every registered identity. Passwords and hashes are never
-    /// surfaced; `status` is active, must-change, disabled, or api-only.
+    /// surfaced.
     List(UserListArgs),
+    /// Deprecated: expire the user's compatibility token.
+    Expire(UserExpireArgs),
+    /// Deprecated: reactivate the user's compatibility token.
+    Revive(UserReviveArgs),
+    /// Deprecated: replace and reactivate the user's compatibility token.
+    #[command(name = "rotate-token")]
+    RotateToken(UserRotateTokenArgs),
     /// Replace the user's password with a new temporary one, revoke
     /// their web sessions, and force a change on next login. Does not
     /// revoke API credentials.
@@ -403,27 +413,36 @@ pub enum UserCommand {
 /// Arguments for `user add`.
 #[derive(Debug, Args)]
 pub struct UserAddArgs {
-    /// Stable username. Required. Validation rejects empty, internal
-    /// whitespace, control chars, and the path/quoting separators
-    /// `/ \ : ; , " ' \``. UTF-8 letters and emails-as-usernames
-    /// (alice@home) are allowed.
+    /// Stable username.
     #[arg(long)]
     pub username: String,
-    /// Display name (e.g. `"Alice Smith"`). Surfaced in the web UI +
-    /// `/api/v1` responses alongside the username. Internal whitespace
-    /// is fine — only the edges are trimmed.
+    /// Optional display name.
     #[arg(long)]
     pub name: Option<String>,
-    /// Email. Basic validation: exactly one `@`, both sides non-empty,
-    /// no whitespace. Intranet-style addresses (`alice@home`) are
-    /// accepted. Lowercased before storage; case-insensitive unique.
+    /// Optional email.
+    #[arg(long)]
+    pub email: Option<String>,
+    /// Emit JSON. The compatibility token is included exactly once.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `user add-human`.
+#[derive(Debug, Args)]
+pub struct UserAddHumanArgs {
+    /// Stable username.
+    #[arg(long)]
+    pub username: String,
+    /// Optional display name.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Optional email.
     #[arg(long)]
     pub email: Option<String>,
     /// Role: `user` (default) or `root`.
     #[arg(long)]
     pub role: Option<String>,
-    /// Emit the response as JSON instead of human-readable text. The
-    /// temporary password is included in either case, once.
+    /// Emit JSON. The temporary password is included exactly once.
     #[arg(long)]
     pub json: bool,
 }
@@ -432,6 +451,36 @@ pub struct UserAddArgs {
 #[derive(Debug, Args)]
 pub struct UserListArgs {
     /// Emit the response as JSON instead of a human-readable table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for deprecated `user expire`.
+#[derive(Debug, Args)]
+pub struct UserExpireArgs {
+    /// Username whose compatibility token to expire.
+    pub username: String,
+    /// Skip the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// Arguments for deprecated `user revive`.
+#[derive(Debug, Args)]
+pub struct UserReviveArgs {
+    /// Username whose compatibility token to revive.
+    pub username: String,
+}
+
+/// Arguments for deprecated `user rotate-token`.
+#[derive(Debug, Args)]
+pub struct UserRotateTokenArgs {
+    /// Username whose compatibility token to rotate.
+    pub username: String,
+    /// Skip the interactive confirmation prompt.
+    #[arg(long)]
+    pub yes: bool,
+    /// Emit JSON. The new token is included exactly once.
     #[arg(long)]
     pub json: bool,
 }
@@ -2804,6 +2853,48 @@ mod tests {
             panic!("expected install-mcp command");
         };
         assert!(matches!(args.client, McpClient::Zed));
+    }
+
+    #[test]
+    fn deprecated_user_token_commands_and_additive_human_create_parse() {
+        for argv in [
+            vec!["ai-memory", "user", "expire", "alice", "--yes"],
+            vec!["ai-memory", "user", "revive", "alice"],
+            vec![
+                "ai-memory",
+                "user",
+                "rotate-token",
+                "alice",
+                "--yes",
+                "--json",
+            ],
+            vec![
+                "ai-memory",
+                "user",
+                "add-human",
+                "--username",
+                "alice",
+                "--role",
+                "root",
+            ],
+        ] {
+            Cli::try_parse_from(&argv)
+                .unwrap_or_else(|error| panic!("{argv:?} must remain parseable: {error}"));
+        }
+    }
+
+    #[test]
+    fn user_add_keeps_the_legacy_token_contract() {
+        let parsed =
+            Cli::try_parse_from(["ai-memory", "user", "add", "--username", "alice", "--json"])
+                .expect("legacy user add parses");
+        let Command::User(args) = parsed.command else {
+            panic!("expected user command");
+        };
+        assert!(
+            matches!(args.command, UserCommand::Add(_)),
+            "user add must remain the legacy token-issuing command"
+        );
     }
 
     #[test]

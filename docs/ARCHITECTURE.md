@@ -440,7 +440,8 @@ the explicit `install-mcp --client claude-code --session-aware` option.
 
 ## HTTP authentication classes
 
-Four credential classes share one process and must not be mixed:
+The process separates four active credential classes from one transitional
+browser compatibility path:
 
 | Class | Wire | Authorizes |
 |---|---|---|
@@ -448,10 +449,11 @@ Four credential classes share one process and must not be mixed:
 | Web session | `ai_memory_session` cookie + CSRF | `/auth/me`, `/admin/*`, `/api/v1/*` by `AuthLevel`; never `/mcp` or hooks |
 | Recovery | `POST /auth/recovery` body | Root password reset; no session |
 | API key | `Authorization: Bearer` (`aim_`, root `AI_MEMORY_AUTH_TOKEN`, or external `amk_`) | Machine APIs; never a web session |
+| Deprecated browser compatibility | HTTP Basic root bearer, then HttpOnly `ai_memory_auth` cookie | GET-only browser routes until any human password or completed bootstrap exists; never machine routes |
 
-HTTP Basic and the legacy `ai_memory_auth` cookie are not credentials.
-`/web` SPA HTML is public static; the builtin wiki browser and JSON APIs
-stay behind the route class above.
+The deprecated Basic/cookie path stops immediately when human auth becomes
+active; restart is not required. `/web` SPA HTML is public static; the builtin
+wiki browser and JSON APIs stay behind the route class above.
 
 ## CLI subcommand surface
 

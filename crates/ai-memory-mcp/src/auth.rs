@@ -1,21 +1,20 @@
 //! Authorization middleware for the HTTP server.
 //!
-//! When any authority is configured (`[auth].bearer_token`, a human
-//! password/session runtime, or a trusted-proxy bearer), machine-only
-//! routes (`/mcp`, `/hook`, `/handoff`, `/workstream/*`) require
-//! `Authorization: Bearer`. Browser Basic auth and the legacy
-//! `ai_memory_auth` cookie are never credentials on this surface.
-//! Human login uses [`crate::human_auth`] (session cookie + CSRF).
+//! Machine-only routes (`/mcp`, `/hook`, `/handoff`,
+//! `/workstream/*`) accept `Authorization: Bearer` only. Browser
+//! routes use Bearer plus one of two mutually exclusive modes:
 //!
-//! When no authority is configured the middleware is a no-op —
+//! - before human password auth is configured, GET requests retain
+//!   the deprecated Basic / `ai_memory_auth` cookie transport;
+//! - after human auth is configured, only short-lived human sessions
+//!   authenticate browser requests.
+//!
+//! When no authority is configured the middleware is a no-op,
 //! preserving zero-config loopback.
 //!
 //! Comparison uses [`subtle::ConstantTimeEq`] so an attacker on the
 //! same LAN cannot use response-time leaks to recover the token byte
 //! by byte.
-//!
-//! 401 responses include `WWW-Authenticate: Bearer` only. They never
-//! advertise a Basic challenge.
 
 use std::sync::Arc;
 
@@ -91,6 +90,10 @@ pub struct AuthState {
     /// Human password/session runtime. `None` for machine-only or
     /// zero-config anonymous loopback.
     pub human: Option<crate::human_auth::HumanAuthRuntime>,
+    /// Whether human auth was intended at startup. Runtime presence is
+    /// separate because the browser transition checks persisted password /
+    /// bootstrap state on every request.
+    human_intended: bool,
 }
 
 impl AuthState {
@@ -177,10 +180,23 @@ impl AuthState {
         self
     }
 
-    /// Attach the human password/session runtime.
+    /// Attach an active human password/session runtime.
     #[must_use]
-    pub fn with_human(mut self, human: crate::human_auth::HumanAuthRuntime) -> Self {
+    pub fn with_human(self, human: crate::human_auth::HumanAuthRuntime) -> Self {
+        self.with_human_runtime(human, true)
+    }
+
+    /// Attach the runtime while preserving the startup decision about whether
+    /// human auth contributes authority. HTTP serving attaches the runtime
+    /// even before bootstrap so the transition can happen without restart.
+    #[must_use]
+    pub fn with_human_runtime(
+        mut self,
+        human: crate::human_auth::HumanAuthRuntime,
+        human_intended: bool,
+    ) -> Self {
         self.human = Some(human);
+        self.human_intended = human_intended;
         self
     }
 
@@ -202,10 +218,11 @@ impl AuthState {
         self.actor_proxy_bearer.as_deref()
     }
 
-    /// True when any authority is configured (machine bearer or human).
+    /// True when machine authority or startup-intended human auth is
+    /// configured.
     #[must_use]
     pub fn enabled(&self) -> bool {
-        self.expected.is_some() || self.human.is_some()
+        self.expected.is_some() || self.human_intended
     }
 }
 
@@ -264,12 +281,11 @@ fn trusted_proxy_actor(headers: &HeaderMap) -> Result<ActorContext, ProxyAsserti
 }
 
 /// Inspect `Authorization: Bearer` and inject actor / [`AuthLevel`] on
-/// success. Browser Basic and the legacy `ai_memory_auth` cookie are
-/// never credentials.
+/// success.
 ///
 /// * [`BearerAuth::Authenticated`] — extensions populated; caller runs `next`.
 /// * [`BearerAuth::Absent`] — no Bearer scheme (missing, Basic, empty, unknown).
-/// * [`BearerAuth::Rejected`] — Bearer scheme present but not a known credential.
+/// * [`BearerAuth::Rejected`] — Bearer scheme was present and did not authenticate.
 /// * `Err(Response)` — trusted-proxy assertion is malformed (400).
 pub async fn authenticate_bearer(
     state: &AuthState,
@@ -278,6 +294,19 @@ pub async fn authenticate_bearer(
     let Some(provided) = extract_bearer_from_headers(req.headers()) else {
         return Ok(BearerAuth::Absent);
     };
+    authenticate_token(state, req, &provided, true).await
+}
+
+/// Authenticate one already-extracted token.
+///
+/// Browser Basic/cookie compatibility calls this with `allow_proxy=false`:
+/// proxy credentials may assert identities only through an explicit Bearer.
+pub(crate) async fn authenticate_token(
+    state: &AuthState,
+    req: &mut Request<axum::body::Body>,
+    provided: &str,
+    allow_proxy: bool,
+) -> Result<BearerAuth, Response> {
     if provided.is_empty() {
         return Ok(BearerAuth::Rejected);
     }
@@ -290,7 +319,8 @@ pub async fn authenticate_bearer(
         return Ok(BearerAuth::Authenticated);
     }
 
-    if let Some(proxy_expected) = state.actor_proxy_bearer.as_deref()
+    if allow_proxy
+        && let Some(proxy_expected) = state.actor_proxy_bearer.as_deref()
         && bool::from(provided.as_bytes().ct_eq(proxy_expected.as_bytes()))
     {
         let actor = match trusted_proxy_actor(req.headers()) {
@@ -321,7 +351,7 @@ pub async fn authenticate_bearer(
     }
 
     if let Some(mu) = state.multiuser.as_ref() {
-        let hash = hash_token(&provided, &mu.pepper);
+        let hash = hash_token(provided, &mu.pepper);
         match mu.reader.find_active_user_by_token_hash(hash).await {
             Ok(Some(hit)) => {
                 debug!(actor.user = %hit.user.username, "authenticated as DB user");

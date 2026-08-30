@@ -1758,7 +1758,8 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `commit -m "…"` | `docker exec` | Stage + commit the wiki tree |
 | `reset --confirm` | `docker exec` | Wipe data (refuses while siblings alive) |
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
-| `user add` / `list` / `reset-password` / `disable` / `enable` / `patch` | `docker exec` or native binary | Human identities and temporary passwords; never issues an API key |
+| `user add-human` / `list` / `reset-password` / `disable` / `enable` / `patch` | `docker exec` or native binary | Human identities and temporary passwords; never issues an API key |
+| `user add` / `expire` / `revive` / `rotate-token` | `docker exec` or native binary | Deprecated 1.x compatibility-token lifecycle backed by `legacy-user-token` |
 | `api-key add` / `list` / `rotate` / `revoke` | `docker exec` or native binary | Native `aim_` machine credentials |
 | `auth login openai-oauth` | same data volume as the server | Store a ChatGPT/Codex OAuth refresh token for the optional `openai-oauth` LLM provider |
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
@@ -1970,9 +1971,12 @@ sandbox, map the data dir read-write, e.g. `ai-jail --rw-map
 
 Human console login is username/password, not a Bearer pasted into the
 browser. Machine APIs keep using `Authorization: Bearer` (`AI_MEMORY_AUTH_TOKEN`
-or a native `aim_` key). The four classes stay isolated: a password only
-issues a session; a session never authenticates `/mcp`/hooks/workstreams;
-recovery never issues a session; an API key never logs into `/auth/login`.
+or a native `aim_` key). Before human auth activates, deprecated GET-only
+browser compatibility may exchange the root bearer through HTTP Basic for an
+HttpOnly `ai_memory_auth` cookie; activation disables that path immediately.
+The active classes stay isolated: a password only issues a session; a session
+never authenticates `/mcp`/hooks/workstreams; recovery never issues a session;
+an API key never logs into `/auth/login`.
 
 ### First-time root (greenfield)
 
