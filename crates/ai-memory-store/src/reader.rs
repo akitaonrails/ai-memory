@@ -817,6 +817,57 @@ pub struct ContaminationReport {
     pub findings: Vec<ContaminationFinding>,
 }
 
+/// One `audit_log` row with names resolved through LEFT JOINs.
+///
+/// Workspace, project, page, and author are `Option` because the log has
+/// no foreign keys (V05: append-only; orphan rows are expected).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditEvent {
+    /// Auto-increment primary key; also the keyset pagination cursor.
+    pub id: i64,
+    /// Event time in microseconds since Unix epoch (V01 convention).
+    pub at: i64,
+    /// Writer-assigned op (`create_page`, `supersede_page`, `purge_project`, …).
+    pub op: String,
+    /// Workspace name, or `None` when the id no longer resolves.
+    pub workspace: Option<String>,
+    /// Project name, or `None` when the id no longer resolves.
+    pub project: Option<String>,
+    /// Page path, or `None` when the id no longer resolves.
+    pub page_path: Option<String>,
+    /// Username, or `None` for anonymous writes and deleted users.
+    pub author_username: Option<String>,
+    /// Schema column. The only writer stores the literal `{}`; not a payload.
+    pub detail: String,
+}
+
+/// Filters for [`ReaderPool::list_audit_events`].
+#[derive(Debug, Clone)]
+pub struct AuditLogFilter {
+    /// Restrict to this workspace **name**.
+    pub workspace: Option<String>,
+    /// Restrict to this project **name**.
+    pub project: Option<String>,
+    /// Restrict to this op string.
+    pub op: Option<String>,
+    /// Keyset cursor: return rows with `id` strictly less than this value.
+    pub before_id: Option<i64>,
+    /// Page size. Clamped to `1..=200`; [`Default`] is 50.
+    pub limit: usize,
+}
+
+impl Default for AuditLogFilter {
+    fn default() -> Self {
+        Self {
+            workspace: None,
+            project: None,
+            op: None,
+            before_id: None,
+            limit: 50,
+        }
+    }
+}
+
 /// Counts that must all be zero before `ai-memory reindex` rebuilds the
 /// derived SQLite store from wiki files.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -6674,6 +6725,88 @@ impl ReaderPool {
                 .count(),
         };
         Ok(ContaminationReport { summary, findings })
+    }
+
+    /// List `audit_log` rows newest-first, resolving names through LEFT JOINs.
+    ///
+    /// Workspace/project filters match on **name** (the same convention as
+    /// [`Self::list_pages`]). `before_id` is a keyset cursor (`id < ?` under
+    /// `ORDER BY id DESC`): new events get higher ids, so they land on later
+    /// first pages instead of shifting this window and duplicating or skipping
+    /// rows already seen. `limit` is clamped to `1..=200`.
+    ///
+    /// `detail` is the schema column; the only writer currently stores the
+    /// literal `{}`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_audit_events(&self, filter: AuditLogFilter) -> StoreResult<Vec<AuditEvent>> {
+        let limit = filter.limit.clamp(1, 200);
+        let workspace = filter.workspace.filter(|s| !s.is_empty());
+        let project = filter.project.filter(|s| !s.is_empty());
+        let op = filter.op.filter(|s| !s.is_empty());
+        let before_id = filter.before_id;
+        self.with_conn(move |conn| {
+            let mut sql = String::from(
+                "SELECT a.id, a.at, a.op, w.name, p.name, pg.path, u.username, a.detail \
+                 FROM audit_log a \
+                 LEFT JOIN workspaces w ON w.id = a.workspace_id \
+                 LEFT JOIN projects p ON p.id = a.project_id \
+                 LEFT JOIN pages pg ON pg.id = a.page_id \
+                 LEFT JOIN users u ON u.id = a.author_id",
+            );
+            let mut binds: Vec<Value> = Vec::new();
+            let mut clauses: Vec<&str> = Vec::new();
+            if workspace.is_some() {
+                clauses.push("w.name = ?");
+            }
+            if project.is_some() {
+                clauses.push("p.name = ?");
+            }
+            if op.is_some() {
+                clauses.push("a.op = ?");
+            }
+            if before_id.is_some() {
+                clauses.push("a.id < ?");
+            }
+            if !clauses.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&clauses.join(" AND "));
+            }
+            sql.push_str(" ORDER BY a.id DESC LIMIT ?");
+            if let Some(ws) = &workspace {
+                binds.push(Value::Text(ws.clone()));
+            }
+            if let Some(proj) = &project {
+                binds.push(Value::Text(proj.clone()));
+            }
+            if let Some(op) = &op {
+                binds.push(Value::Text(op.clone()));
+            }
+            if let Some(before) = before_id {
+                binds.push(Value::Integer(before));
+            }
+            binds.push(Value::Integer(i64::try_from(limit).unwrap_or(200)));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(binds.iter()), |row| {
+                Ok(AuditEvent {
+                    id: row.get(0)?,
+                    at: row.get(1)?,
+                    op: row.get(2)?,
+                    workspace: row.get(3)?,
+                    project: row.get(4)?,
+                    page_path: row.get(5)?,
+                    author_username: row.get(6)?,
+                    detail: row.get(7)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// Return aggregate counts for the `status` view.

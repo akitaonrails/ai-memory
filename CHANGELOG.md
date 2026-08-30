@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `GET /admin/audit-log`, a read-only paginated reader for the existing
+  `audit_log` table. Events resolve workspace, project, page path, and author
+  username through LEFT JOINs (orphans stay `null` — the log has no foreign
+  keys by design), page by keyset (`before_id`) so a live trail cannot skip or
+  duplicate rows, and clamp `limit` to 1..=200 (default 50). The `detail`
+  column is returned for schema fidelity; the only writer still stores the
+  literal `{}`. (#531)
 - `install-mcp --client zcode` registers ai-memory as an MCP server in the
   ZCode CLI (z.ai). The user-scope config lives at `~/.zcode/cli/config.json`
   with servers under the nested `mcp.servers` map, and the generated entry is
