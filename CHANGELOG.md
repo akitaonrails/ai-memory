@@ -287,7 +287,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drains, and superseding versions do not mistake the later writer for the
   origin; manual page writes remain unattributed. (#494)
 
-
 ### Fixed
 - Prevented stored Markdown from automatically fetching external image URLs
   when viewed in the web UI, while preserving clickable external links and
