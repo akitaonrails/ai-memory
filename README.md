@@ -232,6 +232,9 @@ priors are at the [bottom](#influences-and-prior-art).
   # Fix a name you regret; the ledger and the current selection stay put.
   ai-memory rename-workstream --from typo-nmae --to refactor-db
 
+  # Pick a managed workstream from any linked local checkout, then resume it.
+  ai-memory resume
+
   # List open cross-agent handoffs, oldest first, with the id
   # `memory_handoff_cancel` needs to clear a stale one.
   ai-memory handoffs
@@ -296,6 +299,22 @@ priors are at the [bottom](#influences-and-prior-art).
   reported on stderr and skipped, so a resume never quietly lands in the wrong
   project. `--workspace` narrows the search; `--yolo` and `--fresh` are
   forwarded.
+- **"Let me choose which workstream to resume."** From any directory, select
+  one of the recent workstreams from your valid client-local managed checkouts:
+
+  ```bash
+  ai-memory resume
+  ai-memory resume --workspace work
+  ```
+
+  The picker shows the workstream name, project scope, activity, and linked
+  harnesses. Use Up/Down (or `j`/`k`) to choose a workstream and Left/Right to
+  cycle its launch harness. Every row starts at `auto`, preserving normal
+  session discovery; the other choices are supported harnesses currently found
+  in `PATH`. Enter launches the displayed combination. The checkout is
+  revalidated first, while the server continues to receive fingerprints rather
+  than a local path. Use `ai-memory workstreams` when you are already in a
+  checkout and only want the read-only list.
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok
@@ -629,10 +648,10 @@ one matching entry.
   required when the env vars are set. Any non-loopback server should use
   bearer auth.
 - **Managed-launch wrapper:** `ai-memory run`, `ai-memory show`,
-  `ai-memory continue`, and `ai-memory workstreams` must be intercepted by the
-  current host wrapper so local checkouts, native harnesses, and session stores
-  remain accessible. An old wrapper may pass these commands into Docker and
-  fail to find a checkout or host executable. Run
+  `ai-memory continue`, `ai-memory resume`, and `ai-memory workstreams` must be
+  intercepted by the current host wrapper so local checkouts, native harnesses,
+  and session stores remain accessible. An old wrapper may pass these commands
+  into Docker and fail to find a checkout or host executable. Run
   `ai-memory upgrade` on the agent machine to refresh it. The host-native runner
   inherits `AI_MEMORY_SERVER_URL`, `AI_MEMORY_AUTH_TOKEN`, and the host `PATH`.
 - **Upgrades:** for Docker-wrapper installs, run `ai-memory upgrade` on each

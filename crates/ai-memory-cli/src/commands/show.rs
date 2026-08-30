@@ -102,9 +102,9 @@ impl Candidate {
     }
 }
 
-struct Choice {
-    label: String,
-    detail: String,
+pub(super) struct Choice {
+    pub(super) label: String,
+    pub(super) detail: String,
 }
 
 #[derive(Serialize)]
@@ -173,7 +173,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
         label: candidate.label(),
         detail: candidate.detail(),
     }));
-    let Some(project_index) = select("Project", &project_choices)? else {
+    let Some(project_index) = select("Project", &mut project_choices)? else {
         return Ok(0);
     };
     let new_project = if project_index == 0 {
@@ -185,7 +185,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
         None
     };
 
-    let harness_choices = harnesses
+    let mut harness_choices = harnesses
         .iter()
         .map(|choice| Choice {
             label: harness_name(*choice),
@@ -196,7 +196,8 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
         .as_deref()
         .map(terminal_text)
         .unwrap_or_else(|| project_choices[project_index].label.clone());
-    let Some(harness_index) = select(&format!("Agent | {project_label}"), &harness_choices)? else {
+    let Some(harness_index) = select(&format!("Agent | {project_label}"), &mut harness_choices)?
+    else {
         return Ok(0);
     };
     let harness = harnesses[harness_index];
@@ -413,7 +414,7 @@ fn print_json(
     Ok(())
 }
 
-fn available_harnesses() -> Vec<RunHarnessChoice> {
+pub(super) fn available_harnesses() -> Vec<RunHarnessChoice> {
     RunHarnessChoice::value_variants()
         .iter()
         .copied()
@@ -621,7 +622,7 @@ fn humanize_age(timestamp: Option<&str>) -> String {
     super::humanize_age_secs((jiff::Timestamp::now() - then).get_seconds())
 }
 
-fn harness_name(harness: RunHarnessChoice) -> String {
+pub(super) fn harness_name(harness: RunHarnessChoice) -> String {
     harness
         .to_possible_value()
         .map_or_else(|| "unknown".to_owned(), |value| value.get_name().to_owned())
@@ -648,7 +649,33 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn select(title: &str, choices: &[Choice]) -> Result<Option<usize>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HorizontalDirection {
+    Left,
+    Right,
+}
+
+type HorizontalHandler<'a> = &'a mut dyn FnMut(usize, HorizontalDirection, &mut Choice);
+
+pub(super) fn select(title: &str, choices: &mut [Choice]) -> Result<Option<usize>> {
+    select_inner(title, choices, None, None)
+}
+
+pub(super) fn select_with_horizontal(
+    title: &str,
+    choices: &mut [Choice],
+    horizontal_hint: &str,
+    on_horizontal: &mut dyn FnMut(usize, HorizontalDirection, &mut Choice),
+) -> Result<Option<usize>> {
+    select_inner(title, choices, Some(horizontal_hint), Some(on_horizontal))
+}
+
+fn select_inner(
+    title: &str,
+    choices: &mut [Choice],
+    horizontal_hint: Option<&str>,
+    mut on_horizontal: Option<HorizontalHandler<'_>>,
+) -> Result<Option<usize>> {
     if choices.is_empty() {
         bail!("nothing to choose from");
     }
@@ -663,7 +690,14 @@ fn select(title: &str, choices: &[Choice]) -> Result<Option<usize>> {
     let mut offset = 0usize;
     let mut drawn = 0u16;
     loop {
-        drawn = draw(title, choices, selected, &mut offset, drawn)?;
+        drawn = draw(
+            title,
+            choices,
+            selected,
+            &mut offset,
+            drawn,
+            horizontal_hint,
+        )?;
         let Event::Key(KeyEvent {
             code,
             modifiers,
@@ -673,6 +707,12 @@ fn select(title: &str, choices: &[Choice]) -> Result<Option<usize>> {
         else {
             continue;
         };
+        if let Some(direction) = horizontal_direction(&code) {
+            if let Some(callback) = on_horizontal.as_mut() {
+                callback(selected, direction, &mut choices[selected]);
+            }
+            continue;
+        }
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
                 selected = selected.checked_sub(1).unwrap_or(choices.len() - 1);
@@ -698,6 +738,14 @@ fn select(title: &str, choices: &[Choice]) -> Result<Option<usize>> {
             }
             _ => {}
         }
+    }
+}
+
+fn horizontal_direction(code: &KeyCode) -> Option<HorizontalDirection> {
+    match code {
+        KeyCode::Left => Some(HorizontalDirection::Left),
+        KeyCode::Right => Some(HorizontalDirection::Right),
+        _ => None,
     }
 }
 
@@ -836,6 +884,7 @@ fn draw(
     selected: usize,
     offset: &mut usize,
     previous: u16,
+    horizontal_hint: Option<&str>,
 ) -> Result<u16> {
     let (columns, _) = terminal::size().unwrap_or((80, 24));
     let width = usize::from(columns.max(20)).saturating_sub(1);
@@ -876,14 +925,17 @@ fn draw(
         }
         write!(out, "\r\n")?;
     }
+    let horizontal_hint = horizontal_hint
+        .map(|hint| format!(" | {hint}"))
+        .unwrap_or_default();
     let hint = if choices.len() > viewport {
         format!(
-            "  up/down move | pgup/pgdn page | enter select | esc cancel [{}/{}]",
+            "  up/down move{horizontal_hint} | pgup/pgdn page | enter select | esc cancel [{}/{}]",
             selected + 1,
             choices.len()
         )
     } else {
-        "  up/down move | enter select | esc cancel".to_owned()
+        format!("  up/down move{horizontal_hint} | enter select | esc cancel")
     };
     write!(out, "{}\r\n", truncate(&hint, width).dark_grey())?;
     out.flush()?;
@@ -1076,5 +1128,18 @@ mod tests {
         for harness in RunHarnessChoice::value_variants() {
             assert_ne!(harness_name(*harness), "unknown");
         }
+    }
+
+    #[test]
+    fn horizontal_arrow_keys_map_to_picker_directions() {
+        assert_eq!(
+            horizontal_direction(&KeyCode::Left),
+            Some(HorizontalDirection::Left)
+        );
+        assert_eq!(
+            horizontal_direction(&KeyCode::Right),
+            Some(HorizontalDirection::Right)
+        );
+        assert_eq!(horizontal_direction(&KeyCode::Up), None);
     }
 }

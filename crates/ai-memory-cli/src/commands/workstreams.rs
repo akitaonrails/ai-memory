@@ -1,6 +1,7 @@
 //! Checkout-local discovery for managed workstreams.
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use ai_memory_core::{ListManagedWorkstreamsRequest, ManagedWorkstreamSummary};
 use ai_memory_workstream::inspect_repository;
@@ -13,20 +14,15 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// List workstreams that `run --workstream` can select in this checkout.
 pub async fn run(config: &Config, args: WorkstreamsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting managed workstream checkout")?;
-    let repository = inspect_repository(&cwd)?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let summaries: Vec<ManagedWorkstreamSummary> = post_json(
+    let summaries = list_for_checkout(
         &endpoint,
-        "/workstream/recent",
-        &ListManagedWorkstreamsRequest {
-            workspace: workspace.clone(),
-            project: project.clone(),
-            repo_fingerprint: repository.repo_fingerprint,
-            worktree_fingerprint: repository.worktree_fingerprint,
-            limit: usize::from(args.limit),
-        },
+        &workspace,
+        &project,
+        &cwd,
+        usize::from(args.limit),
     )
     .await?;
     if args.json {
@@ -35,6 +31,34 @@ pub async fn run(config: &Config, args: WorkstreamsArgs) -> Result<()> {
     }
     print!("{}", render_human(&summaries, &workspace, &project));
     Ok(())
+}
+
+/// List recent managed workstreams for one local checkout.
+///
+/// The server receives only its stable repository/worktree fingerprints; the
+/// checkout path stays client-local so a remote server can never choose or
+/// disclose a path on this host.
+pub(super) async fn list_for_checkout(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    checkout: &Path,
+    limit: usize,
+) -> Result<Vec<ManagedWorkstreamSummary>> {
+    let repository =
+        inspect_repository(checkout).context("inspecting managed workstream checkout")?;
+    post_json(
+        endpoint,
+        "/workstream/recent",
+        &ListManagedWorkstreamsRequest {
+            workspace: workspace.to_owned(),
+            project: project.to_owned(),
+            repo_fingerprint: repository.repo_fingerprint,
+            worktree_fingerprint: repository.worktree_fingerprint,
+            limit,
+        },
+    )
+    .await
 }
 
 fn render_human(summaries: &[ManagedWorkstreamSummary], workspace: &str, project: &str) -> String {

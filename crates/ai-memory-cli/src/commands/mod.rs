@@ -53,6 +53,7 @@ pub mod reorg;
 pub mod reset;
 pub mod restore;
 pub mod restore_page;
+pub mod resume;
 pub mod run;
 pub mod search;
 pub mod serve;

@@ -95,6 +95,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Resume(args) => {
+            let exit_code = commands::resume::run(&config, args).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Command::Handoffs(args) => commands::handoffs::run(&config, args).await,
         Command::Workstreams(args) => commands::workstreams::run(&config, args).await,
         Command::RenameWorkstream(args) => commands::rename_workstream::run(&config, args).await,

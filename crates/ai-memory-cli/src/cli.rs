@@ -43,6 +43,8 @@ pub enum Command {
     /// Resume the most recently launched managed checkout from anywhere,
     /// without `cd` and without picking from a list.
     Continue(ContinueArgs),
+    /// Interactively pick a recent managed workstream and launch harness.
+    Resume(ResumeArgs),
     /// List open cross-agent handoffs so a stale one can be cancelled by id.
     Handoffs(HandoffsArgs),
     /// List recent managed workstreams selectable from the current checkout.
@@ -324,6 +326,29 @@ pub struct ContinueArgs {
     /// Only consider checkouts resolving to this workspace.
     #[arg(long)]
     pub workspace: Option<String>,
+    /// Disable native permission prompts using the resolved harness's
+    /// equivalent dangerous-mode option. Forwarded to `run`.
+    #[arg(long)]
+    pub yolo: bool,
+    /// Start a new native session instead of resuming the linked one.
+    /// Forwarded to `run`.
+    #[arg(long)]
+    pub fresh: bool,
+}
+
+/// Arguments for `resume`.
+///
+/// The picker deliberately accepts only wrapper-owned flags. Harness selection
+/// happens interactively, then it delegates to `run --workstream NAME` in the
+/// selected checkout.
+#[derive(Debug, Args)]
+pub struct ResumeArgs {
+    /// Only consider checkouts resolving to this workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Maximum workstreams to show in the picker.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub limit: u8,
     /// Disable native permission prompts using the resolved harness's
     /// equivalent dangerous-mode option. Forwarded to `run`.
     #[arg(long)]
@@ -2156,6 +2181,42 @@ mod tests {
             vec!["ai-memory", "continue", "claude"],
             vec!["ai-memory", "continue", "--model", "opus"],
             vec!["ai-memory", "continue", "--executable", "/bin/claude"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&rejected).is_err(),
+                "{rejected:?} must not parse"
+            );
+        }
+    }
+
+    /// `resume` is an interactive selector, so it keeps the same narrow
+    /// wrapper-only command-line surface as `continue`; its picker selects the
+    /// native harness without accepting harness-native arguments.
+    #[test]
+    fn resume_takes_picker_and_wrapper_flags_only() {
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "resume",
+            "--workspace",
+            "work",
+            "--limit",
+            "50",
+            "--yolo",
+        ])
+        .expect("resume parses picker flags");
+        let Command::Resume(args) = parsed.command else {
+            panic!("expected resume command");
+        };
+        assert_eq!(args.workspace.as_deref(), Some("work"));
+        assert_eq!(args.limit, 50);
+        assert!(args.yolo);
+        assert!(!args.fresh);
+
+        for rejected in [
+            vec!["ai-memory", "resume", "claude"],
+            vec!["ai-memory", "resume", "--model", "opus"],
+            vec!["ai-memory", "resume", "--executable", "/bin/claude"],
+            vec!["ai-memory", "resume", "--limit", "0"],
         ] {
             assert!(
                 Cli::try_parse_from(&rejected).is_err(),

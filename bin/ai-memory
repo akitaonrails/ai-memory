@@ -372,7 +372,7 @@ native_host_binary() {
     Darwin) os="macos" ;;
     *)
       echo "ai-memory: the Docker wrapper cannot provide managed host launches on this OS" >&2
-      echo "install the native release binary to use ai-memory run/show/continue/workstreams/rename-workstream" >&2
+      echo "install the native release binary to use ai-memory run/show/continue/resume/workstreams/rename-workstream" >&2
       return 1
       ;;
   esac
@@ -447,7 +447,7 @@ case "${1:-}" in
     cmd_upgrade
     exit 0
     ;;
-  run | show | continue | workstreams | rename-workstream)
+  run | show | continue | resume | workstreams | rename-workstream)
     NATIVE_HOST_COMMAND=$1
     shift
     NATIVE_HOST_BIN=$(native_host_binary)

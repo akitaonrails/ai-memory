@@ -835,6 +835,7 @@ fn managed_host_commands_use_native_path_and_remote_server_without_docker() {
         &["run", "codex", "--yolo", "resume"],
         &["show", "--json", "--no-scan"],
         &["continue", "--workspace", "work", "--yolo"],
+        &["resume", "--workspace", "work", "--limit", "5"],
         &["workstreams", "--limit", "5", "--json"],
         &["rename-workstream", "--from", "old", "--to", "new"],
     ];
