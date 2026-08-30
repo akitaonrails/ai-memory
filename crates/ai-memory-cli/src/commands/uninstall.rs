@@ -344,6 +344,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             Omp,
             AntigravityCli,
             Zero,
+            Zcode,
             VsCodeCopilot,
             Zed,
             Devin,
@@ -1095,7 +1096,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::Swival
         | McpClient::Devin => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
-        McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
+        McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Zed => Some(&["context_servers"]),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,

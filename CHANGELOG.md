@@ -24,6 +24,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embedded engine v0.16.5), so the prior session's handoff is delivered
   automatically.
 
+## [1.37.0] - 2026-08-30
+
+### Added
+- Added `GET /admin/audit-log`, a read-only paginated reader for the existing
+  `audit_log` table. Events resolve workspace, project, page path, and author
+  username through LEFT JOINs (orphans stay `null` — the log has no foreign
+  keys by design), page by keyset (`before_id`) so a live trail cannot skip or
+  duplicate rows, and clamp `limit` to 1..=200 (default 50). The `detail`
+  column is returned for schema fidelity; the only writer still stores the
+  literal `{}`. (#531)
+- `install-mcp --client zcode` registers ai-memory as an MCP server in the
+  ZCode CLI (z.ai). The user-scope config lives at `~/.zcode/cli/config.json`
+  with servers under the nested `mcp.servers` map, and the generated entry is
+  a native streamable-HTTP registration — `type: "http"`, `url`, and an
+  `Authorization` bearer header when a token is configured. ZCode's entry
+  schema is strict (unknown keys make it drop the server silently), so the
+  entry carries exactly those keys and nothing else. `--apply` merges in place
+  preserving sibling servers and is idempotent; uninstall sweeps the same
+  file. MCP-only for now — lifecycle hooks are tracked separately in #512.
+  (#511)
+
+### Fixed
+- Stopped a session summary spending its characters on tool family labels. The
+  summary #477 added names the busiest tools, but for the seven agents that go
+  through `closed_tool_agent` — Claude Code among them — a tool observation's
+  title is written by `safe_tool_title` as `tool <family>`, and `ToolFamily`
+  has four variants. Measured on a live 1,885-page instance, 21,136 of 29,804
+  `PostToolUse` observations (71%) carried one of three such literals against
+  56 real tool names in the other 29%, and every tool mention in every summary
+  there was a family label: `580 completed tool calls across tool non-file,
+  tool unknown and tool file` spent 47 characters to say that some calls
+  touched files and some did not. Family labels are now counted but not named,
+  and a session with nothing else to name drops the clause instead of filling
+  it. The predicate lives beside the writer and is derived from the same serde
+  representation, so a new `ToolFamily` variant cannot escape it. (#527)
+
 ## [1.36.0] - 2026-08-29
 
 ### Added
@@ -4056,7 +4092,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.36.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.37.0...HEAD
+[1.37.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.37.0
 [1.36.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.36.0
 [1.35.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.35.0
 [1.34.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.34.0

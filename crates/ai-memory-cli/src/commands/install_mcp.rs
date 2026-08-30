@@ -73,6 +73,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Omp => render_omp(&args)?,
         McpClient::AntigravityCli => render_antigravity_cli(&args)?,
         McpClient::Zero => render_zero(&args)?,
+        McpClient::Zcode => render_zcode(&args)?,
         McpClient::Devin => render_devin(&args)?,
         McpClient::KimiCode => render_kimi_code(&args)?,
         McpClient::KiroCli => render_kiro_cli(&args)?,
@@ -204,6 +205,10 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // to ~/.config; we target the default and --config-file covers
         // non-default XDG setups (same policy as OpenCode above).
         McpClient::Zero => home()?.join(".config").join("zero").join("config.json"),
+        // ZCode keeps its user-scope config at ~/.zcode/cli/config.json
+        // (workspace scopes like .zcode/config.json exist, but user scope
+        // is the install default for every other client too).
+        McpClient::Zcode => home()?.join(".zcode").join("cli").join("config.json"),
         McpClient::Devin => home()?.join(".devin").join("config.json"),
         // Kimi Code keeps its data dir at $KIMI_CODE_HOME when set,
         // falling back to ~/.kimi-code; MCP servers live in mcp.json at
@@ -490,8 +495,10 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // Zero's config.json nests servers under `mcp.servers`, the same
-        // shape OpenClaw uses.
-        McpClient::Openclaw | McpClient::Zero => Some(JsonMcpLocation::NestedMcpServers),
+        // shape OpenClaw uses. ZCode nests its servers the same way.
+        McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => {
+            Some(JsonMcpLocation::NestedMcpServers)
+        }
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
         McpClient::Zed => Some(JsonMcpLocation::RootContextServers),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
@@ -504,6 +511,7 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::OpenCode => build_mcp_entry_opencode(args),
         McpClient::Openclaw => build_mcp_entry_openclaw(args),
         McpClient::Zero => build_mcp_entry_zero(args),
+        McpClient::Zcode => build_mcp_entry_zcode(args),
         McpClient::Codex | McpClient::Grok => {
             bail!("internal: Codex/Grok MCP config is TOML, not JSON")
         }
@@ -769,6 +777,23 @@ fn build_mcp_entry_openclaw(args: &InstallMcpArgs) -> Result<serde_json::Value> 
 /// bearer headers — `internal/config/types.go`'s `MCPServerConfig` accepts
 /// `type: "http"` + `url` + a `headers` map (issue #156).
 fn build_mcp_entry_zero(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let bearer = bearer_header_value(args.auth_token.as_deref());
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("http"));
+    entry.insert("url".into(), json!(server_url));
+    if let Some(b) = bearer {
+        entry.insert("headers".into(), json!({"Authorization": b}));
+    }
+    Ok(serde_json::Value::Object(entry))
+}
+
+/// ZCode MCP entry: `type: "http"` + `url` + optional `headers` under
+/// `~/.zcode/cli/config.json`'s `mcp.servers` map. ZCode's entry schema
+/// is strict — an entry carrying any key outside `type`/`url`/`headers`/
+/// `enabled`/`timeoutMs` is dropped silently — so this deliberately
+/// emits nothing else (issue #511).
+fn build_mcp_entry_zcode(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
     let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     let mut entry = serde_json::Map::new();
@@ -1092,6 +1117,20 @@ fn render_zero(args: &InstallMcpArgs) -> Result<String> {
         "# Zero (Gitlawb/zero) — merge into ~/.config/zero/config.json\n\
          # ($XDG_CONFIG_HOME/zero/config.json on non-default XDG setups),\n\
          # or run `zero mcp add` / re-run this command with --apply.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_zcode(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# ZCode (z.ai) — merge into ~/.zcode/cli/config.json\n\
+         # (or re-run this command with --apply), then restart ZCode.\n\
+         #\n\
+         # The entry schema is strict: keys outside type/url/headers/\n\
+         # enabled/timeoutMs make ZCode drop the server silently.\n\
+         # ai-memory's default stateless /mcp endpoint needs no flavor\n\
+         # marker; auth goes in the headers map.\n\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
     ))
@@ -1650,6 +1689,7 @@ mod tests {
             McpClient::Omp => render_omp(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
             McpClient::Zero => render_zero(&args).unwrap(),
+            McpClient::Zcode => render_zcode(&args).unwrap(),
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
@@ -1676,6 +1716,7 @@ mod tests {
             McpClient::Omp,
             McpClient::AntigravityCli,
             McpClient::Zero,
+            McpClient::Zcode,
             McpClient::Devin,
             McpClient::KimiCode,
             McpClient::KiroCli,
@@ -1716,6 +1757,7 @@ mod tests {
             McpClient::Omp,
             McpClient::AntigravityCli,
             McpClient::Zero,
+            McpClient::Zcode,
             McpClient::Devin,
             McpClient::KimiCode,
             McpClient::KiroCli,
@@ -1749,6 +1791,7 @@ mod tests {
             McpClient::Omp => render_omp(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
             McpClient::Zero => render_zero(&args).unwrap(),
+            McpClient::Zcode => render_zcode(&args).unwrap(),
             McpClient::Devin => render_devin(&args).unwrap(),
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::KiroCli => render_kiro_cli(&args).unwrap(),
@@ -1977,6 +2020,92 @@ mod tests {
                 .join(".gemini")
                 .join("config")
                 .join("mcp_config.json")
+        );
+    }
+
+    /// Pin ZCode's user-scope config destination: ~/.zcode/cli/config.json.
+    /// Workspace scopes (.zcode/config.json, zcode.json, .agents/mcp.json)
+    /// exist, but user scope is the install default every other client
+    /// uses too (#511).
+    #[test]
+    fn zcode_mcp_config_path_pins_user_scope_location() {
+        assert_eq!(
+            mcp_config_path(McpClient::Zcode).unwrap(),
+            home_dir()
+                .unwrap()
+                .join(".zcode")
+                .join("cli")
+                .join("config.json")
+        );
+    }
+
+    /// ZCode's entry schema is strict — any key outside
+    /// type/url/headers/enabled/timeoutMs makes it drop the server
+    /// silently — so the fragment must carry exactly the documented
+    /// keys, nested under `mcp.servers` (#511).
+    #[test]
+    fn zcode_renderer_nests_strict_http_entry_under_mcp_servers() {
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::Zcode)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "mcp": {
+                    "servers": {
+                        "ai-memory": {
+                            "type": "http",
+                            "url": "http://127.0.0.1:49374/mcp",
+                            "headers": {
+                                "Authorization": "Bearer test-token-deadbeef"
+                            }
+                        }
+                    }
+                }
+            })
+        );
+        let rendered = render_zcode(&args_for(McpClient::Zcode)).unwrap();
+        assert!(rendered.contains("~/.zcode/cli/config.json"));
+        assert!(rendered.contains("strict"));
+    }
+
+    /// `--apply` merges under `mcp.servers` keeping the rest of the
+    /// config and sibling servers intact, and re-runs are a no-op.
+    #[test]
+    fn zcode_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "theme": "dark",
+  "mcp": {
+    "servers": {
+      "other": {"type": "http", "url": "https://other.example/mcp"}
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::Zcode);
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(
+            value["mcp"]["servers"]["other"]["url"], "https://other.example/mcp",
+            "install must preserve sibling servers"
+        );
+        assert_eq!(value["mcp"]["servers"]["ai-memory"]["type"], "http");
+        assert_eq!(
+            value["mcp"]["servers"]["ai-memory"]["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
         );
     }
 

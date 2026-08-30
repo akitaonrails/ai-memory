@@ -12,6 +12,7 @@
 //! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent.
 //! - `GET  /admin/sessions/by-agent` — session counts per agent CLI for one scope.
 //! - `GET  /admin/activity/by-client` — MCP tool-call counts per client (server-wide).
+//! - `GET  /admin/audit-log`      — paginated read of the append-only `audit_log`.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -57,10 +58,11 @@ use ai_memory_core::{
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
-    ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    DecayParams, NewAutoImproveProposal, PagesMode, ReaderPool, RejectAutoImproveProposal,
-    ScopeResolutionError, SkippedProposal, StageAutoImproveRun, StoreError, WriterHandle,
-    create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
+    ApproveAutoImproveProposalResult, AuditLogFilter, AutoImproveProposalOperation,
+    AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal, PagesMode, ReaderPool,
+    RejectAutoImproveProposal, ScopeResolutionError, SkippedProposal, StageAutoImproveRun,
+    StoreError, WriterHandle, create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope,
+    lookup_existing_workspace,
 };
 use ai_memory_wiki::{
     AdmissionContext, AdmissionOp, Markdown, SessionPageFile, Wiki, WikiError, WritePageRequest,
@@ -606,6 +608,7 @@ pub fn admin_router_with_sweep_tuning(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
         )
+        .route("/admin/audit-log", get(handle_audit_log))
         .route("/admin/search", get(handle_search))
         .route("/admin/read-page", get(handle_read_page))
         .route("/admin/reorg", post(handle_reorg))
@@ -834,6 +837,62 @@ async fn handle_audit_contamination(
         Ok(report) => (
             StatusCode::OK,
             Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Query string for `GET /admin/audit-log`. Names are optional independent
+/// filters; when both workspace and project are present they are resolved
+/// through [`lookup_existing_scope`] so a typo fails closed (404) instead of
+/// looking like an empty log.
+#[derive(Debug, Deserialize)]
+struct AuditLogQuery {
+    workspace: Option<String>,
+    project: Option<String>,
+    op: Option<String>,
+    before_id: Option<i64>,
+    #[serde(default = "default_audit_log_limit")]
+    limit: usize,
+}
+
+fn default_audit_log_limit() -> usize {
+    50
+}
+
+/// `GET /admin/audit-log` — read-only paginated trail of the existing
+/// `audit_log` table. `detail` is returned for schema fidelity; it is not a
+/// payload (the only writer stores the literal `{}`).
+async fn handle_audit_log(
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<AuditLogQuery>,
+) -> impl IntoResponse {
+    let workspace = trimmed_opt(q.workspace.as_deref()).map(str::to_owned);
+    let project = trimmed_opt(q.project.as_deref()).map(str::to_owned);
+    if let (Some(ws), Some(proj)) = (workspace.as_deref(), project.as_deref()) {
+        match lookup_ws_proj_no_create(&state, ws, proj).await {
+            Ok(_) => {}
+            Err(e) => return e,
+        }
+    }
+    let filter = AuditLogFilter {
+        workspace,
+        project,
+        op: trimmed_opt(q.op.as_deref()).map(str::to_owned),
+        before_id: q.before_id,
+        limit: q.limit,
+    };
+    match state.reader.list_audit_events(filter).await {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(&events)
+                    .map(|list| serde_json::json!({ "events": list }))
+                    .unwrap_or_else(|_| serde_json::json!({ "events": [] })),
+            ),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -9565,6 +9624,7 @@ mod tests {
                 serde_json::Value::Null,
             ),
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),
+            ("GET", "/admin/audit-log", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
             (
                 "GET",
