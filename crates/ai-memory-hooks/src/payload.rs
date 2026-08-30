@@ -4,7 +4,7 @@ use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, tru
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
-    ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
+    ToolFamily, ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
 };
 
 /// Durable excerpt ceiling for user prompts. Prompts retain more working
@@ -612,6 +612,22 @@ fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
     )
 }
 
+/// `true` when `title` is one this module produced from a [`ToolFamily`]
+/// rather than from the harness's own tool name.
+///
+/// Derived from the same serde representation [`safe_tool_title`] writes, so
+/// a new `ToolFamily` variant is recognised here without a second edit — the
+/// two cannot drift into disagreeing about what this module emits.
+///
+/// The distinction matters downstream: a family is a partition of the calls,
+/// not a name for what they did, so a reader gains nothing from being told a
+/// session spent itself "across tool non-file and tool unknown".
+pub(crate) fn is_safe_tool_title(title: &str) -> bool {
+    title.strip_prefix("tool ").is_some_and(|family| {
+        serde_json::from_value::<ToolFamily>(serde_json::Value::String(family.to_owned())).is_ok()
+    })
+}
+
 fn safe_tool_body(
     event: HookEvent,
     metadata: Option<&ToolObservationMetadata>,
@@ -993,6 +1009,64 @@ fn normalize_token(value: &str, max_len: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The predicate must accept exactly what `safe_tool_title` emits, for
+    /// every `ToolFamily` variant. Inputs are built *through* the writer
+    /// rather than written by hand, so the two cannot drift apart on what a
+    /// family title looks like.
+    ///
+    /// The list below is checked by the compiler, not by trust: the
+    /// wildcard-free `match` stops compiling the moment a variant is added,
+    /// which routes whoever adds it here. Without that this test would keep
+    /// passing while the new variant went uncovered — the comment would be
+    /// making a promise the enumeration does not keep.
+    #[test]
+    fn the_predicate_recognises_every_title_the_writer_can_emit() {
+        let every_variant = [
+            ToolFamily::File,
+            ToolFamily::SearchList,
+            ToolFamily::NonFile,
+            ToolFamily::Unknown,
+        ];
+        for family in every_variant {
+            match family {
+                ToolFamily::File
+                | ToolFamily::SearchList
+                | ToolFamily::NonFile
+                | ToolFamily::Unknown => {}
+            }
+        }
+        for family in every_variant {
+            let written = safe_tool_title(&ToolObservationMetadata {
+                tool_family: family,
+                tool_call_id: None,
+            });
+            assert!(
+                is_safe_tool_title(&written),
+                "{written:?} is written by safe_tool_title and must be recognised"
+            );
+        }
+    }
+
+    /// A harness's own tool name is never mistaken for a family label, even
+    /// when it happens to start with the same word.
+    #[test]
+    fn a_real_tool_name_is_not_a_family_label() {
+        for name in [
+            "Bash",
+            "Edit",
+            "tool",
+            "tool ",
+            "tool Bash",
+            "toolfile",
+            "Tool file",
+        ] {
+            assert!(
+                !is_safe_tool_title(name),
+                "{name:?} is not something safe_tool_title writes"
+            );
+        }
+    }
 
     #[test]
     fn project_source_parses_both_spellings_and_defaults_closed() {

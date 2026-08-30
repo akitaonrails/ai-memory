@@ -14,7 +14,7 @@ use ai_memory_core::{
 };
 use jiff::tz::TimeZone;
 
-use crate::payload::truncate_for_title;
+use crate::payload::{is_safe_tool_title, truncate_for_title};
 
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
@@ -232,24 +232,39 @@ fn session_summary(tally: &SessionTally<'_>) -> String {
         let mut by_calls: Vec<(&str, usize)> =
             tally.tool_counts.iter().map(|(k, v)| (*k, *v)).collect();
         by_calls.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        let named: Vec<&str> = by_calls
+        // A `tool <family>` title is what `safe_tool_title` writes when the
+        // harness's own tool name is not carried through: a partition of the
+        // calls, never a name for them. Listing those spends the reader's
+        // attention to say "some of the calls touched files and some did
+        // not", so they are counted but not named, and a session with
+        // nothing else to name drops the clause rather than filling it.
+        let nameable: Vec<&str> = by_calls
             .iter()
-            .take(SUMMARY_MAX_NAMED_TOOLS)
             .map(|(name, _)| *name)
+            .filter(|name| !is_safe_tool_title(name))
             .collect();
-        let tools = if by_calls.len() > SUMMARY_MAX_NAMED_TOOLS {
-            format!(
-                "{} and {} more",
-                join_and(&named),
-                by_calls.len() - SUMMARY_MAX_NAMED_TOOLS
-            )
+        parts.push(if nameable.is_empty() {
+            format!("{calls} completed tool call{}", plural(calls))
         } else {
-            join_and(&named)
-        };
-        parts.push(format!(
-            "{calls} completed tool call{} across {tools}",
-            plural(calls)
-        ));
+            let named: Vec<&str> = nameable
+                .iter()
+                .copied()
+                .take(SUMMARY_MAX_NAMED_TOOLS)
+                .collect();
+            let tools = if by_calls.len() > named.len() {
+                format!(
+                    "{} and {} more",
+                    join_and(&named),
+                    by_calls.len() - named.len()
+                )
+            } else {
+                join_and(&named)
+            };
+            format!(
+                "{calls} completed tool call{} across {tools}",
+                plural(calls)
+            )
+        });
     }
 
     if let (Some(start), Some(end)) = (tally.start, tally.end)
@@ -565,6 +580,44 @@ mod tests {
         assert_eq!(
             page.frontmatter_json["summary"],
             serde_json::json!("1 prompt, 1 completed tool call across Bash, over 5m.")
+        );
+    }
+
+    /// Measured on a live 1,885-page instance: 21,136 of 29,804 `PostToolUse`
+    /// observations (71%) carried one of three `tool <family>` literals,
+    /// against 56 real tool names in the other 29%. Every tool mention in
+    /// every summary on that instance was a family label, so the clause was
+    /// spending characters to say nothing.
+    #[test]
+    fn family_labels_are_counted_but_not_named() {
+        let mut observations = vec![obs(ObservationKind::UserPrompt, "do the thing")];
+        for (tool, calls) in [("tool non-file", 9), ("tool file", 4), ("tool unknown", 2)] {
+            for _ in 0..calls {
+                observations.push(obs(ObservationKind::PostToolUse, tool));
+            }
+        }
+        let summary = session_summary(&tally_session(&observations));
+        assert_eq!(summary, "1 prompt, 15 completed tool calls.");
+        assert!(
+            !summary.contains("across"),
+            "nothing nameable is left, so the clause must go rather than be filled: {summary}"
+        );
+    }
+
+    /// A session that mixes both keeps the names it has. The families still
+    /// count toward the total and toward "and N more", because they are real
+    /// groups of calls — they just are not worth a reader's attention.
+    #[test]
+    fn real_names_survive_alongside_family_labels() {
+        let mut observations = vec![obs(ObservationKind::UserPrompt, "do the thing")];
+        for (tool, calls) in [("tool non-file", 20), ("Bash", 5), ("Edit", 2)] {
+            for _ in 0..calls {
+                observations.push(obs(ObservationKind::PostToolUse, tool));
+            }
+        }
+        assert_eq!(
+            session_summary(&tally_session(&observations)),
+            "1 prompt, 27 completed tool calls across Bash and Edit and 1 more."
         );
     }
 
