@@ -100,10 +100,14 @@ main() {
   AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
     AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
     bin/ai-memory workstreams --limit 5 --json
+  AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
+    AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
+    bin/ai-memory rename-workstream --from typo-nmae --to refactor-db
   assert_contains "${wrapper_log}" "run codex --yolo"
   assert_contains "${wrapper_log}" "show --json --no-scan"
   assert_contains "${wrapper_log}" "continue --workspace work --yolo"
   assert_contains "${wrapper_log}" "workstreams --limit 5 --json"
+  assert_contains "${wrapper_log}" "rename-workstream --from typo-nmae --to refactor-db"
 
   log "Creating temporary alternate root"
   mkdir -p \

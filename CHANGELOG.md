@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `ai-memory rename-workstream`, a checkout-local rename for managed
+  workstreams selectable by current name or by the stable id `workstreams`
+  prints. Names were fixed at `run --new` time and had no correction path, so
+  a typo outlived the work it labelled. The rename is metadata only: the
+  ledger, managed runs, and linked native sessions all key on the workstream
+  id, and `selected_at` and `updated_at` are deliberately left untouched, so
+  neither the listing order nor the workstream a bare `ai-memory run` resumes
+  moves as a side effect of relabelling. The destination is validated exactly
+  like a `--new` name and refused with a named conflict when another
+  workstream in the same checkout already holds it; renaming a workstream to
+  the name it already has writes nothing and is not an error. Both selectors
+  repeat the checkout predicate, so an id belonging to another workspace,
+  project, or worktree reads as absent rather than renamable. The Docker
+  wrapper routes the command through its native host client, since repository
+  identity is a host resource.
+
 ## [1.38.0] - 2026-08-30
 
 ### Added

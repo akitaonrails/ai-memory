@@ -33,6 +33,7 @@ use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, PrepareWorkstreamRun, PreparedWorkstreamRun,
+    RenameWorkstream, RenamedWorkstream,
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
@@ -437,6 +438,10 @@ pub(crate) enum WriteCmd {
     FinishWorkstreamRun {
         input: FinishWorkstreamRun,
         reply: oneshot::Sender<StoreResult<FinishedWorkstreamRun>>,
+    },
+    RenameWorkstream {
+        input: RenameWorkstream,
+        reply: oneshot::Sender<StoreResult<RenamedWorkstream>>,
     },
     Shutdown,
 }
@@ -1760,6 +1765,18 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Retitle one checkout-local workstream, leaving its selection and
+    /// activity timestamps untouched.
+    pub async fn rename_workstream(
+        &self,
+        input: RenameWorkstream,
+    ) -> StoreResult<RenamedWorkstream> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RenameWorkstream { input, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     async fn send(&self, cmd: WriteCmd) -> StoreResult<()> {
         self.inner
             .tx
@@ -2446,6 +2463,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::FinishWorkstreamRun { input, reply } => {
                 let result = crate::workstream::finish_run(&mut conn, &input);
                 send_or_warn(reply, result, "finish_workstream_run");
+            }
+            WriteCmd::RenameWorkstream { input, reply } => {
+                let result = crate::workstream::rename(&mut conn, &input);
+                send_or_warn(reply, result, "rename_workstream");
             }
         }
     }

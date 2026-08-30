@@ -69,7 +69,8 @@ pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConso
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamSelection,
+    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus,
+    StoredWorkstreamSummary, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -169,7 +170,7 @@ mod tests {
         ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, LinkTarget,
         ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewWorkstreamEvent,
         ObservationId, ObservationKind, PageId, PagePath, ProjectId, Sanitized, Sanitizer,
-        SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
+        SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind, WorkstreamId,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -5982,6 +5983,299 @@ mod tests {
         // A real workspace paired with the other one's project must not fall
         // back to either list.
         assert!(visible(&store, mine, theirs_proj).await.is_empty());
+    }
+
+    /// Create `names` as workstreams in one checkout, newest last, and hand
+    /// back each one's `(workstream, run)` pair. Preparing is the only way to
+    /// create a workstream, so every seeded row also owns a live run lease.
+    async fn seed_workstreams(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        names: &[&str],
+    ) -> Vec<(WorkstreamId, ManagedRunId)> {
+        let mut ids = Vec::new();
+        for name in names {
+            let prepared = store
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    selection: WorkstreamSelection::New((*name).into()),
+                    ..managed_prepare_input(ws, proj, name)
+                })
+                .await
+                .unwrap();
+            ids.push((prepared.workstream_id, prepared.run_id));
+        }
+        ids
+    }
+
+    fn rename_input(
+        ws: WorkspaceId,
+        proj: ProjectId,
+        selector: WorkstreamSelector,
+        to: &str,
+    ) -> RenameWorkstream {
+        RenameWorkstream {
+            workspace_id: ws,
+            project_id: proj,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            selector,
+            new_name: to.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_retitles_by_name_or_id_and_keeps_the_stable_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let seeded = seed_workstreams(&store, ws, proj, &["alpha", "beta"]).await;
+        let ids: Vec<WorkstreamId> = seeded.iter().map(|(id, _)| *id).collect();
+        let run_ids: Vec<ManagedRunId> = seeded.iter().map(|(_, run)| *run).collect();
+
+        let by_name = store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("alpha".into()),
+                "alpha-renamed",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(by_name.from, "alpha");
+        assert_eq!(by_name.to, "alpha-renamed");
+        // The id is what the ledger and `workstream-search` key on, so a
+        // rename that minted a new one would orphan the history.
+        assert_eq!(by_name.workstream_id, ids[0]);
+
+        let by_id = store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Id(ids[1]),
+                "beta-renamed",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(by_id.from, "beta");
+        assert_eq!(by_id.workstream_id, ids[1]);
+
+        // Both new names are selectable, which is the whole point of the
+        // rename. Seeding left a live lease on each workstream, so release
+        // them first: `Named` selection refuses a busy workstream, and that
+        // refusal would mask whether the name resolved at all.
+        for run_id in &run_ids {
+            assert!(store.writer.cancel_managed_run(*run_id).await.unwrap());
+        }
+        for name in ["alpha-renamed", "beta-renamed"] {
+            store
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    selection: WorkstreamSelection::Named(name.into()),
+                    ..managed_prepare_input(ws, proj, name)
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_does_not_reorder_the_discovery_listing() {
+        // Relabelling is not activity. If a rename bumped `updated_at` the
+        // renamed row would jump its peers, and if it bumped `selected_at` a
+        // bare `ai-memory run` would silently resume a different workstream —
+        // both as a side effect of fixing a typo.
+        //
+        // Three rows, not two: `is_current` leads the ORDER BY, so the
+        // current workstream sorts first whatever its timestamps say. Only a
+        // pair of non-current rows can show an `updated_at` bump at all.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        seed_workstreams(&store, ws, proj, &["oldest", "middle", "current"]).await;
+
+        async fn listing(store: &Store, ws: WorkspaceId, proj: ProjectId) -> Vec<(String, bool)> {
+            store
+                .reader
+                .recent_workstreams(ws, proj, "repo".into(), "worktree".into(), 20)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.name, row.current))
+                .collect()
+        }
+        let before = listing(&store, ws, proj).await;
+        assert_eq!(
+            before,
+            [
+                ("current".to_owned(), true),
+                ("middle".to_owned(), false),
+                ("oldest".to_owned(), false),
+            ]
+        );
+
+        store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("oldest".into()),
+                "oldest-renamed",
+            ))
+            .await
+            .unwrap();
+
+        // `oldest-renamed` must stay behind `middle`: it was renamed, not
+        // worked on. A bumped `updated_at` would put it second.
+        assert_eq!(
+            listing(&store, ws, proj).await,
+            [
+                ("current".to_owned(), true),
+                ("middle".to_owned(), false),
+                ("oldest-renamed".to_owned(), false),
+            ]
+        );
+
+        // Renaming the current workstream must not hand `current` to anyone
+        // else either, which a bumped `selected_at` on the wrong row would do.
+        store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("oldest-renamed".into()),
+                "oldest-again",
+            ))
+            .await
+            .unwrap();
+        let after = listing(&store, ws, proj).await;
+        assert_eq!(after[0], ("current".to_owned(), true));
+        assert_eq!(after[2].0, "oldest-again");
+    }
+
+    #[tokio::test]
+    async fn rename_refuses_a_name_another_workstream_holds() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        seed_workstreams(&store, ws, proj, &["alpha", "beta"]).await;
+
+        let failure = store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("alpha".into()),
+                "beta",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&failure, StoreError::WorkstreamNameTaken(name) if name == "beta"),
+            "expected a named collision, got {failure:?}"
+        );
+
+        // Renaming onto its own current name writes nothing and is not an
+        // error, so a repeated command stays safe.
+        let noop = store
+            .writer
+            .rename_workstream(rename_input(
+                ws,
+                proj,
+                WorkstreamSelector::Name("alpha".into()),
+                "alpha",
+            ))
+            .await
+            .unwrap();
+        assert_eq!((noop.from.as_str(), noop.to.as_str()), ("alpha", "alpha"));
+    }
+
+    #[tokio::test]
+    async fn rename_cannot_reach_a_workstream_outside_the_resolved_scope() {
+        // `workstreams.id` is globally unique, so the id selector would be a
+        // cross-scope write primitive without the checkout predicate.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (mine, mine_proj) = open_managed_scope(&store, "shared-name").await;
+        let theirs = store
+            .writer
+            .get_or_create_workspace("other-workspace")
+            .await
+            .unwrap();
+        let theirs_proj = store
+            .writer
+            .get_or_create_project(theirs, "shared-name", None)
+            .await
+            .unwrap();
+        let theirs_ids = seed_workstreams(&store, theirs, theirs_proj, &["theirs"]).await;
+        let theirs_workstream = theirs_ids[0].0;
+        seed_workstreams(&store, mine, mine_proj, &["mine"]).await;
+
+        let by_id = store
+            .writer
+            .rename_workstream(rename_input(
+                mine,
+                mine_proj,
+                WorkstreamSelector::Id(theirs_workstream),
+                "stolen",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(by_id, StoreError::NotFound(_)),
+            "an id from another workspace must read as absent, got {by_id:?}"
+        );
+
+        let by_name = store
+            .writer
+            .rename_workstream(rename_input(
+                mine,
+                mine_proj,
+                WorkstreamSelector::Name("theirs".into()),
+                "stolen",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(by_name, StoreError::NotFound(_)));
+
+        // The other workspace's row is untouched by either attempt.
+        let theirs_names: Vec<String> = store
+            .reader
+            .recent_workstreams(theirs, theirs_proj, "repo".into(), "worktree".into(), 20)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(theirs_names, ["theirs"]);
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_a_name_that_run_new_would_reject() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        seed_workstreams(&store, ws, proj, &["alpha"]).await;
+
+        for bad in ["", "   ", "has/slash", "has\\backslash", "ctrl\u{1}char"] {
+            let failure = store
+                .writer
+                .rename_workstream(rename_input(
+                    ws,
+                    proj,
+                    WorkstreamSelector::Name("alpha".into()),
+                    bad,
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(failure, StoreError::InvalidState(_)),
+                "name {bad:?} should be rejected, got {failure:?}"
+            );
+        }
     }
 
     #[tokio::test]

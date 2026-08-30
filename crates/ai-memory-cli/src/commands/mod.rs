@@ -45,6 +45,7 @@ pub mod purge_project;
 pub mod read_page;
 pub mod reindex;
 pub mod rename_project;
+pub mod rename_workstream;
 pub mod render_shared;
 pub mod reorg;
 pub mod reset;
