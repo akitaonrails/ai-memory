@@ -77,7 +77,7 @@ pub struct LoginUser {
     pub password_hash: Option<String>,
 }
 
-/// Insert a token-only compatibility identity. V52 mirrors
+/// Insert a token-only compatibility identity. V53 mirrors
 /// `users.token_hash` into the reserved `legacy-user-token`
 /// `api_credentials` row in the same transaction.
 ///
