@@ -16,6 +16,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column is returned for schema fidelity; the only writer still stores the
   literal `{}`. (#531)
 
+### Fixed
+- Stopped a session summary spending its characters on tool family labels. The
+  summary #477 added names the busiest tools, but for the seven agents that go
+  through `closed_tool_agent` — Claude Code among them — a tool observation's
+  title is written by `safe_tool_title` as `tool <family>`, and `ToolFamily`
+  has four variants. Measured on a live 1,885-page instance, 21,136 of 29,804
+  `PostToolUse` observations (71%) carried one of three such literals against
+  56 real tool names in the other 29%, and every tool mention in every summary
+  there was a family label: `580 completed tool calls across tool non-file,
+  tool unknown and tool file` spent 47 characters to say that some calls
+  touched files and some did not. Family labels are now counted but not named,
+  and a session with nothing else to name drops the clause instead of filling
+  it. The predicate lives beside the writer and is derived from the same serde
+  representation, so a new `ToolFamily` variant cannot escape it. (#527)
+
 ## [1.36.0] - 2026-08-29
 
 ### Added
