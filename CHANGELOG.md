@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   secrets. Existing 32-byte `users.token_hash` values copy losslessly into
   `api_credentials`. The mirror triggers remain load-bearing for the deprecated
   1.x `user add|expire|revive|rotate-token` shims and may be removed only when
-  those shims are removed in 2.0.
+  those shims are removed in 2.0. (#533)
 
 ### Changed
 - `/admin/*` and `/api/v1/*` accept a human web session or a machine Bearer.
@@ -27,11 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authenticated. Human auth is additive during 1.x: until a human password or
   completed bootstrap exists, deprecated GET-only HTTP Basic and
   `ai_memory_auth` cookie authentication continue to work. The transition to
-  human auth disables both legacy browser credentials immediately.
+  human auth disables both legacy browser credentials immediately. (#533)
 - Preserved `ai-memory user add|expire|revive|rotate-token` and their admin
   endpoints as deprecated 1.x compatibility paths backed by the reserved
   `legacy-user-token` API credential. New automation should use
-  `api-key add|rotate|revoke`.
+  `api-key add|rotate|revoke`. (#533)
 
 ## [1.38.0] - 2026-08-30
 
