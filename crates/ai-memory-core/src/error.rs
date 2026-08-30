@@ -35,6 +35,11 @@ pub enum MemoryError {
     #[error("invalid email: {0}")]
     InvalidEmail(String),
 
+    /// A human password failed [`crate::user::validate_human_password`].
+    /// The string is a generic policy message and never names the value.
+    #[error("invalid password: {0}")]
+    InvalidPassword(String),
+
     /// Wraps any underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),

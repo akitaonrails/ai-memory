@@ -336,8 +336,8 @@ ai-memory auth status
 ```
 
 The login command stores only provider credentials in `<data_dir>/auth.json`.
-It is separate from `AI_MEMORY_AUTH_TOKEN`, which protects MCP, hooks, and the
-web UI.
+It is separate from `AI_MEMORY_AUTH_TOKEN`, the machine-root Bearer used by
+MCP, hooks, handoffs, workstreams, and machine calls to dual-auth APIs.
 
 For GitHub Copilot, use the matching provider login before starting the server
 with `AI_MEMORY_LLM_PROVIDER=copilot`:
@@ -375,10 +375,15 @@ current page's project unless the target carries its own scope).
 only by their own glyph), inline `` `…` `` code, and 4-space-indented
 code; external schemes inside the brackets (`http://`, `https://`,
 `mailto:`, `data:`, `javascript:`, `vbscript:`, `tel:`, `file:`)
-stay literal too. If the server has `AI_MEMORY_AUTH_TOKEN` set, the
-browser uses HTTP Basic auth: leave the username blank and paste the
-token as the password. MCP and hook clients continue to use
-`Authorization: Bearer <token>`.
+stay literal too.
+
+With no authority configured on loopback, the built-in wiki remains
+anonymous. For human-authenticated administration, serve the compiled admin SPA
+with `--web-ui-dir`: it signs in through `/auth/login` and uses an HttpOnly web
+session plus CSRF protection. HTTP Basic and browser-stored Bearers are
+unsupported. `AI_MEMORY_AUTH_TOKEN` and `aim_` API keys remain machine-only
+credentials sent as `Authorization: Bearer <token>` by MCP, hook, handoff, and
+workstream clients.
 
 To host the web UI under a URL subpath behind a reverse proxy, the
 `--base-path` / `--web-slug` flags do the work — see

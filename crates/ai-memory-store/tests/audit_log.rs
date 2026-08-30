@@ -1,7 +1,7 @@
 //! Reader for the append-only `audit_log` table.
 
-use ai_memory_core::{NewPage, NewUser, PagePath, ProjectId, Tier, UserId, WorkspaceId};
-use ai_memory_store::{AuditLogFilter, Store, TOKEN_HASH_LEN};
+use ai_memory_core::{NewPage, NewUser, PagePath, ProjectId, Tier, UserId, UserRole, WorkspaceId};
+use ai_memory_store::{AuditLogFilter, Store};
 
 async fn seed_page(
     store: &Store,
@@ -38,13 +38,15 @@ async fn list_audit_events_resolves_names_pages_and_clamps_limit() {
 
     let alice = store
         .writer
-        .create_user(
+        .create_human_user(
             NewUser {
                 username: "alice".to_string(),
                 name: None,
                 email: None,
             },
-            [7u8; TOKEN_HASH_LEN],
+            UserRole::User,
+            None,
+            false,
         )
         .await
         .unwrap();

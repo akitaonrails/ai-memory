@@ -11,13 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, HandoffAcceptance, HandoffId, IdentityKey, ManagedRunId, NewHandoff, NewObservation,
-    NewPage, NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
-    Sanitized, SessionId, UserId, WorkspaceId,
+    AgentKind, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey, ManagedRunId,
+    NewHandoff, NewObservation, NewPage, NewSession, NewUser, ObservationId, OwnerFilter, PageId,
+    PagePath, ProjectId, Sanitized, SessionId, UserId, UserRole, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
+use crate::api_credentials;
 use crate::auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, FailAutoImproveProposal,
     RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
@@ -31,6 +33,7 @@ use crate::ops::{
 };
 use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
+use crate::web_sessions::{self, WebSession};
 use crate::workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, PrepareWorkstreamRun, PreparedWorkstreamRun,
 };
@@ -347,22 +350,92 @@ pub(crate) enum WriteCmd {
         applied_at: i64,
         reply: oneshot::Sender<StoreResult<()>>,
     },
-    CreateUser {
-        new_user: NewUser,
-        token_hash: [u8; TOKEN_HASH_LEN],
+    BootstrapRoot {
+        username: String,
+        name: Option<String>,
+        email: Option<String>,
+        password_hash: String,
         reply: oneshot::Sender<StoreResult<UserId>>,
     },
-    RotateUserToken {
+    RecoverRoot {
+        username: String,
+        name: Option<String>,
+        email: Option<String>,
+        password_hash: String,
+        reply: oneshot::Sender<StoreResult<UserId>>,
+    },
+    CreateHumanUser {
+        new_user: NewUser,
+        role: UserRole,
+        password_hash: Option<String>,
+        must_change_password: bool,
+        reply: oneshot::Sender<StoreResult<UserId>>,
+    },
+    ResetHumanPassword {
         user_id: UserId,
+        password_hash: String,
+        must_change_password: bool,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    SetUserDisabled {
+        user_id: UserId,
+        disabled: bool,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    PatchUser {
+        user_id: UserId,
+        name: Option<Option<String>>,
+        email: Option<Option<String>>,
+        role: Option<UserRole>,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    ChangePassword {
+        user_id: UserId,
+        expected_password_hash: String,
+        new_password_hash: String,
+        session_id: Uuid,
+        new_session_hash: [u8; TOKEN_HASH_LEN],
+        new_csrf_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    IssueWebSession {
+        user_id: UserId,
+        expected_password_hash: String,
+        expected_role: UserRole,
+        expected_must_change: bool,
+        session_hash: [u8; TOKEN_HASH_LEN],
+        csrf_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<WebSession>>,
+    },
+    RevokeWebSession {
+        session_hash: [u8; TOKEN_HASH_LEN],
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    TouchWebSession {
+        session_id: Uuid,
+        last_used_at: i64,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    CreateApiCredential {
+        id: ApiCredentialId,
+        user_id: UserId,
+        label: String,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+        reply: oneshot::Sender<StoreResult<ApiCredentialId>>,
+    },
+    RotateApiCredential {
+        id: ApiCredentialId,
         new_token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
-    ExpireUserToken {
-        user_id: UserId,
+    RevokeApiCredential {
+        id: ApiCredentialId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
-    ReviveUserToken {
-        user_id: UserId,
+    TouchApiCredential {
+        id: ApiCredentialId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     TouchUserLastSeen {
@@ -1475,75 +1548,290 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Insert a new user. `new_user` MUST already have been validated by
-    /// [`NewUser::validate`](ai_memory_core::NewUser::validate); the
-    /// caller (CLI or admin handler) generates the plaintext token,
-    /// hashes it with the per-server pepper via
-    /// [`crate::users::hash_token`], and passes only the digest in.
+    /// One-shot root bootstrap. `password_hash` is already Argon2id PHC.
     ///
     /// # Errors
-    /// - [`StoreError::WriterClosed`] if the writer has shut down.
-    /// - [`StoreError::Duplicate`] when the username or email collides.
-    /// - [`StoreError::Sqlite`] for any other SQL failure.
-    pub async fn create_user(
+    /// Writer closed, duplicate identity, already completed, SQL.
+    pub async fn bootstrap_root(
         &self,
-        new_user: NewUser,
-        token_hash: [u8; TOKEN_HASH_LEN],
+        username: String,
+        name: Option<String>,
+        email: Option<String>,
+        password_hash: String,
     ) -> StoreResult<UserId> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::CreateUser {
-            new_user,
-            token_hash,
+        self.send(WriteCmd::BootstrapRoot {
+            username,
+            name,
+            email,
+            password_hash,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Replace a user's token hash with a freshly-generated digest.
-    /// Implicitly clears `token_expired_at` — rotating an expired
-    /// token only makes sense to make it usable again. Returns `false`
-    /// when the user id doesn't exist; `true` on successful update.
+    /// Break-glass root reset. Does not touch API credentials.
     ///
     /// # Errors
-    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`]
-    /// per the usual writer-actor flow.
-    pub async fn rotate_user_token(
+    /// Writer closed, duplicate, SQL.
+    pub async fn recover_root(
+        &self,
+        username: String,
+        name: Option<String>,
+        email: Option<String>,
+        password_hash: String,
+    ) -> StoreResult<UserId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecoverRoot {
+            username,
+            name,
+            email,
+            password_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Insert a human identity. `new_user` MUST already have been validated.
+    /// No API credential is created.
+    ///
+    /// # Errors
+    /// Writer closed, duplicate username/email, SQL.
+    pub async fn create_human_user(
+        &self,
+        new_user: NewUser,
+        role: UserRole,
+        password_hash: Option<String>,
+        must_change_password: bool,
+    ) -> StoreResult<UserId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CreateHumanUser {
+            new_user,
+            role,
+            password_hash,
+            must_change_password,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Admin password reset. Revokes web sessions.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn reset_human_password(
         &self,
         user_id: UserId,
-        new_token_hash: [u8; TOKEN_HASH_LEN],
+        password_hash: String,
+        must_change_password: bool,
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::RotateUserToken {
+        self.send(WriteCmd::ResetHumanPassword {
             user_id,
-            new_token_hash,
+            password_hash,
+            must_change_password,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Stamp `token_expired_at = now()` so the user's current token stops
-    /// authenticating. Idempotent — repeating the call leaves the original
-    /// expiry timestamp untouched. Returns `false` when the user doesn't exist.
+    /// Enable or disable human login. Disable revokes sessions.
     ///
     /// # Errors
-    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
-    pub async fn expire_user_token(&self, user_id: UserId) -> StoreResult<bool> {
+    /// Last recoverable root, writer closed, SQL.
+    pub async fn set_user_disabled(&self, user_id: UserId, disabled: bool) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::ExpireUserToken { user_id, reply: tx })
+        self.send(WriteCmd::SetUserDisabled {
+            user_id,
+            disabled,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Patch name/email/role. `Some(None)` clears an optional field.
+    ///
+    /// # Errors
+    /// Last recoverable root, duplicate email, writer closed, SQL.
+    pub async fn patch_user(
+        &self,
+        user_id: UserId,
+        name: Option<Option<String>>,
+        email: Option<Option<String>>,
+        role: Option<UserRole>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PatchUser {
+            user_id,
+            name,
+            email,
+            role,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Change password for the current session and rotate its cookies.
+    ///
+    /// # Errors
+    /// Concurrent password change, writer closed, SQL.
+    pub async fn change_password(
+        &self,
+        user_id: UserId,
+        expected_password_hash: String,
+        new_password_hash: String,
+        session_id: Uuid,
+        new_session_hash: [u8; TOKEN_HASH_LEN],
+        new_csrf_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ChangePassword {
+            user_id,
+            expected_password_hash,
+            new_password_hash,
+            session_id,
+            new_session_hash,
+            new_csrf_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Recheck PHC, role, disabled state, and must-change state, then insert
+    /// a web session.
+    ///
+    /// # Errors
+    /// Credentials no longer valid, writer closed, SQL.
+    pub async fn issue_web_session(
+        &self,
+        user_id: UserId,
+        expected_password_hash: String,
+        expected_role: UserRole,
+        expected_must_change: bool,
+        session_hash: [u8; TOKEN_HASH_LEN],
+        csrf_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<WebSession> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::IssueWebSession {
+            user_id,
+            expected_password_hash,
+            expected_role,
+            expected_must_change,
+            session_hash,
+            csrf_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Logout: revoke one session by secret hash.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn revoke_web_session(
+        &self,
+        session_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RevokeWebSession {
+            session_hash,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Touch `web_sessions.last_used_at` at most once per minute.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn touch_web_session(
+        &self,
+        session_id: Uuid,
+        last_used_at: i64,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::TouchWebSession {
+            session_id,
+            last_used_at,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Insert a native API credential. `id` is caller-chosen.
+    ///
+    /// # Errors
+    /// Duplicate hash, writer closed, SQL.
+    pub async fn create_api_credential(
+        &self,
+        id: ApiCredentialId,
+        user_id: UserId,
+        label: String,
+        token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+    ) -> StoreResult<ApiCredentialId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CreateApiCredential {
+            id,
+            user_id,
+            label,
+            token_hash,
+            preview,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Rotate a native API credential hash and un-revoke it.
+    ///
+    /// # Errors
+    /// Duplicate hash, writer closed, SQL.
+    pub async fn rotate_api_credential(
+        &self,
+        id: ApiCredentialId,
+        new_token_hash: [u8; TOKEN_HASH_LEN],
+        preview: Option<String>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RotateApiCredential {
+            id,
+            new_token_hash,
+            preview,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Revoke a native API credential. Idempotent.
+    ///
+    /// # Errors
+    /// Writer closed / SQL.
+    pub async fn revoke_api_credential(&self, id: ApiCredentialId) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RevokeApiCredential { id, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Clear `token_expired_at`, re-activating the user's existing token.
-    /// Idempotent. Returns `false` when the user doesn't exist.
+    /// Touch `api_credentials.last_used_at`.
     ///
     /// # Errors
-    /// Returns [`StoreError::WriterClosed`] / [`StoreError::Sqlite`].
-    pub async fn revive_user_token(&self, user_id: UserId) -> StoreResult<bool> {
+    /// Writer closed / SQL.
+    pub async fn touch_api_credential(&self, id: ApiCredentialId) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::ReviveUserToken { user_id, reply: tx })
+        self.send(WriteCmd::TouchApiCredential { id, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
@@ -2285,29 +2573,180 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::insert_wiki_migration(&mut conn, &name, applied_at);
                 send_or_warn(reply, result, "insert_wiki_migration");
             }
-            WriteCmd::CreateUser {
+            WriteCmd::BootstrapRoot {
+                username,
+                name,
+                email,
+                password_hash,
+                reply,
+            } => {
+                let result = users::bootstrap_root(
+                    &mut conn,
+                    &username,
+                    name.as_deref(),
+                    email.as_deref(),
+                    &password_hash,
+                );
+                send_or_warn(reply, result, "bootstrap_root");
+            }
+            WriteCmd::RecoverRoot {
+                username,
+                name,
+                email,
+                password_hash,
+                reply,
+            } => {
+                let result = users::recover_root(
+                    &mut conn,
+                    &username,
+                    name.as_deref(),
+                    email.as_deref(),
+                    &password_hash,
+                );
+                send_or_warn(reply, result, "recover_root");
+            }
+            WriteCmd::CreateHumanUser {
                 new_user,
-                token_hash,
+                role,
+                password_hash,
+                must_change_password,
                 reply,
             } => {
-                let result = users::insert_user(&conn, &new_user, &token_hash);
-                send_or_warn(reply, result, "create_user");
+                let result = users::insert_human_user(
+                    &conn,
+                    &new_user,
+                    role,
+                    password_hash.as_deref(),
+                    must_change_password,
+                );
+                send_or_warn(reply, result, "create_human_user");
             }
-            WriteCmd::RotateUserToken {
+            WriteCmd::ResetHumanPassword {
                 user_id,
-                new_token_hash,
+                password_hash,
+                must_change_password,
                 reply,
             } => {
-                let result = users::rotate_user_token(&conn, user_id, &new_token_hash);
-                send_or_warn(reply, result, "rotate_user_token");
+                let result = users::reset_human_password(
+                    &mut conn,
+                    user_id,
+                    &password_hash,
+                    must_change_password,
+                );
+                send_or_warn(reply, result, "reset_human_password");
             }
-            WriteCmd::ExpireUserToken { user_id, reply } => {
-                let result = users::expire_user_token(&conn, user_id);
-                send_or_warn(reply, result, "expire_user_token");
+            WriteCmd::SetUserDisabled {
+                user_id,
+                disabled,
+                reply,
+            } => {
+                let result = users::set_user_disabled(&mut conn, user_id, disabled);
+                send_or_warn(reply, result, "set_user_disabled");
             }
-            WriteCmd::ReviveUserToken { user_id, reply } => {
-                let result = users::revive_user_token(&conn, user_id);
-                send_or_warn(reply, result, "revive_user_token");
+            WriteCmd::PatchUser {
+                user_id,
+                name,
+                email,
+                role,
+                reply,
+            } => {
+                let result = users::patch_user(&mut conn, user_id, name, email, role);
+                send_or_warn(reply, result, "patch_user");
+            }
+            WriteCmd::ChangePassword {
+                user_id,
+                expected_password_hash,
+                new_password_hash,
+                session_id,
+                new_session_hash,
+                new_csrf_hash,
+                reply,
+            } => {
+                let result = users::change_password(
+                    &mut conn,
+                    user_id,
+                    &expected_password_hash,
+                    &new_password_hash,
+                    session_id,
+                    &new_session_hash,
+                    &new_csrf_hash,
+                );
+                send_or_warn(reply, result, "change_password");
+            }
+            WriteCmd::IssueWebSession {
+                user_id,
+                expected_password_hash,
+                expected_role,
+                expected_must_change,
+                session_hash,
+                csrf_hash,
+                reply,
+            } => {
+                let result = users::issue_web_session(
+                    &mut conn,
+                    user_id,
+                    &expected_password_hash,
+                    expected_role,
+                    expected_must_change,
+                    &session_hash,
+                    &csrf_hash,
+                );
+                send_or_warn(reply, result, "issue_web_session");
+            }
+            WriteCmd::RevokeWebSession {
+                session_hash,
+                reply,
+            } => {
+                let result = web_sessions::revoke_session_by_hash(&conn, &session_hash);
+                send_or_warn(reply, result, "revoke_web_session");
+            }
+            WriteCmd::TouchWebSession {
+                session_id,
+                last_used_at,
+                reply,
+            } => {
+                let result = web_sessions::touch_web_session(&conn, session_id, last_used_at);
+                send_or_warn(reply, result, "touch_web_session");
+            }
+            WriteCmd::CreateApiCredential {
+                id,
+                user_id,
+                label,
+                token_hash,
+                preview,
+                reply,
+            } => {
+                let result = api_credentials::insert_api_credential(
+                    &conn,
+                    id,
+                    user_id,
+                    &label,
+                    &token_hash,
+                    preview.as_deref(),
+                );
+                send_or_warn(reply, result, "create_api_credential");
+            }
+            WriteCmd::RotateApiCredential {
+                id,
+                new_token_hash,
+                preview,
+                reply,
+            } => {
+                let result = api_credentials::rotate_api_credential(
+                    &conn,
+                    id,
+                    &new_token_hash,
+                    preview.as_deref(),
+                );
+                send_or_warn(reply, result, "rotate_api_credential");
+            }
+            WriteCmd::RevokeApiCredential { id, reply } => {
+                let result = api_credentials::revoke_api_credential(&conn, id);
+                send_or_warn(reply, result, "revoke_api_credential");
+            }
+            WriteCmd::TouchApiCredential { id, reply } => {
+                let result = api_credentials::touch_api_credential(&conn, id);
+                send_or_warn(reply, result, "touch_api_credential");
             }
             WriteCmd::TouchUserLastSeen { user_id, reply } => {
                 let result = users::touch_user_last_seen(&conn, user_id);

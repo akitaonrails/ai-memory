@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+mod api_credentials;
 mod auto_improve;
 pub mod decay;
 mod error;
@@ -21,15 +22,18 @@ mod fts_query;
 mod maintenance;
 mod migrations;
 mod ops;
+pub mod password;
 mod reader;
 mod scope;
 mod session_consolidation;
 pub mod users;
+pub mod web_sessions;
 mod workstream;
 mod writer;
 
 pub use fts_query::prepare_fts5_query;
 
+pub use api_credentials::{AuthenticatedApiUser, generate_api_key, preview_for as api_key_preview};
 pub use auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
@@ -66,7 +70,10 @@ pub use scope::{
     lookup_global_scope, resolve_many_existing_scopes,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
-pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
+pub use users::{
+    LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token,
+};
+pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
     PreparedWorkstreamRun, StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamSelection,

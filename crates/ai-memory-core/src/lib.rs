@@ -54,9 +54,9 @@ pub use handoff::{
     HandoffState, NewHandoff,
 };
 pub use ids::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId, ManagedRunId,
-    ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
-    WorkstreamId,
+    AgentKind, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId,
+    ManagedRunId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId,
+    WorkspaceId, WorkstreamId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{
@@ -72,7 +72,12 @@ pub use slots::{
     SLOT_PREFIX, SlotPlacement, SlotVisibility, is_slot_named, is_slot_path, slot_owner,
     slot_placement,
 };
-pub use user::{MAX_EMAIL_LEN, MAX_USERNAME_LEN, NewUser, User, validate_email, validate_username};
+pub use user::{
+    ApiCredential, EXTERNAL_API_KEY_PREFIX, MAX_EMAIL_LEN, MAX_HUMAN_PASSWORD_BYTES,
+    MAX_USERNAME_LEN, MIN_HUMAN_PASSWORD_BYTES, NATIVE_API_KEY_PREFIX, NewUser,
+    SESSION_SECRET_PREFIX, User, UserRole, validate_email, validate_human_password,
+    validate_username,
+};
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
     ListManagedWorkstreamsRequest, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse,

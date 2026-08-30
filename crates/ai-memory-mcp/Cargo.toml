@@ -28,8 +28,8 @@ rmcp.workspace = true
 schemars.workspace = true
 axum.workspace = true
 http.workspace = true
-# HTTP auth middleware (bearer/basic/cookie): constant-time token
-# compare, Basic-header decoding, random token generation.
+# HTTP auth middleware: constant-time Bearer compare. Basic is not a
+# credential; sessions live in human_auth.
 subtle.workspace = true
 base64.workspace = true
 getrandom.workspace = true

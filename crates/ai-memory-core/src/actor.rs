@@ -17,7 +17,7 @@
 //!    `config.auth.bearer_token`. Middleware fills `user` / `email` / `name`
 //!    from `[auth].root_username` / `root_email` (and optional `root_name`).
 //! 3. **Identified multi-user** — bearer token matches an active
-//!    `users.token_hash` row. Middleware fills the actor from the row.
+//!    `api_credentials.token_hash` row. Middleware fills the actor from the owning user.
 //! 4. **External auth proxy** — a trusted sidecar authenticates with the
 //!    dedicated proxy bearer and asserts a username or complete OIDC
 //!    issuer/subject pair in `X-Memory-Actor-*` headers. Proxy callers are users

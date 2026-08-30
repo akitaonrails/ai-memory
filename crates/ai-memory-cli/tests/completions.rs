@@ -69,7 +69,10 @@ fn scripts_cover_subcommands_from_across_the_tree() {
             "purge-project",
             "move-session",
             "user",
-            "rotate-token",
+            "reset-password",
+            "api-key",
+            "rotate",
+            "revoke",
             "auth",
             "login",
         ] {

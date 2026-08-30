@@ -4042,8 +4042,8 @@ pub(crate) mod tests {
         let author = UserId::new();
         let now = Timestamp::now().as_microsecond();
         conn.execute(
-            "INSERT INTO users (id, username, token_hash, created_at) \
-             VALUES (?1, 'feedback-author', X'01', ?2)",
+            "INSERT INTO users (id, username, created_at) \
+             VALUES (?1, 'feedback-author', ?2)",
             params![author.as_bytes(), now],
         )
         .unwrap();
@@ -4249,9 +4249,8 @@ pub(crate) mod tests {
         let user_id = UserId::new();
         let now = jiff::Timestamp::now().as_microsecond();
         conn.execute(
-            "INSERT INTO users \
-             (id, username, name, email, token_hash, created_at) \
-             VALUES (?1, 'alice', NULL, NULL, X'00', ?2)",
+            "INSERT INTO users (id, username, name, email, created_at) \
+             VALUES (?1, 'alice', NULL, NULL, ?2)",
             params![user_id.as_bytes(), now],
         )
         .unwrap();
@@ -4313,9 +4312,9 @@ pub(crate) mod tests {
         let alice = UserId::new();
         let bob = UserId::new();
         conn.execute(
-            "INSERT INTO users (id, username, name, email, token_hash, created_at) \
-             VALUES (?1, 'alice', NULL, NULL, X'01', ?2), \
-                    (?3, 'bob',   NULL, NULL, X'02', ?2)",
+            "INSERT INTO users (id, username, name, email, created_at) \
+             VALUES (?1, 'alice', NULL, NULL, ?2), \
+                    (?3, 'bob',   NULL, NULL, ?2)",
             params![alice.as_bytes(), now, bob.as_bytes()],
         )
         .unwrap();
@@ -7164,14 +7163,16 @@ pub(crate) mod tests {
     }
 
     fn seed_user(conn: &Connection, username: &str) -> ai_memory_core::UserId {
-        crate::users::insert_user(
+        crate::users::insert_human_user(
             conn,
             &ai_memory_core::NewUser {
                 username: username.to_string(),
                 name: None,
                 email: None,
             },
-            &[7u8; crate::users::TOKEN_HASH_LEN],
+            ai_memory_core::UserRole::User,
+            None,
+            false,
         )
         .expect("seed user")
     }

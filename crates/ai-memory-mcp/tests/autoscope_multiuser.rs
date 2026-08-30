@@ -7,7 +7,7 @@
 //! crate (no `lib.rs`), so its `auth` module isn't reachable from an
 //! integration test in another crate. The slice that matters for
 //! `auto_scope` is the (Bearer header → ActorContext.user) wiring, which
-//! is short enough to replicate verbatim. Cookie / Basic-auth paths are
+//! is short enough to replicate verbatim. Cookie paths are
 //! covered elsewhere and have no bearing on actor-key derivation.
 //!
 //! If `require_bearer` adds a new ActorContext field that affects the
@@ -17,10 +17,13 @@
 //! `user.username` into the actor key would split the per-actor map
 //! across rungs, which is exactly what this test pins.
 
-use ai_memory_core::{ActiveProject, ActiveProjectMode, ActorContext, NewUser, SessionId, Tier};
+use ai_memory_core::{
+    ActiveProject, ActiveProjectMode, ActorContext, ApiCredentialId, NewUser, SessionId, Tier,
+    UserRole,
+};
 use ai_memory_hooks::{HookState, ProjectCacheStore, SubagentSessionSet, hook_router};
 use ai_memory_mcp::AiMemoryServer;
-use ai_memory_store::{Store, TokenPepper, generate_token, hash_token};
+use ai_memory_store::{Store, TokenPepper, generate_api_key, hash_token};
 use ai_memory_wiki::Wiki;
 use axum::Router;
 use axum::body::Body;
@@ -77,20 +80,27 @@ impl MultiUserHarness {
         let mut users = Vec::with_capacity(num_users);
         for i in 1..=num_users {
             let username = format!("user{i}");
-            let raw_token = generate_token().expect("gen token");
+            let raw_token = generate_api_key().expect("gen token");
             let hash = hash_token(&raw_token, &pepper);
-            store
+            let user_id = store
                 .writer
-                .create_user(
+                .create_human_user(
                     NewUser {
                         username: username.clone(),
                         name: Some(format!("User {i}")),
                         email: Some(format!("user{i}@example.com")),
                     },
-                    hash,
+                    UserRole::User,
+                    None,
+                    false,
                 )
                 .await
                 .expect("create user");
+            store
+                .writer
+                .create_api_credential(ApiCredentialId::new(), user_id, "test".into(), hash, None)
+                .await
+                .expect("create api credential");
 
             // Each user "owns" a uniquely-named project + marker page; the
             // FTS5 tokenizer treats `_` as a TOKEN character, so the body
@@ -227,18 +237,18 @@ async fn bearer_lookup(
     if let Some(token) = bearer {
         let hash = hash_token(token, &state.pepper);
         match state.reader.find_active_user_by_token_hash(hash).await {
-            Ok(Some(user)) => {
+            Ok(Some(hit)) => {
                 // Mirror require_bearer:
-                //   ActorContext.user = user.username
-                //   ActorContext.name  = user.name
-                //   ActorContext.email = user.email
+                //   ActorContext.user = hit.user.username
+                //   ActorContext.name  = hit.user.name
+                //   ActorContext.email = hit.user.email
                 req.extensions_mut().insert(ActorContext {
-                    user: Some(user.username.clone()),
-                    name: user.name.clone(),
-                    email: user.email.clone(),
+                    user: Some(hit.user.username.clone()),
+                    name: hit.user.name.clone(),
+                    email: hit.user.email.clone(),
                     ..ActorContext::default()
                 });
-                req.extensions_mut().insert(user.id);
+                req.extensions_mut().insert(hit.user.id);
             }
             _ => {
                 req.extensions_mut().insert(ActorContext::anonymous());

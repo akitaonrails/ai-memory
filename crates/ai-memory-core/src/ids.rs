@@ -87,6 +87,7 @@ id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
 id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
 id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
+id_newtype!(pub ApiCredentialId, "Identifier for one native `aim_` API credential.");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
 id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");

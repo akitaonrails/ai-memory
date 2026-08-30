@@ -1,18 +1,7 @@
-//! `ai-memory user` — manage registered users for multi-user attribution.
+//! `ai-memory user` — manage human users for password login.
 //!
-//! Thin HTTP client over the admin endpoints in
-//! `ai-memory-mcp::admin::handle_{create,list,expire,revive,
-//! rotate_token}_user`. Per invariant #16 (CLI is always a thin HTTP
-//! client) the CLI never opens the store; everything routes through
-//! `/admin/users/*`. The caller's bearer token must authenticate as
-//! root or the server returns 403 (User tier) / 401 (Anonymous).
-//!
-//! Backward compatibility: every install that predates v0.8 lacks the
-//! `[auth].token_pepper` field. The server's user-management routes
-//! 503 in that case with `multi-user not enabled (set
-//! [auth].token_pepper in config or run `ai-memory init`)`. Existing
-//! single-user installs see that error only if they actively try to
-//! use these subcommands — the rest of the CLI keeps working.
+//! Thin HTTP client over `/admin/users*`. The caller's bearer token must
+//! authenticate as root.
 
 use std::io::{self, BufRead, Write};
 
@@ -20,16 +9,12 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{
-    UserAddArgs, UserArgs, UserCommand, UserExpireArgs, UserListArgs, UserReviveArgs,
-    UserRotateTokenArgs,
+    UserAddArgs, UserArgs, UserCommand, UserDisableArgs, UserEnableArgs, UserListArgs,
+    UserPatchArgs, UserResetPasswordArgs,
 };
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, get_json, post_json};
+use crate::http_client::{ServerEndpoint, get_json, patch_json, post_json};
 
-/// Mirrors `ai_memory_core::User` on the server side. Repeated here
-/// rather than imported to keep the CLI <-> server contract explicit
-/// at the deserialisation boundary (the CLI tolerates a future server
-/// that adds fields without a recompile).
 #[derive(Debug, Deserialize, Serialize)]
 struct UserRow {
     id: String,
@@ -42,19 +27,38 @@ struct UserRow {
     #[serde(default)]
     last_seen_at: Option<i64>,
     #[serde(default)]
-    token_expired_at: Option<i64>,
+    role: String,
+    #[serde(default)]
+    must_change_password: bool,
+    #[serde(default)]
+    disabled_at: Option<i64>,
+    #[serde(default)]
+    has_password: bool,
 }
 
 impl UserRow {
-    fn is_token_active(&self) -> bool {
-        self.token_expired_at.is_none()
+    fn status(&self) -> &'static str {
+        if self.disabled_at.is_some() {
+            "disabled"
+        } else if !self.has_password {
+            "api-only"
+        } else if self.must_change_password {
+            "must-change"
+        } else {
+            "active"
+        }
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct UserWithToken {
+struct UserWithPassword {
     user: UserRow,
-    token: String,
+    temporary_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserResponse {
+    user: UserRow,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,9 +76,10 @@ pub async fn run(config: &Config, args: UserArgs) -> Result<()> {
     match args.command {
         UserCommand::Add(args) => add(&ep, args).await,
         UserCommand::List(args) => list(&ep, args).await,
-        UserCommand::Expire(args) => expire(&ep, args).await,
-        UserCommand::Revive(args) => revive(&ep, args).await,
-        UserCommand::RotateToken(args) => rotate_token(&ep, args).await,
+        UserCommand::ResetPassword(args) => reset_password(&ep, args).await,
+        UserCommand::Disable(args) => disable(&ep, args).await,
+        UserCommand::Enable(args) => enable(&ep, args).await,
+        UserCommand::Patch(args) => patch(&ep, args).await,
     }
 }
 
@@ -85,9 +90,16 @@ struct CreateUserBody<'a> {
     name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     email: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a str>,
 }
 
 async fn add(ep: &ServerEndpoint, args: UserAddArgs) -> Result<()> {
+    let role = args
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let body = CreateUserBody {
         username: args.username.trim(),
         name: args
@@ -100,39 +112,12 @@ async fn add(ep: &ServerEndpoint, args: UserAddArgs) -> Result<()> {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty()),
+        role,
     };
-    let resp: UserWithToken = post_json(ep, "/admin/users", &body)
+    let resp: UserWithPassword = post_json(ep, "/admin/users", &body)
         .await
         .context("creating user")?;
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "user": &resp.user,
-                "token": &resp.token
-            }))?
-        );
-    } else {
-        let mut stderr = io::stderr().lock();
-        let _ = writeln!(stderr, "✓ created user '{}'", resp.user.username);
-        if let Some(name) = &resp.user.name {
-            let _ = writeln!(stderr, "  name:  {name}");
-        }
-        if let Some(email) = &resp.user.email {
-            let _ = writeln!(stderr, "  email: {email}");
-        }
-        let _ = writeln!(
-            stderr,
-            "  id:    {}\n\n\
-             Store this token now — it will NOT be shown again. \
-             Only its SHA-256 digest is kept in the DB.",
-            resp.user.id
-        );
-        // Token on stdout so it can be piped (`> ~/.config/...`) without
-        // the surrounding human chrome.
-        println!("{}", resp.token);
-    }
-    Ok(())
+    print_temp_password(&resp, args.json, "created")
 }
 
 async fn list(ep: &ServerEndpoint, args: UserListArgs) -> Result<()> {
@@ -147,8 +132,6 @@ async fn list(ep: &ServerEndpoint, args: UserListArgs) -> Result<()> {
         println!("(no registered users)");
         return Ok(());
     }
-    // Fixed-width table — usernames are validated ≤ 64 chars in core,
-    // but most are short, so right-pad to the longest in this batch.
     let user_w = resp
         .users
         .iter()
@@ -163,105 +146,156 @@ async fn list(ep: &ServerEndpoint, args: UserListArgs) -> Result<()> {
         .max()
         .unwrap_or(4)
         .max(4);
-    let email_w = resp
+    let role_w = resp
         .users
         .iter()
-        .filter_map(|u| u.email.as_ref().map(String::len))
+        .map(|u| u.role.len())
         .max()
-        .unwrap_or(5)
-        .max(5);
+        .unwrap_or(4)
+        .max(4);
 
     println!(
-        "{:<user_w$}  {:<name_w$}  {:<email_w$}  {:<8}",
+        "{:<user_w$}  {:<name_w$}  {:<role_w$}  {:<12}",
         "USERNAME",
         "NAME",
-        "EMAIL",
+        "ROLE",
         "STATUS",
         user_w = user_w,
         name_w = name_w,
-        email_w = email_w,
+        role_w = role_w,
     );
     for u in &resp.users {
-        let status = if u.is_token_active() {
-            "active"
-        } else {
-            "expired"
-        };
         println!(
-            "{:<user_w$}  {:<name_w$}  {:<email_w$}  {:<8}",
+            "{:<user_w$}  {:<name_w$}  {:<role_w$}  {:<12}",
             u.username,
             u.name.as_deref().unwrap_or("-"),
-            u.email.as_deref().unwrap_or("-"),
-            status,
+            u.role,
+            u.status(),
             user_w = user_w,
             name_w = name_w,
-            email_w = email_w,
+            role_w = role_w,
         );
     }
     Ok(())
 }
 
-async fn expire(ep: &ServerEndpoint, args: UserExpireArgs) -> Result<()> {
+async fn reset_password(ep: &ServerEndpoint, args: UserResetPasswordArgs) -> Result<()> {
     if !args.yes {
         confirm(&format!(
-            "Expire token for user '{}'? Their token stops authenticating immediately. (y/N) ",
+            "Reset password for user '{}'? Their current password stops working immediately. (y/N) ",
             args.username
         ))?;
     }
-    let path = format!("/admin/users/{}/expire", url_encode(&args.username));
-    // The server returns `{ user: UserRow }` but the CLI only needs to
-    // confirm a 2xx; ignore the payload.
-    let _: serde_json::Value = post_json(ep, &path, &serde_json::json!({}))
+    let path = format!("/admin/users/{}/reset-password", url_encode(&args.username));
+    let resp: UserWithPassword = post_json(ep, &path, &serde_json::json!({}))
         .await
-        .context("expiring user")?;
-    println!("✓ expired token for user '{}'", args.username);
-    Ok(())
+        .context("resetting password")?;
+    print_temp_password(&resp, args.json, "reset password for")
 }
 
-async fn revive(ep: &ServerEndpoint, args: UserReviveArgs) -> Result<()> {
-    let path = format!("/admin/users/{}/revive", url_encode(&args.username));
-    let _: serde_json::Value = post_json(ep, &path, &serde_json::json!({}))
-        .await
-        .context("reviving user")?;
-    println!("✓ revived token for user '{}'", args.username);
-    Ok(())
-}
-
-async fn rotate_token(ep: &ServerEndpoint, args: UserRotateTokenArgs) -> Result<()> {
+async fn disable(ep: &ServerEndpoint, args: UserDisableArgs) -> Result<()> {
     if !args.yes {
         confirm(&format!(
-            "Rotate token for user '{}'? Any existing client using the old token will \
-             start getting 401 immediately. (y/N) ",
+            "Disable human login for user '{}'? (y/N) ",
             args.username
         ))?;
     }
-    let path = format!("/admin/users/{}/rotate-token", url_encode(&args.username));
-    let resp: UserWithToken = post_json(ep, &path, &serde_json::json!({}))
+    let path = format!("/admin/users/{}/disable", url_encode(&args.username));
+    let _: UserResponse = post_json(ep, &path, &serde_json::json!({}))
         .await
-        .context("rotating user token")?;
+        .context("disabling user")?;
+    println!("✓ disabled user '{}'", args.username);
+    Ok(())
+}
+
+async fn enable(ep: &ServerEndpoint, args: UserEnableArgs) -> Result<()> {
+    let path = format!("/admin/users/{}/enable", url_encode(&args.username));
+    let _: UserResponse = post_json(ep, &path, &serde_json::json!({}))
+        .await
+        .context("enabling user")?;
+    println!("✓ enabled user '{}'", args.username);
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct PatchUserBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+}
+
+async fn patch(ep: &ServerEndpoint, args: UserPatchArgs) -> Result<()> {
+    let body = PatchUserBody {
+        name: args.name.map(|s| {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }),
+        email: args.email.map(|s| {
+            let trimmed = s.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }),
+        role: args
+            .role
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    };
+    let path = format!("/admin/users/{}", url_encode(&args.username));
+    let resp: UserResponse = patch_json(ep, &path, &body)
+        .await
+        .context("patching user")?;
     if args.json {
+        println!("{}", serde_json::to_string_pretty(&resp.user)?);
+    } else {
+        println!(
+            "✓ updated user '{}' ({})",
+            resp.user.username,
+            resp.user.status()
+        );
+    }
+    Ok(())
+}
+
+fn print_temp_password(resp: &UserWithPassword, json: bool, verb: &str) -> Result<()> {
+    if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "user": &resp.user,
-                "token": &resp.token
+                "temporary_password": &resp.temporary_password
             }))?
         );
     } else {
         let mut stderr = io::stderr().lock();
+        let _ = writeln!(stderr, "✓ {verb} user '{}'", resp.user.username);
+        if let Some(name) = &resp.user.name {
+            let _ = writeln!(stderr, "  name:  {name}");
+        }
+        if let Some(email) = &resp.user.email {
+            let _ = writeln!(stderr, "  email: {email}");
+        }
         let _ = writeln!(
             stderr,
-            "✓ rotated token for user '{}'\n\n\
-             Store this token now — it will NOT be shown again.",
-            resp.user.username
+            "  role:  {}\n\n\
+             Store this temporary password now — it will NOT be shown again. \
+             The user must change it on next login.",
+            resp.user.role
         );
-        println!("{}", resp.token);
+        println!("{}", resp.temporary_password);
     }
     Ok(())
 }
 
-/// Lightweight interactive y/N prompt. Reads from stdin; an empty
-/// reply, EOF, or anything starting with `n`/`N` aborts.
 fn confirm(prompt: &str) -> Result<()> {
     let mut stderr = io::stderr().lock();
     let _ = write!(stderr, "{prompt}");
@@ -280,11 +314,6 @@ fn confirm(prompt: &str) -> Result<()> {
     Ok(())
 }
 
-/// Percent-encode a username for URL-path use. The validation in
-/// `core::user::validate_username` already excludes whitespace and the
-/// common path separators (`/ \ : ; ,`), and emails-as-usernames
-/// (`alice@home`) carry `@` which is reserved in paths. Conservative
-/// encode: anything that isn't alphanumeric / `-_.` becomes `%XX`.
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
@@ -311,29 +340,7 @@ mod tests {
     #[test]
     fn url_encode_percent_encodes_at_and_other_specials() {
         assert_eq!(url_encode("alice@home"), "alice%40home");
-        // Validation forbids these but the encoder must still be safe
-        // if a future relaxation lets them through.
         assert_eq!(url_encode("a/b"), "a%2Fb");
         assert_eq!(url_encode("a b"), "a%20b");
-    }
-
-    #[test]
-    fn user_row_active_status_reflects_token_expired_at() {
-        let active = UserRow {
-            id: "x".into(),
-            username: "alice".into(),
-            name: None,
-            email: None,
-            created_at: 0,
-            last_seen_at: None,
-            token_expired_at: None,
-        };
-        assert!(active.is_token_active());
-
-        let expired = UserRow {
-            token_expired_at: Some(123),
-            ..active
-        };
-        assert!(!expired.is_token_active());
     }
 }

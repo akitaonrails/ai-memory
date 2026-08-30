@@ -23,16 +23,15 @@ const TOKEN_PEPPER_BYTES: usize = 32;
 /// Build the `[auth]` block appended to the freshly-rendered default
 /// config on `ai-memory init`. The pepper is auto-generated so it's
 /// stable from install onwards (rotating it invalidates every existing
-/// user token — see `ai-memory-store::users` for the rationale).
+/// native API key — see `ai-memory-store::api_credentials`).
 fn render_default_auth_block(pepper: &str) -> String {
     format!(
         "
-# Per-server token pepper. Keeps stolen `users.token_hash` rows useless
+# Per-server token pepper. Keeps stolen `api_credentials.token_hash` rows useless
 # to an offline attacker by mixing each token with this secret before
 # hashing. Auto-generated on `ai-memory init`. **Do NOT change after
-# the first user is added** — rotating invalidates every existing
-# token. Only used when multi-user is enabled (at least one row in
-# the `users` table); single-user / bearer-only setups don't read it.
+# the first native API key is added** — rotating invalidates every key.
+# Human password login does not use this pepper.
 token_pepper = \"{pepper}\"
 
 # Multi-user attribution (all optional).
@@ -41,8 +40,8 @@ token_pepper = \"{pepper}\"
 # leaves it anonymous. Set them to label root-token writes in the
 # audit log + page frontmatter.
 #
-# Add additional users with `ai-memory user add --username <name>`;
-# each user gets their own token tied to a row in the `users` table.
+# Add human users with `ai-memory user add --username <name>`, then issue
+# programmatic access separately with `ai-memory api-key add`.
 #
 # root_username = \"boss\"
 # root_email    = \"boss@example.com\"

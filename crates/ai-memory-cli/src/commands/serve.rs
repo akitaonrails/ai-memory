@@ -17,11 +17,16 @@ use ai_memory_hooks::{
     workstream_router,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
+use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
     AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
+    expire_legacy_cookie_mw, internal_auth_router, public_auth_router, require_dual_auth,
+    session_auth_router,
 };
-use ai_memory_store::{ReaderPool, Store, WriterHandle};
-use ai_memory_web::{WebMountSpec, mount_web_router, normalize_prefix, web_base_href};
+use ai_memory_store::{
+    ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
+};
+use ai_memory_web::{WebMountSpec, normalize_prefix, split_web_routers, web_base_href};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -34,6 +39,7 @@ use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -61,14 +67,29 @@ const SESSION_CONSOLIDATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// requests are expected to finish well inside this lease.
 const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
 
+fn validate_api_credential_pepper(api_credentials_exist: bool, auth: &AuthSettings) -> Result<()> {
+    let pepper_present = auth
+        .token_pepper
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if api_credentials_exist && !pepper_present {
+        anyhow::bail!(
+            "api credentials exist but [auth].token_pepper is missing or blank; restore the original pepper from configuration backup before serving"
+        );
+    }
+    Ok(())
+}
+
 /// Validate the credentials that keep an existing multi-user installation
 /// closed. Bootstrap installs have no user rows yet and retain their historical
 /// compatibility behavior regardless of placeholder auth values.
-fn validate_existing_users_auth(users_exist: bool, auth: &AuthSettings) -> Result<()> {
-    if !users_exist {
-        return Ok(());
-    }
-
+fn validate_existing_users_auth(
+    users_exist: bool,
+    api_credentials_exist: bool,
+    human_mode: bool,
+    auth: &AuthSettings,
+) -> Result<()> {
+    validate_api_credential_pepper(api_credentials_exist, auth)?;
     let pepper_present = auth
         .token_pepper
         .as_deref()
@@ -77,18 +98,206 @@ fn validate_existing_users_auth(users_exist: bool, auth: &AuthSettings) -> Resul
         .bearer_token
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
-    match (pepper_present, bearer_present) {
-        (true, true) => Ok(()),
-        (false, false) => anyhow::bail!(
-            "users exist but [auth].token_pepper and [auth].bearer_token are missing or blank; restore both original secrets from configuration backup before serving"
-        ),
-        (false, true) => anyhow::bail!(
-            "users exist but [auth].token_pepper is missing or blank; restore the original pepper from configuration backup before serving"
-        ),
-        (true, false) => anyhow::bail!(
-            "users exist but [auth].bearer_token is missing or blank; configure the original static root bearer token before serving"
-        ),
+    if users_exist && !human_mode {
+        return match (pepper_present, bearer_present) {
+            (true, true) => Ok(()),
+            (false, false) => anyhow::bail!(
+                "users exist but [auth].token_pepper and [auth].bearer_token are missing or blank; restore both original secrets from configuration backup before serving"
+            ),
+            (false, true) => anyhow::bail!(
+                "users exist but [auth].token_pepper is missing or blank; restore the original pepper from configuration backup before serving"
+            ),
+            (true, false) => anyhow::bail!(
+                "users exist but [auth].bearer_token is missing or blank; configure the original static root bearer token before serving"
+            ),
+        };
     }
+    Ok(())
+}
+
+fn secret_configured(secret: Option<&secrecy::SecretString>) -> bool {
+    secret.is_some_and(|s| !s.expose_secret().trim().is_empty())
+}
+
+fn parse_trusted_proxy_cidrs(auth: &AuthSettings) -> Result<Vec<Cidr>> {
+    auth.trusted_proxy_cidrs
+        .iter()
+        .map(|spec| {
+            Cidr::parse(spec).map_err(|e| {
+                anyhow::anyhow!("invalid [auth].trusted_proxy_cidrs entry {spec:?}: {e}")
+            })
+        })
+        .collect()
+}
+
+async fn maybe_bootstrap_root(store: &Store, auth: &AuthSettings) -> Result<()> {
+    if store.reader.bootstrap_completed().await? {
+        if secret_configured(auth.initial_root_password.as_ref()) {
+            tracing::warn!(
+                "[auth].initial_root_password is ignored because bootstrap already completed; unset AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD"
+            );
+        }
+        return Ok(());
+    }
+    let Some(password) = auth
+        .initial_root_password
+        .as_ref()
+        .map(|s| s.expose_secret().to_string())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let username = auth
+        .root_username
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("root");
+    let recovery = auth
+        .recovery_token
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
+        .filter(|s| !s.trim().is_empty());
+    let reserved: Vec<&str> = [
+        auth.bearer_token
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+        auth.actor_proxy_bearer_token
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+        recovery,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    ai_memory_core::validate_human_password(&password, Some(username), &reserved)
+        .context("initial root password does not meet policy")?;
+    if let Some(pepper) = auth
+        .token_pepper
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    {
+        let hash = hash_token(&password, &TokenPepper::new(pepper.to_string()));
+        if store.reader.token_hash_exists(hash).await? {
+            anyhow::bail!(
+                "[auth].initial_root_password collides with an existing API credential; choose a different password"
+            );
+        }
+    }
+    let phc = ai_memory_store::password::hash_password(password)
+        .await
+        .context("hashing initial root password")?;
+    store
+        .writer
+        .bootstrap_root(
+            username.to_string(),
+            auth.root_name.clone(),
+            auth.root_email.clone(),
+            phc,
+        )
+        .await
+        .context("bootstrapping root user")?;
+    tracing::warn!(
+        "root user bootstrapped; unset AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD so the plaintext is not kept in the process environment"
+    );
+    Ok(())
+}
+
+async fn validate_configured_secret_collisions(
+    store: &Store,
+    auth: &AuthSettings,
+    include_initial_password: bool,
+) -> Result<()> {
+    let Some(pepper) = auth
+        .token_pepper
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| TokenPepper::new(value.to_string()))
+    else {
+        return Ok(());
+    };
+    let mut secrets = Vec::new();
+    if let Some(value) = auth
+        .bearer_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].bearer_token", value));
+    }
+    if let Some(value) = auth
+        .actor_proxy_bearer_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].actor_proxy_bearer_token", value));
+    }
+    if let Some(value) = auth
+        .recovery_token
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].recovery_token", value));
+    }
+    if include_initial_password
+        && let Some(value) = auth
+            .initial_root_password
+            .as_ref()
+            .map(ExposeSecret::expose_secret)
+            .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].initial_root_password", value));
+    }
+    for (name, value) in secrets {
+        if store
+            .reader
+            .token_hash_exists(hash_token(value, &pepper))
+            .await?
+        {
+            anyhow::bail!(
+                "{name} collides with an existing API credential; configure a distinct secret"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn human_auth_intended(auth: &AuthSettings, bootstrap_completed: bool, any_password: bool) -> bool {
+    bootstrap_completed
+        || any_password
+        || secret_configured(auth.initial_root_password.as_ref())
+        || secret_configured(auth.recovery_token.as_ref())
+}
+
+fn require_recoverable_root_or_recovery(
+    human_mode: bool,
+    recoverable_roots: i64,
+    recovery_configured: bool,
+) -> Result<()> {
+    if human_mode && recoverable_roots == 0 && !recovery_configured {
+        anyhow::bail!(
+            "human authentication is enabled but no recoverable root user exists; set [auth].recovery_token to rebuild root via POST /auth/recovery"
+        );
+    }
+    Ok(())
+}
+
+fn reserved_human_passwords(auth: &AuthSettings) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(v) = auth
+        .bearer_token
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push(v.to_string());
+    }
+    if let Some(v) = auth
+        .actor_proxy_bearer_token
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push(v.to_string());
+    }
+    out
 }
 
 fn configured(value: Option<&String>) -> bool {
@@ -140,10 +349,22 @@ fn running_in_container() -> bool {
 fn validate_http_exposure(
     local_addr: SocketAddr,
     auth_enabled: bool,
+    human_mode: bool,
+    secure_cookie: bool,
     allow_insecure_no_auth: bool,
     containerized: bool,
 ) -> Result<HttpExposure> {
-    if local_addr.ip().is_loopback() || auth_enabled {
+    if local_addr.ip().is_loopback() {
+        return Ok(HttpExposure::Safe);
+    }
+    if human_mode && !secure_cookie {
+        anyhow::bail!(
+            "refusing human authentication on non-loopback plain HTTP address {local_addr}: \
+             passwords and session cookies require [auth].secure_cookie=true behind a trusted \
+             HTTPS reverse proxy. Non-Secure human cookies are allowed only on loopback."
+        );
+    }
+    if auth_enabled {
         return Ok(HttpExposure::Safe);
     }
     if allow_insecure_no_auth {
@@ -428,8 +649,28 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         );
     }
 
-    validate_existing_users_auth(store.reader.users_exist().await?, &config.auth)?;
+    let api_credentials_exist = store.reader.api_credentials_exist().await?;
+    validate_api_credential_pepper(api_credentials_exist, &config.auth)?;
+    let bootstrap_completed_before_start = store.reader.bootstrap_completed().await?;
+    validate_configured_secret_collisions(&store, &config.auth, !bootstrap_completed_before_start)
+        .await?;
+    maybe_bootstrap_root(&store, &config.auth).await?;
+    let bootstrap_completed = store.reader.bootstrap_completed().await?;
+    let any_password = store.reader.any_password_hash().await?;
+    let human_mode = human_auth_intended(&config.auth, bootstrap_completed, any_password);
+    require_recoverable_root_or_recovery(
+        human_mode,
+        store.reader.count_recoverable_roots().await?,
+        secret_configured(config.auth.recovery_token.as_ref()),
+    )?;
+    validate_existing_users_auth(
+        store.reader.users_exist().await?,
+        api_credentials_exist,
+        human_mode,
+        &config.auth,
+    )?;
     validate_trusted_proxy_auth(&config.auth)?;
+    let trusted_proxy_cidrs = parse_trusted_proxy_cidrs(&config.auth)?;
 
     // Run any outstanding wiki-structure migrations before the watcher starts
     // so file moves and renames are never raced by the reconciler.
@@ -777,14 +1018,49 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     store.writer.clone(),
                 );
             }
+            if human_mode {
+                let recovery_token_hash = config
+                    .auth
+                    .recovery_token
+                    .as_ref()
+                    .map(ExposeSecret::expose_secret)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(hash_session_secret);
+                let root_username = config
+                    .auth
+                    .root_username
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "root".to_string());
+                auth_state = auth_state.with_human(HumanAuthRuntime {
+                    reader: store.reader.clone(),
+                    writer: store.writer.clone(),
+                    recovery_token_hash,
+                    root_username,
+                    root_name: config.auth.root_name.clone(),
+                    root_email: config.auth.root_email.clone(),
+                    reserved_passwords: reserved_human_passwords(&config.auth),
+                    trusted_proxy_cidrs: trusted_proxy_cidrs.clone(),
+                    limiter: Arc::new(LoginLimiter::default()),
+                });
+            }
             let auth_state = Arc::new(auth_state);
             let auth_enabled = auth_state.enabled();
-            let router = axum::Router::new()
+            let machine = axum::Router::new()
                 .nest_service("/mcp", mcp_service)
                 .merge(hooks)
                 .merge(workstreams)
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-                .merge(admin.layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES)));
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    require_bearer,
+                ));
+            let admin = admin
+                .layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES))
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    require_dual_auth,
+                ));
             let base_path = normalize_prefix(&args.base_path);
             if base_path.is_empty() && !args.base_path.trim_matches('/').trim().is_empty() {
                 tracing::warn!(
@@ -805,8 +1081,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             }
             let base_href = web_base_href(&args.base_path, &args.web_slug);
-            let router = mount_web_router(
-                router,
+            let web = split_web_routers(
                 args.enable_web,
                 store.reader.clone(),
                 wiki.clone(),
@@ -818,7 +1093,20 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_path: &base_path,
                 },
             )?;
-            let router = apply_http_layers(router, auth_state, config.allowed_hosts.clone());
+            let router = machine
+                .merge(admin)
+                .merge(public_auth_router(auth_state.clone()))
+                .merge(session_auth_router(auth_state.clone()))
+                .merge(internal_auth_router(auth_state.clone()))
+                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    require_dual_auth,
+                )))
+                .merge(web.public.layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    expire_legacy_cookie_mw,
+                )));
+            let router = apply_host_layer(router, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
             // base = root (unchanged). The auth/host layers are already
             // attached to `router`, so they run for every nested route.
@@ -848,6 +1136,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let exposure = validate_http_exposure(
                 local_addr,
                 auth_enabled,
+                human_mode,
+                config.auth.secure_cookie,
                 args.allow_insecure_no_auth,
                 running_in_container(),
             )?;
@@ -876,29 +1166,31 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             } else if auth_enabled && !local_addr.ip().is_loopback() {
                 // Auth IS configured but the server is reachable from
-                // the network on plain HTTP. The bearer token (and
-                // multi-user per-user tokens from `ai-memory user
-                // add`) ride cleartext — sniffable on the LAN. Advise
-                // the operator to front with a TLS proxy. One-shot
-                // log at startup, not refusal to serve (operators may
-                // be testing, behind their own proxy already, etc.).
+                // the network on plain HTTP. Machine bearer credentials
+                // ride cleartext — sniffable on the LAN. Advise the
+                // operator to front with a TLS proxy. One-shot log at
+                // startup, not refusal to serve (operators may be testing,
+                // behind their own proxy already, etc.).
                 tracing::warn!(
                     %local_addr,
-                    "AI_MEMORY_AUTH_TOKEN is set but the server is bound to a \
-                     non-loopback address on plain HTTP — bearer tokens travel \
+                    "authentication is enabled but the server is bound to a \
+                     non-loopback address on plain HTTP — bearer credentials travel \
                      cleartext on the network. Front ai-memory with a TLS-terminating \
                      reverse proxy (Caddy, Cloudflare Tunnel, nginx). See \
                      docs/https-via-proxy.md for copy-paste templates."
                 );
             }
             let shutdown_cancel = cancel.clone();
-            let serve_result = axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    info!("ctrl-c received; shutting down");
-                    shutdown_cancel.cancel();
-                })
-                .await;
+            let serve_result = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("ctrl-c received; shutting down");
+                shutdown_cancel.cancel();
+            })
+            .await;
             cancel.cancel();
             if let Some(task) = session_consolidation_task
                 && let Err(error) = task.await
@@ -1611,20 +1903,11 @@ fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String
     command
 }
 
-fn apply_http_layers(
-    router: axum::Router,
-    auth_state: Arc<AuthState>,
-    allowed_hosts: Vec<String>,
-) -> axum::Router {
-    router
-        .layer(axum::middleware::from_fn_with_state(
-            auth_state,
-            require_bearer,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(allowed_hosts),
-            require_allowed_host,
-        ))
+fn apply_host_layer(router: axum::Router, allowed_hosts: Vec<String>) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        Arc::new(allowed_hosts),
+        require_allowed_host,
+    ))
 }
 
 async fn require_allowed_host(
@@ -1670,12 +1953,13 @@ fn host_without_port(host: &str) -> &str {
 mod tests {
     use super::*;
     use ai_memory_core::{
-        AgentKind, NewObservation, NewSession, ObservationKind, PagePath, Sanitized, Sanitizer,
-        SessionId, Tier,
+        AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,
+        Sanitized, Sanitizer, SessionId, Tier,
     };
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult, SyntheticEmbedder};
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
+    use secrecy::SecretString;
     use std::future::Future;
     use std::pin::Pin;
     use tempfile::TempDir;
@@ -1721,7 +2005,8 @@ mod tests {
                         bearer_token: bearer_token.map(str::to_string),
                         ..AuthSettings::default()
                     };
-                    let result = validate_existing_users_auth(users_exist, &auth);
+                    let result =
+                        validate_existing_users_auth(users_exist, users_exist, false, &auth);
                     let should_pass =
                         !users_exist || (pepper_label == "present" && bearer_label == "present");
                     assert_eq!(
@@ -1732,6 +2017,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn native_api_key_pepper_preflight_is_independent_of_human_mode() {
+        let missing = AuthSettings::default();
+        assert!(validate_api_credential_pepper(true, &missing).is_err());
+
+        let configured = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_api_credential_pepper(true, &configured).is_ok());
+        assert!(validate_api_credential_pepper(false, &missing).is_ok());
     }
 
     #[test]
@@ -1753,14 +2051,38 @@ mod tests {
                     // the operator overrode it.
                     let allowed = loopback || auth_enabled || allow_override;
                     assert_eq!(
-                        validate_http_exposure(local_addr, auth_enabled, allow_override, false)
-                            .is_ok(),
+                        validate_http_exposure(
+                            local_addr,
+                            auth_enabled,
+                            false,
+                            false,
+                            allow_override,
+                            false,
+                        )
+                        .is_ok(),
                         allowed,
                         "address={address}, auth={auth_enabled}, override={allow_override}"
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn human_auth_non_loopback_requires_secure_cookie_posture() {
+        let remote: SocketAddr = "192.168.1.90:49374".parse().unwrap();
+        assert!(validate_http_exposure(remote, true, true, false, false, false).is_err());
+        assert!(validate_http_exposure(remote, true, true, false, true, true).is_err());
+        assert_eq!(
+            validate_http_exposure(remote, true, true, true, false, false).unwrap(),
+            HttpExposure::Safe
+        );
+
+        let loopback: SocketAddr = "127.0.0.1:49374".parse().unwrap();
+        assert_eq!(
+            validate_http_exposure(loopback, true, true, false, false, false).unwrap(),
+            HttpExposure::Safe
+        );
     }
 
     /// Regression for #407. The published image binds `0.0.0.0` because that
@@ -1773,32 +2095,36 @@ mod tests {
 
         // The exact Quick Start shape: no token, no override, in a container.
         assert_eq!(
-            validate_http_exposure(quick_start, false, false, true).expect("must not refuse"),
+            validate_http_exposure(quick_start, false, false, false, false, true)
+                .expect("must not refuse"),
             HttpExposure::UndeterminedInContainer,
         );
 
         // Identical inputs on a host still refuse — the carve-out is scoped
         // to the container case and does not soften the host rule.
-        assert!(validate_http_exposure(quick_start, false, false, false).is_err());
+        assert!(validate_http_exposure(quick_start, false, false, false, false, false).is_err());
 
-        // A container is not a blanket downgrade: with auth configured the
-        // verdict is Safe, so the operator gets no spurious warning.
+        // A container is not a blanket downgrade: with machine auth configured
+        // the verdict is Safe, so the operator gets no spurious warning.
         assert_eq!(
-            validate_http_exposure(quick_start, true, false, true).expect("auth is fine"),
+            validate_http_exposure(quick_start, true, false, false, false, true)
+                .expect("auth is fine"),
             HttpExposure::Safe,
         );
 
         // An explicit override still reports as an override, not as the
         // container case, so the startup log keeps naming the real reason.
         assert_eq!(
-            validate_http_exposure(quick_start, false, true, true).expect("override is fine"),
+            validate_http_exposure(quick_start, false, false, false, true, true)
+                .expect("override is fine"),
             HttpExposure::InsecureByOverride,
         );
 
         // Loopback inside a container is plain Safe.
         let loopback: SocketAddr = "127.0.0.1:49374".parse().expect("valid test address");
         assert_eq!(
-            validate_http_exposure(loopback, false, false, true).expect("loopback is fine"),
+            validate_http_exposure(loopback, false, false, false, false, true)
+                .expect("loopback is fine"),
             HttpExposure::Safe,
         );
     }
@@ -2776,13 +3102,22 @@ mod tests {
         validate_web_ui_args(true, Some(ui.path())).unwrap();
     }
 
+    #[test]
+    fn human_mode_does_not_require_root_bearer() {
+        let auth = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            bearer_token: None,
+            ..AuthSettings::default()
+        };
+        assert!(validate_existing_users_auth(true, false, true, &auth).is_ok());
+    }
+
     #[tokio::test]
     async fn web_routes_are_inside_auth_layer() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let router = mount_web_router(
-            axum::Router::new(),
+        let web = split_web_routers(
             true,
             store.reader.clone(),
             wiki,
@@ -2795,9 +3130,12 @@ mod tests {
             },
         )
         .unwrap();
-        let router = apply_http_layers(
-            router,
-            Arc::new(AuthState::new(Some("secret".to_string()))),
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = apply_host_layer(
+            web.protected.layer(axum::middleware::from_fn_with_state(
+                auth,
+                require_dual_auth,
+            )),
             vec!["localhost".to_string()],
         );
 
@@ -2813,6 +3151,205 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn custom_spa_is_public_while_api_stays_authenticated() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "<html><body>spa</body></html>",
+        )
+        .unwrap();
+        let web = split_web_routers(
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                web_ui_dir: Some(ui.path()),
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: "/web/",
+                base_path: "",
+            },
+        )
+        .unwrap();
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = apply_host_layer(
+            web.public
+                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                    auth,
+                    require_dual_auth,
+                ))),
+            vec!["localhost".to_string()],
+        );
+
+        let spa = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spa.status(), StatusCode::OK);
+
+        let api = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn custom_spa_root_fallback_preserves_host_owned_routes() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "<html><head></head><body>root spa shell</body></html>",
+        )
+        .unwrap();
+        let web = split_web_routers(
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                web_ui_dir: Some(ui.path()),
+                cors_origins: &[],
+                web_slug: "/",
+                base_href: "/",
+                base_path: "",
+            },
+        )
+        .unwrap();
+
+        let mut protected_host = axum::Router::new();
+        for path in [
+            "/admin/status",
+            "/mcp",
+            "/hook",
+            "/handoff",
+            "/workstream/runs",
+        ] {
+            protected_host = protected_host.route(
+                path,
+                axum::routing::any(|| async { StatusCode::UNAUTHORIZED }),
+            );
+        }
+        let public_auth = axum::Router::new().route(
+            "/auth/login",
+            axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = protected_host
+            .merge(public_auth)
+            .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                auth,
+                require_dual_auth,
+            )))
+            .merge(web.public)
+            .merge(ai_memory_web::favicon_router());
+
+        // Mutation captured: dropping any host-owned route merge lets the root SPA
+        // wildcard return its HTML shell instead of the reserved route response.
+        for (method, path) in [
+            (axum::http::Method::GET, "/admin/status"),
+            (axum::http::Method::POST, "/mcp"),
+            (axum::http::Method::POST, "/hook"),
+            (axum::http::Method::GET, "/handoff"),
+            (axum::http::Method::POST, "/workstream/runs"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must reach its authenticated host route"
+            );
+        }
+
+        let api = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+
+        let auth = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/auth/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.status(), StatusCode::NO_CONTENT);
+
+        let favicon = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.ico")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(favicon.status(), StatusCode::OK);
+        assert_eq!(
+            favicon.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("image/png"))
+        );
+
+        let shell = router
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shell.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(shell.into_body(), 4096).await.unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("root spa shell"),
+            "/login must still use the root SPA fallback"
+        );
     }
 
     #[tokio::test]
@@ -2909,6 +3446,301 @@ mod tests {
         assert_eq!(
             provider_health.snapshot().embedding.status,
             ai_memory_llm::ProviderHealthStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn human_auth_intended_from_bootstrap_password_or_recovery() {
+        let empty = AuthSettings::default();
+        assert!(!human_auth_intended(&empty, false, false));
+        assert!(human_auth_intended(&empty, true, false));
+        assert!(human_auth_intended(&empty, false, true));
+        let recovery = AuthSettings {
+            recovery_token: Some(SecretString::from("break-glass-recovery-token-32chr")),
+            ..AuthSettings::default()
+        };
+        assert!(human_auth_intended(&recovery, false, false));
+        let initial = AuthSettings {
+            initial_root_password: Some(SecretString::from("twelve-chars!!")),
+            ..AuthSettings::default()
+        };
+        assert!(human_auth_intended(&initial, false, false));
+    }
+
+    #[test]
+    fn human_mode_fails_closed_without_recoverable_root_or_recovery() {
+        let err = require_recoverable_root_or_recovery(true, 0, false).unwrap_err();
+        assert!(err.to_string().contains("no recoverable root"));
+        require_recoverable_root_or_recovery(true, 0, true).unwrap();
+        require_recoverable_root_or_recovery(true, 1, false).unwrap();
+        require_recoverable_root_or_recovery(false, 0, false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn maybe_bootstrap_root_is_one_shot() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let first = AuthSettings {
+            initial_root_password: Some(SecretString::from("twelve-chars!!")),
+            ..AuthSettings::default()
+        };
+        maybe_bootstrap_root(&store, &first).await.unwrap();
+        assert!(store.reader.bootstrap_completed().await.unwrap());
+        assert_eq!(store.reader.count_recoverable_roots().await.unwrap(), 1);
+        let second = AuthSettings {
+            initial_root_password: Some(SecretString::from("different-pass!!")),
+            ..AuthSettings::default()
+        };
+        maybe_bootstrap_root(&store, &second).await.unwrap();
+        let login = store
+            .reader
+            .find_login_user_by_username("root".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ai_memory_store::password::verify_password(
+                "twelve-chars!!".into(),
+                login.password_hash.clone().unwrap(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !ai_memory_store::password::verify_password(
+                "different-pass!!".into(),
+                login.password_hash.unwrap(),
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_bootstrap_root_fails_closed_on_api_credential_collision() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let mut user = NewUser {
+            username: "legacy".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let pepper = TokenPepper::new("pepper");
+        let password = "twelve-chars!!";
+        store
+            .writer
+            .create_api_credential(
+                ApiCredentialId::new(),
+                user_id,
+                "legacy".into(),
+                hash_token(password, &pepper),
+                None,
+            )
+            .await
+            .unwrap();
+        let auth = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            initial_root_password: Some(SecretString::from(password)),
+            ..AuthSettings::default()
+        };
+        let err = maybe_bootstrap_root(&store, &auth).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("collides with an existing API credential"),
+            "{err}"
+        );
+        assert!(!store.reader.bootstrap_completed().await.unwrap());
+
+        let state =
+            AuthState::new(None).with_multiuser(pepper, store.reader.clone(), store.writer.clone());
+        let mut machine_request = Request::builder()
+            .header("authorization", format!("Bearer {password}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            ai_memory_mcp::auth::authenticate_bearer(&state, &mut machine_request)
+                .await
+                .unwrap(),
+            ai_memory_mcp::auth::BearerAuth::Authenticated
+        ));
+        assert_eq!(
+            machine_request
+                .extensions()
+                .get::<ai_memory_core::AuthLevel>(),
+            Some(&ai_memory_core::AuthLevel::User)
+        );
+
+        let login = public_auth_router(Arc::new(state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "legacy",
+                            "password": password,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn internal_session_introspect_is_inside_host_guard_not_require_bearer() {
+        let state = std::sync::Arc::new(
+            AuthState::new(Some("root-bearer".into()))
+                .with_trusted_proxy_bearer("proxy-bearer-token"),
+        );
+        let router = apply_host_layer(internal_auth_router(state), vec!["memory.example".into()]);
+        let body = Body::from(r#"{"session":"","method":"GET"}"#);
+
+        let missing_host = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/session-introspect")
+                    .header("authorization", "Bearer proxy-bearer-token")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_host.status(), StatusCode::BAD_REQUEST);
+        let text = String::from_utf8(
+            axum::body::to_bytes(missing_host.into_body(), 4096)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("missing Host"), "{text}");
+
+        let bad_host = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/session-introspect")
+                    .header("Host", "evil.example")
+                    .header("authorization", "Bearer proxy-bearer-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session":"","method":"GET"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_host.status(), StatusCode::FORBIDDEN);
+
+        let allowed = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/session-introspect")
+                    .header("Host", "memory.example")
+                    .header("authorization", "Bearer proxy-bearer-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session":"","method":"GET"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(allowed.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["authenticated"], false);
+        let body_text = json.to_string();
+        assert!(
+            !body_text.contains("X-Memory-Actor"),
+            "proxy bearer without actor headers must reach introspect, not MissingIdentity: {body_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_authority_secrets_cannot_match_api_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let mut user = NewUser {
+            username: "legacy".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let pepper = TokenPepper::new("pepper");
+        let secret = "configured-authority-collision-32chars";
+        store
+            .writer
+            .create_api_credential(
+                ApiCredentialId::new(),
+                user_id,
+                "legacy".into(),
+                hash_token(secret, &pepper),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let cases = [
+            AuthSettings {
+                token_pepper: Some("pepper".into()),
+                bearer_token: Some(secret.into()),
+                ..AuthSettings::default()
+            },
+            AuthSettings {
+                token_pepper: Some("pepper".into()),
+                actor_proxy_bearer_token: Some(secret.into()),
+                ..AuthSettings::default()
+            },
+            AuthSettings {
+                token_pepper: Some("pepper".into()),
+                recovery_token: Some(SecretString::from(secret)),
+                ..AuthSettings::default()
+            },
+        ];
+        for auth in cases {
+            let err = validate_configured_secret_collisions(&store, &auth, false)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("collides with an existing API credential")
+            );
+            assert!(!err.to_string().contains(secret));
+        }
+
+        let ignored_initial = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            initial_root_password: Some(SecretString::from(secret)),
+            ..AuthSettings::default()
+        };
+        validate_configured_secret_collisions(&store, &ignored_initial, false)
+            .await
+            .unwrap();
+        assert!(
+            validate_configured_secret_collisions(&store, &ignored_initial, true)
+                .await
+                .is_err()
         );
     }
 

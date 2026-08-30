@@ -1,7 +1,7 @@
 # Multi-user attribution
 
-> **Status:** Introduced in v0.8; this page documents the current shipped
-> contract.
+> **Status:** Introduced in v0.8; human password login, web sessions, and
+> native `aim_` API credentials are the current shipped contract.
 
 ai-memory is **single-tenant wiki data** with **optional multi-user
 attribution**. Every authenticated request sees the same wiki pages —
@@ -59,13 +59,49 @@ Every HTTP request is resolved to one of four authentication tiers:
 | **0 — Anonymous** | No `[auth].bearer_token` set. | Allowed, no identity. Same as pre-multi-user defaults. |
 | **1 — Root** | Bearer matches `[auth].bearer_token`. | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
 | **1b — Proxy-asserted user** | Bearer matches the distinct `[auth].actor_proxy_bearer_token`. | Identity is taken from trusted `X-Memory-Actor-*` headers. The request is a **user** unless its OIDC issuer/subject pair exactly matches the configured root pair. Missing or malformed identity is rejected. |
-| **2 — DB user** | Bearer doesn't match root, matches a `users.token_hash` row (via SHA-256 of token + `[auth].token_pepper`). | Allowed as **that user** for normal read/write APIs. All `/admin/*` endpoints are root-only in multi-user mode. The audit log records the username/email/name. |
+| **2 — DB user** | Bearer doesn't match root, matches an active `api_credentials.token_hash` (SHA-256 of the secret + `[auth].token_pepper`). Native keys use the `aim_` prefix. | Allowed as **that user** for normal read/write APIs. Native keys always resolve as `AuthLevel::User`, even when the owning identity is `role=root`. All `/admin/*` endpoints are root-only in multi-user mode. The audit log records the username/email/name. |
 | **3 — 401** | Bearer present but matches nothing. | Rejected. Closes the bypass — unknown bearers can't slip through as anonymous. |
 
 The rungs are sticky: a request is matched at the first credential that
 applies, never escalates. Startup rejects equal root and proxy credentials;
 root and proxy credentials take precedence over any accidental DB-token
 collision.
+
+Human password login is **not** a bearer rung. A browser session cookie never
+authenticates `/mcp`, `/hook`, `/handoff`, or `/workstream/*`, and a password
+never authenticates as `Authorization: Bearer`.
+
+## Human login (password + web session)
+
+The console signs in with username and password. The engine issues an
+`HttpOnly` `ai_memory_session` cookie (`ams_` secret, hash only in SQLite)
+plus a separate CSRF cookie that the SPA must send on cookie-authenticated
+`POST`/`PUT`/`PATCH`/`DELETE`. Machine Bearers skip CSRF.
+
+| Endpoint | Class | Notes |
+|---|---|---|
+| `POST /auth/login` | public | Rate-limited. Returns the `/auth/me` snapshot plus `Set-Cookie`. |
+| `GET /auth/me` | session | Identity, `role`, `must_change_password`, capabilities. Anonymous only in zero-config loopback. |
+| `POST /auth/password` | session + CSRF | Changes password, revokes other sessions, rotates this one. |
+| `POST /auth/logout` | session + CSRF | Revokes the session and expires cookies. |
+| `POST /auth/recovery` | public | Break-glass for the configured `root_username`. Never issues a session. |
+
+Passwords are Argon2id PHC strings, 12–1024 UTF-8 bytes, hashed off the writer
+actor. The last enabled root with a password cannot be disabled or demoted.
+
+Greenfield bootstrap consumes `AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD` once
+(`human_auth_state.bootstrap_completed`). Later restarts ignore it — unset the
+env var. Lost root uses `AI_MEMORY_AUTH__RECOVERY_TOKEN` (at least 32
+characters), compared constant-time and never stored in SQLite. Public
+recovery failures — wrong token, recovery unset, or password policy —
+share one 401 `{"error":"invalid credentials"}` body. `Config::load()`
+rejects equality among the initial password, recovery token, root bearer,
+and actor-proxy bearer without logging the values. Operator runbook:
+[Human password bootstrap and recovery](install.md#human-password-bootstrap-and-recovery).
+
+`/admin/*` and `/api/v1/*` accept a machine Bearer **or** a web session.
+Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
+behind auth. The engine expires the legacy `ai_memory_auth` cookie.
 
 ## Trusted proxy identity
 
@@ -81,7 +117,7 @@ Configure a distinct proxy credential:
 [auth]
 bearer_token = "<root-token>"                    # direct administration
 actor_proxy_bearer_token = "<different-token>"  # SSO proxy only
-secure_cookie = true                              # when `/web` is HTTPS-only
+secure_cookie = true                              # required beyond loopback
 
 # Optional stable identity for the root human behind an OIDC proxy.
 root_issuer = "https://idp.example"
@@ -92,9 +128,11 @@ root_subject = "<root-subject>"
   differ from `bearer_token`, and `serve` refuses startup otherwise or when the
   root bearer is absent.
 - Only set it when the server is reachable *only* through that proxy.
-- `secure_cookie` is independent of proxy identity. Enable it when a trusted
-  reverse proxy terminates HTTPS for `/web`; ai-memory never trusts forwarded
-  protocol headers to infer it. Direct HTTP browsers will not send that cookie.
+- `secure_cookie` is independent of proxy identity. Human auth requires it on
+  every non-loopback listener; ai-memory treats it as the explicit signal that
+  a trusted reverse proxy terminates HTTPS for `/web` and never trusts
+  forwarded protocol headers to infer that fact. Direct HTTP browsers will not
+  send a Secure cookie.
 - **The proxy MUST strip client-supplied `X-Memory-Actor-*` headers before
   setting its own.** Use a directive that *replaces* the header rather than
   appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`) —
@@ -346,25 +384,23 @@ root_name     = "Boss"             # optional, surfaced in UIs
 ```
 
 `token_pepper` was auto-generated by `ai-memory init`; **do not
-change it after adding users** — rotating the pepper invalidates
-every existing token. The pepper is what makes a stolen `users`
-table useless to an offline attacker; an attacker with both the
-DB and the config has tokens at their disposal anyway, so the
-pepper's job is closed by the file-permission boundary.
+change it after issuing native API keys** — rotating the pepper invalidates
+every `aim_` credential. The pepper makes copied
+`api_credentials.token_hash` rows useless to an offline attacker; human
+passwords and sessions do not use it.
 
-`init` creates the pepper before any users exist. Until the first user is
-added, operational admin endpoints retain single-user compatibility; creating
-that first user switches them to root-only immediately, without a restart.
-Expired user rows still keep admin mode root-only. If a database has users but
-either the pepper or static root bearer is missing or blank, `serve` refuses
-startup. Restore both original secrets from configuration backup (or set the
-root bearer from the secret manager) rather than removing users; the root token
-is required to administer the existing users.
+`init` creates the pepper before any keys exist. Human users and web
+sessions can operate without a machine-root bearer; native API-key lookup
+still requires the original pepper. If `api_credentials` contains rows and
+the pepper is missing or blank, `serve` refuses startup before applying
+human bootstrap. Restore the original pepper from configuration backup
+rather than deleting identities or keys.
 
-### 2. Add another user
+### 2. Add another human
 
-Each `ai-memory user add` issues one token, printed **exactly
-once**. Only its SHA-256 digest is kept in the DB.
+Each `ai-memory user add` creates a person with a temporary password,
+printed **exactly once**. The new user must change it on next login.
+This does **not** issue an API key.
 
 ```console
 $ AI_MEMORY_AUTH_TOKEN=<root-token> \
@@ -373,84 +409,91 @@ $ AI_MEMORY_AUTH_TOKEN=<root-token> \
 ✓ created user 'alice'
   name:  Alice Smith
   email: alice@home
-  id:    01935a82-6f7a-7d22-b8c0-...
+  role:  user
 
-Store this token now — it will NOT be shown again. Only its
-SHA-256 digest is kept in the DB.
+Store this temporary password now — it will NOT be shown again.
+The user must change it on next login.
 
-mYi3pq...<43-chars>...wKp2Ze
+xK7mPq...<temp password>
 ```
 
-stderr carries the human chrome, stdout carries the bare token
-so you can pipe it (`> ~/.config/ai-memory/alice.token`).
+stderr carries the human chrome; stdout is the bare password so you can
+pipe it. Use `--role root` to create a second recoverable root.
 
 ### 3. List users
 
 ```console
 $ AI_MEMORY_AUTH_TOKEN=<root-token> ai-memory user list
 
-USERNAME  NAME         EMAIL             STATUS
-alice     Alice Smith  alice@home        active
-bob       -            bob@home          active
-carol     -            -                 expired
+USERNAME  NAME         ROLE  STATUS
+alice     Alice Smith  user  must-change
+bob       -            user  active
+carol     -            user  disabled
+dave      -            user  api-only
 ```
 
-The list never surfaces tokens — only their hashes are in the DB.
+`api-only` is a brownfield row that still has a native API credential
+but no password. Grant human login with `user reset-password`; that does
+not reveal or rotate the machine secret. The list never surfaces
+passwords, hashes, or API secrets.
 
-### 4. Disable a token (without losing attribution history)
+### 4. Disable human login (without losing attribution history)
 
-`ai-memory user expire <username>` stamps `token_expired_at = now()`
-on the row. The user's bearer stops authenticating immediately, but
-the row stays put so historical `author_id` references in
-`audit_log` and `pages` keep resolving to their
-real names.
+`ai-memory user disable <username>` stamps `disabled_at` and revokes web
+sessions. Historical `author_id` references keep resolving. Native API
+credentials stay valid — revoke those separately with `api-key revoke`.
 
 ```console
-$ ai-memory user expire alice
-Expire token for user 'alice'? Their token stops authenticating immediately. (y/N) y
-✓ expired token for user 'alice'
+$ ai-memory user disable alice
+Disable human login for user 'alice'? (y/N) y
+✓ disabled user 'alice'
 ```
 
-Pass `--yes` to skip the prompt (CI / scripts).
+Pass `--yes` to skip the prompt (CI / scripts). Re-enable with
+`ai-memory user enable alice`. The last enabled root with a password
+cannot be disabled or demoted.
 
-To re-enable later: `ai-memory user revive alice`.
+### 5. Issue, rotate, or revoke a native API key
 
-### 5. Rotate a leaked / lost token
+Machine clients use `aim_` credentials, not passwords:
 
 ```console
-$ ai-memory user rotate-token alice
-Rotate token for user 'alice'? Any existing client using the old token will start getting 401 immediately. (y/N) y
-✓ rotated token for user 'alice'
+$ ai-memory api-key add --username alice --label codex-laptop
+✓ created API key '…' (codex-laptop)
 
 Store this token now — it will NOT be shown again.
 
-XGqsBp...<43-chars>...zRm0Vt
+aim_mYi3pq...<secret>
 ```
 
-Rotation implicitly revives an expired token — you can recover an
-offboarded user without first running `revive`.
+```console
+$ ai-memory api-key rotate <id>
+$ ai-memory api-key revoke <id>
+```
+
+Rotation 401s the previous plaintext immediately. A revoked secret does
+not come back; issue a new key instead. Native keys authenticate as
+`AuthLevel::User` even when attached to a `role=root` identity —
+root automation still uses `[auth].bearer_token`. External `amk_` keys
+stay in `mcp-auth`; they are not listed here.
 
 ## Backward compatibility
 
-If you're upgrading from a pre-v0.8 ai-memory:
+If you're upgrading a machine-bearer-only install:
 
-- **No action is required.** Your existing
-  `[auth].bearer_token`-only setup continues to authenticate
-  exactly as before. The auth middleware just stamps an anonymous
-  `ActorContext` and your audit log records the same shape it did
-  before.
-- The `users` table is added by migration V14 and stays empty
-  until you actively run `ai-memory user add`. SQL queries against
-  it return no rows; the rest of the schema is unchanged.
-- Multi-user mode requires `[auth].token_pepper`. Without it, the
-  user-management endpoints return **503** with a clear
-  `multi-user not enabled` message. Existing installs never trip
-  this because they never call `user add`.
-- `/admin/*` endpoints are open to the configured bearer token in
-  single-user mode, matching historical behavior. Creating the first user row
-  immediately makes every admin endpoint root-only; DB-user tokens receive
-  **403** and anonymous requests receive **401**. Merely configuring
-  `[auth].token_pepper` does not activate that boundary.
+- **No immediate action is required.** Existing
+  `[auth].bearer_token` authentication continues to work as before.
+  Configure human bootstrap/recovery only when enabling password login.
+- Migration V51 extends the existing `users` table with human role/password
+  state and creates `web_sessions`; V52 copies every valid legacy
+  `users.token_hash` into `api_credentials` without changing its digest or
+  owner id.
+- Native API credentials require `[auth].token_pepper`. Human user creation,
+  password reset, disable/enable, and session login do not create or depend
+  on API keys.
+- In human mode, `/admin/*` is available to a root web session or the
+  machine-root bearer. Native `aim_` credentials always remain
+  `AuthLevel::User` and receive **403** on root-only operations.
 
 ### Migrating an existing single-user install
 
@@ -479,24 +522,29 @@ config:
 You can defer steps 3-4 indefinitely — `bearer_token` alone keeps
 working as it always has.
 
-## How tokens are stored
+## How credentials are stored
 
-- 32 bytes of OS CSPRNG, URL-safe-base64-encoded → 43-character
-  string.
-- DB column `users.token_hash` stores `SHA-256(token || ":" ||
-  token_pepper)`, never the plaintext.
-- The per-server `token_pepper` makes a DB-only theft (e.g. a
-  copied SQLite file) useless to an offline attacker: the search
-  space for the unpeppered hash is `(token, pepper)` jointly.
-- Constant-time comparison (`subtle::ConstantTimeEq`) on the hash
-  side-steps timing attacks against the lookup path.
+**Passwords** are Argon2id PHC strings on `users.password_hash` with a
+random per-password salt. They never land in `api_credentials` and are
+never compared as Bearer.
 
-We deliberately **don't** use argon2id here even though it would be
-the textbook choice. Tokens are 256-bit CSPRNG, so brute force is
-infeasible regardless of hash strength; argon2id's per-hash salt
-would force O(N) scans on every auth request, where SHA-256 +
-`UNIQUE` index gives us the O(1) lookup the hot path needs.
-See `crates/ai-memory-store/src/users.rs` for the full rationale.
+**Native API keys** (`aim_` + 43 URL-safe characters from 32 CSPRNG
+bytes) store `SHA-256(token || ":" || token_pepper)` in
+`api_credentials.token_hash`. The per-server `token_pepper` makes a
+DB-only theft (a copied SQLite file) useless offline. Constant-time
+comparison on the hash avoids timing leaks on the lookup path.
+Argon2id is the wrong KDF here: 256-bit CSPRNG secrets are not
+brute-forceable, and a per-hash salt would force O(N) scans on every
+auth request. See `crates/ai-memory-store/src/api_credentials.rs`.
+
+**Web sessions** hash a 256-bit `ams_` secret with SHA-256 (no pepper)
+into `web_sessions`. The cookie is `HttpOnly`, `SameSite=Strict`,
+`Path=/`. CSRF is a separate cookie compared to the session's CSRF
+hash.
+
+Brownfield `users.token_hash` values were copied losslessly into
+`api_credentials` (same 32-byte digest, label `legacy-user-token`).
+Runtime lookup no longer reads the old columns.
 
 ## Where attribution shows up
 
@@ -504,7 +552,7 @@ See `crates/ai-memory-store/src/users.rs` for the full rationale.
 |---|---|
 | Auth middleware injects `Extension<ActorContext>` on every request | ✓ P1.3 |
 | All `/admin/*` routes gate on `Extension<AuthLevel>::Root` in multi-user mode | ✓ P1.4 |
-| `ai-memory user add/list/expire/revive/rotate-token` CLI | ✓ P1.5 |
+| `ai-memory user add/list/reset-password/disable/enable/patch` and `ai-memory api-key add/list/rotate/revoke` | ✓ |
 | `pages.author_id` populated, frontmatter `last_modified_by` block | ✓ P1.6 |
 | `/api/v1` page responses include `author: { username, name?, email? }` | ✓ P1.7 |
 | ETag invalidation on author change (so caches refresh attribution) | ✓ P1.7 |
@@ -516,20 +564,17 @@ Commit ids for each milestone are recorded in `CHANGELOG.md`.
 
 ## Wiring agent hooks to a specific user
 
-After `ai-memory user add` prints a user's token, point that user's
+After `ai-memory api-key add` prints a native secret, point that user's
 agent install at it via `install-hooks`:
 
 ```console
-$ ai-memory user add --username alice --email alice@home --name "Alice Smith"
-✓ created user 'alice'
-  name:  Alice Smith
-  email: alice@home
-  ...
+$ ai-memory api-key add --username alice --label claude-hooks
+✓ created API key '…' (claude-hooks)
 
-XGq...<43-chars>...zRm    # the token, stdout only
+aim_XGq...<secret>    # stdout only
 
 $ ai-memory install-hooks --apply --agent claude-code \
-    --as-user alice --auth-token XGq...<43-chars>...zRm
+    --as-user alice --auth-token aim_XGq...<secret>
 [ai-memory] hooks installing for user: alice
 ✓ staged 5 hook script(s) → ...
 ```
@@ -554,16 +599,19 @@ the bearer authenticates, attribution flows from the token's owner
   multi-user mode. If you need data isolation, run separate
   ai-memory servers (per-user data dirs) and front them with a reverse
   proxy.
-- **One token per user.** Rotation issues a new token and
-  invalidates the old in the same transaction. There's no
-  notion of multiple device-bound tokens per user.
-- **Root token is single.** `[auth].bearer_token` is the admin token
-  for every `/admin/*` endpoint. DB users created with `user add` are
-  normal users, not additional admins.
+- **Native keys are not passwords.** `user add` never issues an `aim_`
+  secret; `api-key add` never issues a login session. Disable/reset of
+  a human leaves API credentials untouched, and revoke/rotate of a key
+  leaves the password/session untouched. One identity may hold several
+  native keys with distinct labels.
+- **Root token is single.** `[auth].bearer_token` is the programmatic
+  admin credential for `/admin/*`. A native key attached to a
+  `role=root` identity still authenticates as `AuthLevel::User`. Human
+  roots operate the console with a web session after password login.
 - **OIDC is request authentication, not page authorization.** Native hooks and
   thin-client CLI commands can send a per-developer OIDC bearer for an external
   OIDC-aware gateway/bridge. Native ai-memory server auth still uses static root
-  bearer / DB-user tokens, and `/admin/*` stays root-only unless a gateway
+  bearer / native `aim_` keys / web sessions, and `/admin/*` stays root-only unless a gateway
   translates accepted OIDC auth into upstream auth that ai-memory accepts.
   ai-memory still has one shared wiki per server and no
   per-page RBAC. The Keycloak/OIDC `sid` claim is also not an ai-memory agent

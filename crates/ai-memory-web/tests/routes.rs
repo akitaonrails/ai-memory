@@ -236,8 +236,6 @@ async fn web_page_view_renders_author_chip_for_attributed_pages() {
         .get_or_create_project(ws, "scratch", None)
         .await
         .unwrap();
-    let pepper = ai_memory_store::TokenPepper::new("test-pepper");
-    let token_hash = ai_memory_store::hash_token("t", &pepper);
     let mut new_user = ai_memory_core::NewUser {
         username: "alice".into(),
         name: Some("Alice Smith".into()),
@@ -246,7 +244,7 @@ async fn web_page_view_renders_author_chip_for_attributed_pages() {
     new_user.validate().unwrap();
     let user_id = store
         .writer
-        .create_user(new_user, token_hash)
+        .create_human_user(new_user, ai_memory_core::UserRole::User, None, false)
         .await
         .unwrap();
 
@@ -2834,8 +2832,6 @@ async fn api_v1_page_surfaces_author_for_db_user_writes() {
         .unwrap();
 
     // Seed a `users` row and write a page attributed to that id.
-    let pepper = ai_memory_store::TokenPepper::new("test-pepper");
-    let token_hash = ai_memory_store::hash_token("any-token", &pepper);
     let mut new_user = ai_memory_core::NewUser {
         username: "alice".into(),
         name: Some("Alice Smith".into()),
@@ -2844,7 +2840,7 @@ async fn api_v1_page_surfaces_author_for_db_user_writes() {
     new_user.validate().unwrap();
     let user_id = store
         .writer
-        .create_user(new_user, token_hash)
+        .create_human_user(new_user, ai_memory_core::UserRole::User, None, false)
         .await
         .unwrap();
 
@@ -2899,8 +2895,6 @@ async fn api_v1_etag_differs_between_anonymous_and_attributed_writes() {
         .get_or_create_project(ws, "scratch", None)
         .await
         .unwrap();
-    let pepper = ai_memory_store::TokenPepper::new("test-pepper");
-    let token_hash = ai_memory_store::hash_token("t", &pepper);
     let mut new_user = ai_memory_core::NewUser {
         username: "alice".into(),
         name: None,
@@ -2909,7 +2903,7 @@ async fn api_v1_etag_differs_between_anonymous_and_attributed_writes() {
     new_user.validate().unwrap();
     let user_id = store
         .writer
-        .create_user(new_user, token_hash)
+        .create_human_user(new_user, ai_memory_core::UserRole::User, None, false)
         .await
         .unwrap();
 

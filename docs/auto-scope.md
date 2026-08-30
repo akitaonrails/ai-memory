@@ -175,9 +175,9 @@ For built-in installs that use static MCP config, prefer:
 ## Pairing with multi-user mode
 
 `per_actor` is most useful when the engine is in multi-user mode (see
-[`docs/users.md`](users.md)) — each authenticated user has their own
-`users.token_hash` row, so the auth middleware tags every request with
-the right `user`. With `[auto_scope] mode = "per_actor"`, two
+[`docs/users.md`](users.md)) — each native API credential resolves through
+`api_credentials` to its owning `users` row, so the auth middleware tags
+every request with the right `user`. With `[auto_scope] mode = "per_actor"`, two
 authenticated users running concurrent agent sessions through the same
 engine no longer overwrite each other's "current project" pointer for
 MCP calls; if their clients also forward session ids, concurrent

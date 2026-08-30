@@ -323,8 +323,8 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     let auth = auth_token_owned.as_deref();
     // P1.8 multi-user attribution: `--as-user` is metadata only — the
     // token stamped into the hook env block is whatever the operator
-    // passed via `--auth-token` (typically the per-user token from
-    // `ai-memory user add`). We surface the username to stderr so the
+    // passed via `--auth-token` (typically a native key from
+    // `ai-memory api-key add`). We surface the username to stderr so the
     // operator can confirm which identity their writes will attribute
     // to. Mismatch between `--as-user` and the actual token's owner is
     // the operator's concern; we don't reach back to the server to
@@ -860,7 +860,7 @@ fn validate_as_user(as_user: Option<&str>, auth_token: Option<&str>) -> Result<(
     if auth_token.map(str::trim).is_none_or(str::is_empty) {
         anyhow::bail!(
             "--as-user '{user}' requires --auth-token \
-             (the token printed by `ai-memory user add --username {user}`)"
+             (issue one with `ai-memory api-key add --username {user} --label <label>`)"
         );
     }
     Ok(())

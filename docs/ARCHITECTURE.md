@@ -438,6 +438,21 @@ keeps the same auth, scope resolver, and tool handlers as direct HTTP clients.
 The adapter fails closed without a Claude session id and is installed only by
 the explicit `install-mcp --client claude-code --session-aware` option.
 
+## HTTP authentication classes
+
+Four credential classes share one process and must not be mixed:
+
+| Class | Wire | Authorizes |
+|---|---|---|
+| Human password | `POST /auth/login` body | Session issuance only |
+| Web session | `ai_memory_session` cookie + CSRF | `/auth/me`, `/admin/*`, `/api/v1/*` by `AuthLevel`; never `/mcp` or hooks |
+| Recovery | `POST /auth/recovery` body | Root password reset; no session |
+| API key | `Authorization: Bearer` (`aim_`, root `AI_MEMORY_AUTH_TOKEN`, or external `amk_`) | Machine APIs; never a web session |
+
+HTTP Basic and the legacy `ai_memory_auth` cookie are not credentials.
+`/web` SPA HTML is public static; the builtin wiki browser and JSON APIs
+stay behind the route class above.
+
 ## CLI subcommand surface
 
 ```
@@ -448,7 +463,7 @@ read-page            write-page           delete-page
 serve                reset                backup
 restore              reindex              install-hooks
 hook                 install-mcp          commit
-checkpoints          restore-page         llm-test
+checkpoints           restore-page         llm-test
 forget-sweep         lint                 curator
 auto-improve-report  auto-improve         finalize-session
 pending-writes       embed                generate-auth-token
@@ -456,7 +471,7 @@ setup-agent          bootstrap            install-instructions
 install-skills       reorg                purge-project
 rename-project       move-project         move-session
 uninstall            auth                 user
-completions          handoffs
+api-key              completions          handoffs
 ```
 
 Run `ai-memory --help` for the full tree.

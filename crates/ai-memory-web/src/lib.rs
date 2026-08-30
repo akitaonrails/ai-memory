@@ -34,8 +34,8 @@ mod state;
 mod templates;
 
 pub use mount::{
-    WebMountSpec, inject_base_href, inject_base_path_meta, mount_web_router, normalize_prefix,
-    web_base_href,
+    SplitWebRouters, WebMountSpec, inject_base_href, inject_base_path_meta, normalize_prefix,
+    split_web_routers, web_base_href,
 };
 pub use state::WebState;
 

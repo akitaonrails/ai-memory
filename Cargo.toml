@@ -97,6 +97,9 @@ base64 = "0.22"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 refinery = { version = "0.8", features = ["rusqlite"] }
 sha2 = "0.10"
+# Argon2id PHC for human passwords. Tokens stay SHA-256+pepper (hot-path
+# unique lookup); the slow KDF is reserved for the password class.
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash", "std"] }
 parking_lot = "0.12"
 
 # Filesystem watcher + process inspection.

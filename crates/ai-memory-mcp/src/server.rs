@@ -8880,18 +8880,17 @@ mod tests {
             .get_or_create_project(ws, "scratch", None)
             .await
             .unwrap();
-        let token = ai_memory_store::generate_token().unwrap();
-        let pepper = ai_memory_store::TokenPepper::new("test-pepper-author");
-        let token_hash = ai_memory_store::hash_token(&token, &pepper);
         let user_id = store
             .writer
-            .create_user(
+            .create_human_user(
                 NewUser {
                     username: "alice".into(),
                     name: Some("Alice Smith".into()),
                     email: Some("alice@example.com".into()),
                 },
-                token_hash,
+                ai_memory_core::UserRole::User,
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -8982,10 +8981,7 @@ mod tests {
         user.validate().unwrap();
         store
             .writer
-            .create_user(
-                user,
-                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
-            )
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
             .await
             .unwrap();
 
@@ -9082,10 +9078,7 @@ mod tests {
         user.validate().unwrap();
         store
             .writer
-            .create_user(
-                user,
-                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
-            )
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
             .await
             .unwrap();
 

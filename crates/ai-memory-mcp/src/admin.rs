@@ -74,7 +74,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
@@ -137,12 +137,12 @@ pub struct AdminState {
     /// handler so a second caller waits its turn (request stays open
     /// until the lock is acquired, then proceeds normally).
     pub bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Per-server token pepper, used by the user-management endpoints
-    /// (`POST /admin/users`, `…/rotate-token`) to hash freshly-issued
-    /// tokens before they land in `users.token_hash`. `None` when the
-    /// operator hasn't set `[auth].token_pepper` in config (single-user
-    /// installs that predate v0.8); user-management endpoints then
-    /// return 503 `multi-user not enabled`.
+    /// Per-server token pepper, used by `/admin/api-credentials` to hash
+    /// freshly-issued `aim_` secrets before they land in
+    /// `api_credentials.token_hash`. `None` when the operator hasn't set
+    /// `[auth].token_pepper` in config (single-user installs that predate
+    /// v0.8); native API-credential endpoints then return 503
+    /// `multi-user not enabled`.
     pub token_pepper: Option<ai_memory_store::TokenPepper>,
     /// Shared in-process pointer to the project the agent is currently
     /// active in (published by the hook router). Read by `move-project` to
@@ -632,11 +632,24 @@ pub fn admin_router_with_sweep_tuning(
             "/admin/users",
             get(handle_list_users).post(handle_create_user),
         )
-        .route("/admin/users/{username}/expire", post(handle_expire_user))
-        .route("/admin/users/{username}/revive", post(handle_revive_user))
+        .route("/admin/users/{username}", patch(handle_patch_user))
         .route(
-            "/admin/users/{username}/rotate-token",
-            post(handle_rotate_user_token),
+            "/admin/users/{username}/reset-password",
+            post(handle_reset_password),
+        )
+        .route("/admin/users/{username}/disable", post(handle_disable_user))
+        .route("/admin/users/{username}/enable", post(handle_enable_user))
+        .route(
+            "/admin/api-credentials",
+            get(handle_list_api_credentials).post(handle_create_api_credential),
+        )
+        .route(
+            "/admin/api-credentials/{id}/rotate",
+            post(handle_rotate_api_credential),
+        )
+        .route(
+            "/admin/api-credentials/{id}/revoke",
+            post(handle_revoke_api_credential),
         );
     operational
         .merge(users)
@@ -6040,51 +6053,68 @@ struct CreateUserRequest {
     name: Option<String>,
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    role: Option<ai_memory_core::UserRole>,
 }
 
-/// JSON response for `POST /admin/users` and `…/rotate-token`.
-/// Carries the plaintext token EXACTLY once — the client (CLI or
-/// admin browser) must surface it to the operator and never persist
-/// it; only the SHA-256 digest is kept in the DB. Subsequent reads
-/// (`GET /admin/users`) omit the token field entirely.
+#[derive(Debug, Deserialize)]
+struct PatchUserRequest {
+    #[serde(default)]
+    name: Option<Option<String>>,
+    #[serde(default)]
+    email: Option<Option<String>>,
+    #[serde(default)]
+    role: Option<ai_memory_core::UserRole>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateApiCredentialRequest {
+    username: String,
+    label: String,
+}
+
 #[derive(Debug, Serialize)]
-struct UserWithTokenResponse {
+struct UserWithPasswordResponse {
     user: ai_memory_core::User,
-    token: String,
+    temporary_password: String,
 }
 
-/// JSON response for `GET /admin/users` and lifecycle ops that don't
-/// issue a new token (expire, revive).
 #[derive(Debug, Serialize)]
 struct UserResponse {
     user: ai_memory_core::User,
 }
 
-/// JSON response for `GET /admin/users`.
 #[derive(Debug, Serialize)]
 struct UserListResponse {
     users: Vec<ai_memory_core::User>,
 }
 
-/// Gate any handler in this section on a root-level request. Returns
-/// the matching error response for the actor's tier (401 anonymous,
-/// 403 user) or `Ok(())` for root.
+#[derive(Debug, Serialize)]
+struct ApiCredentialWithTokenResponse {
+    credential: ai_memory_core::ApiCredential,
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiCredentialListResponse {
+    credentials: Vec<ai_memory_core::ApiCredential>,
+}
+
 fn require_root(
     level: ai_memory_core::AuthLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     level
-        .authorize(Capability::UserManagement, true)
+        .authorize(ai_memory_core::Capability::UserManagement, true)
         .map_err(|e| {
-            (
-                authz_status(e),
-                Json(serde_json::json!({ "error": e.message() })),
-            )
+            let status = if e.is_authentication_required() {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            (status, Json(serde_json::json!({ "error": e.message() })))
         })
 }
 
-/// Get the active token-pepper. Returns 503 when multi-user wasn't
-/// configured — same shape as `/admin/embed` returns when no embedder
-/// is wired.
 fn require_pepper(
     state: &AdminState,
 ) -> Result<&ai_memory_store::TokenPepper, (StatusCode, Json<serde_json::Value>)> {
@@ -6092,26 +6122,60 @@ fn require_pepper(
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "multi-user not enabled (set [auth].token_pepper in config or run `ai-memory init`)"
+                "error": "native API keys require [auth].token_pepper (run `ai-memory init`)"
             })),
         )
     })
 }
 
-/// Handler for `POST /admin/users`.
-///
-/// Validates the input, generates a fresh 32-byte token, hashes it with
-/// the per-server pepper, and inserts the row. Returns
-/// `UserWithTokenResponse` so the caller can display the plaintext
-/// token exactly once.
+fn reserved_password(
+    auth: Option<axum::Extension<std::sync::Arc<crate::auth::AuthState>>>,
+    password: &str,
+) -> bool {
+    auth.is_some_and(|axum::Extension(state)| {
+        crate::human_auth::password_is_reserved(&state, password)
+    })
+}
+
+async fn hash_temp_password() -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let raw = ai_memory_store::password::generate_temporary_password()
+        .map_err(|e| internal_err(e.to_string()))?;
+    ai_memory_core::validate_human_password(&raw, None, &[])
+        .map_err(|e| validation_error(e.to_string()))?;
+    Ok(raw)
+}
+
+async fn mint_temporary_password(
+    state: &AdminState,
+    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    for _ in 0..8 {
+        let raw = hash_temp_password().await?;
+        if reserved_password(auth.clone(), &raw) {
+            continue;
+        }
+        if let Some(pepper) = state.token_pepper.as_ref() {
+            let hash = ai_memory_store::hash_token(&raw, pepper);
+            match state.reader.token_hash_exists(hash).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => return Err(internal_err(e.to_string())),
+            }
+        }
+        return Ok(raw);
+    }
+    Err(internal_err(
+        "could not mint a unique temporary password".to_string(),
+    ))
+}
+
 async fn handle_create_user(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
     Json(req): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
-    let pepper = require_pepper(&state)?;
-
     let mut new_user = ai_memory_core::NewUser {
         username: req.username,
         name: req.name,
@@ -6120,34 +6184,34 @@ async fn handle_create_user(
     new_user
         .validate()
         .map_err(|e| validation_error(e.to_string()))?;
-
-    let token = ai_memory_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
-    let token_hash = ai_memory_store::hash_token(&token, pepper);
-
+    let role = req.role.unwrap_or(ai_memory_core::UserRole::User);
+    let raw = mint_temporary_password(&state, auth).await?;
+    let phc = ai_memory_store::password::hash_password(raw.clone())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
     let user_id = state
         .writer
-        .create_user(new_user.clone(), token_hash)
+        .create_human_user(new_user, role, Some(phc), true)
         .await
         .map_err(map_user_store_err)?;
-
-    // Round-trip through the reader so we surface the same canonical
-    // shape `GET /admin/users` returns (incl. created_at).
     let user = state
         .reader
         .find_user_by_id(user_id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
         .ok_or_else(|| internal_err("created user vanished from store".to_string()))?;
-
     Ok((
         StatusCode::OK,
-        Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
+        Json(
+            serde_json::to_value(UserWithPasswordResponse {
+                user,
+                temporary_password: raw,
+            })
+            .unwrap_or_default(),
+        ),
     ))
 }
 
-/// Handler for `GET /admin/users`. Includes users with expired tokens
-/// (the response's `token_expired_at` field distinguishes them); the
-/// CLI list renderer shows an "expired" flag.
 async fn handle_list_users(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -6164,10 +6228,67 @@ async fn handle_list_users(
     ))
 }
 
-/// Handler for `POST /admin/users/:username/expire`. Idempotent: the
-/// first call stamps `token_expired_at = now()`, subsequent calls
-/// leave the original timestamp untouched (via COALESCE in the store).
-async fn handle_expire_user(
+async fn handle_patch_user(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+    Json(req): Json<PatchUserRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    state
+        .writer
+        .patch_user(user.id, req.name, req.email, req.role)
+        .await
+        .map_err(map_user_store_err)?;
+    let user = state
+        .reader
+        .find_user_by_id(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("user vanished after patch".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
+    ))
+}
+
+async fn handle_reset_password(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    let raw = mint_temporary_password(&state, auth).await?;
+    let phc = ai_memory_store::password::hash_password(raw.clone())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    state
+        .writer
+        .reset_human_password(user.id, phc, true)
+        .await
+        .map_err(map_user_store_err)?;
+    let user = state
+        .reader
+        .find_user_by_id(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("user vanished after reset".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(UserWithPasswordResponse {
+                user,
+                temporary_password: raw,
+            })
+            .unwrap_or_default(),
+        ),
+    ))
+}
+
+async fn handle_disable_user(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
     axum::extract::Path(username): axum::extract::Path<String>,
@@ -6176,25 +6297,22 @@ async fn handle_expire_user(
     let user = lookup_user_by_username(&state, &username).await?;
     state
         .writer
-        .expire_user_token(user.id)
+        .set_user_disabled(user.id, true)
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
-    // Re-read to surface the new token_expired_at in the response.
+        .map_err(map_user_store_err)?;
     let user = state
         .reader
         .find_user_by_id(user.id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after expire".to_string()))?;
+        .ok_or_else(|| internal_err("user vanished after disable".to_string()))?;
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
     ))
 }
 
-/// Handler for `POST /admin/users/:username/revive`. Clears
-/// `token_expired_at`. Idempotent (revive on an active user is a no-op).
-async fn handle_revive_user(
+async fn handle_enable_user(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
     axum::extract::Path(username): axum::extract::Path<String>,
@@ -6203,64 +6321,144 @@ async fn handle_revive_user(
     let user = lookup_user_by_username(&state, &username).await?;
     state
         .writer
-        .revive_user_token(user.id)
+        .set_user_disabled(user.id, false)
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
+        .map_err(map_user_store_err)?;
     let user = state
         .reader
         .find_user_by_id(user.id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after revive".to_string()))?;
+        .ok_or_else(|| internal_err("user vanished after enable".to_string()))?;
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
     ))
 }
 
-/// Handler for `POST /admin/users/:username/rotate-token`. Issues a
-/// fresh token, hashes it with the server pepper, replaces the row's
-/// `token_hash`, and implicitly clears `token_expired_at` (rotating
-/// makes the new token usable immediately even if the prior one was
-/// expired). Returns the plaintext token once.
-async fn handle_rotate_user_token(
+async fn handle_create_api_credential(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    axum::extract::Path(username): axum::extract::Path<String>,
+    Json(req): Json<CreateApiCredentialRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_root(level)?;
     let pepper = require_pepper(&state)?;
-    let user = lookup_user_by_username(&state, &username).await?;
-
-    let token = ai_memory_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
+    let user = lookup_user_by_username(&state, &req.username).await?;
+    let token = ai_memory_store::generate_api_key().map_err(|e| internal_err(e.to_string()))?;
     let token_hash = ai_memory_store::hash_token(&token, pepper);
-
-    let updated = state
+    let preview = ai_memory_store::api_key_preview(&token);
+    let id = state
         .writer
-        .rotate_user_token(user.id, token_hash)
+        .create_api_credential(
+            ai_memory_core::ApiCredentialId::new(),
+            user.id,
+            req.label,
+            token_hash,
+            Some(preview),
+        )
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
-    if !updated {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "user vanished mid-rotation" })),
-        ));
-    }
-    let user = state
+        .map_err(map_user_store_err)?;
+    let credential = state
         .reader
-        .find_user_by_id(user.id)
+        .find_api_credential(id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after rotate".to_string()))?;
+        .ok_or_else(|| internal_err("credential vanished after create".to_string()))?;
     Ok((
         StatusCode::OK,
-        Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
+        Json(
+            serde_json::to_value(ApiCredentialWithTokenResponse { credential, token })
+                .unwrap_or_default(),
+        ),
     ))
 }
 
-/// Shared lookup helper: 404 when the user doesn't exist, else returns
-/// the row. Used by every per-username handler so error shapes stay
-/// uniform across `expire` / `revive` / `rotate-token`.
+async fn handle_list_api_credentials(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let credentials = state
+        .reader
+        .list_api_credentials()
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(ApiCredentialListResponse { credentials }).unwrap_or_default()),
+    ))
+}
+
+async fn handle_rotate_api_credential(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let pepper = require_pepper(&state)?;
+    let id: ai_memory_core::ApiCredentialId = id
+        .parse()
+        .map_err(|e: ai_memory_core::MemoryError| validation_error(e.to_string()))?;
+    let token = ai_memory_store::generate_api_key().map_err(|e| internal_err(e.to_string()))?;
+    let token_hash = ai_memory_store::hash_token(&token, pepper);
+    let preview = ai_memory_store::api_key_preview(&token);
+    let updated = state
+        .writer
+        .rotate_api_credential(id, token_hash, Some(preview))
+        .await
+        .map_err(map_user_store_err)?;
+    if !updated {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such credential" })),
+        ));
+    }
+    let credential = state
+        .reader
+        .find_api_credential(id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("credential vanished after rotate".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(ApiCredentialWithTokenResponse { credential, token })
+                .unwrap_or_default(),
+        ),
+    ))
+}
+
+async fn handle_revoke_api_credential(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let id: ai_memory_core::ApiCredentialId = id
+        .parse()
+        .map_err(|e: ai_memory_core::MemoryError| validation_error(e.to_string()))?;
+    state
+        .writer
+        .revoke_api_credential(id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let credential = state
+        .reader
+        .find_api_credential(id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "no such credential" })),
+            )
+        })?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "credential": credential })),
+    ))
+}
+
 async fn lookup_user_by_username(
     state: &AdminState,
     username: &str,
@@ -6278,7 +6476,6 @@ async fn lookup_user_by_username(
     })
 }
 
-/// Convert a username/email validation error into a 400 response.
 fn validation_error(msg: String) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
@@ -6286,16 +6483,16 @@ fn validation_error(msg: String) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// Map StoreError to the right HTTP status. UNIQUE violations on
-/// username / email become 409; everything else is a 500.
 fn map_user_store_err(e: ai_memory_store::StoreError) -> (StatusCode, Json<serde_json::Value>) {
     match e {
-        ai_memory_store::StoreError::Duplicate(msg) => (
+        ai_memory_store::StoreError::Duplicate(msg)
+        | ai_memory_store::StoreError::InvalidState(msg) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": msg })),
         ),
         ai_memory_store::StoreError::Memory(ai_memory_core::MemoryError::InvalidUsername(msg))
-        | ai_memory_store::StoreError::Memory(ai_memory_core::MemoryError::InvalidEmail(msg)) => {
+        | ai_memory_store::StoreError::Memory(ai_memory_core::MemoryError::InvalidEmail(msg))
+        | ai_memory_store::StoreError::Memory(ai_memory_core::MemoryError::InvalidPassword(msg)) => {
             validation_error(msg)
         }
         other => internal_err(other.to_string()),
@@ -9564,6 +9761,91 @@ mod tests {
         (tmp, router)
     }
 
+    /// Same AdminState as [`user_admin_test_router`], but AuthLevel comes from
+    /// the production dual-auth Bearer lookup (`authenticate_bearer` +
+    /// `api_credentials` hash), not a stub that stamps Root/User by string
+    /// compare. Configured `root_token` is AuthLevel::Root; a DB native key
+    /// authenticates as AuthLevel::User even when `users.role` is root.
+    fn user_admin_dual_auth_router(root_token: &'static str) -> (TempDir, Router) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(pepper.clone()),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+        let auth_state = Arc::new(
+            crate::auth::AuthState::new(Some(root_token.to_string())).with_multiuser(
+                pepper,
+                store.reader.clone(),
+                store.writer.clone(),
+            ),
+        );
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            crate::human_auth::require_dual_auth,
+        ));
+        (tmp, router)
+    }
+
+    async fn post_disable_user(
+        router: &Router,
+        root_token: &str,
+        username: &str,
+    ) -> axum::http::Response<Body> {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/users/{username}/disable"))
+                    .header("authorization", format!("Bearer {root_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn patch_user(
+        router: &Router,
+        root_token: &str,
+        username: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/admin/users/{username}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {root_token}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn post_create_user(
         router: &Router,
         root_token: &str,
@@ -9748,13 +10030,13 @@ mod tests {
                 "/admin/users",
                 serde_json::json!({"username": "alice"}),
             ),
-            ("POST", "/admin/users/alice/expire", serde_json::Value::Null),
-            ("POST", "/admin/users/alice/revive", serde_json::Value::Null),
             (
                 "POST",
-                "/admin/users/alice/rotate-token",
+                "/admin/users/alice/disable",
                 serde_json::Value::Null,
             ),
+            ("POST", "/admin/users/alice/enable", serde_json::Value::Null),
+            ("GET", "/admin/api-credentials", serde_json::Value::Null),
         ]
     }
 
@@ -9975,7 +10257,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users/alice/expire")
+                    .uri("/admin/users/alice/disable")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -10108,10 +10390,11 @@ mod tests {
         // Email was normalised to lowercase by NewUser::validate.
         assert_eq!(json["user"]["email"], "alice@example.com");
         assert_eq!(json["user"]["name"], "Alice Smith");
-        // Plaintext token is surfaced exactly once — 43 chars (32 bytes
-        // URL-safe-base64).
-        let token = json["token"].as_str().unwrap();
-        assert_eq!(token.len(), 43);
+        // Temporary password is surfaced exactly once.
+        let pw = json["temporary_password"].as_str().unwrap();
+        assert!(pw.len() >= 12);
+        assert!(json["user"]["must_change_password"].as_bool().unwrap());
+        assert!(json.get("token").is_none());
     }
 
     #[tokio::test]
@@ -10203,12 +10486,15 @@ mod tests {
         assert_eq!(users[2]["username"], "carol");
         // Tokens are NEVER surfaced by the list endpoint.
         for u in users {
-            assert!(u.get("token").is_none(), "list must not leak tokens");
+            assert!(
+                u.get("token").is_none() && u.get("temporary_password").is_none(),
+                "list must not leak secrets"
+            );
         }
     }
 
     #[tokio::test]
-    async fn expire_then_revive_round_trips() {
+    async fn disable_then_enable_round_trips() {
         let (_tmp, router) = user_admin_test_router("root-token");
         let _ = post_create_user(
             &router,
@@ -10217,13 +10503,12 @@ mod tests {
         )
         .await;
 
-        // Expire.
         let resp = router
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users/alice/expire")
+                    .uri("/admin/users/alice/disable")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -10233,14 +10518,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["user"]["token_expired_at"].is_i64());
+        assert!(json["user"]["disabled_at"].is_i64());
 
-        // Revive.
         let resp = router
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users/alice/revive")
+                    .uri("/admin/users/alice/enable")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -10250,17 +10534,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["user"]["token_expired_at"].is_null());
+        assert!(json["user"]["disabled_at"].is_null());
     }
 
     #[tokio::test]
-    async fn expire_unknown_user_returns_404() {
+    async fn disable_unknown_user_returns_404() {
         let (_tmp, router) = user_admin_test_router("root-token");
         let resp = router
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users/ghost/expire")
+                    .uri("/admin/users/ghost/disable")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -10271,25 +10555,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_token_issues_a_distinct_token() {
+    async fn rotate_api_credential_issues_a_distinct_secret() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let create_resp = post_create_user(
+        let _ = post_create_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
         )
         .await;
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api-credentials")
+                    .header("authorization", "Bearer root-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "username": "alice",
+                            "label": "laptop"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
         let body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
-        let original_token = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["token"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let original_token = created["token"].as_str().unwrap().to_string();
+        let id = created["credential"]["id"].as_str().unwrap();
+        assert!(original_token.starts_with("aim_"));
 
         let resp = router
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users/alice/rotate-token")
+                    .uri(format!("/admin/api-credentials/{id}/rotate"))
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -10300,14 +10604,13 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let new_token = json["token"].as_str().unwrap();
-        assert_eq!(new_token.len(), 43);
-        assert_ne!(new_token, original_token, "rotate must change the token");
+        assert!(new_token.starts_with("aim_"));
+        assert_ne!(new_token, original_token, "rotate must change the secret");
     }
 
     #[tokio::test]
-    async fn create_user_returns_503_when_pepper_not_configured() {
-        // Same as user_admin_test_router but with token_pepper = None,
-        // covering the "rung 1-only" backward-compat install.
+    async fn create_user_works_without_pepper_but_api_keys_return_503() {
+        // Humans do not need a pepper. Native API keys still do.
         use ai_memory_core::ActorContext;
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -10343,7 +10646,8 @@ mod tests {
             },
         ));
 
-        let resp = router
+        let created = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -10356,8 +10660,235 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api-credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "username": "alice",
+                            "label": "cli"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let _ = tmp;
+    }
+
+    #[tokio::test]
+    async fn patch_demotion_of_last_recoverable_root_returns_409() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let created = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "keeper", "role": "root"}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["user"]["role"], "root");
+        assert_eq!(json["user"]["has_password"].as_bool(), Some(true));
+
+        let resp = patch_user(
+            &router,
+            "root-token",
+            "keeper",
+            serde_json::json!({"role": "user"}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("last recoverable root"),
+            "409 body must surface the store InvalidState mapping; got {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_of_last_recoverable_root_returns_409() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let created = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "keeper", "role": "root"}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let resp = post_disable_user(&router, "root-token", "keeper").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("last recoverable root"),
+            "409 body must surface the store InvalidState mapping; got {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_root_removals_leave_one_recoverable_root() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        for name in ["alice", "bob"] {
+            let created = post_create_user(
+                &router,
+                "root-token",
+                serde_json::json!({"username": name, "role": "root"}),
+            )
+            .await;
+            assert_eq!(created.status(), StatusCode::OK, "setup {name}");
+        }
+
+        let (demote, disable) = tokio::join!(
+            patch_user(
+                &router,
+                "root-token",
+                "alice",
+                serde_json::json!({"role": "user"}),
+            ),
+            post_disable_user(&router, "root-token", "bob"),
+        );
+        let statuses = [demote.status(), disable.status()];
+        let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+        assert!(
+            ok <= 1,
+            "at most one concurrent root-removal may succeed; got {statuses:?}"
+        );
+        assert!(
+            statuses
+                .iter()
+                .all(|s| *s == StatusCode::OK || *s == StatusCode::CONFLICT),
+            "root-removal must be 200 or 409; got {statuses:?}"
+        );
+
+        let listed = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = to_bytes(listed.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let recoverable = json["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|u| {
+                u["role"] == "root"
+                    && u["disabled_at"].is_null()
+                    && u["has_password"].as_bool() == Some(true)
+            })
+            .count();
+        assert!(
+            recoverable >= 1,
+            "a recoverable root must remain after concurrent removals; got {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_api_token_for_root_role_user_cannot_manage_users() {
+        let (_tmp, router) = user_admin_dual_auth_router("root-token");
+        let created = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "boss", "role": "root"}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["user"]["role"], "root");
+
+        let issued = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api-credentials")
+                    .header("authorization", "Bearer root-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "username": "boss",
+                            "label": "legacy-user-token"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(issued.status(), StatusCode::OK);
+        let body = to_bytes(issued.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let native_token = json["token"].as_str().unwrap();
+        assert!(native_token.starts_with("aim_"));
+
+        let as_native = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", format!("Bearer {native_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            as_native.status(),
+            StatusCode::FORBIDDEN,
+            "role=root must not elevate a looked-up native API credential"
+        );
+
+        let unknown = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", "Bearer aim_not-a-stored-credential")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.status(),
+            StatusCode::UNAUTHORIZED,
+            "unknown bearer must 401 through real lookup, not a User stub"
+        );
+
+        let as_root = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(as_root.status(), StatusCode::OK);
     }
 
     // ---------------------------------------------------------------------

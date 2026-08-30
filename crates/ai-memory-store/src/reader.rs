@@ -1141,7 +1141,7 @@ pub struct PageSummary {
 ///
 /// Repeated here rather than reused from `ai_memory_core::User` because
 /// the response shape intentionally omits internal fields (id,
-/// created_at, last_seen_at, token_expired_at) — only the human-facing
+/// created_at, last_seen_at, role) — only the human-facing
 /// identity is part of the API contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct PageAuthor {
@@ -6975,24 +6975,26 @@ impl ReaderPool {
 
     // ── user lookups ────────────────────────────────────────────────
 
-    /// Hot path for the auth middleware: hash the incoming bearer token,
-    /// look up the matching row, and return the user iff their token is
-    /// active (`token_expired_at IS NULL`).
+    /// Hot path for Bearer auth: native `api_credentials` where
+    /// `revoked_at IS NULL`. Does not filter `users.disabled_at`.
+    /// Always authenticates as [`ai_memory_core::AuthLevel::User`].
     ///
     /// # Errors
-    /// Propagates any SQL or pool error. Returns `Ok(None)` when no row
-    /// matches the hash (either no such user, or the token was expired).
+    /// Propagates any SQL or pool error. Returns `Ok(None)` when no
+    /// active credential matches.
     pub async fn find_active_user_by_token_hash(
         &self,
         token_hash: [u8; TOKEN_HASH_LEN],
-    ) -> StoreResult<Option<User>> {
-        self.with_conn(move |conn| crate::users::find_active_user_by_token_hash(conn, &token_hash))
-            .await
+    ) -> StoreResult<Option<crate::AuthenticatedApiUser>> {
+        let now = now_us();
+        self.with_conn(move |conn| {
+            crate::api_credentials::find_active_user_by_token_hash(conn, &token_hash, now)
+        })
+        .await
     }
 
     /// Look up a user by exact-match username. Used by admin endpoints
-    /// that accept username on the wire (`expire`, `revive`,
-    /// `rotate-token`).
+    /// that accept username on the wire.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -7001,9 +7003,34 @@ impl ReaderPool {
             .await
     }
 
-    /// Look up a user by id. **Returns even users whose token is expired**
-    /// — this is the attribution-display path (a page authored by alice
-    /// must still render "alice" after her token has been expired).
+    /// Login lookup including the stored Argon2id PHC.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_login_user_by_username(
+        &self,
+        username: String,
+    ) -> StoreResult<Option<crate::LoginUser>> {
+        self.with_conn(move |conn| crate::users::find_login_user_by_username(conn, &username))
+            .await
+    }
+
+    /// Live (unrevoked, unexpired) web session by secret hash.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_live_session_by_hash(
+        &self,
+        session_hash: [u8; TOKEN_HASH_LEN],
+    ) -> StoreResult<Option<crate::LiveWebSession>> {
+        let now = now_us();
+        self.with_conn(move |conn| {
+            crate::web_sessions::find_live_session_by_hash(conn, &session_hash, now)
+        })
+        .await
+    }
+
+    /// Look up a user by id, including disabled and password-less rows.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -7012,14 +7039,89 @@ impl ReaderPool {
             .await
     }
 
-    /// All registered users, ordered by `created_at` ascending. Includes
-    /// users whose token is expired (the CLI surfaces the active/expired
-    /// flag from `token_expired_at`).
+    /// All registered users, ordered by `created_at` ascending.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn list_users(&self) -> StoreResult<Vec<User>> {
         self.with_conn(crate::users::list_users).await
+    }
+
+    /// Whether bootstrap has been marked complete.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn bootstrap_completed(&self) -> StoreResult<bool> {
+        self.with_conn(crate::users::bootstrap_completed).await
+    }
+
+    /// Whether any user has a password hash.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn any_password_hash(&self) -> StoreResult<bool> {
+        self.with_conn(crate::users::any_password_hash).await
+    }
+
+    /// Recoverable-root count for startup validation.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn count_recoverable_roots(&self) -> StoreResult<i64> {
+        self.with_conn(crate::users::count_recoverable_roots).await
+    }
+
+    /// Whether any native API credential exists (pepper required).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn api_credentials_exist(&self) -> StoreResult<bool> {
+        self.with_conn(crate::api_credentials::api_credentials_exist)
+            .await
+    }
+
+    /// True when any credential (active or revoked) stores this hash.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn token_hash_exists(&self, token_hash: [u8; TOKEN_HASH_LEN]) -> StoreResult<bool> {
+        self.with_conn(move |conn| crate::api_credentials::token_hash_exists(conn, &token_hash))
+            .await
+    }
+
+    /// List native API credentials, newest first.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_api_credentials(&self) -> StoreResult<Vec<ai_memory_core::ApiCredential>> {
+        self.with_conn(crate::api_credentials::list_api_credentials)
+            .await
+    }
+
+    /// List credentials for one user.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_api_credentials_for_user(
+        &self,
+        user_id: UserId,
+    ) -> StoreResult<Vec<ai_memory_core::ApiCredential>> {
+        self.with_conn(move |conn| {
+            crate::api_credentials::list_api_credentials_for_user(conn, user_id)
+        })
+        .await
+    }
+
+    /// Look up one credential by id.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn find_api_credential(
+        &self,
+        id: ai_memory_core::ApiCredentialId,
+    ) -> StoreResult<Option<ai_memory_core::ApiCredential>> {
+        self.with_conn(move |conn| crate::api_credentials::find_api_credential(conn, id))
+            .await
     }
 
     /// Return whether any user row exists, including expired users. This cheap

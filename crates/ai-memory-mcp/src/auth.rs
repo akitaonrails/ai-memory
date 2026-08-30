@@ -1,74 +1,58 @@
 //! Authorization middleware for the HTTP server.
 //!
-//! When `[auth].bearer_token` (or the `AI_MEMORY_AUTH_TOKEN` env var)
-//! is set, every request to `/mcp`, `/hook`, `/handoff`, and `/web/*`
-//! must present the token via one of three transports:
+//! When any authority is configured (`[auth].bearer_token`, a human
+//! password/session runtime, or a trusted-proxy bearer), machine-only
+//! routes (`/mcp`, `/hook`, `/handoff`, `/workstream/*`) require
+//! `Authorization: Bearer`. Browser Basic auth and the legacy
+//! `ai_memory_auth` cookie are never credentials on this surface.
+//! Human login uses [`crate::human_auth`] (session cookie + CSRF).
 //!
-//! - **Bearer header** (any method): MCP clients + hooks. Required
-//!   on all non-GET methods.
-//! - **Basic auth** (GET only): browsers — username ignored, token
-//!   in the password field. Triggers the native credential dialog
-//!   via the `WWW-Authenticate: Basic` challenge in 401 responses.
-//! - **Session cookie** (GET only): set automatically after a
-//!   successful Basic auth so the browser doesn't re-prompt every
-//!   session.
-//!
-//! When the token is *unset*, the middleware is a no-op — preserving
-//! the zero-config local-development experience and keeping the
-//! existing e2e + unit tests working.
+//! When no authority is configured the middleware is a no-op —
+//! preserving zero-config loopback.
 //!
 //! Comparison uses [`subtle::ConstantTimeEq`] so an attacker on the
 //! same LAN cannot use response-time leaks to recover the token byte
-//! by byte. The constant-time guarantee depends on both sides being
-//! the same length; `subtle` returns a constant-cost `Choice::from(0)`
-//! when lengths differ, which is the right thing here.
+//! by byte.
 //!
-//! Wire shape matches the MCP authorization spec
-//! (modelcontextprotocol.io/specification/.../basic/authorization):
-//! 401 responses include `WWW-Authenticate: Bearer …` so MCP clients
-//! detect missing/expired credentials. GET 401s ALSO include `Basic
-//! …` so browsers dialog-prompt automatically.
-//!
-//! ## Why not OAuth
-//!
-//! The MCP spec mandates full OAuth 2.1 for HTTP-authenticated
-//! servers. That's overkill for a single-user homelab and would
-//! force every MCP client config to deal with authorization-server
-//! discovery + PKCE + token refresh. A static bearer token is
-//! wire-compatible with the spec's `Authorization: Bearer …` shape
-//! (clients send the header the same way; they just don't run the
-//! OAuth dance to obtain the token). Every supported client
-//! (Claude Code, Codex, OpenCode, Cursor, Claude Desktop via
-//! `mcp-remote`, Gemini CLI, OpenClaw) accepts a static
-//! `Authorization` header in its config.
+//! 401 responses include `WWW-Authenticate: Bearer` only. They never
+//! advertise a Basic challenge.
 
 use std::sync::Arc;
 
 use ai_memory_core::{ActorContext, AuthLevel, IdentityKey};
 use ai_memory_store::{ReaderPool, TokenPepper, WriterHandle, hash_token};
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 use tracing::debug;
 
-/// Cookie name used for browser session persistence after a
-/// successful Basic auth handshake.
-const AUTH_COOKIE: &str = "ai_memory_auth";
-/// Realm advertised in `WWW-Authenticate` challenges. Shows up in
-/// the browser's credential prompt as "Server says: <realm>".
+/// Realm advertised in `WWW-Authenticate` Bearer challenges.
 const AUTH_REALM: &str = "ai-memory";
 
+/// Outcome of inspecting `Authorization: Bearer` without running the
+/// rest of the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BearerAuth {
+    /// Actor and [`AuthLevel`] were injected into the request.
+    Authenticated,
+    /// No Bearer scheme. Basic, empty, unknown, or missing Authorization
+    /// do not count as a presented Bearer.
+    Absent,
+    /// Bearer scheme was present and did not authenticate.
+    Rejected,
+}
+
 /// Optional multi-user resolver tier — token-hash lookup against the
-/// `users` table. Populated only when both a per-server pepper and a
+/// `api_credentials` table. Populated only when both a per-server pepper and a
 /// reader pool are available (i.e. after `ai-memory init` ran and a
 /// store was opened). Single-user (rung-1) setups skip this entirely;
 /// rung-0 (no auth) skips the whole middleware.
 #[derive(Clone)]
 pub struct MultiUserResolver {
     /// Hashes incoming tokens with the per-server pepper before the
-    /// `users.token_hash` lookup.
+    /// `api_credentials.token_hash` lookup.
     pub pepper: TokenPepper,
     /// Read-only pool used by the auth hot path
     /// (`find_active_user_by_token_hash`).
@@ -104,6 +88,9 @@ pub struct AuthState {
     /// separate from the root bearer so a missing identity assertion cannot
     /// accidentally turn proxy traffic into root traffic.
     actor_proxy_bearer: Option<String>,
+    /// Human password/session runtime. `None` for machine-only or
+    /// zero-config anonymous loopback.
+    pub human: Option<crate::human_auth::HumanAuthRuntime>,
 }
 
 impl AuthState {
@@ -171,8 +158,8 @@ impl AuthState {
     }
 
     /// Enable multi-user lookups: a bearer that doesn't match the root
-    /// token is hashed with `pepper` and checked against the `users`
-    /// table; a hit attributes the request to that user's identity.
+    /// token is hashed with `pepper` and checked against
+    /// `api_credentials`; a hit attributes the request to that user.
     /// Without this attach, the middleware only knows about rung 0/1
     /// and rejects unknown bearers (closing the bypass).
     #[must_use]
@@ -190,37 +177,38 @@ impl AuthState {
         self
     }
 
-    /// True when a token is configured (i.e. the middleware is doing
-    /// anything). Useful for the startup log line so the operator
-    /// sees whether their server is open or closed.
+    /// Attach the human password/session runtime.
+    #[must_use]
+    pub fn with_human(mut self, human: crate::human_auth::HumanAuthRuntime) -> Self {
+        self.human = Some(human);
+        self
+    }
+
+    /// Per-server token pepper when multi-user lookup is enabled.
+    #[must_use]
+    pub fn pepper(&self) -> Option<&TokenPepper> {
+        self.multiuser.as_ref().map(|mu| &mu.pepper)
+    }
+
+    /// Whether browser cookies must be marked `Secure`.
+    #[must_use]
+    pub fn secure_cookie(&self) -> bool {
+        self.secure_cookie
+    }
+
+    /// Dedicated actor-proxy bearer, if configured.
+    #[must_use]
+    pub fn actor_proxy_bearer(&self) -> Option<&str> {
+        self.actor_proxy_bearer.as_deref()
+    }
+
+    /// True when any authority is configured (machine bearer or human).
     #[must_use]
     pub fn enabled(&self) -> bool {
-        self.expected.is_some()
+        self.expected.is_some() || self.human.is_some()
     }
 }
 
-/// axum middleware closure. Wire with
-/// `axum::middleware::from_fn_with_state(state, require_bearer)`.
-///
-/// Token sources, in priority order:
-/// 1. `Authorization: Bearer <token>` header. Works for any method.
-///    This is what MCP + hook clients send.
-/// 2. **GET only:** `Authorization: Basic <base64(user:token)>`.
-///    Username is ignored; the password portion is the token.
-///    Browsers send this automatically after the native credential
-///    prompt fires on a 401 + `WWW-Authenticate: Basic`. On success
-///    we also set the `ai_memory_auth` cookie so subsequent visits
-///    (including from a fresh browser session) skip the prompt.
-/// 3. **GET only:** `ai_memory_auth` cookie set by the Basic handshake.
-///
-/// POST / PUT / DELETE / etc. require the Bearer header. Cookie and
-/// Basic auth are GET-only, which confines cookie-CSRF to read-only
-/// pages — `/mcp` + `/hook` are POST-only and stay header-gated.
-///
-/// On 401 for GET requests the response includes both `Basic` and
-/// `Bearer` challenges in `WWW-Authenticate`. Browsers honour the
-/// `Basic` challenge (native dialog); MCP clients honour the `Bearer`
-/// challenge.
 /// Every header the trusted-proxy assertion reads.
 /// A repeated occurrence of any of them makes the assertion ambiguous — see
 /// [`trusted_proxy_actor`].
@@ -275,82 +263,35 @@ fn trusted_proxy_actor(headers: &HeaderMap) -> Result<ActorContext, ProxyAsserti
     Ok(asserted)
 }
 
-/// axum middleware closure. Wire with
-/// `axum::middleware::from_fn_with_state(state, require_bearer)`.
+/// Inspect `Authorization: Bearer` and inject actor / [`AuthLevel`] on
+/// success. Browser Basic and the legacy `ai_memory_auth` cookie are
+/// never credentials.
 ///
-/// Token sources, in priority order:
-/// 1. `Authorization: Bearer <token>` header. Works for any method.
-///    This is what MCP + hook clients send.
-/// 2. **GET only:** `Authorization: Basic <base64(user:token)>`.
-///    Username is ignored; the password portion is the token.
-///    Browsers send this automatically after the native credential
-///    prompt fires on a 401 + `WWW-Authenticate: Basic`. On success
-///    we also set the `ai_memory_auth` cookie so subsequent visits
-///    (including from a fresh browser session) skip the prompt.
-/// 3. **GET only:** `ai_memory_auth` cookie set by the Basic handshake.
-///
-/// POST / PUT / DELETE / etc. require the Bearer header. Cookie and
-/// Basic auth are GET-only, which confines cookie-CSRF to read-only
-/// pages — `/mcp` + `/hook` are POST-only and stay header-gated.
-///
-/// On 401 for GET requests the response includes both `Basic` and
-/// `Bearer` challenges in `WWW-Authenticate`. Browsers honour the
-/// `Basic` challenge (native dialog); MCP clients honour the `Bearer`
-/// challenge.
-pub async fn require_bearer(
-    State(state): State<Arc<AuthState>>,
-    mut req: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    // Rung 0: auth disabled. Inject anonymous actor + anonymous
-    // tier (so downstream handlers that read Extension<ActorContext>
-    // and Extension<AuthLevel> always have one), then pass through.
-    let Some(expected) = state.expected.as_deref() else {
-        req.extensions_mut().insert(ActorContext::anonymous());
-        req.extensions_mut().insert(AuthLevel::Anonymous);
-        return next.run(req).await;
+/// * [`BearerAuth::Authenticated`] — extensions populated; caller runs `next`.
+/// * [`BearerAuth::Absent`] — no Bearer scheme (missing, Basic, empty, unknown).
+/// * [`BearerAuth::Rejected`] — Bearer scheme present but not a known credential.
+/// * `Err(Response)` — trusted-proxy assertion is malformed (400).
+pub async fn authenticate_bearer(
+    state: &AuthState,
+    req: &mut Request<axum::body::Body>,
+) -> Result<BearerAuth, Response> {
+    let Some(provided) = extract_bearer_from_headers(req.headers()) else {
+        return Ok(BearerAuth::Absent);
     };
-
-    let is_get = req.method() == Method::GET;
-    let from_bearer = extract_bearer_header(&req);
-    let from_basic = if is_get {
-        extract_basic_header(&req)
-    } else {
-        None
-    };
-    let from_cookie = if is_get { extract_cookie(&req) } else { None };
-
-    let provided = from_bearer
-        .as_deref()
-        .or(from_basic.as_deref())
-        .or(from_cookie.as_deref())
-        .unwrap_or("");
-
-    // Rung 1: root credential. Actor assertion headers are intentionally
-    // ignored here; only the distinct proxy credential may assert them.
-    if bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
-        req.extensions_mut().insert(state.root_actor.clone());
-        req.extensions_mut().insert(AuthLevel::Root);
-
-        // First successful Basic-auth hit (no cookie yet) → also stamp
-        // the cookie so the user doesn't get the dialog again next
-        // browser session. Subsequent navigations ride the cookie alone.
-        if from_basic.is_some() && from_cookie.is_none() {
-            let mut resp = next.run(req).await;
-            if let Ok(cookie) = build_session_cookie(provided, state.secure_cookie).parse() {
-                resp.headers_mut().insert(header::SET_COOKIE, cookie);
-            }
-            return resp;
-        }
-        return next.run(req).await;
+    if provided.is_empty() {
+        return Ok(BearerAuth::Rejected);
     }
 
-    // Rung 1b: only an explicit Bearer token can enter the trusted-proxy
-    // branch. Basic auth and cookies are browser conveniences for the root
-    // credential, not a way to impersonate the proxy.
-    if let (Some(proxy_expected), Some(proxy_provided)) =
-        (state.actor_proxy_bearer.as_deref(), from_bearer.as_deref())
-        && bool::from(proxy_provided.as_bytes().ct_eq(proxy_expected.as_bytes()))
+    if let Some(expected) = state.expected.as_deref()
+        && bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
+    {
+        req.extensions_mut().insert(state.root_actor.clone());
+        req.extensions_mut().insert(AuthLevel::Root);
+        return Ok(BearerAuth::Authenticated);
+    }
+
+    if let Some(proxy_expected) = state.actor_proxy_bearer.as_deref()
+        && bool::from(provided.as_bytes().ct_eq(proxy_expected.as_bytes()))
     {
         let actor = match trusted_proxy_actor(req.headers()) {
             Ok(actor) => actor,
@@ -359,7 +300,7 @@ pub async fn require_bearer(
                     ?error,
                     "auth rejected: invalid trusted-proxy identity assertion"
                 );
-                return invalid_proxy_identity(error);
+                return Err(invalid_proxy_identity(error));
             }
         };
         let level = if state.asserts_root_identity(&actor) {
@@ -367,120 +308,139 @@ pub async fn require_bearer(
         } else {
             AuthLevel::User
         };
-        debug!(actor.user = ?actor.user, actor.issuer = ?actor.issuer, actor.sub = ?actor.sub, ?level, "identity asserted by trusted proxy");
+        debug!(
+            actor.user = ?actor.user,
+            actor.issuer = ?actor.issuer,
+            actor.sub = ?actor.sub,
+            ?level,
+            "identity asserted by trusted proxy"
+        );
         req.extensions_mut().insert(actor);
         req.extensions_mut().insert(level);
-        return next.run(req).await;
+        return Ok(BearerAuth::Authenticated);
     }
 
-    // Rung 2: bearer matches neither root nor proxy. If multi-user is enabled,
-    // hash + look up the token against the `users` table.
-    if let Some(mu) = state.multiuser.as_ref()
-        && !provided.is_empty()
-    {
-        let hash = hash_token(provided, &mu.pepper);
+    if let Some(mu) = state.multiuser.as_ref() {
+        let hash = hash_token(&provided, &mu.pepper);
         match mu.reader.find_active_user_by_token_hash(hash).await {
-            Ok(Some(user)) => {
-                // NEVER log the token itself; the username + agent is
-                // safe and useful for "who hit /api/v1 last".
-                debug!(actor.user = %user.username, "authenticated as DB user");
+            Ok(Some(hit)) => {
+                debug!(actor.user = %hit.user.username, "authenticated as DB user");
                 let actor = ActorContext {
-                    user: Some(user.username.clone()),
-                    name: user.name.clone(),
-                    email: user.email.clone(),
+                    user: Some(hit.user.username.clone()),
+                    name: hit.user.name.clone(),
+                    email: hit.user.email.clone(),
                     ..ActorContext::default()
                 };
                 req.extensions_mut().insert(actor);
-                req.extensions_mut().insert(user.id);
+                req.extensions_mut().insert(hit.user.id);
                 req.extensions_mut().insert(AuthLevel::User);
-
-                // Fire-and-forget last_seen_at bump. Errors are logged
-                // but never block the response — middleware MUST stay
-                // off the response's critical path. Same browser-cookie
-                // dance as rung 1 above.
                 let writer = mu.writer.clone();
-                let user_id = user.id;
+                let user_id = hit.user.id;
+                let credential_id = hit.credential_id;
                 tokio::spawn(async move {
+                    if let Err(e) = writer.touch_api_credential(credential_id).await {
+                        tracing::warn!(
+                            error = %e,
+                            credential_id = %credential_id,
+                            "touch_api_credential failed"
+                        );
+                    }
                     if let Err(e) = writer.touch_user_last_seen(user_id).await {
                         tracing::warn!(error = %e, user_id = %user_id, "touch_user_last_seen failed");
                     }
                 });
-
-                if from_basic.is_some() && from_cookie.is_none() {
-                    let mut resp = next.run(req).await;
-                    if let Ok(cookie) = build_session_cookie(provided, state.secure_cookie).parse()
-                    {
-                        resp.headers_mut().insert(header::SET_COOKIE, cookie);
-                    }
-                    return resp;
-                }
-                return next.run(req).await;
+                return Ok(BearerAuth::Authenticated);
             }
-            Ok(None) => {
-                // Bearer present + multi-user enabled + no match → fall
-                // through to the 401 below. Critical for closing the
-                // bypass: an unknown bearer MUST NOT pass even when
-                // multi-user lookup is configured.
-            }
+            Ok(None) => return Ok(BearerAuth::Rejected),
             Err(e) => {
-                tracing::error!(error = %e, "auth: users table lookup failed");
-                return unauthorized(is_get);
+                tracing::error!(error = %e, "auth: api_credentials lookup failed");
+                return Ok(BearerAuth::Rejected);
             }
         }
     }
 
-    debug!("auth rejected: invalid or missing token");
-    unauthorized(is_get)
+    Ok(BearerAuth::Rejected)
 }
 
-fn extract_bearer_header(req: &Request<axum::body::Body>) -> Option<String> {
-    let h = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    // Accept both "Bearer xxx" and "bearer xxx" (case-insensitive
-    // scheme per RFC 7235 §2.1).
-    let (scheme, value) = h.split_once(' ')?;
-    if scheme.eq_ignore_ascii_case("Bearer") {
-        Some(value.trim_start().to_string())
-    } else {
-        None
-    }
-}
-
-fn extract_basic_header(req: &Request<axum::body::Body>) -> Option<String> {
-    use base64::Engine;
-    let h = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    let (scheme, value) = h.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("Basic") {
-        return None;
-    }
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(value.trim_start())
-        .ok()?;
-    let s = std::str::from_utf8(&decoded).ok()?;
-    // Standard form: `user:password`. We ignore the username (the
-    // browser dialog always asks for one but we don't have multi-user
-    // accounts — only the password = bearer token matters).
-    let (_user, pass) = s.split_once(':')?;
-    Some(pass.to_string())
-}
-
-fn extract_cookie(req: &Request<axum::body::Body>) -> Option<String> {
-    let h = req.headers().get(header::COOKIE)?.to_str().ok()?;
-    for pair in h.split(';') {
-        let pair = pair.trim();
-        if let Some(val) = pair.strip_prefix(&format!("{AUTH_COOKIE}=")) {
-            return Some(val.to_string());
+/// Machine-only middleware. Wire with
+/// `axum::middleware::from_fn_with_state(state, require_bearer)`.
+///
+/// Anonymous passthrough happens only when [`AuthState::enabled`] is
+/// false (zero-config loopback). Human mode without a presented Bearer
+/// is 401 — sessions never authenticate `/mcp`.
+pub async fn require_bearer(
+    State(state): State<Arc<AuthState>>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    match authenticate_bearer(&state, &mut req).await {
+        Ok(BearerAuth::Authenticated) => next.run(req).await,
+        Err(resp) => resp,
+        Ok(BearerAuth::Absent) if !state.enabled() => {
+            req.extensions_mut().insert(ActorContext::anonymous());
+            req.extensions_mut().insert(AuthLevel::Anonymous);
+            next.run(req).await
+        }
+        Ok(BearerAuth::Absent | BearerAuth::Rejected) => {
+            debug!("auth rejected: invalid or missing token");
+            unauthorized_bearer()
         }
     }
-    None
 }
 
-fn build_session_cookie(token: &str, secure_cookie: bool) -> String {
-    // 30-day Max-Age — long enough that re-entering the credential
-    // every month is rare. HttpOnly hides it from inline JS and Strict keeps
-    // cross-site requests from riding it. `Secure` remains opt-in so direct
-    // loopback/plain-HTTP browser use works; never infer it from proxy headers.
-    let secure = if secure_cookie { "; Secure" } else { "" };
-    format!("{AUTH_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000{secure}")
+/// Bearer token value from all `Authorization` occurrences.
+///
+/// Basic, unknown, and empty headers are discarded. Exactly one Bearer
+/// attempt is accepted; repeated Bearer attempts collapse to an empty
+/// value so authentication fails closed rather than choosing one.
+#[must_use]
+pub fn extract_bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+    let mut bearer = None;
+    for value in headers.get_all(header::AUTHORIZATION) {
+        let Ok(raw) = value.to_str() else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        let split_at = trimmed.find([' ', '\t']);
+        let (scheme, token) = split_at.map_or((trimmed, ""), |idx| {
+            (&trimmed[..idx], trimmed[idx..].trim())
+        });
+        if !scheme.eq_ignore_ascii_case("Bearer") {
+            continue;
+        }
+        if bearer.is_some() {
+            return Some(String::new());
+        }
+        bearer = Some(token.to_string());
+    }
+    bearer
+}
+
+/// True when `Authorization` uses the Bearer scheme, even with no token.
+#[must_use]
+pub fn has_bearer_scheme(headers: &HeaderMap) -> bool {
+    extract_bearer_from_headers(headers).is_some()
+}
+
+/// True when any trusted-proxy identity header is present.
+#[must_use]
+pub fn any_actor_header(headers: &HeaderMap) -> bool {
+    PROXY_ASSERTION_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+}
+
+/// 401 with `WWW-Authenticate: Bearer` only. Never advertise Basic.
+#[must_use]
+pub fn unauthorized_bearer() -> Response {
+    let mut resp = (StatusCode::UNAUTHORIZED, "auth required\n").into_response();
+    resp.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        format!("Bearer realm=\"{AUTH_REALM}\", error=\"invalid_token\"")
+            .parse()
+            .expect("static header value is valid"),
+    );
+    resp
 }
 
 /// The proxy's identity headers contradict themselves. Not a 401 — the
@@ -500,32 +460,6 @@ fn invalid_proxy_identity(error: ProxyAssertionError) -> Response {
         }
     };
     (StatusCode::BAD_REQUEST, message).into_response()
-}
-
-fn unauthorized(include_basic_challenge: bool) -> Response {
-    let mut resp = (StatusCode::UNAUTHORIZED, "auth required\n").into_response();
-    // Order of challenges matters: browsers parse the first challenge
-    // they understand and show the dialog for it. Putting `Basic`
-    // first ensures GET-from-browser triggers the native prompt; MCP
-    // clients (which speak only Bearer) ignore the Basic and read
-    // their challenge from the second value.
-    //
-    // Non-GET 401s skip the Basic challenge — sending it on a POST
-    // would invite the browser to dialog-prompt for an endpoint
-    // it can't authenticate this way anyway.
-    let value = if include_basic_challenge {
-        format!(
-            "Basic realm=\"{AUTH_REALM}\", \
-             Bearer realm=\"{AUTH_REALM}\", error=\"invalid_token\""
-        )
-    } else {
-        format!("Bearer realm=\"{AUTH_REALM}\", error=\"invalid_token\"")
-    };
-    resp.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        value.parse().expect("static header value is valid"),
-    );
-    resp
 }
 
 /// Generate a fresh random bearer token, hex-encoded.
@@ -602,10 +536,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let www = resp.headers().get(header::WWW_AUTHENTICATE).unwrap();
         let www = www.to_str().unwrap();
-        // GET 401 advertises BOTH challenges so browsers (Basic) and
-        // MCP clients (Bearer) each see what they understand.
         assert!(www.contains("Bearer"));
-        assert!(www.contains("Basic"));
+        assert!(!www.contains("Basic"));
     }
 
     #[tokio::test]
@@ -674,7 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cookie_with_right_token_passes_get() {
+    async fn cookie_is_never_a_machine_credential() {
         let r = router_with_auth(Some("right-token"));
         let resp = r
             .oneshot(
@@ -686,7 +618,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
     }
 
     #[tokio::test]
@@ -697,44 +630,6 @@ mod tests {
                 Request::builder()
                     .uri("/probe")
                     .header("Authorization", "Bearer wrong-token")
-                    .header("Cookie", "ai_memory_auth=right-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn cookie_with_wrong_token_fails() {
-        let r = router_with_auth(Some("right-token"));
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .header("Cookie", "ai_memory_auth=wrong-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn cookie_ignored_on_post() {
-        // POST routes must use Bearer header; cookie auth is GET-only
-        // to keep the CSRF surface confined to read paths.
-        let state = Arc::new(AuthState::new(Some("right-token".to_string())));
-        let r = Router::new()
-            .route("/probe", axum::routing::post(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(state, require_bearer));
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/probe")
                     .header("Cookie", "ai_memory_auth=right-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -755,76 +650,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_auth_with_right_token_passes_get_and_sets_non_secure_cookie() {
+    async fn basic_auth_is_never_a_machine_credential() {
         let r = router_with_auth(Some("right-token"));
         let resp = r
             .oneshot(
                 Request::builder()
                     .uri("/probe")
                     .header("Authorization", basic_auth("right-token"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        // First successful Basic hit also stamps the cookie so the
-        // browser doesn't dialog-prompt every session.
-        let cookie = resp
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("set-cookie on first Basic-auth success")
-            .to_str()
-            .unwrap();
-        assert_eq!(
-            cookie,
-            "ai_memory_auth=right-token; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000"
-        );
-    }
-
-    #[tokio::test]
-    async fn basic_auth_sets_secure_cookie_only_when_explicitly_enabled() {
-        let r = router_with_auth_secure_cookie(Some("right-token"), true);
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .header("Authorization", basic_auth("right-token"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()
-                .get(header::SET_COOKIE)
-                .expect("set-cookie on first Basic-auth success")
-                .to_str()
-                .unwrap(),
-            "ai_memory_auth=right-token; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000; Secure"
-        );
-    }
-
-    #[tokio::test]
-    async fn basic_auth_with_wrong_password_returns_401() {
-        let r = router_with_auth(Some("right-token"));
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .header("Authorization", basic_auth("wrong-token"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        let www = resp.headers().get(header::WWW_AUTHENTICATE).unwrap();
+        let www = www.to_str().unwrap();
+        assert!(www.contains("Bearer"));
+        assert!(!www.contains("Basic"));
     }
 
     #[tokio::test]
     async fn basic_auth_ignored_on_post() {
-        // POST routes must use Bearer header; Basic auth is GET-only.
         let state = Arc::new(AuthState::new(Some("right-token".to_string())));
         let r = Router::new()
             .route("/probe", axum::routing::post(|| async { "ok" }))
@@ -841,31 +688,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        // POST 401 must NOT advertise Basic — browsers would dialog
-        // for a route they can't authenticate this way.
         let www = resp.headers().get(header::WWW_AUTHENTICATE).unwrap();
         let www = www.to_str().unwrap();
         assert!(www.contains("Bearer"));
         assert!(!www.contains("Basic"));
     }
 
-    #[tokio::test]
-    async fn cookie_request_does_not_re_set_cookie() {
-        // Already-authed-by-cookie requests don't need a Set-Cookie
-        // refresh; that's a waste of bandwidth on every navigation.
-        let r = router_with_auth(Some("right-token"));
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .header("Cookie", "ai_memory_auth=right-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    #[test]
+    fn bearer_parser_discards_other_schemes_and_accepts_tabs() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Basic saved-browser-value"),
+        );
+        headers.append(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("bEaReR\tmachine-token"),
+        );
+        assert_eq!(
+            extract_bearer_from_headers(&headers).as_deref(),
+            Some("machine-token")
+        );
+    }
+
+    #[test]
+    fn bearer_parser_rejects_multiple_bearer_attempts() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer first"),
+        );
+        headers.append(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer second"),
+        );
+        assert_eq!(extract_bearer_from_headers(&headers).as_deref(), Some(""));
     }
 
     #[test]
@@ -1447,17 +1304,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let pepper = TokenPepper::new("test-pepper");
-        let token = ai_memory_store::generate_token().unwrap();
-        let token_hash = ai_memory_store::hash_token(&token, &pepper);
         let mut new_user = NewUser {
             username: username.into(),
             name: Some(format!("{username} display")),
             email: Some(format!("{username}@example.com")),
         };
         new_user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(new_user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let token = ai_memory_store::generate_api_key().unwrap();
+        let token_hash = ai_memory_store::hash_token(&token, &pepper);
         store
             .writer
-            .create_user(new_user, token_hash)
+            .create_api_credential(
+                ai_memory_core::ApiCredentialId::new(),
+                user_id,
+                "test".into(),
+                token_hash,
+                Some(ai_memory_store::api_key_preview(&token)),
+            )
             .await
             .unwrap();
 
@@ -1517,14 +1385,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rung2_expired_user_token_is_rejected() {
-        // Expiring a user's token must immediately stop authenticating
+    async fn rung2_revoked_api_credential_is_rejected() {
+        // Revoking a native API key must immediately stop authenticating
         // (no 30s cache window or similar). Critical for `ai-memory
-        // user expire` to be useful as an offboarding tool.
+        // api-key revoke` to be useful as an offboarding tool.
         let (_tmp, state, token) = setup_multiuser("alice").await;
 
-        // Look up user id via the writer-side roundtrip (no public
-        // find-by-username on WriterHandle, so use the reader pool).
         let user = state
             .multiuser
             .as_ref()
@@ -1534,8 +1400,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let creds = state
+            .multiuser
+            .as_ref()
+            .unwrap()
+            .reader
+            .list_api_credentials_for_user(user.id)
+            .await
+            .unwrap();
         let writer = state.multiuser.as_ref().unwrap().writer.clone();
-        writer.expire_user_token(user.id).await.unwrap();
+        writer.revoke_api_credential(creds[0].id).await.unwrap();
 
         let r = router_with_state(state);
         let resp = r
@@ -1556,8 +1430,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rung2_revived_user_token_authenticates_again() {
-        let (_tmp, state, token) = setup_multiuser("alice").await;
+    async fn rung2_rotated_api_credential_replaces_the_secret() {
+        let (_tmp, state, old_token) = setup_multiuser("alice").await;
         let user = state
             .multiuser
             .as_ref()
@@ -1567,22 +1441,50 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let creds = state
+            .multiuser
+            .as_ref()
+            .unwrap()
+            .reader
+            .list_api_credentials_for_user(user.id)
+            .await
+            .unwrap();
+        let pepper = state.pepper().expect("pepper");
+        let new_token = ai_memory_store::generate_api_key().unwrap();
         let writer = state.multiuser.as_ref().unwrap().writer.clone();
-        writer.expire_user_token(user.id).await.unwrap();
-        writer.revive_user_token(user.id).await.unwrap();
+        writer
+            .rotate_api_credential(
+                creds[0].id,
+                ai_memory_store::hash_token(&new_token, pepper),
+                Some(ai_memory_store::api_key_preview(&new_token)),
+            )
+            .await
+            .unwrap();
 
         let r = router_with_state(state);
-        let resp = r
+        let old = r
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/probe")
-                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Authorization", format!("Bearer {old_token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
+        let new = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", format!("Bearer {new_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(new.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1624,16 +1526,27 @@ mod tests {
             axum::middleware::from_fn_with_state(Arc::new(state), require_bearer),
         );
 
-        let token = ai_memory_store::generate_token().unwrap();
         let mut user = NewUser {
             username: "alice".into(),
             name: None,
             email: None,
         };
         user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let token = ai_memory_store::generate_api_key().unwrap();
         store
             .writer
-            .create_user(user, ai_memory_store::hash_token(&token, &pepper))
+            .create_api_credential(
+                ai_memory_core::ApiCredentialId::new(),
+                user_id,
+                "test".into(),
+                ai_memory_store::hash_token(&token, &pepper),
+                Some(ai_memory_store::api_key_preview(&token)),
+            )
             .await
             .unwrap();
 
@@ -1666,6 +1579,28 @@ mod tests {
     #[test]
     fn blank_root_token_is_not_enabled() {
         assert!(!AuthState::new(Some("  ".into())).enabled());
+    }
+
+    #[tokio::test]
+    async fn require_bearer_401_advertises_bearer_not_basic() {
+        let resp = router_with_auth(Some("secret"))
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let www = resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .expect("WWW-Authenticate")
+            .to_str()
+            .unwrap();
+        assert!(www.contains("Bearer"), "{www}");
+        assert!(!www.to_ascii_lowercase().contains("basic"), "{www}");
     }
 
     #[tokio::test]

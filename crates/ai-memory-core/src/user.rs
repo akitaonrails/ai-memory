@@ -11,20 +11,41 @@
 //!
 //! See [`crate::actor`] for the broader rationale: ai-memory's data is
 //! single-tenant by design. A `User` row records *who* a write came
-//! from; it does not gate *whether* the write was allowed.
+//! from; it does not gate *whether* the write was allowed. Human
+//! `role=root` vs `role=user` only affects web-session capabilities;
+//! a native API credential always authenticates as [`crate::AuthLevel::User`].
 //!
-//! ## Token storage (referenced here, implemented in `ai-memory-store`)
+//! ## Credential classes (referenced here, implemented in `ai-memory-store`)
 //!
-//! Tokens are 32 bytes of CSPRNG (256 bits of entropy). The store keeps
-//! a single `SHA-256(token || ":" || pepper)` digest per user; the
-//! per-server pepper from `[auth].token_pepper` makes a DB-only theft
-//! useless to an offline attacker. SHA-256 gives an O(1) UNIQUE-index
-//! lookup the per-request auth hot path needs. See
-//! `ai_memory_store::users` for the actual hash + generate helpers.
+//! Human passwords are Argon2id PHC strings on `users.password_hash` and
+//! never authenticate as Bearer. Native machine keys are 256-bit secrets
+//! with prefix [`NATIVE_API_KEY_PREFIX`]; the store keeps
+//! `SHA-256(token || ":" || pepper)` in `api_credentials`. Web sessions
+//! use prefix [`SESSION_SECRET_PREFIX`] and store only SHA-256 of the
+//! secret (no pepper). See `ai_memory_store::users` / `api_credentials`
+//! / `web_sessions`.
 
 use serde::{Deserialize, Serialize};
 
-use crate::{MemoryError, UserId};
+use crate::{ApiCredentialId, MemoryError, UserId};
+
+/// Web-session secret prefix. A human password that equals this prefix
+/// is rejected so a leaked session cookie cannot be reused as a password.
+pub const SESSION_SECRET_PREFIX: &str = "ams_";
+
+/// Native engine-issued API key prefix (`aim_…`). Distinct from the
+/// external `amk_` keys issued by mcp-auth.
+pub const NATIVE_API_KEY_PREFIX: &str = "aim_";
+
+/// External mcp-auth consumer-key prefix. Human passwords must not
+/// impersonate this class either.
+pub const EXTERNAL_API_KEY_PREFIX: &str = "amk_";
+
+/// Minimum UTF-8 byte length of a human password.
+pub const MIN_HUMAN_PASSWORD_BYTES: usize = 12;
+
+/// Maximum UTF-8 byte length of a human password.
+pub const MAX_HUMAN_PASSWORD_BYTES: usize = 1024;
 
 /// Maximum username length. Anything longer is a misconfiguration; the
 /// engine, CLI, and web UI all assume a small username fits in a single
@@ -34,8 +55,48 @@ pub const MAX_USERNAME_LEN: usize = 64;
 /// Maximum email length per RFC 5321 §4.5.3.1.3 (path length).
 pub const MAX_EMAIL_LEN: usize = 254;
 
+/// Human role stored on `users.role`. Only two values exist; a native
+/// API credential never inherits Root from this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserRole {
+    /// Console operator. A web session for this role is
+    /// [`crate::AuthLevel::Root`].
+    Root,
+    /// Default human role. Web sessions and native API keys are
+    /// [`crate::AuthLevel::User`].
+    #[default]
+    User,
+}
+
+impl UserRole {
+    /// Wire / SQL value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::User => "user",
+        }
+    }
+
+    /// Parse a stored `users.role` value.
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::MalformedRecord`] for any other string.
+    pub fn parse(value: &str) -> Result<Self, MemoryError> {
+        match value {
+            "root" => Ok(Self::Root),
+            "user" => Ok(Self::User),
+            other => Err(MemoryError::MalformedRecord(format!(
+                "unknown user role {other:?}"
+            ))),
+        }
+    }
+}
+
 /// A registered user as stored. `id` is the UUIDv7 primary key; the
-/// other fields mirror the `users` table.
+/// other fields mirror the public `users` columns. Password hashes,
+/// session hashes, CSRF hashes, and API-key hashes never appear here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
     /// Stable identity. Used by `audit_log.author_id` and
@@ -52,21 +113,50 @@ pub struct User {
     /// Microseconds since epoch; `None` until the first authenticated
     /// request from this user. Updated fire-and-forget per request.
     pub last_seen_at: Option<i64>,
-    /// Microseconds since epoch; `None` means the token is active.
-    /// `ai-memory user expire` stamps it, `revive` clears it,
-    /// `rotate-token` issues a fresh hash AND implicitly clears this
-    /// field (rotating a token only makes sense to make it usable again).
-    pub token_expired_at: Option<i64>,
+    /// Human role. Native API credentials ignore this for AuthLevel.
+    pub role: UserRole,
+    /// The next web login must change the password before `/admin` or
+    /// `/api/v1` become available.
+    pub must_change_password: bool,
+    /// Microseconds since epoch; `None` means human login is enabled.
+    pub disabled_at: Option<i64>,
+    /// `true` when `users.password_hash` is populated. Token-only
+    /// brownfield rows are `false` ("API only") until reset-password.
+    pub has_password: bool,
 }
 
 impl User {
-    /// `true` if the user's current token is usable. Auth middleware
-    /// uses this to short-circuit the request before hitting any
-    /// further state.
+    /// `true` when human login is currently allowed.
     #[must_use]
-    pub fn is_token_active(&self) -> bool {
-        self.token_expired_at.is_none()
+    pub fn is_human_enabled(&self) -> bool {
+        self.disabled_at.is_none() && self.has_password
     }
+}
+
+/// Public metadata for one native API credential. The authenticating
+/// hash is never serialised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiCredential {
+    /// Stable credential id. Brownfield copies use the parent `user_id`.
+    pub id: ApiCredentialId,
+    /// Owning human (or brownfield) identity.
+    pub user_id: UserId,
+    /// Operator-supplied label.
+    pub label: String,
+    /// Optional non-authenticating preview (e.g. last four of `aim_…`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// Microseconds since epoch.
+    pub created_at: i64,
+    /// Microseconds since epoch; `None` until first use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
+    /// Optional absolute expiry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// Microseconds since epoch when revoked; `None` means active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<i64>,
 }
 
 /// Pre-insert shape for a new user. Carries the inputs the caller
@@ -214,6 +304,48 @@ pub fn validate_email(s: &str) -> Result<(), MemoryError> {
     }
     if domain.is_empty() {
         return Err(MemoryError::InvalidEmail("empty domain part".into()));
+    }
+    Ok(())
+}
+
+/// Validate a human password before Argon2id hashing.
+///
+/// Policy (AUTH-010): 12–1024 UTF-8 bytes; not a reserved credential
+/// prefix ([`SESSION_SECRET_PREFIX`], [`NATIVE_API_KEY_PREFIX`],
+/// [`EXTERNAL_API_KEY_PREFIX`]); not equal to `username` or any
+/// configured reserved secret (recovery token, machine-root bearer,
+/// actor-proxy bearer). Token-hash collision is checked by the store
+/// against `api_credentials` hashes only.
+///
+/// Failures always use the same generic [`MemoryError::InvalidPassword`]
+/// text so callers cannot distinguish which rule fired.
+///
+/// # Errors
+/// Returns [`MemoryError::InvalidPassword`] on any policy violation.
+pub fn validate_human_password(
+    password: &str,
+    username: Option<&str>,
+    reserved_plaintext: &[&str],
+) -> Result<(), MemoryError> {
+    const GENERIC: &str = "does not meet policy";
+    let bytes = password.len();
+    if !(MIN_HUMAN_PASSWORD_BYTES..=MAX_HUMAN_PASSWORD_BYTES).contains(&bytes) {
+        return Err(MemoryError::InvalidPassword(GENERIC.into()));
+    }
+    if password.starts_with(SESSION_SECRET_PREFIX)
+        || password.starts_with(NATIVE_API_KEY_PREFIX)
+        || password.starts_with(EXTERNAL_API_KEY_PREFIX)
+    {
+        return Err(MemoryError::InvalidPassword(GENERIC.into()));
+    }
+    if username.is_some_and(|name| password == name) {
+        return Err(MemoryError::InvalidPassword(GENERIC.into()));
+    }
+    if reserved_plaintext
+        .iter()
+        .any(|secret| !secret.is_empty() && password == *secret)
+    {
+        return Err(MemoryError::InvalidPassword(GENERIC.into()));
     }
     Ok(())
 }
@@ -413,5 +545,31 @@ mod tests {
             email: Some("not-an-email".into()),
         };
         assert!(matches!(nu.validate(), Err(MemoryError::InvalidEmail(_))));
+    }
+    #[test]
+    fn human_password_accepts_typical() {
+        assert!(validate_human_password("twelve chars!!", Some("alice"), &[]).is_ok());
+    }
+
+    #[test]
+    fn human_password_rejects_short_long_prefix_and_reserved() {
+        let ok = "twelve chars!!";
+        assert!(validate_human_password(&ok[..11], None, &[]).is_err());
+        let too_long = "a".repeat(MAX_HUMAN_PASSWORD_BYTES + 1);
+        assert!(validate_human_password(&too_long, None, &[]).is_err());
+        assert!(validate_human_password(&format!("ams_{ok}"), None, &[]).is_err());
+        assert!(validate_human_password(&format!("aim_{ok}"), None, &[]).is_err());
+        assert!(validate_human_password(&format!("amk_{ok}"), None, &[]).is_err());
+        assert!(validate_human_password(ok, Some(ok), &[]).is_err());
+        assert!(validate_human_password(ok, Some("alice"), &[ok]).is_err());
+    }
+
+    #[test]
+    fn user_role_round_trips() {
+        assert_eq!(UserRole::parse("root").unwrap(), UserRole::Root);
+        assert_eq!(UserRole::parse("user").unwrap(), UserRole::User);
+        assert!(UserRole::parse("admin").is_err());
+        assert_eq!(UserRole::Root.as_str(), "root");
+        assert_eq!(UserRole::default(), UserRole::User);
     }
 }

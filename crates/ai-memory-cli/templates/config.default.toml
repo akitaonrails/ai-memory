@@ -225,5 +225,12 @@ mid_session = "follow-cwd"
 # behind a trusted HTTPS-terminating reverse proxy, set this to true so browsers
 # send the cookie only over HTTPS. Do not enable it for direct HTTP: browsers
 # will not send a Secure cookie there.
+#
+# Prefer environment variables for secrets so they are not stored in this file:
+#   AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD  one-shot greenfield root password
+#   AI_MEMORY_AUTH__RECOVERY_TOKEN         break-glass (>=32 chars); never a session
+#   AI_MEMORY_AUTH__TRUSTED_PROXY_CIDRS    CIDRs allowed to supply X-Forwarded-For
+# Unset INITIAL_ROOT_PASSWORD after the first successful serve. Recovery only
+# resets the configured root_username via POST /auth/recovery.
 [auth]
 secure_cookie = false

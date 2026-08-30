@@ -1,11 +1,10 @@
 //! Mounting orchestration for the `/api/v1` + web-UI HTTP surfaces.
 //!
-//! The host binary (`ai-memory serve`) builds its MCP/hook/admin router,
-//! then hands it to [`mount_web_router`] to nest the JSON API and mount
-//! either the operator's custom SPA (`--web-ui-dir`) or the built-in
-//! server-rendered wiki browser. Base-path / web-slug normalisation and
-//! `<base href>` injection live here too so the served HTML always
-//! resolves relative URLs under the configured prefix.
+//! The host binary (`ai-memory serve`) splits the JSON API and either the
+//! operator's custom SPA (`--web-ui-dir`) or built-in server-rendered wiki,
+//! attaches the appropriate public/dual-auth middleware, then merges them.
+//! Base-path normalisation and `<base href>` injection live here too so
+//! served HTML resolves relative URLs under the configured prefix.
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -17,7 +16,7 @@ use ai_memory_wiki::Wiki;
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderName, Method, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tower::service_fn;
@@ -275,10 +274,9 @@ mod web_base_tests {
     }
 }
 
-/// Path / URL config the web mount needs. Bundling these together
-/// keeps `mount_web_router` and its helpers under clippy's
-/// `too_many_arguments` threshold without `#[allow]` papering over
-/// the call shape.
+/// Path / URL config the web mount needs. Bundling these together keeps
+/// [`split_web_routers`] below clippy's `too_many_arguments` threshold
+/// without hiding the call shape.
 pub struct WebMountSpec<'a> {
     /// Operator-supplied custom SPA directory (`--web-ui-dir`). `None`
     /// mounts the built-in server-rendered wiki browser instead.
@@ -295,49 +293,70 @@ pub struct WebMountSpec<'a> {
     pub base_path: &'a str,
 }
 
-/// Orchestrator: assemble the `/api/v1` + web-UI surfaces on top of
-/// `router`. Skips everything when web is disabled. Each concern lives
-/// in a dedicated helper below so this function reads as a four-step
-/// recipe (CORS-scoped API, slug normalisation, SPA-vs-builtin choice,
-/// final mount).
-pub fn mount_web_router(
+/// Public SPA vs dual-auth wiki/API split.
+///
+/// Custom `--web-ui-dir` shells are public (session login lives in the SPA).
+/// Builtin wiki pages and `/api/v1` are dual-auth.
+pub struct SplitWebRouters {
+    /// Unauthenticated custom SPA (empty when builtin wiki is mounted).
+    pub public: axum::Router,
+    /// `/api/v1` plus the builtin wiki when that is the chosen UI.
+    pub protected: axum::Router,
+}
+
+/// Split the web surfaces so the host can attach different auth layers.
+///
+/// # Errors
+/// Custom SPA `index.html` cannot be read.
+pub fn split_web_routers(
+    enable_web: bool,
+    reader: ReaderPool,
+    wiki: Wiki,
+    spec: WebMountSpec<'_>,
+) -> Result<SplitWebRouters> {
+    if !enable_web {
+        return Ok(SplitWebRouters {
+            public: axum::Router::new(),
+            protected: axum::Router::new(),
+        });
+    }
+    let api = build_api_router(&reader, &wiki, spec.cors_origins);
+    let protected_api = axum::Router::new().nest("/api/v1", api);
+    let slug = normalize_prefix(spec.web_slug);
+    let mount = if slug.is_empty() { "/" } else { slug.as_str() };
+    if let Some(dir) = spec.web_ui_dir {
+        let public = mount_custom_spa(
+            axum::Router::new(),
+            dir,
+            &slug,
+            spec.base_href,
+            spec.base_path,
+            mount,
+        )?;
+        return Ok(SplitWebRouters {
+            public,
+            protected: protected_api,
+        });
+    }
+    Ok(SplitWebRouters {
+        public: axum::Router::new(),
+        protected: mount_builtin_browser(protected_api, reader, wiki, &slug, spec.base_href, mount),
+    })
+}
+
+/// Test-only composition helper. Production must attach distinct auth
+/// middleware to [`SplitWebRouters::public`] and
+/// [`SplitWebRouters::protected`] before merging them.
+#[cfg(test)]
+fn mount_web_router(
     router: axum::Router,
     enable_web: bool,
     reader: ReaderPool,
     wiki: Wiki,
     spec: WebMountSpec<'_>,
 ) -> Result<axum::Router> {
-    if !enable_web {
-        return Ok(router);
-    }
-    // Register the web surfaces BEFORE applying the bearer middleware. In
-    // axum 0.8, `.layer()` only attaches to routes registered before the
-    // call; nesting after the layer would silently bypass auth for /web/*.
-    let router = router.nest(
-        "/api/v1",
-        build_api_router(&reader, &wiki, spec.cors_origins),
-    );
-
-    // Where the UI is mounted WITHIN the (already-applied) base path.
-    // Empty slug => the UI is the root of the base path itself.
-    let slug = normalize_prefix(spec.web_slug);
-    let mount = if slug.is_empty() { "/" } else { slug.as_str() };
-
-    // Custom SPA via --web-ui-dir (SPA fallback to index.html), otherwise
-    // the built-in server-side wiki browser. In both cases the served
-    // index carries an injected `<base href>` so relative asset/router
-    // URLs resolve under `{base_path}{web_slug}`.
-    if let Some(dir) = spec.web_ui_dir {
-        return mount_custom_spa(router, dir, &slug, spec.base_href, spec.base_path, mount);
-    }
-    Ok(mount_builtin_browser(
-        router,
-        reader,
-        wiki,
-        &slug,
-        spec.base_href,
-        mount,
-    ))
+    let split = split_web_routers(enable_web, reader, wiki, spec)?;
+    Ok(router.merge(split.protected).merge(split.public))
 }
 
 /// Build the `/api/v1` router and apply the per-origin CORS layer if
@@ -358,7 +377,11 @@ fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -
     let cors = CorsLayer::new()
         .allow_origin(parsed)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("x-csrf-token"),
+        ])
         .allow_credentials(true)
         .max_age(Duration::from_secs(600));
     info!(origins = ?cors_origins, "CORS layer attached to /api/v1");

@@ -237,6 +237,32 @@ pub async fn get_json<T: DeserializeOwned>(
         .with_context(|| format!("parsing JSON body from GET {url}"))
 }
 
+/// PATCH JSON body to `<endpoint>{path}`, deserialise JSON response.
+///
+/// # Errors
+/// Same as [`get_json`].
+pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    body: &B,
+) -> Result<T> {
+    let client = reqwest::Client::new();
+    let url = endpoint.build_url(path);
+    let req = endpoint.authenticate(client.patch(&url).json(body));
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(server_response_error(status, body));
+    }
+    resp.json::<T>()
+        .await
+        .with_context(|| format!("parsing JSON body from PATCH {url}"))
+}
+
 /// POST JSON body to `<endpoint>{path}`, deserialise JSON response.
 ///
 /// # Errors

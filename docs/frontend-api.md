@@ -16,44 +16,46 @@
 
 ## 2. Auth model
 
-Every `/api/v1/*` request goes through the same bearer + host-allowlist
-middleware as `/mcp`, `/hook`, and `/admin/*` — they're all nested
-*before* the auth layers are applied
-(`crates/ai-memory-cli/src/commands/serve.rs`, see `mount_web_router` →
-`apply_http_layers`). So:
+`/api/v1/*` and `/admin/*` are dual-auth surfaces:
 
-- **Anonymous request → `401 Unauthorized`** (when the server is running
-  with a bearer token configured).
-- **Disallowed `Host` header → `403 Forbidden`** (DNS-rebinding guard).
-- The static bearer is the root credential. DB-user tokens and a configured
-  trusted-proxy bearer resolve per-user identities; actor-scoped responses then
-  expose only that operator's plus shared handoffs. See
-  [`docs/users.md`](users.md) for the full auth ladder.
+- Human operators authenticate with `POST /auth/login`. The engine returns an
+  `HttpOnly`, `SameSite=Strict` `ai_memory_session` cookie plus a readable
+  `ai_memory_csrf` cookie. Browser requests use `credentials: "include"`;
+  mutations also copy the CSRF cookie to `X-CSRF-Token`.
+- Machine clients send `Authorization: Bearer <token>`. The static
+  `AI_MEMORY_AUTH_TOKEN` is machine-root authority; native `aim_` API keys are
+  always User-level. Bearers never authenticate `/auth/*`.
+- A recognized Bearer has precedence over a browser session. An invalid Bearer
+  fails closed rather than falling back to cookies. Basic and unknown schemes
+  are not credentials and do not suppress an otherwise valid web session.
+- `/mcp`, hooks, handoffs, and workstream routes are machine-only. A web-session
+  cookie cannot authenticate them.
+- A disallowed `Host` header receives `403 Forbidden` before auth evaluation
+  (DNS-rebinding guard).
 
-Pass the bearer in the standard header:
+The custom SPA shell and its static assets are public so the login screen can
+load. Its data routes remain protected. Start with:
 
 ```http
-Authorization: Bearer <token>
+GET /auth/me
 ```
 
-Get a token:
+An authenticated response includes the operator identity, password-change
+state, and server-calculated capabilities. On an intentionally zero-config
+loopback server it instead returns an explicit anonymous snapshot. When human
+authority is configured, login is:
 
-```bash
-ai-memory generate-auth-token   # writes a root token to stdout
-# then export AI_MEMORY_AUTH_TOKEN=<token> in the server's environment,
-# or put it under [auth].bearer_token in config.toml
+```http
+POST /auth/login
+Content-Type: application/json
+
+{"username":"alice","password":"…"}
 ```
 
-In a same-origin SPA, the token can come from:
-
-- A user-pasted value in the UI (the simplest model — same as the
-  built-in `/web` browser's HTTP Basic prompt).
-- A platform-specific secret store, then injected into `fetch()` calls.
-
-> **XSS note:** if your SPA stores the bearer in `localStorage` and ships
-> with an XSS bug, the token is exfiltrable. That's the SPA's risk, not
-> the API's. Consider read-only environment-injected tokens or HTTP-only
-> cookie tunneling via a reverse proxy if you're hardening for that.
+Do not put `AI_MEMORY_AUTH_TOKEN`, `aim_` keys, session values, or CSRF values
+in `localStorage`. HTTP Basic browser login is unsupported. See
+[`docs/users.md`](users.md) for bootstrap, password rotation, recovery, roles,
+session expiry, and API-key lifecycle.
 
 ## 3. Error model
 
@@ -67,11 +69,12 @@ with one of these statuses:
 
 | Status | When |
 |---|---|
-| `400 Bad Request` | invalid query params, malformed `Authorization`, partial scope (workspace without project or vice versa), too many scopes in `POST /search` (>25), empty `q`, malformed session id, unknown observation `kinds` or `order`. |
-| `401 Unauthorized` | bearer missing or wrong. |
-| `403 Forbidden` | Host header not in allowlist; or a non-root caller requests `all_owners=true`. |
+| `400 Bad Request` | invalid query params, malformed input, partial scope (workspace without project or vice versa), too many scopes in `POST /search` (>25), empty `q`, malformed session id, unknown observation `kinds` or `order`. |
+| `401 Unauthorized` | human session or machine Bearer is missing, expired, revoked, or invalid. |
+| `403 Forbidden` | Host header not in allowlist; cookie mutation lacks valid CSRF; password change is pending; or the authenticated authority lacks the requested capability. |
 | `404 Not Found` | workspace, project, or page doesn't exist; page file missing on disk; or a session id that is not visible in that project for the caller. |
-| `500 Internal Server Error` | reader pool / SQLite failure. Body is always the fixed `{"error":"internal server error"}`; the underlying cause is logged server-side rather than returned, so it cannot leak paths or configuration to a browser. |
+| `429 Too Many Requests` | login/recovery rate limit or bounded password-KDF queue is saturated. |
+| `500 Internal Server Error` | reader pool / SQLite failure. Body is always a fixed generic error; the underlying cause is logged server-side rather than returned, so it cannot leak paths or configuration to a browser. |
 
 ## 4. Endpoint reference
 
@@ -438,10 +441,9 @@ mounted at the absolute host root — outside `--base-path` and outside
 the `/web` nest — so the browser's automatic fetch reaches it even
 under a subpath deployment. The response is `image/png` despite the
 `.ico` URL (modern browsers accept PNG icons), and the route is
-**exempt from bearer auth and host allowlist**: a browser opening a
-fresh tab gets the icon without an HTTP Basic prompt, and the
-embedded PNG is the same one any visitor to `/web` already sees, so
-the info-leak surface is nil.
+**exempt from authentication and host allowlist**: a fresh tab can fetch the
+icon before login, and the embedded PNG is the same one any visitor to `/web`
+already sees, so the info-leak surface is nil.
 
 ### 4.11 Sessions
 
@@ -566,10 +568,11 @@ ai-memory serve \
 
 The static directory is served at `/web` via `tower-http::ServeDir`:
 
-- **Same auth as `/api/v1`.** Mounted before the bearer middleware
-  layer, so `/web/*` requests must carry the same `Authorization`
-  header (browsers typically prompt via HTTP Basic when auth is on —
-  the user pastes the token as the password).
+- **Public shell, protected data.** `index.html`, client-router fallbacks, and
+  static assets load without credentials so the login form can render.
+  `/auth/me`, `/api/v1/*`, and `/admin/*` enforce the session/Bearer contract
+  above. The built-in wiki router used when `--web-ui-dir` is absent remains
+  protected because it renders data server-side.
 - **SPA fallback.** Missing paths fall back to `index.html`, so a
   client-side router (React Router, SvelteKit, etc.) can own
   `/web/whatever` without 404s.
@@ -621,23 +624,41 @@ project tree). No regression.
 ## 7. Worked example: minimal SPA fetch
 
 ```js
-// Resolve the API base from the SPA shell injected by ai-memory. The meta tag
-// is empty at host root and e.g. "/wiki" behind a subpath reverse proxy.
+// Resolve bases from the SPA shell injected by ai-memory. The meta tag is
+// empty at host root and e.g. "/wiki" behind a subpath reverse proxy.
 const basePath = document
   .querySelector('meta[name="ai-memory-base-path"]')
   ?.getAttribute("content") ?? "";
-const API = `${location.origin}${basePath}/api/v1`;
-const TOKEN = localStorage.getItem("ai-memory-token"); // your storage choice
+const origin = `${location.origin}${basePath}`;
+const API = `${origin}/api/v1`;
+
+async function login(username, password) {
+  const resp = await fetch(`${origin}/auth/login`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!resp.ok) throw new Error(`login failed: ${resp.status}`);
+  return resp.json();
+}
+
+function cookie(name) {
+  const prefix = `${encodeURIComponent(name)}=`;
+  return document.cookie
+    .split(";")
+    .map(value => value.trim())
+    .find(value => value.startsWith(prefix))
+    ?.slice(prefix.length);
+}
 
 async function apiGet(path, params) {
   const url = new URL(`${API}${path}`, location.origin);
-  if (params) Object.entries(params).forEach(([k, v]) =>
-    v != null && url.searchParams.set(k, v));
+  if (params) Object.entries(params).forEach(([key, value]) =>
+    value != null && url.searchParams.set(key, value));
   const resp = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
-    },
+    credentials: "include",
+    headers: { Accept: "application/json" },
   });
   if (!resp.ok) {
     const { error } = await resp.json().catch(() => ({ error: resp.statusText }));
@@ -646,16 +667,19 @@ async function apiGet(path, params) {
   return resp.json();
 }
 
-// Top-level "home" view in one request.
-const overview = await apiGet("/workspaces/default/projects/ai-memory/overview", { limit: 10 });
+// Call login() from the UI first. The HttpOnly session is never visible here.
+const overview = await apiGet("/workspaces/default/projects/ai-memory/overview", {
+  limit: 10,
+});
 console.log(overview.briefing.counts.pages_latest, "pages");
 
-// Multi-scope search.
+// POST is CSRF-protected even when the operation is read-only.
 const search = await fetch(`${API}/search`, {
   method: "POST",
+  credentials: "include",
   headers: {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${TOKEN}`,
+    "X-CSRF-Token": decodeURIComponent(cookie("ai_memory_csrf") ?? ""),
   },
   body: JSON.stringify({
     q: "karpathy",
@@ -665,7 +689,7 @@ const search = await fetch(`${API}/search`, {
     ],
     limit: 20,
   }),
-}).then(r => r.json());
+}).then(response => response.json());
 ```
 
 `curl` smoke test:

@@ -3,8 +3,8 @@
 `ai-memory completions <shell>` prints a completion script to stdout for
 `bash`, `zsh`, `fish`, `powershell`, or `elvish`. The script is generated from
 the binary's own command tree, so it covers every subcommand and flag of the
-version that produced it — including nested commands like `user rotate-token`
-and `auth login`.
+version that produced it — including nested commands like `user reset-password`,
+`api-key rotate`, and `auth login`.
 
 The Docker wrapper's `upgrade` command is wrapper-owned rather than part of the
 native clap command tree, so it is the one subcommand not present in generated

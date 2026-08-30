@@ -25,19 +25,20 @@ Add a TLS-terminating proxy in front of ai-memory when any of these
 apply:
 
 - **Multi-user mode is on** (at least one user row exists; `[auth].token_pepper`
-  is the credential prerequisite). Per-user tokens travel between clients and
+  is the credential prerequisite). Native `aim_` keys travel between clients and
   the server — sniffable over plain HTTP on the LAN. See
   [`docs/users.md`](users.md).
 - **The server is bound beyond loopback** (`AI_MEMORY_BIND=0.0.0.0:49374` or a LAN-routable IP). Anyone on the network segment sees plaintext token traffic and `/web` cookies.
-- **You access `/web` from a different machine** than the one running ai-memory. The browser session cookie set after Basic auth lives in the clear over HTTP.
+- **You access `/web` from a different machine** than the one running ai-memory. The browser session cookie set after password login lives in the clear over HTTP.
 - **You're exposing ai-memory beyond the LAN.** Cloudflare Tunnel or a public-domain Caddy with Let's Encrypt are the two patterns most homelab operators land on.
 
-ai-memory refuses to start unauthenticated non-loopback HTTP by default.
-Configure `AI_MEMORY_AUTH_TOKEN` or bind loopback; the dangerous
-`--allow-insecure-no-auth` escape hatch exists only for intentional plain-HTTP
-LAN use. Authenticated non-loopback plain HTTP remains available and logs a
-loud warning: bearer tokens and `/web` cookies are still sniffable without
-TLS. The decision to add TLS is yours; this page is the recipes.
+ai-memory refuses unauthenticated non-loopback HTTP by default. Machine-only
+Bearer deployments may still bind authenticated plain HTTP and receive a loud
+warning because those credentials remain sniffable. Human authentication is
+stricter: a non-loopback listener refuses startup unless
+`AI_MEMORY_AUTH__SECURE_COOKIE=true`, which is the operator's explicit signal
+that a trusted HTTPS proxy owns the browser-facing edge. Non-Secure human
+cookies are supported only on an actual loopback listener.
 
 ## Pick a path
 
@@ -160,9 +161,11 @@ ai-memory install-hooks --agent  claude-code --apply \
     --server-url "https://memory.example.com/wiki" --auth-token "$AI_MEMORY_AUTH_TOKEN"
 ```
 
-The built-in browser is then at `https://memory.example.com/wiki/web`; add
-`AI_MEMORY_WEB_SLUG=/` if you want the browser or custom `--web-ui-dir` SPA at
-`https://memory.example.com/wiki` itself.
+The web surface is then at `https://memory.example.com/wiki/web`; add
+`AI_MEMORY_WEB_SLUG=/` if you want the built-in browser or custom
+`--web-ui-dir` SPA at `https://memory.example.com/wiki` itself. Human console
+login requires the custom SPA; the built-in server-rendered wiki remains
+protected data rather than an authentication page.
 
 **Safety rules on both flags.** `AI_MEMORY_BASE_PATH` and
 `AI_MEMORY_WEB_SLUG` go through the same normaliser. Segments must be
@@ -421,13 +424,12 @@ directly off the request, which proxies forward verbatim. The
 
 For browser access to `/web` through HTTPS, set
 `AI_MEMORY_AUTH__SECURE_COOKIE=true` (or `[auth] secure_cookie = true`). This
-marks the Basic-auth session cookie `Secure`; it is always `HttpOnly`,
+marks the `ai_memory_session` cookie `Secure`; it is always `HttpOnly`,
 `SameSite=Strict`, and `Path=/`. ai-memory intentionally does **not** infer
 HTTPS from `X-Forwarded-Proto` or any other proxy header. Close direct HTTP
-access to the public hostname, or redirect it to HTTPS. Enabling
-`secure_cookie` on a direct HTTP deployment makes browsers withhold the cookie,
-which is expected safety behavior. It remains false by default so loopback and
-plain-HTTP local `/web` continue to work.
+access to the public hostname, or redirect it to HTTPS. Human auth on a
+non-loopback listener will not start without this setting. It remains false by
+default only so direct loopback smoke/development can use plain HTTP.
 
 The only thing to mind: **`AI_MEMORY_ALLOWED_HOSTS` must include the
 public hostname**, not just `localhost`. The host-allowlist middleware

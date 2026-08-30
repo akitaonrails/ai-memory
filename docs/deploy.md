@@ -105,7 +105,7 @@ CLI sends an `Authorization: Bearer <token>` header on every call; ai-memory's
 middleware validates with a constant-time comparison.
 
 **Encrypted transport.** Plain HTTP on the LAN means anyone with a
-packet capture can read the bearer token (and per-user tokens once
+packet capture can read the bearer token (and native `aim_` keys once
 multi-user mode is on) in transit. Add a TLS-terminating reverse
 proxy in front of ai-memory — Caddy with Let's Encrypt, Caddy with
 its internal CA, Cloudflare Tunnel, nginx, or external cert files —
