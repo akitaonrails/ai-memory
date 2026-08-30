@@ -139,6 +139,20 @@ pub(crate) fn zero_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("hooks.json"))
 }
 
+/// `~/.zcode/cli/config.json` — ZCode's user-scope config. The root
+/// `hooks` block lives in the same file `install-mcp --client zcode`
+/// registers MCP servers in; user scope runs headless with no trust
+/// gate, while ZCode's workspace scopes (`.zcode/config.json`,
+/// `zcode.json`) are trust-gated and off by default, so they are never
+/// targeted (#512).
+pub(crate) fn zcode_config_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.zcode/cli/config.json")?
+        .join(".zcode")
+        .join("cli")
+        .join("config.json"))
+}
+
 /// `~/.devin/hooks.v1.json` — Devin CLI lifecycle hooks (default target).
 pub(crate) fn devin_hooks_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -447,6 +461,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
+            AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Devin => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
                 apply_to_devin_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
@@ -562,6 +577,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             render_grok(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::Zcode => render_zcode(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Devin => {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
             render_devin(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
@@ -701,6 +717,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::AntigravityCli => antigravity_hooks_path().ok()?,
             AgentChoice::Grok => grok_hooks_path().ok()?,
             AgentChoice::Zero => zero_hooks_path().ok()?,
+            AgentChoice::Zcode => zcode_config_path().ok()?,
             AgentChoice::Devin => devin_hooks_path().ok()?,
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
             AgentChoice::KiroCli => return None,
@@ -1070,6 +1087,10 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // No first-party Pool MCP installer ships yet, so there is no
         // config file to infer a server URL or token from.
         AgentChoice::Pool => None,
+        // The ZCode MCP client ships with #511; until that lands there is
+        // no `McpClient::Zcode` whose config the installer could scrape a
+        // server URL or token from.
+        AgentChoice::Zcode => None,
     }
 }
 
@@ -4455,6 +4476,160 @@ fn render_zero(
     Ok(())
 }
 
+/// Whether a hook entry in ZCode's `hooks.events` map is one ai-memory
+/// wrote. Our entries carry a `statusMessage` starting with `ai-memory`
+/// — the only schema-documented free-form key, so ownership is marked
+/// without emitting keys ZCode would drop.
+fn is_our_zcode_hook(hook: &serde_json::Value) -> bool {
+    hook.get("statusMessage")
+        .and_then(|v| v.as_str())
+        .is_some_and(|msg| msg.starts_with("ai-memory"))
+}
+
+/// Merge ai-memory hooks into the root `hooks` block of ZCode's
+/// user-scope `~/.zcode/cli/config.json` (#512). Sibling config keys
+/// (`model`, `provider`, `mcp.servers`, …) always survive: the merge
+/// touches only `hooks.enabled` (defaulted, never flipped),
+/// `hooks.maxOutputBytes` (set only when absent), and `hooks.events`,
+/// replaces entries ai-memory owns (idempotent re-apply), and never
+/// edits matcher groups it did not write.
+fn apply_to_zcode_hooks(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => zcode_config_path()?,
+    };
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = super::render_shared::build_zcode_hooks_config(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_events = payload
+        .get("events")
+        .and_then(|v| v.as_object())
+        .context("internal: build_zcode_hooks_config didn't return an events map")?
+        .clone();
+    let mut hooks_disabled = false;
+    let outcome = apply_atomic(&path, |existing| {
+        mutate_json(existing, |root| {
+            // `hooks` sits beside sibling config keys that must survive.
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .context("`hooks` is present in the ZCode config but not an object")?;
+            hooks_disabled = hooks.get("enabled").and_then(|v| v.as_bool()) == Some(false);
+            if !hooks.contains_key("enabled") {
+                hooks.insert("enabled".into(), serde_json::Value::Bool(true));
+            }
+            // Raise the stdout ceiling above ZCode's 32 KiB default so a
+            // fetched handoff is not truncated mid-JSON before injection.
+            // Only when the user has not chosen their own value: the key
+            // is block-level and would also bound third-party hooks.
+            if !hooks.contains_key("maxOutputBytes")
+                && let Some(ceiling) = payload.get("maxOutputBytes")
+            {
+                hooks.insert("maxOutputBytes".into(), ceiling.clone());
+            }
+            let events = hooks
+                .entry("events")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .context("`hooks.events` is present in the ZCode config but not an object")?;
+            for (event, ours) in &our_events {
+                let ours = ours
+                    .as_array()
+                    .context("internal: zcode event payload is not a matcher-group array")?;
+                let slot = events
+                    .entry(event.clone())
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                let slot = slot.as_array_mut().context(
+                    "`hooks.events.{event}` is present in the ZCode config but not an array",
+                )?;
+                for group in slot.iter_mut() {
+                    if let Some(hooks) = group
+                        .as_object_mut()
+                        .and_then(|group| group.get_mut("hooks"))
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        hooks.retain(|hook| !is_our_zcode_hook(hook));
+                    }
+                }
+                slot.retain(|group| match group.get("hooks") {
+                    Some(serde_json::Value::Array(hooks)) => !hooks.is_empty(),
+                    _ => true,
+                });
+                slot.extend(ours.iter().cloned());
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    if hooks_disabled {
+        eprintln!(
+            "# warning: this config sets \"enabled\": false inside `hooks`, \
+             so ZCode will not run ANY hooks (including ai-memory's) until \
+             you re-enable them."
+        );
+    }
+    println!("# NOTE: ZCode injects SessionStart stdout as model context, so the");
+    println!("#       prior session's handoff is delivered automatically.");
+    println!("# NOTE: ZCode fires `Stop` at the end of every turn and has no");
+    println!("#       SessionEnd — close sessions with");
+    println!("#       `ai-memory finalize-session --agent zcode`.");
+    Ok(())
+}
+
+/// Print ZCode's `hooks` block to stdout (dry-run counterpart of
+/// [`apply_to_zcode_hooks`]).
+fn render_zcode(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    let payload = super::render_shared::build_zcode_hooks_config(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing zcode hook config")?;
+    println!("# ZCode (z.ai) hooks config — merge the `hooks` block into");
+    println!("# ~/.zcode/cli/config.json (the same file `install-mcp --client");
+    println!("# zcode` registers MCP servers in), or re-run with --apply to");
+    println!("# merge it in place, preserving the rest of the config.");
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: token embedded in each hook's args below.");
+        println!("#       Treat the config as sensitive (chmod 600).");
+    }
+    println!("# NOTE: ZCode injects SessionStart stdout as model context, so the");
+    println!("#       prior session's handoff is delivered automatically.");
+    println!("# NOTE: ZCode fires `Stop` at the end of every turn and has no");
+    println!("#       SessionEnd — close sessions with");
+    println!("#       `ai-memory finalize-session --agent zcode`.");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 fn render_devin(
     hooks_dir: &Path,
     server_url: &str,
@@ -4823,6 +4998,7 @@ mod tests {
             KiroCli,
             KiroCliV3,
             Pool,
+            Zcode,
         ] {
             assert!(
                 !capture_assistant_allowed(agent),
@@ -4857,6 +5033,7 @@ mod tests {
             KiroCli,
             KiroCliV3,
             Pool,
+            Zcode,
         ] {
             assert!(!prompt_capture_options_allowed(agent), "{agent:?}");
         }
@@ -5780,6 +5957,225 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
                 .all(|h| h["command"] != serde_json::json!("/old/ai-memory")),
             "the stale command path must be replaced"
         );
+    }
+
+    #[test]
+    fn zcode_hooks_config_covers_all_events_with_strict_entries() {
+        let payload = super::super::render_shared::build_zcode_hooks_config(
+            "http://127.0.0.1:49374",
+            Some("tok-test"),
+            Some(Path::new("/data")),
+            Some("repo-root"),
+        );
+        assert_eq!(payload["enabled"], serde_json::json!(true));
+        // Raised above ZCode's 32 KiB default so a fetched handoff is not
+        // truncated before injection.
+        assert_eq!(payload["maxOutputBytes"], serde_json::json!(65536));
+        let events = payload["events"].as_object().unwrap();
+        assert_eq!(
+            events.len(),
+            super::super::render_shared::ZCODE_EVENTS.len(),
+            "one entry per documented ZCode trigger"
+        );
+        for (zcode_event, our_event) in super::super::render_shared::ZCODE_EVENTS {
+            let groups = events[zcode_event].as_array().unwrap();
+            assert_eq!(groups.len(), 1, "{zcode_event}: one matcher group");
+            let hooks = groups[0]["hooks"].as_array().unwrap();
+            assert_eq!(hooks.len(), 1, "{zcode_event}: one hook entry");
+            let hook = &hooks[0];
+            // Exec form: `type: "process"` spawns command + args with no
+            // shell, so every key must be from ZCode's documented schema —
+            // undocumented keys make it drop the entry.
+            assert_eq!(hook["type"], serde_json::json!("process"), "{zcode_event}");
+            assert_eq!(
+                hook["statusMessage"].as_str().unwrap(),
+                "ai-memory capture",
+                "{zcode_event}: ownership marker"
+            );
+            assert_eq!(hook["timeoutMs"], serde_json::json!(10_000));
+            for key in hook.as_object().unwrap().keys() {
+                assert!(
+                    matches!(
+                        key.as_str(),
+                        "type" | "command" | "args" | "enabled" | "timeoutMs" | "statusMessage"
+                    ),
+                    "{zcode_event}: undocumented hook key {key}"
+                );
+            }
+            let args: Vec<&str> = hook["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str().unwrap())
+                .collect();
+            assert!(args.contains(&"hook"), "{args:?}");
+            assert!(
+                args.contains(&"--event") && args.contains(&our_event),
+                "{args:?}"
+            );
+            assert!(
+                args.contains(&"--agent") && args.contains(&"zcode"),
+                "{args:?}"
+            );
+            assert!(args.contains(&"--server-url") && args.contains(&"http://127.0.0.1:49374"));
+            assert!(args.contains(&"--auth-token") && args.contains(&"tok-test"));
+            assert!(args.contains(&"--data-dir") && args.contains(&"/data"));
+            assert!(args.contains(&"--project-strategy") && args.contains(&"repo-root"));
+        }
+        // PostToolUseFailure fires instead of PostToolUse when the tool
+        // throws; the loop above already proved it forwards onto the same
+        // `post-tool-use` channel as its success sibling.
+        assert!(events.contains_key("PostToolUseFailure"));
+    }
+
+    #[test]
+    fn zcode_apply_preserves_siblings_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{
+  "theme": "dark",
+  "model": {"main": "zai/glm-5.1"},
+  "mcp": {"servers": {"other": {"type": "http", "url": "https://other.example/mcp"}}},
+  "hooks": {
+    "enabled": true,
+    "events": {
+      "SessionStart": [
+        {"matcher": "Bash", "hooks": [
+          {"type": "process", "command": "/usr/bin/true", "args": [], "enabled": true}
+        ]},
+        {"hooks": [
+          {"type": "process", "command": "/old/ai-memory", "args": [],
+           "enabled": true, "statusMessage": "ai-memory capture"}
+        ]}
+      ]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::Zcode,
+            capture_assistant: false,
+            config_file: Some(path.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_zcode_hooks(
+            "http://127.0.0.1:49374",
+            Some("tok-test"),
+            Path::new("/data"),
+            &args,
+        )
+        .unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        apply_to_zcode_hooks(
+            "http://127.0.0.1:49374",
+            Some("tok-test"),
+            Path::new("/data"),
+            &args,
+        )
+        .unwrap();
+        let second = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(first, second, "re-apply must be a no-op");
+        let root: serde_json::Value = serde_json::from_str(&second).unwrap();
+        // Sibling config keys survive: hooks share the file with the model
+        // and MCP registration (#511).
+        assert_eq!(root["theme"], serde_json::json!("dark"));
+        assert_eq!(root["model"]["main"], serde_json::json!("zai/glm-5.1"));
+        assert_eq!(
+            root["mcp"]["servers"]["other"]["url"],
+            serde_json::json!("https://other.example/mcp")
+        );
+        // The handoff-injection stdout ceiling lands with the hooks block.
+        assert_eq!(root["hooks"]["maxOutputBytes"], serde_json::json!(65536));
+        let session_start = root["hooks"]["events"]["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            session_start.len(),
+            2,
+            "the third-party matcher group must survive the merge"
+        );
+        let third_party = &session_start[0];
+        assert_eq!(
+            third_party["matcher"],
+            serde_json::json!("Bash"),
+            "third-party matcher groups are preserved untouched"
+        );
+        assert_eq!(
+            third_party["hooks"][0]["command"],
+            serde_json::json!("/usr/bin/true")
+        );
+        let ours = &session_start[1];
+        assert_eq!(
+            ours["hooks"][0]["command"],
+            super::super::render_shared::build_zcode_hooks_config(
+                "http://127.0.0.1:49374",
+                Some("tok-test"),
+                Some(Path::new("/data")),
+                None
+            )["events"]["SessionStart"][0]["hooks"][0]["command"],
+            "the stale ai-memory command path must be replaced"
+        );
+        for (zcode_event, _) in super::super::render_shared::ZCODE_EVENTS {
+            assert!(
+                root["hooks"]["events"][zcode_event].is_array(),
+                "missing {zcode_event}"
+            );
+        }
+    }
+
+    #[test]
+    fn zcode_apply_flags_a_user_disabled_hooks_block() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::write(&path, r#"{"hooks": {"enabled": false, "events": {}}}"#).unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::Zcode,
+            capture_assistant: false,
+            config_file: Some(path.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_zcode_hooks("http://127.0.0.1:49374", None, Path::new("/data"), &args).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["hooks"]["enabled"],
+            serde_json::json!(false),
+            "a user-disabled hooks block must stay disabled (we warn instead)"
+        );
+        assert_eq!(
+            root["hooks"]["events"].as_object().unwrap().len(),
+            super::super::render_shared::ZCODE_EVENTS.len()
+        );
+    }
+
+    #[test]
+    fn zcode_apply_respects_a_user_chosen_output_ceiling() {
+        // `maxOutputBytes` is block-level and would also bound third-party
+        // hooks, so a value the user chose is never overwritten.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{"hooks": {"enabled": true, "maxOutputBytes": 4096, "events": {}}}"#,
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::Zcode,
+            capture_assistant: false,
+            config_file: Some(path.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_zcode_hooks("http://127.0.0.1:49374", None, Path::new("/data"), &args).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["hooks"]["maxOutputBytes"], serde_json::json!(4096));
     }
 
     #[test]

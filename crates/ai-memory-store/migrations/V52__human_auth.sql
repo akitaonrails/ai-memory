@@ -8,8 +8,8 @@
 --
 -- token_hash stays nullable and UNIQUE (SQLite UNIQUE allows many
 -- NULLs) without a length CHECK so a pre-V14 malformed blob can still
--- be copied; V52 aborts on length != 32. Backfill every existing row
--- as role='user'. Defaults let a restored pre-V51 binary INSERT.
+-- be copied; V53 aborts on length != 32. Backfill every existing row
+-- as role='user'. Defaults let a restored pre-V52 binary INSERT.
 
 
 CREATE TABLE users_new (
@@ -60,13 +60,13 @@ CREATE INDEX idx_web_sessions_user ON web_sessions(user_id);
 CREATE INDEX idx_web_sessions_expires ON web_sessions(expires_at);
 
 -- `PRAGMA foreign_key_check` alone only returns rows under execute_batch and
--- cannot abort. Fail the migration if this rebuild damaged either V51-owned
+-- cannot abort. Fail the migration if this rebuild damaged either V52-owned
 -- author reference, without scanning unrelated pre-existing violations.
-CREATE TABLE v51_fk_guard (
+CREATE TABLE v52_fk_guard (
     ok INTEGER NOT NULL CHECK (ok = 0)
 );
-INSERT INTO v51_fk_guard (ok)
+INSERT INTO v52_fk_guard (ok)
 SELECT
     (SELECT COUNT(*) FROM pragma_foreign_key_check('pages')) +
     (SELECT COUNT(*) FROM pragma_foreign_key_check('audit_log'));
-DROP TABLE v51_fk_guard;
+DROP TABLE v52_fk_guard;

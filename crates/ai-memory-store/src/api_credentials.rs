@@ -283,7 +283,12 @@ mod tests {
         conn
     }
 
-    fn insert_v50_user(conn: &Connection, username: &str, hash: &[u8], expired: bool) -> UserId {
+    fn insert_pre_human_user(
+        conn: &Connection,
+        username: &str,
+        hash: &[u8],
+        expired: bool,
+    ) -> UserId {
         let id = UserId::new();
         conn.execute(
             "INSERT INTO users (id, username, name, email, token_hash, created_at, token_expired_at) \
@@ -300,13 +305,13 @@ mod tests {
     }
 
     #[test]
-    fn api_credentials_v52_copies_active_and_expired_hashes() {
+    fn api_credentials_v53_copies_active_and_expired_hashes() {
         let mut conn = open_to(50);
         let active = [0xAAu8; 32];
         let expired = [0xBBu8; 32];
-        let alice = insert_v50_user(&conn, "alice", &active, false);
-        let bob = insert_v50_user(&conn, "bob", &expired, true);
-        crate::migrations::run_to(&mut conn, 52).unwrap();
+        let alice = insert_pre_human_user(&conn, "alice", &active, false);
+        let bob = insert_pre_human_user(&conn, "bob", &expired, true);
+        crate::migrations::run_to(&mut conn, 53).unwrap();
 
         let (label, hash, revoked): (String, Vec<u8>, Option<i64>) = conn
             .query_row(
@@ -331,8 +336,8 @@ mod tests {
     }
 
     #[test]
-    fn api_credentials_v52_aborts_on_malformed_hash_length() {
-        let mut conn = open_to(51);
+    fn api_credentials_v53_aborts_on_malformed_hash_length() {
+        let mut conn = open_to(52);
         let id = UserId::new();
         conn.execute(
             "INSERT INTO users (id, username, name, email, token_hash, created_at, role) \
@@ -340,7 +345,7 @@ mod tests {
             params![id.as_bytes(), [1u8; 16].as_slice()],
         )
         .unwrap();
-        let err = crate::migrations::run_to(&mut conn, 52).unwrap_err();
+        let err = crate::migrations::run_to(&mut conn, 53).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("CHECK") || msg.contains("constraint") || msg.contains("ok"),
@@ -349,8 +354,8 @@ mod tests {
     }
 
     #[test]
-    fn api_credentials_v52_skips_password_only_users() {
-        let mut conn = open_to(51);
+    fn api_credentials_v53_skips_password_only_users() {
+        let mut conn = open_to(52);
         let id = UserId::new();
         conn.execute(
             "INSERT INTO users (id, username, name, email, token_hash, created_at, role, password_hash) \
@@ -358,7 +363,7 @@ mod tests {
             params![id.as_bytes()],
         )
         .unwrap();
-        crate::migrations::run_to(&mut conn, 52).unwrap();
+        crate::migrations::run_to(&mut conn, 53).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM api_credentials", [], |row| row.get(0))
             .unwrap();
@@ -366,8 +371,8 @@ mod tests {
     }
 
     #[test]
-    fn api_credentials_v52_mirror_trigger_copies_pre_v51_write() {
-        let mut conn = open_to(52);
+    fn api_credentials_v53_mirror_trigger_copies_pre_v52_write() {
+        let mut conn = open_to(53);
         let id = UserId::new();
         let hash = [0xCCu8; 32];
         conn.execute(
@@ -393,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_stops_at_v52_rollback_bridge() {
+    fn schema_stops_at_v53_rollback_bridge() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::migrations::run(&mut conn).unwrap();
@@ -404,7 +409,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 52);
+        assert_eq!(version, 53);
         let cols: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'token_hash'",
@@ -416,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn api_credentials_v52_human_create_has_no_key() {
+    fn api_credentials_v53_human_create_has_no_key() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::migrations::run(&mut conn).unwrap();
@@ -463,11 +468,11 @@ mod tests {
     }
 
     #[test]
-    fn api_credentials_v52_expire_then_revive_mirrors_legacy_token() {
+    fn api_credentials_v53_expire_then_revive_mirrors_legacy_token() {
         let mut conn = open_to(50);
         let hash = [0xDDu8; 32];
-        let id = insert_v50_user(&conn, "eve", &hash, false);
-        crate::migrations::run_to(&mut conn, 52).unwrap();
+        let id = insert_pre_human_user(&conn, "eve", &hash, false);
+        crate::migrations::run_to(&mut conn, 53).unwrap();
 
         conn.execute(
             "UPDATE users SET token_expired_at = ?1 WHERE id = ?2",
@@ -511,8 +516,8 @@ mod tests {
     }
 
     #[test]
-    fn api_credentials_v52_post_v52_malformed_hash_write_aborts() {
-        let conn = open_to(52);
+    fn api_credentials_v53_post_v53_malformed_hash_write_aborts() {
+        let conn = open_to(53);
         let bad_id = UserId::new();
         let err = conn
             .execute(
@@ -571,16 +576,16 @@ mod tests {
     }
 
     #[test]
-    fn api_credentials_v52_v50_peppered_secret_still_authenticates() {
+    fn api_credentials_v53_v50_peppered_secret_still_authenticates() {
         let mut conn = open_to(50);
         let pepper = TokenPepper::new("test-pepper-1234567890abcdef");
         let active_secret = "v50-plaintext-active-secret";
         let expired_secret = "v50-plaintext-expired-secret";
         let active_hash = hash_token(active_secret, &pepper);
         let expired_hash = hash_token(expired_secret, &pepper);
-        let alice = insert_v50_user(&conn, "alice-v50", &active_hash, false);
-        let bob = insert_v50_user(&conn, "bob-v50", &expired_hash, true);
-        crate::migrations::run_to(&mut conn, 52).unwrap();
+        let alice = insert_pre_human_user(&conn, "alice-v50", &active_hash, false);
+        let bob = insert_pre_human_user(&conn, "bob-v50", &expired_hash, true);
+        crate::migrations::run_to(&mut conn, 53).unwrap();
 
         let copied_active: Vec<u8> = conn
             .query_row(

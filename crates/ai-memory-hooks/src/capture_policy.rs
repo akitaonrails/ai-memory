@@ -161,7 +161,10 @@ pub(crate) fn tool_observation_metadata(
 ) -> Option<ToolObservationMetadata> {
     let object = raw.as_object()?;
     let (name, id) = match agent {
-        AgentKind::ClaudeCode | AgentKind::CommandCode => (
+        // ZCode tool payloads carry Claude Code's snake_case aliases
+        // (`tool_name`, `tool_use_id`, `tool_input`) alongside the native
+        // camelCase — all captured live (engine v0.16.5, #512).
+        AgentKind::ClaudeCode | AgentKind::CommandCode | AgentKind::Zcode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -206,6 +209,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::Hermes
                             | AgentKind::KiroCli
                             | AgentKind::Pool
+                            | AgentKind::Zcode
                     ) {
                         "tool_input"
                     } else {
@@ -238,6 +242,19 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             None => ToolOutcome::Unknown,
         },
         AgentKind::AntigravityCli
+            if raw
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| !error.is_empty()) =>
+        {
+            ToolOutcome::Error
+        }
+        // ZCode fires `PostToolUseFailure` instead of `PostToolUse` when the
+        // tool throws; that payload carries `error` (string) + `error_details`
+        // (live-captured, #512). `exitCode` is deliberately not mapped to
+        // Success: the same `tool_response` object carries `timedOut` /
+        // `interrupted`, so exit code alone does not prove success.
+        AgentKind::Zcode
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -580,7 +597,10 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         | AgentKind::Devin
         | AgentKind::Hermes
         | AgentKind::KiroCli
-        | AgentKind::Pool => object
+        | AgentKind::Pool
+        // ZCode mirrors Claude Code's snake_case `tool_name`/`tool_input`
+        // aliases on every tool event (live-captured, #512).
+        | AgentKind::Zcode => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -1185,6 +1205,74 @@ mod tests {
         ] {
             assert_eq!(family(tool), expected, "tool: {tool}");
         }
+    }
+
+    #[test]
+    fn zcode_documented_tool_shape_is_closed_and_honors_exclusions() {
+        // Live-captured ZCode payload (engine v0.16.5, #512): the snake_case
+        // aliases carry exactly the fields Claude Code sends, including a
+        // real provider-format tool call id (`call_…`).
+        let raw = json!({
+            "hookEventName": "PostToolUse",
+            "toolName": "Write",
+            "tool_name": "Write",
+            "tool_use_id": "call_6d8f8fd5d9eb4888b0f9d5c6",
+            "toolInput": {"file_path": "/repo/secret/token.txt", "content": "do not retain"},
+            "tool_input": {"file_path": "/repo/secret/token.txt", "content": "do not retain"},
+            "session_id": "sess_0a5ba797",
+            "cwd": "/repo"
+        });
+        let metadata = tool_observation_metadata(AgentKind::Zcode, &raw, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(
+            metadata.tool_call_id.as_deref(),
+            Some("call_6d8f8fd5d9eb4888b0f9d5c6")
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let decision = policy.inspect(AgentKind::Zcode, &raw, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        let unknown = policy.inspect(AgentKind::Other, &raw, "/repo");
+        assert_eq!(
+            unknown.protocol().extraction_state(),
+            ExtractionState::UnsupportedSchema
+        );
+        assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    #[test]
+    fn zcode_post_tool_use_failure_error_maps_to_error_outcome() {
+        // Live-captured PostToolUseFailure payload (run 10, real model, #512):
+        // `error` is a plain string, `error_details` carries the internal
+        // error class.
+        let raw = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Write",
+            "error": "File not found: /proc/capture-test.txt",
+            "error_details": {
+                "message": "File not found: /proc/capture-test.txt",
+                "type": "FileSystemPortError"
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Zcode, &raw),
+            ToolOutcome::Error
+        );
+        // exitCode is deliberately not trusted for Success: the same
+        // tool_response object carries timedOut / interrupted flags.
+        let ok = json!({"tool_response": {"exitCode": 0}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Zcode, &ok),
+            ToolOutcome::Unknown
+        );
     }
 
     #[test]

@@ -1275,6 +1275,17 @@ pub enum AgentChoice {
     /// session-end event).
     #[value(alias = "poolside")]
     Pool,
+    /// ZCode (z.ai) — JSON-config lifecycle hooks in the root `hooks` block
+    /// of `~/.zcode/cli/config.json` (the same file `install-mcp --client
+    /// zcode` registers MCP servers in). Entries are exec-form
+    /// `type: "process"` (`command` + `args`, no shell), so ai-memory's
+    /// native `hook` command runs directly. ZCode injects `SessionStart`
+    /// stdout as model context (`hookSpecificOutput.additionalContext`,
+    /// verified live against engine v0.16.5), so handoff delivery works.
+    /// `Stop` fires at the end of every turn and there is no `SessionEnd`,
+    /// so close sessions with `ai-memory finalize-session --agent zcode`.
+    #[value(alias = "zai")]
+    Zcode,
 }
 
 impl AgentChoice {
@@ -1303,6 +1314,7 @@ impl AgentChoice {
             Self::KiroCli | Self::KiroCliV3 => AgentKind::KiroCli,
             Self::CommandCode => AgentKind::CommandCode,
             Self::Pool => AgentKind::Pool,
+            Self::Zcode => AgentKind::Zcode,
         }
     }
 
@@ -1314,7 +1326,9 @@ impl AgentChoice {
     #[must_use]
     pub const fn script_hook_subdir(self) -> Option<&'static str> {
         match self {
-            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw | Self::Zero => None,
+            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw | Self::Zero | Self::Zcode => {
+                None
+            }
             _ => Some(self.kind().as_str()),
         }
     }
@@ -1324,7 +1338,8 @@ impl AgentChoice {
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
     /// Agent kind to finalize. Defaults to Codex for backward compatibility;
-    /// Codex, Antigravity CLI, and Pool have no reliable true SessionEnd hook.
+    /// Codex, Antigravity CLI, Pool, and ZCode have no reliable true
+    /// SessionEnd hook.
     #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
     pub agent: AgentChoice,
     /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
@@ -2608,6 +2623,34 @@ mod tests {
             panic!("expected finalize-session for pool");
         };
         assert_eq!(args.agent, AgentChoice::Pool);
+    }
+
+    #[test]
+    fn zcode_hook_and_finalize_aliases_parse() {
+        for alias in ["zcode", "zai"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse ZCode alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for ZCode alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::Zcode);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Zcode);
+            // Native exec-form integration: no script bundle to stage.
+            assert_eq!(args.agent.script_hook_subdir(), None);
+        }
+        let cli = Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "zcode"])
+            .expect("failed to parse finalize-session --agent zcode");
+        let Command::FinalizeSession(args) = cli.command else {
+            panic!("expected finalize-session for zcode");
+        };
+        assert_eq!(args.agent, AgentChoice::Zcode);
     }
 
     #[test]

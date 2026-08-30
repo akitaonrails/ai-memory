@@ -3,14 +3,14 @@
 -- Abort — no partial commit — if any non-NULL hash is the wrong length.
 -- Keep users.token_hash / token_expired_at for rollback; runtime of
 -- this binary never reads them. Mirror triggers copy create/rotate/
--- expire/revive from a restored pre-V51 binary.
+-- expire/revive from a restored pre-V52 binary.
 
-CREATE TABLE v52_token_hash_guard (
+CREATE TABLE v53_token_hash_guard (
     ok INTEGER NOT NULL CHECK (ok = 0)
 );
-INSERT INTO v52_token_hash_guard (ok)
+INSERT INTO v53_token_hash_guard (ok)
 SELECT COUNT(*) FROM users WHERE token_hash IS NOT NULL AND length(token_hash) != 32;
-DROP TABLE v52_token_hash_guard;
+DROP TABLE v53_token_hash_guard;
 
 CREATE TABLE api_credentials (
     id            BLOB NOT NULL PRIMARY KEY,

@@ -486,8 +486,8 @@ If you're upgrading a machine-bearer-only install:
 - **No immediate action is required.** Existing
   `[auth].bearer_token` authentication continues to work as before.
   Configure human bootstrap/recovery only when enabling password login.
-- Migration V51 extends the existing `users` table with human role/password
-  state and creates `web_sessions`; V52 copies every valid legacy
+- Migration V52 extends the existing `users` table with human role/password
+  state and creates `web_sessions`; V53 copies every valid legacy
   `users.token_hash` into `api_credentials` without changing its digest or
   owner id.
 - Deprecated 1.x `user add`, `user expire`, `user revive`, and

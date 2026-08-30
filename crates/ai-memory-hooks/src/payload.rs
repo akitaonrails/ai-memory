@@ -600,6 +600,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::AntigravityCli
             | AgentKind::Hermes
             | AgentKind::Pool
+            | AgentKind::Zcode
     )
 }
 
@@ -1721,6 +1722,38 @@ mod tests {
         assert_eq!(env.title_hint.as_deref(), Some("tool file"));
         assert_eq!(env.session_id.as_deref(), Some("pool-session"));
         assert_eq!(env.cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn zcode_tool_payload_uses_the_captured_dual_casing_shape() {
+        // Live-captured PostToolUse payload (embedded engine v0.16.5, #512):
+        // native camelCase plus Claude Code-compatible snake_case aliases on
+        // every shared field.
+        let raw = serde_json::json!({
+            "hookEventName": "PostToolUse",
+            "hook_event_name": "PostToolUse",
+            "toolName": "Bash",
+            "tool_name": "Bash",
+            "toolCallId": "call_86cedcb9c40a4a40856e9ee7",
+            "tool_use_id": "call_86cedcb9c40a4a40856e9ee7",
+            "toolInput": {"command": "echo capture-ok"},
+            "tool_input": {"command": "echo capture-ok"},
+            "sessionId": "sess_4fc06da3",
+            "session_id": "sess_4fc06da3",
+            "cwd": "/tmp/zcode-capture"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("zcode".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(env.agent, AgentKind::Zcode);
+        assert_eq!(env.session_id.as_deref(), Some("sess_4fc06da3"));
+        assert_eq!(env.cwd.as_deref(), Some("/tmp/zcode-capture"));
+        assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
     }
 
     /// Body is well-formed JSON but the expected `session_id` /
