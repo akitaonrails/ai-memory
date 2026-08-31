@@ -422,15 +422,27 @@ Keep running `install-mcp` and `install-hooks` **as your own user**, not
 as the service — they write per-user agent config, and the rule at the
 top of this page still applies.
 
-> Verified from the WinSW project documentation (3.x; requires .NET
-> Framework 4.6.1+ or the self-contained .NET build) and from the
-> ai-memory CLI surface. The job-object failure mode was root-caused on a
-> real Windows install by the reporter of
-> [#530](https://github.com/akitaonrails/ai-memory/issues/530), including
-> the Task Scheduler event IDs above. The WinSW steps themselves have not
-> been executed by a maintainer on Windows hardware — corrections from
-> anyone who runs them, especially the Windows and WinSW versions they
-> were true for, are welcome.
+> Verified from the WinSW project documentation and the ai-memory CLI
+> surface, then run end to end on real hardware by the reporter of
+> [#530](https://github.com/akitaonrails/ai-memory/issues/530), who also
+> root-caused the job-object failure mode above from the Task Scheduler
+> event IDs.
+>
+> **Validated on** Windows 11 25H2 (build 26200.9168) with WinSW v2.12.0
+> (`WinSW-x64.exe`) and ai-memory v1.38.0, from an elevated PowerShell
+> session, against a throwaway service id, port and data directory.
+> Confirmed: `install`; `start`; the service `Running` as `LocalSystem`
+> with `StartType Automatic`; an MCP `initialize` answered over the bound
+> port; the absolute `--data-dir` honoured, with no
+> `systemprofile\AppData\Local\ai-memory` created; crash recovery — the
+> wrapped `ai-memory.exe` was force-killed and a new process was answering
+> 8s later, consistent with the 5-second `<onfailure>` delay plus startup;
+> and a clean `stop` + `uninstall`. The service was configured with
+> `StartType Automatic`; actual boot-time startup was not independently
+> exercised. At the time of this validation (2026-08-31), v2.12.0 was the
+> latest stable WinSW release; the published 3.x releases were
+> prereleases. Corrections from anyone running a different Windows or
+> WinSW version are welcome.
 
 ## Native Hook Command (Claude Code on Windows)
 

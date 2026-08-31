@@ -148,6 +148,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — a service runs as `LocalSystem`, so `%LOCALAPPDATA%` would resolve to the
   system profile and quietly serve an empty data directory.
 
+- Scenario E's WinSW steps were executed end to end on real Windows hardware,
+  and the doc now records what they were true for: Windows 11 25H2 (build
+  26200.9168), WinSW v2.12.0, ai-memory v1.38.0, from an elevated PowerShell
+  session against a throwaway service, port and data directory. Install, start,
+  `LocalSystem` + `Automatic`, an MCP `initialize` answered over the bound
+  port, the absolute `--data-dir` honoured, crash recovery ~8s after
+  force-killing the wrapped process, and a clean stop/uninstall all held;
+  the service was configured with `StartType Automatic`, but boot-time
+  startup was not independently exercised (#530).
+
 ## [1.38.0] - 2026-08-30
 
 ### Added
