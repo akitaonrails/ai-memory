@@ -102,6 +102,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drain honouring `AI_MEMORY_SERVER_URL` would send captured events to whatever
   address happened to be exported into the process that ran it.
 
+### Docs
+
+- `docs/windows.md` gains **Scenario E**, a persistent-server story for native
+  Windows. Scenarios C and D both ended at `ai-memory serve` in a foreground
+  terminal, while Linux got `Restart=on-failure` from the packaged systemd
+  units; WinSW is now documented as the equivalent supervisor (#530).
+
+  It leads with the trap rather than the recipe. A Scheduled Task whose action
+  is a PowerShell script calling `Start-Process` looks correct and is silently
+  killed at the next reboot: `Start-Process` returns immediately, the script
+  exits, and Task Scheduler tears down the job object the still-running server
+  was never detached from. The only symptom is a permanently green
+  `LastTaskResult = 0`, which is why it costs hours. Reported and root-caused
+  with event-log evidence by @gabrielscharb.
+
+  Also documented: `sc create` against `ai-memory.exe` cannot work (no SCM
+  control-code dispatcher, and none is planned — the resiliency belongs in the
+  supervisor, as it does on Linux); the corrected Task Scheduler shape for
+  anyone who wants one anyway; and why the WinSW config must use absolute paths
+  — a service runs as `LocalSystem`, so `%LOCALAPPDATA%` would resolve to the
+  system profile and quietly serve an empty data directory.
+
 ## [1.38.0] - 2026-08-30
 
 ### Added
