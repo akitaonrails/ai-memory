@@ -153,6 +153,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three destructive commands in one place instead of documenting the limits of
   one and overstating the other two.
 
+- `install-hooks` now finds the bundled `hooks/` directory when `ai-memory` is
+  invoked through a symlink (#546). Reported by @alvadorn against 1.38.0 on
+  macOS arm64 with `~/.local/bin/ai-memory -> <repo>/target/release/ai-memory`
+  — the layout the quick start encourages.
+
+  `std::env::current_exe()` is not consistent across platforms: Linux reads
+  `/proc/self/exe` and gets a fully resolved path, macOS returns the path as
+  invoked. Every candidate is derived by walking *parents* of it, so an
+  unresolved symlink did not mislead one guess — it moved the entire search to
+  `$HOME`, and no `hooks/` directory was ever reachable. Resolving the path
+  first makes macOS agree with Linux, where it is a no-op.
+
+  Two smaller fixes alongside it. The cwd's git checkout is now probed as a
+  **last** candidate: the cwd was previously never consulted, which made the
+  failure actively misleading — the error reads like a wrong-directory problem,
+  so the first thing anyone tries is `cd` into the checkout, and that changed
+  nothing. It is deliberately last, so it can only rescue a lookup that was
+  going to fail and never displaces an installed bundle. The error message also
+  now names `--hooks-dir`, the escape hatch it previously left unmentioned.
+
 ### Docs
 
 - `docs/windows.md` gains **Scenario E**, a persistent-server story for native

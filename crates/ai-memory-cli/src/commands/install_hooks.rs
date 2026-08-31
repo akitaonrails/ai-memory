@@ -4177,13 +4177,18 @@ fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<Path
         repo_root_guess(),
         exe_dir_guess(),
         dirs::data_local_dir(),
+        cwd_repo_root(),
     );
     for path in &candidates {
         if !path.as_os_str().is_empty() && path.is_dir() {
             return Ok(path.clone());
         }
     }
-    anyhow::bail!("could not locate hooks directory. Tried: {:?}", candidates,);
+    anyhow::bail!(
+        "could not locate hooks directory. Tried: {candidates:?}\n\n\
+         Pass --hooks-dir <dir> to point at the bundle explicitly, where <dir> \
+         is the PARENT holding `{sub}/` (e.g. `--hooks-dir <repo>/hooks`)."
+    );
 }
 
 fn hook_source_candidates(
@@ -4191,8 +4196,9 @@ fn hook_source_candidates(
     repo_root: Option<PathBuf>,
     exe_dir: Option<PathBuf>,
     data_local_dir: Option<PathBuf>,
+    cwd_repo_root: Option<PathBuf>,
 ) -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(5);
+    let mut candidates = Vec::with_capacity(6);
     // Cargo-run from the repo.
     if let Some(root) = repo_root {
         candidates.push(root.join("hooks").join(sub));
@@ -4213,24 +4219,75 @@ fn hook_source_candidates(
     if let Some(dir) = data_local_dir {
         candidates.push(dir.join("ai-memory/hooks").join(sub));
     }
+    // Last resort: the checkout the caller is standing in (#546).
+    if let Some(root) = cwd_repo_root {
+        candidates.push(root.join("hooks").join(sub));
+    }
     candidates
+}
+
+/// The running binary's real path, with symlinks resolved.
+///
+/// `std::env::current_exe()` is not consistent across platforms here. On Linux
+/// it reads `/proc/self/exe`, which is already fully resolved; on macOS it
+/// returns the path as invoked, symlink and all. Every candidate below is
+/// derived from this path by walking *parents*, so an unresolved symlink does
+/// not just mislead one guess — it moves the whole search to the wrong part of
+/// the filesystem.
+///
+/// That is exactly what `~/.local/bin/ai-memory -> <repo>/target/release/…`
+/// did: `repo_root_guess` walked up from `~/.local/bin` to `$HOME` and probed
+/// `$HOME/hooks/<agent>` (#546). Canonicalizing first makes macOS agree with
+/// Linux; on Linux it is a no-op, since the path is already resolved.
+///
+/// A path that cannot be canonicalized (it vanished, or a permission denies
+/// the walk) falls back to the original rather than giving up: an unresolved
+/// guess is still worth probing.
+fn resolve_exe_path(exe: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&exe).unwrap_or(exe)
+}
+
+fn current_exe_resolved() -> Option<PathBuf> {
+    std::env::current_exe().ok().map(resolve_exe_path)
+}
+
+/// Workspace root for a binary at `<repo>/target/{debug,release}/<name>`.
+/// Split from [`repo_root_guess`] so the derivation is testable against a
+/// path that is not this test binary's own.
+fn repo_root_from_exe(exe: &Path) -> Option<PathBuf> {
+    exe.parent()?.parent()?.parent().map(Path::to_path_buf)
 }
 
 fn repo_root_guess() -> Option<PathBuf> {
     // When the binary lives under target/{debug,release}/<name>, the
     // workspace root is two parents up.
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent()?.parent()?.parent().map(Path::to_path_buf))
+    current_exe_resolved()
+        .as_deref()
+        .and_then(repo_root_from_exe)
 }
 
 /// Directory the running binary lives in. The release tarball ships the
 /// `hooks/` bundle right next to the binary, so a no-`--source`
 /// `install-hooks` finds it there (issue #107).
 fn exe_dir_guess() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
+    current_exe_resolved().and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// Git checkout containing the current directory, if any.
+///
+/// Probed last, purely as a safety net. Before #546 the cwd was never
+/// consulted at all, which made the failure actively misleading: the error
+/// reads like a wrong-directory problem, so the first thing anyone tries is
+/// `cd` into the checkout — and that changed nothing.
+///
+/// Deliberately the *last* candidate, so it can only rescue a lookup that was
+/// going to fail outright. It never displaces an installed bundle for someone
+/// who happens to be sitting in a checkout.
+fn cwd_repo_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    cwd.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 // CLAUDE_CODE_EVENTS + build_claude_code_payload now live in
@@ -6674,6 +6731,82 @@ model = "gpt-5"
         assert!(format!("{err:#}").contains("no hook scripts"));
     }
 
+    /// #546: `~/.local/bin/ai-memory -> <repo>/target/release/ai-memory` is
+    /// the layout the quick start encourages, and it broke discovery outright
+    /// on macOS, where `current_exe()` returns the symlink rather than its
+    /// target. Every candidate is derived by walking parents of that path, so
+    /// the whole search moved to `$HOME`.
+    ///
+    /// The two halves of this test are each other's control: the first pins
+    /// the broken derivation, the second pins the fix. Remove the
+    /// canonicalization and the second assertion fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_binary_resolves_back_to_its_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let real_exe = repo.join("target").join("release").join("ai-memory");
+        fs::create_dir_all(real_exe.parent().unwrap()).unwrap();
+        fs::write(&real_exe, b"binary").unwrap();
+        fs::create_dir_all(repo.join("hooks").join("claude-code")).unwrap();
+
+        let bin = tmp.path().join("home").join(".local").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let link = bin.join("ai-memory");
+        std::os::unix::fs::symlink(&real_exe, &link).unwrap();
+
+        // The bug: three parents up from ~/.local/bin/ai-memory is $HOME, so
+        // the probe became `$HOME/hooks/claude-code` and never touched the
+        // checkout.
+        assert_eq!(
+            repo_root_from_exe(&link).unwrap(),
+            tmp.path().join("home"),
+            "unresolved, the guess walks out of the checkout entirely"
+        );
+
+        // The fix: canonicalize first and the derivation lands in the repo.
+        let resolved = repo_root_from_exe(&resolve_exe_path(link)).unwrap();
+        assert_eq!(
+            fs::canonicalize(&resolved).unwrap(),
+            fs::canonicalize(&repo).unwrap(),
+        );
+        assert!(
+            resolved.join("hooks").join("claude-code").is_dir(),
+            "and the hooks bundle is where it was all along"
+        );
+    }
+
+    /// A path that cannot be canonicalized is still worth probing, so
+    /// resolution falls back to the original rather than dropping the guess.
+    #[test]
+    fn an_unresolvable_exe_path_is_kept_as_is() {
+        let missing = PathBuf::from("/nonexistent-546/target/release/ai-memory");
+        assert_eq!(resolve_exe_path(missing.clone()), missing);
+    }
+
+    /// The cwd checkout is a last resort and must never displace an installed
+    /// bundle for someone who merely happens to be standing in a repo.
+    #[test]
+    fn the_cwd_checkout_is_probed_last() {
+        let candidates = hook_source_candidates(
+            "claude-code",
+            Some(PathBuf::from("/repo")),
+            Some(PathBuf::from("/opt/ai-memory")),
+            Some(PathBuf::from("/home/alice/.local/share")),
+            Some(PathBuf::from("/home/alice/src/ai-memory")),
+        );
+
+        assert_eq!(
+            candidates.last().unwrap(),
+            &PathBuf::from("/home/alice/src/ai-memory/hooks/claude-code"),
+        );
+        assert_eq!(
+            candidates[0],
+            PathBuf::from("/repo/hooks/claude-code"),
+            "the exe-derived checkout still wins"
+        );
+    }
+
     #[test]
     fn hook_source_candidates_include_native_package_dir() {
         let candidates = hook_source_candidates(
@@ -6681,6 +6814,7 @@ model = "gpt-5"
             Some(PathBuf::from("/repo")),
             Some(PathBuf::from("/opt/ai-memory")),
             Some(PathBuf::from("/home/alice/.local/share")),
+            None,
         );
 
         assert_eq!(candidates[0], PathBuf::from("/repo/hooks/claude-code"));
@@ -6711,6 +6845,7 @@ model = "gpt-5"
             "claude-code",
             None,
             Some(PathBuf::from("/private/tmp/ai-memory-macos-aarch64")),
+            None,
             None,
         );
         assert!(
