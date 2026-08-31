@@ -538,6 +538,20 @@ pub async fn drain(
 
     let mut idx = 0;
     let mut batch_supported = true;
+    // Endpoints that proved unreachable during THIS pass. A spooled entry
+    // carries the URL it was captured against, so a spool can hold entries
+    // addressed to a port nothing listens on any more (an old `--bind`, a
+    // restarted server on a new port). Those can never be delivered, and
+    // before #493 the drain stopped at the first one — charging a single
+    // attempt and returning, which left every deliverable entry behind them
+    // stuck until it aged out of the 7-day window and was dropped undelivered.
+    //
+    // Recording the dead endpoint lets the pass skip its entries (without
+    // charging attempts they did not earn) and carry on to entries addressed
+    // somewhere that answers. A total outage is unchanged: every entry shares
+    // the one dead endpoint, so the pass still ends having burnt one attempt.
+    let mut unreachable_endpoints: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     'drain: while idx < files.len() {
         if started.elapsed() >= total_budget {
             result.remaining += files.len() - idx;
@@ -549,6 +563,12 @@ pub async fn drain(
         let Some(entry) = load_live_entry(&path, &mut result) else {
             continue;
         };
+        if unreachable_endpoints.contains(&batch_endpoint(&entry.url)) {
+            // Already proven undeliverable this pass. Leave it queued and do
+            // not bump attempts: it was never actually attempted.
+            result.remaining += 1;
+            continue;
+        }
         if body_is_malformed(&entry) {
             bump_or_drop(&path, &entry, &mut result);
             continue;
@@ -693,11 +713,29 @@ pub async fn drain(
                             PostOutcome::Failed => {
                                 bump_or_drop(path, entry, &mut result);
                             }
+                            PostOutcome::Unreachable => {
+                                // Same reasoning as the batch arm: the address
+                                // is dead, not the entry. Charge it once, then
+                                // skip its siblings for the rest of the pass.
+                                bump_or_drop(path, entry, &mut result);
+                                unreachable_endpoints.insert(batch_endpoint(&entry.url));
+                            }
                         }
                     }
                 }
+                BatchOutcome::Unreachable => {
+                    // Nothing is listening at this endpoint. Charge the first
+                    // entry one attempt so a permanently dead address still
+                    // ages out, mark the endpoint, and keep going: entries
+                    // addressed elsewhere in this spool are still deliverable.
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    result.remaining += chunk.len().saturating_sub(1);
+                    unreachable_endpoints.insert(base.clone());
+                    continue;
+                }
                 BatchOutcome::Failed => {
-                    // The batch didn't land (transport error / unexpected status).
+                    // The batch didn't land (server answered with an unexpected
+                    // status, or the body did not parse).
                     // The server may have processed none, some, or all items before
                     // the client saw the failure. Charge only the first item
                     // conservatively and leave the rest queued for a future pass so
@@ -730,6 +768,10 @@ pub async fn drain(
                 }
                 PostOutcome::Failed => {
                     bump_or_drop(&path, &entry, &mut result);
+                }
+                PostOutcome::Unreachable => {
+                    bump_or_drop(&path, &entry, &mut result);
+                    unreachable_endpoints.insert(batch_endpoint(&entry.url));
                 }
             }
         }
@@ -1488,6 +1530,81 @@ mod tests {
         let loaded: SpoolEntry =
             serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
         assert_eq!(loaded.attempts, 0, "429 must not consume the retry budget");
+    }
+
+    /// #493: a spooled entry carries the URL it was captured against, so a
+    /// spool can hold entries addressed to a port nothing listens on any more.
+    /// Before the fix the drain stopped at the first one, so events queued
+    /// behind a dead-port head were never delivered — they sat until the
+    /// 7-day window dropped them undelivered.
+    #[tokio::test]
+    async fn dead_endpoint_at_the_head_does_not_block_deliverable_entries_behind_it() {
+        // A live server for the entries that *can* be delivered.
+        let live = serve_counting_hook(
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            "200 OK",
+        )
+        .await;
+
+        // A port with nothing on it: bind, read the address, then drop.
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        // Oldest first: the head is undeliverable, the rest are fine — the
+        // reported shape. Kept to `MAX_SPOOL_FILES` (3 under cfg(test)) so
+        // enqueue does not prune the fixture out from under the test.
+        for _ in 0..1 {
+            enqueue(
+                &spool,
+                &entry_for(
+                    format!("http://{dead}/hook?event=x"),
+                    "{}".into(),
+                    None,
+                    false,
+                ),
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            enqueue(
+                &spool,
+                &entry_for(
+                    format!("http://{live}/hook?event=x"),
+                    "{}".into(),
+                    None,
+                    false,
+                ),
+            )
+            .unwrap();
+        }
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+        )
+        .await;
+
+        assert_eq!(
+            r.sent, 2,
+            "the deliverable entries must be sent in the same pass, not stranded \
+             behind the dead endpoint"
+        );
+        let (files, _) = list_entries(&spool).unwrap();
+        assert_eq!(files.len(), 1, "only the dead-port entry stays queued");
+        let loaded: SpoolEntry =
+            serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(
+            loaded.attempts, 1,
+            "the entry actually attempted is charged exactly once"
+        );
     }
 
     #[tokio::test]
