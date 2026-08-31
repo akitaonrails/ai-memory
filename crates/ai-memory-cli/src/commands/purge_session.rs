@@ -68,8 +68,13 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
     .await?;
 
     let n = |key: &str| report[key].as_u64().unwrap_or(0);
+    // The session id is deliberately not echoed. The caller passed it, so
+    // repeating it adds nothing they do not have, and this command exists to
+    // make a session stop existing — writing its id into terminal scrollback
+    // and shell history leaves a pointer to the thing just erased. The scope
+    // and the counts are what confirm the operation did what was asked.
     println!(
-        "Purged session {session_id} from {workspace}/{project}: \
+        "Purged session from {workspace}/{project}: \
          {} observations, {} handoffs, {} pages, {} auto-improve runs.",
         n("observations_deleted"),
         n("handoffs_deleted"),
