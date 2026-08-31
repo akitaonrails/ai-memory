@@ -2959,37 +2959,6 @@ pub fn insert_wiki_migration(
     Ok(())
 }
 
-/// Delete a project's rows inside one transaction.
-///
-/// This is a *logical* delete unless `compaction` is [`Compaction::Reclaim`].
-/// The rows are gone and nothing reaches them through the API or search, but
-/// their bytes remain in free pages of the database file until it is
-/// rewritten — as with any SQLite delete. Neither mode is forensic erasure:
-/// the wiki git history and any earlier backup still hold the content.
-///
-/// Execution order:
-/// 1. Count rows in each dependent table (pages/all versions, sessions,
-///    observations, handoffs, embeddings) before the delete so we can
-///    report how many rows were removed.
-/// 2. Collect all distinct page paths stored under the project — these are
-///    the on-disk files the caller must clean up after this function returns.
-/// 3. DELETE FROM projects WHERE id = ? — the ON DELETE CASCADE clauses in
-///    V01 + V02 propagate the delete to pages, sessions, observations,
-///    handoffs, and page_embeddings automatically.
-/// 4. Commit and return the [`PurgeSummary`].
-///
-/// The `workspace_project_label` string is passed in by the caller (the
-/// admin handler has the human-readable names; the writer only has IDs) and
-/// forwarded verbatim into [`PurgeSummary::label`] for logging.
-///
-/// `force` overrides the live-managed-run guard (step 0): `workstreams`
-/// cascades out of `projects`, so purging a scope whose lease is still live
-/// would delete the lease row out from under a running agent.
-///
-/// # Errors
-/// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
-/// still live and `force` is false, or [`StoreError`] if any SQL statement
-/// fails. The transaction is rolled back automatically on error.
 /// Whether a destructive scope operation should reclaim the freed bytes
 /// afterwards. Shared by [`purge_session`], [`purge_project`] and
 /// [`delete_workspace`] so the family makes one promise, not three.
@@ -3022,6 +2991,17 @@ pub enum Compaction {
     Reclaim,
 }
 
+/// Every FTS5 index in the schema, which is what [`reclaim_freed_pages`]
+/// rebuilds.
+///
+/// Named here rather than spelled inside the SQL so the "every" is checkable:
+/// `reclaim_rebuilds_every_fts_index_in_the_schema` compares this list against
+/// `sqlite_master` and fails when a new index is added without a decision
+/// being made about it. A list inside a string literal cannot be compared to
+/// anything, and the failure mode of getting it wrong is silent — text stays
+/// searchable after an operator asked for it to be reclaimed.
+const ALL_FTS_INDEXES: &[&str] = &["observations_fts", "pages_fts", "workstream_events_fts"];
+
 /// Rebuild every FTS5 index, then `VACUUM`. Runs after the caller's
 /// transaction has committed: `VACUUM` cannot run inside one, and a rebuild is
 /// a whole-index operation we do not want holding the write lock for the
@@ -3037,12 +3017,14 @@ pub enum Compaction {
 /// follows in every case. A `rebuild` is idempotent, so the extra work is a
 /// no-op for a scope that deleted nothing from that table.
 fn reclaim_freed_pages(conn: &Connection) -> StoreResult<()> {
-    conn.execute_batch(
-        "INSERT INTO observations_fts(observations_fts) VALUES('rebuild'); \
-         INSERT INTO pages_fts(pages_fts) VALUES('rebuild'); \
-         INSERT INTO workstream_events_fts(workstream_events_fts) VALUES('rebuild'); \
-         VACUUM;",
-    )?;
+    let mut batch = String::new();
+    for index in ALL_FTS_INDEXES {
+        // Compile-time constants, never caller input; FTS5 has no
+        // bind-parameter form for the rebuild statement.
+        batch.push_str(&format!("INSERT INTO {index}({index}) VALUES('rebuild'); "));
+    }
+    batch.push_str("VACUUM;");
+    conn.execute_batch(&batch)?;
     Ok(())
 }
 
@@ -3269,6 +3251,37 @@ pub fn purge_session(
     })
 }
 
+/// Delete a project's rows inside one transaction.
+///
+/// This is a *logical* delete unless `compaction` is [`Compaction::Reclaim`].
+/// The rows are gone and nothing reaches them through the API or search, but
+/// their bytes remain in free pages of the database file until it is
+/// rewritten — as with any SQLite delete. Neither mode is forensic erasure:
+/// the wiki git history and any earlier backup still hold the content.
+///
+/// Execution order:
+/// 1. Count rows in each dependent table (pages/all versions, sessions,
+///    observations, handoffs, embeddings) before the delete so we can
+///    report how many rows were removed.
+/// 2. Collect all distinct page paths stored under the project — these are
+///    the on-disk files the caller must clean up after this function returns.
+/// 3. DELETE FROM projects WHERE id = ? — the ON DELETE CASCADE clauses in
+///    V01 + V02 propagate the delete to pages, sessions, observations,
+///    handoffs, and page_embeddings automatically.
+/// 4. Commit and return the [`PurgeSummary`].
+///
+/// The `workspace_project_label` string is passed in by the caller (the
+/// admin handler has the human-readable names; the writer only has IDs) and
+/// forwarded verbatim into [`PurgeSummary::label`] for logging.
+///
+/// `force` overrides the live-managed-run guard (step 0): `workstreams`
+/// cascades out of `projects`, so purging a scope whose lease is still live
+/// would delete the lease row out from under a running agent.
+///
+/// # Errors
+/// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
+/// still live and `force` is false, or [`StoreError`] if any SQL statement
+/// fails. The transaction is rolled back automatically on error.
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -5212,6 +5225,45 @@ pub(crate) mod tests {
             "documented boundary: purge is a logical delete. If this now fails, \
              byte-level removal was added and the #387 scope note, the CLI help \
              and the operator-facing docs all need updating to match."
+        );
+    }
+
+    /// `reclaim_freed_pages` promises to rebuild *every* FTS5 index, which is
+    /// what makes it safe for all three scopes to share one definition of
+    /// "reclaimed". #548 established that a project or workspace delete
+    /// cascades `workstream_events` out without firing the trigger that would
+    /// drop its rows from `workstream_events_fts`, so an index left out of the
+    /// batch keeps live entries for rows that no longer exist.
+    ///
+    /// The promise is checked against the schema rather than trusted. A new
+    /// FTS index added later fails here, which routes whoever adds it into the
+    /// decision — the alternative is that `--compact` silently skips it and
+    /// text stays searchable after an operator asked for it to be reclaimed,
+    /// with the response still reporting `compacted: true`.
+    #[test]
+    fn reclaim_rebuilds_every_fts_index_in_the_schema() {
+        let (_tmp, conn, _ws, _proj) = fresh_db();
+        let mut in_schema: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND sql LIKE '%USING fts5%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        in_schema.sort();
+
+        let mut declared: Vec<String> = ALL_FTS_INDEXES.iter().map(|s| (*s).to_owned()).collect();
+        declared.sort();
+
+        assert_eq!(
+            in_schema, declared,
+            "ALL_FTS_INDEXES is out of date. `reclaim_freed_pages` rebuilds only \
+             what is listed there, so an FTS index missing from it survives a \
+             --compact with entries for deleted rows still in it. Add the new \
+             index, or exclude it deliberately here and say why."
         );
     }
 
