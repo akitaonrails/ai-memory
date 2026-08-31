@@ -21,11 +21,12 @@
 //! - `POST /admin/commit`         — stage + commit the wiki tree via git.
 //! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
 //! - `POST /admin/restore-page`   — restore one page from a checkpoint.
-//! - `POST /admin/purge-project`  — delete a project and all its data.
+//! - `POST /admin/purge-project`  — delete a project's rows and wiki files.
 //! - `POST /admin/purge-session`  — delete one session and what it derived.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
-//! - `POST /admin/delete-workspace` — delete a workspace and all of its projects.
+//! - `POST /admin/delete-workspace` — delete a workspace's rows and every
+//!   project under it.
 //! - `POST /admin/merge-workspace` — fold every project of one workspace into
 //!   another, then delete the emptied source workspace.
 //! - `POST /admin/move-project`   — move a project into another workspace
@@ -3398,6 +3399,11 @@ struct PurgeProjectRequest {
     /// out from under a running agent, which then cannot save its history.
     #[serde(default)]
     force: bool,
+    /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
+    /// delete commits. Off by default; see `ai_memory_store::Compaction` for
+    /// the cost and for what it does not guarantee.
+    #[serde(default)]
+    compact: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/purge-project`.
@@ -3432,6 +3438,10 @@ pub struct PurgeProjectReport {
     /// Post-purge checkpoint, if the purge changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Whether the freed bytes were reclaimed (`compact: true` was requested
+    /// and the FTS rebuilds plus `VACUUM` ran). Not a claim of erasure — the
+    /// wiki git history and pre-purge backups still hold the content.
+    pub compacted: bool,
 }
 
 async fn remove_workstream_segment_storage(
@@ -3560,9 +3570,15 @@ async fn handle_purge_project(
         Err(e) => return e,
     };
 
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+
     let summary = match state
         .writer
-        .purge_project(ws_id, proj_id, &label, author_id, req.force)
+        .purge_project(ws_id, proj_id, &label, author_id, req.force, compaction)
         .await
     {
         Ok(s) => s,
@@ -3622,6 +3638,7 @@ async fn handle_purge_project(
         files_failed,
         pre_checkpoint,
         checkpoint,
+        compacted: summary.compacted,
     };
 
     (
@@ -3715,6 +3732,11 @@ struct DeleteWorkspaceRequest {
     /// non-empty workspace is refused so a typo can't wipe live data.
     #[serde(default)]
     force: bool,
+    /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
+    /// delete commits. Off by default; see `ai_memory_store::Compaction` for
+    /// the cost and for what it does not guarantee.
+    #[serde(default)]
+    compact: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/delete-workspace`.
@@ -3743,6 +3765,10 @@ pub struct DeleteWorkspaceResult {
     /// Post-delete mirror checkpoint, if one was taken.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Whether the freed bytes were reclaimed (`compact: true` was requested
+    /// and the FTS rebuilds plus `VACUUM` ran). Not a claim of erasure — the
+    /// wiki git history and pre-delete backups still hold the content.
+    pub compacted: bool,
 }
 
 /// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
@@ -3756,7 +3782,12 @@ async fn handle_delete_workspace(
     let actor = actor_ext
         .map(|axum::Extension(a)| a)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
-    match delete_workspace_core(&state, &req.workspace, req.force, actor).await {
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+    match delete_workspace_core(&state, &req.workspace, req.force, actor, compaction).await {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
@@ -3775,6 +3806,7 @@ async fn delete_workspace_core(
     workspace: &str,
     force: bool,
     actor: ai_memory_core::ActorContext,
+    compaction: ai_memory_store::Compaction,
 ) -> Result<DeleteWorkspaceResult, MoveErr> {
     let ws_id = lookup_ws_no_create(state, workspace).await?;
 
@@ -3816,7 +3848,11 @@ async fn delete_workspace_core(
     let pre_checkpoint =
         checkpoint_or_500(&state.wiki, format!("pre-delete-workspace {workspace}"))?;
 
-    let summary = match state.writer.delete_workspace(ws_id, force).await {
+    let summary = match state
+        .writer
+        .delete_workspace(ws_id, force, compaction)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             let status = match &e {
@@ -3870,6 +3906,7 @@ async fn delete_workspace_core(
         files_failed,
         pre_checkpoint,
         checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {workspace}")),
+        compacted: summary.compacted,
     })
 }
 
@@ -5623,7 +5660,14 @@ async fn copy_purge_merge(
     // `purge_project` here, so the audit author is left NULL.
     let summary = match state
         .writer
-        .purge_project(src_ws, src_proj, &label, None, false)
+        .purge_project(
+            src_ws,
+            src_proj,
+            &label,
+            None,
+            false,
+            ai_memory_store::Compaction::Skip,
+        )
         .await
     {
         Ok(s) => s,
@@ -5844,21 +5888,28 @@ async fn handle_merge_workspace(
     // Every project moved → the source workspace is now empty. Delete the shell
     // with force=false: it must be empty, so a race that repopulated it aborts
     // safely without wiping fresh data.
-    let source_workspace_deleted =
-        match delete_workspace_core(&state, &req.from, false, actor).await {
-            Ok(_) => true,
-            Err((_status, body)) => {
-                // The moves succeeded; only the final empty-shell delete failed
-                // (e.g. a concurrent write recreated a project). No data was
-                // lost, so report success-with-caveat instead of a hard error.
-                warn!(
-                    workspace = %req.from,
-                    "merge-workspace: source drained but shell delete failed: {:?}",
-                    body
-                );
-                false
-            }
-        };
+    let source_workspace_deleted = match delete_workspace_core(
+        &state,
+        &req.from,
+        false,
+        actor,
+        ai_memory_store::Compaction::Skip,
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err((_status, body)) => {
+            // The moves succeeded; only the final empty-shell delete failed
+            // (e.g. a concurrent write recreated a project). No data was
+            // lost, so report success-with-caveat instead of a hard error.
+            warn!(
+                workspace = %req.from,
+                "merge-workspace: source drained but shell delete failed: {:?}",
+                body
+            );
+            false
+        }
+    };
 
     let report = MergeWorkspaceReport {
         from: req.from,

@@ -290,6 +290,8 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         /// Purge even when a managed workstream still holds a live run lease.
         force: bool,
+        /// Whether to reclaim the freed bytes after the delete commits.
+        compaction: ops::Compaction,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
     /// Delete one session and everything derived from it, inside a single
@@ -309,6 +311,8 @@ pub(crate) enum WriteCmd {
     DeleteWorkspace {
         workspace_id: WorkspaceId,
         force: bool,
+        /// Whether to reclaim the freed bytes after the delete commits.
+        compaction: ops::Compaction,
         reply: oneshot::Sender<StoreResult<DeleteWorkspaceSummary>>,
     },
     /// Rename a workspace's `name` column (UUID-keyed dir doesn't move).
@@ -1215,6 +1219,7 @@ impl WriterHandle {
         label: impl Into<String>,
         author_id: Option<ai_memory_core::UserId>,
         force: bool,
+        compaction: ops::Compaction,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
@@ -1223,6 +1228,7 @@ impl WriterHandle {
             label: label.into(),
             author_id,
             force,
+            compaction,
             reply: tx,
         })
         .await?;
@@ -1272,11 +1278,13 @@ impl WriterHandle {
         &self,
         workspace_id: WorkspaceId,
         force: bool,
+        compaction: ops::Compaction,
     ) -> StoreResult<DeleteWorkspaceSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeleteWorkspace {
             workspace_id,
             force,
+            compaction,
             reply: tx,
         })
         .await?;
@@ -2243,6 +2251,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 label,
                 author_id,
                 force,
+                compaction,
                 reply,
             } => {
                 let result = ops::purge_project(
@@ -2252,6 +2261,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &label,
                     author_id,
                     force,
+                    compaction,
                 );
                 send_or_warn(reply, result, "purge_project");
             }
@@ -2276,9 +2286,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::DeleteWorkspace {
                 workspace_id,
                 force,
+                compaction,
                 reply,
             } => {
-                let result = ops::delete_workspace(&mut conn, &workspace_id, force);
+                let result = ops::delete_workspace(&mut conn, &workspace_id, force, compaction);
                 send_or_warn(reply, result, "delete_workspace");
             }
             WriteCmd::RenameWorkspace {

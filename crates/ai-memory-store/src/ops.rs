@@ -148,6 +148,9 @@ pub struct PurgeSummary {
     /// pre-delete identifiers to remove `raw/workstreams/<id>/` after the SQL
     /// transaction commits and to report any filesystem partial failure.
     pub workstream_ids: Vec<String>,
+    /// Whether the freed bytes were reclaimed (the FTS rebuilds and `VACUUM`
+    /// ran). False for the default logical delete.
+    pub compacted: bool,
 }
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -2801,41 +2804,20 @@ pub fn insert_wiki_migration(
     Ok(())
 }
 
-/// Delete a project and all its data inside one transaction.
+/// Whether a destructive operation should reclaim the freed bytes afterwards.
 ///
-/// Execution order:
-/// 1. Count rows in each dependent table (pages/all versions, sessions,
-///    observations, handoffs, embeddings) before the delete so we can
-///    report how many rows were removed.
-/// 2. Collect all distinct page paths stored under the project — these are
-///    the on-disk files the caller must clean up after this function returns.
-/// 3. DELETE FROM projects WHERE id = ? — the ON DELETE CASCADE clauses in
-///    V01 + V02 propagate the delete to pages, sessions, observations,
-///    handoffs, and page_embeddings automatically.
-/// 4. Commit and return the [`PurgeSummary`].
-///
-/// The `workspace_project_label` string is passed in by the caller (the
-/// admin handler has the human-readable names; the writer only has IDs) and
-/// forwarded verbatim into [`PurgeSummary::label`] for logging.
-///
-/// `force` overrides the live-managed-run guard (step 0): `workstreams`
-/// cascades out of `projects`, so purging a scope whose lease is still live
-/// would delete the lease row out from under a running agent.
-///
-/// # Errors
-/// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
-/// still live and `force` is false, or [`StoreError`] if any SQL statement
-/// fails. The transaction is rolled back automatically on error.
-/// Whether [`purge_session`] should reclaim the freed bytes afterwards.
+/// Shared by [`purge_session`], [`purge_project`] and [`delete_workspace`].
 ///
 /// A purge is a logical delete: the rows are gone and nothing can reach them
 /// through the API or through search, but their bytes remain in free pages of
 /// the database file until the file is rewritten — exactly as for any other
 /// SQLite delete.
 ///
-/// [`Compaction::Reclaim`] additionally rebuilds the affected FTS5 indexes
-/// (the tokens survive an ordinary delete inside the index segments) and runs
-/// `VACUUM`, after the deletion has committed.
+/// [`Compaction::Reclaim`] additionally rebuilds the FTS5 indexes the
+/// operation actually touched (the tokens survive an ordinary delete inside
+/// the index segments) and runs `VACUUM`, after the deletion has committed.
+/// Which indexes those are is per-operation, not universal — see
+/// [`reclaim_after_commit`].
 ///
 /// # Cost and limits
 ///
@@ -2852,8 +2834,44 @@ pub fn insert_wiki_migration(
 pub enum Compaction {
     /// Leave the freed pages alone. The default, and what #387 promises.
     Skip,
-    /// Rebuild the affected FTS indexes and `VACUUM` after committing.
+    /// Rebuild the touched FTS indexes and `VACUUM` after committing.
     Reclaim,
+}
+
+/// FTS5 indexes a *session* purge can dirty.
+const SESSION_SCOPED_FTS: &[&str] = &["observations_fts", "pages_fts"];
+
+/// FTS5 indexes a *project* or *workspace* purge can dirty.
+///
+/// The extra one over [`SESSION_SCOPED_FTS`] is `workstream_events_fts`:
+/// `workstreams` cascades out of both `projects` and `workspaces`, and
+/// `workstream_events` cascades out of that (`V31__managed_workstreams.sql`).
+/// A managed workstream's event ledger is reachable from neither a session id
+/// nor a page, so no session purge ever touches this index and a project or
+/// workspace purge always can.
+const SCOPE_WIDE_FTS: &[&str] = &["observations_fts", "pages_fts", "workstream_events_fts"];
+
+/// Rebuild the named FTS5 indexes, then `VACUUM`.
+///
+/// Both steps run *after* the deleting transaction has committed: `VACUUM`
+/// cannot run inside one, and a rebuild is a whole-index operation we do not
+/// want holding the write lock for the duration of the delete.
+///
+/// `fts_tables` is the set the caller's delete actually touched, and that set
+/// differs per operation — passing the wrong one is a silent defect, because
+/// an ordinary delete leaves the tokens inside the index segments and
+/// `VACUUM` alone does not clear them. An index omitted here keeps stale
+/// entries for rows that no longer exist.
+fn reclaim_after_commit(conn: &Connection, fts_tables: &[&str]) -> StoreResult<()> {
+    // Every call site passes a compile-time constant, never caller input;
+    // FTS5 offers no bind-parameter form for the rebuild statement.
+    let mut batch = String::new();
+    for table in fts_tables {
+        batch.push_str(&format!("INSERT INTO {table}({table}) VALUES('rebuild'); "));
+    }
+    batch.push_str("VACUUM;");
+    conn.execute_batch(&batch)?;
+    Ok(())
 }
 
 /// What [`purge_session`] removed. All counts are rows actually deleted.
@@ -3065,15 +3083,8 @@ pub fn purge_session(
 
     tx.commit()?;
 
-    // Outside the transaction: `VACUUM` cannot run inside one, and a rebuild
-    // is a whole-index operation we do not want holding the write lock for
-    // the duration of the delete.
     if compaction == Compaction::Reclaim {
-        conn.execute_batch(
-            "INSERT INTO observations_fts(observations_fts) VALUES('rebuild'); \
-             INSERT INTO pages_fts(pages_fts) VALUES('rebuild'); \
-             VACUUM;",
-        )?;
+        reclaim_after_commit(conn, SESSION_SCOPED_FTS)?;
     }
 
     Ok(PurgeSessionSummary {
@@ -3086,6 +3097,36 @@ pub fn purge_session(
     })
 }
 
+/// Delete a project's rows inside one transaction.
+///
+/// Execution order:
+/// 1. Count rows in each dependent table (pages/all versions, sessions,
+///    observations, handoffs, embeddings) before the delete so we can
+///    report how many rows were removed.
+/// 2. Collect all distinct page paths stored under the project — these are
+///    the on-disk files the caller must clean up after this function returns.
+/// 3. DELETE FROM projects WHERE id = ? — the ON DELETE CASCADE clauses in
+///    V01 + V02 propagate the delete to pages, sessions, observations,
+///    handoffs, and page_embeddings automatically.
+/// 4. Commit and return the [`PurgeSummary`].
+///
+/// The `workspace_project_label` string is passed in by the caller (the
+/// admin handler has the human-readable names; the writer only has IDs) and
+/// forwarded verbatim into [`PurgeSummary::label`] for logging.
+///
+/// `force` overrides the live-managed-run guard (step 0): `workstreams`
+/// cascades out of `projects`, so purging a scope whose lease is still live
+/// would delete the lease row out from under a running agent.
+///
+/// `compaction` decides whether the freed bytes are reclaimed afterwards. The
+/// default leaves them in free pages of the database file, exactly as any
+/// other SQLite delete does — see [`Compaction`], whose caveats apply here
+/// verbatim.
+///
+/// # Errors
+/// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
+/// still live and `force` is false, or [`StoreError`] if any SQL statement
+/// fails. The transaction is rolled back automatically on error.
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -3093,6 +3134,7 @@ pub fn purge_project(
     workspace_project_label: &str,
     author_id: Option<ai_memory_core::UserId>,
     force: bool,
+    compaction: Compaction,
 ) -> StoreResult<PurgeSummary> {
     let tx = conn.transaction()?;
 
@@ -3221,6 +3263,11 @@ pub fn purge_project(
     )?;
 
     tx.commit()?;
+
+    if compaction == Compaction::Reclaim {
+        reclaim_after_commit(conn, SCOPE_WIDE_FTS)?;
+    }
+
     Ok(PurgeSummary {
         label: workspace_project_label.to_string(),
         page_paths,
@@ -3232,6 +3279,7 @@ pub fn purge_project(
         workstreams_deleted,
         managed_runs_deleted,
         workstream_ids,
+        compacted: compaction == Compaction::Reclaim,
     })
 }
 
@@ -3248,6 +3296,9 @@ pub struct DeleteWorkspaceSummary {
     pub managed_runs_deleted: u64,
     /// Pre-delete identifiers for post-commit raw-segment cleanup.
     pub workstream_ids: Vec<String>,
+    /// Whether the freed bytes were reclaimed (the FTS rebuilds and `VACUUM`
+    /// ran). False for the default logical delete.
+    pub compacted: bool,
 }
 
 /// Delete a workspace row. Refuses a workspace that still holds projects
@@ -3257,6 +3308,11 @@ pub struct DeleteWorkspaceSummary {
 /// observations / handoffs / managed workstreams. The caller removes the
 /// on-disk workspace and raw workstream directories afterwards.
 ///
+/// `compaction` decides whether the freed bytes are reclaimed afterwards. The
+/// default leaves them in free pages of the database file, exactly as any
+/// other SQLite delete does — see [`Compaction`], whose caveats apply here
+/// verbatim.
+///
 /// # Errors
 /// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and `force`
 /// is false; [`StoreError::NotFound`] when the workspace does not exist.
@@ -3264,6 +3320,7 @@ pub fn delete_workspace(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
     force: bool,
+    compaction: Compaction,
 ) -> StoreResult<DeleteWorkspaceSummary> {
     let tx = conn.transaction()?;
     let wid = workspace_id.as_bytes();
@@ -3303,12 +3360,18 @@ pub fn delete_workspace(
         return Err(StoreError::NotFound("workspace".into()));
     }
     tx.commit()?;
+
+    if compaction == Compaction::Reclaim {
+        reclaim_after_commit(conn, SCOPE_WIDE_FTS)?;
+    }
+
     Ok(DeleteWorkspaceSummary {
         projects_deleted,
         pages_deleted,
         workstreams_deleted,
         managed_runs_deleted,
         workstream_ids,
+        compacted: compaction == Compaction::Reclaim,
     })
 }
 
@@ -4140,7 +4203,7 @@ pub(crate) mod tests {
         let prepared = open_managed_run(&mut conn, &ws, &proj);
 
         // Non-empty (holds the "scratch" project + a page) → refused w/o force.
-        let err = delete_workspace(&mut conn, &ws, false).unwrap_err();
+        let err = delete_workspace(&mut conn, &ws, false, Compaction::Skip).unwrap_err();
         assert!(
             matches!(err, StoreError::WorkspaceNotEmpty(n) if n >= 1),
             "expected WorkspaceNotEmpty, got {err:?}"
@@ -4155,7 +4218,7 @@ pub(crate) mod tests {
         assert_eq!(ws_still, 1, "refused delete must not touch the row");
 
         // Force cascades: project + page gone, workspace row gone.
-        let summary = delete_workspace(&mut conn, &ws, true).unwrap();
+        let summary = delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap();
         assert!(
             summary.projects_deleted >= 1 && summary.pages_deleted >= 1,
             "{summary:?}"
@@ -4177,7 +4240,7 @@ pub(crate) mod tests {
 
         // Deleting again → NotFound.
         assert!(matches!(
-            delete_workspace(&mut conn, &ws, true).unwrap_err(),
+            delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap_err(),
             StoreError::NotFound(_)
         ));
     }
@@ -4186,12 +4249,59 @@ pub(crate) mod tests {
     fn delete_workspace_empty_succeeds_without_force() {
         let (_tmp, mut conn, _ws, _proj) = fresh_db();
         let empty = get_or_create_workspace(&mut conn, "orphan-ws").unwrap();
-        let summary = delete_workspace(&mut conn, &empty, false).unwrap();
+        let summary = delete_workspace(&mut conn, &empty, false, Compaction::Skip).unwrap();
         assert_eq!(summary.projects_deleted, 0);
         assert_eq!(summary.pages_deleted, 0);
         assert_eq!(summary.workstreams_deleted, 0);
         assert_eq!(summary.managed_runs_deleted, 0);
         assert!(summary.workstream_ids.is_empty());
+    }
+
+    /// #540: `delete-workspace` made the same "and all of its projects"
+    /// promise `purge-project` did. Both halves of the boundary, in one test
+    /// because the workspace path has no separate scope to keep alive — the
+    /// sibling here is a second workspace.
+    #[test]
+    fn delete_workspace_reclaims_only_when_asked() {
+        let bytes_after = |compaction: Compaction| -> (bool, bool, bool) {
+            let (tmp, mut conn, ws, proj) = fresh_db();
+            let db_path = tmp.path().join("test.sqlite");
+            let other_ws = get_or_create_workspace(&mut conn, "sibling").unwrap();
+            let other_proj = get_or_create_project(&mut conn, &other_ws, "keeper", None).unwrap();
+            seed_session(&mut conn, ws, proj, "target");
+            seed_session(&mut conn, other_ws, other_proj, "keep");
+            seed_workstream_event(&conn, ws, proj, "doomed-workspace-event");
+
+            let summary = delete_workspace(&mut conn, &ws, true, compaction).unwrap();
+            assert_eq!(summary.compacted, compaction == Compaction::Reclaim);
+
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+            let raw = std::fs::read(&db_path).unwrap();
+            let hit = |needle: &str| raw.windows(needle.len()).any(|w| w == needle.as_bytes());
+            (
+                hit("obs-target"),
+                hit("doomed-workspace-event"),
+                hit("obs-keep"),
+            )
+        };
+
+        let (obs, event, sibling) = bytes_after(Compaction::Skip);
+        assert!(
+            obs && event,
+            "documented boundary: the default delete is logical. If this now \
+             fails, byte-level removal became the default and every operator- \
+             facing claim about delete-workspace needs revisiting."
+        );
+        assert!(sibling, "the sibling workspace is untouched");
+
+        let (obs, event, sibling) = bytes_after(Compaction::Reclaim);
+        assert!(!obs, "Reclaim removes the deleted workspace's observations");
+        assert!(
+            !event,
+            "and its managed-workstream events — the index a session purge \
+             never has to consider"
+        );
+        assert!(sibling, "the sibling workspace survives the VACUUM intact");
     }
 
     #[test]
@@ -4541,6 +4651,244 @@ pub(crate) mod tests {
         assert!(
             bytes.windows(8).any(|w| w == b"obs-keep"),
             "the surviving session's text is untouched by the compaction"
+        );
+    }
+
+    /// Rows in an FTS5 index's `%_data` shadow table. Drops when the index is
+    /// rebuilt and the deleted entries are dropped from its segments; an
+    /// ordinary delete leaves them behind.
+    fn fts_data_rows(conn: &Connection, index: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {index}_data"), [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    /// A managed workstream under `proj` with one event whose `content`
+    /// carries `marker`. Reachable from neither a session id nor a page, so
+    /// only a project- or workspace-wide delete ever removes it.
+    fn seed_workstream_event(conn: &Connection, ws: WorkspaceId, proj: ProjectId, marker: &str) {
+        let id = ai_memory_core::WorkstreamId::new();
+        let now = Timestamp::now().as_microsecond();
+        conn.execute(
+            "INSERT INTO workstreams (id, workspace_id, project_id, repo_fingerprint, \
+             worktree_fingerprint, name, cwd, created_at, selected_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'repo', 'wt', ?4, '/tmp', ?5, ?5, ?5)",
+            rusqlite::params![
+                &id.as_bytes()[..],
+                &ws.as_bytes()[..],
+                &proj.as_bytes()[..],
+                marker,
+                now
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workstream_events (workstream_id, sequence, event_id, agent_kind, \
+             native_session_id, kind, role, content, created_at) \
+             VALUES (?1, 1, ?2, 'claude-code', 'native-1', 'message', 'user', ?3, ?4)",
+            rusqlite::params![&id.as_bytes()[..], format!("{marker}-ev"), marker, now],
+        )
+        .unwrap();
+    }
+
+    /// The same boundary `purge_session_is_unsearchable_but_does_not_claim_byte_level_removal`
+    /// pins for one session, for the whole project. #540: the help text used
+    /// to promise "ALL its data", which this asserts is not what the default
+    /// does.
+    #[test]
+    fn purge_project_is_unsearchable_but_does_not_claim_byte_level_removal() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let db_path = tmp.path().join("test.sqlite");
+        let keep = get_or_create_project(&mut conn, &ws, "keeper", None).unwrap();
+        seed_session(&mut conn, ws, proj, "target");
+        seed_session(&mut conn, ws, keep, "keep");
+
+        let summary = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .unwrap();
+        assert!(!summary.compacted, "the default does not reclaim");
+
+        let matches = |c: &Connection, term: &str| -> i64 {
+            c.query_row(
+                "SELECT COUNT(*) FROM observations_fts WHERE observations_fts MATCH ?1",
+                rusqlite::params![format!("\"{term}\"")],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            matches(&conn, "obs-target"),
+            0,
+            "the purged project is not searchable"
+        );
+        assert_eq!(
+            matches(&conn, "obs-keep"),
+            1,
+            "the sibling project still is"
+        );
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+        let bytes = std::fs::read(&db_path).unwrap();
+        assert!(
+            bytes.windows(10).any(|w| w == b"obs-target"),
+            "documented boundary: the default purge is a logical delete. If this \
+             now fails, byte-level removal became the default and the CLI help, \
+             the admin endpoint docs and docs/lifecycle-ops.md all need updating."
+        );
+    }
+
+    /// The opt-in half for a project. Paired with the test above, exactly as
+    /// #539 paired the two halves for a session.
+    #[test]
+    fn purge_project_with_reclaim_removes_the_bytes_from_the_file() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let db_path = tmp.path().join("test.sqlite");
+        let keep = get_or_create_project(&mut conn, &ws, "keeper", None).unwrap();
+        seed_session(&mut conn, ws, proj, "target");
+        seed_session(&mut conn, ws, keep, "keep");
+
+        let summary = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Reclaim,
+        )
+        .unwrap();
+        assert!(summary.compacted, "the summary reports that VACUUM ran");
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+        let bytes = std::fs::read(&db_path).unwrap();
+        assert!(
+            !bytes.windows(10).any(|w| w == b"obs-target"),
+            "Reclaim must remove the purged text from the database file"
+        );
+        assert!(
+            bytes.windows(8).any(|w| w == b"obs-keep"),
+            "the surviving project's text is untouched by the compaction"
+        );
+    }
+
+    /// #540, the part a literal reuse of #539 gets wrong.
+    ///
+    /// `purge_session` rebuilds `observations_fts` and `pages_fts`, which is
+    /// exhaustive for a session. A project also cascades into `workstreams`
+    /// and from there into `workstream_events`, whose `content` is indexed by
+    /// a third FTS table that no session purge can reach. Reusing the session
+    /// set here would leave that index holding entries for rows that no
+    /// longer exist, silently, with the summary still reporting `compacted`.
+    ///
+    /// Asserted as "an explicit rebuild afterwards changes nothing", which
+    /// stays true however the reclaim is spelled, and is shown to have teeth
+    /// by the `Skip` half — where the same explicit rebuild does change it.
+    #[test]
+    fn purge_project_reclaim_rebuilds_the_workstream_event_index() {
+        let rows_after = |compaction: Compaction| -> (i64, i64, i64) {
+            let (_tmp, mut conn, ws, proj) = fresh_db();
+            let keep = get_or_create_project(&mut conn, &ws, "keeper", None).unwrap();
+            seed_workstream_event(&conn, ws, proj, "doomed-event-text");
+            seed_workstream_event(&conn, ws, keep, "surviving-event-text");
+
+            purge_project(
+                &mut conn,
+                &ws,
+                &proj,
+                "default/scratch",
+                None,
+                true,
+                compaction,
+            )
+            .unwrap();
+
+            let after = fts_data_rows(&conn, "workstream_events_fts");
+            conn.execute_batch(
+                "INSERT INTO workstream_events_fts(workstream_events_fts) VALUES('rebuild');",
+            )
+            .unwrap();
+            let after_explicit = fts_data_rows(&conn, "workstream_events_fts");
+
+            let survivor: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workstream_events_fts \
+                     WHERE workstream_events_fts MATCH '\"surviving-event-text\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (after, after_explicit, survivor)
+        };
+
+        let (reclaimed, reclaimed_then_rebuilt, survivor) = rows_after(Compaction::Reclaim);
+        assert_eq!(
+            reclaimed, reclaimed_then_rebuilt,
+            "Reclaim must already have rebuilt workstream_events_fts — an explicit \
+             rebuild afterwards found more to drop, so the purge left stale index \
+             entries behind for rows it deleted"
+        );
+        assert_eq!(
+            survivor, 1,
+            "the surviving project's events stay searchable"
+        );
+
+        let (skipped, skipped_then_rebuilt, _) = rows_after(Compaction::Skip);
+        assert!(
+            skipped > skipped_then_rebuilt,
+            "sanity: without Reclaim the index does hold droppable entries, so the \
+             assertion above is testing something"
+        );
+    }
+
+    /// Which FTS indexes a project or workspace purge must rebuild is not a
+    /// fact about today's schema that can be left implicit. Every FTS5 index
+    /// in the database currently sits over a table that cascades out of
+    /// `projects` or `workspaces`, so [`SCOPE_WIDE_FTS`] is all of them.
+    ///
+    /// A new index added later fails here, which is the point: whoever adds
+    /// it decides whether a scope-wide purge dirties it, rather than
+    /// discovering months later that `--compact` quietly skipped it.
+    #[test]
+    fn scope_wide_reclaim_covers_every_fts_index_in_the_schema() {
+        let (_tmp, conn, _ws, _proj) = fresh_db();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND sql LIKE '%USING fts5%' ORDER BY name",
+            )
+            .unwrap();
+        let mut in_schema: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        in_schema.sort();
+
+        let mut declared: Vec<String> = SCOPE_WIDE_FTS.iter().map(|s| (*s).to_owned()).collect();
+        declared.sort();
+
+        assert_eq!(
+            in_schema, declared,
+            "SCOPE_WIDE_FTS is out of date. Every FTS5 index over a table that \
+             cascades out of `projects` or `workspaces` must be listed, or \
+             `--compact` leaves it holding entries for deleted rows. If the new \
+             index is genuinely unreachable from a project or workspace delete, \
+             exclude it here deliberately and say why."
+        );
+
+        assert!(
+            SESSION_SCOPED_FTS
+                .iter()
+                .all(|t| SCOPE_WIDE_FTS.contains(t)),
+            "a session purge cannot dirty an index a project purge does not"
         );
     }
 
@@ -7746,8 +8094,16 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         // Simulate the post-purge state: project row gone.
         // `purge_project` drives the cascading deletes we want here.
-        let _ = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
-            .expect("purge of fresh project should succeed");
+        let _ = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .expect("purge of fresh project should succeed");
         // Now try to rename the project that no longer exists. The
         // pre-fix code returned `Ok(())` because `UPDATE` affected
         // zero rows. The fix returns `NotFound` so admin handlers
@@ -7808,6 +8164,7 @@ pub(crate) mod tests {
             "default/scratch",
             Some(author),
             false,
+            Compaction::Skip,
         )
         .expect("purge should succeed");
 
@@ -7855,8 +8212,16 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         open_managed_run(&mut conn, &ws, &proj);
 
-        let err = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
-            .expect_err("an active managed run must block the purge");
+        let err = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .expect_err("an active managed run must block the purge");
 
         match err {
             StoreError::ManagedRunActive { count, workstreams } => {
@@ -7888,8 +8253,16 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let prepared = open_managed_run(&mut conn, &ws, &proj);
 
-        let summary = purge_project(&mut conn, &ws, &proj, "default/scratch", None, true)
-            .expect("force purges regardless of the live lease");
+        let summary = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            true,
+            Compaction::Skip,
+        )
+        .expect("force purges regardless of the live lease");
 
         assert_eq!(summary.workstreams_deleted, 1);
         assert_eq!(summary.managed_runs_deleted, 1);
@@ -7916,8 +8289,16 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let summary = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
-            .expect("a lapsed lease is not a running agent");
+        let summary = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .expect("a lapsed lease is not a running agent");
 
         assert_eq!(summary.workstreams_deleted, 1);
         assert_eq!(summary.managed_runs_deleted, 1);

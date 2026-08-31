@@ -1946,6 +1946,45 @@ async fn delete_workspace_force_removes_everything() {
     );
 }
 
+/// #540: the `compact` field must be reachable over HTTP on this endpoint
+/// too, and the response must say which mode ran. Absent is the default.
+#[tokio::test]
+async fn delete_workspace_compact_defaults_off_and_is_reported_either_way() {
+    for (request, expected) in [
+        (json!({ "workspace": "victim", "force": true }), false),
+        (
+            json!({ "workspace": "victim", "force": true, "compact": false }),
+            false,
+        ),
+        (
+            json!({ "workspace": "victim", "force": true, "compact": true }),
+            true,
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (state, store) = make_state(&tmp).await;
+        seed_page(&store, &state.wiki, "victim", "proj", "notes/a.md", "body").await;
+        seed_page(&store, &state.wiki, "keeper", "proj", "notes/b.md", "body").await;
+
+        let resp = post(state, "/admin/delete-workspace", request.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{request}");
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["compacted"].as_bool(),
+            Some(expected),
+            "compacted must report what actually ran, for {request}: {body}"
+        );
+        assert!(
+            body["pages_deleted"].as_u64().unwrap_or(0) >= 1,
+            "the delete happens either way: {body}"
+        );
+        // A VACUUM rewrites the whole file, so the surviving workspace is the
+        // thing most likely to be damaged by getting this wrong.
+        let survivor = store.reader.find_workspace("keeper".into()).await.unwrap();
+        assert!(survivor.is_some(), "the untargeted workspace survives");
+    }
+}
+
 #[tokio::test]
 async fn delete_workspace_unknown_is_404() {
     let tmp = TempDir::new().unwrap();

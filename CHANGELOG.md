@@ -48,6 +48,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wiki git history keeps page content in its objects and commit messages, and
   earlier backups still contain it. `docs/lifecycle-ops.md` states that
   boundary in a table so it is not inferred from the command name.
+- `ai-memory purge-project --compact` and `compact: true` on
+  `POST /admin/delete-workspace` reclaim the freed bytes, the way
+  `purge-session --compact` already did. Both commands described themselves as
+  deleting "ALL its data", which no delete in this system does: measured with a
+  canary token, the text was still recoverable from `memory.sqlite` after the
+  purge, because rows go and bytes stay in free pages until the file is
+  rewritten. The commands' help text and the admin endpoint docs now say what
+  they remove instead of promising byte-level removal, and
+  `docs/lifecycle-ops.md` carries the same boundary table for the whole
+  destructive family rather than for `purge-session` alone (#540).
+
+  Compaction is scope-aware rather than a copy of the session batch. A session
+  purge dirties `observations_fts` and `pages_fts`; a project or workspace
+  delete also cascades into `workstreams` and their `workstream_events`, whose
+  content is indexed by a third FTS table that no session purge can reach.
+  Rebuilding only the session's two would have left that index holding entries
+  for rows that no longer exist, with the response still reporting
+  `compacted: true`. A test asserts the set is exhaustive against the schema,
+  so an FTS index added later fails there rather than being silently skipped.
+  The internal purges that back `move-project`'s merge teardown and
+  `merge-workspace`'s shell delete stay uncompacted — those are steps of a
+  move, not an operator asking to reclaim bytes.
 
 ### Fixed
 - The hook drain no longer stalls the whole spool behind one undeliverable

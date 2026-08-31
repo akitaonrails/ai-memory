@@ -561,3 +561,43 @@ async fn purge_project_idempotent_second_call_is_404() {
         "second purge must 404 because project is already gone"
     );
 }
+
+/// #540: `compact` is a wire field, so the boundary the store enforces has to
+/// be reachable over HTTP and reported back. Absent means the default, and
+/// the response says which of the two happened rather than leaving the
+/// caller to assume.
+#[tokio::test]
+async fn purge_project_compact_defaults_off_and_is_reported_either_way() {
+    for (request, expected) in [
+        (
+            json!({ "workspace": "default", "project": "doomed", "confirm": true }),
+            false,
+        ),
+        (
+            json!({ "workspace": "default", "project": "doomed", "confirm": true, "compact": false }),
+            false,
+        ),
+        (
+            json!({ "workspace": "default", "project": "doomed", "confirm": true, "compact": true }),
+            true,
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (state, store) = make_state(&tmp).await;
+        seed_two_projects(&store, &state.wiki).await;
+
+        let resp = post(state, "/admin/purge-project", request.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{request}");
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["compacted"].as_bool(),
+            Some(expected),
+            "compacted must report what actually ran, for {request}: {body}"
+        );
+        // The purge itself is unaffected by the mode.
+        assert!(
+            body["pages_deleted"].as_u64().unwrap_or(0) >= 1,
+            "the delete happens either way: {body}"
+        );
+    }
+}
