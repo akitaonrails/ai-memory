@@ -4183,7 +4183,10 @@ fn resolve_hooks_dir(explicit: Option<&Path>, agent: AgentChoice) -> Result<Path
             return Ok(path.clone());
         }
     }
-    anyhow::bail!("could not locate hooks directory. Tried: {:?}", candidates,);
+    anyhow::bail!(
+        "could not locate hooks directory. Tried: {candidates:?}. \
+         Pass --hooks-dir <directory containing {sub}/> to point at the bundle explicitly.",
+    );
 }
 
 fn hook_source_candidates(
@@ -4217,20 +4220,38 @@ fn hook_source_candidates(
 }
 
 fn repo_root_guess() -> Option<PathBuf> {
-    // When the binary lives under target/{debug,release}/<name>, the
-    // workspace root is two parents up.
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent()?.parent()?.parent().map(Path::to_path_buf))
+    repo_root_from_exe(&current_exe_resolved()?)
+}
+
+/// When the binary lives under target/{debug,release}/<name>, the
+/// workspace root is two parents up.
+fn repo_root_from_exe(exe: &Path) -> Option<PathBuf> {
+    Some(exe.parent()?.parent()?.parent()?.to_path_buf())
 }
 
 /// Directory the running binary lives in. The release tarball ships the
 /// `hooks/` bundle right next to the binary, so a no-`--source`
 /// `install-hooks` finds it there (issue #107).
 fn exe_dir_guess() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
+    Some(current_exe_resolved()?.parent()?.to_path_buf())
+}
+
+/// Path of the running binary with symlinks resolved.
+///
+/// Both guesses above are relative to where the binary *lives*, not to how
+/// it was invoked. `~/.local/bin/ai-memory -> <repo>/target/release/ai-memory`
+/// is the layout the quick start suggests, and without this the repo-root
+/// guess walks up from the link's own directory to `$HOME` while the tarball
+/// guess stops at `~/.local/bin` — leaving the bundled `hooks/` unreachable
+/// from every candidate, whatever the cwd (issue #546).
+fn current_exe_resolved() -> Option<PathBuf> {
+    std::env::current_exe().ok().map(resolve_exe_path)
+}
+
+/// Canonicalise an executable path, keeping the original when the target
+/// cannot be resolved (deleted binary, or a filesystem that refuses).
+fn resolve_exe_path(exe: PathBuf) -> PathBuf {
+    fs::canonicalize(&exe).unwrap_or(exe)
 }
 
 // CLAUDE_CODE_EVENTS + build_claude_code_payload now live in
@@ -6700,6 +6721,47 @@ model = "gpt-5"
             candidates[4],
             PathBuf::from("/home/alice/.local/share/ai-memory/hooks/claude-code")
         );
+    }
+
+    /// #546: `~/.local/bin/ai-memory -> <repo>/target/release/ai-memory` is
+    /// what the quick start's `~/.local/bin` layout produces for a source
+    /// build. Discovery is derived from the binary's own location, so the
+    /// link has to be resolved first or every candidate misses the checkout.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_are_found_through_a_symlinked_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let exe = repo.join("target").join("release").join("ai-memory");
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"").unwrap();
+        let link_dir = tmp.path().join("home").join(".local").join("bin");
+        fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join("ai-memory");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+
+        let resolved = resolve_exe_path(link);
+        let candidates = hook_source_candidates(
+            "claude-code",
+            repo_root_from_exe(&resolved),
+            resolved.parent().map(Path::to_path_buf),
+            None,
+        );
+
+        assert_eq!(
+            candidates[0],
+            fs::canonicalize(&repo)
+                .unwrap()
+                .join("hooks")
+                .join("claude-code"),
+            "the checkout must be the first candidate, not the symlink's ancestor"
+        );
+    }
+
+    #[test]
+    fn resolve_exe_path_keeps_an_unresolvable_path() {
+        let missing = PathBuf::from("/definitely/not/here/ai-memory");
+        assert_eq!(resolve_exe_path(missing.clone()), missing);
     }
 
     #[test]
