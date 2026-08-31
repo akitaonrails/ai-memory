@@ -552,6 +552,8 @@ pub async fn drain(
     // the one dead endpoint, so the pass still ends having burnt one attempt.
     let mut unreachable_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Resolved on first need only — a healthy drain never reads the config.
+    let mut configured_server: Option<Option<String>> = None;
     'drain: while idx < files.len() {
         if started.elapsed() >= total_budget {
             result.remaining += files.len() - idx;
@@ -724,10 +726,66 @@ pub async fn drain(
                     }
                 }
                 BatchOutcome::Unreachable => {
-                    // Nothing is listening at this endpoint. Charge the first
-                    // entry one attempt so a permanently dead address still
-                    // ages out, mark the endpoint, and keep going: entries
-                    // addressed elsewhere in this spool are still deliverable.
+                    // Nothing is listening where this entry was captured. The
+                    // envelope froze the address at capture time, so a server
+                    // that came back on a different port leaves the whole
+                    // spool addressed somewhere dead (#493).
+                    //
+                    // Before giving up, retry once against the address this
+                    // store is actually configured to use — but only when the
+                    // recorded host is loopback, where the authority can only
+                    // ever have meant "this machine" and a stale port is
+                    // unambiguous. A remote host is left alone: re-pointing it
+                    // would misdeliver a spool captured against another server
+                    // on purpose.
+                    //
+                    // This runs only for an endpoint that has already failed to
+                    // connect, so a healthy drain is untouched by it.
+                    let configured = configured_server
+                        .get_or_insert_with(|| configured_server_url(data_dir))
+                        .clone();
+                    let retry = configured.as_deref().and_then(|server| {
+                        if !is_loopback_url(&chunk[0].1.url) {
+                            return None;
+                        }
+                        let rerooted = batch_endpoint(&reroot_url(&chunk[0].1.url, server)?);
+                        (rerooted != base).then_some(rerooted)
+                    });
+
+                    if let Some(rerooted) = retry {
+                        match post_batch(
+                            &client,
+                            &rerooted,
+                            &payload,
+                            bearer.as_deref(),
+                            batch_timeout,
+                        )
+                        .await
+                        {
+                            BatchOutcome::Accepted(k) => {
+                                let k = k.min(chunk.len());
+                                for (path, _) in &chunk[..k] {
+                                    let _ = std::fs::remove_file(path);
+                                }
+                                result.sent += k;
+                                result.remaining += chunk.len().saturating_sub(k);
+                                continue;
+                            }
+                            BatchOutcome::AcceptedIndices { indices, .. } => {
+                                let sent = delete_accepted_indices(&chunk, &indices);
+                                result.sent += sent;
+                                result.remaining += chunk.len().saturating_sub(sent);
+                                continue;
+                            }
+                            // The configured address is no better. Fall through
+                            // to the skip path below rather than trying again.
+                            _ => {}
+                        }
+                    }
+
+                    // Charge the entry actually tried so a permanently dead
+                    // address still ages out, mark the endpoint, and keep
+                    // going: entries addressed elsewhere are still deliverable.
                     bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
                     result.remaining += chunk.len().saturating_sub(1);
                     unreachable_endpoints.insert(base.clone());
@@ -866,6 +924,52 @@ async fn entry_bearer(
             oidc_cache.clone().flatten()
         }
     }
+}
+
+/// Is this URL's host a loopback address?
+///
+/// A loopback authority is only meaningful on the machine that recorded it, so
+/// a stale port in one is unambiguous — nothing else could have been meant. A
+/// remote host is left alone: re-pointing it would misdeliver a spool that was
+/// deliberately captured against another server.
+fn is_loopback_url(url: &str) -> bool {
+    let rest = match url.split_once("://") {
+        Some((_, rest)) => rest,
+        None => url,
+    };
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1"
+}
+
+/// Rewrite `url`'s scheme and authority onto `server_url`, keeping path and
+/// query. Used only to retry an endpoint that has already proven unreachable.
+fn reroot_url(url: &str, server_url: &str) -> Option<String> {
+    let base = server_url.trim_end_matches('/');
+    let rest = url.split_once("://").map(|(_, r)| r)?;
+    let path_and_query = rest.find(['/', '?']).map(|i| &rest[i..]).unwrap_or("");
+    Some(format!("{base}{path_and_query}"))
+}
+
+/// The server URL declared in **this store's own** `config.toml`, or `None`
+/// when the file has no `server_url`.
+///
+/// Deliberately reads only that file rather than going through
+/// `Config::load`, which also merges the process environment. A drain that
+/// honoured `AI_MEMORY_SERVER_URL` would redirect captured private events to
+/// whatever address happened to be exported into the process that ran it —
+/// including, in a test run, a real server. The retry below sends data
+/// somewhere other than where it was addressed, so its target must come from
+/// the store's own on-disk configuration and nowhere else.
+///
+/// Resolved lazily and only after an endpoint has already failed to connect,
+/// so a healthy drain never pays for it and the hot hook path is untouched.
+fn configured_server_url(data_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(data_dir.join("config.toml")).ok()?;
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    doc.get("server_url")?
+        .as_str()
+        .map(std::string::ToString::to_string)
 }
 
 /// The `/hook/batch` URL for a spooled per-event URL: strip the `?…` query and
@@ -1605,6 +1709,109 @@ mod tests {
             loaded.attempts, 1,
             "the entry actually attempted is charged exactly once"
         );
+    }
+
+    /// #493: the envelope freezes the address at capture time, so a server
+    /// that came back on a different port leaves the whole spool addressed
+    /// somewhere dead. Skipping those entries stops them blocking the queue,
+    /// but they are still never delivered — they age out at `MAX_AGE_MS`.
+    /// When the recorded host is loopback the intent is unambiguous, so the
+    /// drain retries once against the configured server.
+    #[tokio::test]
+    async fn a_dead_loopback_port_is_retried_against_the_configured_server() {
+        let live = serve_counting_hook(
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            "200 OK",
+        )
+        .await;
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Point this store's config at the server that is actually up.
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            format!("server_url = \"http://{live}\"\n"),
+        )
+        .unwrap();
+
+        let spool = spool_dir(tmp.path());
+        enqueue(
+            &spool,
+            &entry_for(
+                format!("http://{dead}/hook?event=x"),
+                "{}".into(),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+        )
+        .await;
+
+        assert_eq!(
+            r.sent, 1,
+            "an entry frozen against a dead loopback port must be delivered to \
+             the configured server, not merely skipped"
+        );
+        assert!(
+            list_entries(&spool).unwrap().0.is_empty(),
+            "delivered entries are removed from the spool"
+        );
+    }
+
+    /// The retry must not re-point a spool captured against another host on
+    /// purpose. Only a loopback authority is unambiguous.
+    #[tokio::test]
+    async fn a_dead_remote_host_is_not_repointed_at_the_local_server() {
+        let live = serve_counting_hook(
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            "200 OK",
+        )
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            format!("server_url = \"http://{live}\"\n"),
+        )
+        .unwrap();
+
+        let spool = spool_dir(tmp.path());
+        // TEST-NET-1 (RFC 5737): guaranteed not routable, and not loopback.
+        enqueue(
+            &spool,
+            &entry_for(
+                "http://192.0.2.1:49374/hook?event=x".into(),
+                "{}".into(),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        )
+        .await;
+
+        assert_eq!(
+            r.sent, 0,
+            "a remote host must never be silently re-pointed at the local server"
+        );
+        assert_eq!(list_entries(&spool).unwrap().0.len(), 1, "still queued");
     }
 
     #[tokio::test]

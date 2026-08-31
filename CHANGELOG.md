@@ -71,6 +71,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own 7,949-entry spool being 100% dead-port, and by @swhite1122, whose
   stand-in courier avoided the stall by continuing past failures (#493).
 
+  An entry frozen against a dead **loopback** port is also now retried once
+  against the address in the store's own `config.toml`, so a server that came
+  back on a different port delivers its backlog instead of merely skipping it.
+  Restricted to loopback because a loopback authority can only ever have meant
+  "this machine", making a stale port unambiguous; a remote host is left alone
+  rather than silently re-pointed. The target is read from that file directly
+  and not through the usual config load, which also merges the environment — a
+  drain honouring `AI_MEMORY_SERVER_URL` would send captured events to whatever
+  address happened to be exported into the process that ran it.
+
 ## [1.38.0] - 2026-08-30
 
 ### Added
