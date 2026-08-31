@@ -332,6 +332,24 @@ pub struct HandoffsArgs {
     /// Emit JSON instead of the human listing.
     #[arg(long)]
     pub json: bool,
+    /// Expire every open handoff in the scope instead of listing them.
+    ///
+    /// Unlike the automatic sweep this does NOT spare manual handoffs or ones
+    /// from another directory — those exemptions are exactly what a leftover
+    /// backlog is made of, so honouring them would clear nothing. Pair with
+    /// `--older-than-days` to keep recent batons.
+    ///
+    /// This is a state change, not a delete: the summary and provenance
+    /// survive and the handoff simply stops being consumable. Requires
+    /// `--confirm`.
+    #[arg(long)]
+    pub expire_all: bool,
+    /// With `--expire-all`, only expire handoffs at least this many days old.
+    #[arg(long)]
+    pub older_than_days: Option<u32>,
+    /// REQUIRED by `--expire-all`.
+    #[arg(long)]
+    pub confirm: bool,
 }
 
 #[derive(Debug, Args)]

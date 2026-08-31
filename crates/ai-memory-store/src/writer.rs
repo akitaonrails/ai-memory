@@ -194,6 +194,17 @@ pub(crate) enum WriteCmd {
         acceptance: HandoffAcceptance,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    /// Expire every open handoff in one scope (#513). See
+    /// [`ops::expire_open_handoffs`] for why this ignores the automatic
+    /// sweep's exemptions.
+    ExpireOpenHandoffs {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        older_than_us: Option<i64>,
+        author_id: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<u64>>,
+    },
     CancelHandoff {
         handoff_id: HandoffId,
         workspace_id: WorkspaceId,
@@ -925,6 +936,37 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptHandoff {
             acceptance,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Expire every open handoff in one scope, optionally only those older
+    /// than `older_than_us`. Returns how many changed.
+    ///
+    /// Unlike the automatic sweep this does not spare manual or
+    /// different-directory handoffs: those are precisely what a leftover
+    /// backlog is made of. It is a state change, not a delete — the summary
+    /// and provenance survive.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`], or a propagated SQL error.
+    pub async fn expire_open_handoffs(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        older_than_us: Option<i64>,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ExpireOpenHandoffs {
+            workspace_id,
+            project_id,
+            owner_filter,
+            older_than_us,
+            author_id,
             reply: tx,
         })
         .await?;
@@ -2081,6 +2123,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::AcceptHandoff { acceptance, reply } => {
                 let result = ops::accept_handoff(&mut conn, &acceptance);
                 send_or_warn(reply, result, "accept_handoff");
+            }
+            WriteCmd::ExpireOpenHandoffs {
+                workspace_id,
+                project_id,
+                owner_filter,
+                older_than_us,
+                author_id,
+                reply,
+            } => {
+                let result = ops::expire_open_handoffs(
+                    &mut conn,
+                    &workspace_id,
+                    &project_id,
+                    &owner_filter,
+                    older_than_us,
+                    author_id,
+                );
+                send_or_warn(reply, result, "expire_open_handoffs");
             }
             WriteCmd::CancelHandoff {
                 handoff_id,

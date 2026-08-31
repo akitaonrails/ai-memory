@@ -2540,6 +2540,93 @@ fn expire_superseded_auto_handoffs(
     Ok(expired)
 }
 
+/// Expire every open handoff in one scope, optionally only those older than
+/// `older_than_us`. Returns how many rows changed.
+///
+/// # Why this ignores the automatic expiry's exemptions
+///
+/// [`expire_superseded_auto_handoffs`] deliberately spares two kinds of open
+/// handoff: manual ones (`from_session_id IS NULL`, written by a person on
+/// purpose) and ones whose `cwd` does not match the accepting session's. Those
+/// exemptions are correct for an automatic sweep triggered by an unrelated
+/// accept.
+///
+/// They also mean the leftover backlog consists, by construction, of exactly
+/// the handoffs the sweep will never touch. An operator-driven bulk expiry
+/// that honoured the same exemptions would therefore expire nothing at all —
+/// it would be a no-op for the only situation it exists to resolve. So this
+/// applies to every open handoff in scope, which is what an operator asking to
+/// clear a backlog is asking for.
+///
+/// Owner scoping still applies, and lives inside the `UPDATE` rather than a
+/// preceding read, so expiring another user's baton is a zero-row no-op rather
+/// than a read-then-write race — the same shape [`cancel_handoff`] uses.
+///
+/// This is a state change, not a delete: the summary, provenance and
+/// timestamps survive. An expired handoff simply stops being consumable.
+///
+/// # Errors
+/// Propagates SQL errors.
+pub fn expire_open_handoffs(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+    owner_filter: &OwnerFilter,
+    older_than_us: Option<i64>,
+    author_id: Option<ai_memory_core::UserId>,
+) -> StoreResult<u64> {
+    let tx = conn.transaction()?;
+    let owner_clause = match owner_filter {
+        OwnerFilter::Any => "",
+        OwnerFilter::User(_) => " AND (owner_user IS NULL OR owner_user = :owner)",
+        OwnerFilter::Unattributed => " AND owner_user IS NULL",
+    };
+    let age_clause = if older_than_us.is_some() {
+        " AND created_at <= :cutoff"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "UPDATE handoffs SET state = 'expired' \
+         WHERE workspace_id = :ws AND project_id = :proj \
+           AND state = 'open'{owner_clause}{age_clause}"
+    );
+
+    let ws_bytes: Vec<u8> = workspace_id.as_bytes().to_vec();
+    let proj_bytes: Vec<u8> = project_id.as_bytes().to_vec();
+    let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = vec![
+        (":ws", &ws_bytes as &dyn rusqlite::ToSql),
+        (":proj", &proj_bytes as &dyn rusqlite::ToSql),
+    ];
+    let owner_value;
+    if let OwnerFilter::User(user) = owner_filter {
+        owner_value = user.clone();
+        params.push((":owner", &owner_value as &dyn rusqlite::ToSql));
+    }
+    let cutoff_value;
+    if let Some(cutoff) = older_than_us {
+        cutoff_value = cutoff;
+        params.push((":cutoff", &cutoff_value as &dyn rusqlite::ToSql));
+    }
+
+    let changed = tx.execute(&sql, params.as_slice())? as u64;
+
+    if changed > 0 {
+        audit_with_detail(
+            &tx,
+            "expire_open_handoffs",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            None,
+            author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+            Timestamp::now().as_microsecond(),
+            &format!("{{\"expired\":{changed}}}"),
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// Mark an open handoff expired so it will no longer be consumed.
 pub fn cancel_handoff(
     conn: &mut Connection,
@@ -4415,6 +4502,184 @@ pub(crate) mod tests {
             survived, 1,
             "a same-path page in another project must survive a purge by id"
         );
+    }
+
+    /// Insert one open handoff. `manual` writes `from_session_id = NULL`,
+    /// which is what makes a handoff exempt from the automatic sweep.
+    fn seed_handoff(
+        conn: &Connection,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        cwd: Option<&str>,
+        manual: bool,
+        owner: Option<&str>,
+        created_at: i64,
+    ) -> Vec<u8> {
+        let id = uuid::Uuid::now_v7().as_bytes().to_vec();
+        let from_session: Option<Vec<u8>> = if manual {
+            None
+        } else {
+            Some(SessionId::new().as_bytes().to_vec())
+        };
+        // An auto handoff needs a real session row for the FK.
+        if let Some(sid) = &from_session {
+            conn.execute(
+                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, started_at, \
+                 actor_user) VALUES (?1, ?2, ?3, 'codex', 1, ?4)",
+                rusqlite::params![&sid[..], ws.as_bytes(), proj.as_bytes(), owner],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO handoffs (id, workspace_id, project_id, from_session_id, from_agent, \
+             summary, state, created_at, cwd, owner_user) \
+             VALUES (?1, ?2, ?3, ?4, 'codex', 'baton', 'open', ?5, ?6, ?7)",
+            rusqlite::params![
+                &id[..],
+                ws.as_bytes(),
+                proj.as_bytes(),
+                from_session,
+                created_at,
+                cwd,
+                owner
+            ],
+        )
+        .unwrap();
+        id
+    }
+
+    fn open_handoffs(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM handoffs WHERE state = 'open'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// #513: the leftover backlog is made of exactly the handoffs the
+    /// automatic sweep exempts — manual ones and ones from a non-matching
+    /// cwd. An operator-driven bulk expiry has to clear those, or it clears
+    /// nothing at all.
+    #[test]
+    fn expire_open_handoffs_clears_the_handoffs_the_auto_sweep_exempts() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        seed_handoff(&conn, ws, proj, Some("/work/a"), true, None, 100);
+        seed_handoff(&conn, ws, proj, Some("/elsewhere"), false, None, 200);
+        seed_handoff(&conn, ws, proj, Some("/work/a"), false, None, 300);
+        assert_eq!(open_handoffs(&conn), 3, "precondition");
+
+        let expired =
+            expire_open_handoffs(&mut conn, &ws, &proj, &OwnerFilter::Any, None, None).unwrap();
+
+        assert_eq!(expired, 3, "every open handoff in scope is cleared");
+        assert_eq!(open_handoffs(&conn), 0);
+    }
+
+    /// It is a state change, not a delete: the summary and provenance survive
+    /// so an operator can still see what was cleared.
+    #[test]
+    fn expire_open_handoffs_preserves_the_rows_it_expires() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        seed_handoff(&conn, ws, proj, Some("/work/a"), true, None, 100);
+
+        expire_open_handoffs(&mut conn, &ws, &proj, &OwnerFilter::Any, None, None).unwrap();
+
+        let (state, summary): (String, String) = conn
+            .query_row("SELECT state, summary FROM handoffs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(state, "expired");
+        assert_eq!(summary, "baton", "content is not destroyed");
+    }
+
+    /// `--older-than` lets an operator clear a backlog without touching a
+    /// handoff created moments ago.
+    #[test]
+    fn expire_open_handoffs_respects_the_age_cutoff() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        seed_handoff(&conn, ws, proj, None, true, None, 100);
+        seed_handoff(&conn, ws, proj, None, true, None, 5_000);
+
+        let expired =
+            expire_open_handoffs(&mut conn, &ws, &proj, &OwnerFilter::Any, Some(1_000), None)
+                .unwrap();
+
+        assert_eq!(expired, 1, "only the older one");
+        assert_eq!(open_handoffs(&conn), 1);
+    }
+
+    /// Scope containment: another project's backlog is untouched.
+    #[test]
+    fn expire_open_handoffs_does_not_cross_project_boundaries() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        seed_handoff(&conn, ws, proj, None, true, None, 100);
+        seed_handoff(&conn, ws, other, None, true, None, 100);
+
+        let expired =
+            expire_open_handoffs(&mut conn, &ws, &proj, &OwnerFilter::Any, None, None).unwrap();
+
+        assert_eq!(expired, 1);
+        assert_eq!(
+            open_handoffs(&conn),
+            1,
+            "the other project's handoff survives"
+        );
+    }
+
+    /// Owner scoping: expiring as one user must not clear another's baton.
+    #[test]
+    fn expire_open_handoffs_leaves_another_owners_baton_alone() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        seed_handoff(&conn, ws, proj, None, true, Some("user:alice"), 100);
+        seed_handoff(&conn, ws, proj, None, true, Some("user:bob"), 100);
+        seed_handoff(&conn, ws, proj, None, true, None, 100);
+
+        let expired = expire_open_handoffs(
+            &mut conn,
+            &ws,
+            &proj,
+            &OwnerFilter::User("user:alice".into()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(expired, 2, "alice's own plus the shared one");
+        let remaining: String = conn
+            .query_row(
+                "SELECT owner_user FROM handoffs WHERE state = 'open'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, "user:bob");
+    }
+
+    /// Already-accepted handoffs are history, not backlog.
+    #[test]
+    fn expire_open_handoffs_does_not_touch_accepted_ones() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        conn.execute(
+            "INSERT INTO handoffs (id, workspace_id, project_id, from_agent, summary, state, \
+             created_at) VALUES (?1, ?2, ?3, 'codex', 'done', 'accepted', 1)",
+            rusqlite::params![
+                &uuid::Uuid::now_v7().as_bytes()[..],
+                ws.as_bytes(),
+                proj.as_bytes()
+            ],
+        )
+        .unwrap();
+
+        let expired =
+            expire_open_handoffs(&mut conn, &ws, &proj, &OwnerFilter::Any, None, None).unwrap();
+        assert_eq!(expired, 0);
+        let state: String = conn
+            .query_row("SELECT state FROM handoffs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "accepted", "an accepted handoff is not backlog");
     }
 
     /// Accepting a handoff does not make its text yours. Purging the

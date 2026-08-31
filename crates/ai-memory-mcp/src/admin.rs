@@ -583,6 +583,7 @@ pub fn admin_router_with_sweep_tuning(
         )
         .route("/admin/curator", post(handle_curator))
         .route("/admin/handoffs", get(handle_open_handoffs_list))
+        .route("/admin/handoffs/expire", post(handle_expire_handoffs))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
             "/admin/pending-writes/{id}",
@@ -2346,6 +2347,75 @@ async fn handle_open_handoffs_list(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
+    }
+}
+
+/// `POST /admin/handoffs/expire` request body.
+#[derive(Deserialize)]
+struct ExpireHandoffsRequest {
+    workspace: String,
+    project: String,
+    /// Mandatory. Without `confirm: true` the server returns 400.
+    confirm: bool,
+    /// Only expire handoffs at least this many days old. Omitted clears the
+    /// whole open backlog for the scope.
+    #[serde(default)]
+    older_than_days: Option<u32>,
+}
+
+/// `POST /admin/handoffs/expire` — clear the open handoff backlog for one
+/// scope.
+///
+/// Unlike the automatic sweep this does not spare manual or
+/// different-directory handoffs. Those exemptions are what the leftover
+/// backlog is made of, so honouring them here would expire nothing. It is a
+/// state change rather than a delete: the summary and provenance survive and
+/// the handoff simply stops being consumable (#513).
+async fn handle_expire_handoffs(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<ExpireHandoffsRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "expiring the handoff backlog requires confirm=true"
+            })),
+        );
+    }
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    // Same owner scoping as cancel: a caller clears their own and shared
+    // batons, never somebody else's.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let owner_filter = ai_memory_core::OwnerFilter::for_actor_context(&actor);
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+
+    let older_than_us = req.older_than_days.map(|days| {
+        jiff::Timestamp::now().as_microsecond() - i64::from(days) * 24 * 60 * 60 * 1_000_000
+    });
+
+    match state
+        .writer
+        .expire_open_handoffs(ws, proj, owner_filter, older_than_us, author_id)
+        .await
+    {
+        Ok(expired) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "expired": expired,
+                "workspace": req.workspace,
+                "project": req.project,
+            })),
+        ),
+        Err(e) => internal_err(e.to_string()),
     }
 }
 

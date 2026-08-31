@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ai-memory handoffs --expire-all --confirm` and `POST /admin/handoffs/expire`
+  clear a stale open-handoff backlog for one scope. The listing added in
+  v1.35.0 made a backlog visible and gave `memory_handoff_cancel` the ids it
+  needs, but clearing one required a call per handoff (#513).
+
+  It deliberately does **not** honour the exemptions the automatic sweep
+  applies. `expire_superseded_auto_handoffs` spares manual handoffs
+  (`from_session_id IS NULL`) and ones whose `cwd` does not match the accepting
+  session — correct for a sweep triggered by an unrelated accept, and the
+  reason a backlog accumulates at all. The leftover backlog is therefore made,
+  by construction, of exactly the handoffs that sweep will never touch, so an
+  operator-driven expiry honouring the same exemptions would clear nothing. A
+  test pins that: applying the sweep's manual-handoff exemption leaves the
+  backlog behind.
+
+  A state change rather than a delete — the summary, provenance and timestamps
+  survive and the handoff simply stops being consumable, which is also why it
+  is recoverable in a way a delete would not be. Owner scoping lives inside the
+  `UPDATE` so expiring another user's baton is a zero-row no-op rather than a
+  read-then-write race, matching `cancel_handoff`. `--older-than-days N` keeps
+  recent batons; `--confirm` is required and the count is audited.
 - `ai-memory purge-session --session-id <uuid> --confirm` and
   `POST /admin/purge-session` delete one session by UUID: its row, its
   observations, the handoffs it authored, its `sessions/<id>.md` page and
