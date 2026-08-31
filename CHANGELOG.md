@@ -71,6 +71,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundary in a table so it is not inferred from the command name.
 
 ### Fixed
+- A failed or skipped embed now leaves a durable record. `page_embeddings`
+  stores only successes, and its upsert rewrites `created_at`, so a global
+  `embed --force` erased any signal about which row had been stale. A failure
+  left nothing at all: the inline write path warned and returned success, and
+  the backfill's per-page warnings lived only in container logs that a restart
+  took with them (#528).
+
+  A `page_embed_failures` ledger (V53) records the last attempt that produced
+  no embedding, across all four sites: the inline `write_page` embed, and the
+  backfill's unreadable-page, empty-body and provider-error branches. The
+  empty-body case matters most — a page skipped on every pass was previously
+  indistinguishable from an idle one, which is what made #509 undiagnosable.
+
+  Failure-only by design. A success writes nothing, because a `page_embeddings`
+  row already records it, so the common path pays no extra write and
+  `embed --force` cannot erase the history — it never touches this table.
+  `status` joins the two to report unresolved failures separately from ones a
+  later pass recovered, so a page that failed once and was repaired does not
+  read as an outstanding problem forever. One row per page, cascading with it.
+
+  Designed to @barrosohub's three constraints, who also supplied the
+  measurement that made the gap concrete: of 1,491 embedding rows on their
+  instance, zero predated the `--force` that had overwritten every timestamp.
+
 - The hook drain no longer stalls the whole spool behind one undeliverable
   entry. A spooled event carries the URL it was captured against, so a spool
   can hold entries addressed to a port nothing listens on any more — an old

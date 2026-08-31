@@ -1806,6 +1806,18 @@ impl Wiki {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, path = %page_id, "embedding failed; page indexed without it");
+                    // The warning alone dies with the container. Record it so
+                    // the page is attributable later (#528); best-effort,
+                    // because failing to note a failure must not fail the
+                    // write that already succeeded.
+                    let _ = self
+                        .writer
+                        .record_embed_failure(
+                            page_id,
+                            ai_memory_store::EmbedOutcome::Failed,
+                            Some(e.to_string()),
+                        )
+                        .await;
                 }
             }
         }

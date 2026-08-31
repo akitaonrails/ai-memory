@@ -205,6 +205,13 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<u64>>,
     },
+    /// Record that an embed attempt produced no embedding (#528).
+    RecordEmbedFailure {
+        page_id: PageId,
+        outcome: crate::ops::EmbedOutcome,
+        detail: Option<String>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     CancelHandoff {
         handoff_id: HandoffId,
         workspace_id: WorkspaceId,
@@ -967,6 +974,32 @@ impl WriterHandle {
             owner_filter,
             older_than_us,
             author_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record that an embed attempt on `page_id` did not produce an
+    /// embedding, so a failed or skipped page is attributable afterwards
+    /// rather than only in container logs (#528).
+    ///
+    /// Success records nothing — that is already implied by a
+    /// `page_embeddings` row — so the common path pays no extra write.
+    ///
+    /// # Errors
+    /// [`StoreError::WriterClosed`], or a propagated SQL error.
+    pub async fn record_embed_failure(
+        &self,
+        page_id: PageId,
+        outcome: crate::ops::EmbedOutcome,
+        detail: Option<String>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordEmbedFailure {
+            page_id,
+            outcome,
+            detail,
             reply: tx,
         })
         .await?;
@@ -2141,6 +2174,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     author_id,
                 );
                 send_or_warn(reply, result, "expire_open_handoffs");
+            }
+            WriteCmd::RecordEmbedFailure {
+                page_id,
+                outcome,
+                detail,
+                reply,
+            } => {
+                let result = ops::record_embed_failure(&conn, &page_id, outcome, detail.as_deref());
+                send_or_warn(reply, result, "record_embed_failure");
             }
             WriteCmd::CancelHandoff {
                 handoff_id,

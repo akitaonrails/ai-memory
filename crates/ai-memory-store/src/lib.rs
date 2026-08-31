@@ -45,10 +45,10 @@ pub use decay::{
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, Compaction, DeleteWorkspaceSummary, EmbeddingWrite, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary,
-    ObservationPruneOutcome, PagesMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
-    purge_session,
+    AdmittedSession, Compaction, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite,
+    HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary,
+    MoveSummary, ObservationPruneOutcome, PagesMode, PurgeSessionSummary, PurgeSummary,
+    ReorgSummary, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,

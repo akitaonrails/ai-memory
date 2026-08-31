@@ -64,6 +64,10 @@ struct Derived {
     observations_rows: u64,
     observations_fts_rows: u64,
     latest_pages_missing_embeddings: u64,
+    #[serde(default)]
+    embed_failures_unresolved: u64,
+    #[serde(default)]
+    embed_failures_recovered: u64,
     embedding_rows: u64,
     embedding_triples: Vec<EmbeddingTriple>,
     links_from_latest_pages: u64,
@@ -204,6 +208,14 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             "  embeddings:   {} rows; {} latest pages missing",
             report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
         );
+        // Only shown when there is something to act on. A recovered count with
+        // no outstanding failures is history, not a problem.
+        if report.derived.embed_failures_unresolved > 0 {
+            println!(
+                "    embed failures: {} unresolved ({} recovered since)",
+                report.derived.embed_failures_unresolved, report.derived.embed_failures_recovered
+            );
+        }
         println!(
             "  links:        {} latest-page links (unresolved: {}, stale: {})",
             report.derived.links_from_latest_pages,

@@ -1457,6 +1457,74 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
 /// `f32` packing of the unit-normalised vector. Provider/model/dim
 /// are denormalised onto the row so a single SELECT can detect
 /// heterogeneity (refuse-on-mismatch path).
+/// Why an embed attempt produced no embedding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedOutcome {
+    /// The embedding provider returned an error.
+    Failed,
+    /// The page could not be read from the wiki.
+    Unreadable,
+    /// The page body was empty after trimming, so there was nothing to embed.
+    /// Not an error, but permanent until the body changes — and previously
+    /// indistinguishable from an idle pass.
+    SkippedEmpty,
+}
+
+impl EmbedOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Unreadable => "unreadable",
+            Self::SkippedEmpty => "skipped_empty",
+        }
+    }
+}
+
+/// Longest `detail` we keep. A provider error can carry a whole response body;
+/// the ledger exists to say what happened, not to archive it.
+const EMBED_FAILURE_DETAIL_MAX: usize = 500;
+
+/// Record that an embed attempt on `page_id` did not produce an embedding.
+///
+/// Failure-only by design: a success writes nothing, because the existence of
+/// a `page_embeddings` row already records it. That keeps the common path free
+/// of an extra write and means a global `embed --force` cannot erase the
+/// history here — it never touches this table (#528).
+///
+/// Upserts on `page_id`, so the row is always the most recent unsuccessful
+/// attempt. It is deliberately left in place after a later pass succeeds: join
+/// against `page_embeddings` to tell "still unresolved" from "recovered".
+///
+/// # Errors
+/// Propagates SQL errors.
+pub fn record_embed_failure(
+    conn: &Connection,
+    page_id: &PageId,
+    outcome: EmbedOutcome,
+    detail: Option<&str>,
+) -> StoreResult<()> {
+    let detail = detail.map(|d| {
+        let mut truncated: String = d.chars().take(EMBED_FAILURE_DETAIL_MAX).collect();
+        if truncated.chars().count() < d.chars().count() {
+            truncated.push('…');
+        }
+        truncated
+    });
+    conn.execute(
+        "INSERT INTO page_embed_failures (page_id, at, outcome, detail) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(page_id) DO UPDATE SET \
+             at = excluded.at, outcome = excluded.outcome, detail = excluded.detail",
+        params![
+            page_id.as_bytes(),
+            Timestamp::now().as_microsecond(),
+            outcome.as_str(),
+            detail,
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn store_embedding(
     conn: &mut Connection,
     page_id: &PageId,
@@ -4680,6 +4748,154 @@ pub(crate) mod tests {
             .query_row("SELECT state FROM handoffs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(state, "accepted", "an accepted handoff is not backlog");
+    }
+
+    fn embed_failure_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM page_embed_failures", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// #528: a failed embed left nothing durable — the inline path warned and
+    /// returned success, and the backfill's warnings died with the container.
+    #[test]
+    fn a_failed_embed_is_recorded_with_its_reason_and_detail() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let page_id = upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+
+        record_embed_failure(
+            &conn,
+            &page_id,
+            EmbedOutcome::Failed,
+            Some("400 empty Part"),
+        )
+        .unwrap();
+
+        let (outcome, detail): (String, Option<String>) = conn
+            .query_row(
+                "SELECT outcome, detail FROM page_embed_failures WHERE page_id = ?1",
+                [page_id.as_bytes()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome, "failed");
+        assert_eq!(detail.as_deref(), Some("400 empty Part"));
+    }
+
+    /// A success must write nothing here — the `page_embeddings` row already
+    /// records it, and the reporter's first constraint was no extra write on
+    /// the hot path.
+    #[test]
+    fn a_successful_embed_writes_no_failure_row() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let page_id = upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+
+        store_embedding(&mut conn, &page_id, &[0_u8; 8], "p", "m", 2).unwrap();
+
+        assert_eq!(embed_failure_rows(&conn), 0);
+    }
+
+    /// The second constraint: a global re-embed must not erase the history.
+    #[test]
+    fn a_later_successful_embed_preserves_the_failure_history() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let page_id = upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+        record_embed_failure(&conn, &page_id, EmbedOutcome::Failed, Some("boom")).unwrap();
+
+        store_embedding(&mut conn, &page_id, &[0_u8; 8], "p", "m", 2).unwrap();
+
+        assert_eq!(
+            embed_failure_rows(&conn),
+            1,
+            "the record of what went wrong survives the repair"
+        );
+    }
+
+    /// Re-attempting overwrites rather than accumulating: one row per page.
+    #[test]
+    fn repeated_failures_keep_only_the_latest_attempt() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let page_id = upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+
+        record_embed_failure(&conn, &page_id, EmbedOutcome::Failed, Some("first")).unwrap();
+        record_embed_failure(&conn, &page_id, EmbedOutcome::SkippedEmpty, None).unwrap();
+
+        assert_eq!(embed_failure_rows(&conn), 1);
+        let outcome: String = conn
+            .query_row("SELECT outcome FROM page_embed_failures", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(outcome, "skipped_empty", "latest attempt wins");
+    }
+
+    /// A provider error can carry a whole response body; the ledger says what
+    /// happened, it does not archive it.
+    #[test]
+    fn failure_detail_is_truncated() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let page_id = upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+        let huge = "x".repeat(5_000);
+
+        record_embed_failure(&conn, &page_id, EmbedOutcome::Failed, Some(&huge)).unwrap();
+
+        let detail: String = conn
+            .query_row("SELECT detail FROM page_embed_failures", [], |r| r.get(0))
+            .unwrap();
+        assert!(detail.chars().count() <= EMBED_FAILURE_DETAIL_MAX + 1);
+        assert!(detail.ends_with('…'), "truncation is visible");
+    }
+
+    /// The ledger cannot outgrow the corpus: rows go with their page.
+    #[test]
+    fn a_failure_row_is_removed_with_its_page() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let page_id = upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+        record_embed_failure(&conn, &page_id, EmbedOutcome::Failed, None).unwrap();
+
+        delete_page(
+            &mut conn,
+            ws,
+            proj,
+            &PagePath::new("notes/a.md").unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(embed_failure_rows(&conn), 0);
+    }
+
+    /// A failure row is the *last unsuccessful attempt*, not proof the page is
+    /// still broken. `status` must separate the two, or a page that failed
+    /// once and recovered reads as an outstanding problem forever.
+    #[test]
+    fn status_separates_unresolved_embed_failures_from_recovered_ones() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let broken = upsert_page(&mut conn, &page(ws, proj, "notes/broken.md", "b")).unwrap();
+        let recovered = upsert_page(&mut conn, &page(ws, proj, "notes/ok.md", "b")).unwrap();
+
+        record_embed_failure(&conn, &broken, EmbedOutcome::Failed, Some("boom")).unwrap();
+        record_embed_failure(&conn, &recovered, EmbedOutcome::SkippedEmpty, None).unwrap();
+        store_embedding(&mut conn, &recovered, &[0_u8; 8], "p", "m", 2).unwrap();
+
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM page_embed_failures f \
+                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                 LEFT JOIN page_embeddings pe ON pe.page_id = f.page_id \
+                 WHERE pe.page_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let recovered_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM page_embed_failures f \
+                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                 JOIN page_embeddings pe ON pe.page_id = f.page_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 1, "only the page still lacking an embedding");
+        assert_eq!(recovered_count, 1, "the repaired page is history");
     }
 
     /// Accepting a handoff does not make its text yours. Purging the
