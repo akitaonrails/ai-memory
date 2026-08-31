@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+- Documented the Windows Scheduled-Task-plus-`Start-Process` autostart trap:
+  the wrapper script's Job Object is torn down (and the spawned
+  `ai-memory.exe` killed with it) the instant the script exits, while
+  `LastTaskResult` keeps reporting `0`. Added Scenario E to `docs/windows.md`
+  covering WinSW as the native-Windows service wrapper (the systemd analog
+  for Windows), tested against Windows 11 25H2 (build 26200.9168) with
+  WinSW v2.12.0 (#530).
+
 ## [1.38.0] - 2026-08-30
 
 ### Added

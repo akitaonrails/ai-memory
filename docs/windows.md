@@ -25,6 +25,43 @@ Command](#native-hook-command-claude-code-on-windows). Other agents use native
 single command strings matching their hook schema. PowerShell/Git Bash script
 bundles are compatibility fallbacks and do not enforce capture-policy v1.
 
+## Known Trap: A Naive Autostart Task Dies Silently
+
+If you already wired a Scheduled Task to run `ai-memory serve` at logon and
+it doesn't seem to actually stay up, read this before anything else — it's
+the most common way to lose the server on native Windows, and it hides
+itself.
+
+The usual shape: a Scheduled Task with a "run at logon" trigger whose action
+is `powershell.exe -File start-server.ps1`, where the script calls
+`Start-Process` to launch `ai-memory.exe` detached and hidden. This looks
+correct — it starts the server, you watch it come up — right up until the
+next reboot.
+
+**Symptom:** `Get-ScheduledTaskInfo` reports `LastTaskResult = 0` every
+single time, the task always "succeeds," yet the server is down and
+Event Viewer's Application log shows no crash for `ai-memory.exe`.
+
+**Root cause:** `Start-Process` returns immediately, so the wrapper script
+has nothing left to do and exits right after spawning the child. Task
+Scheduler runs the task's action inside a Job Object, and the spawned
+`ai-memory.exe` child never broke away from that job. The instant the
+action process (`powershell.exe`) exits, Windows tears down the Job Object
+— killing every process still in it, including the child that was supposed
+to keep running. That's a clean `TerminateProcess` call, not a fault, so it
+leaves nothing in Application-Error to search for. You can confirm this
+after the fact by cross-referencing `Microsoft-Windows-TaskScheduler/Operational`
+event IDs 200 (action started) / 201 (action completed) against the
+server's own startup log line: if the task "completes" within the same
+second the server logged its one startup line, the Job Object killed it,
+not an application fault.
+
+**Fix:** stop routing the server through a wrapper script that exits. See
+[Scenario E](#scenario-e-running-as-a-windows-service-winsw) below — running
+under a real service supervisor sidesteps the Job Object entirely, gets you
+start-on-boot instead of start-at-logon, and adds restart-on-crash, which
+the Scheduled Task approach never had in the first place.
+
 ## Scenario A: Everything Inside WSL2
 
 This is the most Linux-like Windows setup. Use it when your agent CLI is
@@ -284,6 +321,104 @@ ignore_paths` policy before spool or network delivery. The legacy `.ps1` and
 --apply` to refresh native hook entries; selected-install capability output says
 whether enforcement is active. See [Capture exclusions](marker-file.md#capture-exclusions).
 
+## Scenario E: Running as a Windows Service (WinSW)
+
+Use this when you want `ai-memory serve` to survive logoff, reboot, and
+crashes on native Windows — without Docker Desktop, and without hand-rolling
+a Scheduled Task (see the trap above). This is the native-Windows analog of
+the systemd units this project already ships for Linux
+(`packaging/systemd/ai-memory.service` / `ai-memory-user.service`, both
+`Restart=on-failure` + `RestartSec=5s`): the restart logic lives in the
+service supervisor, not in `ai-memory` itself — the same bargain Linux
+makes with systemd.
+
+[WinSW](https://github.com/winsw/winsw) wraps an ordinary console
+executable as a real Windows Service, so `ai-memory.exe` needs no code
+changes and no Windows-specific build — it's the same binary as Scenario
+C/D.
+
+```powershell
+# 1. Install the binary first, same as Scenario C.
+$Dest = "$env:LOCALAPPDATA\ai-memory"
+New-Item -ItemType Directory -Force $Dest | Out-Null
+Invoke-WebRequest `
+    -Uri "https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-windows-x86_64.zip" `
+    -OutFile "$env:TEMP\ai-memory.zip"
+Expand-Archive "$env:TEMP\ai-memory.zip" -DestinationPath $Dest -Force
+Get-ChildItem "$Dest\ai-memory.exe" | Unblock-File
+
+# 2. Download WinSW next to it, named to match the service you're about to
+#    define — the config file must share the executable's base name.
+Invoke-WebRequest `
+    -Uri "https://github.com/winsw/winsw/releases/latest/download/WinSW-x64.exe" `
+    -OutFile "$Dest\ai-memory-service.exe"
+
+# 3. Write the service config as ai-memory-service.xml, next to it.
+@'
+<service>
+  <id>ai-memory</id>
+  <name>ai-memory MCP server</name>
+  <description>Runs `ai-memory serve` as a Windows service with automatic restart on failure.</description>
+  <executable>%LOCALAPPDATA%\ai-memory\ai-memory.exe</executable>
+  <arguments>--data-dir "%LOCALAPPDATA%\ai-memory" serve --transport http --enable-web</arguments>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+  <onfailure action="restart" delay="5 sec"/>
+  <resetfailure>1 hour</resetfailure>
+</service>
+'@ | Set-Content -Encoding utf8 "$Dest\ai-memory-service.xml"
+
+# 4. Install and start. This needs an elevated PowerShell (Run as
+#    Administrator) — registering any Windows service does, WinSW included.
+& "$Dest\ai-memory-service.exe" install
+& "$Dest\ai-memory-service.exe" start
+
+# 5. Verify.
+Get-Service ai-memory
+& "$Dest\ai-memory.exe" status
+```
+
+`<onfailure action="restart" delay="5 sec"/>` is WinSW's equivalent of
+systemd's `Restart=on-failure` / `RestartSec=5s`: if `ai-memory.exe` exits
+unexpectedly, the Service Control Manager restarts it 5 seconds later.
+`<resetfailure>1 hour</resetfailure>` clears the failure count after an hour
+of stable running, so an old crash loop doesn't count against a fresh
+incident today. Because it registers with the SCM directly, the service
+starts at boot — before anyone logs on — rather than at logon, and it isn't
+tied to a console or a Job Object the way the Scheduled Task wrapper above
+is: there's no parent process left to exit and tear it down.
+
+To remove it:
+
+```powershell
+& "$Dest\ai-memory-service.exe" stop
+& "$Dest\ai-memory-service.exe" uninstall
+```
+
+**Tested against:** Windows 11 25H2 (build 26200.9168 — note this build's
+own registry `ProductName` string still reports "Windows 10 Pro," a known
+cosmetic string bug unrelated to the actual OS version) and WinSW v2.12.0
+(`WinSW-x64.exe`). Confirmed on that combination: install, start,
+`Get-Service` reporting `Running` with `StartType Automatic`, the bound
+port reachable, and a clean `stop` + `uninstall`. The `<onfailure>` restart
+itself is WinSW's own long-standing, documented SCM recovery-action
+behavior (see the [WinSW service descriptor
+docs](https://github.com/winsw/winsw/blob/master/docs/xml-config-file.md)),
+not anything specific to `ai-memory`; we did not additionally reproduce the
+kill-and-recover cycle end to end on this machine, because the wrapped
+process runs as `LocalSystem` by default and a non-elevated session can't
+force-kill a `LocalSystem` process to simulate the crash. If you validate
+that leg — or a different Windows build / WinSW version — please report it
+on [#530](https://github.com/akitaonrails/ai-memory/issues/530) so this
+note grows instead of going stale.
+
+Prefer [WinSW](https://github.com/winsw/winsw) over [NSSM](https://nssm.cc/)
+here: its XML config commits cleanly alongside this repo's other packaging
+assets, and it ships as one self-contained executable with no separate
+installer for the service manager itself.
+
 ## Native Hook Command (Claude Code on Windows)
 
 By default on native Windows, Claude Code hooks are rendered using Claude's
@@ -398,6 +533,10 @@ Windows agent builds.
   behavior depends on the host runtime loading those files correctly.
   Pi's generated extension also bridges MCP tools because Pi has no native
   `mcp.json` install surface.
+- A Scheduled Task that launches the server via `Start-Process` from a
+  wrapper script looks fine (`LastTaskResult = 0` forever) while silently
+  dying on every reboot — see [Known Trap](#known-trap-a-naive-autostart-task-dies-silently)
+  and use [Scenario E](#scenario-e-running-as-a-windows-service-winsw) instead.
 
 ## Suggested Test Checklist
 
