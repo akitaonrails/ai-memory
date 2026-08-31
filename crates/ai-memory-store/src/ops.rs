@@ -964,8 +964,35 @@ pub(crate) fn begin_session_in_transaction(
     Ok(())
 }
 
+/// Whether this session was purged and must not be recreated by late-arriving
+/// events. Scoped: a purge in one project does not suppress ingest for a
+/// session id in another.
+fn session_is_purged(conn: &Connection, session: &NewSession) -> StoreResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM purged_sessions \
+             WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+         )",
+        params![
+            session.id.as_bytes(),
+            session.workspace_id.as_bytes(),
+            session.project_id.as_bytes(),
+        ],
+        |row| row.get::<_, i64>(0),
+    )? == 1)
+}
+
 fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()> {
     validate_identity_storage_key(session.actor_user.as_deref(), "session owner")?;
+    // A purge must be terminal. The events that produced a session can still
+    // be sitting undelivered in a client hook spool; without this check the
+    // next drain recreates the session row and the observations land again,
+    // silently undoing a deletion an application already promised its user
+    // (#387). Every ingest path funnels through here, so this is the one
+    // place the guard has to live.
+    if session_is_purged(conn, session)? {
+        return Err(StoreError::SessionPurged(session.id.to_string()));
+    }
     let now = Timestamp::now().as_microsecond();
     let agent = session.agent_kind.as_str();
     let cwd: Option<String> = session
@@ -3004,6 +3031,21 @@ pub fn purge_session(
         rusqlite::params![&sid[..], &wid[..], &pid[..]],
     )? as u64;
 
+    // Tombstone before the row goes, in the same transaction: a purge that
+    // committed the deletion but not the tombstone would be undone by the
+    // next spool drain (#387).
+    tx.execute(
+        "INSERT INTO purged_sessions (session_id, workspace_id, project_id, purged_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(session_id) DO UPDATE SET purged_at = excluded.purged_at",
+        rusqlite::params![
+            &sid[..],
+            &wid[..],
+            &pid[..],
+            Timestamp::now().as_microsecond()
+        ],
+    )?;
+
     // Finally the session itself; cascades scheduler claims and
     // consolidation jobs, which hold no content of their own.
     tx.execute(
@@ -4500,6 +4542,47 @@ pub(crate) mod tests {
             bytes.windows(8).any(|w| w == b"obs-keep"),
             "the surviving session's text is untouched by the compaction"
         );
+    }
+
+    /// A purge must be terminal. The events that produced a session can sit
+    /// undelivered in a client hook spool for days (#493 measured spools with
+    /// thousands), so without a tombstone the next drain recreates the session
+    /// row and the observations land again — silently undoing a deletion an
+    /// application already reported to its user.
+    #[test]
+    fn a_purged_session_is_not_recreated_by_late_arriving_events() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "target");
+        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+
+        // Exactly what a spool drain delivers after the purge.
+        let session = hook_session(sid, ws, proj, None);
+        let err =
+            begin_session(&mut conn, &session).expect_err("a purged session must not be recreated");
+        assert!(matches!(err, StoreError::SessionPurged(_)), "got {err:?}");
+
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM sessions"),
+            0,
+            "still gone"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 0);
+    }
+
+    /// The tombstone is scoped: purging a session id in one project must not
+    /// block ingest for the same id in another, or one purge could deny
+    /// capture across the whole store.
+    #[test]
+    fn a_tombstone_does_not_block_the_same_session_id_in_another_project() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "target");
+        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+
+        let elsewhere = hook_session(sid, ws, other, None);
+        begin_session(&mut conn, &elsewhere)
+            .expect("a purge in one project must not suppress ingest in another");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
     }
 
     fn session_end_observation(session: &NewSession) -> NewObservation {

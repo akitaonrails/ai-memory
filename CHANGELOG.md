@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admission chain runs before any row is touched, so a `reject`-policy webhook
   can still abort the purge.
 
+  The purge is terminal. Events that produced a session can sit undelivered in
+  a client hook spool for days, and `begin_session` would otherwise recreate
+  the session row when that spool drained — silently undoing a deletion an
+  application had already reported to its user. A `purged_sessions` tombstone
+  (V52) is written in the same transaction as the delete, and ingest refuses to
+  recreate a session that carries one. The tombstone is scoped, so purging an
+  id in one project cannot suppress capture for that id elsewhere.
+
   The purge is a **logical delete** by default: the session is unreachable
   through the API and through search, but its bytes stay in free pages of the
   database file, as with any SQLite delete. `--compact` additionally rebuilds
