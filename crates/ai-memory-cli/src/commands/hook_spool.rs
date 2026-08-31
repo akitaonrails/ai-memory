@@ -509,6 +509,29 @@ pub async fn drain(
     total_budget: Duration,
     per_event_timeout: Duration,
 ) -> DrainResult {
+    drain_with_live_token(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        live_static_token().as_deref(),
+    )
+    .await
+}
+
+/// [`drain`] with the current static bearer supplied explicitly.
+///
+/// The environment is read once, at the boundary in [`drain`], and passed down
+/// as data. Tests drive this directly: mutating process-wide environment from a
+/// test would race every other test in the binary, and `set_var` is `unsafe` in
+/// this edition — which this workspace forbids outright.
+pub async fn drain_with_live_token(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    live_token: Option<&str>,
+) -> DrainResult {
     let (mut files, unreadable) = match list_entries(spool) {
         Ok(listed) => listed,
         Err(e) => {
@@ -722,6 +745,32 @@ pub async fn drain(
                                 bump_or_drop(path, entry, &mut result);
                                 unreachable_endpoints.insert(batch_endpoint(&entry.url));
                             }
+                            PostOutcome::Unauthorized => {
+                                // Credential rejected, not the entry. Retry once
+                                // with this drain's live token (#542).
+                                let retry =
+                                    static_retry_token(entry, item_bearer.as_deref(), live_token);
+                                let recovered = match retry {
+                                    Some(token) => matches!(
+                                        post_hook(
+                                            &client,
+                                            &entry.url,
+                                            &entry.body,
+                                            Some(token),
+                                            per_event_timeout,
+                                        )
+                                        .await,
+                                        PostOutcome::Delivered
+                                    ),
+                                    None => false,
+                                };
+                                if recovered {
+                                    let _ = std::fs::remove_file(path);
+                                    result.sent += 1;
+                                } else {
+                                    bump_or_drop(path, entry, &mut result);
+                                }
+                            }
                         }
                     }
                 }
@@ -791,6 +840,49 @@ pub async fn drain(
                     unreachable_endpoints.insert(base.clone());
                     continue;
                 }
+                BatchOutcome::Unauthorized => {
+                    // The envelope froze its credential at capture time, so a
+                    // rotated token leaves every entry captured under the old
+                    // one failing identically — the credential half of the
+                    // same problem #493 fixed for the address (#542).
+                    //
+                    // Retry once with the token this drain was handed, which is
+                    // current by construction. Runs only for a batch that has
+                    // already been rejected, so a healthy drain never pays for
+                    // it.
+                    let retry = static_retry_token(&chunk[0].1, bearer.as_deref(), live_token);
+                    if let Some(token) = retry {
+                        match post_batch(&client, &base, &payload, Some(token), batch_timeout).await
+                        {
+                            BatchOutcome::Accepted(k) => {
+                                let k = k.min(chunk.len());
+                                for (path, _) in &chunk[..k] {
+                                    let _ = std::fs::remove_file(path);
+                                }
+                                result.sent += k;
+                                result.remaining += chunk.len().saturating_sub(k);
+                                continue;
+                            }
+                            BatchOutcome::AcceptedIndices { indices, .. } => {
+                                let sent = delete_accepted_indices(&chunk, &indices);
+                                result.sent += sent;
+                                result.remaining += chunk.len().saturating_sub(sent);
+                                continue;
+                            }
+                            // The current token is no better — the server is
+                            // rejecting more than a stale credential. Fall
+                            // through and charge conservatively.
+                            _ => {}
+                        }
+                    }
+
+                    // Same conservative accounting as `Failed`: the server
+                    // refused the whole batch, so nothing in it was processed.
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    result.remaining +=
+                        chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
+                    break;
+                }
                 BatchOutcome::Failed => {
                     // The batch didn't land (server answered with an unexpected
                     // status, or the body did not parse).
@@ -830,6 +922,31 @@ pub async fn drain(
                 PostOutcome::Unreachable => {
                     bump_or_drop(&path, &entry, &mut result);
                     unreachable_endpoints.insert(batch_endpoint(&entry.url));
+                }
+                PostOutcome::Unauthorized => {
+                    // Credential rejected, not the entry. Retry once with this
+                    // drain's live token (#542).
+                    let retry = static_retry_token(&entry, bearer.as_deref(), live_token);
+                    let recovered = match retry {
+                        Some(token) => matches!(
+                            post_hook(
+                                &client,
+                                &entry.url,
+                                &entry.body,
+                                Some(token),
+                                per_event_timeout,
+                            )
+                            .await,
+                            PostOutcome::Delivered
+                        ),
+                        None => false,
+                    };
+                    if recovered {
+                        let _ = std::fs::remove_file(&path);
+                        result.sent += 1;
+                    } else {
+                        bump_or_drop(&path, &entry, &mut result);
+                    }
                 }
             }
         }
@@ -924,6 +1041,47 @@ async fn entry_bearer(
             oidc_cache.clone().flatten()
         }
     }
+}
+
+/// Environment variable carrying the *current* static bearer into a spawned
+/// `hook-drain`.
+///
+/// Deliberately the environment and not a command-line flag: the drain is a
+/// separate process, and an argument would put the credential in the process
+/// table for anyone running `ps` while it runs.
+pub(crate) const LIVE_TOKEN_ENV: &str = "AI_MEMORY_AUTH_TOKEN";
+
+/// The static bearer this drain process was handed, if any.
+///
+/// `hook-drain` is spawned by a lifecycle hook that already holds the current
+/// token, and passes it down in the child's environment. A drain started by
+/// hand, or by a hook running against a server that needs no auth, simply has
+/// none — and the re-resolve below is skipped rather than guessed at.
+fn live_static_token() -> Option<String> {
+    std::env::var(LIVE_TOKEN_ENV).ok().filter(|t| !t.is_empty())
+}
+
+/// The token to retry a `401` with, or `None` when retrying is pointless.
+///
+/// A spooled envelope freezes its credential at capture time, so rotating the
+/// token leaves every already-spooled entry authenticating with the old one
+/// (#542). The drain process, by contrast, was handed the current token by the
+/// hook that spawned it moments ago.
+///
+/// Two guards keep this from turning into a blind second attempt: only
+/// `Static` entries qualify — an `Oidc` bearer is already resolved and
+/// refreshed once per pass, so a 401 there is a real rejection — and the live
+/// token must actually differ from the one that just failed. Retrying an
+/// identical credential would only repeat the failure at double the cost.
+fn static_retry_token<'a>(
+    entry: &SpoolEntry,
+    rejected: Option<&str>,
+    live: Option<&'a str>,
+) -> Option<&'a str> {
+    if entry.auth_mode != AuthMode::Static {
+        return None;
+    }
+    live.filter(|t| Some(*t) != rejected)
 }
 
 /// Is this URL's host a loopback address?
@@ -1957,6 +2115,190 @@ mod tests {
             })
             .collect();
         assert_eq!(attempts, vec![0, 1, 0]);
+    }
+
+    /// A mock hook server that accepts exactly one bearer and answers `401` to
+    /// everything else. Models a rotated credential: the token frozen into the
+    /// spool is no longer valid, the drain's live one is.
+    async fn serve_token_gated_hook(
+        accepted_token: &'static str,
+        req_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let rc = req_count.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let authorized = req.lines().any(|l| {
+                        l.trim().eq_ignore_ascii_case(&format!(
+                            "authorization: Bearer {accepted_token}"
+                        ))
+                    });
+                    let is_batch = req
+                        .lines()
+                        .next()
+                        .is_some_and(|l| l.contains("/hook/batch"));
+                    let (status, body) = if !authorized {
+                        ("401 Unauthorized", "{\"error\":\"bad token\"}".to_string())
+                    } else if is_batch {
+                        let payload = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let accepted = serde_json::from_str::<serde_json::Value>(payload)
+                            .ok()
+                            .and_then(|v| v.as_array().map(Vec::len))
+                            .unwrap_or(0);
+                        ("200 OK", format!("{{\"accepted\":{accepted}}}"))
+                    } else {
+                        ("202 Accepted", "queued".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr.to_string()
+    }
+
+    /// #542: the spool freezes its credential at capture time, so rotating the
+    /// token strands every already-spooled entry on the old one. The drain is
+    /// handed the current token by the hook that spawned it, and retries a
+    /// rejected entry with it.
+    #[tokio::test]
+    async fn drain_recovers_an_entry_stranded_by_a_rotated_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_token_gated_hook("rotated-new", count.clone()).await;
+
+        let entry = entry_for(
+            format!("http://{addr}/hook?event=e0"),
+            "{}".into(),
+            Some("stale-old"),
+            false,
+        );
+        enqueue(&spool, &entry).unwrap();
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("rotated-new"),
+        )
+        .await;
+
+        assert_eq!(r.sent, 1, "the stranded entry is recovered");
+        assert_eq!(list_entries(&spool).unwrap().0.len(), 0, "and removed");
+    }
+
+    /// The control for the test above, and the behaviour before this change:
+    /// with no live token the drain has nothing to retry with, so the entry
+    /// stays queued and is charged one attempt. Pinned so the recovery test
+    /// cannot pass merely because the server was lenient.
+    #[tokio::test]
+    async fn drain_without_a_live_token_leaves_a_rejected_entry_queued() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_token_gated_hook("rotated-new", count.clone()).await;
+
+        let entry = entry_for(
+            format!("http://{addr}/hook?event=e0"),
+            "{}".into(),
+            Some("stale-old"),
+            false,
+        );
+        enqueue(&spool, &entry).unwrap();
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            None,
+        )
+        .await;
+
+        assert_eq!(r.sent, 0, "nothing to retry with");
+        assert_eq!(list_entries(&spool).unwrap().0.len(), 1, "entry survives");
+    }
+
+    /// An identical token is not worth a second request, and a non-static
+    /// entry is not this mechanism's business: an OIDC bearer is already
+    /// resolved and refreshed once per pass, so a 401 there is a real
+    /// rejection rather than a stale freeze.
+    #[test]
+    fn static_retry_token_only_fires_when_it_can_change_the_outcome() {
+        let static_entry = entry_for("http://x/hook".into(), "{}".into(), Some("old"), false);
+        let oidc_entry = entry_for("http://x/hook".into(), "{}".into(), None, true);
+        let anon_entry = entry_for("http://x/hook".into(), "{}".into(), None, false);
+
+        assert_eq!(
+            static_retry_token(&static_entry, Some("old"), Some("new")),
+            Some("new"),
+            "a rotated token is worth one retry"
+        );
+        assert_eq!(
+            static_retry_token(&static_entry, Some("old"), Some("old")),
+            None,
+            "an identical token would only repeat the failure"
+        );
+        assert_eq!(
+            static_retry_token(&static_entry, Some("old"), None),
+            None,
+            "no live token, nothing to retry with"
+        );
+        assert_eq!(
+            static_retry_token(&oidc_entry, Some("resolved"), Some("new")),
+            None,
+            "OIDC is already re-resolved per pass; a 401 there is genuine"
+        );
+        assert_eq!(
+            static_retry_token(&anon_entry, None, Some("new")),
+            None,
+            "an anonymous entry was never authenticated"
+        );
+    }
+
+    /// A `401` must be distinguishable from any other refusal, or the drain
+    /// cannot tell "this credential is stale" from "this event is bad".
+    #[tokio::test]
+    async fn a_401_is_reported_as_unauthorized_not_failed() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_token_gated_hook("right", count.clone()).await;
+        let client = build_client();
+
+        assert_eq!(
+            crate::commands::hook_capture::post_hook(
+                &client,
+                &format!("http://{addr}/hook?event=e"),
+                "{}",
+                Some("wrong"),
+                Duration::from_millis(500),
+            )
+            .await,
+            crate::commands::hook_capture::PostOutcome::Unauthorized
+        );
+        assert_eq!(
+            crate::commands::hook_capture::post_hook(
+                &client,
+                &format!("http://{addr}/hook?event=e"),
+                "{}",
+                Some("right"),
+                Duration::from_millis(500),
+            )
+            .await,
+            crate::commands::hook_capture::PostOutcome::Delivered,
+            "the gate itself works, so the 401 above is about the token"
+        );
     }
 
     /// A mock hook server: answers `200 {"accepted":N}` to `POST /hook/batch`

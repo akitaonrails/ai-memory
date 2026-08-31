@@ -124,8 +124,8 @@ fn should_incremental_drain(event: &str, spool_len: usize, threshold: usize) -> 
     event == "post-tool-use" && spool_len >= threshold
 }
 
-fn spawn_background_drainer(data_dir: &Path) -> std::io::Result<()> {
-    hook_drain_process::spawn(data_dir)
+fn spawn_background_drainer(data_dir: &Path, live_token: Option<&str>) -> std::io::Result<()> {
+    hook_drain_process::spawn(data_dir, live_token)
 }
 
 fn should_spawn_background_drainer(event: &str) -> bool {
@@ -299,9 +299,10 @@ fn cwd_query_suffix(
 
 fn after_background_drain_event_enqueue(
     data_dir: &Path,
-    spawn: impl FnOnce(&Path) -> std::io::Result<()>,
+    live_token: Option<&str>,
+    spawn: impl FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    spawn(data_dir)
+    spawn(data_dir, live_token)
 }
 
 /// Hidden drain-only fast path. Reads no stdin and writes no stdout.
@@ -477,7 +478,7 @@ async fn run_with_payload<W, S>(
 ) -> anyhow::Result<()>
 where
     W: std::io::Write,
-    S: FnOnce(&Path) -> std::io::Result<()>,
+    S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 {
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
@@ -794,7 +795,15 @@ where
     // but `stop` and `pre-compact` also trigger the helper so delivery does not
     // rely on the single hook most likely to be cancelled during agent shutdown.
     if should_spawn_background_drainer(&args.event)
-        && let Err(err) = after_background_drain_event_enqueue(&dd, spawn_background_drainer)
+        && let Err(err) = after_background_drain_event_enqueue(
+            &dd,
+            // The hook's own token: current by definition, since the agent
+            // config it came from was rendered by the last `install-hooks`.
+            // The drain uses it only to retry an entry the server has already
+            // rejected with 401 (#542).
+            args.auth_token.as_deref(),
+            spawn_background_drainer,
+        )
     {
         eprintln!(
             "ai-memory hook warning: failed to start background spool drainer; event remains queued: {err}"
@@ -1191,7 +1200,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1210,7 +1219,7 @@ mod tests {
             antigravity_hook_args("pre-tool-use", "http://127.0.0.1:1"),
             "not-json".into(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1338,7 +1347,7 @@ mod tests {
             devin_hook_args("session-start"),
             payload.to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1378,7 +1387,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1430,7 +1439,7 @@ mod tests {
             devin_hook_args("post-tool-use"),
             payload.to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1468,7 +1477,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1484,7 +1493,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1627,7 +1636,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1640,7 +1649,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1677,7 +1686,7 @@ mod tests {
             args,
             r#"{"session_id":"s","cwd":"/tmp"}"#.into(),
             &mut stdout,
-            |path| {
+            |path, _token| {
                 assert_eq!(path, data_dir.as_path());
                 assert_eq!(hook_spool::spool_len(&spool), 1, "spawn runs after enqueue");
                 called.set(called.get() + 1);
@@ -1720,7 +1729,7 @@ mod tests {
                 args,
                 r#"{"session_id":"s","cwd":"/tmp"}"#.into(),
                 &mut stdout,
-                |path| {
+                |path, _token| {
                     assert_eq!(path, data_dir.as_path());
                     assert_eq!(hook_spool::spool_len(&spool), 1, "spawn runs after enqueue");
                     called.set(called.get() + 1);
@@ -1757,9 +1766,13 @@ mod tests {
             capture_mode: None,
         };
 
-        run_with_payload(Some(data_dir), args, "{}".into(), &mut stdout, |_path| {
-            Err(std::io::Error::other("spawn failed"))
-        })
+        run_with_payload(
+            Some(data_dir),
+            args,
+            "{}".into(),
+            &mut stdout,
+            |_path, _token| Err(std::io::Error::other("spawn failed")),
+        )
         .await
         .unwrap();
 
@@ -1790,7 +1803,7 @@ mod tests {
             args,
             r#"{"hook_event_name":"SessionEnd"}"#.into(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1814,7 +1827,7 @@ mod tests {
     #[test]
     fn session_end_spawn_failure_is_returned_for_warning_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = after_background_drain_event_enqueue(tmp.path(), |_path| {
+        let err = after_background_drain_event_enqueue(tmp.path(), None, |_path, _token| {
             Err(std::io::Error::other("spawn failed"))
         })
         .unwrap_err();
@@ -1827,7 +1840,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let called = std::cell::Cell::new(false);
 
-        after_background_drain_event_enqueue(tmp.path(), |path| {
+        after_background_drain_event_enqueue(tmp.path(), None, |path, _token| {
             assert_eq!(path, tmp.path());
             called.set(true);
             Ok(())
@@ -1877,7 +1890,7 @@ mod tests {
         let called = std::cell::Cell::new(false);
         let mut args = devin_hook_args("post-tool-use");
         args.server_url = "http://127.0.0.1:1".into();
-        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret/SENTINEL"}}).to_string(), &mut stdout, |_| { called.set(true); Ok(()) }).await.unwrap();
+        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret/SENTINEL"}}).to_string(), &mut stdout, |_, _| { called.set(true); Ok(()) }).await.unwrap();
         assert_eq!(stdout, b"{}\n");
         assert!(!called.get());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
@@ -1912,7 +1925,7 @@ mod tests {
             args,
             raw.to_string(),
             &mut stdout,
-            |_| {
+            |_, _| {
                 called.set(true);
                 Ok(())
             },
@@ -1953,7 +1966,7 @@ mod tests {
             args,
             raw.to_string(),
             &mut stdout,
-            |_| {
+            |_, _| {
                 called.set(true);
                 Ok(())
             },
@@ -1993,7 +2006,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| {
+            |_, _| {
                 called.set(true);
                 Ok(())
             },
@@ -2016,7 +2029,7 @@ mod tests {
         .unwrap();
         let data_dir = tmp.path().join("data");
         let mut stdout = Vec::new();
-        run_with_payload(Some(data_dir.clone()), devin_hook_args("post-tool-use"), serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL_PATH","args":"SENTINEL_ARGS"},"output":"SENTINEL_OUTPUT","error":"SENTINEL_ERROR","nested":{"raw":"SENTINEL_NESTED"}}).to_string(), &mut stdout, |_| Ok(())).await.unwrap();
+        run_with_payload(Some(data_dir.clone()), devin_hook_args("post-tool-use"), serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL_PATH","args":"SENTINEL_ARGS"},"output":"SENTINEL_OUTPUT","error":"SENTINEL_ERROR","nested":{"raw":"SENTINEL_NESTED"}}).to_string(), &mut stdout, |_, _| Ok(())).await.unwrap();
         let entry = read_spooled_entries(&hook_spool::spool_dir(&data_dir))
             .pop()
             .unwrap();
@@ -2039,7 +2052,7 @@ mod tests {
         let mut args = devin_hook_args("post-tool-use");
         args.check_capture = true;
         let mut stdout = Vec::new();
-        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL"}}).to_string(), &mut stdout, |_| Err(std::io::Error::other("must not spawn"))).await.unwrap();
+        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL"}}).to_string(), &mut stdout, |_, _| Err(std::io::Error::other("must not spawn"))).await.unwrap();
         let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         // Pin the exact key set, not just its size: `--check-capture` is how an
         // operator verifies an opt-out, so a field silently appearing or
@@ -2082,7 +2095,7 @@ mod tests {
             devin_hook_args("post-tool-use"),
             inactive_payload.clone(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2103,7 +2116,7 @@ mod tests {
             serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"public"}})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2134,7 +2147,7 @@ mod tests {
             args,
             raw.to_string(),
             &mut stdout,
-            |_| Err(std::io::Error::other("must not spawn")),
+            |_, _| Err(std::io::Error::other("must not spawn")),
         )
         .await
         .unwrap();
@@ -2167,7 +2180,7 @@ mod tests {
                 devin_hook_args("post-tool-use"),
                 raw.to_string(),
                 &mut stdout,
-                |_| Ok(()),
+                |_, _| Ok(()),
             )
             .await
             .unwrap();
@@ -2274,7 +2287,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2322,7 +2335,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Err(std::io::Error::other("must not spawn")),
+            |_, _| Err(std::io::Error::other("must not spawn")),
         )
         .await
         .unwrap();
@@ -2346,7 +2359,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2381,7 +2394,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2412,7 +2425,7 @@ mod tests {
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2429,7 +2442,7 @@ mod tests {
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2449,7 +2462,7 @@ mod tests {
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2475,7 +2488,7 @@ mod tests {
             kimi_hook_args("session-start", &base),
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path()}).to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2500,7 +2513,7 @@ mod tests {
             args,
             serde_json::json!({"session_id": "claude-session", "cwd": tmp.path()}).to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2545,7 +2558,7 @@ mod tests {
             kimi_hook_args("user-prompt-submit", &base),
             payload.clone(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2566,7 +2579,7 @@ mod tests {
             kimi_hook_args("user-prompt-submit", &base),
             payload,
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2598,7 +2611,7 @@ mod tests {
             kimi_hook_args("user-prompt", &base),
             payload.clone(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2617,7 +2630,7 @@ mod tests {
             kimi_hook_args("user-prompt", &base),
             payload,
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2646,7 +2659,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();

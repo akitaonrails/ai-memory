@@ -153,6 +153,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three destructive commands in one place instead of documenting the limits of
   one and overstating the other two.
 
+- The hook-spool drain can now recover events stranded by a rotated auth token
+  (#542). A spooled envelope freezes the bearer it was captured with, so
+  rotating the token left every already-spooled entry authenticating with the
+  old one and failing `401` forever; OIDC already re-resolved per pass, static
+  tokens did not.
+
+  The drain now retries a rejected entry once with the token it was handed by
+  the hook that spawned it, which is current by construction. Bounded three
+  ways: only after the server has already answered `401`, only for a `Static`
+  entry, and only when the live token actually differs from the one that just
+  failed — so a healthy drain never pays for it and an identical credential is
+  not re-sent.
+
+  The token reaches the drain in the child process's **environment**, never on
+  its command line: an argument would publish the credential to the process
+  table for every local user for as long as the drain runs. A test pins that it
+  stays out of argv. `401` also became a distinct `Unauthorized` outcome —
+  previously indistinguishable from any other refusal, so the drain could not
+  tell a stale credential from a bad event.
+
+  No new credential is stored at rest: the drain is handed a token that already
+  exists rather than reading one from a file ai-memory would have to write and
+  protect.
+
 ### Docs
 
 - `docs/windows.md` gains **Scenario E**, a persistent-server story for native

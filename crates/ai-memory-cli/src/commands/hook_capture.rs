@@ -344,6 +344,13 @@ pub enum PostOutcome {
     /// so the drain can skip past them instead of stopping at the first one
     /// (#493).
     Unreachable,
+    /// `401` — the server rejected the bearer. Distinguished from
+    /// [`Self::Failed`] because it says something about the *credential*
+    /// rather than the entry: a spooled event carries the token frozen at
+    /// capture time, so after a rotation every entry captured under the old
+    /// one fails identically and is recoverable by retrying with the current
+    /// token (#542).
+    Unauthorized,
 }
 
 /// POST the payload as JSON, best-effort. `timeout` is caller-chosen: the
@@ -371,6 +378,7 @@ pub async fn post_hook(
         Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
             PostOutcome::Saturated
         }
+        Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => PostOutcome::Unauthorized,
         Ok(_) => PostOutcome::Failed,
         Err(_) => PostOutcome::Unreachable,
     }
@@ -409,6 +417,10 @@ pub enum BatchOutcome {
     /// `404`/`405` — the server has no `/hook/batch` (a pre-upgrade build). The
     /// caller falls back to per-event `POST /hook` for the rest of the drain.
     Unsupported,
+    /// `401` — the server rejected the batch's bearer. See
+    /// [`PostOutcome::Unauthorized`]; the whole batch shares one identity, so
+    /// a rejected credential fails all of it and none of it was processed.
+    Unauthorized,
     /// Transport error or any other non-2xx: the batch outcome is unknown. The
     /// drain charges conservatively so trailing events that may never have been
     /// attempted do not burn retry budget.
@@ -474,6 +486,8 @@ pub async fn post_batch(
                 || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
             {
                 BatchOutcome::Unsupported
+            } else if status == reqwest::StatusCode::UNAUTHORIZED {
+                BatchOutcome::Unauthorized
             } else {
                 BatchOutcome::Failed
             }
