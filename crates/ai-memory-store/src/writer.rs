@@ -295,9 +295,12 @@ pub(crate) enum WriteCmd {
         dim: u32,
         reply: oneshot::Sender<StoreResult<u64>>,
     },
-    /// Delete a project and all its data (pages, sessions, observations,
-    /// handoffs, embeddings) in one transaction. Returns the paths of
-    /// every page file that must be removed from disk by the caller.
+    /// Delete a project's rows (pages, sessions, observations, handoffs,
+    /// embeddings) in one transaction. Returns the paths of every page file
+    /// that must be removed from disk by the caller.
+    ///
+    /// A logical delete unless `compaction` is [`ops::Compaction::Reclaim`]:
+    /// freed bytes stay in the file until it is rewritten.
     PurgeProject {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -308,6 +311,8 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         /// Purge even when a managed workstream still holds a live run lease.
         force: bool,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
     /// Delete one session and everything derived from it, inside a single
@@ -327,6 +332,8 @@ pub(crate) enum WriteCmd {
     DeleteWorkspace {
         workspace_id: WorkspaceId,
         force: bool,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
         reply: oneshot::Sender<StoreResult<DeleteWorkspaceSummary>>,
     },
     /// Rename a workspace's `name` column (UUID-keyed dir doesn't move).
@@ -1273,7 +1280,8 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Delete a project and all its data in one atomic transaction.
+    /// Delete a project's rows in one atomic transaction. Logical unless
+    /// `compaction` is [`ops::Compaction::Reclaim`].
     ///
     /// ON DELETE CASCADE propagates the delete through pages, sessions,
     /// observations, handoffs, and page_embeddings automatically. The
@@ -1290,6 +1298,7 @@ impl WriterHandle {
         label: impl Into<String>,
         author_id: Option<ai_memory_core::UserId>,
         force: bool,
+        compaction: crate::ops::Compaction,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
@@ -1298,6 +1307,7 @@ impl WriterHandle {
             label: label.into(),
             author_id,
             force,
+            compaction,
             reply: tx,
         })
         .await?;
@@ -1347,11 +1357,13 @@ impl WriterHandle {
         &self,
         workspace_id: WorkspaceId,
         force: bool,
+        compaction: crate::ops::Compaction,
     ) -> StoreResult<DeleteWorkspaceSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeleteWorkspace {
             workspace_id,
             force,
+            compaction,
             reply: tx,
         })
         .await?;
@@ -2345,6 +2357,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 label,
                 author_id,
                 force,
+                compaction,
                 reply,
             } => {
                 let result = ops::purge_project(
@@ -2354,6 +2367,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &label,
                     author_id,
                     force,
+                    compaction,
                 );
                 send_or_warn(reply, result, "purge_project");
             }
@@ -2378,9 +2392,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::DeleteWorkspace {
                 workspace_id,
                 force,
+                compaction,
                 reply,
             } => {
-                let result = ops::delete_workspace(&mut conn, &workspace_id, force);
+                let result = ops::delete_workspace(&mut conn, &workspace_id, force, compaction);
                 send_or_warn(reply, result, "delete_workspace");
             }
             WriteCmd::RenameWorkspace {

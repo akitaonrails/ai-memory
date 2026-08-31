@@ -148,6 +148,9 @@ pub struct PurgeSummary {
     /// pre-delete identifiers to remove `raw/workstreams/<id>/` after the SQL
     /// transaction commits and to report any filesystem partial failure.
     pub workstream_ids: Vec<String>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran). False for a
+    /// plain logical delete.
+    pub compacted: bool,
 }
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -2956,7 +2959,13 @@ pub fn insert_wiki_migration(
     Ok(())
 }
 
-/// Delete a project and all its data inside one transaction.
+/// Delete a project's rows inside one transaction.
+///
+/// This is a *logical* delete unless `compaction` is [`Compaction::Reclaim`].
+/// The rows are gone and nothing reaches them through the API or search, but
+/// their bytes remain in free pages of the database file until it is
+/// rewritten — as with any SQLite delete. Neither mode is forensic erasure:
+/// the wiki git history and any earlier backup still hold the content.
 ///
 /// Execution order:
 /// 1. Count rows in each dependent table (pages/all versions, sessions,
@@ -2981,7 +2990,9 @@ pub fn insert_wiki_migration(
 /// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
 /// still live and `force` is false, or [`StoreError`] if any SQL statement
 /// fails. The transaction is rolled back automatically on error.
-/// Whether [`purge_session`] should reclaim the freed bytes afterwards.
+/// Whether a destructive scope operation should reclaim the freed bytes
+/// afterwards. Shared by [`purge_session`], [`purge_project`] and
+/// [`delete_workspace`] so the family makes one promise, not three.
 ///
 /// A purge is a logical delete: the rows are gone and nothing can reach them
 /// through the API or through search, but their bytes remain in free pages of
@@ -3009,6 +3020,30 @@ pub enum Compaction {
     Skip,
     /// Rebuild the affected FTS indexes and `VACUUM` after committing.
     Reclaim,
+}
+
+/// Rebuild every FTS5 index, then `VACUUM`. Runs after the caller's
+/// transaction has committed: `VACUUM` cannot run inside one, and a rebuild is
+/// a whole-index operation we do not want holding the write lock for the
+/// duration of a delete.
+///
+/// All three indexes are rebuilt regardless of which scope was deleted. They
+/// are `content=`-backed external-content tables, so an ordinary delete leaves
+/// the tokens behind inside the index segments and only a `rebuild` clears
+/// them — and a project or workspace delete cascades `workstream_events` just
+/// as it does `pages` and `observations`. Rebuilding only the indexes a given
+/// caller "should" have touched is exactly the reasoning that leaves text
+/// searchable after a purge, and the cost is dominated by the `VACUUM` that
+/// follows in every case. A `rebuild` is idempotent, so the extra work is a
+/// no-op for a scope that deleted nothing from that table.
+fn reclaim_freed_pages(conn: &Connection) -> StoreResult<()> {
+    conn.execute_batch(
+        "INSERT INTO observations_fts(observations_fts) VALUES('rebuild'); \
+         INSERT INTO pages_fts(pages_fts) VALUES('rebuild'); \
+         INSERT INTO workstream_events_fts(workstream_events_fts) VALUES('rebuild'); \
+         VACUUM;",
+    )?;
+    Ok(())
 }
 
 /// What [`purge_session`] removed. All counts are rows actually deleted.
@@ -3220,15 +3255,8 @@ pub fn purge_session(
 
     tx.commit()?;
 
-    // Outside the transaction: `VACUUM` cannot run inside one, and a rebuild
-    // is a whole-index operation we do not want holding the write lock for
-    // the duration of the delete.
     if compaction == Compaction::Reclaim {
-        conn.execute_batch(
-            "INSERT INTO observations_fts(observations_fts) VALUES('rebuild'); \
-             INSERT INTO pages_fts(pages_fts) VALUES('rebuild'); \
-             VACUUM;",
-        )?;
+        reclaim_freed_pages(conn)?;
     }
 
     Ok(PurgeSessionSummary {
@@ -3248,6 +3276,7 @@ pub fn purge_project(
     workspace_project_label: &str,
     author_id: Option<ai_memory_core::UserId>,
     force: bool,
+    compaction: Compaction,
 ) -> StoreResult<PurgeSummary> {
     let tx = conn.transaction()?;
 
@@ -3376,6 +3405,11 @@ pub fn purge_project(
     )?;
 
     tx.commit()?;
+
+    if compaction == Compaction::Reclaim {
+        reclaim_freed_pages(conn)?;
+    }
+
     Ok(PurgeSummary {
         label: workspace_project_label.to_string(),
         page_paths,
@@ -3387,6 +3421,7 @@ pub fn purge_project(
         workstreams_deleted,
         managed_runs_deleted,
         workstream_ids,
+        compacted: compaction == Compaction::Reclaim,
     })
 }
 
@@ -3403,6 +3438,9 @@ pub struct DeleteWorkspaceSummary {
     pub managed_runs_deleted: u64,
     /// Pre-delete identifiers for post-commit raw-segment cleanup.
     pub workstream_ids: Vec<String>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran). False for a
+    /// plain logical delete.
+    pub compacted: bool,
 }
 
 /// Delete a workspace row. Refuses a workspace that still holds projects
@@ -3419,6 +3457,7 @@ pub fn delete_workspace(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
     force: bool,
+    compaction: Compaction,
 ) -> StoreResult<DeleteWorkspaceSummary> {
     let tx = conn.transaction()?;
     let wid = workspace_id.as_bytes();
@@ -3458,12 +3497,18 @@ pub fn delete_workspace(
         return Err(StoreError::NotFound("workspace".into()));
     }
     tx.commit()?;
+
+    if compaction == Compaction::Reclaim {
+        reclaim_freed_pages(conn)?;
+    }
+
     Ok(DeleteWorkspaceSummary {
         projects_deleted,
         pages_deleted,
         workstreams_deleted,
         managed_runs_deleted,
         workstream_ids,
+        compacted: compaction == Compaction::Reclaim,
     })
 }
 
@@ -4295,7 +4340,7 @@ pub(crate) mod tests {
         let prepared = open_managed_run(&mut conn, &ws, &proj);
 
         // Non-empty (holds the "scratch" project + a page) → refused w/o force.
-        let err = delete_workspace(&mut conn, &ws, false).unwrap_err();
+        let err = delete_workspace(&mut conn, &ws, false, Compaction::Skip).unwrap_err();
         assert!(
             matches!(err, StoreError::WorkspaceNotEmpty(n) if n >= 1),
             "expected WorkspaceNotEmpty, got {err:?}"
@@ -4310,7 +4355,7 @@ pub(crate) mod tests {
         assert_eq!(ws_still, 1, "refused delete must not touch the row");
 
         // Force cascades: project + page gone, workspace row gone.
-        let summary = delete_workspace(&mut conn, &ws, true).unwrap();
+        let summary = delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap();
         assert!(
             summary.projects_deleted >= 1 && summary.pages_deleted >= 1,
             "{summary:?}"
@@ -4332,7 +4377,7 @@ pub(crate) mod tests {
 
         // Deleting again → NotFound.
         assert!(matches!(
-            delete_workspace(&mut conn, &ws, true).unwrap_err(),
+            delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap_err(),
             StoreError::NotFound(_)
         ));
     }
@@ -4341,7 +4386,7 @@ pub(crate) mod tests {
     fn delete_workspace_empty_succeeds_without_force() {
         let (_tmp, mut conn, _ws, _proj) = fresh_db();
         let empty = get_or_create_workspace(&mut conn, "orphan-ws").unwrap();
-        let summary = delete_workspace(&mut conn, &empty, false).unwrap();
+        let summary = delete_workspace(&mut conn, &empty, false, Compaction::Skip).unwrap();
         assert_eq!(summary.projects_deleted, 0);
         assert_eq!(summary.pages_deleted, 0);
         assert_eq!(summary.workstreams_deleted, 0);
@@ -4449,6 +4494,178 @@ pub(crate) mod tests {
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// Insert one managed workstream event carrying a distinctive marker.
+    /// `workstream_events` cascades out of `workstreams`, which cascades out
+    /// of `projects` — so a project purge removes these rows without ever
+    /// running a `DELETE` statement against the table itself.
+    fn seed_workstream_event(
+        conn: &Connection,
+        workstream_id: &ai_memory_core::WorkstreamId,
+        marker: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO workstream_events (workstream_id, sequence, event_id, agent_kind, \
+             native_session_id, kind, role, content, created_at) \
+             VALUES (?1, 1, ?2, 'claude-code', 'native-1', 'message', 'user', ?3, ?4)",
+            rusqlite::params![
+                workstream_id.as_bytes(),
+                format!("evt-{marker}"),
+                format!("evt-body-{marker}"),
+                Timestamp::now().as_microsecond(),
+            ],
+        )
+        .unwrap();
+    }
+
+    /// The default for a project purge is the same logical delete `#387`
+    /// documented for a session purge. Pinned so the CLI help, the admin route
+    /// docs and `docs/lifecycle-ops.md` cannot drift away from the behaviour:
+    /// if this starts failing, byte-level removal became the default and all
+    /// three need updating together.
+    #[test]
+    fn purge_project_is_a_logical_delete_by_default() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let db_path = tmp.path().join("test.sqlite");
+        seed_session(&mut conn, ws, proj, "canaryproj");
+
+        let summary = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .unwrap();
+        assert!(!summary.compacted, "the default does not VACUUM");
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+        let bytes = std::fs::read(&db_path).unwrap();
+        assert!(
+            bytes.windows(14).any(|w| w == b"obs-canaryproj"),
+            "documented boundary: purge-project is a logical delete. If this now \
+             fails, byte-level removal became the default and the #540 note, the \
+             CLI help and docs/lifecycle-ops.md all need updating to match."
+        );
+    }
+
+    /// The opt-in half. Paired with `purge_project_is_a_logical_delete_by_default`
+    /// so the two together pin the difference between what the command promises
+    /// and what it offers.
+    #[test]
+    fn purge_project_with_reclaim_removes_the_bytes_from_the_file() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let db_path = tmp.path().join("test.sqlite");
+        seed_session(&mut conn, ws, proj, "canaryproj");
+        // A second project in the same workspace must survive untouched.
+        let other = get_or_create_project(&mut conn, &ws, "keeper", None).unwrap();
+        seed_session(&mut conn, ws, other, "survivor");
+
+        let summary = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Reclaim,
+        )
+        .unwrap();
+        assert!(summary.compacted, "the summary reports that VACUUM ran");
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+        let bytes = std::fs::read(&db_path).unwrap();
+        assert!(
+            !bytes.windows(14).any(|w| w == b"obs-canaryproj"),
+            "Reclaim must remove the purged project's text from the database file"
+        );
+        assert!(
+            bytes.windows(12).any(|w| w == b"obs-survivor"),
+            "the sibling project's text is untouched by the compaction"
+        );
+    }
+
+    /// The reason `reclaim_freed_pages` rebuilds all three FTS indexes rather
+    /// than the two a session purge needs.
+    ///
+    /// `workstream_events` is an external-content FTS5 table whose rows leave
+    /// via the `projects` → `workstreams` → `workstream_events` cascade. A
+    /// cascade does not fire the `AFTER DELETE` trigger that would remove the
+    /// row from the index (`recursive_triggers` is off), so both the index
+    /// entry and its tokens survive the delete. Rebuilding only `pages_fts`
+    /// and `observations_fts` — the set a session purge needs — would leave a
+    /// managed agent's transcript text in the file after an operator asked for
+    /// it to be reclaimed.
+    #[test]
+    fn reclaim_clears_workstream_event_text_that_left_via_cascade() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let db_path = tmp.path().join("test.sqlite");
+        let prepared = open_managed_run(&mut conn, &ws, &proj);
+        seed_workstream_event(&conn, &prepared.workstream_id, "canaryevt");
+
+        // Present before the purge, both in the file and in the index.
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workstream_events_fts \
+                 WHERE workstream_events_fts MATCH '\"canaryevt\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "the event is searchable before the purge");
+
+        purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            true,
+            Compaction::Reclaim,
+        )
+        .unwrap();
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+        let bytes = std::fs::read(&db_path).unwrap();
+        // Assert on the *token*, not the whole hyphenated body. The body only
+        // ever existed contiguously in the content table, which `VACUUM` clears
+        // on its own; what survives an ordinary delete is the tokenized form
+        // inside the FTS5 segments, and only a `rebuild` removes that. Asserting
+        // on the full string would pass with or without the rebuild and prove
+        // nothing.
+        assert!(
+            !bytes.windows(9).any(|w| w == b"canaryevt"),
+            "Reclaim must clear workstream event tokens; if this fails, the \
+             workstream_events_fts rebuild was dropped from reclaim_freed_pages \
+             and a managed transcript's text survives a compacted purge"
+        );
+    }
+
+    /// `delete_workspace` takes the same path and makes the same promise.
+    #[test]
+    fn delete_workspace_reclaim_removes_the_bytes_and_reports_it() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let db_path = tmp.path().join("test.sqlite");
+        seed_session(&mut conn, ws, proj, "canaryws");
+
+        let skipped = {
+            let other = get_or_create_workspace(&mut conn, "doomed").unwrap();
+            delete_workspace(&mut conn, &other, false, Compaction::Skip).unwrap()
+        };
+        assert!(!skipped.compacted, "the default does not VACUUM");
+
+        let summary = delete_workspace(&mut conn, &ws, true, Compaction::Reclaim).unwrap();
+        assert!(summary.compacted, "the summary reports that VACUUM ran");
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+        let bytes = std::fs::read(&db_path).unwrap();
+        assert!(
+            !bytes.windows(12).any(|w| w == b"obs-canaryws"),
+            "Reclaim must remove the deleted workspace's text from the file"
+        );
     }
 
     /// #387, the reporter's reproduction: after purging one session by UUID,
@@ -8227,8 +8444,16 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         // Simulate the post-purge state: project row gone.
         // `purge_project` drives the cascading deletes we want here.
-        let _ = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
-            .expect("purge of fresh project should succeed");
+        let _ = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .expect("purge of fresh project should succeed");
         // Now try to rename the project that no longer exists. The
         // pre-fix code returned `Ok(())` because `UPDATE` affected
         // zero rows. The fix returns `NotFound` so admin handlers
@@ -8289,6 +8514,7 @@ pub(crate) mod tests {
             "default/scratch",
             Some(author),
             false,
+            Compaction::Skip,
         )
         .expect("purge should succeed");
 
@@ -8336,8 +8562,16 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         open_managed_run(&mut conn, &ws, &proj);
 
-        let err = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
-            .expect_err("an active managed run must block the purge");
+        let err = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .expect_err("an active managed run must block the purge");
 
         match err {
             StoreError::ManagedRunActive { count, workstreams } => {
@@ -8369,8 +8603,16 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let prepared = open_managed_run(&mut conn, &ws, &proj);
 
-        let summary = purge_project(&mut conn, &ws, &proj, "default/scratch", None, true)
-            .expect("force purges regardless of the live lease");
+        let summary = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            true,
+            Compaction::Skip,
+        )
+        .expect("force purges regardless of the live lease");
 
         assert_eq!(summary.workstreams_deleted, 1);
         assert_eq!(summary.managed_runs_deleted, 1);
@@ -8397,8 +8639,16 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let summary = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
-            .expect("a lapsed lease is not a running agent");
+        let summary = purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .expect("a lapsed lease is not a running agent");
 
         assert_eq!(summary.workstreams_deleted, 1);
         assert_eq!(summary.managed_runs_deleted, 1);

@@ -70,6 +70,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier backups still contain it. `docs/lifecycle-ops.md` states that
   boundary in a table so it is not inferred from the command name.
 
+- `ai-memory purge-project --compact` and `{"compact": true}` on
+  `POST /admin/delete-workspace` reclaim the bytes a delete frees, reusing the
+  `Compaction` opt-in that `purge-session` gained in the same cycle (#540). Both
+  responses now report `compacted`.
+
+  Compaction rebuilds **all three** FTS5 indexes rather than the two a session
+  purge needs. A managed workstream's `workstream_events` rows leave through the
+  `projects → workstreams → workstream_events` cascade, and a cascade does not
+  fire the `AFTER DELETE` trigger that would drop them from
+  `workstream_events_fts` — so the tokens survive an ordinary delete, and a
+  `VACUUM` alone does not clear them. A test pins this: removing the third
+  rebuild leaves a purged agent transcript's text in the database file.
+
 ### Fixed
 - A failed or skipped embed now leaves a durable record. `page_embeddings`
   stores only successes, and its upsert rewrites `created_at`, so a global
@@ -125,6 +138,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and not through the usual config load, which also merges the environment — a
   drain honouring `AI_MEMORY_SERVER_URL` would send captured events to whatever
   address happened to be exported into the process that ran it.
+
+- `purge-project` and `delete-workspace` no longer overstate what they delete
+  (#540). The help text promised "Permanently delete a project and ALL its
+  data", which reads as byte-level removal neither command performed.
+
+  The deletion was never the defect. Rows go and bytes stay in free pages until
+  the file is rewritten — ordinary SQLite behaviour, and the same boundary
+  `purge-session` already documented. Measured on a canary token: delete alone
+  leaves the text on disk, delete + `VACUUM` still leaves it, and only
+  delete + FTS `rebuild` + `VACUUM` removes it. The claim was what needed
+  fixing, so both commands now describe the boundary they actually enforce and
+  offer the same `--compact` opt-in, and `docs/lifecycle-ops.md` covers all
+  three destructive commands in one place instead of documenting the limits of
+  one and overstating the other two.
 
 ### Docs
 

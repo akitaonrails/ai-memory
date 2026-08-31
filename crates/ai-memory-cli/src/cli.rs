@@ -145,9 +145,15 @@ pub enum Command {
     /// `is_latest=false` (they were a multi-project mash-up) so the
     /// next consolidation can regenerate them per-project. Idempotent.
     Reorg(ReorgArgs),
-    /// Permanently delete a project and ALL its data (pages, sessions,
-    /// observations, handoffs, embeddings, on-disk wiki files).
-    /// This is irreversible — requires `--confirm`.
+    /// Delete a project: its pages, sessions, observations, handoffs,
+    /// embeddings, managed workstreams and on-disk wiki files.
+    ///
+    /// Irreversible — requires `--confirm`. By default this is a logical
+    /// delete: the rows are gone and nothing can reach them through the API
+    /// or search, but their bytes remain in free pages of the database file
+    /// until it is rewritten, as with any SQLite delete. `--compact`
+    /// reclaims them; neither mode is forensic erasure, because the wiki git
+    /// history and any earlier backup still hold the content.
     PurgeProject(PurgeProjectArgs),
     /// Permanently delete ONE session and everything derived from it.
     ///
@@ -627,6 +633,19 @@ pub struct PurgeProjectArgs {
     /// out — purging is destructive and irreversible.
     #[arg(long)]
     pub confirm: bool,
+    /// Also reclaim the freed bytes: rebuild the FTS indexes and VACUUM the
+    /// database after the delete commits.
+    ///
+    /// Without this the purge is a logical delete — the project is gone from
+    /// the API and from search, but its bytes stay in free pages of the
+    /// database file until it is next rewritten, as with any SQLite delete.
+    ///
+    /// This rewrites the WHOLE database and needs free disk space of about
+    /// its size, so it takes minutes on a large store. It also does NOT make
+    /// the content forensically unrecoverable: the wiki git history and any
+    /// backup taken before the purge still contain it.
+    #[arg(long)]
+    pub compact: bool,
 }
 
 /// Arguments for `purge-session`.

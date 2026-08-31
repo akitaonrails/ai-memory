@@ -15,6 +15,8 @@ struct PurgeProjectRequest {
     confirm: bool,
     /// Purge even when a managed workstream still holds a live run lease.
     force: bool,
+    /// Rebuild the FTS indexes and VACUUM after the delete commits.
+    compact: bool,
 }
 
 /// Run the `purge-project` subcommand.
@@ -49,6 +51,7 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
             project: project.clone(),
             confirm: true,
             force: args.force,
+            compact: args.compact,
         },
     )
     .await?;
@@ -88,6 +91,16 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
         println!(
             "Warning: {} wiki file(s) could not be removed from disk (DB rows are gone).",
             failed.len()
+        );
+    }
+    if report["compacted"].as_bool().unwrap_or(false) {
+        println!("Database compacted: freed bytes reclaimed.");
+    } else {
+        println!(
+            "Note: this was a logical delete. The project is unreachable through \
+             the API and search, but its bytes remain in the database file until \
+             it is rewritten. Re-run with --compact to reclaim them (slow), and \
+             see docs/lifecycle-ops.md for what that does and does not guarantee."
         );
     }
     Ok(())
