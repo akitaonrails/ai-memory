@@ -13,6 +13,7 @@ pub mod backup;
 pub mod bootstrap;
 pub mod checkpoints;
 pub mod commit;
+pub mod compact;
 pub mod completions;
 pub mod continue_session;
 pub mod curator;

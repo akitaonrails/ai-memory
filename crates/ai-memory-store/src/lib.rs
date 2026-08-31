@@ -45,10 +45,10 @@ pub use decay::{
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, Compaction, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite,
-    HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary,
-    MoveSummary, ObservationPruneOutcome, PagesMode, PurgeSessionSummary, PurgeSummary,
-    ReorgSummary, purge_session, record_embed_failure,
+    AdmittedSession, CompactSummary, Compaction, DeleteWorkspaceSummary, EmbedOutcome,
+    EmbeddingWrite, HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, PagesMode, PurgeSessionSummary,
+    PurgeSummary, ReorgSummary, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
@@ -58,8 +58,8 @@ pub use reader::{
     ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
     PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary,
     ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
-    SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts, StoredEmbedding,
-    StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts, StorageStatus,
+    StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,

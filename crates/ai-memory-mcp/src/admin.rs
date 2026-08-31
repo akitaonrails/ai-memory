@@ -26,6 +26,7 @@
 //! - `POST /admin/purge-session`  — delete one session and what it derived.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
+//! - `POST /admin/compact`        — reclaim free pages; deletes nothing.
 //! - `POST /admin/delete-workspace` — delete a workspace and its projects
 //!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
 //! - `POST /admin/merge-workspace` — fold every project of one workspace into
@@ -628,6 +629,7 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/move-session", post(handle_move_session))
         .route("/admin/delete-workspace", post(handle_delete_workspace))
+        .route("/admin/compact", post(handle_compact))
         .route("/admin/rename-workspace", post(handle_rename_workspace))
         .route("/admin/merge-workspace", post(handle_merge_workspace))
         .route("/admin/write-page", post(handle_write_page))
@@ -923,6 +925,9 @@ pub struct StatusReport {
     pub counts: ai_memory_store::StatusCounts,
     /// Derived-index and retrieval-readiness diagnostics.
     pub derived: ai_memory_store::DerivedIndexStatus,
+    /// Physical storage figures — file size and reclaimable free pages — so an
+    /// operator can decide whether a `VACUUM` is worth its exclusive lock.
+    pub storage: ai_memory_store::StorageStatus,
     /// Passive process-scoped provider health.
     pub providers: ProviderHealthSnapshot,
     /// Hook-ingestion counters for this server process. Counts and one
@@ -952,6 +957,9 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
     match state.reader.status_counts().await {
         Ok(counts) => match state.reader.derived_index_status().await {
             Ok(derived) => {
+                // Three pragma reads; a failure here must not take down the
+                // whole status response, which is also the health probe.
+                let storage = state.reader.storage_status().await.unwrap_or_default();
                 let report = StatusReport {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     data_dir: state.data_dir.display().to_string(),
@@ -959,6 +967,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     db_path: state.db_path.display().to_string(),
                     counts,
                     derived,
+                    storage,
                     providers: state.provider_health.snapshot(),
                     ingest: state.ingest_metrics.snapshot(),
                 };
@@ -3845,6 +3854,62 @@ pub struct DeleteWorkspaceResult {
 /// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
 /// project/page under it. Guarded: refuses a non-empty workspace unless
 /// `force` (a typo shouldn't wipe live data). Orphan-workspace cleanup.
+/// JSON request body for `POST /admin/compact`.
+#[derive(Deserialize)]
+struct CompactRequest {
+    /// Mandatory confirmation. Not because compaction destroys anything — it
+    /// deletes nothing — but because it takes an exclusive lock and rewrites
+    /// the whole database, so every write blocks until it finishes. That is an
+    /// availability decision, and it should be deliberate.
+    confirm: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/compact`.
+#[derive(Debug, Serialize)]
+pub struct CompactReport {
+    /// Database size in bytes before the rebuild + `VACUUM`.
+    pub bytes_before: u64,
+    /// Database size in bytes afterwards.
+    pub bytes_after: u64,
+    /// Bytes returned to the filesystem (saturating at zero).
+    pub bytes_reclaimed: u64,
+}
+
+/// `POST /admin/compact` — rebuild the FTS indexes and `VACUUM`, deleting
+/// nothing. The on-demand form of what the destructive commands offer as
+/// `--compact`.
+async fn handle_compact(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CompactRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "compact rewrites the whole database under an exclusive \
+                          lock; pass confirm: true to proceed"
+            })),
+        );
+    }
+    match state.writer.compact().await {
+        Ok(summary) => {
+            let report = CompactReport {
+                bytes_before: summary.bytes_before,
+                bytes_after: summary.bytes_after,
+                bytes_reclaimed: summary.bytes_reclaimed(),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
 async fn handle_delete_workspace(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,

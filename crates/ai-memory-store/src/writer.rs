@@ -327,6 +327,11 @@ pub(crate) enum WriteCmd {
         compaction: crate::ops::Compaction,
         reply: oneshot::Sender<StoreResult<crate::ops::PurgeSessionSummary>>,
     },
+    /// Reclaim free pages on demand: rebuild the FTS indexes and `VACUUM`,
+    /// deleting nothing. See [`ops::compact`].
+    Compact {
+        reply: oneshot::Sender<StoreResult<crate::ops::CompactSummary>>,
+    },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
     /// sessions/…). Refused when non-empty unless `force`.
     DeleteWorkspace {
@@ -1370,6 +1375,21 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Reclaim free pages on demand, deleting nothing.
+    ///
+    /// Runs through the writer actor like every other exclusive operation, so
+    /// it cannot overlap a write: `VACUUM` takes an exclusive lock and would
+    /// otherwise contend with one.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error from the rebuild or `VACUUM`.
+    pub async fn compact(&self) -> StoreResult<crate::ops::CompactSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::Compact { reply: tx }).await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Rename a workspace (column-only; the on-disk dir is UUID-keyed).
     ///
     /// # Errors
@@ -2388,6 +2408,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     compaction,
                 );
                 send_or_warn(reply, result, "purge_session");
+            }
+            WriteCmd::Compact { reply } => {
+                let result = ops::compact(&mut conn);
+                send_or_warn(reply, result, "compact");
             }
             WriteCmd::DeleteWorkspace {
                 workspace_id,

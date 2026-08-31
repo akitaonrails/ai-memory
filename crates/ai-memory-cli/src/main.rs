@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
         Command::DeletePage(args) => commands::delete_page::run(&config, args).await,
         Command::Serve(args) => commands::serve::run(&config, args).await,
         Command::Reset(args) => commands::reset::run(&config, args),
+        Command::Compact(args) => commands::compact::run(&config, args).await,
         Command::Backup(args) => commands::backup::run(&config, args).await,
         Command::Restore(args) => commands::restore::run(&config, args),
         Command::Reindex(args) => commands::reindex::run(&config, args).await,

@@ -70,6 +70,14 @@ pub enum Command {
     Serve(ServeArgs),
     /// Wipe the data directory's wiki/, db/, raw/ contents.
     Reset(ResetArgs),
+    /// Reclaim free database pages. Deletes nothing.
+    ///
+    /// Rebuilds the FTS indexes and VACUUMs, returning free pages to the
+    /// filesystem. `ai-memory status` reports how much there is to reclaim —
+    /// check it first: this takes an exclusive lock and rewrites the whole
+    /// database, so every write blocks until it finishes and it needs free
+    /// disk space of roughly the database's own size.
+    Compact(CompactArgs),
     /// Snapshot wiki/, db/, and config.toml into a gzipped tarball.
     Backup(BackupArgs),
     /// Restore a backup tarball into the data directory.
@@ -611,6 +619,15 @@ pub struct ReorgArgs {
     /// Show what would change without writing.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// Arguments for `compact`.
+#[derive(Debug, Args)]
+pub struct CompactArgs {
+    /// REQUIRED. Not because compaction destroys anything — it deletes
+    /// nothing — but because it blocks every write for as long as it runs.
+    #[arg(long)]
+    pub confirm: bool,
 }
 
 /// Arguments for `purge-project`.

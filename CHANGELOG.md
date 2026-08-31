@@ -83,6 +83,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VACUUM` alone does not clear them. A test pins this: removing the third
   rebuild leaves a purged agent transcript's text in the database file.
 
+- `ai-memory compact --confirm` and `POST /admin/compact` reclaim free
+  database pages on demand, deleting nothing, and `ai-memory status` now
+  reports the figure that makes the decision possible: database size,
+  reclaimable bytes, and the share of the file they represent (#549).
+
+  Until now compaction was only reachable by *deleting* something — it existed
+  solely as `--compact` on the destructive commands — so a store that had
+  accumulated free pages through a retention sweep or months of superseded page
+  versions had no way to return the space except by purging data worth keeping.
+  There was also no figure anywhere saying whether a `VACUUM` would reclaim
+  anything at all, which made scheduling one guesswork.
+
+  `docs/deploy.md` documents the operational side, including why an
+  unconditional nightly `VACUUM` is the wrong default: it takes an exclusive
+  lock and rewrites the whole database, so every write blocks — and because
+  SQLite reuses free pages, a store in steady use usually has almost nothing to
+  reclaim, paying the full cost for no benefit. The recipe there is conditional
+  on the reported figure and runs in off hours.
+
+  `status` only advises compaction once the backlog is worth the stall (≥20% of
+  the file *and* ≥64 MiB); the raw numbers are always reported.
+
 ### Fixed
 - A failed or skipped embed now leaves a durable record. `page_embeddings`
   stores only successes, and its upsert rewrites `created_at`, so a global
