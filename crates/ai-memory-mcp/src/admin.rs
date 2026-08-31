@@ -22,6 +22,7 @@
 //! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
 //! - `POST /admin/restore-page`   — restore one page from a checkpoint.
 //! - `POST /admin/purge-project`  — delete a project and all its data.
+//! - `POST /admin/purge-session`  — delete one session and what it derived.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/delete-workspace` — delete a workspace and all of its projects.
@@ -619,6 +620,7 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/checkpoints", get(handle_checkpoints))
         .route("/admin/restore-page", post(handle_restore_page))
         .route("/admin/purge-project", post(handle_purge_project))
+        .route("/admin/purge-session", post(handle_purge_session))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/move-session", post(handle_move_session))
@@ -3258,6 +3260,123 @@ async fn handle_restore_page(
             .unwrap_or_else(|_| serde_json::json!({})),
         ),
     ))
+}
+
+// ---------------------------------------------------------------------
+// purge-session
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/purge-session`.
+#[derive(Deserialize)]
+struct PurgeSessionRequest {
+    /// Workspace name. Must already exist; 404 otherwise.
+    workspace: String,
+    /// Project name. Must already exist; 404 otherwise.
+    project: String,
+    /// Full `sessions.id` UUID. A session that does not belong to the named
+    /// workspace/project is a 404 — the id alone is never authority over
+    /// another scope.
+    session_id: String,
+    /// Mandatory confirmation flag. Without `confirm: true` the server
+    /// returns 400 — purging is destructive and irreversible.
+    confirm: bool,
+    /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
+    /// delete commits. Off by default; see `ai_memory_store::Compaction` for
+    /// the cost and for what it does not guarantee.
+    #[serde(default)]
+    compact: bool,
+}
+
+/// `POST /admin/purge-session` — delete one session and everything derived
+/// from it, inside a single workspace/project scope.
+async fn handle_purge_session(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<PurgeSessionRequest>,
+) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+
+    let session_id = match req.session_id.trim().parse::<SessionId>() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "session_id must be a full UUID" })),
+            );
+        }
+    };
+
+    let (ws_id, proj_id) =
+        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    // Admission runs before anything is deleted so a reject-policy webhook can
+    // refuse while every row is still intact — same order as purge-project.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let ctx = AdmissionContext {
+        workspace: req.workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeSession,
+        actor,
+        ..Default::default()
+    };
+    if let Err(e) = state
+        .wiki
+        .admit_purge_session(ws_id, proj_id, Some(ctx))
+        .await
+    {
+        return internal_err(e.to_string());
+    }
+
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+
+    let summary = match state
+        .writer
+        .purge_session(ws_id, proj_id, session_id, author_id, compaction)
+        .await
+    {
+        Ok(s) => s,
+        // Absent from this scope (or already purged) is a 404, not a fault.
+        Err(e @ StoreError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session_id": session_id.to_string(),
+            "workspace": req.workspace,
+            "project": req.project,
+            "observations_deleted": summary.observations_deleted,
+            "handoffs_deleted": summary.handoffs_deleted,
+            "pages_deleted": summary.pages_deleted,
+            "auto_improve_runs_deleted": summary.auto_improve_runs_deleted,
+            "removed_paths": summary.removed_paths,
+            "compacted": summary.compacted,
+        })),
+    )
 }
 
 // ---------------------------------------------------------------------

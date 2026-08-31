@@ -2799,6 +2799,251 @@ pub fn insert_wiki_migration(
 /// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
 /// still live and `force` is false, or [`StoreError`] if any SQL statement
 /// fails. The transaction is rolled back automatically on error.
+/// Whether [`purge_session`] should reclaim the freed bytes afterwards.
+///
+/// A purge is a logical delete: the rows are gone and nothing can reach them
+/// through the API or through search, but their bytes remain in free pages of
+/// the database file until the file is rewritten — exactly as for any other
+/// SQLite delete.
+///
+/// [`Compaction::Reclaim`] additionally rebuilds the affected FTS5 indexes
+/// (the tokens survive an ordinary delete inside the index segments) and runs
+/// `VACUUM`, after the deletion has committed.
+///
+/// # Cost and limits
+///
+/// `VACUUM` rewrites the entire database and needs free disk space of roughly
+/// the database's own size. On a multi-gigabyte store this is minutes, not
+/// milliseconds, so it is opt-in rather than the default.
+///
+/// It also does **not** make the content forensically unrecoverable. The wiki
+/// git repository keeps page text in its objects and commit messages, and any
+/// backup taken before the purge still contains it. Reclaiming bytes from the
+/// live SQLite file is worth doing on its own terms; it is not a guarantee of
+/// erasure everywhere, and must not be described as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compaction {
+    /// Leave the freed pages alone. The default, and what #387 promises.
+    Skip,
+    /// Rebuild the affected FTS indexes and `VACUUM` after committing.
+    Reclaim,
+}
+
+/// What [`purge_session`] removed. All counts are rows actually deleted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PurgeSessionSummary {
+    /// `observations` rows removed.
+    pub observations_deleted: u64,
+    /// `handoffs` rows removed — only those this session *authored*.
+    pub handoffs_deleted: u64,
+    /// `pages` rows removed, counting every version in the supersession chain.
+    pub pages_deleted: u64,
+    /// `auto_improve_runs` rows removed.
+    pub auto_improve_runs_deleted: u64,
+    /// On-disk wiki paths whose rows are gone, for the caller to unlink.
+    pub removed_paths: Vec<String>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran).
+    pub compacted: bool,
+}
+
+/// Delete one session and everything addressable from it, within one scope.
+///
+/// # Scope containment
+///
+/// This is a destructive operation driven by a caller-supplied id, so the
+/// scope is enforced structurally rather than trusted:
+///
+/// - the session must exist **and** belong to `(workspace_id, project_id)`;
+///   a session id from another scope is [`StoreError::NotFound`] and nothing
+///   is deleted;
+/// - every statement is additionally filtered on `workspace_id` and
+///   `project_id` wherever the table carries them, so even a mismatched id
+///   cannot reach a row in another workspace or project;
+/// - derived pages are deleted by **id**, from a set collected and
+///   scope-checked first — never by path. Two projects may hold the same
+///   `sessions/<uuid>.md` path, and a hand-written page can occupy the path a
+///   session later claims; deleting by path would take those with it.
+///
+/// # Ordering
+///
+/// `auto_improve_runs.session_id`, `handoffs.from_session_id`,
+/// `handoffs.accepted_by_session` and `pages.supersedes` are all
+/// `ON DELETE SET NULL`. Cutting the session first nulls the pointers needed
+/// to find what it produced, so every target is collected before anything is
+/// deleted.
+///
+/// # What is deliberately *not* deleted
+///
+/// Handoffs this session **accepted** but did not author. Their summary text
+/// belongs to the authoring session; accepting one does not transfer
+/// ownership, and removing it would destroy another session's record. Those
+/// rows keep their content and lose only the `accepted_by_session` pointer,
+/// via the existing `ON DELETE SET NULL`.
+pub fn purge_session(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    author_id: Option<ai_memory_core::UserId>,
+    compaction: Compaction,
+) -> StoreResult<PurgeSessionSummary> {
+    let wid = workspace_id.as_bytes();
+    let pid = project_id.as_bytes();
+    let sid = session_id.as_bytes();
+    let tx = conn.transaction()?;
+
+    // The session must live in this scope. A mismatch is NotFound, not a
+    // silent no-op: the caller asked to delete something and must learn that
+    // it did not happen.
+    let in_scope: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sessions \
+         WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        rusqlite::params![&sid[..], &wid[..], &pid[..]],
+        |row| row.get(0),
+    )?;
+    if in_scope == 0 {
+        return Err(StoreError::NotFound(format!(
+            "session {session_id} not found in this workspace/project"
+        )));
+    }
+
+    // ---- collect, before anything is cut ----
+
+    // The derived page and every version of it. Walk from the recorded
+    // summary page across the supersession chain, staying inside the scope.
+    let page_ids: Vec<Vec<u8>> = {
+        let mut stmt = tx.prepare(
+            "WITH RECURSIVE chain(id) AS ( \
+                 SELECT summary_page_id FROM sessions \
+                  WHERE id = ?1 AND summary_page_id IS NOT NULL \
+                 UNION \
+                 SELECT p.id FROM pages p JOIN chain c ON p.supersedes = c.id \
+             ) \
+             SELECT p.id FROM pages p JOIN chain c ON p.id = c.id \
+              WHERE p.workspace_id = ?2 AND p.project_id = ?3",
+        )?;
+        stmt.query_map(rusqlite::params![&sid[..], &wid[..], &pid[..]], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let removed_paths: Vec<String> = if page_ids.is_empty() {
+        Vec::new()
+    } else {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT path FROM pages \
+              WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        )?;
+        let mut paths = Vec::new();
+        for id in &page_ids {
+            let found: Option<String> = stmt
+                .query_row(rusqlite::params![&id[..], &wid[..], &pid[..]], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if let Some(path) = found
+                && !paths.contains(&path)
+            {
+                paths.push(path);
+            }
+        }
+        paths
+    };
+
+    let run_ids: Vec<Vec<u8>> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM auto_improve_runs \
+              WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        )?;
+        stmt.query_map(rusqlite::params![&sid[..], &wid[..], &pid[..]], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // ---- delete, innermost first ----
+
+    for run in &run_ids {
+        tx.execute(
+            "DELETE FROM auto_improve_rejections \
+              WHERE source_run_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            rusqlite::params![&run[..], &wid[..], &pid[..]],
+        )?;
+    }
+    let auto_improve_runs_deleted = tx.execute(
+        "DELETE FROM auto_improve_runs \
+          WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        rusqlite::params![&sid[..], &wid[..], &pid[..]],
+    )? as u64;
+
+    // Authored only. See the note above about accepted handoffs.
+    let handoffs_deleted = tx.execute(
+        "DELETE FROM handoffs \
+          WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        rusqlite::params![&sid[..], &wid[..], &pid[..]],
+    )? as u64;
+
+    // Pages by id, scoped. Cascades `page_embeddings` and fires `pages_fts_ad`.
+    let mut pages_deleted = 0u64;
+    for id in &page_ids {
+        pages_deleted += tx.execute(
+            "DELETE FROM pages WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            rusqlite::params![&id[..], &wid[..], &pid[..]],
+        )? as u64;
+    }
+
+    // Deleted explicitly rather than left to the cascade so the row count is
+    // known and can be reported. Measured: this does *not* change what the
+    // FTS index retains — with an external-content table the cascade already
+    // makes the text unsearchable, and the tokens stay in the FTS5 segments
+    // either way until a `rebuild`. See the scope note on this function.
+    let observations_deleted = tx.execute(
+        "DELETE FROM observations \
+          WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        rusqlite::params![&sid[..], &wid[..], &pid[..]],
+    )? as u64;
+
+    // Finally the session itself; cascades scheduler claims and
+    // consolidation jobs, which hold no content of their own.
+    tx.execute(
+        "DELETE FROM sessions WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        rusqlite::params![&sid[..], &wid[..], &pid[..]],
+    )?;
+
+    audit(
+        &tx,
+        "purge_session",
+        Some(wid),
+        Some(pid),
+        None,
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+        Timestamp::now().as_microsecond(),
+    )?;
+
+    tx.commit()?;
+
+    // Outside the transaction: `VACUUM` cannot run inside one, and a rebuild
+    // is a whole-index operation we do not want holding the write lock for
+    // the duration of the delete.
+    if compaction == Compaction::Reclaim {
+        conn.execute_batch(
+            "INSERT INTO observations_fts(observations_fts) VALUES('rebuild'); \
+             INSERT INTO pages_fts(pages_fts) VALUES('rebuild'); \
+             VACUUM;",
+        )?;
+    }
+
+    Ok(PurgeSessionSummary {
+        observations_deleted,
+        handoffs_deleted,
+        pages_deleted,
+        auto_improve_runs_deleted,
+        removed_paths,
+        compacted: compaction == Compaction::Reclaim,
+    })
+}
+
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -3976,6 +4221,285 @@ pub(crate) mod tests {
             body: "observation".into(),
             importance: 5,
         }
+    }
+
+    /// Seed a session with one observation and a derived page, return the ids.
+    fn seed_session(
+        conn: &mut Connection,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        marker: &str,
+    ) -> (SessionId, PageId) {
+        let sid = SessionId::new();
+        let session = hook_session(sid, ws, proj, None);
+        begin_session(conn, &session).unwrap();
+        let mut obs = hook_observation(&session);
+        obs.body = format!("obs-{marker}");
+        insert_observation(conn, &obs).unwrap();
+        let page_id = upsert_page(
+            conn,
+            &page(
+                ws,
+                proj,
+                &format!("sessions/{marker}.md"),
+                &format!("page-{marker}"),
+            ),
+        )
+        .unwrap();
+        end_session(conn, &sid, Some(&page_id)).unwrap();
+        (sid, page_id)
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// #387, the reporter's reproduction: after purging one session by UUID,
+    /// its rows are gone from every table that held them.
+    #[test]
+    fn purge_session_removes_the_session_and_everything_derived_from_it() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (sid, _page) = seed_session(&mut conn, ws, proj, "target");
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM sessions"),
+            0,
+            "sessions=0"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM observations"),
+            0,
+            "observations=0"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0, "pages=0");
+        assert_eq!(summary.observations_deleted, 1);
+        assert_eq!(summary.pages_deleted, 1);
+        assert_eq!(
+            summary.removed_paths,
+            vec!["sessions/target.md".to_string()]
+        );
+    }
+
+    /// The blast radius must stop at the session. A sibling session in the
+    /// same project keeps every row it owns.
+    #[test]
+    fn purge_session_leaves_a_sibling_session_in_the_same_project_intact() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (target, _) = seed_session(&mut conn, ws, proj, "target");
+        let (keep, keep_page) = seed_session(&mut conn, ws, proj, "keep");
+
+        purge_session(&mut conn, ws, proj, target, None, Compaction::Skip).unwrap();
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
+        let survivor: Vec<u8> = conn
+            .query_row("SELECT id FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(survivor, keep.as_bytes().to_vec(), "the sibling survived");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 1);
+        let body: String = conn
+            .query_row("SELECT body FROM observations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(body, "obs-keep");
+        let page_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE id = ?1",
+                [keep_page.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(page_rows, 1, "the sibling's page survived");
+    }
+
+    /// A session id is not authority over another scope. Naming the wrong
+    /// project must fail closed and delete nothing.
+    #[test]
+    fn purge_session_refuses_a_session_from_another_project_and_deletes_nothing() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "target");
+
+        let err = purge_session(&mut conn, ws, other, sid, None, Compaction::Skip)
+            .expect_err("a session outside the named project must not be purgeable");
+        assert!(matches!(err, StoreError::NotFound(_)), "got {err:?}");
+
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM sessions"),
+            1,
+            "nothing deleted"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 1);
+    }
+
+    /// Same containment across workspaces.
+    #[test]
+    fn purge_session_refuses_a_session_from_another_workspace() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let ws2 = get_or_create_workspace(&mut conn, "second").unwrap();
+        let proj2 = get_or_create_project(&mut conn, &ws2, "scratch", None).unwrap();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "target");
+
+        let err = purge_session(&mut conn, ws2, proj2, sid, None, Compaction::Skip)
+            .expect_err("cross-workspace purge must be refused");
+        assert!(matches!(err, StoreError::NotFound(_)));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
+    }
+
+    /// Two projects can hold the same `sessions/<uuid>.md` path. Deleting by
+    /// path would take the other one; deleting by id must not.
+    #[test]
+    fn purge_session_does_not_delete_an_identically_pathed_page_in_another_project() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "shared");
+        let twin = upsert_page(
+            &mut conn,
+            &page(ws, other, "sessions/shared.md", "page-elsewhere"),
+        )
+        .unwrap();
+
+        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+
+        let survived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE id = ?1",
+                [twin.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            survived, 1,
+            "a same-path page in another project must survive a purge by id"
+        );
+    }
+
+    /// Accepting a handoff does not make its text yours. Purging the
+    /// accepting session must not destroy the authoring session's record.
+    #[test]
+    fn purge_session_deletes_authored_handoffs_but_not_accepted_ones() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (author, _) = seed_session(&mut conn, ws, proj, "author");
+        let (accepter, _) = seed_session(&mut conn, ws, proj, "accepter");
+        conn.execute(
+            "INSERT INTO handoffs (id, workspace_id, project_id, from_session_id, from_agent, \
+             summary, state, created_at, accepted_by_session) \
+             VALUES (?1, ?2, ?3, ?4, 'codex', 'authored-by-author', 'accepted', 1, ?5)",
+            rusqlite::params![
+                &uuid::Uuid::now_v7().as_bytes()[..],
+                ws.as_bytes(),
+                proj.as_bytes(),
+                author.as_bytes(),
+                accepter.as_bytes()
+            ],
+        )
+        .unwrap();
+
+        let summary = purge_session(&mut conn, ws, proj, accepter, None, Compaction::Skip).unwrap();
+        assert_eq!(summary.handoffs_deleted, 0, "accepting is not authorship");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM handoffs"),
+            1,
+            "the authoring session's handoff survives"
+        );
+
+        let summary = purge_session(&mut conn, ws, proj, author, None, Compaction::Skip).unwrap();
+        assert_eq!(
+            summary.handoffs_deleted, 1,
+            "the author's handoff is removed"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM handoffs"), 0);
+    }
+
+    /// Purging a session that is already gone is NotFound, not a partial
+    /// delete of whatever happens to match.
+    #[test]
+    fn purge_session_is_not_found_when_run_twice() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (sid, _) = seed_session(&mut conn, ws, proj, "target");
+        let (keep, _) = seed_session(&mut conn, ws, proj, "keep");
+
+        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        let err = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip)
+            .expect_err("already gone");
+        assert!(matches!(err, StoreError::NotFound(_)));
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM sessions"),
+            1,
+            "the second call left the surviving session alone"
+        );
+        let _ = keep;
+    }
+
+    /// Pins the advertised boundary. A purged session is unreachable through
+    /// the API and through search, but its bytes are still in the database
+    /// file until a `rebuild` + `VACUUM` — exactly as they are for any other
+    /// SQLite delete. #387 promises the former and explicitly not the latter,
+    /// and this test fails if someone changes that without revisiting the
+    /// claim we make to operators.
+    #[test]
+    fn purge_session_is_unsearchable_but_does_not_claim_byte_level_removal() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let db_path = tmp.path().join("test.sqlite");
+        let (sid, _) = seed_session(&mut conn, ws, proj, "target");
+        let (_keep, _) = seed_session(&mut conn, ws, proj, "keep");
+
+        purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+
+        let gone: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations_fts WHERE observations_fts MATCH '\"obs-target\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0, "the purged session is not searchable");
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations_fts WHERE observations_fts MATCH '\"obs-keep\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "the sibling session is still searchable");
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+        let bytes = std::fs::read(&db_path).unwrap();
+        let still_on_disk = bytes.windows(10).any(|w| w == b"obs-target");
+        assert!(
+            still_on_disk,
+            "documented boundary: purge is a logical delete. If this now fails, \
+             byte-level removal was added and the #387 scope note, the CLI help \
+             and the operator-facing docs all need updating to match."
+        );
+    }
+
+    /// The opt-in half: `Compaction::Reclaim` must actually remove the bytes
+    /// the default leaves behind. Paired with
+    /// `purge_session_is_unsearchable_but_does_not_claim_byte_level_removal`,
+    /// which asserts the opposite for the default, so the two together pin
+    /// the difference between what we promise and what we offer.
+    #[test]
+    fn purge_session_with_reclaim_removes_the_bytes_from_the_file() {
+        let (tmp, mut conn, ws, proj) = fresh_db();
+        let db_path = tmp.path().join("test.sqlite");
+        let (sid, _) = seed_session(&mut conn, ws, proj, "target");
+        let (_keep, _) = seed_session(&mut conn, ws, proj, "keep");
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Reclaim).unwrap();
+        assert!(summary.compacted, "the summary reports that VACUUM ran");
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+        let bytes = std::fs::read(&db_path).unwrap();
+        assert!(
+            !bytes.windows(10).any(|w| w == b"obs-target"),
+            "Reclaim must remove the purged text from the database file"
+        );
+        assert!(
+            bytes.windows(8).any(|w| w == b"obs-keep"),
+            "the surviving session's text is untouched by the compaction"
+        );
     }
 
     fn session_end_observation(session: &NewSession) -> NewObservation {

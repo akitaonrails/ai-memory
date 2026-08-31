@@ -9,6 +9,7 @@ on a homelab box where mistakes are harder to undo.
 | Command | Safe with server **running**? | Wipes data? | Reversible? | Notes |
 |---|---|---|---|---|
 | `purge-project --confirm` | ✅ yes | the one project's data | no | Deletes the UUID-namespaced wiki root and raw workstream segments; sibling projects remain untouched. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. |
+| `purge-session --session-id --confirm` | ✅ yes | the one session's data | no | Deletes one session by UUID: its row, its observations, the handoffs it **authored**, its `sessions/<id>.md` page and every superseded version, their embeddings, and its auto-improve runs. Strictly scoped — a session that does not belong to the named workspace/project is a `404` and nothing is deleted. Handoffs the session only *accepted* are kept: that text belongs to the session that wrote it. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
 | `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. |
@@ -25,6 +26,55 @@ State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
 fundamentally cannot run while another process holds the SQLite WAL writer. See
 [CLAUDE.md §16](../CLAUDE.md) for the invariant.
+
+
+## `purge-session` and what "deleted" means
+
+`purge-session` answers *"forget this conversation"*: after it runs, the
+session is gone from the API, from `status` counts and from search.
+
+```bash
+ai-memory purge-session \
+  --workspace default --project my-app \
+  --session-id 0199f3d2-1c4e-7a10-9f3b-2b0c5d8e7a11 \
+  --confirm
+```
+
+It is a **logical delete**, and the distinction matters if you are answering a
+regulatory erasure request rather than tidying up:
+
+| | default | `--compact` |
+|---|---|---|
+| Reachable through the API / MCP tools | no | no |
+| Returned by search (FTS) | no | no |
+| Bytes still present in `memory.sqlite` | **yes**, in free pages | no |
+| Text still in the wiki git history | **yes** | **yes** |
+| Present in backups taken before the purge | **yes** | **yes** |
+| Cost | one transaction | rewrites the whole database |
+
+`--compact` rebuilds the affected FTS5 indexes — an ordinary delete leaves the
+tokens inside the index segments, which is why a rebuild rather than a
+`VACUUM` alone is what clears them — and then `VACUUM`s to release the freed
+pages. It needs free disk space of roughly the database's own size and takes
+minutes on a large store, which is why it is opt-in.
+
+**`--compact` is not forensic erasure.** The wiki git repository stores page
+content in its objects *and its commit messages*, and any backup taken before
+the purge still contains everything. Removing the bytes from the live SQLite
+file is worth doing on its own terms; do not describe it to a user as a
+guarantee that the content is unrecoverable, because it is not.
+
+### Scope containment
+
+The session id is never authority on its own. Every statement is filtered on
+`workspace_id` and `project_id` as well as `session_id`, the session must
+belong to the named scope or the call is a `404` with nothing deleted, and the
+derived pages are deleted by **id** rather than by path — two projects can
+hold the same `sessions/<uuid>.md`, and deleting by path would take the other
+one with it. `/admin/purge-session` runs the admission chain before any row is
+touched, so a `failure_policy = reject` webhook can still abort the whole
+operation while the data is intact.
+
 
 ## What "project isolation" means here
 

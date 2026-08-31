@@ -292,6 +292,18 @@ pub(crate) enum WriteCmd {
         force: bool,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
+    /// Delete one session and everything derived from it, inside a single
+    /// `(workspace, project)` scope. See [`ops::purge_session`].
+    PurgeSession {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        /// Authenticated operator recorded in the `audit_log` row.
+        author_id: Option<ai_memory_core::UserId>,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
+        reply: oneshot::Sender<StoreResult<crate::ops::PurgeSessionSummary>>,
+    },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
     /// sessions/…). Refused when non-empty unless `force`.
     DeleteWorkspace {
@@ -1211,6 +1223,38 @@ impl WriterHandle {
             label: label.into(),
             author_id,
             force,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete one session by id, with everything derived from it, inside a
+    /// single `(workspace, project)` scope.
+    ///
+    /// Scope is enforced in the store: a session that does not belong to the
+    /// named workspace and project is [`StoreError::NotFound`] and nothing is
+    /// deleted. See [`ops::purge_session`] for what is and is not removed —
+    /// in particular, handoffs this session *accepted* are left alone.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when the session is absent from that scope,
+    /// [`StoreError::WriterClosed`], or a propagated SQL error.
+    pub async fn purge_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        author_id: Option<ai_memory_core::UserId>,
+        compaction: crate::ops::Compaction,
+    ) -> StoreResult<crate::ops::PurgeSessionSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgeSession {
+            workspace_id,
+            project_id,
+            session_id,
+            author_id,
+            compaction,
             reply: tx,
         })
         .await?;
@@ -2210,6 +2254,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     force,
                 );
                 send_or_warn(reply, result, "purge_project");
+            }
+            WriteCmd::PurgeSession {
+                workspace_id,
+                project_id,
+                session_id,
+                author_id,
+                compaction,
+                reply,
+            } => {
+                let result = ops::purge_session(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    author_id,
+                    compaction,
+                );
+                send_or_warn(reply, result, "purge_session");
             }
             WriteCmd::DeleteWorkspace {
                 workspace_id,

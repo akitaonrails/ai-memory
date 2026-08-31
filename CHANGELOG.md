@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ai-memory purge-session --session-id <uuid> --confirm` and
+  `POST /admin/purge-session` delete one session by UUID: its row, its
+  observations, the handoffs it authored, its `sessions/<id>.md` page and
+  every superseded version, their embeddings, and its auto-improve runs.
+  `purge-project` was too broad and `delete-page` removed a single wiki path,
+  so an application promising to forget one conversation had nothing to call
+  (#387).
+
+  Scope is enforced structurally rather than trusted: every statement filters
+  on `workspace_id` and `project_id` alongside `session_id`, a session outside
+  the named scope is a `404` with nothing deleted, and derived pages are
+  deleted by id rather than by path — two projects can hold the same
+  `sessions/<uuid>.md`, and deleting by path would take the other one with it.
+  Targets are collected before anything is cut, because
+  `auto_improve_runs.session_id`, `handoffs.from_session_id`,
+  `handoffs.accepted_by_session` and `pages.supersedes` are all
+  `ON DELETE SET NULL`: cutting the session first destroys the pointers needed
+  to find what it produced. Handoffs the session only *accepted* are
+  deliberately kept — that text belongs to the session that authored them. The
+  admission chain runs before any row is touched, so a `reject`-policy webhook
+  can still abort the purge.
+
+  The purge is a **logical delete** by default: the session is unreachable
+  through the API and through search, but its bytes stay in free pages of the
+  database file, as with any SQLite delete. `--compact` additionally rebuilds
+  the affected FTS5 indexes and `VACUUM`s. The rebuild is the operative step —
+  measured, an ordinary delete leaves the tokens inside the index segments and
+  `VACUUM` alone does not clear them. `--compact` rewrites the whole database,
+  needs free disk space of about its size, and is **not** forensic erasure: the
+  wiki git history keeps page content in its objects and commit messages, and
+  earlier backups still contain it. `docs/lifecycle-ops.md` states that
+  boundary in a table so it is not inferred from the command name.
+
 ## [1.38.0] - 2026-08-30
 
 ### Added

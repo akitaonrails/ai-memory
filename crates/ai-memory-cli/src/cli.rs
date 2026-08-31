@@ -149,6 +149,14 @@ pub enum Command {
     /// observations, handoffs, embeddings, on-disk wiki files).
     /// This is irreversible — requires `--confirm`.
     PurgeProject(PurgeProjectArgs),
+    /// Permanently delete ONE session and everything derived from it.
+    ///
+    /// Removes the session row, its observations, the handoffs it authored,
+    /// its derived wiki page (every version) and their embeddings — scoped
+    /// strictly to the named workspace and project. Handoffs this session
+    /// only *accepted* are left alone: their text belongs to the session that
+    /// wrote them.
+    PurgeSession(PurgeSessionArgs),
     /// Rename a project within its workspace. No files move on disk —
     /// the wiki is flat and pages are differentiated by project_id only.
     /// Useful after renaming the project's directory on disk so the hook
@@ -601,6 +609,39 @@ pub struct PurgeProjectArgs {
     /// out — purging is destructive and irreversible.
     #[arg(long)]
     pub confirm: bool,
+}
+
+/// Arguments for `purge-session`.
+#[derive(Debug, Args)]
+pub struct PurgeSessionArgs {
+    /// Full session UUID, exactly as `sessions.id` stores it.
+    #[arg(long)]
+    pub session_id: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. When omitted, auto-derived from the basename of
+    /// the current git repo root (or CWD if no git repo).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// REQUIRED for the purge to run. Without this flag the CLI errors
+    /// out — purging is destructive and irreversible.
+    #[arg(long)]
+    pub confirm: bool,
+    /// Also reclaim the freed bytes: rebuild the affected FTS indexes and
+    /// VACUUM the database after the delete commits.
+    ///
+    /// Without this the purge is a logical delete — the session is gone from
+    /// the API and from search, but its bytes stay in free pages of the
+    /// database file until it is next rewritten, as with any SQLite delete.
+    ///
+    /// This rewrites the WHOLE database and needs free disk space of about
+    /// its size, so it takes minutes on a large store. It also does NOT make
+    /// the content forensically unrecoverable: the wiki git history and any
+    /// backup taken before the purge still contain it.
+    #[arg(long)]
+    pub compact: bool,
 }
 
 /// Arguments for `rename-project`.

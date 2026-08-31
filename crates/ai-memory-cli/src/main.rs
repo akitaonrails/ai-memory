@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
         Command::InstallSkills(args) => commands::install_skills::run(&config, args),
         Command::Reorg(args) => commands::reorg::run(&config, args).await,
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,
+        Command::PurgeSession(args) => commands::purge_session::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
         Command::MoveProject(args) => commands::move_project::run(&config, args).await,
         Command::MoveSession(args) => commands::move_session::run(&config, args).await,

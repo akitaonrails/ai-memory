@@ -61,6 +61,11 @@ Webhooks fire on these `op` values today (extensible enum):
   `remove_dir_all`, routed from `/admin/purge-project`). Carries the
   project in `ctx`, **no** page path; fired before the directory is
   removed so a mirror can drop the project.
+- `purge_session` — one session is purged (routed from
+  `/admin/purge-session`). Carries the workspace/project in `ctx`, **no** page
+  path — the operation is driven by session id rather than by path. Fired
+  before any row is deleted, so a `reject`-policy webhook can refuse the purge
+  while the session's data is still intact.
 - `purge_workspace` — a whole workspace is purged (routed from
   `/admin/delete-workspace`). Carries the workspace in `ctx.workspace`, leaves
   `ctx.project` empty, and has **no** page path; fired before SQL/file
