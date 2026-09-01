@@ -331,6 +331,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Re-run `install-hooks --apply` to move an existing install onto the stored
   form. Only `--apply` persists; printing a snippet writes no credential.
 
+- Atomic wiki writes now absorb transient Windows sharing violations (#567).
+  On Windows the tmp-then-rename persist can fail with
+  `ERROR_SHARING_VIOLATION` when an antivirus or indexer briefly holds the
+  just-created tempfile — endemic on CI runners, and the cause of a
+  `per_session_isolates_concurrent_writes` failure on the nightly Windows run.
+  Both persist sites retry up to five times with linear backoff (at most
+  150 ms) before propagating; `ACCESS_DENIED` and every other error still
+  propagate immediately, and nothing is classified transient off Windows, so
+  Unix behaviour is byte-for-byte unchanged. The retry mechanics are tested on
+  every platform by injecting the failure rather than hoping to reproduce a
+  scanner's timing.
+
 ### Docs
 
 - `docs/windows.md` gains **Scenario E**, a persistent-server story for native
