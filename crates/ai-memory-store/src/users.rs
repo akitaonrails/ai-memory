@@ -934,10 +934,10 @@ mod tests {
     }
 
     #[test]
-    fn human_auth_v52_migrates_token_only_user() {
+    fn human_auth_v54_migrates_token_only_user() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        crate::migrations::run_to(&mut conn, 51).unwrap();
+        crate::migrations::run_to(&mut conn, 53).unwrap();
         let id = UserId::new();
         let hash = [7u8; 32];
         conn.execute(
@@ -946,7 +946,7 @@ mod tests {
             params![id.as_bytes(), hash.as_slice()],
         )
         .unwrap();
-        crate::migrations::run_to(&mut conn, 52).unwrap();
+        crate::migrations::run_to(&mut conn, 54).unwrap();
         let (username, role, token, bootstrap): (String, String, Vec<u8>, i64) = conn
             .query_row(
                 "SELECT u.username, u.role, u.token_hash, s.bootstrap_completed \
@@ -966,16 +966,16 @@ mod tests {
     }
 
     #[test]
-    fn human_auth_v52_empty_store_leaves_bootstrap_incomplete() {
+    fn human_auth_v54_empty_store_leaves_bootstrap_incomplete() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        crate::migrations::run_to(&mut conn, 51).unwrap();
+        crate::migrations::run_to(&mut conn, 53).unwrap();
         // SQLite ignores PRAGMA foreign_keys inside refinery's transaction;
         // Store::open disables FKs around migrations for the same reason.
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        crate::migrations::run_to(&mut conn, 52).unwrap();
+        crate::migrations::run_to(&mut conn, 54).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        assert_eq!(schema_version(&conn), 52);
+        assert_eq!(schema_version(&conn), 54);
         assert!(!users_exist(&conn).unwrap());
         assert!(!bootstrap_completed(&conn).unwrap());
         assert_foreign_keys_clean(&conn);
@@ -988,10 +988,10 @@ mod tests {
     }
 
     #[test]
-    fn human_auth_v52_rejects_orphaned_page_author_ids() {
+    fn human_auth_v54_rejects_orphaned_page_author_ids() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        crate::migrations::run_to(&mut conn, 51).unwrap();
+        crate::migrations::run_to(&mut conn, 53).unwrap();
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
 
         let workspace = [1u8; 16];
@@ -1024,20 +1024,20 @@ mod tests {
         )
         .unwrap();
 
-        let error = crate::migrations::run_to(&mut conn, 52)
+        let error = crate::migrations::run_to(&mut conn, 54)
             .expect_err("V52 must abort rather than preserve an orphaned page author");
         assert!(
             error.to_string().contains("CHECK constraint failed"),
             "unexpected V52 guard error: {error}"
         );
-        assert_eq!(schema_version(&conn), 51, "failed V52 must roll back");
+        assert_eq!(schema_version(&conn), 53, "failed V54 must roll back");
     }
 
     #[test]
-    fn human_auth_v52_ignores_unrelated_preexisting_foreign_key_violations() {
+    fn human_auth_v54_ignores_unrelated_preexisting_foreign_key_violations() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        crate::migrations::run_to(&mut conn, 51).unwrap();
+        crate::migrations::run_to(&mut conn, 53).unwrap();
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         conn.execute(
             "INSERT INTO projects (id, workspace_id, name, created_at) \
@@ -1046,16 +1046,16 @@ mod tests {
         )
         .unwrap();
 
-        crate::migrations::run_to(&mut conn, 52)
+        crate::migrations::run_to(&mut conn, 54)
             .expect("V52 must guard only references affected by its users-table rebuild");
-        assert_eq!(schema_version(&conn), 52);
+        assert_eq!(schema_version(&conn), 54);
     }
 
     #[test]
-    fn human_auth_v52_preserves_page_and_audit_author_ids() {
+    fn human_auth_v54_preserves_page_and_audit_author_ids() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        crate::migrations::run_to(&mut conn, 51).unwrap();
+        crate::migrations::run_to(&mut conn, 53).unwrap();
         let author = UserId::new();
         let hash = [9u8; 32];
         conn.execute(
@@ -1106,9 +1106,9 @@ mod tests {
         .unwrap();
 
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        crate::migrations::run_to(&mut conn, 52).unwrap();
+        crate::migrations::run_to(&mut conn, 54).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-        assert_eq!(schema_version(&conn), 52);
+        assert_eq!(schema_version(&conn), 54);
         let (user_id, role): (Vec<u8>, String) = conn
             .query_row(
                 "SELECT id, role FROM users WHERE username = 'alice'",
