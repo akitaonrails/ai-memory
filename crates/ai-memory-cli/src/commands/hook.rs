@@ -799,10 +799,12 @@ where
     if should_spawn_background_drainer(&args.event)
         && let Err(err) = after_background_drain_event_enqueue(
             &dd,
-            // The hook's own token: current by definition, since the agent
-            // config it came from was rendered by the last `install-hooks`.
-            // The drain uses it only to retry an entry the server has already
-            // rejected with 401 (#542).
+            // The hook's own token, resolved the same way it authenticates
+            // its own request: `--auth-token`, else the environment, else the
+            // copy `install-hooks --apply` persisted under the data dir
+            // (#552). Current by construction either way. The drain uses it
+            // only to retry an entry the server has already rejected with 401
+            // (#542).
             effective_token,
             spawn_background_drainer,
         )

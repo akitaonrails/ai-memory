@@ -6716,7 +6716,10 @@ model = "gpt-5"
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         let agent_label = "stage-empty-in-place";
-        let in_place = data_dir.join("ai-memory/hooks").join(agent_label);
+        // Must equal what `stage_hook_scripts_in` computes, or this stops
+        // being the source==dest case it exists to cover and duplicates the
+        // different-paths test below (#554 moved the destination shape).
+        let in_place = data_dir.join("hooks").join(agent_label);
         fs::create_dir_all(&in_place).unwrap();
         // Intentionally no scripts in `in_place`.
 
