@@ -459,23 +459,22 @@ wiki browser and JSON APIs stay behind the route class above.
 
 ```
 init                 status               run
-show                 continue             workstreams
-workstream-search    audit-contamination  search
-read-page            write-page           delete-page
-serve                reset                backup
-restore              reindex              install-hooks
-hook                 install-mcp          commit
-checkpoints           restore-page         llm-test
-forget-sweep         lint                 curator
-auto-improve-report  auto-improve         finalize-session
-pending-writes       embed                generate-auth-token
-setup-agent          bootstrap            install-instructions
-install-skills       reorg                purge-project
-rename-project       move-project         move-session
-uninstall            auth                 user
-completions          handoffs             purge-session
-compact
-rename-workstream
+show                 continue             resume
+workstreams          rename-workstream    workstream-search
+audit-contamination  search               read-page
+write-page           delete-page          serve
+reset                backup               restore
+reindex              install-hooks        hook
+install-mcp          commit               checkpoints
+restore-page         llm-test             forget-sweep
+lint                 curator              auto-improve-report
+auto-improve         finalize-session     pending-writes
+embed                generate-auth-token  setup-agent
+bootstrap            install-instructions install-skills
+reorg                purge-project        rename-project
+move-project         move-session         uninstall
+auth                 user                 completions
+handoffs             purge-session        compact
 api-key
 ```
 

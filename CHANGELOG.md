@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `ai-memory resume`, an interactive picker for recent managed
+  workstreams from the current checkout and validated client-local links. It
+  launches the selected named workstream with the established automatic harness
+  selection while the server continues to receive only repository/worktree
+  fingerprints, extending the checkout-local discovery introduced by
+  `workstreams`. Left/Right cycles `auto` and the supported harnesses found in
+  `PATH`, so the selected workstream can be continued directly in another agent.
+  (#499)
+
 - `ai-memory handoffs --expire-all --confirm` and `POST /admin/handoffs/expire`
   clear a stale open-handoff backlog for one scope. The listing added in
   v1.35.0 made a backlog visible and gave `memory_handoff_cancel` the ids it

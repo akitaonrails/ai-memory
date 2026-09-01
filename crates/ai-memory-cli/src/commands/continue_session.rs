@@ -130,7 +130,7 @@ fn linked_at(link: &ProjectLink) -> Option<jiff::Timestamp> {
 /// replaced by a symlink; the scope check rejects a directory that still
 /// exists but now resolves to a different project, which would otherwise
 /// file this session's memory under the wrong scope.
-fn resolve_target(config: &Config, link: &ProjectLink) -> Result<PathBuf> {
+pub(super) fn resolve_target(config: &Config, link: &ProjectLink) -> Result<PathBuf> {
     let path = validate_registered_path(&link.path)?;
     let (workspace, project) = super::resolve_scope_for_path(config, &path)?;
     if workspace != link.workspace || project != link.project {

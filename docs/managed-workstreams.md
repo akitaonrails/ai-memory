@@ -150,6 +150,39 @@ directory, including automatic harness selection. `continue` therefore accepts
 `--workspace`, `--yolo`, and `--fresh`, but not native harness arguments or
 `--executable`, whose meaning depends on a harness the user did not name.
 
+## Picking a workstream
+
+`ai-memory resume` is the interactive counterpart to `continue`: it presents
+recent workstreams from every valid client-local managed checkout, then launches
+the selected named workstream without needing a `cd` first.
+
+```bash
+ai-memory resume
+ai-memory resume --workspace work --limit 50
+```
+
+Use Up/Down (or `j`/`k`) to move between workstreams and Left/Right to cycle the
+launch harness for the highlighted row. Each row remembers its choice while you
+navigate. `auto` is the initial choice and preserves bare `ai-memory run`'s
+discovery of the newest usable session; the remaining choices are supported
+harness executables detected in the host `PATH`. Enter launches the displayed
+workstream/harness combination, while Escape or `q` cancels.
+
+The current selection for each checkout leads the picker, followed by recent
+activity. Each row identifies its workspace/project, activity age, selected
+launch harness, and already linked harnesses. Choosing a different harness is
+how an existing workstream can be continued in another agent. `--yolo` and
+`--fresh` are forwarded to the eventual managed launch.
+
+The picker seeds discovery with the current checkout and paths from this host's
+private `client-projects.json` registry. It revalidates both the canonical path
+and resolved scope before it asks the server for that checkout's workstreams,
+and deduplicates the same workstream reached through both sources. The server
+receives only the repository/worktree fingerprints required for the existing
+checkout-local listing, never a host path. It needs an interactive terminal;
+scripts can continue to use `ai-memory workstreams --json` after selecting a
+checkout themselves.
+
 ## Automatic harness selection
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for
@@ -444,14 +477,14 @@ original config is not modified. ai-memory opens the project database read-only;
 the launched Crush process continues its normal native session writes.
 
 The Linux/macOS Docker shell wrapper cannot inspect host projects or execute a
-host agent from inside its helper container. For `run`, `show`, `continue`, and
-`workstreams`, it downloads the matching native release into
+host agent from inside its helper container. For `run`, `show`, `continue`,
+`resume`, and `workstreams`, it downloads the matching native release into
 `~/.cache/ai-memory/native-runner`, verifies the published SHA-256 checksum, and
 executes that host client. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
 specific native build. Native package, release, and source installs need no
 shim. On native Windows, use the published `ai-memory.exe` or a source build.
 
-The wrapper intercepts all four commands before Docker and preserves the host
+The wrapper intercepts all five commands before Docker and preserves the host
 `PATH`, `AI_MEMORY_SERVER_URL`, and authentication environment. The native client's
 startup log shows `server_url` as well as its local config paths; `data_dir` and
 `bind` describe local defaults and do not override a configured remote server.
