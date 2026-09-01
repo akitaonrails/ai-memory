@@ -80,6 +80,12 @@ pub enum StoreError {
     /// caller-invariant violation).
     #[error("not found: {0}")]
     NotFound(String),
+    /// A late-arriving event named a session that `purge_session` removed.
+    /// Recreating it would silently undo a deletion the operator already
+    /// performed and an application may already have reported to a user, so
+    /// ingest refuses instead (#387).
+    #[error("session {0} was purged and cannot be recreated")]
+    SessionPurged(String),
 
     /// A workspace delete was refused because it still holds projects and the
     /// caller did not pass `force`. Carries the project count so the admin

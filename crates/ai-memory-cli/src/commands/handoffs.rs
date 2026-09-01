@@ -39,6 +39,11 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+
+    if args.expire_all {
+        return expire(&endpoint, &workspace, &project, &args).await;
+    }
+
     let response: OpenHandoffsResponse = get_json(
         &endpoint,
         "/admin/handoffs",
@@ -109,4 +114,62 @@ mod tests {
     fn a_future_timestamp_clamps_to_just_now() {
         assert_eq!(humanize_age_secs(-5), "just now");
     }
+}
+
+/// Request body for `POST /admin/handoffs/expire`.
+#[derive(serde::Serialize)]
+struct ExpireRequest<'a> {
+    workspace: &'a str,
+    project: &'a str,
+    confirm: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    older_than_days: Option<u32>,
+}
+
+/// Clear the open handoff backlog for one scope.
+async fn expire(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    args: &HandoffsArgs,
+) -> Result<()> {
+    if !args.confirm {
+        let age = args
+            .older_than_days
+            .map(|d| format!(" --older-than-days {d}"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "--expire-all marks every open handoff in {workspace}/{project} expired.\n\
+             The rows and their summaries are kept; they just stop being consumable.\n\
+             Unlike the automatic sweep this also clears manual handoffs and ones from \
+             another directory.\n\n  \
+             ai-memory handoffs --workspace {workspace} --project {project}{age} \
+             --expire-all --confirm"
+        );
+    }
+
+    let report: serde_json::Value = crate::http_client::post_json(
+        endpoint,
+        "/admin/handoffs/expire",
+        &ExpireRequest {
+            workspace,
+            project,
+            confirm: true,
+            older_than_days: args.older_than_days,
+        },
+    )
+    .await?;
+
+    let expired = report["expired"].as_u64().unwrap_or(0);
+    if expired == 0 {
+        println!("No open handoffs to expire in {workspace}/{project}.");
+    } else {
+        println!(
+            "Expired {expired} open handoff{} in {workspace}/{project}. \
+             The rows are kept and remain visible in the audit log; they are \
+             no longer offered to an agent.",
+            if expired == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
 }

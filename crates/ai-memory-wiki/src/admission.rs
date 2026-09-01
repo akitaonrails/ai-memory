@@ -56,6 +56,13 @@ pub enum AdmissionOp {
     /// `remove_dir_all`). Carries the project (ctx), no page path. Lets a
     /// mirror remove the project's directory.
     PurgeProject,
+    /// One session is being purged (`purge_session`): its rows, the handoffs
+    /// it authored, and its `sessions/<id>.md` page and every version of it.
+    /// Carries the workspace/project; no page path, since the operation is
+    /// driven by session id rather than by path. Lets a mirror drop the
+    /// session page file, and lets a scope-guard webhook refuse the delete
+    /// before any row is touched.
+    PurgeSession,
     /// A whole workspace is being purged. Carries the workspace (ctx), no page
     /// path, and an empty project. Lets a mirror remove the workspace tree.
     PurgeWorkspace,
@@ -92,6 +99,7 @@ impl AdmissionOp {
             AdmissionOp::Consolidate => "consolidate",
             AdmissionOp::Delete => "delete",
             AdmissionOp::PurgeProject => "purge_project",
+            AdmissionOp::PurgeSession => "purge_session",
             AdmissionOp::PurgeWorkspace => "purge_workspace",
             AdmissionOp::MoveProject => "move_project",
             AdmissionOp::MoveSession => "move_session",

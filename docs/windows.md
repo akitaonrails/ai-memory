@@ -14,6 +14,11 @@ Antigravity CLI, or another agent.
   PowerShell on Windows.
 - Do not mix the Windows wrapper with WSL2-launched agents unless you
   deliberately override every config and hook path.
+- To keep the server running across logoff and reboot on native
+  Windows, use a service wrapper — see [Scenario
+  E](#scenario-e-keep-the-server-running-native-windows-service). Do not
+  launch it from a Scheduled Task via `Start-Process`; that looks like it
+  works and is silently killed at the next reboot.
 
 The difference matters because hook configs contain executable paths.
 WSL2 agents need Linux paths and POSIX `.sh` hooks. Native Windows
@@ -206,6 +211,10 @@ assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +
 the `ai-memory.exe` path from the running binary, keep the extracted `.exe`
 at a stable location (re-run `install-hooks` if you move it).
 
+This leaves the server running only while a terminal is open. To keep it
+up across logoff and reboot, continue to [Scenario
+E](#scenario-e-keep-the-server-running-native-windows-service).
+
 ## Scenario D: Native Windows Source Build
 
 Use this when developing ai-memory itself on Windows or when you do not
@@ -220,6 +229,9 @@ cargo test --workspace
 target\debug\ai-memory.exe init
 target\debug\ai-memory.exe serve --transport http --bind 127.0.0.1:49374
 ```
+
+That last command holds the terminal. For a persistent server, see
+[Scenario E](#scenario-e-keep-the-server-running-native-windows-service).
 
 ### If the build fails with `os error 4551`
 
@@ -283,6 +295,154 @@ ignore_paths` policy before spool or network delivery. The legacy `.ps1` and
 `.sh` paths do not. After upgrading, rerun `install-hooks --agent <agent>
 --apply` to refresh native hook entries; selected-install capability output says
 whether enforcement is active. See [Capture exclusions](marker-file.md#capture-exclusions).
+
+## Scenario E: Keep The Server Running (Native Windows Service)
+
+Scenarios C and D both end at `ai-memory serve` in a foreground terminal.
+That is fine for a trial and wrong for daily use: close the window, log
+off, or reboot, and the server is gone.
+
+On Linux the packaged units in `packaging/systemd/` supply
+`Restart=on-failure` and `RestartSec=5s`. Note where that resiliency
+lives — systemd performs the restarts, not ai-memory. Native Windows
+gets the same bargain through a **service wrapper**. ai-memory does not
+implement a Windows Service control-code dispatcher, so `sc create` or
+`New-Service` pointed straight at `ai-memory.exe` will not work: the SCM
+starts the process, waits for it to report in, never hears from it, and
+kills it.
+
+### ⚠️ Do not launch the server from a Scheduled Task with `Start-Process`
+
+**Symptoms: `LastTaskResult = 0` reports success forever, the server is
+gone after every reboot, and there is no crash dialog, no Application
+Error event, and no further line in the server log after its startup
+line.** A failure whose only symptom is a green status is why this
+warning exists.
+
+The broken shape is a task whose action is
+`powershell.exe -File start-server.ps1`, where the script calls
+`Start-Process` to launch `ai-memory.exe`:
+
+1. The task fires and `powershell.exe` runs the script.
+2. `Start-Process` launches `ai-memory.exe` and returns **immediately**;
+   it does not wait for the child.
+3. The script has nothing left to do, so `powershell.exe` exits. Task
+   Scheduler records the instance as completed with return code 0
+   (operational-log events 201/102).
+4. Task Scheduler runs each task instance inside a **job object**. When
+   the action process exits, the job is torn down and every process
+   still assigned to it is terminated. `ai-memory.exe` was started as a
+   child of the task's PowerShell and never broke away from the job, so
+   it dies with it — in the same second it started.
+
+The server's log therefore contains exactly one line, its own startup
+line, and nothing after it.
+
+**If you specifically want Task Scheduler**, remove the wrapper: point
+the task action at `ai-memory.exe` directly, with `serve` in the
+arguments, so the process Task Scheduler monitors *is* the server and
+stays in the job for as long as it runs. Then also:
+
+- run the task **whether the user is logged on or not**, so it survives
+  logoff and starts without an interactive session;
+- clear the default **3-day execution time limit**
+  (`-ExecutionTimeLimit ([TimeSpan]::Zero)`), which otherwise stops a
+  perfectly healthy long-running server;
+- set restart-on-failure explicitly (`-RestartCount`,
+  `-RestartInterval`). A task has no `Restart=on-failure` unless asked.
+
+Even corrected, that is a task pretending to be a service. Prefer the
+wrapper below.
+
+### WinSW
+
+[WinSW](https://github.com/winsw/winsw) wraps any console binary as a
+real Windows Service. Its config is a single XML file that sits beside
+the executable, and it needs no separate service-manager install.
+
+WinSW derives its config filename from its own, so **rename the
+downloaded executable and give the XML the same base name**:
+
+```powershell
+$Dest = "$env:LOCALAPPDATA\ai-memory"
+# Download the WinSW release matching your runtime (.NET Framework 4.6.1+
+# or the self-contained .NET build) from https://github.com/winsw/winsw/releases
+# Pin a specific release tag rather than "latest", and keep a note of which
+# one you installed — it is a third-party binary running as a service.
+Move-Item .\WinSW-x64.exe "$Dest\ai-memory-service.exe"
+```
+
+`ai-memory-service.xml`, beside it. Substitute your own expanded `$Dest`
+for `C:\Users\you\AppData\Local\ai-memory` — spell it out rather than
+leaving a variable in the file:
+
+```xml
+<service>
+  <id>ai-memory</id>
+  <name>ai-memory MCP server</name>
+  <description>Long-term memory server for AI coding agents.</description>
+  <executable>C:\Users\you\AppData\Local\ai-memory\ai-memory.exe</executable>
+  <arguments>--data-dir "C:\Users\you\AppData\Local\ai-memory" serve --transport http --bind 127.0.0.1:49374</arguments>
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="5 sec"/>
+  <log mode="roll"/>
+</service>
+```
+
+`<onfailure action="restart" delay="5 sec"/>` is the SCM recovery action
+that mirrors the units' `Restart=on-failure` + `RestartSec=5s`.
+
+**Use absolute paths here, not `%LOCALAPPDATA%`.** A Windows service runs
+as `LocalSystem` unless you say otherwise, and `%LOCALAPPDATA%` expands
+against *that* account — `C:\Windows\System32\config\systemprofile\AppData\Local`
+— so the service would quietly serve an empty data directory somewhere
+you never look, while your real wiki sits untouched in your profile. Either
+write the path out in full as above, or add a `<serviceaccount>` block so
+the service runs as your user.
+
+Install and start it:
+
+```powershell
+& "$Dest\ai-memory-service.exe" install
+& "$Dest\ai-memory-service.exe" start
+& "$Dest\ai-memory-service.exe" status
+
+# Verify the server is actually answering, not merely "Running".
+Get-Service ai-memory
+ai-memory status
+```
+
+`stop`, `restart`, and `uninstall` are the remaining commands. Because
+the bind is loopback, the service account does not affect reachability:
+agents running as your user still reach `127.0.0.1:49374`. Only the data
+directory is account-sensitive, which is what the absolute path above
+settles.
+
+Keep running `install-mcp` and `install-hooks` **as your own user**, not
+as the service — they write per-user agent config, and the rule at the
+top of this page still applies.
+
+> Verified from the WinSW project documentation and the ai-memory CLI
+> surface, then run end to end on real hardware by the reporter of
+> [#530](https://github.com/akitaonrails/ai-memory/issues/530), who also
+> root-caused the job-object failure mode above from the Task Scheduler
+> event IDs.
+>
+> **Validated on** Windows 11 25H2 (build 26200.9168) with WinSW v2.12.0
+> (`WinSW-x64.exe`) and ai-memory v1.38.0, from an elevated PowerShell
+> session, against a throwaway service id, port and data directory.
+> Confirmed: `install`; `start`; the service `Running` as `LocalSystem`
+> with `StartType Automatic`; an MCP `initialize` answered over the bound
+> port; the absolute `--data-dir` honoured, with no
+> `systemprofile\AppData\Local\ai-memory` created; crash recovery — the
+> wrapped `ai-memory.exe` was force-killed and a new process was answering
+> 8s later, consistent with the 5-second `<onfailure>` delay plus startup;
+> and a clean `stop` + `uninstall`. The service was configured with
+> `StartType Automatic`; actual boot-time startup was not independently
+> exercised. At the time of this validation (2026-08-31), v2.12.0 was the
+> latest stable WinSW release; the published 3.x releases were
+> prereleases. Corrections from anyone running a different Windows or
+> WinSW version are welcome.
 
 ## Native Hook Command (Claude Code on Windows)
 
@@ -380,6 +540,11 @@ hook.
 
 Windows hook support is new and needs real-world testing against native
 Windows agent builds.
+
+- There is no Windows Service dispatcher in `ai-memory.exe`; persistence
+  comes from a wrapper ([Scenario
+  E](#scenario-e-keep-the-server-running-native-windows-service)), the same
+  way it comes from systemd on Linux.
 
 - Claude Code may be used natively on Windows or from inside WSL2. Native
   Claude Code invokes hooks as a direct binary call (no shell) by default;

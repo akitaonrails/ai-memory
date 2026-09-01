@@ -948,6 +948,13 @@ pub struct DerivedIndexStatus {
     pub observations_fts_rows: u64,
     /// Latest pages without any embedding row.
     pub latest_pages_missing_embeddings: u64,
+    /// Latest pages whose last embed attempt failed or was skipped and which
+    /// still have no embedding. These are the pages an operator can act on.
+    pub embed_failures_unresolved: u64,
+    /// Latest pages that recorded a failed or skipped embed at some point but
+    /// have an embedding now. Kept because a global `embed --force` used to
+    /// erase exactly this history, leaving a recurrence unattributable (#528).
+    pub embed_failures_recovered: u64,
     /// Stored embedding rows, regardless of provider/model/dim.
     pub embedding_rows: u64,
     /// Stored embedding triples and row counts.
@@ -6872,6 +6879,25 @@ impl ReaderPool {
                 observations_fts_rows: count(
                     conn,
                     "SELECT COUNT(*) FROM observations_fts_docsize",
+                )?,
+                // Split by whether an embedding exists *now*: a failure row is
+                // the last unsuccessful attempt, not proof the page is still
+                // broken. Without this join a page that failed once and
+                // recovered would read as an outstanding problem forever.
+                embed_failures_unresolved: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM page_embed_failures f \
+                     JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                     LEFT JOIN page_embeddings pe ON pe.page_id = f.page_id \
+                     WHERE pe.page_id IS NULL",
+                )?,
+                embed_failures_recovered: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM page_embed_failures f \
+                     JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                     JOIN page_embeddings pe ON pe.page_id = f.page_id",
                 )?,
                 latest_pages_missing_embeddings: count(
                     conn,

@@ -123,11 +123,26 @@ pub async fn run_embedding_backfill(
             Ok(md) => md,
             Err(e) => {
                 warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
+                // Durable, so the page is attributable after the container
+                // that logged this is gone (#528).
+                let _ = writer
+                    .record_embed_failure(
+                        cand.id,
+                        ai_memory_store::EmbedOutcome::Unreadable,
+                        Some(e.to_string()),
+                    )
+                    .await;
                 counts.failed += 1;
                 continue;
             }
         };
         if md.body.trim().is_empty() {
+            // Permanent until the body changes. Recorded because a page
+            // skipped on every pass is otherwise indistinguishable from an
+            // idle one, which is what made #509 undiagnosable.
+            let _ = writer
+                .record_embed_failure(cand.id, ai_memory_store::EmbedOutcome::SkippedEmpty, None)
+                .await;
             counts.skipped += 1;
             continue;
         }
@@ -135,6 +150,13 @@ pub async fn run_embedding_backfill(
             Ok(vec) => vec,
             Err(e) => {
                 warn!(path = %cand.path, error = %e, "embed: provider call failed");
+                let _ = writer
+                    .record_embed_failure(
+                        cand.id,
+                        ai_memory_store::EmbedOutcome::Failed,
+                        Some(e.to_string()),
+                    )
+                    .await;
                 counts.failed += 1;
                 continue;
             }

@@ -181,7 +181,7 @@ priors are at the [bottom](#influences-and-prior-art).
   session-aware current-project routing; Claude Code has a built-in opt-in
   bridge via `install-mcp --session-aware`.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
-  `restore-page`, `purge-project`, `rename-project`, `move-project`,
+  `restore-page`, `purge-project`, `purge-session`, `rename-project`, `move-project`,
   `move-session`,
   `audit-contamination`, `lint`, `curator`, `auto-improve`,
   `auto-improve-report`, `pending-writes`, `embed`, `forget-sweep`, `backup`,
