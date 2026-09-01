@@ -13,6 +13,8 @@
 #   ai-memory show ...      Use that client for host project/harness discovery.
 #   ai-memory continue ...  Use that client to resume the newest linked checkout.
 #   ai-memory workstreams   Use that client to inspect the host checkout identity.
+#   ai-memory rename-workstream
+#                           Same: the rename is keyed on host repo identity.
 #
 # Env overrides:
 #   AI_MEMORY_IMAGE         docker image (default: akitaonrails/ai-memory:latest)
@@ -370,7 +372,7 @@ native_host_binary() {
     Darwin) os="macos" ;;
     *)
       echo "ai-memory: the Docker wrapper cannot provide managed host launches on this OS" >&2
-      echo "install the native release binary to use ai-memory run/show/continue/workstreams" >&2
+      echo "install the native release binary to use ai-memory run/show/continue/workstreams/rename-workstream" >&2
       return 1
       ;;
   esac
@@ -445,7 +447,7 @@ case "${1:-}" in
     cmd_upgrade
     exit 0
     ;;
-  run | show | continue | workstreams)
+  run | show | continue | workstreams | rename-workstream)
     NATIVE_HOST_COMMAND=$1
     shift
     NATIVE_HOST_BIN=$(native_host_binary)

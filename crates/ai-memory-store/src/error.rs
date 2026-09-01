@@ -156,6 +156,14 @@ pub enum StoreError {
     /// A live `ai-memory run` lease already owns the selected workstream.
     #[error("workstream is already active: {0}")]
     WorkstreamBusy(String),
+
+    /// A workstream rename was rejected because another workstream in the
+    /// same checkout already holds the destination name. `workstreams` is
+    /// UNIQUE on (workspace, project, repo, worktree, name), so the rename
+    /// would violate that constraint; refusing by name gives the caller the
+    /// collision instead of a bare SQLite error.
+    #[error("workstream name '{0}' is already taken in this checkout")]
+    WorkstreamNameTaken(String),
 }
 
 impl StoreError {

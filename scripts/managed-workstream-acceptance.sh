@@ -1244,6 +1244,89 @@ jq -e 'length == 0' <<<"$other_json" >/dev/null || {
   exit 1
 }
 
+# `ai-memory rename-workstream` must correct a name without disturbing anything
+# keyed on the workstream. The id is stable, so the ledger, managed runs, and
+# linked native sessions follow the rename, and neither the listing order nor
+# the workstream a bare `ai-memory run` resumes may move as a side effect of
+# relabelling.
+before_rename_json=$workstreams_json
+adopt_id=$(jq -r '.[] | select(.name == "edge-adopt") | .workstream_id' \
+  <<<"$workstreams_json")
+rename_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --from edge-adopt --to edge-adopt-fixed --json)
+jq -e --arg id "$adopt_id" \
+  '.workstream_id == $id and .from == "edge-adopt" and .to == "edge-adopt-fixed"' \
+  <<<"$rename_json" >/dev/null || {
+  printf 'rename-workstream did not report the retitled workstream\n' >&2
+  printf '%s\n' "$rename_json" >&2
+  exit 1
+}
+renamed_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams --json)
+jq -e --arg id "$adopt_id" \
+  '.[0].current and .[0].name == "edge-adopt-fixed" and .[0].workstream_id == $id' \
+  <<<"$renamed_json" >/dev/null || {
+  printf 'rename moved the listing order or the current selection\n' >&2
+  printf '%s\n' "$renamed_json" >&2
+  exit 1
+}
+jq -e '[.[] | select(.name == "edge-adopt")] | length == 0' \
+  <<<"$renamed_json" >/dev/null || {
+  printf 'the name the rename replaced survived in the listing\n' >&2
+  printf '%s\n' "$renamed_json" >&2
+  exit 1
+}
+
+# A name another workstream in this checkout already holds is refused, as is a
+# name `run --new` would reject. Both must fail before writing anything.
+if (cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --from edge-kimi --to edge-adopt-fixed) >/dev/null 2>&1; then
+  printf 'rename-workstream took a name another workstream already holds\n' >&2
+  exit 1
+fi
+if (cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --from edge-kimi --to 'nested/name') >/dev/null 2>&1; then
+  printf 'rename-workstream took a name run --new would reject\n' >&2
+  exit 1
+fi
+
+# The stable id is unique across every checkout, so the scope predicate has to
+# repeat on the id selector: an id belonging to another worktree must read as
+# absent rather than as a renamable target.
+if (cd "$OTHER_REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --project "$(basename "$REPO")" --workstream-id "$adopt_id" \
+  --to hijacked) >/dev/null 2>&1; then
+  printf 'rename-workstream reached a workstream outside the calling checkout\n' >&2
+  exit 1
+fi
+
+# Renaming to the name it already carries writes nothing and is not an error.
+noop_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --from edge-adopt-fixed --to edge-adopt-fixed --json)
+jq -e '.from == .to and .to == "edge-adopt-fixed"' <<<"$noop_json" >/dev/null || {
+  printf 'renaming to the current name was not reported as a no-op\n' >&2
+  printf '%s\n' "$noop_json" >&2
+  exit 1
+}
+
+# Renaming back by id has to restore the listing exactly. Anything the refused
+# attempts, the no-op, or the rename itself touched -- a bumped `updated_at`, a
+# moved selection, a reordered row -- surfaces as a diff here.
+rename_back=$(cd "$REPO" && "$BIN" --data-dir "$DATA" rename-workstream \
+  --workstream-id "$adopt_id" --to edge-adopt)
+grep -q "Renamed workstream 'edge-adopt-fixed' to 'edge-adopt'" \
+  <<<"$rename_back" || {
+  printf 'human rename output did not report both names\n' >&2
+  printf '%s\n' "$rename_back" >&2
+  exit 1
+}
+after_rename_json=$(cd "$REPO" && "$BIN" --data-dir "$DATA" workstreams --json)
+[ "$after_rename_json" = "$before_rename_json" ] || {
+  printf 'a rename round trip left the listing changed\n' >&2
+  diff <(printf '%s\n' "$before_rename_json") \
+    <(printf '%s\n' "$after_rename_json") >&2 || true
+  exit 1
+}
+
 if [ "$DETERMINISTIC_ONLY" = 1 ]; then
   printf 'deterministic managed-workstream acceptance passed\n'
   exit 0

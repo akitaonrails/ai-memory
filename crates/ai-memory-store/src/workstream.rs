@@ -160,6 +160,48 @@ pub struct StoredWorkstreamSummary {
     pub linked_harnesses: Vec<AgentKind>,
 }
 
+/// How a rename addresses the workstream it retitles.
+///
+/// Both forms stay inside the caller's resolved scope: an id that belongs to
+/// another workspace, project, or worktree is treated as absent rather than
+/// renamed, so a guessed identifier cannot reach across the scope boundary
+/// that `workstreams` is keyed on.
+#[derive(Debug, Clone)]
+pub enum WorkstreamSelector {
+    /// Address by current name, unique within one checkout.
+    Name(String),
+    /// Address by stable id, as printed by the discovery listing.
+    Id(WorkstreamId),
+}
+
+/// Store-level input for retitling one managed workstream.
+#[derive(Debug, Clone)]
+pub struct RenameWorkstream {
+    /// Workspace holding the workstream.
+    pub workspace_id: WorkspaceId,
+    /// Project holding the workstream.
+    pub project_id: ProjectId,
+    /// Stable repository identity hash.
+    pub repo_fingerprint: String,
+    /// Stable worktree identity hash.
+    pub worktree_fingerprint: String,
+    /// Which workstream to retitle.
+    pub selector: WorkstreamSelector,
+    /// Replacement name, validated exactly like a `--new` name.
+    pub new_name: String,
+}
+
+/// Outcome of a successful rename.
+#[derive(Debug, Clone)]
+pub struct RenamedWorkstream {
+    /// The workstream that was retitled.
+    pub workstream_id: WorkstreamId,
+    /// Name before the rename.
+    pub from: String,
+    /// Name after the rename.
+    pub to: String,
+}
+
 struct FinishRunRow {
     workstream: Vec<u8>,
     agent_wire: String,
@@ -877,6 +919,107 @@ pub(crate) fn list_recent(
         }
     }
     Ok(summaries)
+}
+
+/// Retitle one checkout-local workstream.
+///
+/// Names are metadata: `workstream_events`, `managed_runs`, and
+/// `workstream_native_sessions` all key on `workstreams.id`, so a rename is a
+/// single-row update with nothing to cascade. `selected_at` and `updated_at`
+/// are deliberately left alone — relabelling is not activity, and bumping
+/// either would reorder the discovery listing (and, for `selected_at`, change
+/// which workstream a bare `ai-memory run` resumes) as a side effect of
+/// fixing a typo.
+///
+/// A rename onto the workstream's own current name succeeds without writing,
+/// so a repeated command is not an error. A rename onto a name another
+/// workstream in the same checkout already holds is refused before the
+/// update, turning the `UNIQUE` constraint into a named error rather than a
+/// bare SQLite failure.
+pub(crate) fn rename(
+    conn: &mut Connection,
+    input: &RenameWorkstream,
+) -> StoreResult<RenamedWorkstream> {
+    validate_workstream_name(&input.new_name)?;
+    let new_name = input.new_name.trim();
+    let tx = conn.transaction()?;
+    let found = match &input.selector {
+        WorkstreamSelector::Name(name) => tx
+            .query_row(
+                "SELECT id, name FROM workstreams \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND repo_fingerprint = ?3 AND worktree_fingerprint = ?4 AND name = ?5",
+                params![
+                    input.workspace_id.as_bytes(),
+                    input.project_id.as_bytes(),
+                    input.repo_fingerprint,
+                    input.worktree_fingerprint,
+                    name,
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?,
+        // The scope predicate stays on the id lookup too: `workstreams.id` is
+        // globally unique, so without it a caller holding an id from another
+        // checkout could retitle a workstream their request never named.
+        WorkstreamSelector::Id(id) => tx
+            .query_row(
+                "SELECT id, name FROM workstreams \
+                 WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                   AND repo_fingerprint = ?4 AND worktree_fingerprint = ?5",
+                params![
+                    id.as_bytes(),
+                    input.workspace_id.as_bytes(),
+                    input.project_id.as_bytes(),
+                    input.repo_fingerprint,
+                    input.worktree_fingerprint,
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?,
+    };
+    let (id_bytes, current_name) = found.ok_or_else(|| {
+        StoreError::NotFound(match &input.selector {
+            WorkstreamSelector::Name(name) => format!("managed workstream '{name}'"),
+            WorkstreamSelector::Id(id) => format!("managed workstream {id}"),
+        })
+    })?;
+    let workstream_id = WorkstreamId::from_slice(&id_bytes)?;
+    if current_name == new_name {
+        return Ok(RenamedWorkstream {
+            workstream_id,
+            from: current_name.clone(),
+            to: current_name,
+        });
+    }
+    let taken: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workstreams \
+         WHERE workspace_id = ?1 AND project_id = ?2 \
+           AND repo_fingerprint = ?3 AND worktree_fingerprint = ?4 \
+           AND name = ?5 AND id IS NOT ?6)",
+        params![
+            input.workspace_id.as_bytes(),
+            input.project_id.as_bytes(),
+            input.repo_fingerprint,
+            input.worktree_fingerprint,
+            new_name,
+            workstream_id.as_bytes(),
+        ],
+        |row| row.get(0),
+    )?;
+    if taken {
+        return Err(StoreError::WorkstreamNameTaken(new_name.to_string()));
+    }
+    tx.execute(
+        "UPDATE workstreams SET name = ?1 WHERE id = ?2",
+        params![new_name, workstream_id.as_bytes()],
+    )?;
+    tx.commit()?;
+    Ok(RenamedWorkstream {
+        workstream_id,
+        from: current_name,
+        to: new_name.to_string(),
+    })
 }
 
 /// Reader-side context range assigned to one managed run.

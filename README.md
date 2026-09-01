@@ -229,6 +229,9 @@ priors are at the [bottom](#influences-and-prior-art).
   # List the workstreams that can be selected from this checkout.
   ai-memory workstreams
 
+  # Fix a name you regret; the ledger and the current selection stay put.
+  ai-memory rename-workstream --from typo-nmae --to refactor-db
+
   # List open cross-agent handoffs, oldest first, with the id
   # `memory_handoff_cancel` needs to clear a stale one.
   ai-memory handoffs

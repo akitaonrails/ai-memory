@@ -284,6 +284,42 @@ pub struct ManagedWorkstreamSummary {
     pub linked_harnesses: Vec<AgentKind>,
 }
 
+/// Checkout identity and selector for retitling one managed workstream.
+///
+/// The two selectors are mutually exclusive and the CLI enforces that before
+/// the request is built; the server still rejects a body carrying both or
+/// neither, since it cannot assume a well-behaved client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameManagedWorkstreamRequest {
+    /// Workspace name resolved by the host CLI.
+    pub workspace: String,
+    /// Project name resolved by the host CLI.
+    pub project: String,
+    /// Stable repository identity hash.
+    pub repo_fingerprint: String,
+    /// Stable worktree identity hash (distinct across linked worktrees).
+    pub worktree_fingerprint: String,
+    /// Current name of the workstream to retitle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Stable id of the workstream to retitle, as printed by discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstream_id: Option<WorkstreamId>,
+    /// Replacement name.
+    pub to: String,
+}
+
+/// Result of a successful managed-workstream rename.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenamedManagedWorkstream {
+    /// The workstream that was retitled.
+    pub workstream_id: WorkstreamId,
+    /// Name before the rename.
+    pub from: String,
+    /// Name after the rename, as stored.
+    pub to: String,
+}
+
 /// Stored workstream event returned by history reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkstreamEvent {

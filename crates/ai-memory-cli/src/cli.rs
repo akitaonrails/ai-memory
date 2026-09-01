@@ -47,6 +47,10 @@ pub enum Command {
     Handoffs(HandoffsArgs),
     /// List recent managed workstreams selectable from the current checkout.
     Workstreams(WorkstreamsArgs),
+    /// Rename a managed workstream in the current checkout. Metadata only:
+    /// the ledger, linked harnesses, and which workstream a bare
+    /// `ai-memory run` resumes are all unchanged.
+    RenameWorkstream(RenameWorkstreamArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
     /// Audit the store for likely cross-project contamination (read-only,
@@ -379,6 +383,33 @@ pub struct WorkstreamsArgs {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
     pub limit: u8,
     /// Emit JSON instead of readable rows.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `rename-workstream`.
+#[derive(Debug, Args)]
+pub struct RenameWorkstreamArgs {
+    /// Workspace containing the managed workstream. Defaults to the nearest
+    /// `.ai-memory.toml` marker's `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project override. Defaults to the current repository project.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Current name of the workstream to rename. Names are unique within one
+    /// checkout, so this is unambiguous wherever `run --workstream` works.
+    #[arg(long, conflicts_with = "workstream_id")]
+    pub from: Option<String>,
+    /// Stable id of the workstream to rename, as printed by `workstreams`.
+    /// Useful when the current name is awkward to retype.
+    #[arg(long, conflicts_with = "from")]
+    pub workstream_id: Option<ai_memory_core::WorkstreamId>,
+    /// New name. Same rules as `run --new`: non-empty, at most 128
+    /// characters, no control characters, no slashes.
+    #[arg(long)]
+    pub to: String,
+    /// Emit JSON instead of a readable line.
     #[arg(long)]
     pub json: bool,
 }

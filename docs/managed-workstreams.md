@@ -64,6 +64,23 @@ activity. Each row includes the linked harnesses and stable workstream id; the
 response does not expose checkout paths, repository fingerprints, or native
 session ids.
 
+Names are chosen at `--new` time and can be corrected later:
+
+```bash
+ai-memory rename-workstream --from typo-nmae --to refactor-db
+ai-memory rename-workstream --workstream-id 01a04092-… --to refactor-db
+```
+
+The two selectors are mutually exclusive; the id is the one `workstreams`
+prints. The rename is metadata only. Names are unique per checkout, so a
+destination another workstream already holds is refused rather than merged,
+and the destination is validated exactly like a `--new` name. Because the
+ledger, linked harnesses, and managed runs all key on the workstream id rather
+than its name, nothing else moves — including which workstream a bare
+`ai-memory run` resumes, and the listing order, both of which stay put because
+a rename deliberately does not touch `selected_at` or `updated_at`. A run that
+is already live keeps displaying the name it launched with until it exits.
+
 ## Project-first launcher
 
 `ai-memory show` reverses the usual `cd` then `run` flow: choose a local

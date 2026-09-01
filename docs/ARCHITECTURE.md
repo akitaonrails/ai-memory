@@ -475,6 +475,7 @@ rename-project       move-project         move-session
 uninstall            auth                 user
 completions          handoffs             purge-session
 compact
+rename-workstream
 api-key
 ```
 
