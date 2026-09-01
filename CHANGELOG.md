@@ -149,6 +149,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they exercise one session at a time, which is the shape that cannot see a
   collaboration or concurrency defect.
 
+  `crates/ai-memory-consolidate/tests/multi_machine.rs` additionally pins the
+  same-project-two-machines case: identity derives from the checkout's name,
+  never its absolute path, so a copy at a different path on another machine
+  is the same project and reads what the first wrote.
+
   `docs/users.md` and `docs/deploy.md` gain the team-facing guidance they were
   missing entirely, including that two servers must never share one data
   directory.
