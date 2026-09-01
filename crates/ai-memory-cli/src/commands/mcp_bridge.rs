@@ -85,6 +85,29 @@ fn upstream_config(
 /// # Errors
 /// Returns an error when Claude did not provide a lifecycle session id, the
 /// upstream HTTP MCP server cannot initialize, or either transport fails.
+/// Install a process-wide rustls crypto provider before the bridge opens an HTTPS
+/// transport.
+///
+/// The bridge uses rmcp's `reqwest-tls-no-provider`, which supplies the platform
+/// certificate verifier without pinning a crypto provider — that is what keeps
+/// aws-lc-rs, and the C toolchain and Android JNI stack it needs, out of every build
+/// of this workspace. The trade is that rustls then has no default provider of its
+/// own, and without one the first `https://` request fails inside the handshake with
+/// an error that does not name the cause. `ring` is already compiled for this binary
+/// via the reqwest 0.12 the rest of the workspace uses, so install that.
+fn install_crypto_provider() -> Result<()> {
+    // `Err` means another component installed a provider first, which is fine — the
+    // postcondition we need is only that *some* provider is present.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        anyhow::bail!(
+            "failed to install a rustls crypto provider; the MCP bridge cannot open an \
+             https:// connection without one"
+        );
+    }
+    Ok(())
+}
+
 pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
     let session_id = config.runtime_env.claude_code_session_id().context(
         "CLAUDE_CODE_SESSION_ID is missing; this bridge must be launched by Claude Code as an stdio MCP server",
@@ -94,6 +117,8 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         .as_deref()
         .map(mcp_server_url_from_base)
         .unwrap_or_else(|| mcp_server_url_from_base(&config.server_url));
+    install_crypto_provider()?;
+
     let transport = StreamableHttpClientTransport::from_config(upstream_config(
         &server_url,
         session_id,
@@ -130,6 +155,17 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn install_crypto_provider_is_idempotent_and_leaves_a_default() {
+        // The bridge builds its transport with `reqwest-tls-no-provider`, so rustls has
+        // no provider of its own. Both calls must succeed and a default must be present
+        // afterwards — the second models another component having installed one first.
+        super::install_crypto_provider().expect("first install");
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        super::install_crypto_provider().expect("second install must not fail");
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
     use super::*;
     use std::sync::{Arc, Mutex};
 

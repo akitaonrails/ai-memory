@@ -334,9 +334,23 @@ pub enum PostOutcome {
     /// backpressure, the event was never processed. Keep it queued WITHOUT
     /// bumping attempts so saturation never burns the entry's retry budget.
     Saturated,
-    /// Any other non-2xx, or a transport error: a genuine miss that should
-    /// count against `MAX_ATTEMPTS`.
+    /// Any other non-2xx: the server answered and refused. A genuine miss
+    /// that should count against `MAX_ATTEMPTS`.
     Failed,
+    /// The request never reached a server — connection refused, DNS failure,
+    /// or timeout. Distinguished from [`Self::Failed`] because it says
+    /// something about the *endpoint* rather than the entry: every other
+    /// spooled event addressed to the same endpoint will fail the same way,
+    /// so the drain can skip past them instead of stopping at the first one
+    /// (#493).
+    Unreachable,
+    /// `401` — the server rejected the bearer. Distinguished from
+    /// [`Self::Failed`] because it says something about the *credential*
+    /// rather than the entry: a spooled event carries the token frozen at
+    /// capture time, so after a rotation every entry captured under the old
+    /// one fails identically and is recoverable by retrying with the current
+    /// token (#542).
+    Unauthorized,
 }
 
 /// POST the payload as JSON, best-effort. `timeout` is caller-chosen: the
@@ -364,8 +378,9 @@ pub async fn post_hook(
         Ok(resp) if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
             PostOutcome::Saturated
         }
+        Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => PostOutcome::Unauthorized,
         Ok(_) => PostOutcome::Failed,
-        Err(_) => PostOutcome::Failed,
+        Err(_) => PostOutcome::Unreachable,
     }
 }
 
@@ -394,9 +409,18 @@ pub enum BatchOutcome {
     /// `429` with a non-contiguous committed set. New servers can include this
     /// when a global saturation happens after earlier skipped items.
     SaturatedIndices(Vec<usize>),
+    /// The request never reached a server — connection refused, DNS failure,
+    /// or timeout. Says something about the *endpoint*, not the batch: every
+    /// other entry addressed there will fail identically, so the drain skips
+    /// past them rather than stopping at the first (#493).
+    Unreachable,
     /// `404`/`405` — the server has no `/hook/batch` (a pre-upgrade build). The
     /// caller falls back to per-event `POST /hook` for the rest of the drain.
     Unsupported,
+    /// `401` — the server rejected the batch's bearer. See
+    /// [`PostOutcome::Unauthorized`]; the whole batch shares one identity, so
+    /// a rejected credential fails all of it and none of it was processed.
+    Unauthorized,
     /// Transport error or any other non-2xx: the batch outcome is unknown. The
     /// drain charges conservatively so trailing events that may never have been
     /// attempted do not burn retry budget.
@@ -462,11 +486,13 @@ pub async fn post_batch(
                 || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
             {
                 BatchOutcome::Unsupported
+            } else if status == reqwest::StatusCode::UNAUTHORIZED {
+                BatchOutcome::Unauthorized
             } else {
                 BatchOutcome::Failed
             }
         }
-        Err(_) => BatchOutcome::Failed,
+        Err(_) => BatchOutcome::Unreachable,
     }
 }
 
@@ -599,9 +625,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_hook_failed_when_server_unreachable() {
-        // Port 1 is unroutable; best-effort means this resolves to `Failed`
-        // (a genuine miss) rather than panicking or erroring.
+    async fn post_hook_unreachable_when_server_is_not_listening() {
+        // Port 1 is unroutable. Best-effort means this resolves to an outcome
+        // rather than panicking — and specifically to `Unreachable`, not
+        // `Failed`: the request never reached a server, so the result says
+        // something about the endpoint rather than about this event. The drain
+        // relies on that distinction to skip past a dead address instead of
+        // stalling the whole spool behind it (#493).
         let client = build_client();
         let outcome = post_hook(
             &client,
@@ -611,7 +641,7 @@ mod tests {
             Duration::from_millis(500),
         )
         .await;
-        assert_eq!(outcome, PostOutcome::Failed);
+        assert_eq!(outcome, PostOutcome::Unreachable);
     }
 
     #[tokio::test]

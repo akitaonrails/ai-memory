@@ -948,6 +948,13 @@ pub struct DerivedIndexStatus {
     pub observations_fts_rows: u64,
     /// Latest pages without any embedding row.
     pub latest_pages_missing_embeddings: u64,
+    /// Latest pages whose last embed attempt failed or was skipped and which
+    /// still have no embedding. These are the pages an operator can act on.
+    pub embed_failures_unresolved: u64,
+    /// Latest pages that recorded a failed or skipped embed at some point but
+    /// have an embedding now. Kept because a global `embed --force` used to
+    /// erase exactly this history, leaving a recurrence unattributable (#528).
+    pub embed_failures_recovered: u64,
     /// Stored embedding rows, regardless of provider/model/dim.
     pub embedding_rows: u64,
     /// Stored embedding triples and row counts.
@@ -958,6 +965,42 @@ pub struct DerivedIndexStatus {
     pub unresolved_links_from_latest_pages: u64,
     /// Latest-page outgoing links pointing at a non-latest target row.
     pub stale_links_from_latest_pages: u64,
+}
+
+/// Physical storage figures, so an operator can decide whether a `VACUUM` is
+/// worth its exclusive lock instead of scheduling one blindly.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageStatus {
+    /// SQLite page size in bytes.
+    pub page_size: u64,
+    /// Total pages in the database.
+    pub page_count: u64,
+    /// Pages on the freelist — allocated, holding no live data, reusable by
+    /// SQLite without growing the file.
+    pub freelist_count: u64,
+    /// `page_count * page_size`. The database's own view of its size, which is
+    /// what `VACUUM` acts on.
+    pub database_bytes: u64,
+    /// `freelist_count * page_size` — an *estimate* of what a `VACUUM` would
+    /// return to the filesystem.
+    ///
+    /// An estimate in both directions: `VACUUM` also defragments, so it can
+    /// release more than the freelist, and it rewrites page headers, so it can
+    /// release slightly less. Treat it as the signal for "is this worth an
+    /// exclusive lock", not as an exact figure.
+    pub reclaimable_bytes: u64,
+}
+
+impl StorageStatus {
+    /// Reclaimable share of the file, 0.0–100.0. Zero when the database is
+    /// empty rather than a division by zero.
+    #[must_use]
+    pub fn reclaimable_pct(&self) -> f64 {
+        if self.database_bytes == 0 {
+            return 0.0;
+        }
+        (self.reclaimable_bytes as f64 / self.database_bytes as f64) * 100.0
+    }
 }
 
 /// Count of embedding rows sharing one `(provider, model, dim)` triple.
@@ -6829,6 +6872,32 @@ impl ReaderPool {
         .await
     }
 
+    /// Physical storage figures for the database file.
+    ///
+    /// Three `PRAGMA` reads, no table scan, so it is cheap enough to sit in
+    /// `status` next to the row counts.
+    ///
+    /// # Errors
+    /// Propagates the SQL error from the pragma reads.
+    pub async fn storage_status(&self) -> StoreResult<StorageStatus> {
+        self.with_conn(|conn| {
+            let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+            let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+            let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+            let page_size = u64::try_from(page_size.max(0)).unwrap_or(0);
+            let page_count = u64::try_from(page_count.max(0)).unwrap_or(0);
+            let freelist_count = u64::try_from(freelist_count.max(0)).unwrap_or(0);
+            Ok(StorageStatus {
+                page_size,
+                page_count,
+                freelist_count,
+                database_bytes: page_count.saturating_mul(page_size),
+                reclaimable_bytes: freelist_count.saturating_mul(page_size),
+            })
+        })
+        .await
+    }
+
     /// Return health counters for derived indexes and link/embedding state.
     ///
     /// These checks are intentionally read-only and derived-index-safe: they
@@ -6872,6 +6941,25 @@ impl ReaderPool {
                 observations_fts_rows: count(
                     conn,
                     "SELECT COUNT(*) FROM observations_fts_docsize",
+                )?,
+                // Split by whether an embedding exists *now*: a failure row is
+                // the last unsuccessful attempt, not proof the page is still
+                // broken. Without this join a page that failed once and
+                // recovered would read as an outstanding problem forever.
+                embed_failures_unresolved: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM page_embed_failures f \
+                     JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                     LEFT JOIN page_embeddings pe ON pe.page_id = f.page_id \
+                     WHERE pe.page_id IS NULL",
+                )?,
+                embed_failures_recovered: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM page_embed_failures f \
+                     JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                     JOIN page_embeddings pe ON pe.page_id = f.page_id",
                 )?,
                 latest_pages_missing_embeddings: count(
                     conn,
@@ -8199,8 +8287,27 @@ fn open_read_only(path: &Path) -> StoreResult<Connection> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The percentage is what an operator actually reads, and it divides by a
+    /// figure that is zero on a fresh database.
+    #[test]
+    fn reclaimable_pct_is_zero_on_an_empty_database_rather_than_nan() {
+        let empty = StorageStatus::default();
+        assert_eq!(empty.database_bytes, 0);
+        assert_eq!(empty.reclaimable_pct(), 0.0);
+        assert!(empty.reclaimable_pct().is_finite(), "never NaN or inf");
+
+        let quarter = StorageStatus {
+            page_size: 4096,
+            page_count: 400,
+            freelist_count: 100,
+            database_bytes: 400 * 4096,
+            reclaimable_bytes: 100 * 4096,
+        };
+        assert!((quarter.reclaimable_pct() - 25.0).abs() < f64::EPSILON);
+    }
     use super::{
-        DESCRIPTOR_MAX_CHARS, entity_query_tokens, handoff_listing_sql, like_escape,
+        DESCRIPTOR_MAX_CHARS, StorageStatus, entity_query_tokens, handoff_listing_sql, like_escape,
         page_descriptor, page_descriptor_expr,
     };
     use crate::Store;

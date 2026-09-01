@@ -41,6 +41,9 @@ struct Report {
     /// Derived-index diagnostics.
     #[serde(default)]
     derived: Derived,
+    /// Physical storage figures (absent from pre-#549 servers).
+    #[serde(default)]
+    storage: Storage,
     /// Hook-ingestion counters from the server process.
     #[serde(default)]
     ingest: Option<IngestReport>,
@@ -64,11 +67,33 @@ struct Derived {
     observations_rows: u64,
     observations_fts_rows: u64,
     latest_pages_missing_embeddings: u64,
+    #[serde(default)]
+    embed_failures_unresolved: u64,
+    #[serde(default)]
+    embed_failures_recovered: u64,
     embedding_rows: u64,
     embedding_triples: Vec<EmbeddingTriple>,
     links_from_latest_pages: u64,
     unresolved_links_from_latest_pages: u64,
     stale_links_from_latest_pages: u64,
+}
+
+/// Suggest compaction only above this share of the file. Below it the
+/// exclusive lock costs more than the space is worth, and SQLite will reuse
+/// those pages on its own as the store grows.
+const RECLAIM_ADVICE_PCT: f64 = 20.0;
+
+/// …and only when the absolute figure is worth a stall. 20% of a 4 MiB
+/// database is not a reason to block every write.
+const RECLAIM_ADVICE_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Storage {
+    page_size: u64,
+    page_count: u64,
+    freelist_count: u64,
+    database_bytes: u64,
+    reclaimable_bytes: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -174,6 +199,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                     "observations": report.counts.observations,
                 },
                 "derived": report.derived,
+                "storage": report.storage,
                 "providers": report.providers,
                 "spool": spool,
                 "capture_mode": capture_mode,
@@ -204,6 +230,35 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             "  embeddings:   {} rows; {} latest pages missing",
             report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
         );
+        // Only shown when there is something to act on. A recovered count with
+        // no outstanding failures is history, not a problem.
+        if report.derived.embed_failures_unresolved > 0 {
+            println!(
+                "    embed failures: {} unresolved ({} recovered since)",
+                report.derived.embed_failures_unresolved, report.derived.embed_failures_recovered
+            );
+        }
+        // The figure that makes a `compact` decision possible. Reported
+        // always, so "should I VACUUM?" has an answer other than a guess; the
+        // advisory line only appears once it is worth the exclusive lock.
+        if report.storage.database_bytes > 0 {
+            let pct = (report.storage.reclaimable_bytes as f64
+                / report.storage.database_bytes as f64)
+                * 100.0;
+            println!(
+                "  storage:      {} on disk, {} reclaimable ({pct:.1}%)",
+                super::compact::human_bytes(report.storage.database_bytes),
+                super::compact::human_bytes(report.storage.reclaimable_bytes),
+            );
+            if pct >= RECLAIM_ADVICE_PCT
+                && report.storage.reclaimable_bytes >= RECLAIM_ADVICE_MIN_BYTES
+            {
+                println!(
+                    "    `ai-memory compact --confirm` would return it \
+                     (blocks writes while it runs)"
+                );
+            }
+        }
         println!(
             "  links:        {} latest-page links (unresolved: {}, stale: {})",
             report.derived.links_from_latest_pages,

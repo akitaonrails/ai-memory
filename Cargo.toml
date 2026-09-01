@@ -112,6 +112,11 @@ fs2 = "0.4"
 winapi-util = "0.1"
 
 # MCP server SDK.
+# Only used to install a process-wide crypto provider for the MCP bridge's HTTPS
+# transport. `default-features = false` is load-bearing: rustls' default set includes
+# `aws_lc_rs`, which is exactly the C/JNI toolchain the bridge avoids by using
+# rmcp's `reqwest-tls-no-provider`. `ring` is already in the lockfile via reqwest 0.12.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"

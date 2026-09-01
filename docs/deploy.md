@@ -210,6 +210,75 @@ scp "$SERVER:$DEPLOY_DIR/data/snapshot-$(date +%F).tar.gz" ./backups/
 The `ai-memory backup` command uses SQLite's online backup API so
 writes during the snapshot are coherent.
 
+## Reclaiming disk space
+
+SQLite does not return deleted space to the filesystem. Deleted rows leave
+their pages on a **freelist**, which SQLite reuses as the database grows again.
+For a store in steady use that is the right behaviour and needs no attention.
+
+`ai-memory status` reports the figure that decides it:
+
+```
+  storage:      2.4 GiB on disk, 610.0 MiB reclaimable (25.4%)
+    `ai-memory compact --confirm` would return it (blocks writes while it runs)
+```
+
+The advisory line only appears once the backlog is worth acting on. When it
+does:
+
+```bash
+ssh "$SERVER" "docker exec ai-memory /usr/local/bin/ai-memory compact --confirm"
+```
+
+Compaction deletes nothing — it rebuilds the FTS indexes and `VACUUM`s.
+
+### Do not schedule an unconditional nightly VACUUM
+
+The obvious move is a nightly cron entry. Resist it:
+
+- `VACUUM` takes an **exclusive lock** and rewrites the entire database. Every
+  write blocks for the duration, which on a large store is minutes — and this
+  server's job is answering hook traffic, so blocking writes drops captures.
+- It needs free disk space of roughly the database's own size, so the nightly
+  job also sets a permanent floor on free space.
+- Because SQLite reuses free pages, a store in steady use usually has almost
+  nothing to reclaim. The nightly run pays the full cost for no benefit on most
+  nights.
+
+The case that genuinely leaves a large freelist is a **one-off deletion** — a
+`purge-project`, a big retention sweep, a `forget-sweep` over months of
+episodic pages. Those are events, not a schedule, and the destructive commands
+already offer `--compact` inline for exactly that moment.
+
+If you do want it automated, make it **conditional** on the figure above and
+put it in off hours:
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/bin/ai-memory-compact-if-worthwhile
+set -euo pipefail
+
+RECLAIMABLE=$(ai-memory status --json | jq '.storage.reclaimable_bytes')
+THRESHOLD=$((1024 * 1024 * 1024))   # 1 GiB — tune to your store
+
+if [ "$RECLAIMABLE" -ge "$THRESHOLD" ]; then
+    ai-memory compact --confirm
+fi
+```
+
+Drive it from a systemd timer (`OnCalendar=Sun 04:00`, `Persistent=true`) or a
+host cron entry. A weekly check that usually does nothing costs one cheap
+`status` call; a nightly `VACUUM` that usually does nothing costs a write stall
+every night.
+
+### What compaction does not do
+
+It is not erasure. The wiki git history keeps page content in its objects and
+commit messages, and any backup taken earlier still holds everything. Compaction
+returns bytes from the live SQLite file — worth doing on its own terms, and not
+a guarantee that content is unrecoverable. See
+[lifecycle-ops.md](lifecycle-ops.md) for the full boundary.
+
 ## Rolling back
 
 ```bash

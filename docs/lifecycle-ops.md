@@ -8,10 +8,12 @@ on a homelab box where mistakes are harder to undo.
 
 | Command | Safe with server **running**? | Wipes data? | Reversible? | Notes |
 |---|---|---|---|---|
-| `purge-project --confirm` | ✅ yes | the one project's data | no | Deletes the UUID-namespaced wiki root and raw workstream segments; sibling projects remain untouched. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. |
+| `purge-project --confirm` | ✅ yes | the one project's data | no | Deletes the UUID-namespaced wiki root and raw workstream segments; sibling projects remain untouched. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). |
+| `purge-session --session-id --confirm` | ✅ yes | the one session's data | no | Deletes one session by UUID: its row, its observations, the handoffs it **authored**, its `sessions/<id>.md` page and every superseded version, their embeddings, and its auto-improve runs. Strictly scoped — a session that does not belong to the named workspace/project is a `404` and nothing is deleted. Handoffs the session only *accepted* are kept: that text belongs to the session that wrote it. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). |
+| `handoffs --expire-all --confirm` | ✅ yes | no (state change only) | no (but nothing is destroyed) | Marks every **open** handoff in the scope `expired` so it stops being offered to an agent. Rows, summaries and provenance are kept and stay visible in the audit log. Unlike the automatic sweep it does **not** spare manual handoffs or ones from another directory — those exemptions are exactly what a leftover backlog is made of, so honouring them would clear nothing. `--older-than-days N` keeps recent batons. Owner-scoped: never touches another user's baton. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
-| `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. |
+| `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. Logical delete by default; `"compact": true` additionally rebuilds the FTS indexes and `VACUUM`s (see below). |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
 | `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
@@ -25,6 +27,78 @@ State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
 fundamentally cannot run while another process holds the SQLite WAL writer. See
 [CLAUDE.md §16](../CLAUDE.md) for the invariant.
+
+
+## What "deleted" means (`purge-session`, `purge-project`, `delete-workspace`)
+
+`purge-session` answers *"forget this conversation"*: after it runs, the
+session is gone from the API, from `status` counts and from search.
+
+```bash
+ai-memory purge-session \
+  --workspace default --project my-app \
+  --session-id 0199f3d2-1c4e-7a10-9f3b-2b0c5d8e7a11 \
+  --confirm
+```
+
+It is a **logical delete**, and the distinction matters if you are answering a
+regulatory erasure request rather than tidying up:
+
+| | default | `--compact` |
+|---|---|---|
+| Reachable through the API / MCP tools | no | no |
+| Returned by search (FTS) | no | no |
+| Bytes still present in `memory.sqlite` | **yes**, in free pages | no |
+| Text still in the wiki git history | **yes** | **yes** |
+| Present in backups taken before the purge | **yes** | **yes** |
+| Cost | one transaction | rewrites the whole database |
+
+`--compact` rebuilds the affected FTS5 indexes — an ordinary delete leaves the
+tokens inside the index segments, which is why a rebuild rather than a
+`VACUUM` alone is what clears them — and then `VACUUM`s to release the freed
+pages. It needs free disk space of roughly the database's own size and takes
+minutes on a large store, which is why it is opt-in.
+
+**`--compact` is not forensic erasure.** The wiki git repository stores page
+content in its objects *and its commit messages*, and any backup taken before
+the purge still contains everything. Removing the bytes from the live SQLite
+file is worth doing on its own terms; do not describe it to a user as a
+guarantee that the content is unrecoverable, because it is not.
+
+### The same is true of `purge-project` and `delete-workspace`
+
+Every row above applies unchanged to `ai-memory purge-project --compact` and to
+`POST /admin/delete-workspace` with `{"compact": true}`. The table is a
+property of *any* SQLite delete, not of one command: rows go, bytes stay in
+free pages until the file is rewritten.
+
+This is worth saying explicitly because the help text for those two commands
+used to promise "ALL its data", which read as byte-level removal they never
+performed (#540). Both now describe the same boundary and both accept the same
+opt-in.
+
+One extra detail applies at project and workspace scope. A managed
+workstream's `workstream_events` rows leave through the
+`projects → workstreams → workstream_events` cascade rather than through a
+`DELETE` against that table, and a cascade does not fire the `AFTER DELETE`
+trigger that would drop the row from `workstream_events_fts`. Compaction
+therefore rebuilds **all three** FTS indexes — `pages_fts`,
+`observations_fts` and `workstream_events_fts` — not just the two a session
+purge needs. Rebuilding only the indexes a given caller "should" have touched
+is what leaves a managed agent's transcript text in the file after an operator
+asked for it to be reclaimed.
+
+### Scope containment
+
+The session id is never authority on its own. Every statement is filtered on
+`workspace_id` and `project_id` as well as `session_id`, the session must
+belong to the named scope or the call is a `404` with nothing deleted, and the
+derived pages are deleted by **id** rather than by path — two projects can
+hold the same `sessions/<uuid>.md`, and deleting by path would take the other
+one with it. `/admin/purge-session` runs the admission chain before any row is
+touched, so a `failure_policy = reject` webhook can still abort the whole
+operation while the data is intact.
+
 
 ## What "project isolation" means here
 
@@ -72,7 +146,13 @@ so a clean SQLite DB can be rebuilt from the UUID-keyed wiki tree alone.
 
 ```bash
 ai-memory purge-project --workspace default --project my-project --confirm
+
+# …and to reclaim the freed bytes as well (slow; rewrites the whole database):
+ai-memory purge-project --workspace default --project my-project --confirm --compact
 ```
+
+Like `purge-session`, this is a logical delete unless `--compact` is given —
+see [What "deleted" means](#what-deleted-means-purge-session-purge-project-delete-workspace).
 
 What happens, in order:
 
@@ -187,7 +267,10 @@ Failure modes:
 Deletes a workspace row and all child projects/pages/sessions/managed
 workstreams through the `workspace_id` cascade. The route is guarded by
 `force: true` for non-empty workspaces and follows the destructive-operation
-ordering used by project purges:
+ordering used by project purges. It accepts the same opt-in reclaim as the
+other two destructive commands — `{"compact": true}` — and is otherwise a
+logical delete; see
+[What "deleted" means](#what-deleted-means-purge-session-purge-project-delete-workspace).
 
 1. Look up the workspace without creating missing scopes.
 2. Run blocking `op=purge_workspace` admission. A reject-policy webhook aborts

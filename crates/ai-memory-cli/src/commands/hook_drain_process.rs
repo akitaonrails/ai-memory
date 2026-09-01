@@ -36,6 +36,13 @@ pub struct DrainCommandSpec {
     pub args: Vec<OsString>,
     /// Stderr log file under `<data_dir>/logs`.
     pub stderr_log: PathBuf,
+    /// Current static bearer to hand the child in its environment, when the
+    /// spawning hook has one.
+    ///
+    /// The environment rather than an argument: a flag would put the
+    /// credential in the process table for the lifetime of the drain, readable
+    /// by anyone who can run `ps`.
+    pub live_token: Option<OsString>,
 }
 
 /// Unit-testable stdio/detach configuration for a drainer process.
@@ -67,7 +74,12 @@ pub enum DetachConfig {
 }
 
 /// Build `ai-memory --data-dir <dir> hook-drain`.
-pub fn command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
+///
+/// `live_token` is the bearer the spawning hook is currently configured with.
+/// A spooled envelope froze its own credential at capture time, so handing the
+/// drain a current one is what lets it recover entries stranded by a rotation
+/// (#542).
+pub fn command_spec(data_dir: &Path, live_token: Option<&str>) -> io::Result<DrainCommandSpec> {
     Ok(DrainCommandSpec {
         exe: std::env::current_exe()?,
         args: vec![
@@ -76,6 +88,7 @@ pub fn command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
             OsString::from("hook-drain"),
         ],
         stderr_log: data_dir.join("logs").join("hook-drain.log"),
+        live_token: live_token.filter(|t| !t.is_empty()).map(OsString::from),
     })
 }
 
@@ -91,9 +104,17 @@ pub fn spawn_config(spec: &DrainCommandSpec, try_breakaway: bool) -> SpawnConfig
 }
 
 /// Spawn the hidden drainer without inheriting hook stdio.
-pub fn spawn(data_dir: &Path) -> io::Result<()> {
-    let spec = command_spec(data_dir)?;
+pub fn spawn(data_dir: &Path, live_token: Option<&str>) -> io::Result<()> {
+    let spec = command_spec(data_dir, live_token)?;
     spawn_spec(&spec)
+}
+
+/// Hand the child the current bearer in its environment, when there is one.
+/// Applied to every spawn path so the breakaway-retry cannot silently drop it.
+fn apply_live_token(command: &mut Command, spec: &DrainCommandSpec) {
+    if let Some(token) = &spec.live_token {
+        command.env(crate::commands::hook_spool::LIVE_TOKEN_ENV, token);
+    }
 }
 
 fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
@@ -108,6 +129,7 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
         .open(&config.stderr_file)?;
 
     let mut command = command_for_spec(spec, &config.detach);
+    apply_live_token(&mut command, spec);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -130,6 +152,7 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
                 .append(true)
                 .open(&config.stderr_file)?;
             let mut retry = command_for_spec(spec, &config.detach);
+            apply_live_token(&mut retry, spec);
             retry
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -234,7 +257,7 @@ mod tests {
     #[test]
     fn command_spec_uses_data_dir_then_hidden_subcommand() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), None).unwrap();
 
         assert_eq!(
             spec.args,
@@ -277,10 +300,52 @@ mod tests {
         rotate_oversized_log(&log, 16);
     }
 
+    /// The credential must reach the drain in its environment and nowhere
+    /// near its argv. A command line is world-readable through the process
+    /// table for as long as the process lives, so passing the token as a flag
+    /// would publish it to every local user each time a session ends.
+    #[test]
+    fn the_live_token_travels_in_the_environment_not_the_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = command_spec(tmp.path(), Some("SECRET-BEARER")).unwrap();
+
+        assert_eq!(
+            spec.live_token.as_deref(),
+            Some(std::ffi::OsStr::new("SECRET-BEARER"))
+        );
+        let rendered: Vec<String> = spec
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !rendered.iter().any(|a| a.contains("SECRET-BEARER")),
+            "token leaked into argv: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|a| a == "hook-drain"),
+            "still the drain command: {rendered:?}"
+        );
+    }
+
+    /// An absent or empty token carries nothing, so a no-auth deployment does
+    /// not export an empty bearer into the child.
+    #[test]
+    fn an_absent_or_empty_token_is_not_carried() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(command_spec(tmp.path(), None).unwrap().live_token.is_none());
+        assert!(
+            command_spec(tmp.path(), Some(""))
+                .unwrap()
+                .live_token
+                .is_none()
+        );
+    }
+
     #[test]
     fn spawn_config_redirects_stdio_and_logs_under_data_dir_logs() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), None).unwrap();
         let config = spawn_config(&spec, true);
 
         assert!(config.stdin_null);
@@ -295,7 +360,7 @@ mod tests {
     #[test]
     fn unix_spawn_config_prefers_true_session_detach_when_available() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), None).unwrap();
         let DetachConfig::UnixNewSession { setsid } = spawn_config(&spec, true).detach;
         if let Some(path) = setsid {
             assert!(
@@ -309,7 +374,7 @@ mod tests {
     #[test]
     fn windows_spawn_config_uses_expected_flags_and_breakaway_toggle() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), None).unwrap();
         let DetachConfig::WindowsCreationFlags(with_breakaway) = spawn_config(&spec, true).detach;
         let DetachConfig::WindowsCreationFlags(without_breakaway) =
             spawn_config(&spec, false).detach;

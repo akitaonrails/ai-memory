@@ -21,10 +21,14 @@
 //! - `POST /admin/commit`         — stage + commit the wiki tree via git.
 //! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
 //! - `POST /admin/restore-page`   — restore one page from a checkpoint.
-//! - `POST /admin/purge-project`  — delete a project and all its data.
+//! - `POST /admin/purge-project`  — delete a project's rows and wiki files
+//!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
+//! - `POST /admin/purge-session`  — delete one session and what it derived.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
-//! - `POST /admin/delete-workspace` — delete a workspace and all of its projects.
+//! - `POST /admin/compact`        — reclaim free pages; deletes nothing.
+//! - `POST /admin/delete-workspace` — delete a workspace and its projects
+//!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
 //! - `POST /admin/merge-workspace` — fold every project of one workspace into
 //!   another, then delete the emptied source workspace.
 //! - `POST /admin/move-project`   — move a project into another workspace
@@ -582,6 +586,7 @@ pub fn admin_router_with_sweep_tuning(
         )
         .route("/admin/curator", post(handle_curator))
         .route("/admin/handoffs", get(handle_open_handoffs_list))
+        .route("/admin/handoffs/expire", post(handle_expire_handoffs))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
             "/admin/pending-writes/{id}",
@@ -619,10 +624,12 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/checkpoints", get(handle_checkpoints))
         .route("/admin/restore-page", post(handle_restore_page))
         .route("/admin/purge-project", post(handle_purge_project))
+        .route("/admin/purge-session", post(handle_purge_session))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/move-session", post(handle_move_session))
         .route("/admin/delete-workspace", post(handle_delete_workspace))
+        .route("/admin/compact", post(handle_compact))
         .route("/admin/rename-workspace", post(handle_rename_workspace))
         .route("/admin/merge-workspace", post(handle_merge_workspace))
         .route("/admin/write-page", post(handle_write_page))
@@ -938,6 +945,9 @@ pub struct StatusReport {
     pub counts: ai_memory_store::StatusCounts,
     /// Derived-index and retrieval-readiness diagnostics.
     pub derived: ai_memory_store::DerivedIndexStatus,
+    /// Physical storage figures — file size and reclaimable free pages — so an
+    /// operator can decide whether a `VACUUM` is worth its exclusive lock.
+    pub storage: ai_memory_store::StorageStatus,
     /// Passive process-scoped provider health.
     pub providers: ProviderHealthSnapshot,
     /// Hook-ingestion counters for this server process. Counts and one
@@ -967,6 +977,9 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
     match state.reader.status_counts().await {
         Ok(counts) => match state.reader.derived_index_status().await {
             Ok(derived) => {
+                // Three pragma reads; a failure here must not take down the
+                // whole status response, which is also the health probe.
+                let storage = state.reader.storage_status().await.unwrap_or_default();
                 let report = StatusReport {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     data_dir: state.data_dir.display().to_string(),
@@ -974,6 +987,7 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     db_path: state.db_path.display().to_string(),
                     counts,
                     derived,
+                    storage,
                     providers: state.provider_health.snapshot(),
                     ingest: state.ingest_metrics.snapshot(),
                 };
@@ -2367,6 +2381,75 @@ async fn handle_open_handoffs_list(
     }
 }
 
+/// `POST /admin/handoffs/expire` request body.
+#[derive(Deserialize)]
+struct ExpireHandoffsRequest {
+    workspace: String,
+    project: String,
+    /// Mandatory. Without `confirm: true` the server returns 400.
+    confirm: bool,
+    /// Only expire handoffs at least this many days old. Omitted clears the
+    /// whole open backlog for the scope.
+    #[serde(default)]
+    older_than_days: Option<u32>,
+}
+
+/// `POST /admin/handoffs/expire` — clear the open handoff backlog for one
+/// scope.
+///
+/// Unlike the automatic sweep this does not spare manual or
+/// different-directory handoffs. Those exemptions are what the leftover
+/// backlog is made of, so honouring them here would expire nothing. It is a
+/// state change rather than a delete: the summary and provenance survive and
+/// the handoff simply stops being consumable (#513).
+async fn handle_expire_handoffs(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<ExpireHandoffsRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "expiring the handoff backlog requires confirm=true"
+            })),
+        );
+    }
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    // Same owner scoping as cancel: a caller clears their own and shared
+    // batons, never somebody else's.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let owner_filter = ai_memory_core::OwnerFilter::for_actor_context(&actor);
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+
+    let older_than_us = req.older_than_days.map(|days| {
+        jiff::Timestamp::now().as_microsecond() - i64::from(days) * 24 * 60 * 60 * 1_000_000
+    });
+
+    match state
+        .writer
+        .expire_open_handoffs(ws, proj, owner_filter, older_than_us, author_id)
+        .await
+    {
+        Ok(expired) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "expired": expired,
+                "workspace": req.workspace,
+                "project": req.project,
+            })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
 async fn handle_pending_writes_list(
     State(state): State<Arc<AdminState>>,
     Query(query): Query<PendingWritesQuery>,
@@ -3281,6 +3364,123 @@ async fn handle_restore_page(
 }
 
 // ---------------------------------------------------------------------
+// purge-session
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/purge-session`.
+#[derive(Deserialize)]
+struct PurgeSessionRequest {
+    /// Workspace name. Must already exist; 404 otherwise.
+    workspace: String,
+    /// Project name. Must already exist; 404 otherwise.
+    project: String,
+    /// Full `sessions.id` UUID. A session that does not belong to the named
+    /// workspace/project is a 404 — the id alone is never authority over
+    /// another scope.
+    session_id: String,
+    /// Mandatory confirmation flag. Without `confirm: true` the server
+    /// returns 400 — purging is destructive and irreversible.
+    confirm: bool,
+    /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
+    /// delete commits. Off by default; see `ai_memory_store::Compaction` for
+    /// the cost and for what it does not guarantee.
+    #[serde(default)]
+    compact: bool,
+}
+
+/// `POST /admin/purge-session` — delete one session and everything derived
+/// from it, inside a single workspace/project scope.
+async fn handle_purge_session(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<PurgeSessionRequest>,
+) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+
+    let session_id = match req.session_id.trim().parse::<SessionId>() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "session_id must be a full UUID" })),
+            );
+        }
+    };
+
+    let (ws_id, proj_id) =
+        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    // Admission runs before anything is deleted so a reject-policy webhook can
+    // refuse while every row is still intact — same order as purge-project.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let ctx = AdmissionContext {
+        workspace: req.workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeSession,
+        actor,
+        ..Default::default()
+    };
+    if let Err(e) = state
+        .wiki
+        .admit_purge_session(ws_id, proj_id, Some(ctx))
+        .await
+    {
+        return internal_err(e.to_string());
+    }
+
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+
+    let summary = match state
+        .writer
+        .purge_session(ws_id, proj_id, session_id, author_id, compaction)
+        .await
+    {
+        Ok(s) => s,
+        // Absent from this scope (or already purged) is a 404, not a fault.
+        Err(e @ StoreError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session_id": session_id.to_string(),
+            "workspace": req.workspace,
+            "project": req.project,
+            "observations_deleted": summary.observations_deleted,
+            "handoffs_deleted": summary.handoffs_deleted,
+            "pages_deleted": summary.pages_deleted,
+            "auto_improve_runs_deleted": summary.auto_improve_runs_deleted,
+            "removed_paths": summary.removed_paths,
+            "compacted": summary.compacted,
+        })),
+    )
+}
+
+// ---------------------------------------------------------------------
 // purge-project
 // ---------------------------------------------------------------------
 
@@ -3299,6 +3499,11 @@ struct PurgeProjectRequest {
     /// out from under a running agent, which then cannot save its history.
     #[serde(default)]
     force: bool,
+    /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
+    /// delete commits. Off by default; see `ai_memory_store::Compaction` for
+    /// the cost and for what it does not guarantee.
+    #[serde(default)]
+    compact: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/purge-project`.
@@ -3327,6 +3532,10 @@ pub struct PurgeProjectReport {
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
     pub files_failed: Vec<String>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran). False for a
+    /// plain logical delete: the rows are gone from the API and from search,
+    /// but their bytes stay in free pages until the file is next rewritten.
+    pub compacted: bool,
     /// Pre-purge checkpoint, if the tree had uncommitted changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_checkpoint: Option<String>,
@@ -3461,9 +3670,15 @@ async fn handle_purge_project(
         Err(e) => return e,
     };
 
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+
     let summary = match state
         .writer
-        .purge_project(ws_id, proj_id, &label, author_id, req.force)
+        .purge_project(ws_id, proj_id, &label, author_id, req.force, compaction)
         .await
     {
         Ok(s) => s,
@@ -3519,6 +3734,7 @@ async fn handle_purge_project(
         workstreams_deleted: summary.workstreams_deleted,
         managed_runs_deleted: summary.managed_runs_deleted,
         workstream_ids: summary.workstream_ids,
+        compacted: summary.compacted,
         files_deleted,
         files_failed,
         pre_checkpoint,
@@ -3616,6 +3832,11 @@ struct DeleteWorkspaceRequest {
     /// non-empty workspace is refused so a typo can't wipe live data.
     #[serde(default)]
     force: bool,
+    /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
+    /// delete commits. Off by default; see `ai_memory_store::Compaction` for
+    /// the cost and for what it does not guarantee.
+    #[serde(default)]
+    compact: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/delete-workspace`.
@@ -3638,6 +3859,10 @@ pub struct DeleteWorkspaceResult {
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
     pub files_failed: Vec<String>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran). False for a
+    /// plain logical delete: the rows are gone from the API and from search,
+    /// but their bytes stay in free pages until the file is next rewritten.
+    pub compacted: bool,
     /// Pre-delete checkpoint, if the tree had uncommitted changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_checkpoint: Option<String>,
@@ -3649,6 +3874,62 @@ pub struct DeleteWorkspaceResult {
 /// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
 /// project/page under it. Guarded: refuses a non-empty workspace unless
 /// `force` (a typo shouldn't wipe live data). Orphan-workspace cleanup.
+/// JSON request body for `POST /admin/compact`.
+#[derive(Deserialize)]
+struct CompactRequest {
+    /// Mandatory confirmation. Not because compaction destroys anything — it
+    /// deletes nothing — but because it takes an exclusive lock and rewrites
+    /// the whole database, so every write blocks until it finishes. That is an
+    /// availability decision, and it should be deliberate.
+    confirm: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/compact`.
+#[derive(Debug, Serialize)]
+pub struct CompactReport {
+    /// Database size in bytes before the rebuild + `VACUUM`.
+    pub bytes_before: u64,
+    /// Database size in bytes afterwards.
+    pub bytes_after: u64,
+    /// Bytes returned to the filesystem (saturating at zero).
+    pub bytes_reclaimed: u64,
+}
+
+/// `POST /admin/compact` — rebuild the FTS indexes and `VACUUM`, deleting
+/// nothing. The on-demand form of what the destructive commands offer as
+/// `--compact`.
+async fn handle_compact(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CompactRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "compact rewrites the whole database under an exclusive \
+                          lock; pass confirm: true to proceed"
+            })),
+        );
+    }
+    match state.writer.compact().await {
+        Ok(summary) => {
+            let report = CompactReport {
+                bytes_before: summary.bytes_before,
+                bytes_after: summary.bytes_after,
+                bytes_reclaimed: summary.bytes_reclaimed(),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
 async fn handle_delete_workspace(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
@@ -3657,7 +3938,12 @@ async fn handle_delete_workspace(
     let actor = actor_ext
         .map(|axum::Extension(a)| a)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
-    match delete_workspace_core(&state, &req.workspace, req.force, actor).await {
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+    match delete_workspace_core(&state, &req.workspace, req.force, actor, compaction).await {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
@@ -3676,6 +3962,7 @@ async fn delete_workspace_core(
     workspace: &str,
     force: bool,
     actor: ai_memory_core::ActorContext,
+    compaction: ai_memory_store::Compaction,
 ) -> Result<DeleteWorkspaceResult, MoveErr> {
     let ws_id = lookup_ws_no_create(state, workspace).await?;
 
@@ -3717,7 +4004,11 @@ async fn delete_workspace_core(
     let pre_checkpoint =
         checkpoint_or_500(&state.wiki, format!("pre-delete-workspace {workspace}"))?;
 
-    let summary = match state.writer.delete_workspace(ws_id, force).await {
+    let summary = match state
+        .writer
+        .delete_workspace(ws_id, force, compaction)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             let status = match &e {
@@ -3767,6 +4058,7 @@ async fn delete_workspace_core(
         workstreams_deleted: summary.workstreams_deleted,
         managed_runs_deleted: summary.managed_runs_deleted,
         workstream_ids: summary.workstream_ids,
+        compacted: summary.compacted,
         files_deleted,
         files_failed,
         pre_checkpoint,
@@ -5522,9 +5814,20 @@ async fn copy_purge_merge(
     // The source purge is an internal step of move-project (a distinct op that
     // records its own move report); it is not attributed as a standalone
     // `purge_project` here, so the audit author is left NULL.
+    // `Skip`: compaction is an operator's explicit choice on a destructive
+    // command, not a side effect of moving a project. A `VACUUM` here would
+    // rewrite the whole database in the middle of a move the caller asked to
+    // be cheap.
     let summary = match state
         .writer
-        .purge_project(src_ws, src_proj, &label, None, false)
+        .purge_project(
+            src_ws,
+            src_proj,
+            &label,
+            None,
+            false,
+            ai_memory_store::Compaction::Skip,
+        )
         .await
     {
         Ok(s) => s,
@@ -5745,21 +6048,29 @@ async fn handle_merge_workspace(
     // Every project moved → the source workspace is now empty. Delete the shell
     // with force=false: it must be empty, so a race that repopulated it aborts
     // safely without wiping fresh data.
-    let source_workspace_deleted =
-        match delete_workspace_core(&state, &req.from, false, actor).await {
-            Ok(_) => true,
-            Err((_status, body)) => {
-                // The moves succeeded; only the final empty-shell delete failed
-                // (e.g. a concurrent write recreated a project). No data was
-                // lost, so report success-with-caveat instead of a hard error.
-                warn!(
-                    workspace = %req.from,
-                    "merge-workspace: source drained but shell delete failed: {:?}",
-                    body
-                );
-                false
-            }
-        };
+    let source_workspace_deleted = match delete_workspace_core(
+        &state,
+        &req.from,
+        false,
+        actor,
+        // The shell is empty by this point; there is nothing to reclaim.
+        ai_memory_store::Compaction::Skip,
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err((_status, body)) => {
+            // The moves succeeded; only the final empty-shell delete failed
+            // (e.g. a concurrent write recreated a project). No data was
+            // lost, so report success-with-caveat instead of a hard error.
+            warn!(
+                workspace = %req.from,
+                "merge-workspace: source drained but shell delete failed: {:?}",
+                body
+            );
+            false
+        }
+    };
 
     let report = MergeWorkspaceReport {
         from: req.from,

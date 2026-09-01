@@ -893,6 +893,30 @@ impl Wiki {
         }
     }
 
+    /// Run the admission chain for a single-session purge, before any row is
+    /// deleted, so a scope-guard webhook can refuse it while the data is
+    /// still intact.
+    ///
+    /// # Errors
+    /// Propagates a webhook rejection as [`WikiError`].
+    pub async fn admit_purge_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<Option<AdmissionContext>> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::PurgeSession;
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(None, &ctx).await?;
+            Ok(Some(ctx))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Run the blocking admission notification for a workspace purge without
     /// removing files. Admin callers use this before the DB purge so a
     /// `failure_policy = reject` webhook can still abort all destructive work.
@@ -1782,6 +1806,18 @@ impl Wiki {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, path = %page_id, "embedding failed; page indexed without it");
+                    // The warning alone dies with the container. Record it so
+                    // the page is attributable later (#528); best-effort,
+                    // because failing to note a failure must not fail the
+                    // write that already succeeded.
+                    let _ = self
+                        .writer
+                        .record_embed_failure(
+                            page_id,
+                            ai_memory_store::EmbedOutcome::Failed,
+                            Some(e.to_string()),
+                        )
+                        .await;
                 }
             }
         }

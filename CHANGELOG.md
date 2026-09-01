@@ -8,6 +8,245 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ai-memory handoffs --expire-all --confirm` and `POST /admin/handoffs/expire`
+  clear a stale open-handoff backlog for one scope. The listing added in
+  v1.35.0 made a backlog visible and gave `memory_handoff_cancel` the ids it
+  needs, but clearing one required a call per handoff (#513).
+
+  It deliberately does **not** honour the exemptions the automatic sweep
+  applies. `expire_superseded_auto_handoffs` spares manual handoffs
+  (`from_session_id IS NULL`) and ones whose `cwd` does not match the accepting
+  session — correct for a sweep triggered by an unrelated accept, and the
+  reason a backlog accumulates at all. The leftover backlog is therefore made,
+  by construction, of exactly the handoffs that sweep will never touch, so an
+  operator-driven expiry honouring the same exemptions would clear nothing. A
+  test pins that: applying the sweep's manual-handoff exemption leaves the
+  backlog behind.
+
+  A state change rather than a delete — the summary, provenance and timestamps
+  survive and the handoff simply stops being consumable, which is also why it
+  is recoverable in a way a delete would not be. Owner scoping lives inside the
+  `UPDATE` so expiring another user's baton is a zero-row no-op rather than a
+  read-then-write race, matching `cancel_handoff`. `--older-than-days N` keeps
+  recent batons; `--confirm` is required and the count is audited.
+- `ai-memory purge-session --session-id <uuid> --confirm` and
+  `POST /admin/purge-session` delete one session by UUID: its row, its
+  observations, the handoffs it authored, its `sessions/<id>.md` page and
+  every superseded version, their embeddings, and its auto-improve runs.
+  `purge-project` was too broad and `delete-page` removed a single wiki path,
+  so an application promising to forget one conversation had nothing to call
+  (#387).
+
+  Scope is enforced structurally rather than trusted: every statement filters
+  on `workspace_id` and `project_id` alongside `session_id`, a session outside
+  the named scope is a `404` with nothing deleted, and derived pages are
+  deleted by id rather than by path — two projects can hold the same
+  `sessions/<uuid>.md`, and deleting by path would take the other one with it.
+  Targets are collected before anything is cut, because
+  `auto_improve_runs.session_id`, `handoffs.from_session_id`,
+  `handoffs.accepted_by_session` and `pages.supersedes` are all
+  `ON DELETE SET NULL`: cutting the session first destroys the pointers needed
+  to find what it produced. Handoffs the session only *accepted* are
+  deliberately kept — that text belongs to the session that authored them. The
+  admission chain runs before any row is touched, so a `reject`-policy webhook
+  can still abort the purge.
+
+  The purge is terminal. Events that produced a session can sit undelivered in
+  a client hook spool for days, and `begin_session` would otherwise recreate
+  the session row when that spool drained — silently undoing a deletion an
+  application had already reported to its user. A `purged_sessions` tombstone
+  (V52) is written in the same transaction as the delete, and ingest refuses to
+  recreate a session that carries one. The tombstone is scoped, so purging an
+  id in one project cannot suppress capture for that id elsewhere.
+
+  The purge is a **logical delete** by default: the session is unreachable
+  through the API and through search, but its bytes stay in free pages of the
+  database file, as with any SQLite delete. `--compact` additionally rebuilds
+  the affected FTS5 indexes and `VACUUM`s. The rebuild is the operative step —
+  measured, an ordinary delete leaves the tokens inside the index segments and
+  `VACUUM` alone does not clear them. `--compact` rewrites the whole database,
+  needs free disk space of about its size, and is **not** forensic erasure: the
+  wiki git history keeps page content in its objects and commit messages, and
+  earlier backups still contain it. `docs/lifecycle-ops.md` states that
+  boundary in a table so it is not inferred from the command name.
+
+- `ai-memory purge-project --compact` and `{"compact": true}` on
+  `POST /admin/delete-workspace` reclaim the bytes a delete frees, reusing the
+  `Compaction` opt-in that `purge-session` gained in the same cycle (#540). Both
+  responses now report `compacted`.
+
+  Compaction rebuilds **all three** FTS5 indexes rather than the two a session
+  purge needs. A managed workstream's `workstream_events` rows leave through the
+  `projects → workstreams → workstream_events` cascade, and a cascade does not
+  fire the `AFTER DELETE` trigger that would drop them from
+  `workstream_events_fts` — so the tokens survive an ordinary delete, and a
+  `VACUUM` alone does not clear them. A test pins this: removing the third
+  rebuild leaves a purged agent transcript's text in the database file.
+
+- `ai-memory compact --confirm` and `POST /admin/compact` reclaim free
+  database pages on demand, deleting nothing, and `ai-memory status` now
+  reports the figure that makes the decision possible: database size,
+  reclaimable bytes, and the share of the file they represent (#549).
+
+  Until now compaction was only reachable by *deleting* something — it existed
+  solely as `--compact` on the destructive commands — so a store that had
+  accumulated free pages through a retention sweep or months of superseded page
+  versions had no way to return the space except by purging data worth keeping.
+  There was also no figure anywhere saying whether a `VACUUM` would reclaim
+  anything at all, which made scheduling one guesswork.
+
+  `docs/deploy.md` documents the operational side, including why an
+  unconditional nightly `VACUUM` is the wrong default: it takes an exclusive
+  lock and rewrites the whole database, so every write blocks — and because
+  SQLite reuses free pages, a store in steady use usually has almost nothing to
+  reclaim, paying the full cost for no benefit. The recipe there is conditional
+  on the reported figure and runs in off hours.
+
+  `status` only advises compaction once the backlog is worth the stall (≥20% of
+  the file *and* ≥64 MiB); the raw numbers are always reported.
+
+### Fixed
+- A failed or skipped embed now leaves a durable record. `page_embeddings`
+  stores only successes, and its upsert rewrites `created_at`, so a global
+  `embed --force` erased any signal about which row had been stale. A failure
+  left nothing at all: the inline write path warned and returned success, and
+  the backfill's per-page warnings lived only in container logs that a restart
+  took with them (#528).
+
+  A `page_embed_failures` ledger (V53) records the last attempt that produced
+  no embedding, across all four sites: the inline `write_page` embed, and the
+  backfill's unreadable-page, empty-body and provider-error branches. The
+  empty-body case matters most — a page skipped on every pass was previously
+  indistinguishable from an idle one, which is what made #509 undiagnosable.
+
+  Failure-only by design. A success writes nothing, because a `page_embeddings`
+  row already records it, so the common path pays no extra write and
+  `embed --force` cannot erase the history — it never touches this table.
+  `status` joins the two to report unresolved failures separately from ones a
+  later pass recovered, so a page that failed once and was repaired does not
+  read as an outstanding problem forever. One row per page, cascading with it.
+
+  Designed to @barrosohub's three constraints, who also supplied the
+  measurement that made the gap concrete: of 1,491 embedding rows on their
+  instance, zero predated the `--force` that had overwritten every timestamp.
+
+- The hook drain no longer stalls the whole spool behind one undeliverable
+  entry. A spooled event carries the URL it was captured against, so a spool
+  can hold entries addressed to a port nothing listens on any more — an old
+  `--bind`, or a server that came back on a different port. The drain stopped
+  at the first such entry, charged it a single retry attempt and returned, so
+  every deliverable event queued behind it was never attempted. With a dead
+  head of queue this is not a delay but silent loss: those events sat until the
+  7-day spool window discarded them undelivered, while the drain reported the
+  same `0 sent, N queued, 0 dropped` a healthy idle pass reports.
+
+  A transport failure is now distinguished from a server rejection
+  (`PostOutcome::Unreachable` / `BatchOutcome::Unreachable`). When an endpoint
+  cannot be reached the drain charges one attempt to the entry it actually
+  tried, records the address, skips its remaining siblings without charging
+  them for an attempt they never got, and carries on to entries addressed
+  somewhere that answers. A total outage behaves exactly as before — every
+  entry shares the one dead endpoint, so the pass still ends having burnt a
+  single attempt. Reported by @rob-prado, who traced it to the head of their
+  own 7,949-entry spool being 100% dead-port, and by @swhite1122, whose
+  stand-in courier avoided the stall by continuing past failures (#493).
+
+  An entry frozen against a dead **loopback** port is also now retried once
+  against the address in the store's own `config.toml`, so a server that came
+  back on a different port delivers its backlog instead of merely skipping it.
+  Restricted to loopback because a loopback authority can only ever have meant
+  "this machine", making a stale port unambiguous; a remote host is left alone
+  rather than silently re-pointed. The target is read from that file directly
+  and not through the usual config load, which also merges the environment — a
+  drain honouring `AI_MEMORY_SERVER_URL` would send captured events to whatever
+  address happened to be exported into the process that ran it.
+
+- `purge-project` and `delete-workspace` no longer overstate what they delete
+  (#540). The help text promised "Permanently delete a project and ALL its
+  data", which reads as byte-level removal neither command performed.
+
+  The deletion was never the defect. Rows go and bytes stay in free pages until
+  the file is rewritten — ordinary SQLite behaviour, and the same boundary
+  `purge-session` already documented. Measured on a canary token: delete alone
+  leaves the text on disk, delete + `VACUUM` still leaves it, and only
+  delete + FTS `rebuild` + `VACUUM` removes it. The claim was what needed
+  fixing, so both commands now describe the boundary they actually enforce and
+  offer the same `--compact` opt-in, and `docs/lifecycle-ops.md` covers all
+  three destructive commands in one place instead of documenting the limits of
+  one and overstating the other two.
+
+- The hook-spool drain can now recover events stranded by a rotated auth token
+  (#542). A spooled envelope freezes the bearer it was captured with, so
+  rotating the token left every already-spooled entry authenticating with the
+  old one and failing `401` forever; OIDC already re-resolved per pass, static
+  tokens did not.
+
+  The drain now retries a rejected entry once with the token it was handed by
+  the hook that spawned it, which is current by construction. Bounded three
+  ways: only after the server has already answered `401`, only for a `Static`
+  entry, and only when the live token actually differs from the one that just
+  failed — so a healthy drain never pays for it and an identical credential is
+  not re-sent.
+
+  The token reaches the drain in the child process's **environment**, never on
+  its command line: an argument would publish the credential to the process
+  table for every local user for as long as the drain runs. A test pins that it
+  stays out of argv. `401` also became a distinct `Unauthorized` outcome —
+  previously indistinguishable from any other refusal, so the drain could not
+  tell a stale credential from a bad event.
+
+  No new credential is stored at rest: the drain is handed a token that already
+  exists rather than reading one from a file ai-memory would have to write and
+  protect.
+
+- Gave `ai-memory mcp-bridge` a TLS backend so it can reach an `https://` MCP
+  server. `ai-memory-cli` enabled rmcp's `transport-streamable-http-client-reqwest`
+  feature, which pulls reqwest in via `__reqwest = ["dep:reqwest"]` and stops
+  there — no `rustls`, no `native-tls`, no TLS at all. reqwest with no TLS
+  feature refuses any non-`http` scheme, so every bridge run against an HTTPS
+  server URL failed at connect with `invalid URL, scheme is not http`, and the
+  only URL that worked was plaintext `http://` — which is also the transport
+  the bridge attaches its bearer token to. Enabling rmcp's `reqwest` feature
+  the bridge now uses rmcp's `reqwest-tls-no-provider`
+  (`reqwest?/rustls-no-provider`), which supplies the platform certificate
+  verifier without pinning a crypto provider, and installs `ring` — already
+  compiled for this binary via the workspace's reqwest 0.12 — as the process
+  default. rmcp's plain `reqwest` feature would have pinned `aws-lc-rs`,
+  adding a compiled C dependency to every build for a bridge most users never
+  enable. The workspace-client half of #492 landed in #496; this is the MCP
+  transport, which is a second, independent copy of reqwest ([#497]).
+
+### Docs
+
+- `docs/windows.md` gains **Scenario E**, a persistent-server story for native
+  Windows. Scenarios C and D both ended at `ai-memory serve` in a foreground
+  terminal, while Linux got `Restart=on-failure` from the packaged systemd
+  units; WinSW is now documented as the equivalent supervisor (#530).
+
+  It leads with the trap rather than the recipe. A Scheduled Task whose action
+  is a PowerShell script calling `Start-Process` looks correct and is silently
+  killed at the next reboot: `Start-Process` returns immediately, the script
+  exits, and Task Scheduler tears down the job object the still-running server
+  was never detached from. The only symptom is a permanently green
+  `LastTaskResult = 0`, which is why it costs hours. Reported and root-caused
+  with event-log evidence by @gabrielscharb.
+
+  Also documented: `sc create` against `ai-memory.exe` cannot work (no SCM
+  control-code dispatcher, and none is planned — the resiliency belongs in the
+  supervisor, as it does on Linux); the corrected Task Scheduler shape for
+  anyone who wants one anyway; and why the WinSW config must use absolute paths
+  — a service runs as `LocalSystem`, so `%LOCALAPPDATA%` would resolve to the
+  system profile and quietly serve an empty data directory.
+
+- Scenario E's WinSW steps were executed end to end on real Windows hardware,
+  and the doc now records what they were true for: Windows 11 25H2 (build
+  26200.9168), WinSW v2.12.0, ai-memory v1.38.0, from an elevated PowerShell
+  session against a throwaway service, port and data directory. Install, start,
+  `LocalSystem` + `Automatic`, an MCP `initialize` answered over the bound
+  port, the absolute `--data-dir` honoured, crash recovery ~8s after
+  force-killing the wrapped process, and a clean stop/uninstall all held;
+  the service was configured with `StartType Automatic`, but boot-time
+  startup was not independently exercised (#530).
 - Human password login, web sessions, and native `aim_` API credentials, so the
   console can use short-lived human sessions instead of a Bearer pasted into
   the browser. `POST /auth/login` issues an `HttpOnly` `ai_memory_session`

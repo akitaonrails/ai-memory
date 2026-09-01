@@ -473,7 +473,9 @@ setup-agent          bootstrap            install-instructions
 install-skills       reorg                purge-project
 rename-project       move-project         move-session
 uninstall            auth                 user
-api-key              completions          handoffs
+completions          handoffs             purge-session
+compact
+api-key
 ```
 
 Run `ai-memory --help` for the full tree.

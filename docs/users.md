@@ -479,6 +479,25 @@ not come back; issue a new key instead. Native keys authenticate as
 root automation still uses `[auth].bearer_token`. External `amk_` keys
 stay in `mcp-auth`; they are not listed here.
 
+#### What rotation does to already-spooled hook events
+
+A lifecycle hook that cannot reach the server writes the event to the local
+spool **together with the bearer it was holding at the time**. Rotating a token
+therefore strands every spooled event captured under the old one: each is
+rejected with `401` on the next drain.
+
+Since #542 the drain recovers them. Re-run `install-hooks --apply` with the new
+token, and the next drain retries any `401`ed entry with the current bearer —
+the hook that spawns the drain hands it down in the child's environment. The
+retry is bounded: it only runs for an entry the server has already rejected,
+only for a static bearer (an OIDC token is re-resolved and refreshed every pass
+anyway), and only when the current token actually differs from the one that
+just failed.
+
+Until you re-run `install-hooks`, the hooks still hold the old token and there
+is nothing newer to retry with — those events stay queued and age out on the
+normal retry budget rather than blocking the rest of the spool (#493).
+
 ## Backward compatibility
 
 If you're upgrading a machine-bearer-only install:
