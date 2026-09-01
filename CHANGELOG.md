@@ -251,6 +251,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Reported by @alvadorn alongside #546 and split out at their suggestion.
 
+- The server bearer is no longer written onto hook command lines (#552).
+  `install-hooks --apply` stored it in the agent's config as
+  `--auth-token <token>` for native hooks and as an `AI_MEMORY_AUTH_TOKEN=`
+  shell prefix for the script hooks, so it sat in `/proc/<pid>/cmdline` —
+  readable by any local user — for the lifetime of every hook, and of every
+  `curl` those hooks ran, on every tool call.
+
+  It now lives in two `0600` files inside the `0700` data dir:
+  `auth-token` for the native `ai-memory hook` path, and `auth-header` for the
+  shell hooks, which pass it to `curl -H @<file>`. The second file is the point
+  rather than duplication — building the header inline would put the credential
+  straight back on a command line.
+
+  Backward compatible: an explicit `--auth-token`, or `AI_MEMORY_AUTH_TOKEN` in
+  the environment, still wins, so configs written before this keep working.
+  Re-run `install-hooks --apply` to move an existing install onto the stored
+  form. Only `--apply` persists; printing a snippet writes no credential.
+
 ### Docs
 
 - `docs/windows.md` gains **Scenario E**, a persistent-server story for native

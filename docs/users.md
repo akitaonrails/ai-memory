@@ -479,6 +479,29 @@ not come back; issue a new key instead. Native keys authenticate as
 root automation still uses `[auth].bearer_token`. External `amk_` keys
 stay in `mcp-auth`; they are not listed here.
 
+#### Where the token is stored
+
+`install-hooks --apply --auth-token …` writes the bearer to two files inside
+the data dir, both `0600` (the data dir itself is `0700`):
+
+| file | read by |
+|---|---|
+| `<data_dir>/auth-token` | the native `ai-memory hook` command |
+| `<data_dir>/auth-header` | the shell hooks, via `curl -H @<file>` |
+
+It is deliberately **not** written into the agent's own config any more. Before
+#552 it went onto the hook's command line — `--auth-token <token>` for native
+hooks, an `AI_MEMORY_AUTH_TOKEN=` shell prefix for the script hooks — which put
+it in the agent's config file *and* in `/proc/<pid>/cmdline` for the lifetime of
+every hook and every `curl`, readable by any local user, on every tool call.
+The second file exists for exactly that reason: building the header inline
+would put the credential straight back on a command line.
+
+An explicit `--auth-token` on a hook command, or `AI_MEMORY_AUTH_TOKEN` in the
+environment, still takes precedence — so configs written before this keep
+working unchanged. Re-run `install-hooks --apply` to move an existing install
+onto the stored form.
+
 #### What rotation does to already-spooled hook events
 
 A lifecycle hook that cannot reach the server writes the event to the local

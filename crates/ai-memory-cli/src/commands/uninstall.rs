@@ -634,6 +634,16 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         apply_change(change, name.as_deref(), &url)?;
     }
 
+    // Removing the hooks removes the only readers of the stored bearer, so
+    // leaving it on disk would strand a live credential (#552). Best-effort:
+    // an unremovable file must not fail a teardown that otherwise succeeded.
+    if let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir) {
+        eprintln!(
+            "ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
+            config.data_dir.display()
+        );
+    }
+
     if args.purge_data {
         for path in data_purge::purge_data_dirs(&config.data_dir)? {
             println!("✓ purged {}", path.display());

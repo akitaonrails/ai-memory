@@ -1384,6 +1384,93 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// `<data_dir>/auth-token` — the raw bearer, `0600`.
+#[must_use]
+pub fn hook_auth_token_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("auth-token")
+}
+
+/// `<data_dir>/auth-header` — the same bearer as a complete
+/// `Authorization:` line, `0600`.
+///
+/// A second file rather than a second parse: the shell hooks pass this to
+/// `curl -H @<file>`, which is what keeps the credential out of *curl's*
+/// argv. Building the header inline would put it straight back on a command
+/// line, which is the whole problem (#552).
+#[must_use]
+pub fn hook_auth_header_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("auth-header")
+}
+
+/// Persist the bearer for hooks to read, replacing any previous pair.
+///
+/// Both files are written `0600` inside the data dir, which is itself `0700`.
+/// That is strictly less exposure than the status quo, where the token sat in
+/// the agent's own config file *and* on the command line of every hook and
+/// every `curl` — readable through `/proc/<pid>/cmdline` by any local user for
+/// as long as each ran.
+///
+/// # Errors
+/// Propagates IO failures from creating the data dir or writing either file.
+pub fn store_hook_auth_token(data_dir: &Path, token: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    write_secret(&hook_auth_token_path_in(data_dir), token)?;
+    write_secret(
+        &hook_auth_header_path_in(data_dir),
+        &format!("Authorization: Bearer {token}\n"),
+    )
+}
+
+/// Remove a persisted bearer pair. Absent files are not an error.
+///
+/// # Errors
+/// Propagates IO failures other than "not found".
+pub fn clear_hook_auth_token(data_dir: &Path) -> std::io::Result<()> {
+    for path in [
+        hook_auth_token_path_in(data_dir),
+        hook_auth_header_path_in(data_dir),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Read the persisted bearer, if one was stored. Trailing newline trimmed.
+#[must_use]
+pub fn read_hook_auth_token(data_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(hook_auth_token_path_in(data_dir)).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Write `contents` to `path` with owner-only permissions.
+///
+/// The mode is set on the handle before any bytes are written on Unix, so the
+/// secret is never briefly world-readable between `create` and `set_permissions`.
+fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no mode bits here; the data dir's own ACL is the boundary.
+        std::fs::write(path, contents)
+    }
+}
+
 fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1417,6 +1504,82 @@ fn normalize_home_dir(home: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #552: the bearer used to travel on every hook's command line, readable
+    /// through `/proc/<pid>/cmdline` by any local user. It now lives in the
+    /// data dir instead — which is only an improvement if the files are not
+    /// world-readable, so the mode is asserted rather than assumed.
+    #[test]
+    fn a_persisted_hook_token_is_owner_only_and_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+
+        store_hook_auth_token(&dd, "s3cret-bearer").unwrap();
+
+        assert_eq!(read_hook_auth_token(&dd).as_deref(), Some("s3cret-bearer"));
+        assert_eq!(
+            std::fs::read_to_string(hook_auth_header_path_in(&dd)).unwrap(),
+            "Authorization: Bearer s3cret-bearer\n",
+            "the header file is what curl reads with -H @file"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for path in [hook_auth_token_path_in(&dd), hook_auth_header_path_in(&dd)] {
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(
+                    mode,
+                    0o600,
+                    "{} must be owner-only, got {mode:o}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// Re-running `install-hooks --apply` after `user rotate-token` must leave
+    /// the new bearer, not both.
+    #[test]
+    fn storing_a_second_token_replaces_the_first() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        store_hook_auth_token(&dd, "old-token").unwrap();
+        store_hook_auth_token(&dd, "new-token").unwrap();
+
+        assert_eq!(read_hook_auth_token(&dd).as_deref(), Some("new-token"));
+        assert!(
+            !std::fs::read_to_string(hook_auth_header_path_in(&dd))
+                .unwrap()
+                .contains("old-token"),
+            "a rotated token must not leave the previous one behind"
+        );
+    }
+
+    /// Absent, empty, and whitespace-only files all read as "no token" rather
+    /// than as an empty bearer, which would send `Authorization: Bearer `.
+    #[test]
+    fn an_absent_or_blank_token_file_reads_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        assert!(read_hook_auth_token(&dd).is_none(), "absent");
+
+        std::fs::create_dir_all(&dd).unwrap();
+        std::fs::write(hook_auth_token_path_in(&dd), "").unwrap();
+        assert!(read_hook_auth_token(&dd).is_none(), "empty");
+        std::fs::write(hook_auth_token_path_in(&dd), "  \n ").unwrap();
+        assert!(read_hook_auth_token(&dd).is_none(), "whitespace only");
+    }
+
+    #[test]
+    fn clearing_a_token_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        store_hook_auth_token(&dd, "tok").unwrap();
+        clear_hook_auth_token(&dd).unwrap();
+        assert!(read_hook_auth_token(&dd).is_none());
+        clear_hook_auth_token(&dd).expect("clearing twice must not error");
+    }
     use super::*;
     use secrecy::{ExposeSecret, SecretString};
     use tempfile::TempDir;

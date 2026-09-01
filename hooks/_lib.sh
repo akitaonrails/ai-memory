@@ -367,11 +367,26 @@ ai_memory_clear_session_id() {
 # The 0.5s timeout matches the project-wide hook latency budget
 # (never block the agent), and the trailing `|| true` makes the
 # function safe to call from `set -e` scripts.
+# Path of the `Authorization:` header file `install-hooks --apply` writes
+# (0600, inside the 0700 data dir). Printed only when readable.
+ai_memory_auth_header_file() {
+    _amhf="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ai-memory}/auth-header"
+    [ -r "$_amhf" ] && printf '%s' "$_amhf"
+}
+
 ai_memory_post_hook() {
+    _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
         curl -s --max-time 0.5 -X POST "$1" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
+            --data-binary @-
+    elif [ -n "$_amhdr" ]; then
+        # `-H @file`: curl reads the header from disk, so the bearer never
+        # appears in curl's argv the way an inline `-H` would (#552).
+        curl -s --max-time 0.5 -X POST "$1" \
+            -H "Content-Type: application/json" \
+            -H @"$_amhdr" \
             --data-binary @-
     else
         curl -s --max-time 0.5 -X POST "$1" \
@@ -387,9 +402,12 @@ ai_memory_post_hook() {
 # stdout (and prepended to the agent's context), so we want to avoid
 # truncating a handoff that was almost ready.
 ai_memory_get_handoff() {
+    _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
         curl -s --max-time 1.0 "$1" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
+    elif [ -n "$_amhdr" ]; then
+        curl -s --max-time 1.0 "$1" -H @"$_amhdr"
     else
         curl -s --max-time 1.0 "$1"
     fi

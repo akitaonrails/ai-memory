@@ -334,7 +334,35 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         .clone()
         .or_else(|| config.auth.bearer_token.clone())
         .or_else(|| inferred.as_ref().and_then(|mcp| mcp.auth_token.clone()));
-    let auth = auth_token_owned.as_deref();
+    // #552: persist the bearer under the data dir (0600) and keep it OUT of
+    // the rendered config. Before this it went onto every hook's command line —
+    // as `--auth-token <token>` for native hooks, as an `AI_MEMORY_AUTH_TOKEN=`
+    // shell prefix for the script hooks — so it was readable through
+    // `/proc/<pid>/cmdline` by any local user for as long as each hook ran, on
+    // every tool call.
+    //
+    // Only `--apply` persists: a printed snippet is the operator's to place, and
+    // writing a credential as a side effect of a dry run would be a surprise.
+    let persisted = if args.apply
+        && let Some(token) = auth_token_owned.as_deref()
+    {
+        crate::config::store_hook_auth_token(&config.data_dir, token).with_context(|| {
+            format!(
+                "storing the hook auth token under {}",
+                config.data_dir.display()
+            )
+        })?;
+        true
+    } else {
+        false
+    };
+    // Renderers take `Option<&str>` and omit the credential entirely when it is
+    // `None`, so one decision here covers every agent instead of twenty edits.
+    let auth = if persisted {
+        None
+    } else {
+        auth_token_owned.as_deref()
+    };
     // P1.8 multi-user attribution: `--as-user` is metadata only — the
     // token stamped into the hook env block is whatever the operator
     // passed via `--auth-token` (typically a native key from
@@ -6773,6 +6801,63 @@ model = "gpt-5"
                 .join("hooks")
                 .join("claude-code"),
             "existing installs must keep staging exactly where they did"
+        );
+    }
+
+    /// #552, the regression guard: `--apply` must persist the bearer under the
+    /// data dir and leave it out of the agent config entirely.
+    ///
+    /// Before this, the token was written into the rendered command — as
+    /// `--auth-token <token>` for native hooks — so it sat in the agent's
+    /// config file *and* in `/proc/<pid>/cmdline` for the lifetime of every
+    /// hook, on every tool call.
+    #[test]
+    fn apply_persists_the_bearer_and_keeps_it_out_of_the_agent_config() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: Some("SEKRIT-BEARER-552".to_string()),
+            config_file: Some(settings.clone()),
+            // Point at the repo's bundle explicitly. Without this the test
+            // leans on hook-dir discovery, which from `target/debug/deps`
+            // walks to `<repo>/target` and then falls through to whatever the
+            // machine happens to have staged — passing for a reason that has
+            // nothing to do with what is under test.
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        run(&config, args).expect("apply should succeed");
+
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            !rendered.contains("SEKRIT-BEARER-552"),
+            "the bearer must not be written into the agent config: {rendered}"
+        );
+        assert!(
+            !rendered.contains("--auth-token"),
+            "no --auth-token flag may reach a hook command line: {rendered}"
+        );
+
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir).as_deref(),
+            Some("SEKRIT-BEARER-552"),
+            "the bearer must be persisted where the hook can read it"
+        );
+        assert!(
+            std::fs::read_to_string(crate::config::hook_auth_header_path_in(&config.data_dir))
+                .unwrap()
+                .contains("SEKRIT-BEARER-552"),
+            "the curl header file must carry it too"
         );
     }
 
