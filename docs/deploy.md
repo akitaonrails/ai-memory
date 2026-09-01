@@ -236,6 +236,46 @@ a single process-wide slot — fine for one harness, but concurrent sessions the
 share it, and unscoped **writes** resolve through it too. See
 [auto-scope.md](auto-scope.md) and [users.md](users.md#running-for-a-team).
 
+### How much load one server absorbs
+
+Every write goes through a single writer actor — the right design for SQLite,
+and the obvious question it raises is when that becomes the ceiling. Measured
+rather than estimated, with
+`cargo test -p ai-memory-store --test writer_throughput -- --ignored --nocapture`:
+
+| concurrent writers | throughput | mean latency |
+|---|---|---|
+| 1 | 42/s | 23.9 ms |
+| 8 | 295/s | 3.4 ms |
+| 32 | 698/s | 1.43 ms |
+| 128 | 700/s | 1.43 ms |
+
+Read it in two parts.
+
+**The ceiling is ~700 writes/second**, reached around 32 concurrent writers and
+flat from there — 128 writers produce the same throughput at the same latency.
+Past saturation the server applies backpressure instead of degrading: the queue
+is bounded at 1024 with an awaiting send, so a burst larger than the queue slows
+its producers down and still lands every write. Nothing is dropped, and nothing
+grows without limit.
+
+**Single-writer latency is dominated by `fsync`, not CPU.** One observation per
+commit costs about one disk sync; concurrency lets SQLite coalesce WAL commits,
+which is why throughput rises 17× while per-write latency *falls*.
+
+For capacity planning: an actively working agent emits on the order of one
+lifecycle write per tool call. Even at a pessimistic one tool call per second
+per agent, ~700/s is several hundred concurrently active agents — far beyond a
+team, and beyond most shared installs. The writer is not the thing that will
+break first.
+
+Two caveats before you lean on the numbers. They were taken on a fast local
+disk; because the cost is `fsync`, a network filesystem or a slow volume will
+be materially lower, which is another reason to keep the data dir on local
+storage. And they measure the store, not the HTTP front door — an install that
+saturates this is far more likely to be limited by the agent side than by
+SQLite.
+
 ## Reclaiming disk space
 
 SQLite does not return deleted space to the filesystem. Deleted rows leave

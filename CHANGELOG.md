@@ -154,6 +154,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never its absolute path, so a copy at a different path on another machine
   is the same project and reads what the first wrote.
 
+  Writer capacity is now measured rather than assumed:
+  `crates/ai-memory-store/tests/writer_throughput.rs` reports ~700 writes/second
+  at saturation (~32 concurrent writers, flat to 128), with single-writer
+  latency dominated by `fsync` rather than CPU. A companion test asserts that a
+  burst larger than the 1024-deep queue applies backpressure and loses nothing.
+  `docs/deploy.md` carries the table and the capacity reading.
+
   `docs/users.md` and `docs/deploy.md` gain the team-facing guidance they were
   missing entirely, including that two servers must never share one data
   directory.
