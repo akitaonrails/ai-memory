@@ -64,6 +64,13 @@ fn upstream_config(
     session_id: &str,
     auth_token: Option<&str>,
 ) -> Result<StreamableHttpClientTransportConfig> {
+    // Every transport in this module is built from a config this function
+    // produced, so installing here covers each of them. Doing it only in
+    // `run` left `StreamableHttpClientTransport::from_config` reachable
+    // without a provider, and reqwest 0.13 under `rustls-no-provider`
+    // *panics* rather than erroring when one is missing.
+    install_crypto_provider()?;
+
     let mut headers = HashMap::new();
     headers.insert(
         ACTOR_SESSION_HEADER,
@@ -117,8 +124,6 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         .as_deref()
         .map(mcp_server_url_from_base)
         .unwrap_or_else(|| mcp_server_url_from_base(&config.server_url));
-    install_crypto_provider()?;
-
     let transport = StreamableHttpClientTransport::from_config(upstream_config(
         &server_url,
         session_id,
@@ -155,6 +160,29 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Building the transport must never depend on a caller having installed
+    /// a provider first. reqwest 0.13 under `rustls-no-provider` **panics**
+    /// inside `ClientBuilder` when none is present, so a missing install is a
+    /// crash rather than an error a caller could handle.
+    ///
+    /// The install lives in `upstream_config` for that reason: every transport
+    /// in this module is built from a config it produced.
+    ///
+    /// Note what this test cannot do. The provider is process-global, so once
+    /// any test installs one this assertion would hold even with the install
+    /// removed. The structural guarantee — install in the constructor path,
+    /// not at one call site — is what actually prevents the panic; this pins
+    /// the contract so the call is not quietly deleted.
+    #[test]
+    fn upstream_config_leaves_a_crypto_provider_installed() {
+        let config = upstream_config("http://127.0.0.1:1/mcp", "session-for-provider", None);
+        assert!(config.is_ok(), "config build must succeed");
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "upstream_config must guarantee a provider before any client is built"
+        );
+    }
 
     #[test]
     fn install_crypto_provider_is_idempotent_and_leaves_a_default() {

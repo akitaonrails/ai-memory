@@ -216,6 +216,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enable. The workspace-client half of #492 landed in #496; this is the MCP
   transport, which is a second, independent copy of reqwest ([#497]).
 
+- `ai-memory mcp-bridge` no longer risks a panic when building its HTTP
+  transport. #497 moved the bridge onto reqwest's `rustls-no-provider`, which
+  **panics** inside `ClientBuilder` when no rustls crypto provider is
+  installed — not an error a caller can handle, a crash. The install ran in
+  `run` only, leaving `StreamableHttpClientTransport::from_config` reachable
+  without one.
+
+  Moved into `upstream_config`, which every transport in that module is built
+  from. Caught by `stdio_bridge_forwards_tools_and_session_header_in_both_http_modes`
+  failing in isolation on `main`; it had passed in CI because the provider is
+  process-global and another test happened to install it first.
+
 ### Docs
 
 - `docs/windows.md` gains **Scenario E**, a persistent-server story for native
