@@ -10,23 +10,27 @@ land in their resolved project, but do not advance shared fallback slots: a
 delayed post-tool, stop, or session-end tail from an older process must not
 redirect a newer session's unscoped reads.
 
-By default that pointer is a single process-wide slot — right for one
-operator running one project at a time, but it collapses parallel
-sessions on shared installs: a hook firing from `~/repo-A` overwrites
-the slot that a concurrent `memory_query` (with no explicit project)
-in `~/repo-B` was about to read.
+Since v1.39 that pointer is **keyed by the caller's own coordinate** by
+default (`per_actor`), so two harnesses in one project — or two operators on
+one server — cannot overwrite each other's notion of "current project".
 
-The `[auto_scope]` config block selects opt-in isolation modes that
-key the pointer by request identity so concurrent callers stay
-separated.
+Before v1.39 the default was a single process-wide slot (`single`). That is
+right for exactly one harness at a time and collapses as soon as there are
+two: a hook firing from `~/repo-A` overwrites the slot that a concurrent
+`memory_query` (with no explicit project) in `~/repo-B` was about to read.
+Because unscoped **writes** resolve through the same pointer, that could also
+land a `memory_write_page` in the wrong project.
+
+The `[auto_scope]` config block still selects the mode explicitly, including
+`single` for anyone who wants the historical slot back.
 
 ## Modes
 
 | `mode`        | Key                    | When to use                                                                                              |
 |---------------|------------------------|----------------------------------------------------------------------------------------------------------|
-| `single`      | (none — global slot)   | **Default.** Single operator, one project at a time. Backward-compatible with every existing install.    |
+| `single`      | (none — global slot)   | The pre-v1.39 behaviour. One operator, one harness at a time; last write wins. Opt in only if you want it. |
 | `per_session` | `session_id`           | Session-aware clients/bridges that forward the hook session id on every MCP request. |
-| `per_actor`   | `(qualified identity, session_id)`, with an identity-only no-session slot | Shared engine fielding multiple authenticated users or trusted-proxy identities. Isolates across operators and fails closed when a forwarded session id does not match hook activity. |
+| `per_actor`   | `(qualified identity, session_id)`, with an identity-only no-session slot | **Default.** Isolates parallel harnesses and separate operators. Falls back to the shared slot for a caller with no coordinate, and for an install where nothing has ever been keyed (no lifecycle hooks); fails closed on a genuine session mismatch. |
 
 Both opt-in modes still publish foreground activity to the single slot in
 parallel, so a caller with no actor identity (anonymous probe, legacy code
@@ -196,3 +200,34 @@ even on a corporate engine fielding hundreds of concurrent sessions.
 The TTL ensures stale entries (closed Claude Code windows, dropped
 hook clients) age out within an hour; the cap drops the oldest
 insertions first if the TTL window is somehow exceeded.
+
+
+## Upgrading to v1.39
+
+The default changed from `single` to `per_actor`. For most installs nothing
+observable changes:
+
+| your setup | before | after |
+|---|---|---|
+| one harness, hooks installed | shared slot | keyed slot for that session — same project |
+| static MCP client (bearer, no session id) | shared slot | that operator's identity-only slot — same project |
+| client that forwards no identity at all | shared slot | shared slot, unchanged |
+| **MCP-only install, no lifecycle hooks** | shared slot | shared slot — nothing is ever keyed, so the fallback applies |
+| two harnesses / two operators | one slot, last write wins | one slot each |
+
+The single behavioural change is deliberate: a client that forwards a session
+id which does **not** match any published hook activity no longer inherits the
+shared slot. Answering it from there is what routed a request into whichever
+project published last — on a shared server, potentially another operator's.
+Such a caller now resolves to the server's configured default instead.
+
+To restore the old behaviour exactly:
+
+```toml
+[auto_scope]
+mode = "single"
+```
+
+or `AI_MEMORY_AUTO_SCOPE__MODE=single`. The effective mode is logged at
+startup (`active-project isolation mode mode=…`), which is the quickest way
+to confirm what a running server is using.

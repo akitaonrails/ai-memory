@@ -210,6 +210,32 @@ scp "$SERVER:$DEPLOY_DIR/data/snapshot-$(date +%F).tar.gz" ./backups/
 The `ai-memory backup` command uses SQLite's online backup API so
 writes during the snapshot are coherent.
 
+## Sharing one server between people or harnesses
+
+A deployed server is the supported way to share a project — between teammates,
+or between several harnesses you run yourself. Two things are worth knowing
+before you hand out the URL.
+
+**One server per data directory.** Point two `ai-memory serve` processes at the
+same `data/` (a synced folder, an NFS mount, two containers on one volume) and
+they will each run their own writer and their own git handle on the wiki. SQLite
+survives it; the wiki and the in-process state do not. Run one server and let
+everyone connect to it — which is also what makes the shared-knowledge model
+work.
+
+**Check the isolation mode.** Unscoped MCP calls resolve "current project"
+through a pointer that, since v1.39, is keyed per caller. The startup line says
+which mode is live:
+
+```
+active-project isolation mode mode=PerActor …
+```
+
+`PerActor` is the default and the one you want on a shared server. `Single` is
+a single process-wide slot — fine for one harness, but concurrent sessions then
+share it, and unscoped **writes** resolve through it too. See
+[auto-scope.md](auto-scope.md) and [users.md](users.md#running-for-a-team).
+
 ## Reclaiming disk space
 
 SQLite does not return deleted space to the filesystem. Deleted rows leave

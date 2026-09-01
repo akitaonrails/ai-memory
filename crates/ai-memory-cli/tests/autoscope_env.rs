@@ -151,13 +151,35 @@ fn spawn_and_wait_for_exit(envs: &[(&str, &str)], timeout: Duration) -> (bool, S
 const STARTUP_NEEDLE: &str = "active-project isolation mode";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// The shipped default keys the active-project pointer by whatever coordinate
+/// the caller has, so two harnesses in one project — or two operators on one
+/// server — do not overwrite each other's pointer.
+///
+/// `Single` is still selectable, but it is no longer what an install gets for
+/// free: a process-wide last-write-wins slot is only correct for exactly one
+/// harness at a time, and nothing about a fresh install says that is the case.
 #[test]
-fn default_mode_is_single() {
+fn default_mode_is_per_actor() {
     let (line, all) = spawn_and_wait_for_log(&[], STARTUP_NEEDLE, STARTUP_TIMEOUT);
     let line = line.unwrap_or_else(|| panic!("startup log line not found.\nstderr:\n{all}"));
     assert!(
+        line.contains("PerActor"),
+        "default mode must log `PerActor`. Got: {line}\nfull stderr:\n{all}"
+    );
+}
+
+/// …and `Single` must remain reachable for anyone who wants the old slot.
+#[test]
+fn single_mode_is_still_selectable_via_env() {
+    let (line, all) = spawn_and_wait_for_log(
+        &[("AI_MEMORY_AUTO_SCOPE__MODE", "single")],
+        STARTUP_NEEDLE,
+        STARTUP_TIMEOUT,
+    );
+    let line = line.unwrap_or_else(|| panic!("startup log line not found.\nstderr:\n{all}"));
+    assert!(
         line.contains("Single"),
-        "default mode must log `Single`. Got: {line}\nfull stderr:\n{all}"
+        "explicit single must log `Single`. Got: {line}\nfull stderr:\n{all}"
     );
 }
 

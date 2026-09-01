@@ -217,6 +217,21 @@ min_session_age_secs = 600
 [routing]
 mid_session = "follow-cwd"
 
+# How the "currently active project" pointer is keyed. Unscoped MCP calls —
+# the normal case, since the tools default to the current project — resolve
+# through it, and so do unscoped writes.
+#
+#   per_actor    (default) keyed by identity + session. Two harnesses, or two
+#                operators, keep separate pointers. Falls back to the shared
+#                slot for a caller with no coordinate and for installs with no
+#                lifecycle hooks.
+#   per_session  keyed by session id only.
+#   single       one process-wide slot, last write wins. The pre-v1.39
+#                behaviour; correct only for one harness at a time.
+#
+# [auto_scope]
+# mode = "per_actor"
+
 # NOTE: `[auth]` must remain the LAST section in this template.
 # `ai-memory init` appends further `[auth]` keys (token_pepper, root_username,
 # ...) as bare keys to the end of the rendered file, so any section added

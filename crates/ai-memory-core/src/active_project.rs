@@ -63,6 +63,7 @@
 //! plain `std::sync::RwLock` is the right primitive (no async lock needed).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -77,19 +78,27 @@ pub const DEFAULT_PER_KEY_TTL: Duration = Duration::from_secs(60 * 60);
 pub const DEFAULT_MAX_ENTRIES: usize = 4096;
 
 /// Selects how the hook router and the MCP tools share the "currently active
-/// project" pointer. `Single` is the legacy behaviour and remains the default
-/// — the other modes are opt-in via the CLI's `[auto_scope]` config block.
+/// project" pointer.
+///
+/// `PerActor` is the default: it keys the pointer by whatever coordinate the
+/// caller actually has, so parallel harnesses and multiple operators stay
+/// separated without configuration. A caller carrying no coordinate at all
+/// still reads the shared slot, which is what keeps a single-harness install
+/// behaving exactly as it always has.
+///
+/// `Single` remains available for installs that want the historical
+/// process-wide slot explicitly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActiveProjectMode {
-    /// Process-wide slot, last-write-wins. Backward-compatible default.
-    #[default]
+    /// Process-wide slot, last-write-wins. The historical behaviour, now opt-in.
     Single,
     /// Keyed by `session_id`. Isolates concurrent agent runs of the same
     /// operator from each other.
     PerSession,
-    /// Keyed by `(user, session_id)`. Isolates across operators as well,
-    /// for installs with multi-user mode enabled.
+    /// Keyed by `(user, session_id)`, with an identity-only slot alongside.
+    /// Isolates parallel harnesses and separate operators. The default.
+    #[default]
     PerActor,
 }
 
@@ -318,12 +327,23 @@ pub struct ActiveProject {
     /// byte-for-byte unchanged.
     single_default_global: Arc<RwLock<bool>>,
     per_actor: Arc<RwLock<PerActorMap>>,
+    /// Whether any keyed entry has ever been published on this process.
+    ///
+    /// Distinguishes "this install has no lifecycle hooks, so nothing was ever
+    /// keyed" from "hooks are running and this key simply does not match".
+    /// The first deserves the shared fallback — there is no better information
+    /// anywhere — while the second is a mismatch that must fail closed rather
+    /// than answer for whichever project published last.
+    ///
+    /// Never reset: an install that once had hook activity is not hookless
+    /// again just because entries aged out of the TTL map.
+    ever_keyed: Arc<AtomicBool>,
 }
 
 impl Default for ActiveProject {
     fn default() -> Self {
         Self::with_config(
-            ActiveProjectMode::Single,
+            ActiveProjectMode::default(),
             DEFAULT_PER_KEY_TTL,
             DEFAULT_MAX_ENTRIES,
         )
@@ -331,7 +351,11 @@ impl Default for ActiveProject {
 }
 
 impl ActiveProject {
-    /// Create an empty `Single`-mode pointer — the legacy default.
+    /// Create an empty pointer in the shipped default mode
+    /// ([`ActiveProjectMode::PerActor`]).
+    ///
+    /// Was `Single` before v1.39. Call [`Self::with_mode`] explicitly for the
+    /// historical process-wide slot.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -353,6 +377,7 @@ impl ActiveProject {
             single: Arc::new(RwLock::new(None)),
             single_default_global: Arc::new(RwLock::new(false)),
             per_actor: Arc::new(RwLock::new(PerActorMap::new(ttl, max_entries))),
+            ever_keyed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -392,6 +417,7 @@ impl ActiveProject {
             return;
         }
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        self.ever_keyed.store(true, Ordering::Relaxed);
         if self.mode == ActiveProjectMode::PerActor
             && actor.user.is_some()
             && actor.session_id.is_some()
@@ -468,8 +494,39 @@ impl ActiveProject {
             return self.read_single();
         }
 
+        let now = Instant::now();
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
-        guard.get(&scoped, Instant::now())
+        if let Some(found) = guard.get(&scoped, now) {
+            return Some(found);
+        }
+
+        // A keyed miss means one of two very different things.
+        //
+        // If this identity has published before — or anything on this process
+        // has — then hooks are running and this coordinate simply does not
+        // match one. That is a mismatch, and answering from the shared slot
+        // would route the request into whichever project published last,
+        // possibly another operator's. Fail closed and let the caller fall
+        // back to its configured default.
+        //
+        // If nothing has *ever* been keyed, this install has no lifecycle
+        // hooks feeding the pointer at all (MCP-only). There is no better
+        // information anywhere, and the shared slot is exactly what such an
+        // install has always used, so keep answering from it.
+        if self.mode == ActiveProjectMode::PerActor && actor.user.is_some() {
+            let identity_only = ActorKey {
+                user: actor.user.clone(),
+                session_id: None,
+            };
+            if guard.get(&identity_only, now).is_some() {
+                return None;
+            }
+        }
+        drop(guard);
+        if self.ever_keyed.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.read_single()
     }
 
     /// Whether the actor opted this session into `default_global` recall (via
@@ -673,6 +730,138 @@ mod tests {
         }
     }
 
+    fn per_actor() -> ActiveProject {
+        ActiveProject::with_config(
+            ActiveProjectMode::PerActor,
+            DEFAULT_PER_KEY_TTL,
+            DEFAULT_MAX_ENTRIES,
+        )
+    }
+
+    fn ids(_n: u8) -> (WorkspaceId, ProjectId) {
+        (WorkspaceId::new(), ProjectId::new())
+    }
+
+    /// The scenario the default must not break: one operator, one harness, and
+    /// an MCP-only install with no lifecycle hooks feeding the pointer.
+    ///
+    /// Nothing is ever keyed, so a request carrying a session id has no keyed
+    /// entry to match. That is not a mismatch — there is no better information
+    /// anywhere — so it must keep reading the shared slot, exactly as it did
+    /// before `PerActor` became the default.
+    #[test]
+    fn a_hookless_install_still_reads_the_shared_slot() {
+        let ap = per_actor();
+        let (ws, proj) = ids(1);
+        ap.set(ws, proj);
+
+        assert_eq!(
+            ap.get_for(&key_actor("alice", "session-never-published")),
+            Some((ws, proj)),
+            "with no keyed activity anywhere, the shared slot is the only answer"
+        );
+    }
+
+    /// Once hooks *are* publishing, a session id that matches nothing is a
+    /// mismatch rather than a hookless install. Answering from the shared slot
+    /// would hand back whichever project published last — on a shared server,
+    /// somebody else's. Fail closed instead.
+    #[test]
+    fn a_session_mismatch_fails_closed_once_anything_has_been_keyed() {
+        let ap = per_actor();
+        let (ws_a, proj_a) = ids(1);
+        ap.set_for(&key_actor("alice", "s-alice"), ws_a, proj_a, false);
+
+        assert_eq!(
+            ap.get_for(&key_actor("alice", "some-other-session")),
+            None,
+            "alice has published, so an unmatched session of hers is a mismatch"
+        );
+        assert_eq!(
+            ap.get_for(&key_actor("carol", "s-carol")),
+            None,
+            "and another operator must not inherit alice's pointer"
+        );
+    }
+
+    /// Scenario: one user, two harnesses open in the same project at once.
+    /// Each must keep its own pointer; neither may overwrite the other.
+    #[test]
+    fn parallel_harnesses_of_one_user_keep_separate_pointers() {
+        let ap = per_actor();
+        let (ws_1, proj_1) = ids(1);
+        let (ws_2, proj_2) = ids(2);
+
+        ap.set_for(&key_actor("alice", "harness-a"), ws_1, proj_1, false);
+        ap.set_for(&key_actor("alice", "harness-b"), ws_2, proj_2, false);
+
+        assert_eq!(
+            ap.get_for(&key_actor("alice", "harness-a")),
+            Some((ws_1, proj_1))
+        );
+        assert_eq!(
+            ap.get_for(&key_actor("alice", "harness-b")),
+            Some((ws_2, proj_2)),
+            "the second harness must not have clobbered the first"
+        );
+    }
+
+    /// Scenario: two operators on one server. Neither may read the other's
+    /// pointer, in either direction.
+    #[test]
+    fn two_operators_never_read_each_others_pointer() {
+        let ap = per_actor();
+        let (ws_a, proj_a) = ids(1);
+        let (ws_c, proj_c) = ids(2);
+
+        ap.set_for(&key_actor("alice", "s-a"), ws_a, proj_a, false);
+        ap.set_for(&key_actor("carol", "s-c"), ws_c, proj_c, false);
+
+        assert_eq!(ap.get_for(&key_actor("alice", "s-a")), Some((ws_a, proj_a)));
+        assert_eq!(ap.get_for(&key_actor("carol", "s-c")), Some((ws_c, proj_c)));
+    }
+
+    /// The commonest authenticated upgrade path: lifecycle hooks publish with
+    /// both a user and a session, while a *static* MCP client (no session-aware
+    /// bridge) sends only its bearer.
+    ///
+    /// That client keys to the identity-only slot, which `set_for` publishes
+    /// alongside the session slot precisely so this works. Without it, every
+    /// static MCP client on an authenticated install would fail closed after
+    /// the default changed — which would be a broken upgrade, not a safer one.
+    #[test]
+    fn a_static_mcp_client_reads_the_identity_only_slot() {
+        let ap = per_actor();
+        let (ws, proj) = ids(1);
+        ap.set_for(&key_actor("alice", "hook-session"), ws, proj, false);
+
+        let static_client = ActorKey {
+            user: Some("alice".to_string()),
+            session_id: None,
+        };
+        assert_eq!(
+            ap.get_for(&static_client),
+            Some((ws, proj)),
+            "a bearer with no session must still resolve to that user's project"
+        );
+    }
+
+    /// A caller with no coordinate at all — an anonymous probe, or a client
+    /// that cannot forward identity — still reads the shared slot. This is what
+    /// keeps the single-harness install unchanged under the new default.
+    #[test]
+    fn an_actorless_caller_still_reads_the_shared_slot_after_keying() {
+        let ap = per_actor();
+        let (ws_a, proj_a) = ids(1);
+        ap.set_for(&key_actor("alice", "s-a"), ws_a, proj_a, false);
+
+        assert_eq!(
+            ap.get_for(&empty_actor()),
+            Some((ws_a, proj_a)),
+            "an empty actor has no coordinate to mismatch on"
+        );
+    }
+
     #[test]
     fn starts_empty() {
         assert!(ActiveProject::new().get().is_none());
@@ -791,7 +980,9 @@ mod tests {
 
     #[test]
     fn single_mode_ignores_actor_coordinates() {
-        let ap = ActiveProject::new();
+        // Explicit: `Single` is opt-in since v1.39, so this pins the mode
+        // rather than relying on whatever the default happens to be.
+        let ap = ActiveProject::with_mode(ActiveProjectMode::Single);
         let alice = key_actor("alice", "sA");
         let bob = key_actor("bob", "sB");
         let ws = WorkspaceId::new();

@@ -291,6 +291,36 @@ prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
 15. **Tracing subscribers explicitly filter their own module** — no
     feedback loops.
 
+16. **Multi-session and multi-user access to one project is a core
+    capability.** One operator running several harnesses at once, and
+    several operators sharing one server, must both work — and knowledge
+    written by either must be readable by the other in the same project.
+    Concretely:
+    - **Pages are shared, batons are owned.** `pages.author_id` exists for
+      attribution and must never become a read filter; `OwnerFilter` applies
+      to handoffs and stays there. A change that scopes page reads by
+      operator silently stops a team collaborating while every single-user
+      test still passes.
+    - **A divergent concurrent write supersedes, never destroys.** Two
+      harnesses editing one path produce a supersession chain; the loser
+      stays reachable. "Last write wins" must not come to mean "the other
+      version is gone".
+    - **A handoff is claimed exactly once**, by two independent `state =
+      'open'` guards (the metadata lookup and the claim `UPDATE`). Keep both;
+      they are defence in depth, not duplication.
+    - **The active-project pointer is keyed by the caller's coordinate**
+      (`ActiveProjectMode::PerActor` by default), so parallel harnesses and
+      separate operators cannot overwrite each other's notion of "current
+      project" — which unscoped *writes* also resolve through.
+
+    Unit tests do not cover this: they exercise one session at a time, which
+    is the exact shape that cannot see a collaboration or concurrency defect.
+    `crates/ai-memory-store/tests/multi_session.rs` and the pointer tests in
+    `ai-memory-core::active_project` are the guards. Any change to scope
+    resolution, page supersession, session identity, handoff acceptance, the
+    writer actor, or owner filters must be argued against this invariant
+    explicitly rather than assumed safe.
+
 Additional boundary rules:
 
 - **Scope resolution:** new MCP/admin/web routes must use

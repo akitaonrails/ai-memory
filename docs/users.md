@@ -521,6 +521,37 @@ Until you re-run `install-hooks`, the hooks still hold the old token and there
 is nothing newer to retry with — those events stay queued and age out on the
 normal retry budget rather than blocking the rest of the spool (#493).
 
+## Running for a team
+
+Everything above concerns *who* a request is, which is the identity half. The
+other half is *which project* it lands in, and it matters most once more than
+one person shares a server.
+
+**Knowledge is shared; batons are owned.** A page written in a project is
+readable by every operator in that project — `pages.author_id` records who
+wrote it and is never a read filter. That is the point of a shared server: what
+one person learns, the next person retrieves. Handoffs are the opposite: a
+handoff carries an owner, and only that operator receives it.
+
+**Concurrent edits supersede rather than collide.** Two people editing the same
+page produce a version chain, not a conflict; the later write becomes latest and
+the earlier one stays reachable. There is no merge, and none is claimed — but
+nothing is destroyed either.
+
+**Isolation of the "current project" pointer is automatic** since v1.39. Unscoped
+calls (the normal case — the MCP tools default to the current project) resolve
+through a pointer keyed by the caller's identity and session, so two operators,
+or one operator with two harnesses, do not overwrite each other. Confirm what a
+server is running with the startup line:
+
+```
+active-project isolation mode mode=PerActor session_ttl_secs=3600 max_entries=4096
+```
+
+If that says `Single` on a shared server, unscoped reads **and writes** from
+concurrent sessions share one last-write-wins slot. See
+[auto-scope.md](auto-scope.md).
+
 ## Backward compatibility
 
 If you're upgrading a machine-bearer-only install:

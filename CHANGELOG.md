@@ -114,6 +114,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `status` only advises compaction once the backlog is worth the stall (≥20% of
   the file *and* ≥64 MiB); the raw numbers are always reported.
 
+### Changed
+
+- **The `[auto_scope]` default changed from `single` to `per_actor`.** The
+  "currently active project" pointer is now keyed by the caller's identity and
+  session, so two harnesses in one project — or two operators on one server —
+  no longer overwrite each other's notion of the current project. Unscoped MCP
+  calls resolve through that pointer, and so do unscoped **writes**, so under
+  the old default a `memory_write_page` from one session could land in whatever
+  project another session had most recently published.
+
+  **Upgrade impact is narrow, and there is an escape hatch.** A single harness
+  with hooks, a static MCP client sending only a bearer, a client forwarding no
+  identity at all, and an MCP-only install with no lifecycle hooks all resolve
+  to the same project they did before — the last case because nothing is ever
+  keyed there, so the shared slot still applies. The one deliberate change: a
+  client forwarding a session id that matches no published hook activity no
+  longer inherits the shared slot, because that is precisely what routed a
+  request into whichever project published last. It now resolves to the
+  server's configured default.
+
+  Set `mode = "single"` under `[auto_scope]`, or
+  `AI_MEMORY_AUTO_SCOPE__MODE=single`, for the old behaviour exactly. The
+  effective mode is logged at startup. `docs/auto-scope.md` carries a
+  per-setup upgrade table.
+
+- Multi-session and multi-user access to one project is now a documented
+  cross-cutting invariant (`AGENTS.md` #16) with integration-level guards:
+  `crates/ai-memory-store/tests/multi_session.rs` plus pointer tests in
+  `ai-memory-core::active_project`. They pin the properties a team depends on —
+  pages shared while handoffs stay owned, a concurrent write superseding rather
+  than destroying, an identical rewrite staying idempotent, and a second accept
+  being unable to steal a claimed handoff. Unit tests could not cover this:
+  they exercise one session at a time, which is the shape that cannot see a
+  collaboration or concurrency defect.
+
+  `docs/users.md` and `docs/deploy.md` gain the team-facing guidance they were
+  missing entirely, including that two servers must never share one data
+  directory.
+
+- `/admin/*` and `/api/v1/*` accept a human web session or a machine Bearer.
+  Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
+  authenticated. Human auth is additive during 1.x: until a human password or
+  completed bootstrap exists, deprecated GET-only HTTP Basic and
+  `ai_memory_auth` cookie authentication continue to work. The transition to
+  human auth disables both legacy browser credentials immediately. (#533)
+- Preserved `ai-memory user add|expire|revive|rotate-token` and their admin
+  endpoints as deprecated 1.x compatibility paths backed by the reserved
+  `legacy-user-token` API credential. New automation should use
+  `api-key add|rotate|revoke`. (#533)
+
 ### Fixed
 - A failed or skipped embed now leaves a durable record. `page_embeddings`
   stores only successes, and its upsert rewrites `created_at`, so a global
@@ -327,18 +377,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `api_credentials`. The mirror triggers remain load-bearing for the deprecated
   1.x `user add|expire|revive|rotate-token` shims and may be removed only when
   those shims are removed in 2.0. (#533)
-
-### Changed
-- `/admin/*` and `/api/v1/*` accept a human web session or a machine Bearer.
-  Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
-  authenticated. Human auth is additive during 1.x: until a human password or
-  completed bootstrap exists, deprecated GET-only HTTP Basic and
-  `ai_memory_auth` cookie authentication continue to work. The transition to
-  human auth disables both legacy browser credentials immediately. (#533)
-- Preserved `ai-memory user add|expire|revive|rotate-token` and their admin
-  endpoints as deprecated 1.x compatibility paths backed by the reserved
-  `legacy-user-token` API credential. New automation should use
-  `api-key add|rotate|revoke`. (#533)
 
 ## [1.38.0] - 2026-08-30
 
