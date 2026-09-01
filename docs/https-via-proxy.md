@@ -447,3 +447,16 @@ If you can't take one of these paths cleanly, the honest answer is
 already trust." The configuration that gives operators the wrong
 mental model — looking secure, not being secure — is worse than
 either.
+
+## The session-aware MCP bridge and HTTPS
+
+`ai-memory mcp-bridge` reaches `https://` server URLs. Earlier releases could not:
+its transport pulled in a second `reqwest` with no TLS backend compiled, so any
+non-`http` scheme was refused before a connection was attempted. If you front
+ai-memory with a TLS-terminating proxy as described above, point the bridge at the
+proxied `https://` URL directly — a second, local proxy on each client machine is
+not needed.
+
+The bridge uses the platform certificate verifier, so it trusts the same roots the
+operating system does. A certificate the OS does not trust — a self-signed one, or a
+private CA that has not been installed into the system trust store — is rejected.

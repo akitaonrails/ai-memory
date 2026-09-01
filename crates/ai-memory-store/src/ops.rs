@@ -3016,7 +3016,7 @@ const ALL_FTS_INDEXES: &[&str] = &["observations_fts", "pages_fts", "workstream_
 /// searchable after a purge, and the cost is dominated by the `VACUUM` that
 /// follows in every case. A `rebuild` is idempotent, so the extra work is a
 /// no-op for a scope that deleted nothing from that table.
-fn reclaim_freed_pages(conn: &Connection) -> StoreResult<()> {
+pub(crate) fn reclaim_freed_pages(conn: &Connection) -> StoreResult<()> {
     let mut batch = String::new();
     for index in ALL_FTS_INDEXES {
         // Compile-time constants, never caller input; FTS5 has no
@@ -3026,6 +3026,62 @@ fn reclaim_freed_pages(conn: &Connection) -> StoreResult<()> {
     batch.push_str("VACUUM;");
     conn.execute_batch(&batch)?;
     Ok(())
+}
+
+/// What one [`compact`] run reclaimed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CompactSummary {
+    /// Database size in bytes before the rebuild + `VACUUM`.
+    pub bytes_before: u64,
+    /// Database size in bytes afterwards.
+    pub bytes_after: u64,
+}
+
+impl CompactSummary {
+    /// Bytes returned to the filesystem. Saturating: a `VACUUM` can leave the
+    /// file marginally larger when defragmentation costs more than the free
+    /// pages it released, and that is a zero, not a negative.
+    #[must_use]
+    pub fn bytes_reclaimed(&self) -> u64 {
+        self.bytes_before.saturating_sub(self.bytes_after)
+    }
+}
+
+/// Reclaim free pages on demand, deleting nothing.
+///
+/// Same operation the destructive commands offer as `--compact`, reachable
+/// without first deleting something. Until this existed, an operator whose
+/// database had accumulated free pages — a large forget-sweep, a retention
+/// pass, months of superseded page versions — had no way to return the space
+/// except by purging data they wanted to keep.
+///
+/// # Cost
+///
+/// `VACUUM` takes an exclusive lock and rewrites the whole file, so every
+/// write blocks for the duration and it needs free disk space of roughly the
+/// database's own size. Read [`crate::reader::StorageStatus::reclaimable_bytes`]
+/// first and run this when it is worth the stall — not on a blind schedule.
+///
+/// # Errors
+/// Propagates the SQL error from the rebuild or the `VACUUM`.
+pub fn compact(conn: &mut Connection) -> StoreResult<CompactSummary> {
+    let bytes_before = database_bytes(conn)?;
+    reclaim_freed_pages(conn)?;
+    let bytes_after = database_bytes(conn)?;
+    Ok(CompactSummary {
+        bytes_before,
+        bytes_after,
+    })
+}
+
+/// `page_count * page_size` — the database's own view of its size, which is
+/// what `VACUUM` acts on. Deliberately not the filesystem size: a `-wal`
+/// sidecar holds committed pages not yet checkpointed into the main file, so
+/// `metadata().len()` would move for reasons compaction has nothing to do with.
+pub(crate) fn database_bytes(conn: &Connection) -> StoreResult<u64> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    Ok((page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64))
 }
 
 /// What [`purge_session`] removed. All counts are rows actually deleted.
@@ -4679,6 +4735,100 @@ pub(crate) mod tests {
             !bytes.windows(12).any(|w| w == b"obs-canaryws"),
             "Reclaim must remove the deleted workspace's text from the file"
         );
+    }
+
+    /// The premise of #549: after a large delete the space is *not* returned
+    /// to the filesystem — SQLite keeps the pages on its freelist for reuse.
+    /// `compact` is what gives them back, without deleting anything itself.
+    ///
+    /// Deliberately paired assertions rather than one: the first pins that
+    /// there is a backlog to reclaim (otherwise the second could pass on an
+    /// empty database and prove nothing), the second that compaction reclaims
+    /// it.
+    #[test]
+    fn compact_returns_free_pages_that_a_delete_left_behind() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        // Enough rows that the freelist is unambiguous rather than noise.
+        for i in 0..400 {
+            upsert_page(
+                &mut conn,
+                &page(ws, proj, &format!("notes/{i}.md"), &"padding ".repeat(256)),
+            )
+            .unwrap();
+        }
+        conn.execute("DELETE FROM pages", []).unwrap();
+
+        let before = database_bytes(&conn).unwrap();
+        let freelist: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            freelist > 0,
+            "the delete must leave a freelist, or this test proves nothing"
+        );
+
+        let summary = compact(&mut conn).unwrap();
+
+        assert_eq!(summary.bytes_before, before);
+        assert!(
+            summary.bytes_after < summary.bytes_before,
+            "compaction must shrink the file: {} -> {}",
+            summary.bytes_before,
+            summary.bytes_after
+        );
+        assert_eq!(
+            summary.bytes_reclaimed(),
+            summary.bytes_before - summary.bytes_after
+        );
+        let after_freelist: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after_freelist, 0,
+            "the freelist is gone, not merely smaller"
+        );
+    }
+
+    /// Compaction deletes nothing. Worth a test of its own: the operation is
+    /// reachable from an admin route and shares its implementation with the
+    /// destructive commands' `--compact`, so "it only reclaims" is a property
+    /// someone could break without noticing.
+    #[test]
+    fn compact_preserves_every_row_and_keeps_the_index_searchable() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        seed_session(&mut conn, ws, proj, "survivor");
+        let pages_before = count(&conn, "SELECT COUNT(*) FROM pages");
+        let obs_before = count(&conn, "SELECT COUNT(*) FROM observations");
+
+        compact(&mut conn).unwrap();
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), pages_before);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM observations"),
+            obs_before
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM observations_fts \
+                 WHERE observations_fts MATCH '\"obs-survivor\"'"
+            ),
+            1,
+            "the rebuilt index still finds the surviving session"
+        );
+    }
+
+    /// A `VACUUM` can leave the file marginally larger when defragmentation
+    /// costs more than the pages it released. That is zero reclaimed, not a
+    /// wrapped-around u64.
+    #[test]
+    fn bytes_reclaimed_saturates_instead_of_underflowing() {
+        let grew = CompactSummary {
+            bytes_before: 1_000,
+            bytes_after: 1_200,
+        };
+        assert_eq!(grew.bytes_reclaimed(), 0);
     }
 
     /// #387, the reporter's reproduction: after purging one session by UUID,
