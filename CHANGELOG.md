@@ -326,6 +326,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a session with nothing else to name drops the clause instead of filling
   it. The predicate lives beside the writer and is derived from the same serde
   representation, so a new `ToolFamily` variant cannot escape it. (#527)
+
 ## [1.36.0] - 2026-08-29
 
 ### Added
