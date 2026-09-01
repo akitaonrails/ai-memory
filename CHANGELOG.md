@@ -237,6 +237,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failing in isolation on `main`; it had passed in CI because the provider is
   process-global and another test happened to install it first.
 
+- `install-hooks` now probes for and stages the hook bundle under the data dir
+  actually in use, instead of the platform default (#554). With
+  `AI_MEMORY_DATA_DIR` (or `--data-dir`) set, the process logged one data dir
+  while `--apply` reported staging into another, quietly populating a directory
+  the operator was not using — and the probe could never find a bundle a
+  previous run, or docker `setup-agent`, had staged into the configured one.
+
+  Byte-identical for a default install: `default_data_dir()` *is*
+  `data_local_dir()/ai-memory`, so `<data_dir>/hooks/<agent>` resolves to the
+  same path the old `<data_local>/ai-memory/hooks/<agent>` produced. A test
+  pins that so the compatibility claim cannot rot.
+
+  Reported by @alvadorn alongside #546 and split out at their suggestion.
+
 ### Docs
 
 - `docs/windows.md` gains **Scenario E**, a persistent-server story for native
