@@ -125,6 +125,39 @@ directory and will tolerate the extra frontmatter, but new writes from
 1.x will not carry the OKF keys — avoid mixing; restore the archive if
 you need to stay on 1.x.)
 
+## Windows: backup fails with `os error 33` (fixed in 2.0.2+)
+
+On **ai-memory 2.0.0 and 2.0.1**, upgrading a Windows store that already
+has data aborts the pre-migration backup with:
+
+```text
+ERROR ai_memory_wiki::migrations::runner: wiki migration failed — server cannot start until this is resolved
+  error=... (os error 33)
+```
+
+`os error 33` is `ERROR_LOCK_VIOLATION`; the localised text varies by
+Windows display language (`O processo não pode acessar o arquivo…` on a
+Portuguese install). The backup walk tried to archive the `.serve.lock`
+file while the same process held a mandatory exclusive lock on it (#593).
+Fresh installs are unaffected.
+
+**Fix:** upgrade to **2.0.2 or later** and restart. The failed migration
+was never recorded, so it simply retries and completes — no manual
+recovery needed.
+
+**Stuck on 2.0.0 / 2.0.1 and cannot upgrade yet?** Hold a byte-range
+lock on `.serve.lock` above the first 64 KB from another process, then
+start `serve --force` (which then runs without taking the whole-file
+lock itself, so the backup can read the 0-byte lock file):
+
+```powershell
+$fs = [IO.File]::Open("$DataDir\.serve.lock", 'OpenOrCreate', 'ReadWrite', 'ReadWrite')
+$fs.Lock(1048576, 1); Start-Sleep 240; $fs.Unlock(1048576, 1); $fs.Dispose()
+```
+
+Restart normally (without `--force`) once the migration completes to
+restore the single-instance guard.
+
 ## Sharing bundles
 
 Post-migration, each project directory *is* an OKF v0.2 bundle. Hand a

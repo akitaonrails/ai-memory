@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The OKF v0.2 pre-migration backup no longer aborts on Windows when
+  upgrading a store with existing data from 1.x to 2.0.x (#593). The
+  backup walks the whole data dir and archived every file, including the
+  `.serve.lock` single-instance lock (#563) — which the same `serve`
+  process holds under a *mandatory* exclusive lock on Windows, so the
+  first read faulted with `ERROR_LOCK_VIOLATION` (os error 33), the
+  backup gate failed, and the server refused to start on either version.
+  The walk now skips `.serve.lock` and its `.holder` sidecar (neither
+  carries durable state); the lock file name is shared from
+  `ai-memory-core`. Unix was immune (advisory locks). Once on the fixed
+  binary a half-migrated store recovers by restarting — the failed wiki
+  migration was never recorded and simply retries.
 - `as_of` time-travel queries and the entity retrieval stream now work
   on real stores. Both read the entity index, which was populated only
   from an LLM consolidator's `entities:` frontmatter — absent on the

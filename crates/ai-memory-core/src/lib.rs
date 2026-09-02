@@ -40,6 +40,14 @@ pub const DEFAULT_PROJECT_NAME: &str = "scratch";
 /// event capture to it.
 pub const GLOBAL_SCOPE_PROJECT: &str = "_global";
 
+/// Name of the single-instance lock file `ai-memory serve` holds for its
+/// process lifetime (#563), directly under the data dir. It carries no
+/// durable state. On Windows the process holds a *mandatory* exclusive lock
+/// on it, so any code that walks the data dir (pre-migration backups,
+/// restores) must skip this name and its `.holder` sidecar — otherwise the
+/// read faults with `ERROR_LOCK_VIOLATION` and aborts the walk (#593).
+pub const SERVE_LOCK_FILE: &str = ".serve.lock";
+
 pub use active_project::{
     ActiveProject, ActiveProjectLookup, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES,
     DEFAULT_PER_KEY_TTL, MidSessionRouting,

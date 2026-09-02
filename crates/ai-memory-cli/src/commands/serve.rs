@@ -11,7 +11,7 @@ use ai_memory_consolidate::{
     ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
     run_lint, run_sweep_with_options,
 };
-use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
+use ai_memory_core::{ActiveProject, ProjectId, SERVE_LOCK_FILE, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, WorkstreamState, hook_router,
     workstream_router,
@@ -67,9 +67,6 @@ const SESSION_CONSOLIDATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// requests are expected to finish well inside this lease.
 const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
 
-/// Lock file guarding a data dir against a second `ai-memory serve` (#563).
-const SERVE_LOCK_FILE: &str = ".serve.lock";
-
 /// The single-instance guard for `ai-memory serve`: an exclusive `flock` on
 /// `<data-dir>/.serve.lock` held for the process lifetime. The OS releases it
 /// when the process exits, so a crashed server never locks the operator out of
@@ -83,7 +80,7 @@ struct ServeLock {
 /// lock file because Windows' exclusive lock blocks reads of the locked
 /// file from other handles; informational only, rewritten by each holder.
 fn holder_info_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join(".serve.lock.holder")
+    data_dir.join(format!("{SERVE_LOCK_FILE}.holder"))
 }
 
 /// Take the single-instance serve lock for `data_dir`.

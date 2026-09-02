@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
+use ai_memory_core::SERVE_LOCK_FILE;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{WikiError, WikiResult};
@@ -166,11 +167,19 @@ fn create_pre_migration_backup_inner(
                     }
                     stack.push(path);
                 } else if ft.is_file() {
-                    if path == archive_path
-                        || path
-                            .file_name()
-                            .is_some_and(|n| n == "pre-migration-backup.json.tmp")
-                    {
+                    // Skip, before any `File::open`: the half-written archive,
+                    // the receipt's temp file, and the serve single-instance
+                    // lock. The lock (`.serve.lock` and its `.holder` sidecar)
+                    // is held under a *mandatory* exclusive lock on Windows,
+                    // so merely opening it to read faults with
+                    // `ERROR_LOCK_VIOLATION` and aborts the whole backup —
+                    // which broke every 1.x -> 2.0 upgrade on Windows (#593).
+                    // It carries no durable state, so dropping it from the
+                    // archive loses nothing.
+                    let skip_by_name = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        n == "pre-migration-backup.json.tmp" || n.starts_with(SERVE_LOCK_FILE)
+                    });
+                    if path == archive_path || skip_by_name {
                         continue;
                     }
                     tar.append_path_with_name(&path, rel)?;
@@ -230,6 +239,23 @@ mod tests {
         std::fs::write(tmp.path().join("wiki/ws/proj/notes/a.md"), "---\n---\nbody").unwrap();
         std::fs::write(tmp.path().join("db.sqlite"), b"not really a db").unwrap();
         tmp
+    }
+
+    /// Relative names of every entry in a backup archive, `/`-separated.
+    fn archived_names(archive: &Path) -> Vec<String> {
+        let file = BufReader::new(File::open(archive).unwrap());
+        let dec = flate2::read::GzDecoder::new(file);
+        let mut ar = tar::Archive::new(dec);
+        ar.entries()
+            .unwrap()
+            .map(|e| {
+                e.unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
     }
 
     #[test]
@@ -316,6 +342,59 @@ mod tests {
             second.entries, 3,
             "data files + first receipt, never the archive"
         );
+    }
+
+    /// #593: `ai-memory serve` holds `.serve.lock` (and rewrites a
+    /// `.serve.lock.holder` sidecar) directly under the data dir, and the
+    /// migration that takes this backup runs in that same process. The walk
+    /// must skip both — on Windows the lock is mandatory and merely opening
+    /// the file to archive it faults the whole backup with
+    /// `ERROR_LOCK_VIOLATION`. Neither file carries durable state, so they
+    /// are simply absent from the archive.
+    #[test]
+    fn the_backup_walk_skips_the_serve_lock_and_its_sidecar() {
+        let data = data_dir_with_content();
+        std::fs::write(data.path().join(".serve.lock"), b"").unwrap();
+        std::fs::write(data.path().join(".serve.lock.holder"), b"pid=1234\n").unwrap();
+        let dest = TempDir::new().unwrap();
+        let receipt = create_pre_migration_backup(data.path(), "test", Some(dest.path())).unwrap();
+
+        // Still only the two real data files — the lock pair was dropped.
+        assert_eq!(receipt.entries, 2);
+        let names = archived_names(&receipt.archive_path);
+        assert!(
+            !names.iter().any(|n| n.contains(".serve.lock")),
+            "the serve lock must never land in the archive: {names:?}"
+        );
+        assert!(names.iter().any(|n| n.ends_with("wiki/ws/proj/notes/a.md")));
+    }
+
+    /// #593 on the platform that actually breaks: hold an exclusive lock on
+    /// `.serve.lock` exactly as `acquire_serve_lock` does, then run the
+    /// backup. Before the fix the walk's `File::open` on the locked file
+    /// faulted with `ERROR_LOCK_VIOLATION` (os error 33) and aborted the
+    /// migration; now the walk skips it and the backup completes.
+    #[cfg(windows)]
+    #[test]
+    fn a_held_serve_lock_does_not_fault_the_backup_on_windows() {
+        let data = data_dir_with_content();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(data.path().join(".serve.lock"))
+            .unwrap();
+        // Exactly what `acquire_serve_lock` holds for the process lifetime.
+        lock.lock().unwrap();
+
+        let dest = TempDir::new().unwrap();
+        let receipt = create_pre_migration_backup(data.path(), "test", Some(dest.path()))
+            .expect("backup must survive a held serve lock (#593)");
+        assert_eq!(receipt.entries, 2);
+        assert!(receipt.archive_present());
+
+        lock.unlock().unwrap();
     }
 
     #[test]
