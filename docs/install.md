@@ -1782,10 +1782,11 @@ startup rather than duplicated onto the request. An entry for `user-agent`
 overrides the default. Values are never logged.
 
 The `opencode` provider needs no configuration for this: OpenCode asks
-callers for `x-opencode-session`, so that provider generates one per process
-unless `AI_MEMORY_LLM_HEADERS` supplies it. Set it explicitly when several
-ai-memory instances should be distinguishable, or should stay stable across
-restarts.
+callers for `x-opencode-session`, and that provider already sends one id per
+logical operation — stable across retries and the structured-output
+fallback, so one consolidation pass reads as one operation in OpenCode's
+metrics. Supply the header through `AI_MEMORY_LLM_HEADERS` to override that,
+for instance to tell several ai-memory instances apart under one account.
 
 #### Match the consolidation budget to a local model's context window
 

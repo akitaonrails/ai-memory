@@ -113,7 +113,9 @@ pub use openai_oauth::{
 };
 #[allow(deprecated)]
 pub use opencode::OPENCODE_ZEN_BASE_URL;
-pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL, OpenCodeProvider};
+pub use opencode::{
+    OPENCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL, OPENCODE_SESSION_HEADER, OpenCodeProvider,
+};
 pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
