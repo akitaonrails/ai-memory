@@ -1913,8 +1913,8 @@ fn merge_codex_hooks(
     config_path: &Path,
 ) -> Result<ApplyOutcome> {
     // Build the Codex-flavoured payload. The JSON shape is identical
-    // to Claude Code's matcher + nested hooks form — only the event
-    // list differs (no `SessionEnd`, which Codex doesn't recognise).
+    // to Claude Code's matcher + nested hooks form — the event list
+    // differs only by the Claude-Code-only subagent events.
     let payload = build_profile_payload_for_agent(
         &super::render_shared::CODEX_PROFILE,
         staged,
@@ -1940,12 +1940,6 @@ fn merge_codex_payload(payload: serde_json::Value, config_path: &Path) -> Result
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
                 .as_object_mut()
                 .context("`hooks` is present in hooks.json but not an object")?;
-            // Remove any stale `SessionEnd` entry left behind by an
-            // earlier version of install-hooks that mistakenly wrote
-            // the Claude-Code-only event into Codex's file. Codex
-            // ignores unknown events but the file looks cleaner
-            // without dead keys.
-            hooks.remove("SessionEnd");
             for (event, value) in &our_hooks {
                 overlay_event_hooks(hooks, event, value);
             }
@@ -6061,8 +6055,9 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             &[CODEX_PROFILE.events],
         );
         assert!(codex.contains("stop"));
+        assert!(codex.contains("session-end"));
         assert!(
-            !codex.contains("session-end") && !codex.contains("subagent-start"),
+            !codex.contains("subagent-start") && !codex.contains("subagent-stop"),
             "Codex manual output must omit scripts outside Codex's hook vocabulary: {codex}"
         );
     }
@@ -8305,6 +8300,7 @@ model = "gpt-5"
                 "post-tool-use.sh",
                 "pre-compact.sh",
                 "stop.sh",
+                "session-end.sh",
             ],
         );
 
@@ -8333,13 +8329,13 @@ model = "gpt-5"
             "SessionStart hook should be present"
         );
         assert!(
-            parsed["hooks"].get("SessionEnd").is_none(),
-            "Codex has no reliable true SessionEnd hook; install must omit it"
+            parsed["hooks"]["SessionEnd"].is_array(),
+            "SessionEnd is wired for Codex since Codex CLI 0.145.0"
         );
     }
 
     #[test]
-    fn codex_removes_stale_session_end_key() {
+    fn codex_session_end_preserves_third_party_and_adds_ours() {
         let hooks_tmp = TempDir::new().unwrap();
         stub_scripts(
             hooks_tmp.path(),
@@ -8350,16 +8346,16 @@ model = "gpt-5"
                 "post-tool-use.sh",
                 "pre-compact.sh",
                 "stop.sh",
+                "session-end.sh",
             ],
         );
 
         let config_tmp = TempDir::new().unwrap();
         let config_path = config_tmp.path().join("hooks.json");
-        // Simulate a file with a stale SessionEnd entry from a previous
-        // install that mistakenly included the Claude-Code-only event.
+        // A third-party SessionEnd hook the user wired up themselves.
         fs::write(
             &config_path,
-            r#"{"hooks":{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"stale.sh"}]}]}}"#,
+            r#"{"hooks":{"SessionEnd":[{"matcher":"","hooks":[{"type":"command","command":"user-own.sh"}]}]}}"#,
         )
         .unwrap();
 
@@ -8375,13 +8371,19 @@ model = "gpt-5"
 
         let parsed: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        // SessionEnd must be gone.
+        let session_end = parsed["hooks"]["SessionEnd"].as_array().unwrap();
+        let rendered = serde_json::to_string(&parsed["hooks"]["SessionEnd"]).unwrap();
+        // Third-party entry survives.
         assert!(
-            parsed["hooks"].get("SessionEnd").is_none(),
-            "stale SessionEnd must be removed; got: {:?}",
-            parsed["hooks"]
+            rendered.contains("user-own.sh"),
+            "third-party SessionEnd entry must survive: {rendered}"
         );
-        // Our hooks are present.
+        // Our managed entry was added alongside it.
+        assert!(
+            rendered.contains("session-end"),
+            "ai-memory SessionEnd entry must be added: {rendered}"
+        );
+        assert_eq!(session_end.len(), 2);
         assert!(parsed["hooks"]["SessionStart"].is_array());
     }
 
