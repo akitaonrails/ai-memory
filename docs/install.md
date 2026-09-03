@@ -1499,7 +1499,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. Optional `AI_MEMORY_LLM_REASONING_EFFORT` (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`/`persistent`) is mapped to each provider's native reasoning field; omit it to keep the model default. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
-| `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode Zen/Go](https://opencode.ai) cloud API at the OpenAI-compatible `opencode.ai/zen/go/v1` endpoint. Requests identify ai-memory by version and reuse one session header across related attempts. Set `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen`. |
+| `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1` — a cost-optimised model subset. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` — historical, and it selects Go like the others; the endpoint is chosen by the base URL, not the alias. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY` or `OPENAI_API_KEY`, with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://api.orcarouter.ai/v1` | `openai/text-embedding-3-small` via [OrcaRouter](https://www.orcarouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY`, with the OpenAI-compatible embedding client. |
@@ -1761,6 +1761,32 @@ ceiling to match the gateway's worst-case generation time:
 ```bash
 -e AI_MEMORY_LLM_TIMEOUT_SECS=900
 ```
+
+#### Send a caller-identifying header to a gateway that requires one
+
+Every chat request already carries `User-Agent: ai-memory/<version>`, so a
+gateway can tell what is calling it. Some also require a header of their own
+for request correlation, and reject or throttle traffic without it. Declare
+those once — they are sent on every chat request, whatever the provider:
+
+```bash
+-e AI_MEMORY_LLM_HEADERS=x-opencode-session=prod-01,x-opencode-client=ai-memory
+```
+
+Entries are `Name=Value` or `Name: Value`, comma separated. A header *value*
+cannot contain a comma through the env var; use `llm_headers = [...]` in
+`config.toml` when one must. Headers ai-memory sets itself (`authorization`,
+`content-type`, `x-api-key`, `x-goog-api-key`, `anthropic-version`,
+`anthropic-beta`, `openai-beta`, `host`, `content-length`) are refused at
+startup rather than duplicated onto the request. An entry for `user-agent`
+overrides the default. Values are never logged.
+
+The `opencode` provider needs no configuration for this: OpenCode asks
+callers for `x-opencode-session`, and that provider already sends one id per
+logical operation — stable across retries and the structured-output
+fallback, so one consolidation pass reads as one operation in OpenCode's
+metrics. Supply the header through `AI_MEMORY_LLM_HEADERS` to override that,
+for instance to tell several ai-memory instances apart under one account.
 
 #### Match the consolidation budget to a local model's context window
 

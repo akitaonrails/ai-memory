@@ -99,6 +99,18 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Repoint the wrapped [`OpenAiProvider`] at another base URL.
+    ///
+    /// For a wrapper that constructs with a product default and lets the
+    /// operator override it — [`crate::OpenCodeProvider`] defaults to Go and
+    /// accepts Zen this way. `new` already takes a base URL, so a direct
+    /// caller has no need for this.
+    #[must_use]
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.inner = self.inner.with_base_url(url);
+        self
+    }
+
     /// Override the per-request timeout on the wrapped
     /// [`OpenAiProvider`]. The factory calls this with
     /// `ProviderConfig::request_timeout_secs`.
@@ -116,6 +128,18 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Forward operator-configured headers to the inner client. Aggregators
+    /// and gateways behind an OpenAI-compatible endpoint are the common case
+    /// for caller-identifying headers.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: crate::ExtraHeaders) -> Self {
+        self.inner = self.inner.with_extra_headers(headers);
+        self
+    }
+
+    /// Forward the caller-identifying defaults to the inner client. Only
+    /// [`crate::OpenCodeProvider`] opts in today; the values sit under any
+    /// operator-configured header of the same name.
     pub(crate) fn with_client_headers(
         mut self,
         user_agent: &'static str,
@@ -123,6 +147,13 @@ impl OpenAiCompatProvider {
     ) -> Self {
         self.inner = self.inner.with_client_headers(user_agent, operation_id);
         self
+    }
+    /// Endpoint the inner client will call. Test-visible so
+    /// [`crate::OpenCodeProvider`]'s tests can assert Go stays the default
+    /// and a Zen override takes effect.
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        self.inner.base_url()
     }
 }
 

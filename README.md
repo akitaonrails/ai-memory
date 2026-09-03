@@ -286,7 +286,7 @@ The full model is in [`docs/security.md`](docs/security.md),
 
 Optional. Everything works with zero LLM calls; adding a provider
 upgrades session summaries and enables semantic search. Anthropic,
-OpenAI (incl. OAuth/Codex), GitHub Copilot, Gemini, OpenCode Zen, and
+OpenAI (incl. OAuth/Codex), GitHub Copilot, Gemini, OpenCode (Go and Zen), and
 any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM) are supported
 for consolidation; OpenAI, Voyage, Gemini, and keyless OpenAI-compatible
 endpoints for embeddings. Configuration lives in

@@ -11,7 +11,11 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, LlmOperationId, ReasoningEffort, Usage};
+use reqwest::header::{HeaderName, HeaderValue};
+
+use crate::types::{
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
+};
 
 /// Default OpenAI API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -91,9 +95,16 @@ pub struct OpenAiProvider {
     dialect: RequestDialect,
     timeout: Duration,
     reasoning_effort: Option<ReasoningEffort>,
+    /// Operator-configured headers from `AI_MEMORY_LLM_HEADERS`. Applied
+    /// last, so an explicit entry wins over any default below.
+    extra_headers: ExtraHeaders,
+    /// Caller-identifying defaults a provider opts into. Layered *under*
+    /// `extra_headers`.
     client_headers: Option<ClientHeaders>,
 }
 
+/// Defaults for a provider whose gateway wants the caller identified: an
+/// agent string, and the header name to report the logical operation under.
 #[derive(Debug, Clone, Copy)]
 struct ClientHeaders {
     user_agent: &'static str,
@@ -117,6 +128,7 @@ impl OpenAiProvider {
             dialect: RequestDialect::Official,
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
             client_headers: None,
         })
     }
@@ -162,6 +174,18 @@ impl OpenAiProvider {
         self
     }
 
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Opt this provider into caller-identifying defaults: `user_agent` as
+    /// the agent string, and `operation_id` as the header *name* to report
+    /// each logical operation under. Both are defaults — an
+    /// `AI_MEMORY_LLM_HEADERS` entry for either name takes precedence.
     pub(crate) fn with_client_headers(
         mut self,
         user_agent: &'static str,
@@ -172,6 +196,13 @@ impl OpenAiProvider {
             operation_id,
         });
         self
+    }
+
+    /// Endpoint the client will call. Test-visible so wrappers that default
+    /// the base URL and let it be overridden can assert which one is set.
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 }
 
@@ -420,18 +451,39 @@ impl OpenAiProvider {
     ) -> LlmResult<OpenAiResponse> {
         let url = normalize_openai_base(&self.base_url, "chat/completions");
         debug!(url, "POST openai");
-        let mut request = self
+        let builder = self
             .client
             .post(&url)
             .timeout(self.timeout)
             .bearer_auth(self.api_key.expose_secret())
-            .header("content-type", "application/json")
-            .json(body);
-        if let Some(headers) = self.client_headers {
-            request = request.header(reqwest::header::USER_AGENT, headers.user_agent);
-            request = request.header(headers.operation_id, operation_id.to_string());
-        }
-        let resp = request.send().await?;
+            .header("content-type", "application/json");
+        // Both header layers go on in one `apply`, which replaces per name.
+        // Adding them separately with `RequestBuilder::header` would *append*
+        // — two `user-agent` values whenever the operator configures one, and
+        // a duplicate is worse than either value alone. `set_default` leaves
+        // an operator entry untouched, so the layering is explicit here
+        // rather than dependent on call order.
+        let request = match self.client_headers {
+            None => self.extra_headers.apply(builder),
+            Some(client) => {
+                let mut headers = self.extra_headers.clone();
+                headers.set_default(
+                    reqwest::header::USER_AGENT,
+                    HeaderValue::from_static(client.user_agent),
+                );
+                // Both are our own constants, so an invalid name is a bug to
+                // surface in the first test run, not a runtime branch.
+                let name = HeaderName::from_static(client.operation_id);
+                // A UUID is always a valid header value; on the impossible
+                // failure, omitting a correlation header beats failing the
+                // consolidation pass that carries it.
+                if let Ok(value) = HeaderValue::from_str(&operation_id.to_string()) {
+                    headers.set_default(name, value);
+                }
+                headers.apply(builder)
+            }
+        };
+        let resp = request.json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;

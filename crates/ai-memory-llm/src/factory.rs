@@ -37,7 +37,8 @@ pub enum ProviderChoice {
     Copilot,
     /// Anthropic Messages API via a Claude-subscription OAuth token.
     AnthropicOAuth,
-    /// OpenCode Zen/Go cloud API (OpenAI-compatible endpoint).
+    /// OpenCode cloud API (OpenAI-compatible endpoint). Defaults to the Go
+    /// endpoint; `base_url` selects Zen's general catalogue instead.
     OpenCode,
 }
 
@@ -109,6 +110,12 @@ pub struct ProviderConfig {
     /// `output_config.effort`, Codex `reasoning.effort`). `None` omits
     /// the field so the model default applies. Gemini and Copilot ignore it.
     pub reasoning_effort: Option<crate::ReasoningEffort>,
+    /// Operator-supplied HTTP headers sent on every chat request. Gateways
+    /// that require a caller-identifying header (OpenCode asks for
+    /// `x-opencode-session` and a specific `User-Agent`) are configured
+    /// through this rather than per-provider special cases. Parsed once from
+    /// `AI_MEMORY_LLM_HEADERS` by `Config::load`; empty by default.
+    pub extra_headers: crate::ExtraHeaders,
 }
 
 /// Embedding providers available to ai-memory.
@@ -256,6 +263,27 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
     }
 }
 
+/// Layer [`crate::DEFAULT_USER_AGENT`] under the operator's headers so every
+/// provider request identifies ai-memory, while an explicit
+/// `AI_MEMORY_LLM_HEADERS` entry still wins.
+///
+/// Copilot is excluded: its client and per-request headers both carry
+/// [`crate::COPILOT_USER_AGENT`], the editor-plugin agent GitHub's Copilot
+/// API expects, and `ExtraHeaders` replaces rather than appends — so a
+/// default here would silently break that provider.
+fn with_default_user_agent(
+    provider: ProviderChoice,
+    mut headers: crate::ExtraHeaders,
+) -> crate::ExtraHeaders {
+    if provider != ProviderChoice::Copilot {
+        headers.set_default(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static(crate::DEFAULT_USER_AGENT),
+        );
+    }
+    headers
+}
+
 /// Construct an `Arc<dyn LlmProvider>` matching the config.
 ///
 /// # Errors
@@ -263,13 +291,15 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
 /// key, base URL) is missing.
 pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>> {
     let timeout = config.request_timeout_secs;
+    let extra_headers = with_default_user_agent(config.provider, config.extra_headers);
     match config.provider {
         ProviderChoice::Anthropic => {
             let key = config.auth.require_api_key()?;
             Ok(Arc::new(
                 AnthropicProvider::new(key, config.model)?
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::OpenAi => {
@@ -277,7 +307,8 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(
                 OpenAiProvider::new(key, config.model)?
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::Gemini => {
@@ -286,7 +317,11 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
             }
-            Ok(Arc::new(provider.with_timeout_secs(timeout)))
+            Ok(Arc::new(
+                provider
+                    .with_timeout_secs(timeout)
+                    .with_extra_headers(extra_headers),
+            ))
         }
         ProviderChoice::OpenAiCompat => {
             let base = config
@@ -296,7 +331,8 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
                     .with_strict(config.compat_strict)
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::OpenAiOAuth => {
@@ -304,13 +340,16 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(
                 OpenAiOAuthProvider::new(path, config.model)?
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::Copilot => {
             let auth = config.auth.require_copilot_auth()?;
             Ok(Arc::new(
-                CopilotProvider::new(auth, config.model)?.with_timeout_secs(timeout),
+                CopilotProvider::new(auth, config.model)?
+                    .with_timeout_secs(timeout)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::AnthropicOAuth => {
@@ -322,15 +361,25 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(
                 provider
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::OpenCode => {
             let key = config.auth.require_api_key()?;
+            // Defaults to Go; an operator reaches Zen's general catalogue
+            // through AI_MEMORY_LLM_BASE_URL. Silently dropping the override
+            // (as this arm used to) left `provider=opencode` unable to speak
+            // to anything but Go.
+            let mut provider = OpenCodeProvider::new(key, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
             Ok(Arc::new(
-                OpenCodeProvider::new(key, config.model)?
+                provider
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
     }
@@ -380,6 +429,41 @@ mod tests {
         );
     }
 
+    /// `reqwest` sends no `User-Agent` unless configured, which left every
+    /// ai-memory provider request anonymous.
+    #[test]
+    fn default_user_agent_is_layered_under_operator_headers() {
+        let headers =
+            with_default_user_agent(ProviderChoice::OpenCode, crate::ExtraHeaders::default());
+        assert_eq!(headers.get("user-agent"), Some(crate::DEFAULT_USER_AGENT));
+    }
+
+    #[test]
+    fn an_operator_user_agent_wins_over_the_default() {
+        let operator = crate::ExtraHeaders::parse(["user-agent: ai-memory-fork/9"]).unwrap();
+        let headers = with_default_user_agent(ProviderChoice::OpenAi, operator);
+        assert_eq!(headers.get("user-agent"), Some("ai-memory-fork/9"));
+    }
+
+    /// GitHub's Copilot API expects the editor-plugin agent; `ExtraHeaders`
+    /// replaces rather than appends, so a default here would break it.
+    #[test]
+    fn copilot_is_left_with_its_editor_plugin_user_agent() {
+        let headers =
+            with_default_user_agent(ProviderChoice::Copilot, crate::ExtraHeaders::default());
+        assert_eq!(headers.get("user-agent"), None);
+    }
+
+    /// "Properly identifies itself (no broad user agents)" means naming
+    /// ai-memory and a version — never impersonating another client.
+    #[test]
+    fn default_user_agent_names_ai_memory_with_a_version() {
+        let ua = crate::DEFAULT_USER_AGENT;
+        assert!(ua.starts_with("ai-memory/"), "{ua}");
+        assert!(ua.len() > "ai-memory/".len(), "{ua} carries no version");
+        assert!(!ua.contains("opencode"), "{ua} impersonates another client");
+    }
+
     #[test]
     fn missing_required_provider_auth_preserves_error_shape() {
         let cfg = ProviderConfig {
@@ -390,6 +474,7 @@ mod tests {
             compat_strict: false,
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
+            extra_headers: crate::ExtraHeaders::default(),
         };
 
         let err = match build_provider(cfg) {

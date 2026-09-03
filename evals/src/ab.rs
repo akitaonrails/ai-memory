@@ -361,6 +361,10 @@ impl From<ResolvedConfig> for ProviderConfig {
             // effort stays at each model's own default unless a future
             // flag threads it through.
             reasoning_effort: None,
+            // No operator header list here: `build_provider` still layers
+            // the default user agent, which is what a gateway needs to
+            // attribute harness traffic.
+            extra_headers: ai_memory_llm::ExtraHeaders::default(),
         }
     }
 }

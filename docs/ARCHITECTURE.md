@@ -596,7 +596,9 @@ AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth |
                            gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
-AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
+AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
+                           opencode (defaults to the Go endpoint, set
+                           https://opencode.ai/zen/v1 for Zen's catalogue)
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
@@ -607,11 +609,30 @@ AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
                            Codex `reasoning.effort`. Gemini and Copilot
                            ignore the key. Host-unsupported values are
                            clamped to each provider's published enum.
+AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
+                           comma-separated `Name=Value` (or `Name: Value`) entries;
+                           e.g. `x-opencode-session=prod-01,x-opencode-client=ai-memory`.
+                           For gateways that require a caller-identifying header.
+                           Headers ai-memory sets itself (authorization,
+                           content-type, x-api-key, x-goog-api-key,
+                           anthropic-version, anthropic-beta, openai-beta,
+                           host, content-length) are refused at startup.
+                           Values are never logged. A header value cannot
+                           contain a comma through the env var — use
+                           `llm_headers = [...]` in config.toml for that.
 AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override
 ```
+
+Every chat request carries `User-Agent: ai-memory/<version>`
+(`ai_memory_llm::DEFAULT_USER_AGENT`, layered in `build_provider`). `reqwest`
+sends no user agent unless configured, so provider requests used to arrive
+anonymous — which gateways that require callers to identify themselves report
+as an unknown client. `AI_MEMORY_LLM_HEADERS=user-agent=...` overrides it. The
+Copilot provider keeps `GitHubCopilotChat/<version>` instead, the
+editor-plugin agent GitHub's Copilot API expects.
 
 `openai-oauth` uses `auth login openai-oauth` and stores the ChatGPT/Codex
 refresh token in `<data_dir>/auth.json`; it is separate from MCP/server bearer

@@ -17,6 +17,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inert; `ai-memory finalize-session --agent codex` remains the fallback.
   `merge_codex_payload` no longer strips a `SessionEnd` key on every apply
   — a third-party `SessionEnd` hook is preserved alongside ours. ([#604])
+- `AI_MEMORY_LLM_HEADERS` (`llm_headers` in `config.toml`) attaches extra
+  HTTP headers to every LLM chat request, for gateways that require a
+  caller-identifying header. Entries are `Name=Value` or `Name: Value`,
+  comma separated in the env var. Parsed and validated once at the
+  configuration boundary, so a malformed entry fails at startup rather than
+  on the first consolidation pass, and providers consume typed header
+  material instead of operator strings. Headers ai-memory sets itself
+  (`authorization`, `content-type`, `x-api-key`, `x-goog-api-key`,
+  `anthropic-version`, `anthropic-beta`, `openai-beta`, `host`,
+  `content-length`) are refused: `reqwest` appends rather than replaces, so a
+  duplicate would break the request instead of overriding it. Values are
+  marked sensitive on the wire and never logged — the `Debug` output carries
+  header names only. ([#606])
+
+### Changed
+- Every LLM chat request now sends `User-Agent: ai-memory/<version>`.
+  `reqwest` sends no user agent unless one is configured, so provider
+  requests previously arrived anonymous, and gateways that require callers to
+  identify themselves reported ai-memory as an unknown client. An
+  `AI_MEMORY_LLM_HEADERS` entry for `user-agent` overrides it. The Copilot
+  provider is unchanged: it keeps `GitHubCopilotChat/<version>`, the
+  editor-plugin agent GitHub's Copilot API expects. ([#606])
+- `x-opencode-session` and the `opencode` user agent, both shipped in 2.0.2,
+  are now operator-overridable like any other header: an
+  `AI_MEMORY_LLM_HEADERS` entry for either name takes precedence over the
+  provider's default. The default remains 2.0.2's — one `LlmOperationId` per
+  logical operation, stable across retries and the strict/tolerant fallback —
+  so nothing changes unless an operator asks for it. Override the session
+  header to tell several ai-memory instances apart in OpenCode's metrics.
+  ([#606])
 
 ### Fixed
 - `install-hooks --agent antigravity-cli` on native Windows now emits
@@ -27,6 +57,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recognized", every hook failed, and the cp850 (non-UTF-8) error text
   aborted the whole `agy` session. Antigravity's command is now rendered
   bare; other Windows agents keep their quotes.
+- `AI_MEMORY_LLM_BASE_URL` now works with `AI_MEMORY_LLM_PROVIDER=opencode`.
+  The provider hardcoded OpenCode's **Go** endpoint and the factory dropped
+  the configured base URL without a word, so Zen's general catalogue at
+  `https://opencode.ai/zen/v1` was unreachable through it — Zen and Go are
+  separate products, not two spellings of one. Go remains the default, so
+  existing setups are unaffected; an override keeps the `x-opencode-session`
+  default and the user agent, since both endpoints correlate requests the
+  same way. Model ids are per catalogue, so set `AI_MEMORY_LLM_MODEL`
+  explicitly when overriding. `OPENCODE_ZEN_BASE_URL` is deprecated in
+  favour of `OPENCODE_GO_BASE_URL`: the constant named Zen but has always
+  held Go's URL. It keeps its value, so code compiled against it is
+  unaffected. ([#606])
 
 ## [2.0.2] - 2026-09-03
 

@@ -20,7 +20,7 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Usage};
+use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Usage};
 
 /// GitHub Copilot's public OAuth client id used by Copilot clients.
 pub const GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -186,6 +186,7 @@ pub struct CopilotProvider {
     auth: CopilotAuth,
     stored: Mutex<CopilotToken>,
     timeout: Duration,
+    extra_headers: ExtraHeaders,
 }
 
 impl CopilotProvider {
@@ -216,6 +217,7 @@ impl CopilotProvider {
             auth,
             stored: Mutex::new(stored),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -225,6 +227,15 @@ impl CopilotProvider {
     #[must_use]
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`. Replaces the client's
+    /// default `user-agent` when the operator configures one.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
         self
     }
 
@@ -284,16 +295,14 @@ impl CopilotProvider {
         let token = self.current_token().await?;
         let url = format!("{}/chat/completions", token.base_url.trim_end_matches('/'));
         debug!(url = %url, "POST copilot chat completions");
-        let resp = self
-            .client
-            .post(&url)
-            .timeout(self.timeout)
-            .bearer_auth(token.access.expose_secret())
-            .headers(copilot_runtime_headers())
-            .json(body)
-            .send()
-            .await
-            .map_err(LlmError::from)?;
+        let request = self.extra_headers.apply(
+            self.client
+                .post(&url)
+                .timeout(self.timeout)
+                .bearer_auth(token.access.expose_secret())
+                .headers(copilot_runtime_headers()),
+        );
+        let resp = request.json(body).send().await.map_err(LlmError::from)?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
