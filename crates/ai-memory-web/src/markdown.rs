@@ -37,10 +37,57 @@ pub fn render(body: &str, workspace: &str, project: &str) -> String {
     // there, mirroring the engine's link extractor.
     let body = preprocess_wikilinks(body, workspace, project);
 
-    let parser = Parser::new_ext(&body, opts).map(sanitize_event);
+    let parser =
+        Parser::new_ext(&body, opts).map(|event| sanitize_event(event, workspace, project));
     let mut out = String::with_capacity(body.len() + body.len() / 4);
     html::push_html(&mut out, parser);
     out
+}
+
+/// Rewrite a relative in-wiki link target (a page like `concepts/foo.md`
+/// or a namespace directory like `_lint/`) to a project-scoped URL, so it
+/// resolves under the web mount's `<base href>` instead of against it. An
+/// external URL, anchor, absolute path, or anything with a scheme is left
+/// for [`safe_url`] to handle. Targets are treated as project-root
+/// relative — the same convention `[[wikilinks]]` use — which is what the
+/// OKF bundle-index page and generated cross-references rely on (#603).
+fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> CowStr<'a> {
+    let trimmed = dest.trim();
+    // Leave anchors, absolute paths, network paths, and any scheme
+    // (http:, mailto:, javascript:, …) to safe_url.
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || trimmed.contains(':')
+    {
+        return dest;
+    }
+    // Already project-scoped (a `[[wikilink]]` the preprocessor rewrote to
+    // `w/<ws>/<proj>/p/…`, including cross-project/workspace targets):
+    // don't scope it again or the path doubles.
+    if trimmed.starts_with("w/") && trimmed.contains("/p/") {
+        return dest;
+    }
+    // Split off a trailing #anchor/?query so it survives the rewrite.
+    let (path_part, suffix) = match trimmed.find(['#', '?']) {
+        Some(i) => (&trimmed[..i], &trimmed[i..]),
+        None => (trimmed, ""),
+    };
+    if path_part.is_empty() || path_part.contains("..") {
+        return dest; // don't rewrite traversal; safe_url/router will reject
+    }
+    let path_part = path_part.trim_end_matches('/');
+    if path_part.is_empty() {
+        return dest;
+    }
+    CowStr::Boxed(
+        format!(
+            "{}{suffix}",
+            crate::templates::page_href(workspace, project, path_part)
+        )
+        .into_boxed_str(),
+    )
 }
 
 /// Convert `[[target]]` / `[[target|label]]` spans into `[label](href)`
@@ -237,7 +284,7 @@ fn split_scope<'a>(
     (cur_ws, cur_proj, target)
 }
 
-fn sanitize_event(event: Event<'_>) -> Event<'_> {
+fn sanitize_event<'a>(event: Event<'a>, workspace: &str, project: &str) -> Event<'a> {
     match event {
         Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
         Event::Start(Tag::Link {
@@ -247,7 +294,9 @@ fn sanitize_event(event: Event<'_>) -> Event<'_> {
             id,
         }) => Event::Start(Tag::Link {
             link_type,
-            dest_url: safe_url(dest_url),
+            // Scope relative in-wiki targets first (#603), then run the
+            // scheme allowlist over whatever remains.
+            dest_url: safe_url(scope_relative_link(dest_url, workspace, project)),
             title,
             id,
         }),
@@ -415,6 +464,34 @@ mod tests {
     fn preserves_clickable_external_links() {
         let html = render("[docs](https://example.com/docs)", "default", "scratch");
         assert!(html.contains(r#"href="https://example.com/docs""#));
+    }
+
+    #[test]
+    fn scopes_relative_links_to_the_project() {
+        // #603: the OKF bundle index's directory links and any relative
+        // in-wiki link must resolve under the web mount, not against it.
+        let html = render(
+            "[lint](_lint/) and [foo](concepts/foo.md)",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/_lint""#),
+            "directory link must be project-scoped: {html}"
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/concepts/foo.md""#),
+            "relative page link must be project-scoped: {html}"
+        );
+        // External, anchor, and dangerous schemes are untouched by the scope pass.
+        let ext = render(
+            "[x](https://e.com) [a](#h) [j](javascript:alert(1))",
+            "d",
+            "p",
+        );
+        assert!(ext.contains(r#"href="https://e.com""#));
+        assert!(ext.contains(r##"href="#h""##));
+        assert!(!ext.contains("javascript:"));
     }
 
     #[test]

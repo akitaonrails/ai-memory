@@ -605,8 +605,22 @@ fn build_update(
     actor: &ai_memory_core::ActorContext,
     author_id: Option<ai_memory_core::UserId>,
 ) -> ConsolidatorResult<(WritePageRequest, ConsolidationOutcome)> {
+    // Never store an empty title: when a proposal omits one, fall back to
+    // the body's H1 (then the path stem), the same derivation the wiki
+    // write path uses — otherwise the page lands with `title: ""` in
+    // frontmatter, reads back titleless, and trips the duplicate-title
+    // lint (#599). `derive_title` returns the frontmatter title when
+    // present, so passing a null frontmatter here means "derive from the
+    // body/path".
+    let effective_title = if upd.title.trim().is_empty() {
+        let probe_path = PagePath::new(upd.path.clone())
+            .unwrap_or_else(|_| PagePath::new("notes/untitled.md").expect("static path is valid"));
+        ai_memory_wiki::derive_title(&serde_json::Value::Null, &upd.body_markdown, &probe_path)
+    } else {
+        upd.title.clone()
+    };
     let final_path = if upd.kind == crate::types::PageKind::Rule {
-        let slug = slugify_for_rule(&upd.title);
+        let slug = slugify_for_rule(&effective_title);
         format!("_rules/{slug}.md")
     } else {
         upd.path.clone()
@@ -615,7 +629,10 @@ fn build_update(
     let tier = upd.tier;
 
     let mut fm = serde_json::Map::new();
-    fm.insert("title".into(), serde_json::Value::String(upd.title.clone()));
+    fm.insert(
+        "title".into(),
+        serde_json::Value::String(effective_title.clone()),
+    );
     fm.insert(
         "tier".into(),
         serde_json::Value::String(tier_as_str(tier).into()),
@@ -627,7 +644,7 @@ fn build_update(
         "kind".into(),
         serde_json::Value::String(upd.kind.as_str().into()),
     );
-    if let Some(summary) = usable_summary(upd.summary.as_deref(), &upd.title) {
+    if let Some(summary) = usable_summary(upd.summary.as_deref(), &effective_title) {
         fm.insert("summary".into(), serde_json::Value::String(summary));
     }
     if !upd.tags.is_empty() {
@@ -671,7 +688,7 @@ fn build_update(
         body: upd.body_markdown.clone(),
         tier,
         pinned: false,
-        title: Some(upd.title.clone()),
+        title: Some(effective_title.clone()),
         admission_ctx: Some(AdmissionContext {
             op: AdmissionOp::Consolidate,
             actor: actor.clone(),
@@ -683,7 +700,7 @@ fn build_update(
     let outcome = ConsolidationOutcome {
         path,
         dry_run,
-        new_title: upd.title.clone(),
+        new_title: effective_title.clone(),
         new_body_markdown: upd.body_markdown.clone(),
         page_id: None,
         tags: upd.tags.clone(),
@@ -1899,6 +1916,38 @@ mod tests {
             req.admission_ctx.expect("ctx").actor.user.as_deref(),
             Some("djalmajr")
         );
+    }
+
+    #[test]
+    fn build_update_derives_title_from_h1_when_proposal_title_is_empty() {
+        // A proposal with no title must not store `title: ""` — it derives
+        // from the body's H1, matching the wiki write path (#599).
+        let update = crate::types::ConsolidatedPageUpdate {
+            path: "concepts/thing.md".into(),
+            tier: Tier::Semantic,
+            kind: crate::types::PageKind::Fact,
+            title: "   ".into(), // blank
+            body_markdown: "# The Real Title\n\nbody text".into(),
+            summary: None,
+            tags: Vec::new(),
+            slot_kind: SlotKind::State,
+            entities: Vec::new(),
+        };
+        let (req, outcome) = build_update(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            &update,
+            false,
+            &ai_memory_core::ActorContext::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            req.frontmatter["title"], "The Real Title",
+            "empty proposal title must derive from the body H1, not persist as \"\""
+        );
+        assert_eq!(req.title.as_deref(), Some("The Real Title"));
+        assert_eq!(outcome.new_title, "The Real Title");
     }
 
     #[test]

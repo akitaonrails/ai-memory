@@ -3081,3 +3081,71 @@ async fn homepage_llm_notice_is_dismissible_and_backup_banner_is_gone() {
         "redundant backup banner must not render"
     );
 }
+
+// ── #603: namespace (directory) links list pages instead of 404 ──
+
+#[tokio::test]
+async fn namespace_path_lists_its_pages() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for (path, title) in [
+        ("_lint/report.md", "Lint report 2026-09-03"),
+        ("concepts/retrieval.md", "Retrieval"),
+    ] {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, path, title, "body"))
+            .await
+            .unwrap();
+    }
+    let app = router(store.reader.clone(), wiki.clone());
+
+    // A directory path (the OKF bundle-index link shape) lists its pages.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch/p/_lint/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = std::str::from_utf8(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .to_owned();
+    assert!(
+        text.contains("Lint report 2026-09-03"),
+        "namespace listing must show its page"
+    );
+    assert!(
+        !text.contains("Retrieval"),
+        "must not list pages from other namespaces"
+    );
+
+    // A namespace with no pages still 404s.
+    let empty = app
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch/p/nope/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::NOT_FOUND);
+}

@@ -1846,11 +1846,17 @@ mod tests {
             .unwrap();
         }
 
+        // Generous budgets: the assertion is about ORDERING (a dead head
+        // must not block the deliverable tail), not latency. Tight timeouts
+        // (500ms per event) flaked under `--all-targets` CPU contention when
+        // a live localhost POST briefly exceeded them and a deliverable
+        // entry timed out spuriously. The dead head still connection-refuses
+        // immediately regardless of the ceiling.
         let r = drain(
             &spool,
             tmp.path(),
+            Duration::from_secs(30),
             Duration::from_secs(5),
-            Duration::from_millis(500),
         )
         .await;
 

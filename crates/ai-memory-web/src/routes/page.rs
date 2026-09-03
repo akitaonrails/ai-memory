@@ -10,7 +10,9 @@ use axum::response::{Html, IntoResponse, Response};
 
 use crate::markdown;
 use crate::state::WebState;
-use crate::templates::{NotFoundView, PageView, humanize, page_href, project_href};
+use crate::templates::{
+    NamespaceView, NotFoundView, PageRow, PageView, humanize, page_href, project_href,
+};
 
 /// Handler for `GET /w/:workspace/:project/p/*path`.
 pub(crate) async fn handler(
@@ -19,7 +21,10 @@ pub(crate) async fn handler(
 ) -> Response {
     let meta = match state.reader.page_meta(&workspace, &project, &path).await {
         Ok(Some(m)) => m,
-        Ok(None) => return not_found_response(),
+        // Not a page — it may be a namespace (directory) link, e.g. the OKF
+        // bundle index's `[_lint/](_lint/)`. Render a listing rather than a
+        // bare 404 (#603).
+        Ok(None) => return namespace_or_not_found(&state, &workspace, &project, &path).await,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
@@ -80,6 +85,52 @@ pub(crate) async fn handler(
         author_username,
         author_name,
         author_email,
+    }
+    .render())
+    {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// When a path is not a page, list the pages under it as a namespace
+/// (directory) if any exist; otherwise 404. Powers the OKF bundle index's
+/// directory links and any relative `dir/` link (#603).
+async fn namespace_or_not_found(
+    state: &Arc<WebState>,
+    workspace: &str,
+    project: &str,
+    path: &str,
+) -> Response {
+    let namespace = path.trim_end_matches('/');
+    if namespace.is_empty() {
+        return not_found_response();
+    }
+    let prefix = format!("{namespace}/");
+    let all = match state.reader.list_pages(workspace, project).await {
+        Ok(p) => p,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let pages: Vec<PageRow> = all
+        .into_iter()
+        .filter(|p| p.path.starts_with(&prefix))
+        .map(|p| PageRow {
+            href: page_href(workspace, project, &p.path),
+            path: p.path,
+            title: p.title,
+            kind: p.kind,
+            updated_relative: humanize(&p.updated_at),
+        })
+        .collect();
+    if pages.is_empty() {
+        return not_found_response();
+    }
+    match (NamespaceView {
+        workspace: workspace.to_owned(),
+        project: project.to_owned(),
+        project_href: project_href(workspace, project),
+        namespace: namespace.to_owned(),
+        pages,
     }
     .render())
     {

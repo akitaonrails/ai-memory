@@ -13,6 +13,10 @@ use crate::{StoreError, StoreResult};
 
 const LEASE_MICROS: i64 = 90 * 1_000_000;
 const MAX_WORKSTREAM_NAME_CHARS: usize = 128;
+/// Store-boundary bound on a workstream event's free-text `content`
+/// (16 KiB, matching the observation body). A backstop against unbounded
+/// persistence, not a functional cap — the hook layer caps tighter.
+const WORKSTREAM_CONTENT_MAX_BYTES: usize = 16 * 1024;
 
 /// How a prepare request chooses the workstream for a repository/worktree.
 #[derive(Debug, Clone)]
@@ -720,6 +724,15 @@ pub(crate) fn finish_run(
             continue;
         }
         latest += 1;
+        // Store-boundary bound (defense in depth): the hook layer already
+        // scrubs and normalizes event content, but the store is the last gate
+        // before durable persistence — bound the free-text `content` so a
+        // caller that ever forgets cannot write unbounded prose to the DB.
+        // `metadata_json` is left intact: it is structured JSON and
+        // truncating the serialized form would corrupt it; its size is
+        // bounded by the event schema, not free text.
+        let content =
+            ai_memory_core::truncate_utf8_bytes(&event.content, WORKSTREAM_CONTENT_MAX_BYTES);
         tx.execute(
             "INSERT INTO workstream_events( \
                  workstream_id, sequence, event_id, agent_kind, native_session_id, \
@@ -735,7 +748,7 @@ pub(crate) fn finish_run(
                 event.source_record_id,
                 event.kind.as_str(),
                 event.role,
-                event.content,
+                content,
                 event.occurred_at,
                 serde_json::to_string(&event.metadata)?,
                 input.segment_path,

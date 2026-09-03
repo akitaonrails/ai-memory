@@ -37,8 +37,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logical operation, stable across retries and the strict/tolerant fallback —
   so nothing changes unless an operator asks for it. Override the session
   header to tell several ai-memory instances apart in OpenCode's metrics.
+### Fixed
+- `AI_MEMORY_LLM_BASE_URL` now works with `AI_MEMORY_LLM_PROVIDER=opencode`.
+  The provider hardcoded OpenCode's **Go** endpoint and the factory dropped
+  the configured base URL without a word, so Zen's general catalogue at
+  `https://opencode.ai/zen/v1` was unreachable through it — Zen and Go are
+  separate products, not two spellings of one. Go remains the default, so
+  existing setups are unaffected; an override keeps the `x-opencode-session`
+  default and the user agent, since both endpoints correlate requests the
+  same way. Model ids are per catalogue, so set `AI_MEMORY_LLM_MODEL`
+  explicitly when overriding. `OPENCODE_ZEN_BASE_URL` is deprecated in
+  favour of `OPENCODE_GO_BASE_URL`: the constant named Zen but has always
+  held Go's URL. It keeps its value, so code compiled against it is
+  unaffected.
+
+## [2.0.2] - 2026-09-03
 
 ### Fixed
+- Web UI: OKF bundle-index links (and any relative in-wiki link) no
+  longer 404 (#603). Relative markdown link targets are now rewritten to
+  project-scoped URLs — the same convention `[[wikilinks]]` use — instead
+  of resolving against the web mount's `<base href>`, and a namespace
+  (directory) path such as `.../p/_lint/` now lists the pages under it
+  rather than returning 404. External links, anchors, and dangerous
+  schemes are untouched by the rewrite.
+- Pages with an empty frontmatter `title` no longer read back titleless
+  or trip a bogus duplicate-title lint (#599). Auto-improve could store
+  `title: ""` while the page had a proper `# H1`; now `memory_read_page`
+  derives the title from the H1 (then the path stem) when the stored one
+  is blank, the duplicate-title lint ignores blank titles instead of
+  collapsing them into one `Multiple pages share title ""` finding, and
+  the consolidator derives a title from the body H1 at write time so new
+  pages never store an empty one. The DB `title` column (search) was
+  already correct; this aligns the frontmatter-title readers with it
+  without rewriting stored pages.
 - Local-embedding model download (`fetch_model`) now bounds a stalled
   connection instead of hanging startup forever (#602): a 30s connect
   timeout and a generous 600s overall ceiling (large model files, so
@@ -87,18 +119,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   auto-improvement reuse the captured ai-memory session ID, while retries and
   structured-output fallback keep the same ID instead of appearing as unrelated
   requests (#608).
-- `AI_MEMORY_LLM_BASE_URL` now works with `AI_MEMORY_LLM_PROVIDER=opencode`.
-  The provider hardcoded OpenCode's **Go** endpoint and the factory dropped
-  the configured base URL without a word, so Zen's general catalogue at
-  `https://opencode.ai/zen/v1` was unreachable through it — Zen and Go are
-  separate products, not two spellings of one. Go remains the default, so
-  existing setups are unaffected; an override keeps the `x-opencode-session`
-  default and the user agent, since both endpoints correlate requests the
-  same way. Model ids are per catalogue, so set `AI_MEMORY_LLM_MODEL`
-  explicitly when overriding. `OPENCODE_ZEN_BASE_URL` is deprecated in
-  favour of `OPENCODE_GO_BASE_URL`: the constant named Zen but has always
-  held Go's URL. It keeps its value, so code compiled against it is
-  unaffected.
 - `as_of` time-travel queries and the entity retrieval stream now work
   on real stores. Both read the entity index, which was populated only
   from an LLM consolidator's `entities:` frontmatter — absent on the
@@ -132,6 +152,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Security
+- Handoff and workstream-event content is now size-bounded at the store
+  boundary as defense in depth (data-layer audit follow-up, #607). The
+  MCP/hook callers already scrub and cap this prose, but the store is the
+  last gate before durable persistence, so it now bounds each handoff
+  field (16 KiB, matching the observation body) and list length, and a
+  workstream event's free-text content — a caller that ever forgot its
+  own cap can no longer write unbounded content to the DB.
 - Untrusted `relations:` frontmatter values (relation keys and targets)
   are now length-bounded before being echoed into warning logs. On a
   shared server one caller's page is parsed by a process whose logs
@@ -4862,7 +4889,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.2
 [2.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.1
 [2.0.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.0
 [1.39.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.39.0

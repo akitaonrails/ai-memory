@@ -181,6 +181,24 @@ pub(crate) struct ProjectView {
     pub recent: Vec<PageRow>,
 }
 
+/// View-model for a namespace (directory) listing — `GET
+/// /w/:workspace/:project/p/:namespace/` when the path names a namespace
+/// rather than a page (#603).
+#[derive(Template)]
+#[template(path = "namespace.html")]
+pub(crate) struct NamespaceView {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Link back to the project overview.
+    pub project_href: String,
+    /// The namespace path (no trailing slash), e.g. `_lint` or `concepts`.
+    pub namespace: String,
+    /// Pages under this namespace.
+    pub pages: Vec<PageRow>,
+}
+
 // ---------------------------------------------------------------------------
 // page.html
 // ---------------------------------------------------------------------------

@@ -357,8 +357,14 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
             });
         }
         // Duplicate-title tracking: peek the frontmatter for a `title` field.
+        // An empty/blank title is not a meaningful shared title — several
+        // pages carrying `title: ""` (e.g. auto-improve pages whose stored
+        // frontmatter title was never filled) must not all collapse into one
+        // bogus `Multiple pages share title ""` finding (#599). Real titles
+        // still dedupe as before.
         if let Some(fm) = frontmatter.as_ref()
             && let Some(t) = fm.get("title").and_then(serde_json::Value::as_str)
+            && !t.trim().is_empty()
         {
             titles
                 .entry(t.to_lowercase())
@@ -728,6 +734,34 @@ mod tests {
         let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
         assert_eq!(dupes.len(), 1);
         assert_eq!(dupes[0].pages.len(), 2);
+    }
+
+    #[test]
+    fn rule_pass_ignores_empty_titles_as_duplicates() {
+        // Several pages carrying `title: ""` (or blank) must NOT collapse
+        // into one bogus `Multiple pages share title ""` finding (#599).
+        let base = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/a.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": ""}"#.into(),
+            expires_at_us: None,
+            salience: None,
+        };
+        let blank = DecayCandidate {
+            path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
+            frontmatter_json: r#"{"title": "   "}"#.into(),
+            ..base.clone()
+        };
+        let findings = rule_based_findings(&[base, blank], STALE_DAYS);
+        assert!(
+            !findings.iter().any(|f| f.kind == "duplicate"),
+            "empty/blank titles must not be reported as a shared title"
+        );
     }
 
     /// M20: a page tagged `kind: rule` in its frontmatter triggers

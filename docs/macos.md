@@ -55,6 +55,15 @@ tar -xzf ai-memory-macos-aarch64.tar.gz
 ./ai-memory serve --transport http --bind 127.0.0.1:49374
 ```
 
+> **The server from step 3 must stay running for every other command.**
+> `ai-memory init` only creates the data dir — it does **not** start a
+> server. `bootstrap`, `install-hooks`, `install-mcp`, and `status` are all
+> clients that talk to the running server over HTTP, so running them while
+> nothing is serving fails with `Connection refused (os error 61)` /
+> `could not reach http://localhost:49374`. Leave `serve` running in its own
+> terminal (or set it up as a login service, below), then run the rest in a
+> second terminal.
+
 In a second terminal, wire the agent:
 
 ```bash

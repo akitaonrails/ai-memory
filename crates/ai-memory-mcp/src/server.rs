@@ -3107,11 +3107,12 @@ impl AiMemoryServer {
         // so operators can fix the disk source of truth.
         match wiki.read_page(ws, proj, &page_path) {
             Ok(md) => {
-                let title = md
-                    .frontmatter
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
+                // Derive the title so an empty/absent frontmatter `title`
+                // falls back to the body's H1 (then the path stem), instead
+                // of surfacing "" — auto-improve pages whose stored
+                // frontmatter title was never filled otherwise read back
+                // titleless despite a proper `# Heading` (#599).
+                let title = ai_memory_wiki::derive_title(&md.frontmatter, &md.body, &page_path);
                 ok_json(&serde_json::json!({
                     "path": page_path.to_string(),
                     "title": title,

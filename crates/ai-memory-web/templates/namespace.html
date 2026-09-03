@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}{{ namespace }}/ — {{ project }} — ai-memory{% endblock %}
+
+{% block content %}
+<nav class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
+  <span>/</span>
+  <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
+  <span>/</span>
+  <span class="text-slate-700 dark:text-slate-200 font-medium">{{ namespace }}/</span>
+</nav>
+
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">{{ namespace }}/</h1>
+<p class="mb-6 text-sm text-slate-500 dark:text-slate-400">{{ pages.len() }} page{% if pages.len() != 1 %}s{% endif %} in this namespace.</p>
+
+{% if pages.is_empty() %}
+<p class="text-sm text-slate-400 dark:text-slate-600">No pages in this namespace.</p>
+{% else %}
+<ul class="divide-y divide-slate-100 dark:divide-slate-800">
+  {% for page in pages %}
+  <li class="py-3 flex items-start justify-between gap-4">
+    <div class="min-w-0">
+      <a href="{{ page.href }}"
+         class="text-sm font-medium text-slate-800 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400 truncate block">
+        {{ page.title }}
+      </a>
+      <div class="flex items-center gap-2 mt-1">
+        <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ page.kind }}</span>
+        <span class="text-xs text-slate-400 dark:text-slate-500 truncate">{{ page.path }}</span>
+      </div>
+    </div>
+    <span class="text-xs text-slate-400 dark:text-slate-500 whitespace-nowrap shrink-0">{{ page.updated_relative }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

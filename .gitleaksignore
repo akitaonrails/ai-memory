@@ -5,3 +5,5 @@ a861ec3d598885d43500713d21d4e1aafbf46645:tests/e2e/handoff_smoke.sh:curl-auth-he
 747c32d50f824cae665f2e35bbd62c8502438903:crates/ai-memory-hooks/src/sanitize.rs:jwt:107
 d8361d3c3a86f870f74841b53c568c64fe42ab1f:crates/ai-memory-core/src/sanitize.rs:gcp-api-key:226
 d8361d3c3a86f870f74841b53c568c64fe42ab1f:crates/ai-memory-core/src/sanitize.rs:generic-api-key:257
+47c9cf2e71712153e3162942a8cb28667a6be27a:crates/ai-memory-core/src/sanitize.rs:generic-api-key:631
+47c9cf2e71712153e3162942a8cb28667a6be27a:crates/ai-memory-core/src/sanitize.rs:generic-api-key:633

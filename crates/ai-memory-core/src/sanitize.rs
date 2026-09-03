@@ -627,10 +627,14 @@ mod tests {
     /// output, so the rule requires an auth qualifier before the suffix.
     #[test]
     fn auth_header_pattern_leaves_non_secret_key_and_token_headers_alone() {
+        // Values use the low-entropy "obvious fake" shape the sanitize
+        // fixtures follow (see .gitleaks.toml) so the secret scanner does
+        // not flag them; the assertion is name-based, so the value shape
+        // is irrelevant to what is being tested.
         for text in [
-            "Idempotency-Key: 3f7a1c2e-9b4d-4f88-a1e2-7c6b5d4e3f21",
+            "Idempotency-Key: 00000000-0000-0000-0000-000000000000",
             "Continuation-Token: 0000000000000000000000",
-            "Next-Page-Token: CiAKGjBpNDd2Nmp2Zml2cWtwYjBk",
+            "Next-Page-Token: 0000000000000000000000000000",
             "Partition-Key: user-000000000000001",
             "Cache-Key: v2-catalog-000000000000",
         ] {

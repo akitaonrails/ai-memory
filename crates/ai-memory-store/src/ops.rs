@@ -2471,13 +2471,38 @@ pub fn end_session_with_handoff(
     Ok(id)
 }
 
+/// Store-boundary bound for a single handoff prose field. Generous
+/// (16 KiB, matching the observation body) — a backstop against
+/// unbounded content, not a functional cap; callers cap tighter.
+const HANDOFF_FIELD_MAX_BYTES: usize = 16 * 1024;
+/// Store-boundary bound on the number of items in a handoff list field.
+const HANDOFF_LIST_MAX_ITEMS: usize = 256;
+
+fn bound_handoff_field(value: &str) -> String {
+    ai_memory_core::truncate_utf8_bytes(value, HANDOFF_FIELD_MAX_BYTES)
+}
+
+fn bound_handoff_list(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .take(HANDOFF_LIST_MAX_ITEMS)
+        .map(|s| bound_handoff_field(s))
+        .collect()
+}
+
 fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<HandoffId> {
     validate_identity_storage_key(h.owner_user.as_deref(), "handoff owner")?;
     let id = HandoffId::new();
     let now = Timestamp::now().as_microsecond();
-    let open_q = serde_json::to_string(&h.open_questions)?;
-    let next_s = serde_json::to_string(&h.next_steps)?;
-    let files = serde_json::to_string(&h.files_touched)?;
+    // Store-boundary bound (defense in depth): the MCP/hook callers already
+    // scrub and cap handoff prose, but the store is the last gate before
+    // durable persistence — mirror the observation body's bound so a caller
+    // that ever forgets cannot write unbounded content to the DB. Generous
+    // enough never to fire under the callers' tighter caps.
+    let summary = bound_handoff_field(&h.summary);
+    let open_q = serde_json::to_string(&bound_handoff_list(&h.open_questions))?;
+    let next_s = serde_json::to_string(&bound_handoff_list(&h.next_steps))?;
+    let files = serde_json::to_string(&bound_handoff_list(&h.files_touched))?;
     let from_session: Option<&[u8]> = h.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
     // Normalize the stored cwd: strip trailing path separators (keep a bare root
     // as "/"). The hook extractor preserves whatever the agent payload sent,
@@ -2544,7 +2569,7 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
             from_agent,
             to_agent,
             cwd,
-            h.summary,
+            summary,
             open_q,
             next_s,
             files,
@@ -6598,6 +6623,56 @@ pub(crate) mod tests {
             resolved.as_deref(),
             Some(&target_id.as_bytes()[..]),
             "link must resolve across projects once the target lands"
+        );
+    }
+
+    /// Store-boundary defense in depth: an unbounded handoff field or list
+    /// (a caller that skipped its own cap) is bounded before it reaches the
+    /// DB, so pathological content cannot grow the store without limit.
+    #[test]
+    fn insert_handoff_bounds_oversized_fields_at_the_store() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let huge = "x".repeat(HANDOFF_FIELD_MAX_BYTES * 3);
+        let many: Vec<String> = (0..HANDOFF_LIST_MAX_ITEMS * 2)
+            .map(|i| format!("step {i}"))
+            .collect();
+        let new = NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: huge.clone(),
+            open_questions: vec![huge.clone()],
+            next_steps: many,
+            files_touched: vec![],
+            owner_user: None,
+        };
+        let id = insert_handoff(&mut conn, &new).unwrap();
+
+        let (summary, open_q, next_s): (String, String, String) = conn
+            .query_row(
+                "SELECT summary, open_questions, next_steps FROM handoffs WHERE id = ?1",
+                params![&id.as_bytes()[..]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            summary.len() <= HANDOFF_FIELD_MAX_BYTES,
+            "summary must be bounded: {} bytes",
+            summary.len()
+        );
+        let open: Vec<String> = serde_json::from_str(&open_q).unwrap();
+        assert!(
+            open[0].len() <= HANDOFF_FIELD_MAX_BYTES,
+            "list item bounded"
+        );
+        let steps: Vec<String> = serde_json::from_str(&next_s).unwrap();
+        assert!(
+            steps.len() <= HANDOFF_LIST_MAX_ITEMS,
+            "list length bounded: {}",
+            steps.len()
         );
     }
 
