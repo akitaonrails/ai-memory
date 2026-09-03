@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use ai_memory_core::{AgentKind, Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+};
 use ai_memory_store::{ReaderPool, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use thiserror::Error;
@@ -187,7 +189,8 @@ impl Consolidator {
             model = self.llm.model(),
             "consolidating session"
         );
-        let page: ConsolidatedPage = complete_structured(&*self.llm, request).await?;
+        let page: ConsolidatedPage =
+            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
 
         let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
@@ -481,7 +484,7 @@ impl Consolidator {
             "consolidating session (multi-page)",
         );
         let batch: ConsolidatedBatch =
-            ai_memory_llm::complete_structured(&*self.llm, request).await?;
+            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
 
         // `dry_run` is always false past the early return above, so every
         // update here is a real write.

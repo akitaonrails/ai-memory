@@ -12,7 +12,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+};
 use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de};
@@ -513,7 +515,8 @@ pub async fn run_auto_improve_review(
         max_tokens: DEFAULT_REVIEW_MAX_TOKENS,
         temperature: Some(0.1),
     };
-    let raw: AutoImproveLlmResponse = complete_structured(llm, request).await?;
+    let raw: AutoImproveLlmResponse =
+        complete_structured_with_operation_id(llm, request, session_id.into()).await?;
     let (mut proposals, mut rejected_candidates, mut warnings) =
         validate_response(raw, &cfg, &existing_index);
     rejected_candidates.extend(prompt_input.rejected_candidates);

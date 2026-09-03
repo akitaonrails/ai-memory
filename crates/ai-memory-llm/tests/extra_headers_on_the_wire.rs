@@ -166,8 +166,54 @@ async fn an_operator_base_url_redirects_the_opencode_provider() {
     assert!(
         values(request, "x-opencode-session")
             .first()
-            .is_some_and(|v| v.starts_with("ai-memory-")),
+            .is_some_and(|v| !v.is_empty()),
         "session header lost when the base URL was overridden"
     );
     assert_eq!(values(request, "user-agent"), vec![DEFAULT_USER_AGENT]);
+}
+
+/// The load-bearing claim of layering operator headers over the provider's
+/// own defaults: an explicit `AI_MEMORY_LLM_HEADERS` entry must beat the
+/// per-operation id, and must arrive exactly once. Appending instead of
+/// replacing would send both values, which is worse than either alone.
+#[tokio::test]
+async fn an_operator_session_header_beats_the_per_operation_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(ProviderConfig {
+        provider: ProviderChoice::OpenCode,
+        model: "mistral-nemo".into(),
+        auth: ProviderAuth::required_api_key_from_env(
+            "OPENCODE_API_KEY",
+            Some(SecretString::from("sk-test")),
+        ),
+        base_url: Some(server.uri()),
+        compat_strict: false,
+        request_timeout_secs: 30,
+        reasoning_effort: None,
+        extra_headers: ExtraHeaders::parse([
+            "x-opencode-session: homelab-01",
+            "user-agent: ai-memory-fork/9",
+        ])
+        .expect("valid"),
+    })
+    .expect("provider builds");
+
+    provider
+        .complete(ChatRequest::user_prompt("hi"))
+        .await
+        .expect("mock responds 200");
+
+    let received = server
+        .received_requests()
+        .await
+        .expect("mock recorded requests");
+    let request = &received[0];
+    assert_eq!(values(request, "x-opencode-session"), vec!["homelab-01"]);
+    assert_eq!(values(request, "user-agent"), vec!["ai-memory-fork/9"]);
 }

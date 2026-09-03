@@ -114,9 +114,10 @@ pub use openai_oauth::{
 #[allow(deprecated)]
 pub use opencode::OPENCODE_ZEN_BASE_URL;
 pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL, OpenCodeProvider};
-pub use provider::{LlmProvider, complete_structured};
+pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
 pub use types::{
-    ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Role, Usage,
+    ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Role,
+    Usage,
 };

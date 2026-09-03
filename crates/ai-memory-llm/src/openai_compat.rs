@@ -18,7 +18,7 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::{OpenAiProvider, RequestDialect, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
-use crate::types::{ChatRequest, ChatResponse};
+use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 
 // Compiled once. Matches <think>, <thinking>, <analysis>, <reasoning> blocks
 // (case-insensitive, non-greedy, DOTALL) that reasoning models emit before
@@ -137,20 +137,23 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Forward the caller-identifying defaults to the inner client. Only
+    /// [`crate::OpenCodeProvider`] opts in today; the values sit under any
+    /// operator-configured header of the same name.
+    pub(crate) fn with_client_headers(
+        mut self,
+        user_agent: &'static str,
+        operation_id: &'static str,
+    ) -> Self {
+        self.inner = self.inner.with_client_headers(user_agent, operation_id);
+        self
+    }
     /// Endpoint the inner client will call. Test-visible so
     /// [`crate::OpenCodeProvider`]'s tests can assert Go stays the default
     /// and a Zen override takes effect.
     #[cfg(test)]
     pub(crate) fn base_url(&self) -> &str {
         self.inner.base_url()
-    }
-
-    /// Headers the inner client will send. Test-visible so the
-    /// [`crate::OpenCodeProvider`] tests can assert its Go defaults survive
-    /// delegation.
-    #[cfg(test)]
-    pub(crate) fn extra_headers(&self) -> &crate::ExtraHeaders {
-        self.inner.extra_headers()
     }
 }
 
@@ -165,13 +168,46 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        self.inner.complete(request).await
+        self.complete_with_operation_id(request, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_with_operation_id(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ChatResponse> {
+        self.inner
+            .complete_with_operation_id(request, operation_id)
+            .await
     }
 
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
         schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured_raw_with_operation_id(request, schema, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured(request, schema, operation_id)
+            .await
+    }
+}
+
+impl OpenAiCompatProvider {
+    async fn complete_structured(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
         // Strict mode: modern local engines
         // honour `response_format=json_schema`. Normalise the schema
@@ -201,11 +237,15 @@ impl LlmProvider for OpenAiCompatProvider {
         if self.strict {
             let mut strict_schema = schema.clone();
             enforce_strict_object_schemas(&mut strict_schema);
-            match self
+            let strict_result = self
                 .inner
-                .complete_structured_raw(request.clone(), strict_schema)
-                .await
-            {
+                .complete_structured_raw_with_operation_id(
+                    request.clone(),
+                    strict_schema,
+                    operation_id,
+                )
+                .await;
+            match strict_result {
                 Ok(v) if v.is_object() => return Ok(v),
                 Ok(_) => {
                     debug!("compat strict: non-object response, falling back to tolerant parser");
@@ -227,7 +267,10 @@ impl LlmProvider for OpenAiCompatProvider {
         // Default (and strict fallback): most older local engines don't
         // honour `response_format`. Ask for JSON and extract the first
         // balanced `{…}` object from the text.
-        let res = self.inner.complete(request).await?;
+        let res = self
+            .inner
+            .complete_with_operation_id(request, operation_id)
+            .await?;
         // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
         // `<think>…</think>` before the JSON. Strip those blocks (and any
         // surrounding markdown fences) before trying to parse — otherwise

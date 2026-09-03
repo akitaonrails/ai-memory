@@ -1,6 +1,37 @@
 //! Provider-neutral request/response types.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Identifier shared by every HTTP attempt for one logical LLM operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LlmOperationId(Uuid);
+
+impl LlmOperationId {
+    /// Generate a fresh time-ordered operation identifier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for LlmOperationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<ai_memory_core::SessionId> for LlmOperationId {
+    fn from(value: ai_memory_core::SessionId) -> Self {
+        Self(value.0)
+    }
+}
+
+impl std::fmt::Display for LlmOperationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// Message role in a chat turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

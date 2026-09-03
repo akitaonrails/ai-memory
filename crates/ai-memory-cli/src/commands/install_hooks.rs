@@ -15,6 +15,7 @@
 //!   and produces no backup.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -4670,13 +4671,75 @@ fn is_our_zcode_hook(hook: &serde_json::Value) -> bool {
         .is_some_and(|msg| msg.starts_with("ai-memory"))
 }
 
+/// Withdraw ai-memory's own hook entries from every matcher group in
+/// `groups`, leaving each group, and anyone else's hooks inside it, in
+/// place.
+fn strip_our_zcode_hook_entries(groups: &mut [serde_json::Value]) {
+    for group in groups.iter_mut() {
+        if let Some(hooks) = group
+            .as_object_mut()
+            .and_then(|group| group.get_mut("hooks"))
+            .and_then(|v| v.as_array_mut())
+        {
+            hooks.retain(|hook| !is_our_zcode_hook(hook));
+        }
+    }
+}
+
+/// Same, for a `hooks.events` slot of unknown shape. Returns how many
+/// entries were withdrawn so the caller can report them; a slot that is
+/// not an array is left untouched and counts zero.
+fn strip_our_zcode_hooks(slot: &mut serde_json::Value) -> usize {
+    let Some(groups) = slot.as_array_mut() else {
+        return 0;
+    };
+    let before = zcode_hook_count(groups);
+    strip_our_zcode_hook_entries(groups);
+    before.saturating_sub(zcode_hook_count(groups))
+}
+
+/// Total hook entries across every matcher group in `groups`, ignoring
+/// groups whose `hooks` is absent or not an array.
+fn zcode_hook_count(groups: &[serde_json::Value]) -> usize {
+    groups
+        .iter()
+        .filter_map(|group| group.get("hooks").and_then(|v| v.as_array()))
+        .map(|hooks| hooks.len())
+        .sum()
+}
+
+/// True when a `hooks.events` entry cannot run anything: no matcher groups
+/// at all, no group carrying a non-empty `hooks` array, or a value that is
+/// not a matcher-group array in the first place. Such a key is pure
+/// downside under ZCode's strict validation, since it runs nothing and can
+/// cost the user every other hook in the block.
+///
+/// Deliberately narrower than "a key ai-memory does not write": several of
+/// those are real ZCode events this tool skips on purpose (see
+/// `PermissionRequest` in `render_shared`), and a key still running
+/// someone's hook is their working config, not a leftover. Reporting on
+/// that set would be a false-positive generator.
+fn zcode_event_runs_nothing(slot: &serde_json::Value) -> bool {
+    match slot.as_array() {
+        Some(groups) => zcode_hook_count(groups) == 0,
+        None => true,
+    }
+}
+
 /// Merge ai-memory hooks into the root `hooks` block of ZCode's
 /// user-scope `~/.zcode/cli/config.json` (#512). Sibling config keys
 /// (`model`, `provider`, `mcp.servers`, …) always survive: the merge
 /// touches only `hooks.enabled` (defaulted, never flipped),
 /// `hooks.maxOutputBytes` (set only when absent), and `hooks.events`,
 /// replaces entries ai-memory owns (idempotent re-apply), and never
-/// edits matcher groups it did not write.
+/// removes a hook it did not write. Entries it owns are withdrawn
+/// wherever they sit, including under event keys this version no longer
+/// writes; event keys themselves are never deleted, only reported when
+/// ai-memory withdrew entries from them, or when they are left unable to
+/// run anything (#600). The one thing it does
+/// discard is a matcher group left holding an empty `hooks` array under a
+/// key it writes, which drops a caller's own empty group along with the
+/// ones its withdrawal emptied.
 fn apply_to_zcode_hooks(
     server_url: &str,
     auth_token: Option<&str>,
@@ -4700,6 +4763,7 @@ fn apply_to_zcode_hooks(
         .context("internal: build_zcode_hooks_config didn't return an events map")?
         .clone();
     let mut hooks_disabled = false;
+    let mut stale: Vec<(String, usize, bool)> = Vec::new();
     let outcome = apply_atomic(&path, |existing| {
         mutate_json(existing, |root| {
             // `hooks` sits beside sibling config keys that must survive.
@@ -4726,37 +4790,6 @@ fn apply_to_zcode_hooks(
                 .or_insert_with(|| serde_json::json!({}))
                 .as_object_mut()
                 .context("`hooks.events` is present in the ZCode config but not an object")?;
-            // First strip EVERY ai-memory-authored hook from EVERY event
-            // key, not only the ones about to be re-added (#600). An older
-            // ai-memory that wrote a hook under an event key this version no
-            // longer manages — or a broken/duplicate leftover — would
-            // otherwise survive untouched, and because the current keys
-            // already match, the whole-file comparison would report "already
-            // up to date" while a stale hook keeps capture pointed at the
-            // wrong event. Drop emptied matcher groups, then any event key
-            // left with no groups, so orphans are genuinely removed and the
-            // apply reports Updated.
-            for slot in events.values_mut() {
-                if let Some(groups) = slot.as_array_mut() {
-                    for group in groups.iter_mut() {
-                        if let Some(hooks) = group
-                            .as_object_mut()
-                            .and_then(|group| group.get_mut("hooks"))
-                            .and_then(|v| v.as_array_mut())
-                        {
-                            hooks.retain(|hook| !is_our_zcode_hook(hook));
-                        }
-                    }
-                    groups.retain(|group| match group.get("hooks") {
-                        Some(serde_json::Value::Array(hooks)) => !hooks.is_empty(),
-                        _ => true,
-                    });
-                }
-            }
-            events.retain(|_event, slot| match slot {
-                serde_json::Value::Array(groups) => !groups.is_empty(),
-                _ => true,
-            });
             for (event, ours) in &our_events {
                 let ours = ours
                     .as_array()
@@ -4767,20 +4800,32 @@ fn apply_to_zcode_hooks(
                 let slot = slot.as_array_mut().context(
                     "`hooks.events.{event}` is present in the ZCode config but not an array",
                 )?;
-                for group in slot.iter_mut() {
-                    if let Some(hooks) = group
-                        .as_object_mut()
-                        .and_then(|group| group.get_mut("hooks"))
-                        .and_then(|v| v.as_array_mut())
-                    {
-                        hooks.retain(|hook| !is_our_zcode_hook(hook));
-                    }
-                }
+                strip_our_zcode_hook_entries(slot);
                 slot.retain(|group| match group.get("hooks") {
                     Some(serde_json::Value::Array(hooks)) => !hooks.is_empty(),
                     _ => true,
                 });
                 slot.extend(ours.iter().cloned());
+            }
+            // ai-memory writes only the six keys in `ZCODE_EVENTS`, but its
+            // own entries can sit under other keys too (a config carried
+            // over from another agent, or hand-edited). Those are ours to
+            // withdraw; the keys themselves are not, so every one is left
+            // in place. What makes a leftover dangerous is ZCode strict-
+            // validating this map: one key it does not recognize and it
+            // rejects the ENTIRE hooks block, ai-memory's included, so
+            // capture dies while the file still matches byte for byte and
+            // apply reports it as up to date (#600). Collect the keys that
+            // can no longer run anything and say so after the write.
+            for (event, slot) in events.iter_mut() {
+                if our_events.contains_key(event) {
+                    continue;
+                }
+                let withdrawn = strip_our_zcode_hooks(slot);
+                let runs_nothing = zcode_event_runs_nothing(slot);
+                if withdrawn > 0 || runs_nothing {
+                    stale.push((event.clone(), withdrawn, runs_nothing));
+                }
             }
             Ok(())
         })
@@ -4792,7 +4837,13 @@ fn apply_to_zcode_hooks(
         match outcome {
             ApplyOutcome::Created => "new file",
             ApplyOutcome::Updated => "backup written next to it",
-            ApplyOutcome::NoOp => "already up to date",
+            // Only claim the install is current when nothing turned up
+            // that can stop ZCode loading it. Saying "already up to date"
+            // over a block ZCode rejects is the whole of #600, and the
+            // notes explaining it go to stderr, so a redirected stdout
+            // would otherwise carry the reassurance and none of the cause.
+            ApplyOutcome::NoOp if stale.is_empty() => "already up to date",
+            ApplyOutcome::NoOp => "unchanged; see the notes below",
         }
     );
     if hooks_disabled {
@@ -4801,6 +4852,42 @@ fn apply_to_zcode_hooks(
              so ZCode will not run ANY hooks (including ai-memory's) until \
              you re-enable them."
         );
+    }
+    if !stale.is_empty() {
+        // The report above goes to stdout and these go to stderr; stdout
+        // block-buffers when redirected, so without this the two arrive out
+        // of order in a log or in CI.
+        let _ = std::io::stdout().flush();
+    }
+    for (event, withdrawn, runs_nothing) in &stale {
+        if *withdrawn > 0 {
+            // A withdrawal is positive evidence ai-memory once lived under
+            // this key, so the risk here is not hypothetical.
+            eprintln!(
+                "# warning: withdrew {withdrawn} ai-memory hook(s) from \
+                 `hooks.events.{event}`, a key ai-memory does not write. The \
+                 key itself was left as found, but ZCode validates this map \
+                 strictly and rejects the ENTIRE hooks block, ai-memory's \
+                 included, over one key it does not recognize, which leaves \
+                 capture silently dead. If ZCode reports `hookCount: 0`, \
+                 remove that key from {}.",
+                path.display()
+            );
+        } else if *runs_nothing {
+            eprintln!(
+                // Only the provenance claim degrades between the two
+                // tiers; the consequence is identical, so state it at full
+                // strength. "If ZCode does not recognize it" keeps this
+                // honest about keys ZCode does accept, such as an empty
+                // `Notification`.
+                "# note: `hooks.events.{event}` runs nothing, and ai-memory \
+                 does not write that key. If ZCode does not recognize it, \
+                 ZCode rejects the ENTIRE hooks block, ai-memory's included, \
+                 and capture is dead while this file looks correct. If ZCode \
+                 reports `hookCount: 0`, remove that key from {}.",
+                path.display()
+            );
+        }
     }
     println!("# NOTE: ZCode injects SessionStart stdout as model context, so the");
     println!("#       prior session's handoff is delivered automatically.");
@@ -6442,30 +6529,31 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             );
         }
     }
-
-    /// #600: an ai-memory hook left under an event key this version no
-    /// longer manages (`SessionEnd` is not in `ZCODE_EVENTS`) must be
-    /// stripped on apply, not silently preserved. Before the fix the merge
-    /// only touched current keys, so the orphan survived and — because the
-    /// current keys matched — apply reported "already up to date".
     #[test]
-    fn zcode_apply_strips_orphan_ai_memory_hooks_under_unmanaged_events() {
+    fn zcode_apply_withdraws_our_hooks_from_foreign_keys_and_keeps_the_rest() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.json");
+        // Keys outside `ZCODE_EVENTS`. ZCode rejects the whole block over
+        // ones it does not recognize, which is how #600 stayed invisible.
+        // `SessionEnd` runs nothing, `PreCompact` holds only our entry, and
+        // `Notification` mixes our entry with a hook we did not write.
         fs::write(
             &path,
             r#"{
   "hooks": {
     "enabled": true,
     "events": {
-      "SessionEnd": [
+      "SessionEnd": [],
+      "PreCompact": [
         {"hooks": [
           {"type": "process", "command": "/old/ai-memory", "args": [],
-           "enabled": true, "statusMessage": "ai-memory capture (legacy)"}
+           "enabled": true, "statusMessage": "ai-memory capture"}
         ]}
       ],
-      "PreToolUse": [
-        {"matcher": "Bash", "hooks": [
+      "Notification": [
+        {"hooks": [
+          {"type": "process", "command": "/old/ai-memory", "args": [],
+           "enabled": true, "statusMessage": "ai-memory capture"},
           {"type": "process", "command": "/usr/bin/true", "args": [], "enabled": true}
         ]}
       ]
@@ -6480,32 +6568,78 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             config_file: Some(path.clone()),
             ..default_hook_args()
         };
-        apply_to_zcode_hooks("http://127.0.0.1:49374", None, Path::new("/data"), &args).unwrap();
 
-        let root: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        apply_to_zcode_hooks(
+            "http://127.0.0.1:49374",
+            Some("tok-test"),
+            Path::new("/data"),
+            &args,
+        )
+        .unwrap();
 
-        // The orphan SessionEnd ai-memory hook is gone — the key emptied of
-        // ai-memory content is dropped entirely.
-        assert!(
-            root["hooks"]["events"].get("SessionEnd").is_none(),
-            "orphan ai-memory hook under an unmanaged event must be removed: {}",
-            root["hooks"]["events"]
+        let first = fs::read_to_string(&path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let events = root["hooks"]["events"].as_object().unwrap();
+
+        // Event keys are never deleted: they are not ai-memory's to remove.
+        assert!(events.contains_key("SessionEnd"));
+        assert!(events.contains_key("PreCompact"));
+        // Our own stale entry is withdrawn wherever it sits.
+        assert_eq!(
+            events["PreCompact"][0]["hooks"].as_array().unwrap().len(),
+            0,
+            "our entry under a key we no longer write must be withdrawn"
         );
-        // A third-party hook under a managed key survives untouched.
-        let pre = root["hooks"]["events"]["PreToolUse"].as_array().unwrap();
-        assert!(
-            pre.iter()
-                .any(|g| g["matcher"] == serde_json::json!("Bash")),
-            "third-party matcher group must survive"
+        // The mixed group is the only case where the ownership filter
+        // decides anything: the foreign hook survives, ours does not.
+        let notification = events["Notification"][0]["hooks"].as_array().unwrap();
+        assert_eq!(notification.len(), 1, "the hook we did not write must stay");
+        assert_eq!(
+            notification[0]["command"],
+            serde_json::json!("/usr/bin/true")
         );
-        // The current ai-memory events are all installed.
         for (zcode_event, _) in super::super::render_shared::ZCODE_EVENTS {
             assert!(
                 root["hooks"]["events"][zcode_event].is_array(),
                 "missing {zcode_event}"
             );
         }
+
+        // Re-apply is still a no-op once the withdrawal has happened.
+        apply_to_zcode_hooks(
+            "http://127.0.0.1:49374",
+            Some("tok-test"),
+            Path::new("/data"),
+            &args,
+        )
+        .unwrap();
+        assert_eq!(first, fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn zcode_event_runs_nothing_covers_degenerate_matcher_groups() {
+        // Each of these leaves the key present but unable to run anything,
+        // which is what makes ZCode reject the block while the file still
+        // looks settled (#600).
+        for shape in [
+            serde_json::json!([]),
+            serde_json::json!([{}]),
+            serde_json::json!([{"matcher": "*"}]),
+            serde_json::json!([{"hooks": []}]),
+            serde_json::json!([{"hooks": null}]),
+        ] {
+            assert!(
+                zcode_event_runs_nothing(&shape),
+                "expected {shape} to run nothing"
+            );
+        }
+        assert!(!zcode_event_runs_nothing(&serde_json::json!([
+            {"hooks": [{"type": "process", "command": "/usr/bin/true"}]}
+        ])));
+        // A value that is not a matcher-group array cannot run hooks either,
+        // and is doubly invalid to ZCode. It is left unmodified, but it is
+        // still reported: staying quiet about it is the #600 failure.
+        assert!(zcode_event_runs_nothing(&serde_json::json!(42)));
     }
 
     #[test]

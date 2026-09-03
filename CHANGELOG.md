@@ -30,23 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AI_MEMORY_LLM_HEADERS` entry for `user-agent` overrides it. The Copilot
   provider is unchanged: it keeps `GitHubCopilotChat/<version>`, the
   editor-plugin agent GitHub's Copilot API expects.
-- The `opencode` provider now sends `x-opencode-session` on every request,
-  defaulting to one id per process when `AI_MEMORY_LLM_HEADERS` does not
-  supply one. OpenCode's Go documentation covers third-party access to its
-  endpoints and asks callers to identify themselves; both Go and Zen
-  correlate requests by that header, and traffic without it is reported as
-  unattributable.
-  Set the header explicitly to keep the value stable across restarts or to
-  tell several ai-memory instances apart.
+- `x-opencode-session` and the `opencode` user agent, both shipped in 2.0.2,
+  are now operator-overridable like any other header: an
+  `AI_MEMORY_LLM_HEADERS` entry for either name takes precedence over the
+  provider's default. The default remains 2.0.2's — one `LlmOperationId` per
+  logical operation, stable across retries and the strict/tolerant fallback —
+  so nothing changes unless an operator asks for it. Override the session
+  header to tell several ai-memory instances apart in OpenCode's metrics.
 
 ### Fixed
-- `install-hooks --agent zcode --apply` now removes stale ai-memory
-  hooks left under event keys this version no longer manages (e.g. a
-  legacy `SessionEnd`), instead of reporting "already up to date" while
-  a broken/orphaned entry lingered (#600). The dry-run printed snippet
-  also now states plainly that `--apply` persists the auth token to
-  `<data-dir>/auth-token` (0600) and writes token-less args, so the
-  applied config differs from the embedded-token snippet by design.
 - Local-embedding model download (`fetch_model`) now bounds a stalled
   connection instead of hanging startup forever (#602): a 30s connect
   timeout and a generous 600s overall ceiling (large model files, so
@@ -73,6 +65,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not imply a secret, so it must be qualified by an auth word:
   `Idempotency-Key`, `Continuation-Token` and storage partition keys are
   left intact and stay readable in captured output.
+- `install-hooks --agent zcode --apply` no longer reports a hooks block
+  ZCode has thrown away as `no-op … (already up to date)` (#600). ZCode
+  validates `hooks.events` strictly and rejects the whole block, including
+  ai-memory's own entries, over a single key it does not recognize, so
+  capture never ran (`hookCount: 0`). Apply only ever merged the six event
+  keys it writes, so a key it does not write was neither inspected nor
+  reported, the file kept matching byte for byte, and the report claimed
+  the install was current. Apply now also withdraws ai-memory's own
+  entries from event keys it no longer writes, wherever they sit, and
+  reports what it found: a warning naming any key it withdrew from, and a
+  note for a key left unable to run anything, both naming the config file.
+  **Changed output:** an unchanged ZCode config with such a key now reports
+  `no-op … (unchanged; see the notes below)` instead of `already up to
+  date`, so a redirected stdout no longer carries the reassurance without
+  the cause. Event keys are never deleted and hooks ai-memory did not write
+  are never removed, so a key holding someone else's hook is reported, not
+  touched.
+- OpenCode Go requests now send `User-Agent: ai-memory/<version>` and a
+  per-operation `x-opencode-session` header. Session consolidation and
+  auto-improvement reuse the captured ai-memory session ID, while retries and
+  structured-output fallback keep the same ID instead of appearing as unrelated
+  requests (#608).
 - `AI_MEMORY_LLM_BASE_URL` now works with `AI_MEMORY_LLM_PROVIDER=opencode`.
   The provider hardcoded OpenCode's **Go** endpoint and the factory dropped
   the configured base URL without a word, so Zen's general catalogue at
