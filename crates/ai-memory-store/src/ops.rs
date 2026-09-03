@@ -3627,6 +3627,30 @@ pub fn purge_session(
 /// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
 /// still live and `force` is false, or [`StoreError`] if any SQL statement
 /// fails. The transaction is rolled back automatically on error.
+/// Whether `(workspace_id, project_id)` — or the whole workspace — was purged
+/// and tombstoned by [`purge_project`] / [`delete_workspace`] (#607).
+///
+/// Returns true when either an exact project tombstone exists or a
+/// whole-workspace tombstone (the `zeroblob(16)` sentinel project id) covers
+/// the workspace. `reindex` calls this before recreating a scope from on-disk
+/// `_meta.md`, so a purge whose file removal crashed cannot be resurrected.
+pub fn scope_is_purged(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+) -> StoreResult<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM purged_scopes \
+             WHERE workspace_id = ?1 AND (project_id = ?2 OR project_id = zeroblob(16)) \
+             LIMIT 1",
+            rusqlite::params![workspace_id.as_bytes(), project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -3749,6 +3773,17 @@ pub fn purge_project(
         rusqlite::params![&pid[..], workspace_id.as_bytes()],
     )?;
 
+    // Tombstone the scope so a `reindex` cannot resurrect it from an on-disk
+    // directory the post-commit file removal failed to (or crashed before)
+    // deleting. Written in the same transaction as the DELETE so the deletion
+    // and its terminality commit atomically (#607). `INSERT OR REPLACE` keeps
+    // a repeated purge idempotent and refreshes `purged_at`.
+    tx.execute(
+        "INSERT OR REPLACE INTO purged_scopes (workspace_id, project_id, purged_at) \
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![workspace_id.as_bytes(), &pid[..], now],
+    )?;
+
     // Attributed audit trail for the destructive purge. `page_id` is None
     // (the whole project is gone); the operator identity comes from the
     // authenticated request (NULL when single-user / unauthenticated).
@@ -3854,6 +3889,18 @@ pub fn delete_workspace(
     if removed == 0 {
         return Err(StoreError::NotFound("workspace".into()));
     }
+
+    // Whole-workspace tombstone (#607): a 16-byte all-zero project id marks the
+    // entire workspace as purged so `reindex` cannot recreate it — or any of
+    // its projects — from on-disk `_meta.md` that the post-commit directory
+    // removal failed to delete. Same transaction as the DELETE for atomic
+    // terminality.
+    tx.execute(
+        "INSERT OR REPLACE INTO purged_scopes (workspace_id, project_id, purged_at) \
+         VALUES (?1, zeroblob(16), ?2)",
+        rusqlite::params![&wid[..], Timestamp::now().as_microsecond()],
+    )?;
+
     tx.commit()?;
 
     if compaction == Compaction::Reclaim {
@@ -5039,6 +5086,52 @@ pub(crate) mod tests {
     /// docs and `docs/lifecycle-ops.md` cannot drift away from the behaviour:
     /// if this starts failing, byte-level removal became the default and all
     /// three need updating together.
+    #[test]
+    fn purge_project_tombstones_the_scope_against_resurrection() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        seed_session(&mut conn, ws, proj, "canaryproj");
+
+        assert!(
+            !scope_is_purged(&conn, &ws, &proj).unwrap(),
+            "a live project is not tombstoned"
+        );
+
+        purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            None,
+            false,
+            Compaction::Skip,
+        )
+        .unwrap();
+
+        assert!(
+            scope_is_purged(&conn, &ws, &proj).unwrap(),
+            "purge must tombstone the scope so reindex cannot resurrect it"
+        );
+        // A different, un-purged project in the same workspace is unaffected.
+        assert!(
+            !scope_is_purged(&conn, &ws, &ai_memory_core::ProjectId::new()).unwrap(),
+            "the tombstone is scoped to the purged project id only"
+        );
+    }
+
+    #[test]
+    fn delete_workspace_tombstones_the_whole_workspace() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        delete_workspace(&mut conn, &ws, true, Compaction::Skip).unwrap();
+
+        // The whole-workspace tombstone covers every project id in that ws,
+        // including ones whose rows are already gone via cascade.
+        assert!(scope_is_purged(&conn, &ws, &proj).unwrap());
+        assert!(scope_is_purged(&conn, &ws, &ai_memory_core::ProjectId::new()).unwrap());
+        // A different workspace is not affected by the sentinel.
+        assert!(!scope_is_purged(&conn, &ai_memory_core::WorkspaceId::new(), &proj).unwrap());
+    }
+
     #[test]
     fn purge_project_is_a_logical_delete_by_default() {
         let (tmp, mut conn, ws, proj) = fresh_db();

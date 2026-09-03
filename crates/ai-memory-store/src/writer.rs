@@ -77,6 +77,11 @@ pub(crate) enum WriteCmd {
         repo_path: Option<String>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    ScopeIsPurged {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     UpsertPage {
         page: NewPage,
         reply: oneshot::Sender<StoreResult<PageId>>,
@@ -722,6 +727,26 @@ impl WriterHandle {
             workspace_id,
             name: name.into(),
             repo_path,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Whether the scope was purged by `purge_project` / `delete_workspace` and
+    /// tombstoned. `reindex` consults this before recreating a scope from
+    /// on-disk `_meta.md` so a purge that crashed before its files were removed
+    /// cannot be silently undone (#607). Routed through the writer actor
+    /// because it owns the connection and is always present.
+    pub async fn scope_is_purged(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ScopeIsPurged {
+            workspace_id,
+            project_id,
             reply: tx,
         })
         .await?;
@@ -2444,6 +2469,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     repo_path.as_deref(),
                 );
                 send_or_warn(reply, result, "ensure_project_with_id");
+            }
+            WriteCmd::ScopeIsPurged {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = ops::scope_is_purged(&conn, &workspace_id, &project_id);
+                send_or_warn(reply, result, "scope_is_purged");
             }
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);

@@ -1,5 +1,6 @@
 //! [`Wiki`] — the only correct write path for the markdown source-of-truth.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,6 +32,10 @@ pub struct ReindexSummary {
     pub projects: usize,
     /// Pages reindexed from the wiki tree.
     pub pages: usize,
+    /// Project directories skipped because their scope was purged and
+    /// tombstoned (#607) — a purge whose on-disk removal did not complete.
+    /// Their pages are deliberately not resurrected.
+    pub skipped_purged: usize,
 }
 
 enum PageStoreRemoval {
@@ -110,7 +115,19 @@ pub struct Wiki {
     /// the directory rename and SQLite re-stamp so stale writes cannot land
     /// files under the old workspace while the project is in flight.
     mutation_lock: Arc<RwLock<()>>,
+    /// Per-page write serialization (#607, item 3). Two concurrent writes to
+    /// the *same* `(ws, proj, path)` would otherwise interleave their
+    /// file-rename and DB-upsert under the shared `mutation_lock` read guard,
+    /// transiently leaving on-disk markdown disagreeing with the DB `latest`
+    /// row. Each path gets its own async mutex, so same-path writers serialize
+    /// while different paths still run concurrently. The map is GC'd
+    /// opportunistically — entries no writer currently holds are dropped on the
+    /// next acquisition — so it stays bounded to currently-contended paths.
+    page_locks: Arc<std::sync::Mutex<HashMap<PageKey, Arc<tokio::sync::Mutex<()>>>>>,
 }
+
+/// Key uniquely identifying a page for per-path write serialization.
+type PageKey = (WorkspaceId, ProjectId, PagePath);
 
 impl Wiki {
     /// Construct a wiki handle rooted at `<data_dir>/wiki/`. Creates the
@@ -132,6 +149,7 @@ impl Wiki {
             admission_chain: None,
             store_reader: None,
             mutation_lock: Arc::new(RwLock::new(())),
+            page_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1392,6 +1410,21 @@ impl Wiki {
         let mut seen_ws = std::collections::HashSet::new();
 
         for (ws, proj, proj_root) in project_dirs {
+            // A purged scope must not be resurrected from an on-disk directory
+            // its purge failed to remove (#607). The tombstone is terminal:
+            // skip the whole directory rather than recreating the scope row and
+            // reindexing its pages. The files stay inert (the watcher skips
+            // them too, #613) until a later purge or manual cleanup removes
+            // them; reindex stays non-destructive.
+            if self.writer.scope_is_purged(ws, proj).await? {
+                tracing::debug!(
+                    workspace = %ws,
+                    project = %proj,
+                    "skipping reindex of a purged (tombstoned) scope",
+                );
+                summary.skipped_purged += 1;
+                continue;
+            }
             if seen_ws.insert(ws) {
                 let ws_dir = proj_root
                     .parent()
@@ -1598,6 +1631,14 @@ impl Wiki {
 
         let (ids, dispatches) = {
             let _guard = self.mutation_lock.read().await;
+            // Serialize every path in this batch against concurrent single-page
+            // or batch writers to the same path (#607). Sorted acquisition
+            // keeps a batch deadlock-free against any other writer.
+            let batch_keys: Vec<PageKey> = staged
+                .iter()
+                .map(|(req, _, _, _)| (req.workspace_id, req.project_id, req.path.clone()))
+                .collect();
+            let _page_guards = self.lock_pages(&batch_keys).await;
             let mut staged_files: Vec<(
                 WritePageRequest,
                 tempfile::NamedTempFile,
@@ -1683,6 +1724,53 @@ impl Wiki {
         }
 
         Ok(ids)
+    }
+
+    /// Acquire the per-path write lock for one page, serializing concurrent
+    /// writers to the same `(ws, proj, path)` while different paths run
+    /// concurrently. See [`Wiki::page_locks`].
+    async fn lock_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut map = self.page_locks.lock().expect("page_locks mutex poisoned");
+            // Opportunistic GC under the same short critical section that hands
+            // out locks: an entry whose only remaining strong ref is the map's
+            // own (count == 1) has no live guard and no waiter, so drop it.
+            map.retain(|_, v| Arc::strong_count(v) > 1);
+            Arc::clone(
+                map.entry((workspace_id, project_id, path.clone()))
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
+    }
+
+    /// Acquire per-path write locks for a batch of pages in a deterministic
+    /// global order (sorted by id/path bytes, deduped) so a batch write and any
+    /// concurrent single-page or batch writer can never deadlock. See
+    /// [`Wiki::page_locks`].
+    async fn lock_pages(&self, keys: &[PageKey]) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut ordered: Vec<PageKey> = keys.to_vec();
+        // The id newtypes are not `Ord`, so order by their byte / string
+        // representation — any total order works, it only has to be consistent
+        // across all acquirers.
+        ordered.sort_by(|a, b| {
+            (a.0.as_bytes(), a.1.as_bytes(), a.2.as_str()).cmp(&(
+                b.0.as_bytes(),
+                b.1.as_bytes(),
+                b.2.as_str(),
+            ))
+        });
+        ordered.dedup();
+        let mut guards = Vec::with_capacity(ordered.len());
+        for (ws, proj, path) in ordered {
+            guards.push(self.lock_page(ws, proj, &path).await);
+        }
+        guards
     }
 
     /// Write `body` (with optional `frontmatter`) atomically to
@@ -1799,6 +1887,11 @@ impl Wiki {
 
         let page_id = {
             let _guard = self.mutation_lock.read().await;
+            // Serialize with any concurrent write to this same path, so the
+            // file-rename and DB-upsert below cannot interleave with another
+            // writer's and leave disk disagreeing with the DB `latest` row
+            // (#607). Different paths still proceed concurrently.
+            let _page_guard = self.lock_page(workspace_id, project_id, &path).await;
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
             let abs = self.abs_path(workspace_id, project_id, &path);
@@ -4196,6 +4289,156 @@ mod tests {
             .unwrap()
             .expect("page exists");
         let _ = meta;
+    }
+
+    /// #607 item 2: a purge commits the DB deletion but removes on-disk files
+    /// only afterward (best-effort). If that removal is interrupted, the
+    /// markdown directory — `_meta.md` included — survives with no `projects`
+    /// row. `reindex_all` must NOT resurrect it: the tombstone written in the
+    /// purge transaction makes the deletion terminal.
+    #[tokio::test]
+    async fn reindex_does_not_resurrect_a_purged_scope_whose_files_survived() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let path = PagePath::new("notes/keep.md").unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/keep.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Keep"}),
+            body: "survivor".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+        // Manifests reindex reads to recreate scopes from disk.
+        wiki.backfill_scope_manifests().await.unwrap();
+
+        // Purge the DB only (store side); the on-disk files intentionally
+        // survive — exactly the crash-before-file-removal window.
+        store
+            .writer
+            .purge_project(
+                ws,
+                proj,
+                "default/scratch",
+                None,
+                false,
+                ai_memory_store::Compaction::Skip,
+            )
+            .await
+            .unwrap();
+        let meta_on_disk = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string())
+            .join("_meta.md");
+        assert!(
+            meta_on_disk.exists(),
+            "the purge left the manifest on disk (the crash window this guards)"
+        );
+
+        let summary = wiki.reindex_all().await.unwrap();
+
+        assert_eq!(
+            summary.skipped_purged, 1,
+            "the purged scope must be skipped"
+        );
+        assert_eq!(
+            summary.projects, 0,
+            "the purged project must not be recreated"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, path.as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "a purged page must not reappear in the index"
+        );
+    }
+
+    /// #607 item 3: two concurrent writes to the SAME page path must not
+    /// interleave their file-rename and DB-upsert. Per-path serialization
+    /// guarantees the winning writer's body lands in both the on-disk file and
+    /// the DB `is_latest` row — they never disagree about who won.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_path_writes_keep_file_and_db_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let path = PagePath::new("notes/hot.md").unwrap();
+        let mk = |tag: char| WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/hot.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Hot"}),
+            body: format!("body-{tag}"),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        };
+
+        // Many rounds so any interleave window is likely to be exercised.
+        for _ in 0..25 {
+            let (wa, wb) = (wiki.clone(), wiki.clone());
+            let (ra, rb) = (mk('a'), mk('b'));
+            let ha = tokio::spawn(async move { wa.write_page(ra).await });
+            let hb = tokio::spawn(async move { wb.write_page(rb).await });
+            ha.await.unwrap().unwrap();
+            hb.await.unwrap().unwrap();
+
+            let on_disk = wiki.read_page(ws, proj, &path).unwrap().body;
+            let in_db = store
+                .reader
+                .page_body_by_ids(ws, proj, path.as_str())
+                .await
+                .unwrap()
+                .expect("a latest row exists")
+                .body;
+            // Compare who won, not exact bytes (emit/parse normalizes newlines):
+            // the file and the DB latest row must reflect the same writer.
+            assert_eq!(
+                on_disk.contains("body-a"),
+                in_db.contains("body-a"),
+                "file ({on_disk:?}) and DB latest ({in_db:?}) disagree on the winning writer"
+            );
+        }
     }
 
     /// Backward-compat: anonymous writes do not add attribution frontmatter.

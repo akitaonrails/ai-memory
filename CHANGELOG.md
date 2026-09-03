@@ -93,6 +93,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace mismatch to hunt for; the disambiguating lookup runs only on the
   failure path, so the common case still pays a single query.
 
+### Security
+- A purged project or workspace can no longer be resurrected by a later
+  `reindex` (#607, data-layer audit follow-up, item 2). `purge_project` /
+  `delete_workspace` commit the DB deletion first and remove on-disk files
+  afterward, best-effort; a crash or failure in that window left the markdown
+  directory (`_meta.md` included) on disk with no row, and `reindex` rebuilt
+  the scope from that manifest — silently undoing the purge. Each purge now
+  writes a `purged_scopes` tombstone in the same transaction as the deletion
+  (a whole-workspace delete uses a `zeroblob(16)` sentinel project id), and
+  `reindex_all` skips any tombstoned scope instead of recreating it. The
+  inert files are left for a later purge or manual cleanup; reindex stays
+  non-destructive.
+- Concurrent writes to the *same* page path are now serialized (#607, item 3).
+  Per-page writes take the shared side of the wiki mutation lock, so two
+  writes to one `(workspace, project, path)` could interleave their
+  file-rename and DB-upsert and transiently leave the on-disk markdown
+  disagreeing with the DB `is_latest` row (self-healing on reindex, no data
+  loss). A per-path async lock now serializes same-path writers while
+  different paths still proceed concurrently; batches acquire their paths in a
+  fixed global order so they cannot deadlock.
+
 ## [2.0.2] - 2026-09-03
 
 ### Fixed
