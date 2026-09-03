@@ -160,6 +160,15 @@ pub struct BootstrapPage {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BootstrapBatch {
     /// Pages to create.
+    ///
+    /// Defaulted because a chunk legitimately has nothing to add: later
+    /// chunks receive the paths earlier ones already wrote, so a model
+    /// that judges the material covered answers with a rationale and no
+    /// `pages` key. Anthropic's `tool_use` schema does not enforce
+    /// required fields the way OpenAI's `strict: true` does, so that
+    /// answer reaches serde — and without a default it aborts the whole
+    /// multi-chunk run, discarding every page the earlier chunks paid for.
+    #[serde(default)]
     pub pages: Vec<BootstrapPage>,
     /// Brief one-paragraph note about what was processed, surfaced
     /// in the wiki/bootstrap.md manifest + the auto-commit message.
@@ -1554,6 +1563,16 @@ mod tests {
         assert_eq!(collected, 27_873);
         assert_eq!(sent, 1);
         assert_eq!(dropped, 27_872);
+    }
+
+    #[test]
+    fn batch_without_pages_key_deserialises_as_empty() {
+        let batch: BootstrapBatch =
+            serde_json::from_str(r#"{"rationale":"already covered by earlier chunks"}"#)
+                .expect("a chunk that adds no pages must not fail the whole run");
+
+        assert!(batch.pages.is_empty());
+        assert_eq!(batch.rationale, "already covered by earlier chunks");
     }
 
     #[test]

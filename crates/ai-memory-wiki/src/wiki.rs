@@ -474,7 +474,7 @@ impl Wiki {
         }
     }
 
-    async fn ensure_project_workspace(
+    pub(crate) async fn ensure_project_workspace(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,

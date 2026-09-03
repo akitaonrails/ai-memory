@@ -414,6 +414,49 @@ LaunchDaemon on macOS. Same shape as the Docker variant.
 
 ---
 
+## Long-running requests: `bootstrap` and proxy idle timeouts
+
+`ai-memory bootstrap` on a large repository holds a **single POST open for
+the whole multi-chunk run** — often 20+ minutes — while the server makes
+LLM calls, with no bytes flowing over the wire in between. A reverse proxy
+with a default idle/read timeout in front of the server will cut that
+connection (`Connection reset by peer`), and the run is lost.
+
+If you run `bootstrap` through a proxy, raise or disable the upstream
+read/write timeout for ai-memory's route.
+
+**Caddy** — disable the backend read/write timeouts on the `reverse_proxy`:
+
+```caddyfile
+memory.example.com {
+    reverse_proxy ai-memory:49374 {
+        transport http {
+            read_timeout 0
+            write_timeout 0
+        }
+    }
+}
+```
+
+**nginx** — raise `proxy_read_timeout` / `proxy_send_timeout` (default 60s)
+well past your longest run:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:49374;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    # plus the http/1.1 + Connection "" lines from the nginx template above
+}
+```
+
+This only matters for the long-held `bootstrap` POST; ordinary MCP and
+`/api/v1` requests are short and unaffected. (A genuinely failed chunk still
+loses the run today — the durable-progress/`--resume` question is tracked
+separately; see #614.)
+
+---
+
 ## What ai-memory does to support being behind a proxy
 
 Nothing special — the server intentionally generates no absolute URLs

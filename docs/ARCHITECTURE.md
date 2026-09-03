@@ -706,7 +706,9 @@ under the distinct `provider="openai-compat"` identity.
 * [`docs/research-agentmemory.md`](research-agentmemory.md),
   [`research-basic-memory.md`](research-basic-memory.md),
   [`research-cognee.md`](research-cognee.md),
-  [`research-ecc.md`](research-ecc.md) - prior art studied.
+  [`research-ecc.md`](research-ecc.md),
+  [`research-codebase-memory-mcp.md`](research-codebase-memory-mcp.md) -
+  prior art studied.
 * [`docs/auto-improvement-loop.md`](auto-improvement-loop.md) -
   Hermes Agent-inspired learning-loop research and safety boundaries.
 * [`docs/issues-*.md`](.) - concrete failure modes we've designed to

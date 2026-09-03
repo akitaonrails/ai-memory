@@ -49,6 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#606])
 
 ### Fixed
+- `bootstrap` no longer aborts the whole multi-chunk run when one chunk
+  returns no `pages` key (#614). Later chunks are told which paths
+  earlier ones wrote, so a model that judges the material already
+  covered legitimately answers with a rationale and no pages; because
+  Anthropic's `tool_use` schema does not enforce required fields the way
+  OpenAI's `strict: true` does, that answer reached serde and failed
+  deserialisation with `missing field 'pages'`. Since pages are only
+  written after every chunk completes, the error discarded the work of
+  all preceding chunks. `pages` now defaults to empty.
 - `install-hooks --agent antigravity-cli` on native Windows now emits
   an unquoted hook `command` (#611). The native-binary rendering wrapped
   the executable, `--data-dir`, and `--server-url` in double quotes, but
@@ -69,6 +78,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   favour of `OPENCODE_GO_BASE_URL`: the constant named Zen but has always
   held Go's URL. It keeps its value, so code compiled against it is
   unaffected. ([#606])
+- The wiki watcher no longer logs a scope-resolution failure for every page
+  in a project directory the store has no row for, on every pass, forever
+  (#613). The OKF v0.2 migration seeded an `index.md` into orphan directories
+  (dirs with a valid-UUID name but no `projects` row — near-empty shells left
+  by older history), and the watcher then warned once per file per 30s
+  reconciliation pass indefinitely — hundreds of identical lines that buried
+  real warnings, including, on one host, a 22-hour `sqlite: disk I/O error`.
+  Reconcile now checks the project scope once per directory and skips an
+  unresolvable one wholesale at `debug`, rather than retrying its pages; if
+  the row later appears the directory indexes normally on the next pass.
+- The store error for an unknown project id now says "does not exist" instead
+  of "does not belong to workspace X" (#612). A dangling id names no
+  workspace mismatch to hunt for; the disambiguating lookup runs only on the
+  failure path, so the common case still pays a single query.
 
 ## [2.0.2] - 2026-09-03
 

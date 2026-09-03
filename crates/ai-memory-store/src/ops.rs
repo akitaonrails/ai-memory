@@ -532,6 +532,15 @@ pub fn ensure_project_with_id(
 /// Wiki writes call this before touching the filesystem so a stale hook/cache
 /// carrying the old workspace for a moved project fails before it can create an
 /// orphan file. The pairing INSERT triggers are still the final SQL backstop.
+///
+/// The two ways this fails need different words, because they send a reader
+/// looking in different places. A project that moved workspaces is a stale
+/// pairing: the row exists, and the caller's copy of its scope is out of date.
+/// A project id with no row at all is a dangling reference — nothing moved,
+/// and there is no scoping question to answer. Reporting the second as "does
+/// not belong to workspace X" costs whoever reads that line a hunt for a
+/// workspace/project mismatch that does not exist. The disambiguating query
+/// runs only on the failure path, so the common case still pays one lookup.
 pub fn ensure_project_workspace(
     conn: &Connection,
     workspace_id: &WorkspaceId,
@@ -545,12 +554,23 @@ pub fn ensure_project_workspace(
         )
         .optional()?;
     if found.is_some() {
-        Ok(())
-    } else {
-        Err(StoreError::NotFound(format!(
-            "project {project_id} does not belong to workspace {workspace_id}"
-        )))
+        return Ok(());
     }
+    let owner: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT workspace_id FROM projects WHERE id = ?1",
+            params![project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Err(StoreError::NotFound(match owner {
+        Some(owner) => format!(
+            "project {project_id} does not belong to workspace {workspace_id}; \
+             it belongs to {}",
+            WorkspaceId::from_slice(&owner)?
+        ),
+        None => format!("project {project_id} does not exist"),
+    }))
 }
 
 /// Upsert a batch of pages inside one transaction. Either *all* pages
@@ -8303,6 +8323,38 @@ pub(crate) mod tests {
                 Err(StoreError::NotFound(_))
             ),
             "a stale workspace/project pair must fail before wiki writes touch disk"
+        );
+    }
+
+    #[test]
+    fn ensure_project_workspace_separates_a_moved_project_from_a_missing_one() {
+        let (_tmp, conn, ws, proj) = fresh_db();
+        let other_ws = WorkspaceId::new();
+        let ghost = ProjectId::new();
+
+        // The project exists, but the caller carries a stale workspace: the
+        // message has to name where it actually lives, or the reader cannot
+        // tell a stale cache from a corrupt one.
+        let moved = ensure_project_workspace(&conn, &other_ws, &proj).unwrap_err();
+        let moved = moved.to_string();
+        assert!(
+            moved.contains(&ws.to_string()) && moved.contains(&other_ws.to_string()),
+            "a moved project must name both the real and the supplied workspace, got: {moved}"
+        );
+
+        // No row at all. Saying this "does not belong to workspace X" sends
+        // the reader hunting a scoping bug that is not there — the id is
+        // simply dangling.
+        let missing = ensure_project_workspace(&conn, &ws, &ghost)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("does not exist"),
+            "a dangling project id must be reported as missing, got: {missing}"
+        );
+        assert!(
+            !missing.contains("does not belong to workspace"),
+            "a dangling project id must not be described as a workspace mismatch, got: {missing}"
         );
     }
 
