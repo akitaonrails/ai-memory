@@ -78,45 +78,69 @@ set small *by construction*, not by after-the-fact pruning.
 - **Hard budget.** A configurable cap (default small, e.g. **≤ 15 promoted
   rules / ~40 lines**) on the managed block. Promotion is admission-controlled
   against it.
-- **Evict to admit.** At the cap, a new rule promotes only by demoting the
-  lowest-scoring current rule back to retrieval-only (it is not deleted — it
-  returns to the `_rules/` page, still queryable). Score = confidence ×
-  breadth × recency-of-use.
-- **Decay & demotion.** A promoted rule that stops being exercised (no related
-  activity, no reinforcement) decays and is demoted, so the block reflects
-  *current* policy, not accumulated history — the same decay philosophy the
-  store already uses for pages.
-- **Never auto-promote silently on the hot path.** Promotion runs through the
-  existing eval-gated, staged **auto-improve** pipeline (pending-writes,
-  reviewed), never as a live side effect of a session.
+- **Evict to admit — but the user chooses.** At the cap, `rules approve`
+  refuses to silently overflow: it names the lowest-scoring current rule and
+  asks the user to `remove` it (or raise the cap) first. Nothing is demoted
+  without a command. Score = confidence × breadth × recency-of-use, used only
+  to *rank* and to *suggest* what to drop.
+- **Decay lowers rank, never removes.** A promoted rule that stops being
+  exercised sinks in `rules recommend` and can be flagged stale for the user
+  to `remove`, so the block trends toward *current* policy — but the removal
+  is always a human command, never automatic.
+- **Never writes on the hot path.** The classifier/scorer that *produce*
+  candidates can reuse the consolidation machinery, but the AGENTS.md block is
+  written *only* by an explicit `approve`/`edit`/`remove` — never as a live
+  side effect of a session (see §6).
 
-## 6. Transparency — "just enough," never behind the user's back
+## 6. Command-driven, never auto-editing (maintainer's call, and the right one)
 
-The maintainer's exact requirement: transparent by default, not verbose,
-notify *just enough* so nothing changes silently.
+The feature does **not** edit AGENTS.md on its own. There is no background
+writer and no "auto-apply." ai-memory only ever *recommends*; the human's
+explicit command is the only thing that changes the file. This is strictly
+better than staged-auto-apply for the maintainer's stated fear — the user is
+in the loop *by construction*, so nothing can change behind their back, and
+there is no "did I get notified enough?" problem to tune.
 
-- **One managed, delimited block.** Reuse the existing marker mechanism
-  (`ai_memory_core::routing_snippet`: `<!-- ai-memory:start -->` …
-  `<!-- ai-memory:end -->`). Promoted rules live **only** inside a clearly
-  labelled sub-block (e.g. `<!-- ai-memory: promoted rules (managed) -->`),
-  so the human's hand-written AGENTS.md is never touched, and the boundary of
-  "what ai-memory added" is unambiguous and reversible.
-- **Provenance per rule.** Each promoted line carries a terse trailer — source
-  page + confidence — so the reader can see *why* it's there and open the full
-  memory.
-- **Opt-in, and staged.** Promotion is **off by default**; when on, each
-  promotion/demotion is a *pending* change the operator reviews (the
-  auto-improve staging surface), not an automatic edit — the same gate the
-  rest of auto-improve uses.
-- **Notify at the right altitude.** When a promotion/demotion is staged (or
-  applied, if the operator enabled auto-apply), surface it *once*, concisely:
-  a `status` line ("2 rules promoted, 1 demoted this cycle — review with …")
-  and the diff of the managed block. No per-turn chatter; no silent edits.
-  The principle: the user should never discover a behavior change by
-  debugging — but should also never be nagged.
-- **Fully reversible.** Removing the managed block (or turning the feature
-  off) restores the prior AGENTS.md byte-for-byte; demoted rules lose nothing
-  (the `_rules/` page remains).
+**The command surface** (CLI, mirrored as MCP tools so an agent can run them
+when the user asks):
+
+- **`ai-memory rules recommend`** — read-only. Lists candidate promotions the
+  classifier/scorer surfaced (§4–5), ranked, each with: the one-line rule,
+  source page, confidence, breadth signal, and *why it qualified*. Changes
+  nothing. This is the discovery surface — the user asks "what have you
+  learned that's rule-worthy?" and sees a short, ranked list, not a wall.
+- **`ai-memory rules approve <id>`** — promote one candidate into the managed
+  AGENTS.md block. If the block is at budget, the command *tells the user*
+  ("at 15/15; approving this means dropping <lowest>, or raise the cap") and
+  does nothing until they decide — eviction is a user choice, never silent.
+- **`ai-memory rules edit <id>`** — tweak the rule's wording before/after
+  promoting (the human phrasing usually beats the extracted one).
+- **`ai-memory rules remove <id>`** — demote a promoted rule back to
+  retrieval-only. The `_rules/` page is untouched; only the AGENTS.md line goes.
+- **`ai-memory rules list`** — show what is currently promoted (the managed
+  block's contents, with provenance).
+
+**Guarantees:**
+- **One managed, delimited block.** The block reuses the existing marker
+  mechanism (`ai_memory_core::routing_snippet`: `<!-- ai-memory:start -->` …
+  `<!-- ai-memory:end -->`), in a clearly labelled sub-block (e.g.
+  `<!-- ai-memory: promoted rules (managed) -->`). The human's hand-written
+  AGENTS.md outside the markers is **never** touched.
+- **Provenance per rule.** Each promoted line carries a terse trailer (source
+  page + confidence) so a reader sees *why* it's there and can open the memory.
+- **Recommendations are pull, not push.** Candidates accrue silently; the user
+  sees them only when they run `recommend`. The one *optional*, low-key nudge:
+  a single `status` line ("N new rule recommendations — `ai-memory rules
+  recommend`") when the candidate set grows, off by a config flag. No per-turn
+  chatter, no pending-writes to babysit.
+- **Fully reversible.** Removing the managed block (or never running `approve`)
+  leaves AGENTS.md exactly as the human wrote it; `remove`/demotion loses
+  nothing (the `_rules/` page remains queryable).
+
+The earlier auto-improve staging path is *not* used here — promotion is a
+deliberate, human-issued edit, not an eval-gated background write. (The
+classifier/scorer that *produce* candidates can still reuse the consolidation
+machinery; only the write is command-gated.)
 
 ## 7. Reusing what already exists
 
@@ -135,12 +159,19 @@ Nothing here needs a new subsystem — it composes primitives 2.0 already ships:
 
 **2.1 (this feature):**
 - Config: `[rules_promotion] enabled` (default false), `max_promoted`,
-  `min_confidence`, `auto_apply` (default false → stage only).
+  `min_confidence`, and `recommend_hint` (the optional one-line `status`
+  nudge; default off). **No `auto_apply` — there is none.**
 - The classifier (§4) + scorer (§5) over `_rules/` candidates.
-- A managed "promoted rules" sub-block writer via `routing_snippet`, with
-  provenance trailers, staged through auto-improve.
-- `status` reporting of the promoted set + last cycle's promote/demote deltas.
-- Demotion/decay.
+- The command surface: `rules recommend` / `approve` / `edit` / `remove` /
+  `list` (CLI + MCP tools), each read-only except the three that the user
+  explicitly invokes to change the managed block.
+- The managed "promoted rules" sub-block writer via `routing_snippet`, with
+  provenance trailers — written **only** by `approve`/`edit`/`remove`.
+- `status` reporting of the currently-promoted set (and the optional
+  new-recommendations hint).
+- Demotion via `remove`; decay only *lowers a rule's rank in `recommend`* and
+  can flag a stale promoted rule for the user to `remove` — it never
+  auto-removes.
 
 **Later (explicitly out of 2.1):**
 - Cross-project / team rule sharing.
@@ -151,11 +182,15 @@ Nothing here needs a new subsystem — it composes primitives 2.0 already ships:
 ## 9. Open questions (for maintainer input before coding)
 
 1. Budget default: is ~15 rules / ~40 lines the right ceiling, or tighter?
-2. Should promotion ever auto-apply, or always stay stage-and-review?
-3. Where should the managed block sit — AGENTS.md, CLAUDE.md, or both (and
+2. Where should the managed block sit — AGENTS.md, CLAUDE.md, or both (and
    how to avoid double-loading when a tool reads both)?
-4. Demotion signal: pure decay, or also an explicit "this rule was wrong"
-   feedback that hard-demotes and records a `contradicts` edge?
+3. Should `approve` also (optionally) emit a small commit so the promotion is
+   captured in the repo's history, or leave that to the user's normal flow?
+4. `recommend`'s default verbosity: top-N only (say 5), with a `--all` flag?
+
+*(Resolved by maintainer, 2026-09-03: no auto-editing of AGENTS.md — the
+feature only recommends; `approve`/`edit`/`remove` commands are the only
+things that write the managed block. §6 reflects this.)*
 
 ---
 
