@@ -13,6 +13,7 @@ use ai_memory_llm::types::ChatRequest;
 use ai_memory_llm::{
     DEFAULT_USER_AGENT, ExtraHeaders, ProviderAuth, ProviderChoice, ProviderConfig, build_provider,
 };
+use secrecy::SecretString;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -118,4 +119,55 @@ async fn provider_owned_headers_survive_alongside_operator_headers() {
         1,
         "provider auth must be sent exactly once"
     );
+}
+
+/// The `opencode` provider defaults to Go, so a base URL an operator sets
+/// must actually redirect it — this is the regression the silently-dropped
+/// `ProviderConfig::base_url` caused. Driving it against a mock is the only
+/// way to see *where* the request went.
+#[tokio::test]
+async fn an_operator_base_url_redirects_the_opencode_provider() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .mount(&server)
+        .await;
+
+    let provider = build_provider(ProviderConfig {
+        provider: ProviderChoice::OpenCode,
+        model: "mistral-nemo".into(),
+        auth: ProviderAuth::required_api_key_from_env(
+            "OPENCODE_API_KEY",
+            Some(SecretString::from("sk-test")),
+        ),
+        base_url: Some(server.uri()),
+        compat_strict: false,
+        request_timeout_secs: 30,
+        reasoning_effort: None,
+        extra_headers: ExtraHeaders::default(),
+    })
+    .expect("provider builds");
+
+    provider
+        .complete(ChatRequest::user_prompt("hi"))
+        .await
+        .expect("the override must reach the mock, not opencode.ai");
+
+    let received = server
+        .received_requests()
+        .await
+        .expect("mock recorded requests");
+    assert_eq!(received.len(), 1, "request did not reach the override");
+
+    // Redirecting must not cost the caller its identity: Zen and Go
+    // correlate requests by the same header.
+    let request = &received[0];
+    assert!(
+        values(request, "x-opencode-session")
+            .first()
+            .is_some_and(|v| v.starts_with("ai-memory-")),
+        "session header lost when the base URL was overridden"
+    );
+    assert_eq!(values(request, "user-agent"), vec![DEFAULT_USER_AGENT]);
 }

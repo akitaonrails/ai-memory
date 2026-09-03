@@ -595,7 +595,9 @@ AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth |
                            gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
-AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
+AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
+                           opencode (defaults to the Go endpoint, set
+                           https://opencode.ai/zen/v1 for Zen's catalogue)
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort

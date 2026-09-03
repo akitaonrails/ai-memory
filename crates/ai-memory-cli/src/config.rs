@@ -182,7 +182,7 @@ pub struct Config {
     /// `Name: Value` (or `Name=Value`) entries. Empty by default.
     ///
     /// Exists for gateways that require a caller-identifying header:
-    /// OpenCode Zen/Go asks callers for `x-opencode-session` plus a specific
+    /// OpenCode asks callers for `x-opencode-session` plus a specific
     /// `User-Agent` and reports traffic carrying neither as an unknown
     /// client. Set with
     /// `AI_MEMORY_LLM_HEADERS=x-opencode-session=…,user-agent=…` (comma
@@ -1376,7 +1376,9 @@ impl Config {
         }
     }
 
-    /// Base URL fallback for `llm-test --provider openai-compat`.
+    /// Base URL fallback for `llm-test`. Resolves exactly as
+    /// [`Self::provider_config`] does, so `llm-test` exercises the endpoint
+    /// `serve` will use — including an `opencode` override onto Zen.
     #[must_use]
     pub fn llm_test_base_url(&self) -> Option<String> {
         self.llm_base_url

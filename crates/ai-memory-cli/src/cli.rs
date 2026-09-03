@@ -1649,7 +1649,7 @@ pub enum LlmProviderChoice {
     OpenaiOauth,
     /// GitHub Copilot Chat backend.
     Copilot,
-    /// OpenCode Zen/Go cloud API.
+    /// OpenCode cloud API (Go by default; AI_MEMORY_LLM_BASE_URL selects Zen).
     Opencode,
 }
 

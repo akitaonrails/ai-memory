@@ -40,7 +40,7 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 ///
 /// `reqwest` sends no `User-Agent` at all unless one is configured, so every
 /// ai-memory provider request used to arrive anonymous. Gateways increasingly
-/// require callers to identify themselves — OpenCode Zen/Go asks for a
+/// require callers to identify themselves — OpenCode asks for a
 /// specific agent ("no broad user agents") and reports traffic without one as
 /// an unknown client — and an unattributable request is the one a rate
 /// limiter throttles first.
@@ -111,7 +111,9 @@ pub use openai_oauth::{
     OPENAI_OAUTH_TOKEN_URL, OpenAiExtras, OpenAiOAuthProvider, OpenAiOAuthToken,
     OpenAiOAuthTokenResponse,
 };
-pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
+#[allow(deprecated)]
+pub use opencode::OPENCODE_ZEN_BASE_URL;
+pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_GO_BASE_URL, OpenCodeProvider};
 pub use provider::{LlmProvider, complete_structured};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;

@@ -99,6 +99,18 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Repoint the wrapped [`OpenAiProvider`] at another base URL.
+    ///
+    /// For a wrapper that constructs with a product default and lets the
+    /// operator override it — [`crate::OpenCodeProvider`] defaults to Go and
+    /// accepts Zen this way. `new` already takes a base URL, so a direct
+    /// caller has no need for this.
+    #[must_use]
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.inner = self.inner.with_base_url(url);
+        self
+    }
+
     /// Override the per-request timeout on the wrapped
     /// [`OpenAiProvider`]. The factory calls this with
     /// `ProviderConfig::request_timeout_secs`.
@@ -125,9 +137,17 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Endpoint the inner client will call. Test-visible so
+    /// [`crate::OpenCodeProvider`]'s tests can assert Go stays the default
+    /// and a Zen override takes effect.
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        self.inner.base_url()
+    }
+
     /// Headers the inner client will send. Test-visible so the
-    /// [`crate::OpenCodeProvider`] tests can assert its Zen/Go defaults
-    /// survive delegation.
+    /// [`crate::OpenCodeProvider`] tests can assert its Go defaults survive
+    /// delegation.
     #[cfg(test)]
     pub(crate) fn extra_headers(&self) -> &crate::ExtraHeaders {
         self.inner.extra_headers()

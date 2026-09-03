@@ -32,13 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   editor-plugin agent GitHub's Copilot API expects.
 - The `opencode` provider now sends `x-opencode-session` on every request,
   defaulting to one id per process when `AI_MEMORY_LLM_HEADERS` does not
-  supply one. OpenCode Zen/Go documents third-party access to its endpoints
-  and asks callers to identify themselves and to send that header for
-  request correlation; traffic without it is reported as unattributable.
+  supply one. OpenCode's Go documentation covers third-party access to its
+  endpoints and asks callers to identify themselves; both Go and Zen
+  correlate requests by that header, and traffic without it is reported as
+  unattributable.
   Set the header explicitly to keep the value stable across restarts or to
   tell several ai-memory instances apart.
 
 ### Fixed
+- `AI_MEMORY_LLM_BASE_URL` now works with `AI_MEMORY_LLM_PROVIDER=opencode`.
+  The provider hardcoded OpenCode's **Go** endpoint and the factory dropped
+  the configured base URL without a word, so Zen's general catalogue at
+  `https://opencode.ai/zen/v1` was unreachable through it — Zen and Go are
+  separate products, not two spellings of one. Go remains the default, so
+  existing setups are unaffected; an override keeps the `x-opencode-session`
+  default and the user agent, since both endpoints correlate requests the
+  same way. Model ids are per catalogue, so set `AI_MEMORY_LLM_MODEL`
+  explicitly when overriding. `OPENCODE_ZEN_BASE_URL` is deprecated in
+  favour of `OPENCODE_GO_BASE_URL`: the constant named Zen but has always
+  held Go's URL. It keeps its value, so code compiled against it is
+  unaffected.
 - `as_of` time-travel queries and the entity retrieval stream now work
   on real stores. Both read the entity index, which was populated only
   from an LLM consolidator's `entities:` frontmatter — absent on the

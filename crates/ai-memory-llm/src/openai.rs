@@ -166,6 +166,13 @@ impl OpenAiProvider {
 
     /// Headers this provider will send. Test-visible so the wrapper tests
     /// (`OpenAiCompatProvider`, `OpenCodeProvider`) can assert delegation.
+    /// Endpoint the client will call. Test-visible so wrappers that default
+    /// the base URL and let it be overridden can assert which one is set.
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     #[cfg(test)]
     pub(crate) fn extra_headers(&self) -> &ExtraHeaders {
         &self.extra_headers

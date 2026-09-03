@@ -203,7 +203,7 @@ impl ReasoningEffort {
 
 /// Operator-supplied HTTP headers attached to every chat request.
 ///
-/// Some gateways require a caller-identifying header: OpenCode Zen/Go asks
+/// Some gateways require a caller-identifying header: OpenCode asks
 /// every tool on its endpoint to send `x-opencode-session` and to identify
 /// itself with a specific `User-Agent`, and flags accounts whose traffic
 /// carries neither. Rather than teach each provider one gateway's wire

@@ -37,7 +37,8 @@ pub enum ProviderChoice {
     Copilot,
     /// Anthropic Messages API via a Claude-subscription OAuth token.
     AnthropicOAuth,
-    /// OpenCode Zen/Go cloud API (OpenAI-compatible endpoint).
+    /// OpenCode cloud API (OpenAI-compatible endpoint). Defaults to the Go
+    /// endpoint; `base_url` selects Zen's general catalogue instead.
     OpenCode,
 }
 
@@ -110,7 +111,7 @@ pub struct ProviderConfig {
     /// the field so the model default applies. Gemini and Copilot ignore it.
     pub reasoning_effort: Option<crate::ReasoningEffort>,
     /// Operator-supplied HTTP headers sent on every chat request. Gateways
-    /// that require a caller-identifying header (OpenCode Zen/Go asks for
+    /// that require a caller-identifying header (OpenCode asks for
     /// `x-opencode-session` and a specific `User-Agent`) are configured
     /// through this rather than per-provider special cases. Parsed once from
     /// `AI_MEMORY_LLM_HEADERS` by `Config::load`; empty by default.
@@ -366,8 +367,16 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         }
         ProviderChoice::OpenCode => {
             let key = config.auth.require_api_key()?;
+            // Defaults to Go; an operator reaches Zen's general catalogue
+            // through AI_MEMORY_LLM_BASE_URL. Silently dropping the override
+            // (as this arm used to) left `provider=opencode` unable to speak
+            // to anything but Go.
+            let mut provider = OpenCodeProvider::new(key, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
             Ok(Arc::new(
-                OpenCodeProvider::new(key, config.model)?
+                provider
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers),
