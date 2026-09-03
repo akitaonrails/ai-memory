@@ -82,8 +82,9 @@ from hook paths.
    converge. Existing ended sessions are baselined at migration instead of
    becoming historical catch-up work. Auto-commits the wiki. Clients
    without a reliable true session-end hook need an explicit ending action:
-   use `ai-memory finalize-session` for Codex, or
-   `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI.
+   `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI
+   (Codex has a native `SessionEnd` since CLI 0.145.0; `finalize-session
+   --agent codex` is only the fallback on older Codex).
    The command selects the latest matching open session and enters the same
    canonical SessionEnd path as a native hook. Generated session-page
    frontmatter records `session_id` plus the immutable `sessions.agent_kind`
