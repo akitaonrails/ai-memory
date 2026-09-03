@@ -22,7 +22,7 @@ use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited, response_text_limited};
 use crate::stored_token::{StoredOAuthToken, refresh_grant};
 use crate::text::truncate_with_ellipsis;
-use crate::types::{ChatRequest, ChatResponse, ReasoningEffort, Usage};
+use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
 
 /// OpenAI OAuth issuer used by Codex/OpenCode.
 pub const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
@@ -140,6 +140,7 @@ pub struct OpenAiOAuthProvider {
     token: Mutex<OpenAiOAuthToken>,
     timeout: Duration,
     reasoning_effort: Option<ReasoningEffort>,
+    extra_headers: ExtraHeaders,
 }
 
 impl OpenAiOAuthProvider {
@@ -162,6 +163,7 @@ impl OpenAiOAuthProvider {
             token: Mutex::new(token),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -170,6 +172,14 @@ impl OpenAiOAuthProvider {
     #[must_use]
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
         self
     }
 
@@ -216,6 +226,7 @@ impl OpenAiOAuthProvider {
             .header("originator", "codex_cli_rs")
             .header("session_id", uuid::Uuid::new_v4().to_string())
             .json(body);
+        request = self.extra_headers.apply(request);
         if let Some(account_id) = token.extra.account_id.as_deref() {
             request = request.header("chatgpt-account-id", account_id);
         }

@@ -9,8 +9,8 @@
 use std::path::{Path, PathBuf};
 
 use ai_memory_llm::{
-    AuthRequirement, EmbedderChoice, EmbedderConfig, LlmError, LlmResult, OPENCODE_DEFAULT_MODEL,
-    ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort,
+    AuthRequirement, EmbedderChoice, EmbedderConfig, ExtraHeaders, LlmError, LlmResult,
+    OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -178,6 +178,22 @@ pub struct Config {
     /// `reasoning`, xAI Grok `reasoning_effort`, Anthropic
     /// `output_config.effort`, Codex `reasoning.effort`).
     pub llm_reasoning_effort: Option<ReasoningEffort>,
+    /// Extra HTTP headers attached to every LLM chat request, as
+    /// `Name: Value` (or `Name=Value`) entries. Empty by default.
+    ///
+    /// Exists for gateways that require a caller-identifying header:
+    /// OpenCode Zen/Go asks callers for `x-opencode-session` plus a specific
+    /// `User-Agent` and reports traffic carrying neither as an unknown
+    /// client. Set with
+    /// `AI_MEMORY_LLM_HEADERS=x-opencode-session=…,user-agent=…` (comma
+    /// separated, so a header *value* cannot contain a comma — use
+    /// `llm_headers` in `config.toml` for those) or `llm_headers = [...]`.
+    ///
+    /// Headers ai-memory sets itself (`authorization`, `content-type`,
+    /// `x-api-key`, …) are refused at startup: `reqwest` appends rather than
+    /// replaces, so a duplicate would break the request instead of
+    /// overriding it. Values are never logged.
+    pub llm_headers: Vec<String>,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -634,6 +650,7 @@ impl Default for Config {
             llm_compat_strict: true,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             llm_reasoning_effort: None,
+            llm_headers: Vec::new(),
             consolidate_on_session_end: false,
             capture_assistant: false,
             strip_root_combinators: false,
@@ -1032,6 +1049,13 @@ impl Config {
                 config.llm_timeout_secs
             );
         }
+        // Parsed (and discarded) here so a malformed header list is rejected
+        // at startup rather than on the first consolidation pass. The typed
+        // value is rebuilt by `llm_provider_config`: `ExtraHeaders` is not
+        // serialisable, and `Config` must stay so.
+        config
+            .llm_extra_headers()
+            .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?;
         validate_auth_secrets(&config.auth)?;
 
         Ok(config)
@@ -1043,11 +1067,22 @@ impl Config {
         self.server_url != DEFAULT_SERVER_URL || self.runtime_env.server_url.is_some()
     }
 
+    /// Parse [`Self::llm_headers`] into typed header material.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] for an entry with no `Name: Value`
+    /// separator, an invalid header name or value, or a header ai-memory
+    /// sets itself.
+    pub fn llm_extra_headers(&self) -> LlmResult<ExtraHeaders> {
+        ExtraHeaders::parse(&self.llm_headers)
+    }
+
     /// Build the configured LLM provider settings, if LLM support is enabled.
     ///
     /// # Errors
-    /// Returns [`LlmError::NotConfigured`] for unknown providers or missing
-    /// provider-specific required values.
+    /// Returns [`LlmError::NotConfigured`] for unknown providers, missing
+    /// provider-specific required values, or a malformed
+    /// [`Self::llm_headers`] entry.
     pub fn llm_provider_config(&self) -> LlmResult<Option<ProviderConfig>> {
         let Some(provider_raw) = non_empty(self.llm_provider.as_deref()) else {
             return Ok(None);
@@ -1101,6 +1136,7 @@ impl Config {
             compat_strict: self.llm_compat_strict,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
+            extra_headers: self.llm_extra_headers()?,
         }))
     }
 
@@ -1889,6 +1925,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn load_round_trips_llm_headers() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "llm_headers = [\"x-opencode-session=ses-1\", \"x-tool: ai-memory\"]\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.llm_headers,
+            vec!["x-opencode-session=ses-1", "x-tool: ai-memory"]
+        );
+    }
+
+    #[test]
+    fn llm_headers_default_to_none_configured() {
+        assert!(Config::default().llm_headers.is_empty());
+    }
+
+    /// Parsed during `load` so a typo surfaces at startup rather than on the
+    /// first consolidation pass, hours later.
+    #[test]
+    fn load_rejects_a_malformed_llm_header() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_headers = [\"no-separator-here\"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a malformed header entry must fail closed");
+        assert!(
+            error.to_string().contains("AI_MEMORY_LLM_HEADERS"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// A duplicate `authorization` would break provider auth rather than
+    /// override it, so the boundary refuses it outright.
+    #[test]
+    fn load_rejects_an_llm_header_ai_memory_owns() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "llm_headers = [\"authorization: Bearer x\"]\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a reserved header must fail closed");
+        assert!(
+            format!("{error:#}").contains("set by ai-memory itself"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     fn load_reasoning_effort(raw: &str) -> anyhow::Result<Config> {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
@@ -2475,6 +2566,36 @@ mod tests {
 
         let provider = cfg.llm_provider_config().unwrap().unwrap();
         assert_eq!(provider.reasoning_effort, effort);
+    }
+
+    #[test]
+    fn provider_config_forwards_the_operator_headers() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            llm_provider: Some("opencode".into()),
+            llm_headers: vec!["x-opencode-session=ses-1".into()],
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(
+            provider.extra_headers,
+            ExtraHeaders::parse(["x-opencode-session=ses-1"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_config_defaults_to_no_operator_headers() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            llm_provider: Some("opencode".into()),
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert_eq!(provider.extra_headers, ExtraHeaders::default());
     }
 
     #[test]

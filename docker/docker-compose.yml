@@ -32,6 +32,11 @@ services:
       # anthropic | openai | openai-oauth | anthropic-oauth | copilot |
       # gemini | openai-compat | opencode
       # See .env.production.example for the full reference.
+      #
+      # Extra headers on every LLM chat request, for a gateway that requires
+      # a caller-identifying one. Comma-separated `Name=Value` entries; the
+      # default `User-Agent: ai-memory/<version>` needs no configuration.
+      # - AI_MEMORY_LLM_HEADERS=x-opencode-session=homelab-01
     healthcheck:
       test: ["CMD", "/usr/local/bin/ai-memory", "status"]
       interval: 30s

@@ -36,6 +36,22 @@
 /// (read once by `Config::load`, applied to every chat provider).
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// `User-Agent` ai-memory sends on provider requests.
+///
+/// `reqwest` sends no `User-Agent` at all unless one is configured, so every
+/// ai-memory provider request used to arrive anonymous. Gateways increasingly
+/// require callers to identify themselves — OpenCode Zen/Go asks for a
+/// specific agent ("no broad user agents") and reports traffic without one as
+/// an unknown client — and an unattributable request is the one a rate
+/// limiter throttles first.
+///
+/// Layered *under* `AI_MEMORY_LLM_HEADERS` by
+/// [`factory::build_provider`], so an operator can still override it. The
+/// Copilot provider keeps [`copilot::COPILOT_USER_AGENT`] instead: GitHub's
+/// Copilot API expects the editor-plugin agent and rejects requests without
+/// it.
+pub const DEFAULT_USER_AGENT: &str = concat!("ai-memory/", env!("CARGO_PKG_VERSION"));
+
 pub mod anthropic;
 pub mod auth;
 pub mod copilot;
@@ -99,4 +115,6 @@ pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvid
 pub use provider::{LlmProvider, complete_structured};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
-pub use types::{ChatMessage, ChatRequest, ChatResponse, ReasoningEffort, Role, Usage};
+pub use types::{
+    ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Role, Usage,
+};

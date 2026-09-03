@@ -1762,6 +1762,31 @@ ceiling to match the gateway's worst-case generation time:
 -e AI_MEMORY_LLM_TIMEOUT_SECS=900
 ```
 
+#### Send a caller-identifying header to a gateway that requires one
+
+Every chat request already carries `User-Agent: ai-memory/<version>`, so a
+gateway can tell what is calling it. Some also require a header of their own
+for request correlation, and reject or throttle traffic without it. Declare
+those once — they are sent on every chat request, whatever the provider:
+
+```bash
+-e AI_MEMORY_LLM_HEADERS=x-opencode-session=prod-01,x-opencode-client=ai-memory
+```
+
+Entries are `Name=Value` or `Name: Value`, comma separated. A header *value*
+cannot contain a comma through the env var; use `llm_headers = [...]` in
+`config.toml` when one must. Headers ai-memory sets itself (`authorization`,
+`content-type`, `x-api-key`, `x-goog-api-key`, `anthropic-version`,
+`anthropic-beta`, `openai-beta`, `host`, `content-length`) are refused at
+startup rather than duplicated onto the request. An entry for `user-agent`
+overrides the default. Values are never logged.
+
+The `opencode` provider needs no configuration for this: OpenCode Zen/Go asks
+callers for `x-opencode-session`, so that provider generates one per process
+unless `AI_MEMORY_LLM_HEADERS` supplies it. Set it explicitly when several
+ai-memory instances should be distinguishable, or should stay stable across
+restarts.
+
 #### Match the consolidation budget to a local model's context window
 
 Consolidation defaults to an approximate 100k-token input target plus a 32k

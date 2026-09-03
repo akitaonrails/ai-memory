@@ -201,9 +201,156 @@ impl ReasoningEffort {
     }
 }
 
+/// Operator-supplied HTTP headers attached to every chat request.
+///
+/// Some gateways require a caller-identifying header: OpenCode Zen/Go asks
+/// every tool on its endpoint to send `x-opencode-session` and to identify
+/// itself with a specific `User-Agent`, and flags accounts whose traffic
+/// carries neither. Rather than teach each provider one gateway's wire
+/// quirks, the operator declares headers once (`AI_MEMORY_LLM_HEADERS`) and
+/// every chat provider sends them.
+///
+/// Parsed and validated at the configuration boundary, so providers consume
+/// typed header material and never re-parse operator strings — the rule
+/// provider auth already follows. Header values are treated as sensitive:
+/// they are marked as such on the wire and the [`std::fmt::Debug`] impl
+/// prints names only, because this is a plausible place for an operator to
+/// put a token.
+#[derive(Clone, Default, PartialEq)]
+pub struct ExtraHeaders(reqwest::header::HeaderMap);
+
+/// Headers ai-memory sets itself on provider requests. Rejected as operator
+/// input: `reqwest` appends rather than replaces, so a second `authorization`
+/// or `content-type` breaks the request instead of annotating it. Failing at
+/// startup beats failing on the first consolidation pass.
+const RESERVED_HEADERS: &[&str] = &[
+    "anthropic-beta",
+    "anthropic-version",
+    "authorization",
+    "content-length",
+    "content-type",
+    "host",
+    "openai-beta",
+    "x-api-key",
+    "x-goog-api-key",
+];
+
+impl ExtraHeaders {
+    /// Parse `Name: Value` / `Name=Value` entries, skipping blank ones.
+    ///
+    /// # Errors
+    /// [`LlmError::NotConfigured`] when an entry has no separator, carries an
+    /// invalid header name or value, or names a header from
+    /// [`RESERVED_HEADERS`].
+    pub fn parse<I, S>(entries: I) -> crate::error::LlmResult<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        use reqwest::header::{HeaderName, HeaderValue};
+
+        let mut map = reqwest::header::HeaderMap::new();
+        for (index, entry) in entries.into_iter().enumerate() {
+            let entry = entry.as_ref().trim();
+            if entry.is_empty() {
+                continue;
+            }
+            // 1-based: operators count list entries from one, and the index
+            // is what the message can safely name — see `split_entry`.
+            let (raw_name, raw_value) = split_entry(entry, index + 1)?;
+            let name = HeaderName::try_from(raw_name).map_err(|_| {
+                crate::error::LlmError::NotConfigured(format!(
+                    "AI_MEMORY_LLM_HEADERS entry {}: {raw_name:?} is not a valid HTTP header name",
+                    index + 1
+                ))
+            })?;
+            if RESERVED_HEADERS.contains(&name.as_str()) {
+                return Err(crate::error::LlmError::NotConfigured(format!(
+                    "AI_MEMORY_LLM_HEADERS entry {}: {name} is set by ai-memory itself \
+                     and cannot be overridden",
+                    index + 1
+                )));
+            }
+            let mut value = HeaderValue::try_from(raw_value).map_err(|_| {
+                // Names the header, never the value.
+                crate::error::LlmError::NotConfigured(format!(
+                    "AI_MEMORY_LLM_HEADERS entry {}: the value for {name} is not a valid \
+                     HTTP header value",
+                    index + 1
+                ))
+            })?;
+            value.set_sensitive(true);
+            map.insert(name, value);
+        }
+        Ok(Self(map))
+    }
+
+    /// Set `name: value` only when the operator has not configured that
+    /// header, so a provider default never overrides an explicit
+    /// `AI_MEMORY_LLM_HEADERS` entry.
+    pub(crate) fn set_default(
+        &mut self,
+        name: reqwest::header::HeaderName,
+        value: reqwest::header::HeaderValue,
+    ) {
+        if !self.0.contains_key(&name) {
+            self.0.insert(name, value);
+        }
+    }
+
+    /// Attach the configured headers to `builder`.
+    ///
+    /// Uses `RequestBuilder::headers`, which *replaces* any value already set
+    /// for the same name. `RequestBuilder::header` appends instead, which
+    /// would send two `user-agent` values on the Copilot provider (its client
+    /// carries one as a default) — a duplicate breaks the request rather than
+    /// overriding it.
+    pub(crate) fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.0.is_empty() {
+            return builder;
+        }
+        builder.headers(self.0.clone())
+    }
+
+    /// Value configured for `name`. Test-visible so provider tests can assert
+    /// what the boundary parsed without exposing values to normal callers.
+    #[cfg(test)]
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).and_then(|v| v.to_str().ok())
+    }
+}
+
+/// Names only — never values. `ProviderConfig` derives `Debug` and is logged
+/// on configuration errors.
+impl std::fmt::Debug for ExtraHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+/// Split `Name: Value` or `Name=Value` on whichever separator appears first,
+/// so a value containing the other character survives intact.
+///
+/// Errors name the entry by position rather than echoing it: an entry with no
+/// separator at all may well be a bare token the operator pasted by mistake.
+fn split_entry(entry: &str, position: usize) -> crate::error::LlmResult<(&str, &str)> {
+    let at = match (entry.find(':'), entry.find('=')) {
+        (Some(colon), Some(equals)) => colon.min(equals),
+        (Some(colon), None) => colon,
+        (None, Some(equals)) => equals,
+        (None, None) => {
+            return Err(crate::error::LlmError::NotConfigured(format!(
+                "AI_MEMORY_LLM_HEADERS entry {position} is neither `Name: Value` nor `Name=Value`"
+            )));
+        }
+    };
+    let (name, rest) = entry.split_at(at);
+    Ok((name.trim(), rest[1..].trim()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ReasoningEffort;
+    use super::{ExtraHeaders, ReasoningEffort};
     use rstest::rstest;
 
     const ALL_EFFORTS: [ReasoningEffort; 9] = [
@@ -285,5 +432,89 @@ mod tests {
         #[case] expected: ReasoningEffort,
     ) {
         assert_eq!(input.openai_wire_effort(), expected);
+    }
+    #[test]
+    fn parse_accepts_both_separators_and_trims() {
+        let headers =
+            ExtraHeaders::parse(["x-opencode-session = ses-1", "  x-tool: ai-memory  ", "  "])
+                .expect("valid entries");
+        assert_eq!(headers.get("x-opencode-session"), Some("ses-1"));
+        assert_eq!(headers.get("x-tool"), Some("ai-memory"));
+    }
+
+    /// A value containing `=` must survive a `Name: Value` entry, and one
+    /// containing `:` a `Name=Value` entry — the split takes the *first*
+    /// separator, not whichever kind it finds.
+    #[test]
+    fn parse_splits_on_the_first_separator_only() {
+        let headers =
+            ExtraHeaders::parse(["x-a: k=v", "x-b=https://example.test/p"]).expect("valid entries");
+        assert_eq!(headers.get("x-a"), Some("k=v"));
+        assert_eq!(headers.get("x-b"), Some("https://example.test/p"));
+    }
+
+    #[test]
+    fn parse_rejects_entry_without_a_separator() {
+        let err = ExtraHeaders::parse(["sk-not-a-header"]).expect_err("must fail closed");
+        let rendered = err.to_string();
+        assert!(rendered.contains("entry 1"), "{rendered}");
+        // The malformed entry may be a pasted secret; it must not be echoed.
+        assert!(!rendered.contains("sk-not-a-header"), "{rendered}");
+    }
+
+    #[test]
+    fn parse_rejects_invalid_header_name() {
+        let err = ExtraHeaders::parse(["not a name: v"]).expect_err("must fail closed");
+        assert!(err.to_string().contains("valid HTTP header name"));
+    }
+
+    /// Newlines are the header-injection vector; rejecting them closes it.
+    /// The message names the header but never the offending value.
+    #[test]
+    fn parse_rejects_invalid_header_value_without_echoing_it() {
+        let err = ExtraHeaders::parse(["x-a: bad\nvalue-smuggled"]).expect_err("must fail closed");
+        let rendered = err.to_string();
+        assert!(rendered.contains("value for x-a"), "{rendered}");
+        assert!(!rendered.contains("smuggled"), "{rendered}");
+    }
+
+    #[rstest::rstest]
+    #[case("authorization: Bearer x")]
+    #[case("Content-Type: text/plain")]
+    #[case("x-api-key: k")]
+    #[case("anthropic-version: 2023-06-01")]
+    fn parse_rejects_headers_ai_memory_owns(#[case] entry: &str) {
+        let err = ExtraHeaders::parse([entry]).expect_err("reserved header must fail closed");
+        assert!(err.to_string().contains("set by ai-memory itself"), "{err}");
+    }
+
+    #[test]
+    fn set_default_never_overrides_an_operator_entry() {
+        let mut headers = ExtraHeaders::parse(["user-agent: mine/1"]).expect("valid");
+        headers.set_default(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static("fallback/1"),
+        );
+        assert_eq!(headers.get("user-agent"), Some("mine/1"));
+    }
+
+    #[test]
+    fn set_default_fills_an_absent_header() {
+        let mut headers = ExtraHeaders::default();
+        headers.set_default(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static("fallback/1"),
+        );
+        assert_eq!(headers.get("user-agent"), Some("fallback/1"));
+    }
+
+    /// `ProviderConfig` derives `Debug` and gets rendered into configuration
+    /// errors; values must not ride along.
+    #[test]
+    fn debug_renders_names_but_not_values() {
+        let headers = ExtraHeaders::parse(["x-opencode-session: ses-secret"]).expect("valid");
+        let rendered = format!("{headers:?}");
+        assert!(rendered.contains("x-opencode-session"), "{rendered}");
+        assert!(!rendered.contains("ses-secret"), "{rendered}");
     }
 }

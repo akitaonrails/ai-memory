@@ -115,6 +115,23 @@ impl OpenAiCompatProvider {
         self.inner = self.inner.with_reasoning_effort(effort);
         self
     }
+
+    /// Forward operator-configured headers to the inner client. Aggregators
+    /// and gateways behind an OpenAI-compatible endpoint are the common case
+    /// for caller-identifying headers.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: crate::ExtraHeaders) -> Self {
+        self.inner = self.inner.with_extra_headers(headers);
+        self
+    }
+
+    /// Headers the inner client will send. Test-visible so the
+    /// [`crate::OpenCodeProvider`] tests can assert its Zen/Go defaults
+    /// survive delegation.
+    #[cfg(test)]
+    pub(crate) fn extra_headers(&self) -> &crate::ExtraHeaders {
+        self.inner.extra_headers()
+    }
 }
 
 #[async_trait]

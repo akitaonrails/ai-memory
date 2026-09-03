@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, ReasoningEffort, Usage};
+use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
 
 /// Default Anthropic API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -47,6 +47,7 @@ pub struct AnthropicProvider {
     model: String,
     timeout: Duration,
     reasoning_effort: Option<ReasoningEffort>,
+    extra_headers: ExtraHeaders,
 }
 
 impl AnthropicProvider {
@@ -64,6 +65,7 @@ impl AnthropicProvider {
             model: model.into(),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -85,6 +87,7 @@ impl AnthropicProvider {
             model: model.into(),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -109,6 +112,14 @@ impl AnthropicProvider {
     #[must_use]
     pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
         self
     }
 }
@@ -301,7 +312,7 @@ impl AnthropicProvider {
         for (name, value) in self.auth_headers() {
             builder = builder.header(name, value);
         }
-        let resp = builder.json(body).send().await?;
+        let resp = self.extra_headers.apply(builder).json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;

@@ -19,7 +19,7 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Role, Usage};
 
 /// Default Gemini API base.
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -31,6 +31,7 @@ pub struct GeminiProvider {
     base_url: String,
     model: String,
     timeout: Duration,
+    extra_headers: ExtraHeaders,
 }
 
 impl GeminiProvider {
@@ -47,6 +48,7 @@ impl GeminiProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -62,6 +64,14 @@ impl GeminiProvider {
     #[must_use]
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
         self
     }
 }
@@ -233,15 +243,14 @@ impl GeminiProvider {
             self.model
         );
         debug!(url, "POST gemini");
-        let resp = self
-            .client
-            .post(&url)
-            .timeout(self.timeout)
-            .header("x-goog-api-key", self.api_key.expose_secret())
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await?;
+        let request = self.extra_headers.apply(
+            self.client
+                .post(&url)
+                .timeout(self.timeout)
+                .header("x-goog-api-key", self.api_key.expose_secret())
+                .header("content-type", "application/json"),
+        );
+        let resp = request.json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `AI_MEMORY_LLM_HEADERS` (`llm_headers` in `config.toml`) attaches extra
+  HTTP headers to every LLM chat request, for gateways that require a
+  caller-identifying header. Entries are `Name=Value` or `Name: Value`,
+  comma separated in the env var. Parsed and validated once at the
+  configuration boundary, so a malformed entry fails at startup rather than
+  on the first consolidation pass, and providers consume typed header
+  material instead of operator strings. Headers ai-memory sets itself
+  (`authorization`, `content-type`, `x-api-key`, `x-goog-api-key`,
+  `anthropic-version`, `anthropic-beta`, `openai-beta`, `host`,
+  `content-length`) are refused: `reqwest` appends rather than replaces, so a
+  duplicate would break the request instead of overriding it. Values are
+  marked sensitive on the wire and never logged — the `Debug` output carries
+  header names only.
+
+### Changed
+- Every LLM chat request now sends `User-Agent: ai-memory/<version>`.
+  `reqwest` sends no user agent unless one is configured, so provider
+  requests previously arrived anonymous, and gateways that require callers to
+  identify themselves reported ai-memory as an unknown client. An
+  `AI_MEMORY_LLM_HEADERS` entry for `user-agent` overrides it. The Copilot
+  provider is unchanged: it keeps `GitHubCopilotChat/<version>`, the
+  editor-plugin agent GitHub's Copilot API expects.
+- The `opencode` provider now sends `x-opencode-session` on every request,
+  defaulting to one id per process when `AI_MEMORY_LLM_HEADERS` does not
+  supply one. OpenCode Zen/Go documents third-party access to its endpoints
+  and asks callers to identify themselves and to send that header for
+  request correlation; traffic without it is reported as unattributable.
+  Set the header explicitly to keep the value stable across restarts or to
+  tell several ai-memory instances apart.
+
 ### Fixed
 - `as_of` time-travel queries and the entity retrieval stream now work
   on real stores. Both read the entity index, which was populated only

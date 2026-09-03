@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, ReasoningEffort, Usage};
+use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
 
 /// Default OpenAI API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -91,6 +91,7 @@ pub struct OpenAiProvider {
     dialect: RequestDialect,
     timeout: Duration,
     reasoning_effort: Option<ReasoningEffort>,
+    extra_headers: ExtraHeaders,
 }
 
 impl OpenAiProvider {
@@ -110,6 +111,7 @@ impl OpenAiProvider {
             dialect: RequestDialect::Official,
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -152,6 +154,21 @@ impl OpenAiProvider {
     pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
         self.reasoning_effort = effort;
         self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Headers this provider will send. Test-visible so the wrapper tests
+    /// (`OpenAiCompatProvider`, `OpenCodeProvider`) can assert delegation.
+    #[cfg(test)]
+    pub(crate) fn extra_headers(&self) -> &ExtraHeaders {
+        &self.extra_headers
     }
 }
 
@@ -362,15 +379,14 @@ impl OpenAiProvider {
     async fn post<B: Serialize>(&self, body: &B) -> LlmResult<OpenAiResponse> {
         let url = normalize_openai_base(&self.base_url, "chat/completions");
         debug!(url, "POST openai");
-        let resp = self
-            .client
-            .post(&url)
-            .timeout(self.timeout)
-            .bearer_auth(self.api_key.expose_secret())
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await?;
+        let request = self.extra_headers.apply(
+            self.client
+                .post(&url)
+                .timeout(self.timeout)
+                .bearer_auth(self.api_key.expose_secret())
+                .header("content-type", "application/json"),
+        );
+        let resp = request.json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
