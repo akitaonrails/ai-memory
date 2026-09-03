@@ -87,7 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real warnings, including, on one host, a 22-hour `sqlite: disk I/O error`.
   Reconcile now checks the project scope once per directory and skips an
   unresolvable one wholesale at `debug`, rather than retrying its pages; if
-  the row later appears the directory indexes normally on the next pass.
+  the row later appears the directory indexes normally on the next pass. The
+  same orphan skip now also guards the real-time directory-event path
+  (`reindex_project_dir`), not just the periodic pass (#616).
 - The store error for an unknown project id now says "does not exist" instead
   of "does not belong to workspace X" (#612). A dangling id names no
   workspace mismatch to hunt for; the disambiguating lookup runs only on the

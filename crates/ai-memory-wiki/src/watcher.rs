@@ -244,21 +244,39 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
     }
 }
 
+/// Returns `false` when the directory was skipped because the store has no
+/// row for it — the same orphan case `reconcile` counts as `skipped_orphans`,
+/// surfaced here so the skip is testable on this path too.
 async fn reindex_project_dir(
     wiki: &Wiki,
     ws: WorkspaceId,
     proj: ProjectId,
     proj_root: std::path::PathBuf,
-) {
+) -> bool {
+    // Same orphan guard `reconcile` applies (#613), for the other way a
+    // project directory reaches the indexer. A filesystem event on a rowless
+    // directory would otherwise walk it and warn once per page, which is the
+    // behaviour that pass was about — quieter here only because it needs an
+    // event rather than firing every 30s. Checking once per directory also
+    // saves walking a tree whose every page is going to fail scope resolution.
+    if let Err(e) = wiki.ensure_project_workspace(ws, proj).await {
+        debug!(
+            workspace = %ws,
+            project = %proj,
+            error = %e,
+            "skipping directory event for a project directory with no store row",
+        );
+        return false;
+    }
     let pages = match tokio::task::spawn_blocking(move || walk_markdown(&proj_root)).await {
         Ok(Ok(pages)) => pages,
         Ok(Err(e)) => {
             warn!(error = %e, "watcher directory walk failed");
-            return;
+            return true;
         }
         Err(e) => {
             warn!(error = %e, "watcher directory walk task failed");
-            return;
+            return true;
         }
     };
 
@@ -268,6 +286,7 @@ async fn reindex_project_dir(
             Err(e) => warn!(path = %path, error = %e, "watcher directory reindex failed"),
         }
     }
+    true
 }
 
 /// Outcome of one reconciliation pass, for the caller's telemetry and tests.
@@ -826,6 +845,40 @@ mod tests {
         assert!(
             stranded.is_empty(),
             "an orphan directory's page must not be indexed"
+        );
+    }
+
+    /// The sibling of `reconcile_skips_project_dirs_with_no_store_row` (#613):
+    /// a directory event reaches the indexer through `reindex_project_dir`,
+    /// which had no orphan guard. Rarer than the 30s pass, same defect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn directory_events_skip_project_dirs_with_no_store_row() {
+        let (tmp, store, wiki, ws, _proj) = setup().await;
+        let wiki_root = tmp.path().join("wiki");
+
+        let orphan = ProjectId::new();
+        let orphan_dir = wiki_root.join(ws.to_string()).join(orphan.to_string());
+        std::fs::create_dir_all(&orphan_dir).unwrap();
+        std::fs::write(orphan_dir.join("index.md"), "seeded shell\n").unwrap();
+        std::fs::write(orphan_dir.join("stale.md"), "eventtoken content\n").unwrap();
+
+        // Exactly what a Create/Modify event on the directory triggers.
+        let indexed = reindex_project_dir(&wiki, ws, orphan, orphan_dir).await;
+        assert!(
+            !indexed,
+            "a rowless directory must be skipped before the walk, not walked \
+             and failed page by page"
+        );
+
+        let stranded = store
+            .reader
+            .search_pages("eventtoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(
+            stranded.is_empty(),
+            "a rowless directory must not index through a directory event, got {}",
+            stranded.len()
         );
     }
 
