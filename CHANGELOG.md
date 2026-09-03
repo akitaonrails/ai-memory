@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#606])
 
 ### Fixed
+- The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
+  Responses endpoint. Luna is not served through Chat Completions, where plain
+  and structured ai-memory calls returned HTTP 500 (#618).
 - `bootstrap` no longer aborts the whole multi-chunk run when one chunk
   returns no `pages` key (#614). Later chunks are told which paths
   earlier ones wrote, so a model that judges the material already

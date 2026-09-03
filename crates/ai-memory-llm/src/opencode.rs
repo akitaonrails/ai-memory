@@ -1,75 +1,63 @@
-//! OpenCode provider — Go by default, Zen on request.
+//! OpenCode Go/Zen provider.
 //!
-//! Thin wrapper around [`OpenAiCompatProvider`] that names the provider
-//! `"opencode"` and accepts an `sk-...` API key from `OPENCODE_API_KEY`.
-//!
-//! OpenCode serves two endpoints, and they are different products rather
-//! than two names for one: **Go** ([`OPENCODE_GO_BASE_URL`]) is a smaller,
-//! cost-optimised model set, while **Zen** (`https://opencode.ai/zen/v1`)
-//! serves the full catalogue. Go is the default here; an operator selects
-//! Zen with `AI_MEMORY_LLM_BASE_URL`, which the factory passes to
-//! [`OpenCodeProvider::with_base_url`]. Model ids are per catalogue, so an
-//! override wants an explicit `AI_MEMORY_LLM_MODEL` too.
-//!
-//! Go's documentation covers third-party access and asks every tool using
-//! it to (1) not generate abusive traffic and (2) "properly identify itself
-//! (no broad user agents)". The agent string is
-//! [`crate::DEFAULT_USER_AGENT`], applied to every provider; what is
-//! specific to this one is `x-opencode-session`, which both endpoints
-//! correlate requests by and which this provider defaults under anything
-//! the operator set through `AI_MEMORY_LLM_HEADERS`.
+//! Selects the wire API published for each model: GPT-5.6 Luna uses the
+//! Responses API and other models use OpenAI-compatible Chat Completions.
+//! Defaults to Go's catalogue at `https://opencode.ai/zen/go/v1`; set
+//! `AI_MEMORY_LLM_BASE_URL` (or call [`OpenCodeProvider::with_base_url`]) to
+//! point at Zen's general catalogue instead. Accepts an `sk-...` API key from
+//! `OPENCODE_API_KEY`. Identifies itself with [`crate::DEFAULT_USER_AGENT`]
+//! and defaults the `x-opencode-session` correlation header, both of which an
+//! `AI_MEMORY_LLM_HEADERS` entry can override.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 
-use crate::error::LlmResult;
+use crate::error::{LlmError, LlmResult};
+use crate::openai::{
+    STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas, normalize_openai_base,
+};
 use crate::openai_compat::OpenAiCompatProvider;
 use crate::provider::LlmProvider;
-use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId};
+use crate::response::{provider_error_body, response_json_limited};
+use crate::types::{
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
+};
 
-/// Public OpenCode **Go** OpenAI-compatible base URL, and this provider's
-/// default endpoint.
-///
-/// Go is a distinct product from Zen's general catalogue, not another
-/// spelling of it: Go serves a smaller, cost-optimised model set under
-/// `zen/go/v1`, while Zen serves the full catalogue at
-/// `https://opencode.ai/zen/v1`. Both authenticate with the same
-/// `OPENCODE_API_KEY` and both correlate requests by
-/// [`OPENCODE_SESSION_HEADER`], so reaching Zen is a base-URL override —
-/// see [`OpenCodeProvider::with_base_url`].
+/// Primary OpenCode Go OpenAI-compatible base URL.
 pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
-/// Misnomer for [`OPENCODE_GO_BASE_URL`], kept so the released public API
-/// keeps compiling: the value has always been Go's endpoint, never Zen's
-/// general one.
+/// Public OpenCode Zen/Go OpenAI-compatible base URL.
 #[deprecated(
     since = "2.1.0",
     note = "names Zen but holds Go's endpoint; use OPENCODE_GO_BASE_URL"
 )]
 pub const OPENCODE_ZEN_BASE_URL: &str = OPENCODE_GO_BASE_URL;
 
-/// Default model when `AI_MEMORY_LLM_MODEL` is not set. Taken from Go's
-/// catalogue, so an operator overriding the base URL should set the model
-/// explicitly rather than assume this id exists on the other endpoint.
+/// Default model when `AI_MEMORY_LLM_MODEL` is not set.
 pub const OPENCODE_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
-/// Session-correlation header OpenCode asks callers to send, on Zen and Go
-/// alike. Requests arriving without it are reported as unattributable and
-/// may be rejected.
+/// Session-correlation header OpenCode asks callers to send, on Zen and Go alike.
 pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
-/// OpenCode LLM provider, pointed at Go unless repointed at Zen.
+/// OpenCode Go LLM provider.
 ///
-/// Routes through `https://opencode.ai/zen/go/v1` using the OpenAI chat
-/// completions wire format. Authenticate with the `sk-...` key obtained
-/// from <https://opencode.ai/auth>.
+/// Routes through `https://opencode.ai/zen/go/v1` using the model's published
+/// Responses or Chat Completions wire format. Authenticate with the `sk-...`
+/// key obtained from <https://opencode.ai/auth>.
 pub struct OpenCodeProvider {
-    inner: OpenAiCompatProvider,
+    transport: OpenCodeTransport,
+}
+
+enum OpenCodeTransport {
+    ChatCompletions(OpenAiCompatProvider),
+    Responses(OpenCodeResponsesProvider),
 }
 
 impl OpenCodeProvider {
-    /// Construct an OpenCode provider against Go, the default endpoint.
-    /// Call [`Self::with_base_url`] for Zen.
+    /// Construct an OpenCode Zen/Go provider.
     ///
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
@@ -77,37 +65,32 @@ impl OpenCodeProvider {
         Self::new_with_base_url(api_key, model, OPENCODE_GO_BASE_URL)
     }
 
-    /// Construct against an explicit endpoint. The session header carries a
-    /// [`LlmOperationId`], so one logical operation keeps one id across
-    /// retries and the strict/tolerant fallback — which is what OpenCode's
-    /// metrics key on. Both values are defaults: an `AI_MEMORY_LLM_HEADERS`
-    /// entry for either name wins.
     fn new_with_base_url(
         api_key: SecretString,
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> LlmResult<Self> {
-        let inner = OpenAiCompatProvider::new(base_url, Some(api_key), model.into())?
-            .with_client_headers(crate::DEFAULT_USER_AGENT, OPENCODE_SESSION_HEADER);
-        Ok(Self { inner })
-    }
-
-    /// Point the provider at a different OpenCode endpoint — Zen's general
-    /// catalogue (`https://opencode.ai/zen/v1`) instead of Go's default.
-    ///
-    /// The factory calls this with `ProviderConfig::base_url`
-    /// (`AI_MEMORY_LLM_BASE_URL`). Identification is unaffected: both
-    /// endpoints correlate requests the same way, so the override changes
-    /// where requests go, not how they identify themselves.
-    #[must_use]
-    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        self.inner = self.inner.with_base_url(url);
-        self
+        let model = model.into();
+        let base_url = base_url.into();
+        let transport = if model_uses_responses_api(&model) {
+            OpenCodeTransport::Responses(OpenCodeResponsesProvider::new(api_key, model, base_url)?)
+        } else {
+            OpenCodeTransport::ChatCompletions(
+                OpenAiCompatProvider::new(base_url, Some(api_key), model)?
+                    .with_client_headers(crate::DEFAULT_USER_AGENT, OPENCODE_SESSION_HEADER),
+            )
+        };
+        Ok(Self { transport })
     }
 
     #[cfg(test)]
     fn with_strict(mut self, strict: bool) -> Self {
-        self.inner = self.inner.with_strict(strict);
+        self.transport = match self.transport {
+            OpenCodeTransport::ChatCompletions(provider) => {
+                OpenCodeTransport::ChatCompletions(provider.with_strict(strict))
+            }
+            responses => responses,
+        };
         self
     }
 
@@ -116,24 +99,70 @@ impl OpenCodeProvider {
     /// `ProviderConfig::request_timeout_secs`.
     #[must_use]
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        self.inner = self.inner.with_timeout_secs(secs);
+        self.transport = match self.transport {
+            OpenCodeTransport::ChatCompletions(provider) => {
+                OpenCodeTransport::ChatCompletions(provider.with_timeout_secs(secs))
+            }
+            OpenCodeTransport::Responses(provider) => {
+                OpenCodeTransport::Responses(provider.with_timeout_secs(secs))
+            }
+        };
         self
     }
 
-    /// Forward reasoning effort to the OpenAI-compatible OpenCode client.
+    /// Forward reasoning effort to the OpenAI-compatible Zen/Go client.
     #[must_use]
-    pub fn with_reasoning_effort(mut self, effort: Option<crate::ReasoningEffort>) -> Self {
-        self.inner = self.inner.with_reasoning_effort(effort);
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.transport = match self.transport {
+            OpenCodeTransport::ChatCompletions(provider) => {
+                OpenCodeTransport::ChatCompletions(provider.with_reasoning_effort(effort))
+            }
+            OpenCodeTransport::Responses(provider) => {
+                OpenCodeTransport::Responses(provider.with_reasoning_effort(effort))
+            }
+        };
         self
     }
 
-    /// Forward operator-configured headers. The session header and user
-    /// agent this provider sets are defaults applied per request, so an
-    /// `AI_MEMORY_LLM_HEADERS` entry for either name wins here.
+    /// Point the provider at a different OpenCode endpoint (Zen's general
+    /// catalogue instead of Go's default). The factory calls this with
+    /// `AI_MEMORY_LLM_BASE_URL`.
+    #[must_use]
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.transport = match self.transport {
+            OpenCodeTransport::ChatCompletions(provider) => {
+                OpenCodeTransport::ChatCompletions(provider.with_base_url(url))
+            }
+            OpenCodeTransport::Responses(provider) => {
+                OpenCodeTransport::Responses(provider.with_base_url(url))
+            }
+        };
+        self
+    }
+
+    /// Forward operator-configured headers (`AI_MEMORY_LLM_HEADERS`). The session
+    /// header and user agent this provider sets are per-request defaults, so an
+    /// operator entry for either name wins.
     #[must_use]
     pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
-        self.inner = self.inner.with_extra_headers(headers);
+        self.transport = match self.transport {
+            OpenCodeTransport::ChatCompletions(provider) => {
+                OpenCodeTransport::ChatCompletions(provider.with_extra_headers(headers))
+            }
+            OpenCodeTransport::Responses(provider) => {
+                OpenCodeTransport::Responses(provider.with_extra_headers(headers))
+            }
+        };
         self
+    }
+
+    #[cfg(test)]
+    fn base_url(&self) -> &str {
+        match &self.transport {
+            OpenCodeTransport::ChatCompletions(provider) => provider.base_url(),
+            OpenCodeTransport::Responses(provider) => &provider.base_url,
+        }
     }
 }
 
@@ -144,7 +173,10 @@ impl LlmProvider for OpenCodeProvider {
     }
 
     fn model(&self) -> &str {
-        self.inner.model()
+        match &self.transport {
+            OpenCodeTransport::ChatCompletions(provider) => provider.model(),
+            OpenCodeTransport::Responses(provider) => &provider.model,
+        }
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
@@ -157,9 +189,16 @@ impl LlmProvider for OpenCodeProvider {
         request: ChatRequest,
         operation_id: LlmOperationId,
     ) -> LlmResult<ChatResponse> {
-        self.inner
-            .complete_with_operation_id(request, operation_id)
-            .await
+        match &self.transport {
+            OpenCodeTransport::ChatCompletions(provider) => {
+                provider
+                    .complete_with_operation_id(request, operation_id)
+                    .await
+            }
+            OpenCodeTransport::Responses(provider) => {
+                provider.complete(request, operation_id).await
+            }
+        }
     }
 
     async fn complete_structured_raw(
@@ -177,10 +216,255 @@ impl LlmProvider for OpenCodeProvider {
         schema: serde_json::Value,
         operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
-        self.inner
-            .complete_structured_raw_with_operation_id(request, schema, operation_id)
-            .await
+        match &self.transport {
+            OpenCodeTransport::ChatCompletions(provider) => {
+                provider
+                    .complete_structured_raw_with_operation_id(request, schema, operation_id)
+                    .await
+            }
+            OpenCodeTransport::Responses(provider) => {
+                provider
+                    .complete_structured(request, schema, operation_id)
+                    .await
+            }
+        }
     }
+}
+
+fn model_uses_responses_api(model: &str) -> bool {
+    // OpenCode Go publishes Luna only through /responses. Its
+    // /chat/completions route returns an internal-server error for these calls.
+    model.eq_ignore_ascii_case("gpt-5.6-luna")
+}
+
+struct OpenCodeResponsesProvider {
+    client: reqwest::Client,
+    api_key: SecretString,
+    base_url: String,
+    model: String,
+    timeout: Duration,
+    reasoning_effort: Option<ReasoningEffort>,
+    extra_headers: ExtraHeaders,
+}
+
+impl OpenCodeResponsesProvider {
+    fn new(api_key: SecretString, model: String, base_url: String) -> LlmResult<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder().build()?,
+            api_key,
+            base_url,
+            model,
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
+        })
+    }
+
+    fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
+    }
+
+    async fn complete(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ChatResponse> {
+        let response = self
+            .post(&self.build_request(&request, None), operation_id)
+            .await?;
+        Ok(ChatResponse {
+            text: extract_output_text(&response).unwrap_or_default(),
+            usage: response.usage.map(|usage| Usage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+            model: response.model,
+        })
+    }
+
+    async fn complete_structured(
+        &self,
+        request: ChatRequest,
+        mut schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        enforce_strict_object_schemas(&mut schema);
+        let text = ResponsesText {
+            format: ResponsesTextFormat::JsonSchema {
+                name: STRUCTURED_OUTPUT_SCHEMA_NAME.into(),
+                schema,
+                strict: true,
+            },
+        };
+        let response = self
+            .post(&self.build_request(&request, Some(text)), operation_id)
+            .await?;
+        let text = extract_output_text(&response).unwrap_or_default();
+        serde_json::from_str(&text).map_err(LlmError::from)
+    }
+
+    fn build_request<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+        text: Option<ResponsesText>,
+    ) -> ResponsesRequest<'a> {
+        ResponsesRequest {
+            model: &self.model,
+            instructions: request.system.as_deref(),
+            input: request
+                .messages
+                .iter()
+                .map(|message| ResponsesInputMessage {
+                    role: message.role.as_str(),
+                    content: vec![ResponsesInputContent {
+                        kind: "input_text",
+                        text: &message.content,
+                    }],
+                })
+                .collect(),
+            max_output_tokens: request.max_tokens,
+            store: false,
+            text,
+            reasoning: self.reasoning_effort.map(|effort| ResponsesReasoning {
+                effort: effort.openai_wire_effort(),
+            }),
+        }
+    }
+
+    async fn post<B: Serialize>(
+        &self,
+        body: &B,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ResponsesResponse> {
+        let url = normalize_openai_base(&self.base_url, "responses");
+        let builder = self
+            .client
+            .post(url)
+            .timeout(self.timeout)
+            .bearer_auth(self.api_key.expose_secret())
+            .header("content-type", "application/json")
+            .json(body);
+        let mut headers = self.extra_headers.clone();
+        headers.set_default(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static(crate::DEFAULT_USER_AGENT),
+        );
+        let name = reqwest::header::HeaderName::from_static(OPENCODE_SESSION_HEADER);
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&operation_id.to_string()) {
+            headers.set_default(name, value);
+        }
+        let response = headers.apply(builder).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body: provider_error_body(response).await,
+            });
+        }
+        response_json_limited(response).await
+    }
+}
+
+#[derive(Serialize)]
+struct ResponsesRequest<'a> {
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
+    input: Vec<ResponsesInputMessage<'a>>,
+    max_output_tokens: u32,
+    store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<ResponsesText>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ResponsesReasoning>,
+}
+
+#[derive(Serialize)]
+struct ResponsesText {
+    format: ResponsesTextFormat,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesTextFormat {
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+        strict: bool,
+    },
+}
+
+#[derive(Serialize)]
+struct ResponsesInputMessage<'a> {
+    role: &'a str,
+    content: Vec<ResponsesInputContent<'a>>,
+}
+
+#[derive(Serialize)]
+struct ResponsesInputContent<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct ResponsesReasoning {
+    effort: ReasoningEffort,
+}
+
+#[derive(Deserialize)]
+struct ResponsesResponse {
+    model: String,
+    #[serde(default)]
+    output: Vec<ResponsesOutputItem>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesOutputItem {
+    #[serde(default)]
+    content: Vec<ResponsesOutputContent>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesOutputContent {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+fn extract_output_text(response: &ResponsesResponse) -> Option<String> {
+    response
+        .output
+        .iter()
+        .flat_map(|item| item.content.iter())
+        .filter_map(|content| content.text.as_deref())
+        .find(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -200,6 +484,17 @@ mod tests {
         })
     }
 
+    fn responses_response_with_content(content: &str) -> serde_json::Value {
+        json!({
+            "model": "gpt-5.6-luna",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": content }],
+            }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 },
+        })
+    }
+
     fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
         request
             .headers
@@ -214,36 +509,107 @@ mod tests {
         assert_eq!(provider.model(), "model-x");
     }
 
-    /// Go and Zen are different endpoints; the default is Go's.
     #[test]
     fn the_default_base_url_is_gos_endpoint() {
         assert_eq!(OPENCODE_GO_BASE_URL, "https://opencode.ai/zen/go/v1");
         assert!(!OPENCODE_DEFAULT_MODEL.is_empty());
     }
 
-    /// The deprecated name kept its value, so code compiled against v2.0
-    /// keeps hitting the endpoint it already hit.
     #[test]
     #[allow(deprecated)]
     fn the_deprecated_alias_still_resolves_to_go() {
         assert_eq!(OPENCODE_ZEN_BASE_URL, OPENCODE_GO_BASE_URL);
     }
 
-    /// Zen's general catalogue is reachable, and is not the default — the
-    /// bug this pair pins is a base URL that could not be overridden.
     #[test]
     fn with_base_url_repoints_the_provider_at_zen() {
-        let go = OpenCodeProvider::new(SecretString::from("sk-test"), "model-x").unwrap();
-        assert_eq!(go.inner.base_url(), OPENCODE_GO_BASE_URL);
+        let provider = OpenCodeProvider::new(SecretString::from("sk-test"), "model-x").unwrap();
+        assert_eq!(provider.base_url(), OPENCODE_GO_BASE_URL);
 
-        let zen = OpenCodeProvider::new(SecretString::from("sk-test"), "model-x")
-            .unwrap()
-            .with_base_url("https://opencode.ai/zen/v1");
-        assert_eq!(zen.inner.base_url(), "https://opencode.ai/zen/v1");
+        let provider = provider.with_base_url("https://opencode.ai/zen/v1");
+        assert_eq!(provider.base_url(), "https://opencode.ai/zen/v1");
     }
 
     #[tokio::test]
-    async fn completion_identifies_ai_memory_and_its_logical_operation() {
+    async fn luna_completion_uses_responses_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(responses_response_with_content("ok")),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenCodeProvider::new_with_base_url(
+            SecretString::from("sk-test"),
+            "gpt-5.6-luna",
+            server.uri(),
+        )
+        .unwrap();
+        let operation_id = LlmOperationId::new();
+        let response = provider
+            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id)
+            .await
+            .unwrap();
+
+        assert_eq!(response.text, "ok");
+        assert_eq!(response.model, "gpt-5.6-luna");
+        assert_eq!(response.usage.unwrap().input_tokens, 1);
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["max_output_tokens"], 1024);
+        assert!(body.get("temperature").is_none());
+        assert_eq!(
+            header_value(&requests[0], "user-agent"),
+            Some(crate::DEFAULT_USER_AGENT)
+        );
+        assert_eq!(
+            header_value(&requests[0], OPENCODE_SESSION_HEADER),
+            Some(operation_id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn luna_structured_completion_uses_responses_api() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(responses_response_with_content(r#"{"ok":true}"#)),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenCodeProvider::new_with_base_url(
+            SecretString::from("sk-test"),
+            "gpt-5.6-luna",
+            server.uri(),
+        )
+        .unwrap();
+        let value = provider
+            .complete_structured_raw(
+                ChatRequest::user_prompt("emit JSON"),
+                json!({
+                    "type": "object",
+                    "properties": { "ok": { "type": "boolean" } },
+                    "required": ["ok"],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, json!({ "ok": true }));
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["schema"]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn deepseek_completion_keeps_chat_completions_and_operation_headers() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -253,7 +619,7 @@ mod tests {
 
         let provider = OpenCodeProvider::new_with_base_url(
             SecretString::from("sk-test"),
-            "model-x",
+            "deepseek-v4-flash",
             server.uri(),
         )
         .unwrap();
