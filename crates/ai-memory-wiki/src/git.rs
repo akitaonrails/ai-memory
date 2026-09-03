@@ -85,8 +85,20 @@ impl GitAdapter {
     fn commit_all_git2(&self, message: &str) -> Result<Option<git2::Oid>, CommitGit2Error> {
         let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
 
-        // Stage everything (including deletions).
+        // Stage everything (including deletions). Clear the index first so
+        // every entry is re-hashed from the working tree: libgit2 keeps a
+        // stat cache and will skip re-reading a file whose size/mtime look
+        // unchanged, trusting the cached blob OID. When that cached OID is
+        // stale or its blob is absent from the object database — which a
+        // store carried across libgit2/git versions or an interrupted
+        // earlier operation can leave behind — `write_tree` below aborts
+        // with "invalid object specified … class=Tree" and, since the wiki
+        // migration commits through this path, the server crash-loops and
+        // never starts (#594). Clearing drops the stat cache, so `add_all`
+        // re-hashes each working-tree file into the ODB and every entry the
+        // tree references is guaranteed present.
         let mut index = repo.index().map_err(CommitGit2Error::Other)?;
+        index.clear().map_err(CommitGit2Error::Other)?;
         index
             .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
             .map_err(CommitGit2Error::Other)?;
@@ -474,6 +486,41 @@ mod tests {
         // Re-commit with no changes -> None again.
         assert!(adapter.commit_all("no changes").unwrap().is_none());
         assert_eq!(adapter.commit_count(), 1);
+    }
+
+    /// #594 hardening: the commit re-hashes every file from the working
+    /// tree rather than trusting cached index blob OIDs. A store carried
+    /// across libgit2/git versions (or an interrupted operation) can leave
+    /// the index's stat cache pointing at a blob absent from the object
+    /// database; `write_tree` then aborts with "invalid object specified"
+    /// and the migration crash-loops. The fix clears the index before
+    /// `add_all`. We can't fabricate a missing-blob entry through git2's
+    /// safe API (it validates the OID on `add`), so we verify the
+    /// behaviour the clear guarantees: the *current* working-tree content
+    /// is what gets committed, even after the same path was committed
+    /// before — i.e. staging always reflects disk, never a cache.
+    #[test]
+    fn commit_all_commits_current_working_tree_content() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+
+        std::fs::write(root.join("log-2026-07.md"), "v1").unwrap();
+        adapter.commit_all("v1").unwrap();
+
+        // Overwrite in place and commit again: the committed blob must be v2.
+        std::fs::write(root.join("log-2026-07.md"), "v2 rewritten").unwrap();
+        let oid = adapter.commit_all("v2").unwrap();
+        assert!(oid.is_some(), "a content change must produce a commit");
+
+        let committed = adapter
+            .file_at_rev("HEAD", Path::new("log-2026-07.md"))
+            .unwrap();
+        assert_eq!(
+            committed, b"v2 rewritten",
+            "commit must reflect the working-tree file, re-hashed from disk"
+        );
+        assert_eq!(adapter.commit_count(), 2);
     }
 
     #[test]

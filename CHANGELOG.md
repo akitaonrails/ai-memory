@@ -40,6 +40,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tell several ai-memory instances apart.
 
 ### Fixed
+- `install-hooks --agent zcode --apply` now removes stale ai-memory
+  hooks left under event keys this version no longer manages (e.g. a
+  legacy `SessionEnd`), instead of reporting "already up to date" while
+  a broken/orphaned entry lingered (#600). The dry-run printed snippet
+  also now states plainly that `--apply` persists the auth token to
+  `<data-dir>/auth-token` (0600) and writes token-less args, so the
+  applied config differs from the embedded-token snippet by design.
+- Local-embedding model download (`fetch_model`) now bounds a stalled
+  connection instead of hanging startup forever (#602): a 30s connect
+  timeout and a generous 600s overall ceiling (large model files, so
+  not the inference clients' flat 120s that would fail a slow download).
+- The OKF v0.2 migration no longer crash-loops on startup with a
+  libgit2 `invalid object specified … class=Tree` error that left the
+  server unable to boot (#594). The wiki commit re-hashed files through
+  libgit2's index, whose stat cache could trust a cached blob OID absent
+  from the object database (a store carried across libgit2/git versions,
+  or an interrupted earlier operation) — `write_tree` then aborted and,
+  because the migration commits through that path, every restart failed.
+  The commit now clears the index before staging so every file is
+  re-hashed from the working tree. (The Docker runtime ships no `git`,
+  so the fix is in-library, not a CLI fallback.)
+- HTTP headers that carry a credential in an opaque value are now redacted
+  before reaching durable storage. Previously such a header matched no
+  built-in pattern unless it used the `Bearer` keyword or an
+  `UPPER_SNAKE_TOKEN=` shape. The bearer rule requires the literal keyword,
+  and the generic env-var rule requires `[A-Z][A-Z0-9_]*_TOKEN`, which never
+  matches a kebab-case header name. `X-Amz-Security-Token` (AWS SigV4),
+  `X-Api-Key`, `Private-Token` (GitLab), and `Ocp-Apim-Subscription-Key`
+  (Azure) all fall in that gap, and tool output echoing a `curl` invocation
+  is a common way they reach capture. A `key` or `token` suffix on its own
+  does not imply a secret, so it must be qualified by an auth word:
+  `Idempotency-Key`, `Continuation-Token` and storage partition keys are
+  left intact and stay readable in captured output.
 - `AI_MEMORY_LLM_BASE_URL` now works with `AI_MEMORY_LLM_PROVIDER=opencode`.
   The provider hardcoded OpenCode's **Go** endpoint and the factory dropped
   the configured base URL without a word, so Zen's general catalogue at
@@ -65,6 +98,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so historical `as_of` is correct. Broad tags don't distort ranking
   (the entity stream is inverse-frequency weighted), and a store already
   written through the current path is a no-op. See `docs/temporal.md`.
+- The OKF v0.2 pre-migration backup walk now skips the `.serve.lock`
+  single-instance lock and its `.serve.lock.holder` sidecar. On Windows
+  the exclusive `LockFileEx` is mandatory, so the same `serve` process
+  that runs the migration also holds `.serve.lock` and could not read it
+  back while creating the backup — the walk aborted with `os error 33`
+  and the server crash-looped on every `2.0.x` upgrade from a 1.x store
+  (#593). Linux/macOS were immune because POSIX locks are advisory.
 - The Windows PowerShell wrapper (`ai-memory.ps1`) no longer crashes with
   `git.exe : fatal: not a git repository … NativeCommandError` when run
   outside a git repository — which broke `ai-memory status` and every
@@ -75,6 +115,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SilentlyContinue`, gates on `$LASTEXITCODE`, and restores the
   preference, falling back to the working directory as before. The
   unredirected Docker invocations were never affected.
+
+
+### Security
+- Untrusted `relations:` frontmatter values (relation keys and targets)
+  are now length-bounded before being echoed into warning logs. On a
+  shared server one caller's page is parsed by a process whose logs
+  others read; a crafted or oversized relation key/target could bloat or
+  pollute the log. Bounded to 200 bytes (UTF-8-safe), matching the
+  bounding every other untrusted-content sink already uses. Found by a
+  data-layer security audit of the store/wiki crates.
 
 ## [2.0.1] - 2026-09-02
 

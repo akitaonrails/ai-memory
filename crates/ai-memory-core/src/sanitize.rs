@@ -111,6 +111,25 @@ const BUILTIN_PATTERN_STRS: &[&str] = &[
     r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
     // URL-embedded credentials: scheme://user:pass@host.
     r"[a-zA-Z][a-zA-Z0-9+\-.]*://[^:/\s]+:[^@\s]+@[^\s]+",
+    // Auth-bearing HTTP headers carrying an opaque value: AWS SigV4's
+    // `X-Amz-Security-Token`, `X-Api-Key`, GitLab's `Private-Token`, Azure's
+    // `Ocp-Apim-Subscription-Key`. Neither of the rules above reaches these:
+    // the `bearer\s+` rule needs the literal scheme keyword, and the generic
+    // env-var rule below needs an `UPPER_SNAKE_TOKEN=` shape that a
+    // kebab-case header name never matches. Tool output echoing a curl
+    // invocation is the usual way they reach capture.
+    //
+    // A `key` or `token` suffix alone does not imply a secret.
+    // `Idempotency-Key`, `Continuation-Token` and storage partition keys use
+    // it for values that carry no credential and stay useful when reading
+    // captured output, so that suffix must be qualified by an auth word.
+    // Unambiguous words (`password`, `secret`, `authorization`) stand alone.
+    //
+    // The value floor keeps short literals such as CORS
+    // `Access-Control-Allow-Credentials: true` intact. It is not what
+    // protects an already-redacted value: `[REDACTED]` starts with `[`,
+    // which the value character class excludes outright.
+    r#"(?i)\b[A-Za-z0-9-]*(?:authentication|authorization|credentials?|password|passwd|apikey|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))\s*:\s*[A-Za-z0-9._~+/=-]{8,}"#,
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
     // even without `sk-` shape).
@@ -575,12 +594,103 @@ mod tests {
         assert!(out3.contains("[REDACTED]"));
     }
 
+    /// The value character class excludes `[`, so a value already replaced
+    /// with `[REDACTED]` by an earlier pattern cannot be matched again and
+    /// lose its header name.
+    #[test]
+    fn auth_header_pattern_does_not_re_eat_an_earlier_redaction() {
+        let out = s().scrub("X-Api-Key: Bearer FAKEfakeFAKEfake0123456789");
+        assert_eq!(out, "X-Api-Key: [REDACTED]");
+    }
+
+    /// The header name is matched with a flat character class rather than
+    /// nested quantifiers, and `regex` is backtracking-free. This pins linear
+    /// behaviour on an adversarial hyphen run instead of asserting on a wall
+    /// clock, which would be flaky in CI.
+    #[test]
+    fn auth_header_pattern_handles_adversarial_hyphen_runs() {
+        let long_name = format!("X{}", "-a".repeat(4_000));
+        let secret = "F".repeat(40);
+
+        let matching = format!("{long_name}-auth-token: {secret}");
+        let out = s().scrub(&matching);
+        assert!(out.contains("[REDACTED]"), "adversarial match not redacted");
+        assert!(!out.contains(&secret), "leaked under adversarial input");
+
+        let non_matching = format!("{long_name}-harmless: {secret}");
+        assert_eq!(s().scrub(&non_matching), non_matching);
+    }
+
+    /// `-Key` and `-Token` suffixes are also used by non-secret headers:
+    /// idempotency keys, pagination cursors, storage partition keys. Those
+    /// carry no credential and stay useful when reading captured tool
+    /// output, so the rule requires an auth qualifier before the suffix.
+    #[test]
+    fn auth_header_pattern_leaves_non_secret_key_and_token_headers_alone() {
+        for text in [
+            "Idempotency-Key: 3f7a1c2e-9b4d-4f88-a1e2-7c6b5d4e3f21",
+            "Continuation-Token: 0000000000000000000000",
+            "Next-Page-Token: CiAKGjBpNDd2Nmp2Zml2cWtwYjBk",
+            "Partition-Key: user-000000000000001",
+            "Cache-Key: v2-catalog-000000000000",
+        ] {
+            assert_eq!(s().scrub(text), text, "over-redacted: {text}");
+        }
+    }
+
     #[test]
     fn scrubs_cloud_credential_paths() {
         let out = s().scrub("read /home/user/.aws/credentials");
         assert!(out.contains("[REDACTED]"));
         let out2 = s().scrub("set KUBECONFIG=/home/user/.kube/config");
         assert!(out2.contains("[REDACTED]"));
+    }
+
+    /// Opaque auth headers reach capture via tool output echoing curl. The
+    /// `bearer\s+` rule needs the literal keyword and the generic env rule
+    /// needs `UPPER_SNAKE_TOKEN=`, so a kebab-case header matched neither.
+    #[test]
+    fn scrubs_opaque_auth_headers_without_bearer_keyword() {
+        for header in [
+            // AWS SigV4 session credential: a real, widely-emitted header
+            // that carries a secret with no scheme keyword.
+            "X-Amz-Security-Token: FAKEfakeFAKEfake0123456789",
+            // GitLab.
+            "Private-Token: FAKEfakeFAKEfake0123456789",
+            "X-Api-Key: FAKEfakeFAKEfake0123456789",
+            "Api-Key: FAKEfakeFAKEfake0123456789",
+            "X-Auth-Token: FAKEfakeFAKEfake0123456789",
+            // Azure API Management, Google, RapidAPI: the auth qualifier is
+            // not always its own segment.
+            "Ocp-Apim-Subscription-Key: FAKEfakeFAKEfake0123456789",
+            "X-Goog-Api-Key: FAKEfakeFAKEfake0123456789",
+            "X-RapidAPI-Key: FAKEfakeFAKEfake0123456789",
+            // A vendor-specific auth header: bare hex, no scheme keyword.
+            "Acme-Authentication: FAKEfake0123456789abcdef0123456789abcdef0123456789abcdef01234567",
+            // Header casing is not normalised by the emitting tool.
+            "x-api-key: FAKEfakeFAKEfake0123456789",
+        ] {
+            let out = s().scrub(header);
+            assert!(out.contains("[REDACTED]"), "not redacted: {header}");
+            assert!(!out.contains("FAKEfake"), "leaked: {header}");
+        }
+    }
+
+    /// The rule keys off an auth-ish word in the header *name*, so ordinary
+    /// hyphenated headers with long values must survive byte-identical.
+    #[test]
+    fn auth_header_pattern_does_not_eat_ordinary_headers() {
+        for text in [
+            "Content-Type: application/json;charset=utf-8",
+            "Accept-Language: en-US,en;q=0.9",
+            "User-Agent: ExampleApp/3.1 ExampleOS/27.0 build/24A431",
+            "Cache-Control: max-age=0, s-maxage=0, no-cache, no-store",
+            "X-Request-Context: 000000-1,29 t:example99",
+            "Content-Length: 4911",
+        ] {
+            let out = s().scrub(text);
+            assert_eq!(out, text, "over-redacted: {text}");
+        }
     }
 
     #[test]

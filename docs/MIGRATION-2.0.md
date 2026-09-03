@@ -19,9 +19,18 @@ one-shot wiki migration runs before the server accepts any traffic:
 
    Set `AI_MEMORY_BACKUP_DIR=/somewhere/else` before starting if your
    home is small; the destination must be outside the data directory.
-   The archive is re-opened and verified after writing. **If the backup
-   cannot be written or verified, the migration aborts and the server
-   refuses to start** — your data is untouched and the error says why.
+The archive is re-opened and verified after writing. **If the backup
+    cannot be written or verified, the migration aborts and the server
+    refuses to start** — your data is untouched and the error says why.
+
+    The walk skips the runtime `.serve.lock` file (and its
+    `.serve.lock.holder` sidecar) so the initial-start abort seen on
+    Windows — where the same `serve` process holds that lock under a
+    mandatory exclusive `LockFileEx`, making the backup read fail with
+    `os error 33` — cannot happen. If you are on 2.0.0/2.0.1 and still
+    hit it, dropping the container/process (or using a byte-range decoy
+    lock above the first 64 KiB with `serve --force`) unblocks the
+    one-time migration; a later patch releases these notes.
 
 2. The wiki git history gets a `pre-okf-migration checkpoint` commit.
 

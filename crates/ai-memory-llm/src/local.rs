@@ -73,7 +73,16 @@ pub fn model_present(models_root: &Path) -> bool {
 pub async fn fetch_model(models_root: &Path) -> LlmResult<()> {
     let dir = model_dir(models_root);
     std::fs::create_dir_all(&dir).map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
-    let client = reqwest::Client::new();
+    // Bound the fetch so a stalled connection can't hang startup forever
+    // (#602). Unlike the inference clients' flat 120s, these are large
+    // model files (~90 MB total), so a 120s *total* cap would spuriously
+    // fail a slow-but-working download: bound the connection stall tightly
+    // and give the body a generous ceiling instead.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| LlmError::UnexpectedShape(e.to_string()))?;
     for (name, pinned) in MODEL_FILES {
         let dest = dir.join(name);
         if let Ok(existing) = std::fs::read(&dest)

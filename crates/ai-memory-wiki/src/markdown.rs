@@ -157,6 +157,20 @@ pub fn extract_all_links(
     links
 }
 
+/// Upper bound (bytes) on an untrusted frontmatter value echoed into a
+/// log line. Frontmatter is agent/operator-authored and, on a shared
+/// server, one caller's page is parsed and logged by a process others
+/// read the logs of; a relation key or target is meant to be a short
+/// identifier, so bounding the logged form keeps a crafted or oversized
+/// value from bloating or polluting the log without losing diagnostic
+/// value. Mirrors the bounding every other untrusted-content sink uses.
+const RELATION_LOG_FIELD_MAX_BYTES: usize = 200;
+
+/// Bound an untrusted frontmatter value for safe logging.
+fn log_bounded(value: &str) -> String {
+    ai_memory_core::truncate_utf8_bytes(value, RELATION_LOG_FIELD_MAX_BYTES)
+}
+
 /// Extract typed relation edges from a page's `relations:` frontmatter
 /// (2.0 item 3):
 ///
@@ -177,7 +191,7 @@ pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget
     let mut out = Vec::new();
     for (key, targets) in relations {
         let Some(relation) = ai_memory_core::Relation::parse(key) else {
-            tracing::warn!(key, "unknown relation key in frontmatter; skipping");
+            tracing::warn!(key = %log_bounded(key), "unknown relation key in frontmatter; skipping");
             continue;
         };
         let Some(list) = targets.as_array() else {
@@ -200,14 +214,14 @@ pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget
                 if raw_path.ends_with(".md") {
                     raw_path.to_string()
                 } else {
-                    tracing::warn!(target, "relation target is not a page; skipping");
+                    tracing::warn!(target = %log_bounded(target), "relation target is not a page; skipping");
                     continue;
                 }
             } else {
                 format!("{raw_path}.md")
             };
             let Ok(path) = PagePath::new(normalized) else {
-                tracing::warn!(target, "unparseable relation target; skipping");
+                tracing::warn!(target = %log_bounded(target), "unparseable relation target; skipping");
                 continue;
             };
             out.push(LinkTarget {
@@ -383,6 +397,35 @@ mod tests {
 
     fn page() -> PagePath {
         PagePath::new("notes/here.md").unwrap()
+    }
+
+    #[test]
+    fn untrusted_relation_values_are_bounded_before_logging() {
+        // A crafted, oversized relation key/target must not reach the log
+        // unbounded (security-audit: untrusted frontmatter -> log sink).
+        let short = "fixes";
+        assert_eq!(log_bounded(short), short, "short values pass through");
+
+        let huge = "x".repeat(10_000);
+        let bounded = log_bounded(&huge);
+        assert!(
+            bounded.len() <= RELATION_LOG_FIELD_MAX_BYTES,
+            "logged value must be bounded: {} bytes",
+            bounded.len()
+        );
+
+        // Never split a UTF-8 code point mid-truncation.
+        let multibyte = "é".repeat(10_000);
+        let bounded = log_bounded(&multibyte);
+        assert!(bounded.len() <= RELATION_LOG_FIELD_MAX_BYTES);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+
+        // A malicious relation block still yields no edges and does not
+        // panic — the bound is applied on the skip path.
+        let fm = serde_json::json!({
+            "relations": { "x".repeat(5_000): ["ok.md"] }
+        });
+        assert!(extract_relation_links(&fm).is_empty());
     }
 
     #[test]
