@@ -754,16 +754,20 @@ pub(crate) struct HookProfile {
 }
 
 /// Codex's hook-event vocabulary (per the openai/codex source —
-/// see `codex-rs/config/src/hooks_tests.rs`). Same shape as Claude
-/// Code's six common events, EXCEPT: Codex has no `SessionEnd` (it
-/// uses `Stop` for both turn-end and session-end signalling).
-pub(crate) const CODEX_EVENTS: [(&str, &str); 6] = [
+/// see `codex-rs/config/src/hook_config.rs`). Same nested shape as
+/// Claude Code. `SessionEnd` shipped in Codex CLI 0.145.0 (openai/codex
+/// PR #33895, "Add SessionEnd hooks for thread teardown"); it is a
+/// root-session-only event that runs synchronously during thread
+/// teardown. Codex still has no `SubagentStart`/`SubagentStop` in a
+/// first-party-supported form here, so those stay Claude-Code-only.
+pub(crate) const CODEX_EVENTS: [(&str, &str); 7] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
 ];
 
 /// Command Code's stable shell-hook vocabulary. Mods expose more lifecycle

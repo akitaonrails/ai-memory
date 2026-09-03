@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `install-hooks --agent codex` now wires Codex's `SessionEnd` hook, so a
+  finished Codex session gets the same automatic end-of-session summary
+  and cross-agent handoff Claude Code already gets. Codex shipped a
+  first-class `SessionEnd` event in Codex CLI 0.145.0 (openai/codex#33895);
+  the `hooks/codex/session-end.{sh,ps1}` scripts already existed and only
+  needed adding to the Codex hook profile. On older Codex the event key is
+  inert; `ai-memory finalize-session --agent codex` remains the fallback.
+  `merge_codex_payload` no longer strips a `SessionEnd` key on every apply
+  — a third-party `SessionEnd` hook is preserved alongside ours. ([#604])
+
 ### Fixed
 - `as_of` time-travel queries and the entity retrieval stream now work
   on real stores. Both read the entity index, which was populated only
