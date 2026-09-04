@@ -996,6 +996,15 @@ pub struct StorageStatus {
     /// release slightly less. Treat it as the signal for "is this worth an
     /// exclusive lock", not as an exact figure.
     pub reclaimable_bytes: u64,
+    /// Free space on the filesystem holding the database file, in bytes.
+    /// `None` when it could not be read (e.g. an unsupported filesystem).
+    ///
+    /// The database's own size says nothing about how much headroom is left
+    /// for it to keep growing — a store that is small can still be minutes
+    /// away from a WAL that cannot extend because the *disk*, not the
+    /// database, is full. This is that signal, reported alongside the
+    /// database's own figures rather than gated on them.
+    pub data_dir_free_bytes: Option<u64>,
 }
 
 impl StorageStatus {
@@ -7005,7 +7014,17 @@ impl ReaderPool {
     /// # Errors
     /// Propagates the SQL error from the pragma reads.
     pub async fn storage_status(&self) -> StoreResult<StorageStatus> {
-        self.with_conn(|conn| {
+        // The database's own dir may not exist as a distinct mount point
+        // (it usually doesn't), but `available_space` walks up to whatever
+        // filesystem holds it either way. A read failure (unsupported
+        // filesystem, transient error) is a signal we don't have, not a
+        // reason to fail the whole status report.
+        let data_dir_free_bytes = self
+            .inner
+            .db_path
+            .parent()
+            .and_then(|dir| fs2::available_space(dir).ok());
+        self.with_conn(move |conn| {
             let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
             let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
@@ -7018,6 +7037,7 @@ impl ReaderPool {
                 freelist_count,
                 database_bytes: page_count.saturating_mul(page_size),
                 reclaimable_bytes: freelist_count.saturating_mul(page_size),
+                data_dir_free_bytes,
             })
         })
         .await
@@ -8456,9 +8476,26 @@ mod tests {
             freelist_count: 100,
             database_bytes: 400 * 4096,
             reclaimable_bytes: 100 * 4096,
+            data_dir_free_bytes: None,
         };
         assert!((quarter.reclaimable_pct() - 25.0).abs() < f64::EPSILON);
     }
+
+    /// The signal this field exists for: a store's own size says nothing
+    /// about disk headroom, so `storage_status` must also report the
+    /// filesystem's free space. A temp dir always has some, so this is
+    /// `Some(n)` with `n > 0`, not just "doesn't crash".
+    #[tokio::test]
+    async fn storage_status_reports_filesystem_free_space() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let status = store.reader.storage_status().await.unwrap();
+        let free = status
+            .data_dir_free_bytes
+            .expect("free space should be readable for a real temp dir");
+        assert!(free > 0);
+    }
+
     use super::{
         DESCRIPTOR_MAX_CHARS, StorageStatus, entity_query_tokens, handoff_listing_sql, like_escape,
         page_descriptor, page_descriptor_expr,

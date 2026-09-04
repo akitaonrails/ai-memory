@@ -643,6 +643,7 @@ mod tests {
             entries: 1,
             created_at: "2026-09-01T00:00:00Z".into(),
             label: "okf-v0.2".into(),
+            dest_free_bytes: None,
         };
         std::fs::write(
             tmp.path().join(ai_memory_wiki::backup::BACKUP_RECEIPT_FILE),
@@ -690,6 +691,7 @@ mod tests {
             entries: 1,
             created_at: "2026-09-01T00:00:00Z".into(),
             label: "okf-v0.2".into(),
+            dest_free_bytes: None,
         };
         std::fs::write(
             tmp.path().join(ai_memory_wiki::backup::BACKUP_RECEIPT_FILE),

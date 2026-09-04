@@ -22,6 +22,8 @@ jiff.workspace = true
 tar.workspace = true
 flate2.workspace = true
 dirs.workspace = true
+# Destination-filesystem free space for the pre-migration backup receipt.
+fs2.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 notify.workspace = true

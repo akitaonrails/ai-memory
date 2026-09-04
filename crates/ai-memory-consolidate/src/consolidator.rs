@@ -1284,13 +1284,10 @@ fn build_frontmatter(
     // boundary parses this frontmatter into typed links.
     let relations: serde_json::Map<String, serde_json::Value> = page
         .relations
-        .iter()
-        .filter(|(key, targets)| {
-            ai_memory_core::Relation::parse(key).is_some() && !targets.is_empty()
-        })
-        .map(|(key, targets)| {
+        .non_empty()
+        .map(|(relation, targets)| {
             (
-                key.clone(),
+                relation.as_str().to_string(),
                 serde_json::Value::Array(
                     targets
                         .iter()
@@ -1405,6 +1402,7 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.m
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Relations;
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
 
@@ -1782,7 +1780,7 @@ mod tests {
             body_markdown: "Body prose.".into(),
             tags: Vec::new(),
             summary: Some("Bounded the queue so backpressure is testable.".into()),
-            relations: std::collections::BTreeMap::new(),
+            relations: Relations::default(),
         };
         let session_id = SessionId::new();
         let frontmatter = build_frontmatter(&page, session_id, AgentKind::Codex);
@@ -1820,26 +1818,48 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("ONE line of plain prose"));
     }
 
-    /// Only the closed vocabulary survives into `relations:` frontmatter
-    /// — an LLM inventing `blames:` must not mint a new edge kind.
+    /// Only non-empty, closed-vocabulary edges reach `relations:` frontmatter.
+    /// The vocabulary is now enforced by the `Relations` type (#630) — there is
+    /// no field for an invented `blames:`, so a bogus edge kind is unrepresentable
+    /// rather than filtered — and an empty kind is omitted.
     #[test]
-    fn relations_frontmatter_keeps_only_the_vocabulary() {
-        let mut page = ConsolidatedPage {
+    fn relations_frontmatter_keeps_only_non_empty_vocabulary() {
+        let page = ConsolidatedPage {
             title: "T".into(),
             body_markdown: "b".into(),
             tags: vec![],
             summary: None,
-            relations: std::collections::BTreeMap::new(),
+            relations: Relations {
+                fixes: vec!["gotchas/g.md".into()],
+                causes: vec![], // empty -> omitted
+                contradicts: vec![],
+            },
         };
-        page.relations
-            .insert("fixes".into(), vec!["gotchas/g.md".into()]);
-        page.relations
-            .insert("blames".into(), vec!["notes/x.md".into()]);
-        page.relations.insert("causes".into(), vec![]);
         let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
         let relations = fm["relations"].as_object().unwrap();
         assert_eq!(relations.len(), 1, "{relations:?}");
         assert_eq!(relations["fixes"][0], "gotchas/g.md");
+    }
+
+    /// #630: the `relations` schema must be a FIXED object with named fields,
+    /// not an open `additionalProperties` map — otherwise OpenAI strict mode
+    /// closes it and the model can never emit an edge on any OpenAI-family
+    /// provider. Pin the shape so a revert to `BTreeMap` fails here.
+    #[test]
+    fn relations_schema_is_a_fixed_object_not_an_open_map() {
+        let schema = serde_json::to_value(schemars::schema_for!(Relations)).unwrap();
+        let props = schema["properties"]
+            .as_object()
+            .expect("relations must be a fixed object with named properties, not an open map");
+        assert!(props.contains_key("causes"));
+        assert!(props.contains_key("fixes"));
+        assert!(props.contains_key("contradicts"));
+        // An open map renders `additionalProperties` as a *schema object*; a
+        // fixed struct renders it as absent or `false`. It must not be a schema.
+        assert!(
+            !schema["additionalProperties"].is_object(),
+            "relations must not carry a schema-valued additionalProperties (open map)"
+        );
     }
 
     #[test]
@@ -1849,7 +1869,7 @@ mod tests {
             body_markdown: "b".into(),
             tags: vec![],
             summary: None,
-            relations: std::collections::BTreeMap::new(),
+            relations: Relations::default(),
         };
         let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
         assert!(fm.get("relations").is_none());

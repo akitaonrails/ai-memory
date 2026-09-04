@@ -31,6 +31,8 @@ argon2.workspace = true
 rusqlite.workspace = true
 refinery.workspace = true
 parking_lot.workspace = true
+# Destination-filesystem free space for storage_status.
+fs2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

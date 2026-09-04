@@ -114,6 +114,10 @@ struct Storage {
     freelist_count: u64,
     database_bytes: u64,
     reclaimable_bytes: u64,
+    /// Free space on the filesystem holding the database (absent from
+    /// pre-#629 servers).
+    #[serde(default)]
+    data_dir_free_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -282,6 +286,9 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 super::compact::human_bytes(report.storage.database_bytes),
                 super::compact::human_bytes(report.storage.reclaimable_bytes),
             );
+            if let Some(free) = report.storage.data_dir_free_bytes {
+                println!("    filesystem free: {}", super::compact::human_bytes(free));
+            }
             if pct >= RECLAIM_ADVICE_PCT
                 && report.storage.reclaimable_bytes >= RECLAIM_ADVICE_MIN_BYTES
             {
@@ -504,6 +511,32 @@ mod tests {
         report_offline_spool(&SpoolHealth::default(), true);
         report_offline_spool(&spool, false);
         report_offline_spool(&spool, true);
+    }
+
+    /// A pre-#629 server's `/admin/status` response has no
+    /// `data_dir_free_bytes` key at all; the field must default to `None`
+    /// rather than fail the whole `storage` object.
+    #[test]
+    fn storage_deserializes_without_free_space_from_an_older_server() {
+        let storage: Storage = serde_json::from_str(
+            r#"{"page_size":4096,"page_count":10,"freelist_count":0,
+                "database_bytes":40960,"reclaimable_bytes":0}"#,
+        )
+        .unwrap();
+        assert_eq!(storage.data_dir_free_bytes, None);
+    }
+
+    /// The signal #629 adds: once a server reports free space, it round-trips
+    /// through the CLI's own struct unchanged.
+    #[test]
+    fn storage_deserializes_free_space_from_a_current_server() {
+        let storage: Storage = serde_json::from_str(
+            r#"{"page_size":4096,"page_count":10,"freelist_count":0,
+                "database_bytes":40960,"reclaimable_bytes":0,
+                "data_dir_free_bytes":80740352}"#,
+        )
+        .unwrap();
+        assert_eq!(storage.data_dir_free_bytes, Some(80_740_352));
     }
 
     #[test]

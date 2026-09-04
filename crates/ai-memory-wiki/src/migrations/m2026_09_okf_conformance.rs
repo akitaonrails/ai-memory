@@ -86,6 +86,7 @@ impl WikiMigration for OkfConformance {
             archive = %receipt.archive_path.display(),
             size_bytes = receipt.size_bytes,
             entries = receipt.entries,
+            dest_free_bytes = ?receipt.dest_free_bytes,
             "pre-migration backup verified"
         );
 

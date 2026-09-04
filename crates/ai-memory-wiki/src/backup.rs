@@ -31,6 +31,13 @@ pub struct BackupReceipt {
     pub created_at: String,
     /// What the backup was taken for (e.g. "okf-v0.2-migration").
     pub label: String,
+    /// Free space on the destination filesystem right after the archive was
+    /// written, in bytes. `None` when it could not be read (e.g. an
+    /// unsupported filesystem) — never fails the backup on its own. A
+    /// verified archive next to a nearly-full disk is the exact shape of
+    /// the outage that motivated this field: the WAL had nowhere left to
+    /// extend minutes after a backup that "succeeded".
+    pub dest_free_bytes: Option<u64>,
 }
 
 impl BackupReceipt {
@@ -211,6 +218,21 @@ fn create_pre_migration_backup_inner(
         ))));
     }
 
+    // A signal only: the backup itself already succeeded and verified, so a
+    // free-space read that fails (unsupported filesystem, transient error)
+    // must not turn a good archive into a failed migration.
+    let dest_free_bytes = match fs2::available_space(&dest_dir) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::debug!(
+                dest = %dest_dir.display(),
+                error = %e,
+                "could not read destination free space"
+            );
+            None
+        }
+    };
+
     let receipt = BackupReceipt {
         archive_path,
         size_bytes,
@@ -219,6 +241,7 @@ fn create_pre_migration_backup_inner(
             .strftime("%Y-%m-%dT%H:%M:%SZ")
             .to_string(),
         label: label.to_string(),
+        dest_free_bytes,
     };
     let tmp = data_dir.join(format!("{BACKUP_RECEIPT_FILE}.tmp"));
     std::fs::write(&tmp, serde_json::to_vec_pretty(&receipt)?)?;
@@ -256,6 +279,22 @@ mod tests {
         assert!(receipt.archive_present());
         let loaded = BackupReceipt::load(data.path()).unwrap();
         assert_eq!(loaded.archive_path, receipt.archive_path);
+    }
+
+    /// The signal this field exists for: a verified archive next to a
+    /// nearly-full disk. A temp dir always reports some free space, and the
+    /// receipt (round-tripped through the JSON file) must carry it.
+    #[test]
+    fn the_receipt_carries_destination_free_space() {
+        let data = data_dir_with_content();
+        let dest = TempDir::new().unwrap();
+        let receipt = create_pre_migration_backup(data.path(), "test", Some(dest.path())).unwrap();
+        let free = receipt
+            .dest_free_bytes
+            .expect("free space should be readable for a real temp dir");
+        assert!(free > 0);
+        let loaded = BackupReceipt::load(data.path()).unwrap();
+        assert_eq!(loaded.dest_free_bytes, receipt.dest_free_bytes);
     }
 
     #[test]

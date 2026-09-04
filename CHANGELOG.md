@@ -81,10 +81,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory pending-writes list` / SQLite; the sidecar is a staging-time
   snapshot.
 
+### Added
+- `ai-memory status` and the pre-migration backup log now report the data
+  directory's **filesystem free space** (#629). The OKF-migration backup gate
+  proves the archive is writable but said nothing about disk headroom — an
+  operator whose 447 MB safety archive left 77 MB free had the store fail to
+  extend its WAL eight minutes later, unlogged, for hours. This is pure signal
+  (no threshold, no refusal): `status` shows `filesystem free:` beside the
+  storage figures, and the "pre-migration backup verified" line now carries
+  `dest_free_bytes`, so the same number is visible right before a migration.
+
 ### Fixed
 - The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
   Responses endpoint. Luna is not served through Chat Completions, where plain
   and structured ai-memory calls returned HTTP 500 (#618).
+- Typed edges (`relations`) now actually work on OpenAI-family providers
+  (#630). `ConsolidatedPage.relations` was an open map
+  (`BTreeMap<String, Vec<String>>`), which the strict structured-output
+  normalizer closes to `additionalProperties: false` — OpenAI strict mode
+  cannot express arbitrary-key maps — so the model was structurally unable to
+  emit any `causes`/`fixes`/`contradicts` edge on `openai`, `openai-oauth`,
+  `copilot`, `opencode`, or `openai-compat`; the 2.0 typed-edges feature was
+  silently dead there. `relations` is now a fixed three-field object
+  (`causes`/`fixes`/`contradicts`), which strict mode expresses and which
+  serializes to the identical `relations:` frontmatter — no migration, no
+  downstream change. A schema guard pins the fixed shape.
 - `finalize-session --agent hermes` (and `claude-desktop`, `crush`, `other`)
   is accepted again (#623). These agents are captured and stored, but
   `finalize-session` reused the install-oriented agent enum — which is
