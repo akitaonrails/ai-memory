@@ -473,7 +473,10 @@ fn posix_wrapper_auto_selects_podman_when_docker_is_unavailable() {
                 .to_owned(),
         ),
         ("uname", "#!/bin/bash\nprintf 'Linux\\n'\n".to_owned()),
-        ("getenforce", "#!/bin/bash\nprintf 'Disabled\\n'\n".to_owned()),
+        (
+            "getenforce",
+            "#!/bin/bash\nprintf 'Disabled\\n'\n".to_owned(),
+        ),
         (
             "grep",
             "#!/bin/bash\n\
@@ -512,7 +515,11 @@ fn posix_wrapper_auto_selects_podman_when_docker_is_unavailable() {
     );
     let args = std::fs::read_to_string(podman_args).unwrap();
     let flags: Vec<_> = args.lines().collect();
-    assert_eq!(flags.first(), Some(&"run"), "Podman was not invoked: {args}");
+    assert_eq!(
+        flags.first(),
+        Some(&"run"),
+        "Podman was not invoked: {args}"
+    );
     assert!(
         flags.contains(&"docker.io/akitaonrails/ai-memory:latest"),
         "default image must not require Podman short-name resolution: {args}"
