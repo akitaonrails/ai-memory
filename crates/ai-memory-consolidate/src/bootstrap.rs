@@ -31,9 +31,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ai_memory_core::{PagePath, ProjectId, Tier, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
 use ai_memory_store::ReaderPool;
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use jiff::Timestamp;
@@ -290,6 +291,46 @@ pub struct Bootstrap {
     pub llm: Arc<dyn LlmProvider>,
 }
 
+/// Maximum attempts (initial + retries) for one bootstrap chunk's LLM call.
+const BOOTSTRAP_CHUNK_MAX_ATTEMPTS: u32 = 3;
+/// Fixed, short delay between chunk retries. Deliberately not tenacity-style
+/// escalating backoff — see the cognee #2840 lesson in `ai-memory-llm`.
+const BOOTSTRAP_CHUNK_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Run one chunk's structured LLM call with a short, bounded retry.
+///
+/// A chunk that fails on a *transient* error ([`LlmError::is_transient`] —
+/// `429`, any `5xx`, or a transport timeout/connect failure) would otherwise
+/// abort the whole multi-chunk run and discard every earlier chunk's pages
+/// (they live only in the in-memory accumulator). The reporter's own bootstrap
+/// runs died repeatedly this way to provider `520`s and connection resets
+/// (#617). A few short retries turn those into a completed run; deterministic
+/// failures (auth, schema, a `4xx`, bad JSON) are not retried — they would only
+/// burn another expensive call.
+async fn complete_chunk_with_retry(
+    llm: &(dyn LlmProvider + 'static),
+    request: ChatRequest,
+    retry_delay: Duration,
+) -> Result<BootstrapBatch, LlmError> {
+    let mut attempt = 1;
+    loop {
+        match complete_structured::<BootstrapBatch>(llm, request.clone()).await {
+            Ok(batch) => return Ok(batch),
+            Err(e) if attempt < BOOTSTRAP_CHUNK_MAX_ATTEMPTS && e.is_transient() => {
+                warn!(
+                    attempt,
+                    max = BOOTSTRAP_CHUNK_MAX_ATTEMPTS,
+                    error = %e,
+                    "bootstrap chunk hit a transient LLM error; retrying shortly",
+                );
+                tokio::time::sleep(retry_delay).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl Bootstrap {
     /// Process pre-collected sources end-to-end: prune to budget,
     /// call the LLM, write pages, return the outcome. Server-side
@@ -379,7 +420,8 @@ impl Bootstrap {
                     .sum::<usize>(),
                 "bootstrap LLM chunk",
             );
-            let batch: BootstrapBatch = complete_structured(&*self.llm, request).await?;
+            let batch: BootstrapBatch =
+                complete_chunk_with_retry(&*self.llm, request, BOOTSTRAP_CHUNK_RETRY_DELAY).await?;
             rationales.push(batch.rationale);
             for page in batch.pages {
                 insert_bootstrap_page(&mut pages_by_path, page, idx + 1);
@@ -1319,7 +1361,113 @@ fn render_manifest_body(input: ManifestRender<'_>) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    /// Fails its first `transient_failures` structured calls with a transient
+    /// provider error (unless `permanent`, which always fails non-transiently),
+    /// then returns an empty batch.
+    struct FlakyLlm {
+        calls: AtomicUsize,
+        transient_failures: usize,
+        permanent: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FlakyLlm {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+        fn model(&self) -> &str {
+            "flaky"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("bootstrap only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.permanent {
+                return Err(LlmError::Auth("nope".into()));
+            }
+            if n < self.transient_failures {
+                return Err(LlmError::Provider {
+                    status: 503,
+                    body: "busy".into(),
+                });
+            }
+            Ok(serde_json::json!({ "pages": [], "rationale": "ok" }))
+        }
+    }
+
+    fn chunk_request() -> ChatRequest {
+        ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("x")],
+            max_tokens: 16,
+            temperature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn chunk_retry_recovers_from_transient_failures() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            transient_failures: 2, // fails twice, succeeds on the 3rd (= MAX)
+            permanent: false,
+        };
+        let batch = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
+            .await
+            .expect("a transient failure that clears within the attempt budget must succeed");
+        assert!(batch.pages.is_empty());
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            3,
+            "should have retried twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_retry_gives_up_after_the_attempt_budget() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            transient_failures: usize::MAX, // never clears
+            permanent: false,
+        };
+        let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
+            .await
+            .expect_err("a persistently transient failure must eventually give up");
+        assert!(err.is_transient());
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            BOOTSTRAP_CHUNK_MAX_ATTEMPTS as usize,
+            "must stop at the attempt budget, not retry forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunk_retry_does_not_retry_a_deterministic_error() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            transient_failures: 0,
+            permanent: true, // returns Auth — not transient
+        };
+        let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
+            .await
+            .expect_err("an auth error must not be retried");
+        assert!(!err.is_transient());
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            1,
+            "a deterministic error must fail on the first call, no retries"
+        );
+    }
 
     fn make_repo(tmp: &Path) -> Result<(), Box<dyn std::error::Error>> {
         // Use system git via std::process::Command instead of git2's

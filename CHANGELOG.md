@@ -52,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
   Responses endpoint. Luna is not served through Chat Completions, where plain
   and structured ai-memory calls returned HTTP 500 (#618).
+- `bootstrap` now retries a chunk's LLM call on a transient error before
+  giving up, instead of letting one blip discard the whole multi-chunk run
+  (#617). A provider `5xx`/`429` or a transport timeout/connect failure on
+  chunk *n* previously aborted the run and threw away chunks *1..n-1* — the
+  reporter's own runs died repeatedly to provider `520`s and connection
+  resets. Each chunk now gets up to 3 short, fixed-delay attempts;
+  deterministic failures (auth, schema, a `4xx`, malformed JSON) are not
+  retried. The retry is deliberately short and bounded, not tenacity-style
+  escalating backoff (cognee #2840). A durable `--resume` for the rarer
+  crash/hard-failure case remains tracked separately in #617.
 - `bootstrap` no longer aborts the whole multi-chunk run when one chunk
   returns no `pages` key (#614). Later chunks are told which paths
   earlier ones wrote, so a model that judges the material already
