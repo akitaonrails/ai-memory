@@ -95,6 +95,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
   Responses endpoint. Luna is not served through Chat Completions, where plain
   and structured ai-memory calls returned HTTP 500 (#618).
+- Corrected `docs/MIGRATION-2.0.md`, which wrongly promised the automatic
+  pre-migration archive could roll a store back to 1.x (#633). The archive is
+  written *after* `Store::open` migrates the SQLite schema forward, so its
+  `db/` is already at the 2.x schema and a 1.x binary refuses to open it. The
+  docs now state the archive is a 2.x recovery point and that a genuine 1.x
+  rollback requires a backup taken with the 1.x binary before upgrading.
+  (The underlying ordering — snapshotting before the DB migration runs — is
+  tracked separately.)
 - Typed edges (`relations`) now actually work on OpenAI-family providers
   (#630). `ConsolidatedPage.relations` was an open map
   (`BTreeMap<String, Vec<String>>`), which the strict structured-output
