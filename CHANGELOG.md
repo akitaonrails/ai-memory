@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The `bin/ai-memory` container wrapper now automatically uses Podman when
+  Docker is unavailable, uses a fully qualified Docker Hub image name to avoid
+  Podman's non-interactive short-name resolution failure, and preserves the
+  selected engine in standalone-container recovery scripts emitted by
+  `ai-memory upgrade` instead of hard-coding `docker` (#636).
+
+## [2.0.3] - 2026-09-04
+
 ### Changed
 - Release, Docker, and the `cargo install --git` snippet now build with
   `--locked` (#628). Without it `cargo install` re-resolves dependencies and
@@ -35,19 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dest_free_bytes`, so the same number is visible right before a migration.
 
 ### Fixed
-- The `bin/ai-memory` container wrapper now automatically uses Podman when
-  Docker is unavailable, uses a fully qualified Docker Hub image name to avoid
-  Podman's non-interactive short-name resolution failure, and preserves the
-  selected engine in standalone-container recovery scripts emitted by
-  `ai-memory upgrade` instead of hard-coding `docker` (#636).
-- Corrected `docs/MIGRATION-2.0.md`, which wrongly promised the automatic
-  pre-migration archive could roll a store back to 1.x (#633). The archive is
-  written *after* `Store::open` migrates the SQLite schema forward, so its
-  `db/` is already at the 2.x schema and a 1.x binary refuses to open it. The
-  docs now state the archive is a 2.x recovery point and that a genuine 1.x
-  rollback requires a backup taken with the 1.x binary before upgrading.
-  (The underlying ordering — snapshotting before the DB migration runs — is
-  tracked separately.)
+- The pre-migration safety archive is now taken **before** the SQLite schema
+  is migrated, so it is a genuine pre-2.0 recovery point a 1.x binary can
+  reopen — restoring the documented "reversible upgrade" (#633). Previously the
+  archive was written inside the wiki migration, which runs *after*
+  `Store::open` has already advanced the DB schema, so the archived `db/` was
+  already at 2.x and a 1.x binary refused it — the documented rollback was
+  impossible. The snapshot now runs in the boot path before `Store::open`,
+  gated to the real 1.x→2.0 upgrade (a fresh install or already-migrated store
+  takes nothing, unchanged) and idempotent; the OKF migration reuses that
+  archive instead of taking a second one. An integration test asserts the
+  archived DB reflects the pre-migration state.
 - Typed edges (`relations`) now actually work on OpenAI-family providers
   (#630). `ConsolidatedPage.relations` was an open map
   (`BTreeMap<String, Vec<String>>`), which the strict structured-output
@@ -4963,7 +4970,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...HEAD
+[2.0.3]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.2
 [2.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.1
 [2.0.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.0

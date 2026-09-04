@@ -46,6 +46,7 @@ use std::path::Path;
 
 use ai_memory_store::WriterHandle;
 
+pub use m2026_09_okf_conformance::snapshot_before_db_migration;
 pub use runner::run_pending;
 
 use crate::error::WikiResult;
