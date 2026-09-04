@@ -406,7 +406,11 @@ pub async fn require_bearer(
     match authenticate_bearer(&state, &mut req).await {
         Ok(BearerAuth::Authenticated) => next.run(req).await,
         Err(resp) => resp,
-        Ok(BearerAuth::Absent) if !state.enabled() => {
+        Ok(BearerAuth::Absent | BearerAuth::Rejected) if !state.enabled() => {
+            // With no configured authority the wire gate is disabled. A
+            // client may still carry a stale bearer from an older secured
+            // deployment; treat it like an anonymous request instead of
+            // making the no-auth server stricter than an absent header.
             req.extensions_mut().insert(ActorContext::anonymous());
             req.extensions_mut().insert(AuthLevel::Anonymous);
             next.run(req).await
@@ -543,6 +547,22 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_token_configured_ignores_an_unexpected_bearer() {
+        let r = router_with_auth(None);
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Authorization", "Bearer stale-client-token")
                     .body(Body::empty())
                     .unwrap(),
             )
