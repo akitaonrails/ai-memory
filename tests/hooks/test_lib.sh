@@ -181,7 +181,7 @@ if command -v git >/dev/null 2>&1; then
     mkdir -p "$REPO"
     git init -q "$REPO"
     git -C "$REPO" -c user.email=t@example.com -c user.name=t \
-        commit -q --allow-empty -m init
+        commit -q --no-gpg-sign --allow-empty -m init
 
     # A subdirectory of the main checkout collapses to the repo basename
     # (not the subdir name) when the marker selects repo-root and pins no

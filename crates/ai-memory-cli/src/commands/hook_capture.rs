@@ -893,6 +893,9 @@ drop_subagent_captures = "true"
                 .unwrap()
                 .success()
         );
+        // The commit exists only because `git worktree add` refuses a repo with
+        // no commits. --no-gpg-sign: a global `commit.gpgsign = true` would
+        // otherwise make git sign as this throwaway identity, and fail.
         assert!(
             std::process::Command::new("git")
                 .arg("-C")
@@ -904,6 +907,7 @@ drop_subagent_captures = "true"
                     "user.name=t",
                     "commit",
                     "-q",
+                    "--no-gpg-sign",
                     "--allow-empty",
                     "-m",
                     "init",

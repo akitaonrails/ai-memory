@@ -85,7 +85,7 @@ jobs:
       - name: Build release binary
         env:
           TAILWIND_SKIP: "1"
-        run: cargo build --release -p ai-memory-cli
+        run: cargo build --locked --release -p ai-memory-cli
 
       - name: Create release tarball
         env:
@@ -142,7 +142,7 @@ jobs:
       - name: Build release binary
         env:
           TAILWIND_SKIP: "1"
-        run: cargo build --release -p ai-memory-cli
+        run: cargo build --locked --release -p ai-memory-cli
 
       # Mirrors the Linux tarball, swapping the Linux-only service assets
       # (packaging/systemd|sysusers|tmpfiles|env) for the macOS-only
@@ -216,7 +216,7 @@ jobs:
       - name: Build release binary
         env:
           TAILWIND_SKIP: "1"
-        run: cargo build --release -p ai-memory-cli
+        run: cargo build --locked --release -p ai-memory-cli
 
       # Mirrors the Linux tarball, minus the Linux-only service assets
       # (packaging/systemd|sysusers|tmpfiles|env). Ships the `.exe`, the full
@@ -549,7 +549,7 @@ jobs:
           echo "# extract it, and follow the bundled docs/windows.md." >> body.md
           echo "" >> body.md
           echo "# From source" >> body.md
-          echo "cargo install --git https://github.com/akitaonrails/ai-memory --tag ${GITHUB_REF_NAME}" >> body.md
+          echo "cargo install --locked --git https://github.com/akitaonrails/ai-memory --tag ${GITHUB_REF_NAME}" >> body.md
           echo '```' >> body.md
 
       - name: Create GitHub Release

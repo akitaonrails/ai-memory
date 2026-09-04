@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 
 use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
-use crate::commands::render_shared::{ts_capture_policy_v1, ts_spool_runtime, ts_string_literal};
+use crate::commands::render_shared::{
+    ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime, ts_string_literal,
+};
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
 pub(crate) const PACKAGE_NAME: &str = "@ai-memory/openclaw-plugin";
@@ -302,6 +304,7 @@ fn build_plugin(
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
+    let resolve_fn = ts_resolve_token_fn();
     let apply_marker_params = apply_marker_params_ts(project_strategy);
     let capture_policy = ts_capture_policy_v1();
     format!(
@@ -317,7 +320,7 @@ import {{ homedir }} from "node:os";
 
 const SERVER = {server_literal}.replace(/\/+$/, "");
 const AGENT = "openclaw";
-{token_line}
+{token_line}{resolve_fn}
 {capture_policy}
 
 function timeoutSignal(ms: number): AbortSignal | undefined {{
@@ -327,7 +330,8 @@ function timeoutSignal(ms: number): AbortSignal | undefined {{
 }}
 
 function authHeaders(): Record<string, string> {{
-  return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
+  const token = resolveToken();
+  return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
 }}
 
 function findMarker(cwd: string | undefined): string | undefined {{
@@ -485,6 +489,7 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
+    if (!response.ok) return undefined;
     const text = (await response.text()).trim();
     return text.length > 0 ? text : undefined;
   }} catch (_e) {{
@@ -642,8 +647,16 @@ mod tests {
         assert!(plugin.contains("const policy = capturePolicy(body"));
         assert!(plugin.contains("body: JSON.stringify(policy.payload)"));
         assert!(plugin.contains("prependContext: handoff"));
-        assert!(plugin.contains("Bearer ${TOKEN}"));
+        assert!(plugin.contains("Bearer ${token}"));
         assert!(plugin.contains("tok"));
+    }
+
+    #[test]
+    fn openclaw_plugin_resolves_token_at_runtime_when_not_embedded() {
+        let plugin = build_plugin("http://127.0.0.1:49374", None, None);
+        assert!(plugin.contains("function resolveToken("));
+        assert!(plugin.contains("const token = resolveToken();"));
+        assert!(plugin.contains("if (!response.ok) return undefined;"));
     }
 
     #[test]

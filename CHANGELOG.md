@@ -47,11 +47,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so nothing changes unless an operator asks for it. Override the session
   header to tell several ai-memory instances apart in OpenCode's metrics.
   ([#606])
+- Release, Docker, and the `cargo install --git` snippet now build with
+  `--locked` (#628). Without it `cargo install` re-resolves dependencies and
+  ignores the committed `Cargo.lock`, so a source install could silently pull
+  a different `schemars` than the one tested — a plausible source of
+  build-to-build structured-output schema drift. A unit guard also asserts the
+  strict-schema normalizer keeps `required` equal to `properties` (and closes
+  open maps), catching that drift class at build time rather than in
+  production.
+- The `_pending/auto-improve/` sidecar no longer renders a `status:` line
+  (#624). It was written once at staging and could never change from
+  `pending` — no code path updates or garbage-collects the sidecar — so it
+  contradicted design principle 14 (SQLite owns approval status) and misled a
+  human (or a second agent) reading the file. Status lives in
+  `ai-memory pending-writes list` / SQLite; the sidecar is a staging-time
+  snapshot.
 
 ### Fixed
 - The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
   Responses endpoint. Luna is not served through Chat Completions, where plain
   and structured ai-memory calls returned HTTP 500 (#618).
+- `finalize-session --agent hermes` (and `claude-desktop`, `crush`, `other`)
+  is accepted again (#623). These agents are captured and stored, but
+  `finalize-session` reused the install-oriented agent enum — which is
+  deliberately limited to agents with a first-party installer — so it rejected
+  them at parse time and their sessions could never be closed, summarised, or
+  consolidated. `finalize-session` is agent-agnostic, so `--agent` now accepts
+  any agent the store recognises (a genuine typo is still rejected);
+  `install-hooks`/`setup-agent` stay limited. A drift guard keeps the two sets
+  from diverging again.
+- generated TypeScript integrations (`--agent open-code`, `omp`, `pi`,
+  `openclaw`) authenticate again under `install-hooks --apply`. Since #552
+  the bearer is deliberately omitted from the rendered file and persisted to
+  the 0600 `<data_dir>/auth-token` file, but only the native hook runtimes
+  learned to read it back: the generated TS adapters kept rendering
+  `TOKEN = null` with no runtime resolution, so every request they make
+  (hook capture, spool drain, handoff fetch) goes out unauthenticated and is
+  rejected by a Bearer-enabled server. The templates now render a
+  `resolveToken()` helper (static embed, then `AI_MEMORY_AUTH_TOKEN`, then
+  the auth-token file) used by `authHeaders()` and the spool writer.
+  `fetchHandoff()` in the same adapters also ignored `response.ok`, so a
+  401 error body could be injected into model context as if it were a
+  handoff; non-OK responses now return `undefined` like other failures.
 - `bootstrap` now retries a chunk's LLM call on a transient error before
   giving up, instead of letting one blip discard the whole multi-chunk run
   (#617). A provider `5xx`/`429` or a transport timeout/connect failure on

@@ -768,6 +768,79 @@ mod tests {
         assert_eq!(names.len(), 3);
     }
 
+    /// Recursively assert every object node an enforced schema produces has
+    /// `additionalProperties: false` and a `required` array that is exactly
+    /// its `properties` keys — no key in `required` that `properties` lacks.
+    fn assert_strict_invariant(node: &serde_json::Value) {
+        if let Some(map) = node.as_object() {
+            if map.contains_key("$ref") {
+                return;
+            }
+            if let Some(props) = map.get("properties").and_then(|p| p.as_object()) {
+                assert_eq!(
+                    map.get("additionalProperties"),
+                    Some(&json!(false)),
+                    "every object must set additionalProperties:false; got {map:?}"
+                );
+                let required: std::collections::BTreeSet<&str> = map
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str())
+                    .collect();
+                let keys: std::collections::BTreeSet<&str> =
+                    props.keys().map(String::as_str).collect();
+                assert_eq!(
+                    required, keys,
+                    "required must equal properties keys (the #628 drift symptom is required \
+                     carrying a key properties lacks)"
+                );
+            }
+            for v in map.values() {
+                assert_strict_invariant(v);
+            }
+        } else if let Some(items) = node.as_array() {
+            for v in items {
+                assert_strict_invariant(v);
+            }
+        }
+    }
+
+    /// #628 guard: a `BTreeMap`-typed field (schemars emits
+    /// `additionalProperties: {schema}`, an open map) is normalized to
+    /// `additionalProperties: false`, NOT recursed into. OpenAI strict mode
+    /// forbids open/arbitrary-key maps — emitting `additionalProperties:{schema}`
+    /// would 400 on every strict provider. This test pins that behavior so the
+    /// map value-schema is never "revived": the correct way to make a map field
+    /// model-producible under strict mode is a fixed-shape array of objects, not
+    /// an open map.
+    #[test]
+    fn enforce_strict_closes_open_maps_and_keeps_required_consistent() {
+        // Shape mirrors ConsolidatedPage: scalar fields plus a `relations`
+        // BTreeMap<String, Vec<String>> rendered as an open map.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "body_markdown": { "type": "string" },
+                "relations": {
+                    "type": "object",
+                    "additionalProperties": { "type": "array", "items": { "type": "string" } }
+                }
+            }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        // The map field is closed, not preserved as an open map.
+        assert_eq!(
+            schema["properties"]["relations"]["additionalProperties"],
+            json!(false),
+            "an open map must be closed for strict mode, not left as additionalProperties:{{schema}}"
+        );
+        // And the whole schema satisfies the strict invariant end to end.
+        assert_strict_invariant(&schema);
+    }
+
     #[test]
     fn enforce_strict_overwrites_incomplete_required() {
         // OpenAI strict mode rejects partial `required` arrays — even an

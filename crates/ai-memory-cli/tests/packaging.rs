@@ -235,7 +235,7 @@ fn aur_packages_install_all_native_assets() {
 #[test]
 fn docker_source_build_uses_vendored_tailwind() {
     let dockerfile = read_repo("docker/Dockerfile");
-    assert!(dockerfile.contains("TAILWIND_SKIP=1 cargo build --release -p ai-memory-cli"));
+    assert!(dockerfile.contains("TAILWIND_SKIP=1 cargo build --locked --release -p ai-memory-cli"));
 }
 
 #[test]

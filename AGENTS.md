@@ -349,6 +349,12 @@ Additional boundary rules:
   Parsers, ID derivation, and retention/decay math especially.
 - Filesystem tests use temp dirs or injected roots (`tempfile`); never
   depend on the real user home directory being writable.
+- Tests that build throwaway git repos must not inherit the contributor's
+  machine config: pass `--no-gpg-sign` on every fixture commit (a global
+  `commit.gpgsign = true` otherwise signs as the fixture's fake identity and
+  fails), and build `git2` signatures with a fixed `Signature::now(...)`,
+  never `repo.signature()`. CI cannot catch either — its runners have no
+  global gitconfig, so the breakage only ever shows up on a developer's box.
 - PRs touching scope resolution need table-driven tests for partial
   scope, missing explicit scope, active-project precedence, and
   cross-workspace isolation.

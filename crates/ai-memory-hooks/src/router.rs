@@ -3730,9 +3730,10 @@ mod tests {
     fn init_repo_with_commit(path: &std::path::Path) -> git2::Repository {
         std::fs::create_dir_all(path).unwrap();
         let repo = git2::Repository::init(path).unwrap();
-        let sig = repo
-            .signature()
-            .unwrap_or_else(|_| git2::Signature::now("test", "test@test.com").unwrap());
+        // Fixed identity, not `repo.signature()`: that reads the machine's global
+        // user.name/user.email, so these commits would be authored by whoever ran
+        // the suite. Unrelated to signing — libgit2 never signs commits.
+        let sig = git2::Signature::now("test", "test@test.com").unwrap();
         let tree_id = repo.index().unwrap().write_tree().unwrap();
         {
             let tree = repo.find_tree(tree_id).unwrap();
@@ -3766,7 +3767,9 @@ mod tests {
         commit
             .arg("-C")
             .arg(path)
-            .args(["commit", "--allow-empty", "-m", "initial"]);
+            // --no-gpg-sign: a global `commit.gpgsign = true` would make git
+            // sign as this fixture's throwaway identity, and fail.
+            .args(["commit", "--no-gpg-sign", "--allow-empty", "-m", "initial"]);
         assert_command_success(commit);
     }
 

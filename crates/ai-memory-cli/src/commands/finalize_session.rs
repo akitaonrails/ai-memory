@@ -52,7 +52,7 @@ struct FinalizeSessionReport {
 /// Returns an error if the configured server cannot list the scope's open
 /// sessions or rejects a synthetic `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
-    let agent = args.agent.kind();
+    let agent = args.agent;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;

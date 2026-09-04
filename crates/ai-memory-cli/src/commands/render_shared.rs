@@ -1803,6 +1803,46 @@ fn claude_code_windows_command_is_unchanged_by_the_codex_fix() {
 /// `hook-spool` on-disk contract (same filenames, same `SpoolEntry` JSON,
 /// same permissions) plus a self-drain. Callers only need `TOKEN`,
 /// `timeoutSignal`, and the node `join`/`homedir`/fs imports in scope.
+/// Runtime credential fallback shared by every generated TypeScript
+/// integration. #552 moved the bearer out of generated files into a 0600
+/// `<data_dir>/auth-token` file and taught the native hook runtimes to read
+/// it back, but the generated TS adapters kept rendering `TOKEN = null`
+/// under `--apply` and had no equivalent read-back, so every request went
+/// out unauthenticated against a Bearer-enabled server. Generated files
+/// call this from `authHeaders()` and the spool writer. Needs `TOKEN`,
+/// `join`, `homedir`, `existsSync`, and `readFileSync` (as `readMarkerText`)
+/// in scope — the same surface `ts_spool_runtime` already assumes.
+pub(crate) fn ts_resolve_token_fn() -> &'static str {
+    r#"
+// Resolve the server bearer per request. A statically embedded token wins
+// (inline installs), then the environment, then the 0600 auth-token file
+// that `install-hooks --apply` persists under the data dir (#552).
+function resolveToken(): string | null {
+  if (TOKEN) return TOKEN;
+  const envToken = process.env.AI_MEMORY_AUTH_TOKEN;
+  if (envToken && envToken.trim()) return envToken.trim();
+  try {
+    const dataDir = process.env.AI_MEMORY_DATA_DIR?.trim();
+    const base = dataDir
+      ? dataDir
+      : process.platform === "darwin"
+        ? join(homedir(), "Library", "Application Support", "ai-memory")
+        : process.platform === "win32"
+          ? join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "ai-memory")
+          : join(process.env.XDG_DATA_HOME?.trim() || join(homedir(), ".local", "share"), "ai-memory");
+    const tokenPath = join(base, "auth-token");
+    if (existsSync(tokenPath)) {
+      const fromFile = readMarkerText(tokenPath, "utf-8").trim();
+      if (fromFile) return fromFile;
+    }
+  } catch {
+    // Best effort: an unreadable token file leaves auth absent.
+  }
+  return null;
+}
+"#
+}
+
 pub(crate) fn ts_spool_runtime() -> &'static str {
     r#"
 // ---- offline spool (#580): the same on-disk contract as `ai-memory hook` ----
@@ -1835,7 +1875,7 @@ function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): v
     const key = `ts${createdMs.toString(16)}${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
     const u = new URL(String(url));
     if (!u.searchParams.has("ingest_key")) u.searchParams.set("ingest_key", key);
-    const token = TOKEN;
+    const token = resolveToken();
     const entry = {
       url: u.toString(),
       body: JSON.stringify(payload),

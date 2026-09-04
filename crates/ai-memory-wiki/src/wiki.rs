@@ -2222,7 +2222,6 @@ fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult
         "# Pending auto-improvement proposal\n\n\
          - proposal_id: `{}`\n\
          - run_id: `{}`\n\
-         - status: `{}`\n\
          - operation: `{}`\n\
          - target_path: `{}`\n\
          - kind: `{}`\n\
@@ -2237,7 +2236,6 @@ fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult
          ## Proposed body\n\n{}\n",
         detail.summary.id,
         detail.summary.run_id,
-        detail.summary.status.as_str(),
         detail.summary.operation.as_str(),
         detail.summary.target_path.as_str(),
         detail.summary.kind,

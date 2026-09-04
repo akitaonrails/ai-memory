@@ -2911,6 +2911,7 @@ fn add_hook_spooling(source: String) -> Result<String> {
       }"#;
     const ENQUEUE_ANCHOR: &str = "function enqueueHook(";
     let runtime = crate::commands::render_shared::ts_spool_runtime();
+    let resolve_fn = crate::commands::render_shared::ts_resolve_token_fn();
     if !source.contains(FETCH_BLOCK) {
         anyhow::bail!(
             "TS integration template drifted: the hook delivery block the \
@@ -2921,7 +2922,11 @@ fn add_hook_spooling(source: String) -> Result<String> {
         anyhow::bail!("TS integration template drifted: enqueueHook anchor not unique");
     }
     let mut out = source.replacen(FETCH_BLOCK, FETCH_REPLACEMENT, 1);
-    out = out.replacen(ENQUEUE_ANCHOR, &format!("{runtime}{ENQUEUE_ANCHOR}"), 1);
+    out = out.replacen(
+        ENQUEUE_ANCHOR,
+        &format!("{resolve_fn}{runtime}{ENQUEUE_ANCHOR}"),
+        1,
+    );
     // Drain the offline spool alongside every queue flush, and extend the
     // imports the runtime needs.
     let drain_anchor =
@@ -2980,7 +2985,8 @@ function timeoutSignal(ms: number): AbortSignal | undefined {{
 }}
 
 function authHeaders(): Record<string, string> {{
-  return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
+  const token = resolveToken();
+  return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
 }}
 
 const HOOK_QUEUE_MAX = 100;
@@ -3216,6 +3222,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
+    if (!response.ok) return undefined;
     const text = (await response.text()).trim();
     return text.length > 0 ? text : undefined;
   }} catch (_e) {{
@@ -3710,7 +3717,8 @@ function timeoutSignal(ms: number): AbortSignal | undefined {{
 }}
 
 function authHeaders(): Record<string, string> {{
-  return TOKEN ? {{ Authorization: `Bearer ${{TOKEN}}` }} : {{}};
+  const token = resolveToken();
+  return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
 }}
 
 const HOOK_QUEUE_MAX = 100;
@@ -3930,6 +3938,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
+    if (!response.ok) return undefined;
     const text = (await response.text()).trim();
     return text.length > 0 ? text : undefined;
   }} catch (_e) {{
@@ -7607,7 +7616,7 @@ model = "gpt-5"
         assert!(plugin.contains("handoffFetches.delete(id);"));
         assert!(plugin.contains("preCompactLast.delete(id);"));
         assert!(plugin.contains("postHook(\"user-prompt\""));
-        assert!(plugin.contains("Bearer ${TOKEN}"));
+        assert!(plugin.contains("Bearer ${token}"));
         assert!(plugin.contains("tok"));
         assert!(
             !plugin.contains(r#""session.created": async"#),
@@ -7679,6 +7688,30 @@ model = "gpt-5"
         assert_generated_ts_uses_bounded_hook_queue(&plugin);
     }
 
+    #[test]
+    fn opencode_plugin_resolves_token_at_runtime_when_not_embedded() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", None, None);
+        assert!(plugin.contains("function resolveToken("));
+        assert!(plugin.contains("const token = resolveToken();"));
+        assert!(plugin.contains("if (!response.ok) return undefined;"));
+    }
+
+    #[test]
+    fn omp_extension_resolves_token_at_runtime_when_not_embedded() {
+        let extension = build_omp_extension("http://127.0.0.1:49374", None, None);
+        assert!(extension.contains("function resolveToken("));
+        assert!(extension.contains("process.env.AI_MEMORY_AUTH_TOKEN"));
+        assert!(extension.contains("auth-token"));
+        assert!(extension.contains("if (!response.ok) return undefined;"));
+    }
+
+    #[test]
+    fn omp_extension_prefers_statically_embedded_token() {
+        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+        assert!(extension.contains("function resolveToken("));
+        assert!(extension.contains("if (TOKEN) return TOKEN;"));
+    }
+
     // ----------------------------------------------------------------
     // OMP tests
     // ----------------------------------------------------------------
@@ -7713,7 +7746,7 @@ model = "gpt-5"
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
         assert!(extension.contains("applyMarkerParams(url, cwd);"));
-        assert!(extension.contains("Bearer ${TOKEN}"));
+        assert!(extension.contains("Bearer ${token}"));
         assert!(extension.contains("tok"));
         assert!(
             extension
@@ -8120,7 +8153,7 @@ model = "gpt-5"
         assert!(extension.contains("payload?.result?.isError"));
         assert!(extension.contains("response.ok"));
         assert!(extension.contains("signal: mcpSignal(signal)"));
-        assert!(extension.contains("Bearer ${TOKEN}"));
+        assert!(extension.contains("Bearer ${token}"));
         assert!(extension.contains("tok"));
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(!extension.contains(".omp"));

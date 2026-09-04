@@ -1501,14 +1501,39 @@ impl AgentChoice {
     }
 }
 
+/// Parse a `finalize-session --agent` value into an [`ai_memory_core::AgentKind`].
+///
+/// Unlike the install-oriented `AgentChoice` value-enum, this accepts every
+/// agent the store's CHECK constraint permits, because finalize-session is
+/// agent-agnostic and must be able to close a session for any captured harness
+/// (#623). A genuine typo — which `from_wire` would silently map to `Other` —
+/// is rejected so the operator gets a clear error instead of a mis-scoped
+/// finalize.
+fn parse_finalizable_agent(s: &str) -> Result<ai_memory_core::AgentKind, String> {
+    use ai_memory_core::AgentKind;
+    let kind = AgentKind::from_wire(s);
+    if matches!(kind, AgentKind::Other) && !s.eq_ignore_ascii_case("other") {
+        let known = AgentKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("unknown agent '{s}'; expected one of: {known}"));
+    }
+    Ok(kind)
+}
+
 /// Arguments for `finalize-session`.
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
-    /// Agent kind to finalize. Defaults to Codex for backward compatibility;
-    /// Codex, Antigravity CLI, Pool, and ZCode have no reliable true
-    /// SessionEnd hook.
-    #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
-    pub agent: AgentChoice,
+    /// Agent kind to finalize. Accepts any agent the store recognises — unlike
+    /// `install-hooks`/`setup-agent`, which are limited to agents with a
+    /// first-party installer. finalize-session is agent-agnostic (it just posts
+    /// a synthetic session-end and summarises), so refusing a captured harness
+    /// like `hermes` here only stranded its sessions unclosable (#623).
+    /// Defaults to Codex for backward compatibility.
+    #[arg(long, default_value = "codex", value_parser = parse_finalizable_agent)]
+    pub agent: ai_memory_core::AgentKind,
     /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
     /// `workspace`, else `default`.
     #[arg(long)]
@@ -2293,6 +2318,39 @@ mod tests {
     }
 
     #[test]
+    fn finalize_session_accepts_hermes_and_every_captured_agent() {
+        // #623: hermes is accepted for capture/storage but the install-oriented
+        // AgentChoice enum lacked it, so finalize-session refused it and hermes
+        // sessions could never be closed. finalize is agent-agnostic; it must
+        // accept every AgentKind the store recognises.
+        let parsed = Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "hermes"])
+            .expect("hermes must be a valid finalize agent");
+        let Command::FinalizeSession(args) = parsed.command else {
+            panic!("expected finalize-session command");
+        };
+        assert_eq!(args.agent, ai_memory_core::AgentKind::Hermes);
+
+        // Drift guard: every AgentKind must be finalizable, so the CLI accept
+        // set can never again fall behind the store's CHECK set (the exact
+        // drift that caused #623). `other` is included via its explicit spelling.
+        for kind in ai_memory_core::AgentKind::ALL {
+            let parsed =
+                Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", kind.as_str()])
+                    .unwrap_or_else(|e| panic!("agent {} must finalize: {e}", kind.as_str()));
+            let Command::FinalizeSession(args) = parsed.command else {
+                panic!("expected finalize-session command");
+            };
+            assert_eq!(args.agent, kind, "wire round-trip for {}", kind.as_str());
+        }
+
+        // A genuine typo is rejected rather than silently mapped to Other.
+        assert!(
+            Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "hermez"]).is_err(),
+            "an unknown agent must be rejected, not silently accepted as Other"
+        );
+    }
+
+    #[test]
     fn architecture_lists_every_visible_cli_subcommand() {
         let architecture = include_str!("../../../docs/ARCHITECTURE.md");
         let cli_section = architecture
@@ -2833,7 +2891,7 @@ mod tests {
         let Command::FinalizeSession(args) = cli.command else {
             panic!("expected finalize-session for pool");
         };
-        assert_eq!(args.agent, AgentChoice::Pool);
+        assert_eq!(args.agent, ai_memory_core::AgentKind::Pool);
     }
 
     #[test]
@@ -2861,7 +2919,7 @@ mod tests {
         let Command::FinalizeSession(args) = cli.command else {
             panic!("expected finalize-session for zcode");
         };
-        assert_eq!(args.agent, AgentChoice::Zcode);
+        assert_eq!(args.agent, ai_memory_core::AgentKind::Zcode);
     }
 
     #[test]

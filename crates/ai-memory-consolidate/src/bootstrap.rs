@@ -1484,15 +1484,19 @@ mod tests {
         run(&["init", "-q", "-b", "main"])?;
         run(&["config", "user.email", "test@example.com"])?;
         run(&["config", "user.name", "Test"])?;
+        // --no-gpg-sign throughout: a global `commit.gpgsign = true` would make
+        // git sign as this fixture's throwaway identity, and fail.
         run(&[
             "commit",
+            "--no-gpg-sign",
             "--allow-empty",
             "-m",
             "feat: initial scaffolding for storage substrate with WAL + supersession chain",
         ])?;
-        run(&["commit", "--allow-empty", "-m", "typo"])?;
+        run(&["commit", "--no-gpg-sign", "--allow-empty", "-m", "typo"])?;
         run(&[
             "commit",
+            "--no-gpg-sign",
             "--allow-empty",
             "-m",
             "design: choose Karpathy compile-not-retrieve model over RAG for capture",
@@ -1831,10 +1835,9 @@ mod tests {
             assert!(status.success(), "git {args:?} failed");
             Ok(())
         };
+        // `git init` alone is enough: MainRepoRoot resolves through
+        // `Repository::discover` + `commondir()`, which never reads HEAD.
         run(&["init", "-q", "-b", "main"]).unwrap();
-        run(&["config", "user.email", "t@t"]).unwrap();
-        run(&["config", "user.name", "t"]).unwrap();
-        run(&["commit", "--allow-empty", "-m", "init"]).unwrap();
 
         let from_sub = repo.join("sub").join("dir");
         let (name, root) =

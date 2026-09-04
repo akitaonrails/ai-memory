@@ -47,7 +47,7 @@ git -C "$REPO" config user.name "ai-memory acceptance"
 git -C "$REPO" config user.email "acceptance@localhost"
 printf '# Managed workstream acceptance\n' >"$REPO/README.md"
 git -C "$REPO" add README.md
-git -C "$REPO" commit -qm "acceptance fixture"
+git -C "$REPO" commit -q --no-gpg-sign -m "acceptance fixture"
 
 TOKEN="managed-acceptance-$(date +%s)-$$"
 PORT=${AI_MEMORY_ACCEPTANCE_PORT:-$((52000 + ($$ % 10000)))}
@@ -1235,7 +1235,7 @@ git -C "$OTHER_REPO" config user.name "ai-memory acceptance"
 git -C "$OTHER_REPO" config user.email "acceptance@localhost"
 printf '# elsewhere\n' >"$OTHER_REPO/README.md"
 git -C "$OTHER_REPO" add README.md
-git -C "$OTHER_REPO" commit -qm "acceptance fixture"
+git -C "$OTHER_REPO" commit -q --no-gpg-sign -m "acceptance fixture"
 other_json=$(cd "$OTHER_REPO" && "$BIN" --data-dir "$DATA" workstreams \
   --project "$(basename "$REPO")" --json)
 jq -e 'length == 0' <<<"$other_json" >/dev/null || {

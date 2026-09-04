@@ -28,7 +28,7 @@ COPY evals ./evals
 COPY docs ./docs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/work/target \
-    TAILWIND_SKIP=1 cargo build --release -p ai-memory-cli \
+    TAILWIND_SKIP=1 cargo build --locked --release -p ai-memory-cli \
  && cp target/release/ai-memory /usr/local/bin/ai-memory
 
 FROM debian:bookworm-slim AS runtime-base
