@@ -449,6 +449,83 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
     assert!(powershell.contains("${ScopeRoot}:/scope:ro"));
 }
 
+#[cfg(unix)]
+#[test]
+fn posix_wrapper_auto_selects_podman_when_docker_is_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let podman_args = tmp.path().join("podman-args.txt");
+    let scripts = [
+        (
+            "podman",
+            format!(
+                "#!/bin/bash\n\
+                 if [ \"${{1:-}}\" = info ]; then\n\
+                 \x20 printf '[name=seccomp]\\n'\n\
+                 \x20 exit 0\n\
+                 fi\n\
+                 printf '%s\\n' \"$@\" > {}\n",
+                shell_path(&podman_args)
+            ),
+        ),
+        (
+            "id",
+            "#!/bin/bash\ncase \"$1\" in -u) printf '1000\\n' ;; -g) printf '1000\\n' ;; esac\n"
+                .to_owned(),
+        ),
+        ("uname", "#!/bin/bash\nprintf 'Linux\\n'\n".to_owned()),
+        (
+            "getenforce",
+            "#!/bin/bash\nprintf 'Disabled\\n'\n".to_owned(),
+        ),
+        (
+            "grep",
+            "#!/bin/bash\n\
+             pattern=\"${@: -1}\"\n\
+             input=\"\"\n\
+             while IFS= read -r line; do input=\"${input}${line}\"; done\n\
+             case \"${input}\" in *\"${pattern}\"*) exit 0 ;; *) exit 1 ;; esac\n"
+                .to_owned(),
+        ),
+    ];
+    for (name, body) in scripts {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let output = Command::new("/bin/bash")
+        .arg(repo_root().join("bin/ai-memory"))
+        .arg("status")
+        .env("PATH", tmp.path())
+        .env("HOME", tmp.path())
+        .env("AI_MEMORY_NO_TTY", "1")
+        .env("AI_MEMORY_NO_VERSION_CHECK", "1")
+        .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env_remove("AI_MEMORY_DOCKER")
+        .env_remove("AI_MEMORY_IMAGE")
+        .env_remove("AI_MEMORY_SERVER_URL")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "wrapper failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let args = std::fs::read_to_string(podman_args).unwrap();
+    let flags: Vec<_> = args.lines().collect();
+    assert_eq!(
+        flags.first(),
+        Some(&"run"),
+        "Podman was not invoked: {args}"
+    );
+    assert!(
+        flags.contains(&"docker.io/akitaonrails/ai-memory:latest"),
+        "default image must not require Podman short-name resolution: {args}"
+    );
+}
+
 #[test]
 fn wrapper_updates_and_install_docs_use_verified_release_assets() {
     let wrapper = read_repo("bin/ai-memory");

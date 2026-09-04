@@ -23,7 +23,7 @@ assert_not_contains() {
   fi
 }
 
-FAKE_DOCKER="${TMP_ROOT}/docker"
+FAKE_DOCKER="${TMP_ROOT}/podman"
 cat >"${FAKE_DOCKER}" <<'DOCKER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -85,9 +85,11 @@ run_upgrade_case standalone 0
 assert_contains "${TMP_ROOT}/standalone/output.log" "does not manage the running ai-memory container"
 assert_not_contains "${TMP_ROOT}/standalone/docker.log" "compose up -d"
 assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "-v ai-memory-data:/data"
+assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "${FAKE_DOCKER} stop ai-memory"
+assert_not_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "docker stop ai-memory"
 
 run_upgrade_case compose 1
-assert_contains "${TMP_ROOT}/compose/output.log" "restarting local ai-memory container via docker compose"
+assert_contains "${TMP_ROOT}/compose/output.log" "restarting local ai-memory container via ${FAKE_DOCKER} compose"
 assert_contains "${TMP_ROOT}/compose/docker.log" "compose up -d"
 if [ -e "${TMP_ROOT}/compose/cache/ai-memory/recreate-ai-memory.sh" ]; then
   fail "Compose-owned container unexpectedly produced a standalone recreation script"

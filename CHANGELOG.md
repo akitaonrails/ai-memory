@@ -103,6 +103,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dest_free_bytes`, so the same number is visible right before a migration.
 
 ### Fixed
+- The `bin/ai-memory` container wrapper now runs on Podman without Docker
+  (#636). It auto-selects the engine (`AI_MEMORY_DOCKER` override → `docker` →
+  `podman`), defaults to the fully-qualified `docker.io/akitaonrails/ai-memory`
+  image so Podman's non-interactive short-name resolution does not fail, and
+  preserves the selected engine in the standalone-container recovery script
+  `ai-memory upgrade` emits instead of hard-coding `docker`.
 - The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
   Responses endpoint. Luna is not served through Chat Completions, where plain
   and structured ai-memory calls returned HTTP 500 (#618).
@@ -5065,7 +5071,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...HEAD
+[2.0.3]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.2
 [2.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.1
 [2.0.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.0
