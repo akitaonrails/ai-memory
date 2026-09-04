@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Generated routing instructions and all project-scoped managed Agent Skills now
+  distinguish session-aware MCP clients from static clients. Static clients are
+  told to pass exact `workspace` + `project` values from `.ai-memory.toml` or
+  operator configuration on every project-scoped call, preventing another
+  session's last active project from capturing reads or writes; global searches
+  and global preference writes retain their scope-free argument rules (#372).
+
 ## [2.0.3] - 2026-09-04
 
 ### Changed

@@ -33,9 +33,14 @@ If the user asks to create a durable project rule such as always do X or never d
 
 Delete only by exact path. If the user gives a vague title or topic, first resolve it to the page path using read-only lookup. Preserve sibling projects unless the user explicitly names them.
 
-## Scope default
+## Project scope
 
-Default to the current project. Pass workspace and project together only when the user explicitly names a different project. Never pass scope arguments for phrases like this project, here, we, or our work.
+Choose scope from the MCP client's identity support:
+
+- **Session-aware MCP clients** that forward the real lifecycle-hook session id on every request should use automatic current-project routing. Omit `workspace`, `project`, and `cwd` for the current repository; pass explicit scope only when the user names a different project.
+- **Static MCP clients** (including clients with lifecycle hooks but no bridge connecting that hook session id to MCP requests) must pass `workspace` and `project` together on every project-scoped call, including requests about this project, here, or our work. Read the exact names from the nearest `.ai-memory.toml` when it declares both. If it does not, obtain the names from the operator or server configuration; never guess them from a directory name and never rely on the server's last active project.
+
+This rule applies only to project-scoped calls. For cross-project retrieval, `global=true` must omit `workspace`, `project`, and `scopes`. For a standing preference written with `scope: "global"`, omit `workspace` and `project`.
 
 ## Architectural decisions get ADR structure and a pin
 
