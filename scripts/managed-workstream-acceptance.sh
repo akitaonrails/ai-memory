@@ -1365,6 +1365,7 @@ CODEX_ACCEPTANCE_HOME="$CONFIG/codex-home"
 CODEX_HOOKS="$CODEX_ACCEPTANCE_HOME/.codex/hooks.json"
 OPENCODE_CONFIG_HOME="$CONFIG/opencode-xdg"
 OPENCODE_PLUGIN="$OPENCODE_CONFIG_HOME/opencode/plugins/ai-memory.ts"
+OPENCODE2_PLUGIN="$OPENCODE_CONFIG_HOME/opencode/plugins/ai-memory-opencode2.ts"
 OPENCODE_DATA_HOME="$CONFIG/opencode-xdg-data"
 PI_EXTENSION="$CONFIG/pi/ai-memory.ts"
 OMP_EXTENSION="$CONFIG/omp/ai-memory.ts"
@@ -1421,6 +1422,22 @@ for config_name in opencode.json opencode.jsonc tui.json; do
       "$OPENCODE_CONFIG_HOME/opencode/$config_name"
   fi
 done
+
+# opencode2's background service defaults to port 49374 — ai-memory's own
+# default — so an isolated service left on defaults crash-loops against any
+# live ai-memory server on this machine. Pin the fixture service at a
+# neighbouring free port before any opencode2 leg runs.
+if command -v opencode2 >/dev/null 2>&1; then
+  OPENCODE2_PORT=$((PORT + 1))
+  for _ in $(seq 1 50); do
+    if ! curl -sS --max-time 0.1 "http://127.0.0.1:$OPENCODE2_PORT/" >/dev/null 2>&1; then
+      break
+    fi
+    OPENCODE2_PORT=$((OPENCODE2_PORT + 1))
+  done
+  XDG_CONFIG_HOME="$OPENCODE_CONFIG_HOME" XDG_DATA_HOME="$OPENCODE_DATA_HOME" \
+    opencode2 service set port "$OPENCODE2_PORT" >/dev/null
+fi
 
 # Kimi Code keeps providers/model and hooks in one config.toml under
 # $KIMI_CODE_HOME. Seed the isolated home with the operator's provider
@@ -1496,6 +1513,7 @@ install_hook() {
 install_hook claude-code "$CLAUDE_SETTINGS"
 install_hook codex "$CODEX_HOOKS"
 install_hook opencode "$OPENCODE_PLUGIN"
+install_hook opencode2 "$OPENCODE2_PLUGIN"
 install_hook pi "$PI_EXTENSION"
 install_hook omp "$OMP_EXTENSION"
 install_hook kimi-code "$KIMI_ACCEPTANCE_HOME/config.toml"
@@ -1506,6 +1524,7 @@ agent_wire_name() {
   case "$1" in
     claude) printf 'claude-code\n' ;;
     opencode) printf 'open-code\n' ;;
+    opencode2) printf 'open-code\n' ;;
     kimi) printf 'kimi-code\n' ;;
     command-code) printf 'command-code\n' ;;
     antigravity) printf 'antigravity-cli\n' ;;
@@ -1557,6 +1576,10 @@ run_harness() {
       native_args=(run --format json --auto "$prompt")
       [ -z "${AI_MEMORY_ACCEPTANCE_OPENCODE_MODEL:-}" ] || native_args=(run --format json --auto --model "$AI_MEMORY_ACCEPTANCE_OPENCODE_MODEL" "$prompt")
       ;;
+    opencode2)
+      native_args=(run --format json --auto "$prompt")
+      [ -z "${AI_MEMORY_ACCEPTANCE_OPENCODE2_MODEL:-${AI_MEMORY_ACCEPTANCE_OPENCODE_MODEL:-}}" ] || native_args=(run --format json --auto --model "${AI_MEMORY_ACCEPTANCE_OPENCODE2_MODEL:-$AI_MEMORY_ACCEPTANCE_OPENCODE_MODEL}" "$prompt")
+      ;;
     pi)
       native_args=(-p --no-tools --no-extensions --extension "$PI_EXTENSION" --session-dir "$CONFIG/pi/sessions" "$prompt")
       [ -z "${AI_MEMORY_ACCEPTANCE_PI_MODEL:-}" ] || native_args=(-p --no-tools --no-extensions --extension "$PI_EXTENSION" --session-dir "$CONFIG/pi/sessions" --model "$AI_MEMORY_ACCEPTANCE_PI_MODEL" "$prompt")
@@ -1601,7 +1624,7 @@ run_harness() {
       CODEX_HOME="$CODEX_ACCEPTANCE_HOME/.codex" \
       "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
       >"$log" 2>&1
-  elif [ "$harness" = opencode ]; then
+  elif [ "$harness" = opencode ] || [ "$harness" = opencode2 ]; then
     (cd "$REPO" && XDG_CONFIG_HOME="$OPENCODE_CONFIG_HOME" \
       XDG_DATA_HOME="$OPENCODE_DATA_HOME" \
       "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \

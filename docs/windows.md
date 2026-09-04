@@ -558,7 +558,8 @@ Windows agent builds.
 - MCP over HTTP should be less path-sensitive than hooks, but
   `install-mcp --apply` still writes to a client-specific config file;
   confirm the agent actually loads it.
-- OpenClaw, OpenCode, OMP / Oh My Pi, and Pi use generated TypeScript
+- OpenClaw, OpenCode (v1 `ai-memory.ts` plus the 2 beta's
+  `ai-memory-opencode2.ts`), OMP / Oh My Pi, and Pi use generated TypeScript
   integrations rather than the shell hook bundle, so their Windows
   behavior depends on the host runtime loading those files correctly.
   Pi's generated extension also bridges MCP tools because Pi has no native

@@ -263,6 +263,9 @@ pub enum RunHarnessChoice {
     /// OpenCode.
     #[value(name = "opencode", alias = "open-code")]
     OpenCode,
+    /// OpenCode 2.0 beta (`opencode2` binary, side-by-side with v1).
+    #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
+    OpenCode2,
     /// Pi coding agent.
     Pi,
     /// Charmbracelet Crush.
@@ -1381,6 +1384,13 @@ pub enum AgentChoice {
     /// them straight to `--agent`, which used to fail on this one.
     #[value(alias = "opencode")]
     OpenCode,
+    /// OpenCode 2.0 beta (`opencode2`, side-by-side with v1) — TypeScript
+    /// plugin hooks under `~/.config/opencode/plugins/` using the V2
+    /// `{ id, setup }` plugin shape. `--apply` writes `ai-memory-opencode2.ts`
+    /// directly; restart OpenCode 2 for it to load. Shares v1's config
+    /// dir, session store, and agent kind.
+    #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
+    OpenCode2,
     /// Real Pi coding agent. The generated TypeScript extension provides
     /// lifecycle capture and bridges ai-memory's HTTP MCP tools into Pi.
     Pi,
@@ -1469,7 +1479,7 @@ impl AgentChoice {
             Self::Codex => AgentKind::Codex,
             Self::Cursor => AgentKind::Cursor,
             Self::GeminiCli => AgentKind::GeminiCli,
-            Self::OpenCode => AgentKind::OpenCode,
+            Self::OpenCode | Self::OpenCode2 => AgentKind::OpenCode,
             Self::Pi => AgentKind::Pi,
             Self::Omp => AgentKind::Omp,
             Self::Openclaw => AgentKind::OpenClaw,
@@ -1493,9 +1503,13 @@ impl AgentChoice {
     #[must_use]
     pub const fn script_hook_subdir(self) -> Option<&'static str> {
         match self {
-            Self::OpenCode | Self::Pi | Self::Omp | Self::Openclaw | Self::Zero | Self::Zcode => {
-                None
-            }
+            Self::OpenCode
+            | Self::OpenCode2
+            | Self::Pi
+            | Self::Omp
+            | Self::Openclaw
+            | Self::Zero
+            | Self::Zcode => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -1554,6 +1568,12 @@ pub enum McpClient {
     /// hook-staging dir name.
     #[value(alias = "opencode")]
     OpenCode,
+    /// OpenCode 2.0 beta (`opencode2`) — `opencode.jsonc`, nested
+    /// `mcp.servers` map with `type: "remote"` + `url` + `headers`.
+    /// V2 drops v1's `enabled` field and disables OAuth discovery for
+    /// header-credentialed servers via `oauth: false`.
+    #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
+    OpenCode2,
     /// Cursor IDE — `~/.cursor/mcp.json` or `.cursor/mcp.json`.
     Cursor,
     /// Anthropic Claude Desktop — uses the `mcp-remote` stdio shim
@@ -2754,6 +2774,48 @@ mod tests {
                 panic!("expected install-mcp command for Kiro alias {alias}");
             };
             assert!(matches!(args.client, McpClient::KiroCli));
+        }
+    }
+
+    #[test]
+    fn opencode2_aliases_parse_to_the_beta_variants() {
+        for alias in ["opencode2", "opencode-v2", "open-code2"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse opencode2 alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for opencode2 alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::OpenCode2);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::OpenCode);
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374/mcp",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse opencode2 alias {alias}: {error}"));
+            let Command::InstallMcp(args) = cli.command else {
+                panic!("expected install-mcp for opencode2 alias {alias}");
+            };
+            assert_eq!(args.client, McpClient::OpenCode2);
+
+            let cli = Cli::try_parse_from(["ai-memory", "run", alias])
+                .unwrap_or_else(|error| panic!("failed to parse run {alias}: {error}"));
+            let Command::Run(args) = cli.command else {
+                panic!("expected run for opencode2 alias {alias}");
+            };
+            assert!(matches!(args.harness, Some(RunHarnessChoice::OpenCode2)));
         }
     }
 

@@ -9,7 +9,7 @@
 #   ai-memory-install-hooks --agent claude-code
 #
 # Options:
-#   --agent <claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi>
+#   --agent <claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|oh-my-pi|pi>
 #                                                which agent (default: claude-code;
 #                                                generated-plugin agents print hints)
 #   --to <dir>                               install root (default: $HOME/.ai-memory/hooks)
@@ -46,11 +46,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$AGENT" in
-    claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|openclaw|omp|pi|oh-my-pi) ;;
+    claude-code|codex|command-code|cursor|gemini-cli|kimi-code|kiro-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|pi|oh-my-pi) ;;
     commandcode|cmdc|cmd) AGENT="command-code" ;;
     kiro) AGENT="kiro-cli" ;;
+    opencode-v2|open-code2) AGENT="opencode2" ;;
     *)
-        echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | openclaw | omp | pi | oh-my-pi)" >&2
+        echo "unsupported agent: $AGENT (expected claude-code | codex | command-code | cursor | gemini-cli | kimi-code | kiro-cli | antigravity-cli | grok | opencode | opencode2 | openclaw | omp | pi | oh-my-pi)" >&2
         exit 64 ;;
 esac
 
@@ -67,6 +68,13 @@ if [[ "$AGENT" == "opencode" ]]; then
     echo "OpenCode uses a generated TypeScript plugin, not shell hook scripts."
     echo "Run: ai-memory install-hooks --agent opencode --apply"
     echo "Then restart OpenCode so it loads ~/.config/opencode/plugins/ai-memory.ts."
+    exit 0
+fi
+
+if [[ "$AGENT" == "opencode2" ]]; then
+    echo "OpenCode 2 uses a generated TypeScript plugin, not shell hook scripts."
+    echo "Run: ai-memory install-hooks --agent opencode2 --apply"
+    echo "Then restart OpenCode 2 so it loads ~/.config/opencode/plugins/ai-memory-opencode2.ts."
     exit 0
 fi
 

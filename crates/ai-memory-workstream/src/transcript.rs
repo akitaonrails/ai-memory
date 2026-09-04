@@ -116,6 +116,9 @@ pub async fn export_transcript(
     if harness == ManagedHarness::OpenCode {
         return export_opencode(home, session_dir, native_session_id, source_cursor);
     }
+    if harness == ManagedHarness::OpenCode2 {
+        return export_opencode2(home, session_dir, native_session_id, source_cursor);
+    }
     if harness == ManagedHarness::Crush {
         return export_crush(cwd, session_dir, native_session_id, source_cursor);
     }
@@ -146,6 +149,9 @@ pub async fn discover_native_session(
 ) -> Result<Option<String>> {
     if harness == ManagedHarness::OpenCode {
         return discover_opencode(home, session_dir, cwd, started_at);
+    }
+    if harness == ManagedHarness::OpenCode2 {
+        return discover_opencode2(home, session_dir, cwd, started_at);
     }
     if harness == ManagedHarness::Crush {
         return discover_crush(cwd, session_dir, started_at);
@@ -184,6 +190,9 @@ pub async fn list_native_sessions(
     }
     if harness == ManagedHarness::OpenCode {
         return list_opencode_sessions(home, session_dir, cwd, limit);
+    }
+    if harness == ManagedHarness::OpenCode2 {
+        return list_opencode2_sessions(home, session_dir, cwd, limit);
     }
     if harness == ManagedHarness::Crush {
         return list_crush_sessions(cwd, session_dir, limit);
@@ -237,6 +246,9 @@ pub fn native_session_exists(
     if harness == ManagedHarness::OpenCode {
         return Ok(opencode_updated(home, session_dir, native_session_id)?.is_some());
     }
+    if harness == ManagedHarness::OpenCode2 {
+        return Ok(opencode2_updated(home, session_dir, native_session_id)?.is_some());
+    }
     if harness == ManagedHarness::Crush {
         return Ok(crush_updated(cwd, session_dir, native_session_id)?.is_some());
     }
@@ -285,6 +297,8 @@ pub async fn wait_for_transcript_flush(
     for _ in 0..10 {
         let current = if harness == ManagedHarness::OpenCode {
             opencode_updated(home, session_dir, native_session_id)?.map(|value| value.to_string())
+        } else if harness == ManagedHarness::OpenCode2 {
+            opencode2_updated(home, session_dir, native_session_id)?.map(|value| value.to_string())
         } else if harness == ManagedHarness::Crush {
             crush_updated(cwd, session_dir, native_session_id)?.map(|value| value.to_string())
         } else {
@@ -440,7 +454,10 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
-            ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Antigravity => {
+            ManagedHarness::OpenCode
+            | ManagedHarness::OpenCode2
+            | ManagedHarness::Crush
+            | ManagedHarness::Antigravity => {
                 return Err(anyhow!(
                     "{} transcripts must use their SQLite adapter",
                     harness.as_str()
@@ -2405,6 +2422,7 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
                 value.get("cwd").and_then(Value::as_str),
             ),
             ManagedHarness::OpenCode
+            | ManagedHarness::OpenCode2
             | ManagedHarness::Crush
             | ManagedHarness::Kimi
             | ManagedHarness::CommandCode
@@ -2916,6 +2934,284 @@ fn opencode_db(home: &Path, session_dir: Option<&Path>) -> PathBuf {
     )
 }
 
+/// OpenCode 2.0 beta transcript adapter.
+///
+/// The beta keeps v1's database file but replaced its tables: `session_v2`
+/// carries sessions, `session_message` carries typed messages. Shapes below
+/// were verified against beta-18999: user `{text, files}`, assistant
+/// `content[]` with `text` / `tool` / `reasoning` parts. Reasoning content
+/// is encrypted and excluded like v1's hidden reasoning; anything else
+/// unrecognized becomes a bounded loss, never a guess — the beta schema is
+/// still changing.
+fn export_opencode2(
+    home: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    let db = opencode_db(home, session_dir);
+    let connection = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| {
+        format!(
+            "opening OpenCode session database {} read-only",
+            db.display()
+        )
+    })?;
+    let cursor = source_cursor
+        .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
+        .unwrap_or_default();
+    let mut statement = connection.prepare(
+        "SELECT id, time_updated, type, data FROM session_message \
+         WHERE session_id = ?1 AND (time_updated > ?2 OR (time_updated = ?2 AND id > ?3)) \
+         ORDER BY time_updated, id",
+    )?;
+    let rows = statement.query_map(params![session, cursor.updated, cursor.id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut events = Vec::new();
+    let mut losses = Vec::new();
+    let mut next_cursor = cursor;
+    for row in rows {
+        let (id, updated, message_type, data_raw) = row?;
+        next_cursor = SqlCursor {
+            updated,
+            id: id.clone(),
+        };
+        let Ok(data) = serde_json::from_str::<Value>(&data_raw) else {
+            losses.push(format!("malformed OpenCode 2 message {id}"));
+            continue;
+        };
+        parse_opencode2(&message_type, &data, session, &id, &mut events, &mut losses);
+    }
+    Ok(ExportedTranscript {
+        native_session_id: session.to_string(),
+        source_cursor: Some(serde_json::to_string(&next_cursor)?),
+        events,
+        losses: deduplicate_losses(losses),
+    })
+}
+
+fn parse_opencode2(
+    message_type: &str,
+    data: &Value,
+    session: &str,
+    id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    match message_type {
+        "user" => {
+            if let Some(text) = data.get("text").and_then(Value::as_str) {
+                push_event(
+                    events,
+                    AgentKind::OpenCode,
+                    session,
+                    id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("user"),
+                    text,
+                    None,
+                    json!({}),
+                );
+            }
+        }
+        "assistant" => {
+            let Some(parts) = data.get("content").and_then(Value::as_array) else {
+                losses.push(format!(
+                    "OpenCode 2 assistant message {id} has no content parts"
+                ));
+                return;
+            };
+            for (index, part) in parts.iter().enumerate() {
+                let kind = part.get("type").and_then(Value::as_str).unwrap_or_default();
+                // One message holds many parts; the block namespaces each
+                // part's events deterministically (call before its result).
+                let block = index * 2;
+                match kind {
+                    "text" => {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            push_event(
+                                events,
+                                AgentKind::OpenCode,
+                                session,
+                                id,
+                                block,
+                                WorkstreamEventKind::Message,
+                                Some("assistant"),
+                                text,
+                                None,
+                                json!({}),
+                            );
+                        }
+                    }
+                    "tool" => {
+                        let name = part.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let state = part.get("state").unwrap_or(&Value::Null);
+                        let input = state.get("input").map(compact_json).unwrap_or_default();
+                        push_event(
+                            events,
+                            AgentKind::OpenCode,
+                            session,
+                            id,
+                            block,
+                            WorkstreamEventKind::ToolCall,
+                            Some("assistant"),
+                            &format!("{name}: {input}"),
+                            None,
+                            json!({"tool": name}),
+                        );
+                        let status = state
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("completed");
+                        if status == "completed" {
+                            let output = state
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .map(|contents| {
+                                    contents
+                                        .iter()
+                                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_default();
+                            if !output.trim().is_empty() {
+                                push_event(
+                                    events,
+                                    AgentKind::OpenCode,
+                                    session,
+                                    id,
+                                    block + 1,
+                                    WorkstreamEventKind::ToolResult,
+                                    Some("tool"),
+                                    &output,
+                                    None,
+                                    json!({"status": status}),
+                                );
+                            }
+                        } else {
+                            losses
+                                .push(format!("OpenCode 2 tool {name} ended with status {status}"));
+                        }
+                    }
+                    "reasoning" => {
+                        losses.push("OpenCode 2 hidden reasoning was intentionally excluded".into())
+                    }
+                    other => losses.push(format!(
+                        "OpenCode 2 {other} part was intentionally excluded"
+                    )),
+                }
+            }
+        }
+        // System catalog notices and similar non-conversation records.
+        _ => {}
+    }
+}
+
+fn discover_opencode2(
+    home: &Path,
+    session_dir: Option<&Path>,
+    cwd: &Path,
+    started_at: SystemTime,
+) -> Result<Option<String>> {
+    let db = opencode_db(home, session_dir);
+    if !db.is_file() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let since = started_at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let mut statement = connection.prepare(
+        "SELECT id FROM session_v2 WHERE directory = ?1 AND time_updated >= ?2 \
+         ORDER BY time_updated DESC LIMIT 1",
+    )?;
+    match statement.query_row(params![cwd.to_string_lossy(), since], |row| row.get(0)) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn list_opencode2_sessions(
+    home: &Path,
+    session_dir: Option<&Path>,
+    cwd: &Path,
+    limit: usize,
+) -> Result<Vec<NativeSessionCandidate>> {
+    let db = opencode_db(home, session_dir);
+    if !db.is_file() {
+        return Ok(Vec::new());
+    }
+    let connection = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT id, time_updated FROM session_v2 \
+         WHERE directory = ?1 ORDER BY time_updated DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![cwd.to_string_lossy(), limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        let (native_session_id, updated_millis) = row?;
+        let Ok(updated_millis) = u64::try_from(updated_millis) else {
+            continue;
+        };
+        if !valid_native_session_id(&native_session_id) {
+            continue;
+        }
+        let Some(updated_at) = UNIX_EPOCH.checked_add(Duration::from_millis(updated_millis)) else {
+            continue;
+        };
+        sessions.push(NativeSessionCandidate {
+            native_session_id,
+            updated_at,
+        });
+    }
+    Ok(sessions)
+}
+
+fn opencode2_updated(
+    home: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+) -> Result<Option<i64>> {
+    let db = opencode_db(home, session_dir);
+    if !db.is_file() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    match connection.query_row(
+        "SELECT time_updated FROM session_v2 WHERE id = ?1",
+        [session],
+        |row| row.get(0),
+    ) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path>) -> PathBuf {
     if let Some(override_dir) = override_dir {
         return override_dir.to_path_buf();
@@ -2923,7 +3219,7 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
     match harness {
         ManagedHarness::Claude => home.join(".claude/projects"),
         ManagedHarness::Codex => home.join(".codex/sessions"),
-        ManagedHarness::OpenCode => home.join(".local/share/opencode"),
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => home.join(".local/share/opencode"),
         ManagedHarness::Pi => home.join(".pi/agent/sessions"),
         ManagedHarness::Crush => home.join(".crush"),
         ManagedHarness::Omp => home.join(".omp/agent/sessions"),
@@ -3151,6 +3447,7 @@ mod tests {
                     // summary.json, not the journal; covered by their own
                     // discovery tests.
                     ManagedHarness::OpenCode
+                    | ManagedHarness::OpenCode2
                     | ManagedHarness::Crush
                     | ManagedHarness::Kimi
                     | ManagedHarness::CommandCode
@@ -3806,6 +4103,142 @@ mod tests {
             export_opencode(home.path(), None, "s1", first.source_cursor.as_deref()).unwrap();
         assert_eq!(second.events.len(), 1);
         assert_eq!(second.events[0].content, "second");
+    }
+
+    /// Beta store fixture: `session_v2` + `session_message` with the shapes
+    /// observed on beta-18999 (user text, assistant text/tool/reasoning).
+    fn opencode2_fixture(home: &Path) {
+        let db = opencode_db(home, None);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_v2(id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
+                                   time_updated INTEGER NOT NULL);\
+                 CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT, \
+                                   time_updated INTEGER, data TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_v2 VALUES ('s2', ?1, 10)",
+                [home.join("repo").to_string_lossy().to_string()],
+            )
+            .unwrap();
+        for (id, updated, kind, data) in [
+            (
+                "m1",
+                1,
+                "user",
+                json!({"text": "do the thing", "files": []}).to_string(),
+            ),
+            (
+                "m2",
+                2,
+                "assistant",
+                json!({"content": [
+                    {"type": "reasoning", "text": "", "state": {}},
+                    {"type": "text", "text": "on it"},
+                    {"type": "tool", "name": "read", "state": {
+                        "status": "completed",
+                        "input": {"path": "a.txt"},
+                        "content": [{"type": "text", "text": "file bytes"}],
+                    }},
+                ]})
+                .to_string(),
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO session_message VALUES (?1, 's2', ?2, ?3, ?4)",
+                    params![id, kind, updated, data],
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn opencode2_adapter_reads_v2_tables_incrementally() {
+        let home = tempfile::tempdir().unwrap();
+        opencode2_fixture(home.path());
+
+        let first = export_opencode2(home.path(), None, "s2", None).unwrap();
+        let contents: Vec<_> = first
+            .events
+            .iter()
+            .map(|event| (event.kind, event.content.as_str()))
+            .collect();
+        assert!(contents.contains(&(WorkstreamEventKind::Message, "do the thing")));
+        assert!(contents.contains(&(WorkstreamEventKind::Message, "on it")));
+        assert!(
+            contents
+                .iter()
+                .any(|(kind, content)| *kind == WorkstreamEventKind::ToolCall
+                    && content.starts_with("read: "))
+        );
+        assert!(contents.contains(&(WorkstreamEventKind::ToolResult, "file bytes")));
+        assert!(
+            first.losses.iter().any(|loss| loss.contains("reasoning")),
+            "encrypted reasoning must stay a named loss: {:?}",
+            first.losses
+        );
+
+        // Incremental cursor: nothing new since the first export.
+        let second =
+            export_opencode2(home.path(), None, "s2", first.source_cursor.as_deref()).unwrap();
+        assert!(second.events.is_empty());
+        assert!(second.losses.is_empty());
+    }
+
+    #[test]
+    fn opencode2_updated_tracks_session_v2_rows() {
+        let home = tempfile::tempdir().unwrap();
+        opencode2_fixture(home.path());
+        assert_eq!(
+            opencode2_updated(home.path(), None, "s2").unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            opencode2_updated(home.path(), None, "missing").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode2_discovery_ignores_other_checkouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        let db_root = temp.path().join("opencode");
+        fs::create_dir_all(&db_root).unwrap();
+        let connection = Connection::open(db_root.join("opencode.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_v2( \
+                     id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_updated INTEGER NOT NULL);",
+            )
+            .unwrap();
+        for (id, directory, updated) in [
+            ("older", &cwd, 100_i64),
+            ("newer", &cwd, 200_i64),
+            ("unrelated", &other, 300_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO session_v2 VALUES (?1, ?2, ?3)",
+                    params![id, directory.to_string_lossy(), updated],
+                )
+                .unwrap();
+        }
+        let found = discover_opencode2(
+            temp.path(),
+            Some(&db_root),
+            &cwd,
+            UNIX_EPOCH + Duration::from_millis(150),
+        )
+        .unwrap();
+        assert_eq!(found.as_deref(), Some("newer"));
     }
 
     /// Build a two-bucket kimi store: `session_a` checked out at `cwd`,

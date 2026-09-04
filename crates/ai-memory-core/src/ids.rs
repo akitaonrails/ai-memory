@@ -318,7 +318,7 @@ impl AgentKind {
         match s {
             "claude-code" | "claude_code" | "claude" => Self::ClaudeCode,
             "codex" => Self::Codex,
-            "open-code" | "opencode" => Self::OpenCode,
+            "open-code" | "opencode" | "opencode2" | "opencode-v2" | "open-code2" => Self::OpenCode,
             "cursor" => Self::Cursor,
             "gemini-cli" | "gemini" => Self::GeminiCli,
             "claude-desktop" | "claude_desktop" => Self::ClaudeDesktop,
@@ -578,6 +578,23 @@ mod tests {
         );
         assert!(AgentKind::KiroCli.session_start_injects_handoff());
         assert!(!AgentKind::KiroCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_opencode_wire_names_share_one_kind() {
+        // OpenCode 2.0 ships side by side as `opencode2` against the same
+        // config dir and session store, so its wire names resolve to the
+        // existing kind — no new variant, no store migration.
+        assert_eq!(AgentKind::OpenCode.as_str(), "open-code");
+        for alias in [
+            "open-code",
+            "opencode",
+            "opencode2",
+            "opencode-v2",
+            "open-code2",
+        ] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::OpenCode);
+        }
     }
 
     #[test]

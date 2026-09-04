@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added first-party OpenCode 2.0 beta (`opencode2`) support.
+  `install-mcp --client opencode2` merges the V2 `mcp.servers` remote entry
+  (no `enabled` field, `oauth: false` for header credentials);
+  `install-hooks --agent opencode2` writes an `ai-memory-opencode2.ts`
+  plugin in the beta `{ id, setup }` shape (no runtime dependency:
+  `Plugin.define` is identity), with handoff injection through the
+  `context` hook and the same `session.*` lifecycle coverage as v1;
+  `ai-memory run opencode2` launches through the `opencode2` binary and
+  imports the beta `session_v2`/`session_message` transcript. The beta
+  shares v1's config dir, session store, and agent kind, so no store
+  migration ships. Verified live against beta-18999 (hook capture,
+  handoff loop, managed launch/resume/import, `opencode↔opencode2`
+  session resume). Two beta caveats are documented: back up
+  `~/.local/share/opencode` first (the beta has migrated the shared
+  database in place before), and move its background service off port
+  49374 when ai-memory serves there. Managed ledger-delta
+  acknowledgement does not fire through the shared background service
+  (redelivery, never loss); see the managed-workstreams notes (#622).
+
 ### Fixed
 - `bootstrap` no longer aborts the whole multi-chunk run when one chunk
   returns no `pages` key (#614). Later chunks are told which paths
