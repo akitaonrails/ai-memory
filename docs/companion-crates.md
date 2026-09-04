@@ -277,6 +277,44 @@ This plan is intentionally parked until the benefit is clearer.
 6. Keep the built-in `/web` UI unchanged unless core ai-memory independently
    needs a small read-only API enhancement.
 
+## Two kinds of companion: data-seam vs. independent hook consumer
+
+`ai-memory-importer` and `ai-memory-web-editor` are *data-seam* companions: they
+talk to ai-memory's public HTTP/MCP surfaces and build on the data it stores.
+Not every adjacent tool is that shape.
+
+**Working-tree coordination is out of core, and is an *independent hook
+consumer*, not a data-seam companion** (decided in #620). Several agent sessions
+sharing one checkout collide over the single git index — one session's
+`git add .` sweeps up another's staged work, a `--fix` run rewrites an unclaimed
+tree — and the natural instinct is to build the guard on ai-memory's captured
+`PreToolUse`/`PostToolUse` signal. That does not work, for two deliberate
+reasons:
+
+- **ai-memory cannot block a tool action.** The `/hook` path is capture-only and
+  fire-and-forget (it returns `202`/`429`, never allow/deny/ask, and processes
+  after responding). Hooks that await a REST round-trip can deadlock the engine
+  (agentmemory #221) — so there is no synchronous veto channel back to the
+  harness, by design.
+- **ai-memory does not retain the file paths.** For closed-tool agents the
+  stored observation is reduced to a `tool_family` label plus outcome; raw
+  arguments, paths, and tool names are extracted only transiently for
+  denylist matching, then dropped (`CaptureDecision` "never retains raw
+  arguments, paths, or arbitrary tool names"). A consumer can see *that* a file
+  op happened in a session, never *which file*.
+
+Reversing either — persisting paths, or adding a blocking hook — trades away a
+privacy/bounding invariant or the anti-deadlock invariant. Both stay.
+
+So a working-tree coordinator installs its **own** `PreToolUse` hook alongside
+ai-memory's, reads the raw `tool_input`, and arbitrates synchronously in its own
+process with its own ephemeral ownership state (a lock file or small store —
+never the wiki or SQLite). It is a *sibling on the same hook event*, not a
+seam-consumer. It may still live under `companions/` for discoverability, but it
+depends on the harness's hook mechanism, not on ai-memory's surfaces. Scope it
+to the shared-index / file-ownership class; stale-tree builds and host
+saturation are build/CI-orchestration, a separate problem.
+
 ## When to move a seam into core
 
 A companion may reveal a missing primitive that belongs in ai-memory. Move only
