@@ -65,6 +65,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Codex => render_codex(&args),
         McpClient::Grok => render_grok(&args)?,
         McpClient::OpenCode => render_opencode(&args)?,
+        McpClient::OpenCode2 => render_opencode2(&args)?,
         McpClient::Cursor => render_cursor(&args)?,
         McpClient::ClaudeDesktop => render_claude_desktop(&args)?,
         McpClient::GeminiCli => render_gemini_cli(&args)?,
@@ -162,6 +163,15 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // --config-file for that case rather than inventing a second default.
         McpClient::Grok => grok_home()?.join("config.toml"),
         McpClient::OpenCode => home()?
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json"),
+        // V2 reads the same global config file (`opencode.json(c)`); its
+        // `mcp.servers` key coexists with v1's `mcp` key in one strict-JSON
+        // file, so both binaries stay wired side by side. Users who keep
+        // comments in `opencode.jsonc` should pass it via `--config-file`
+        // (`mutate_json` refuses to rewrite non-strict JSON).
+        McpClient::OpenCode2 => home()?
             .join(".config")
             .join("opencode")
             .join("opencode.json"),
@@ -494,6 +504,9 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::CommandCode
         | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
+        // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
+        // Zero, and ZCode use.
+        McpClient::OpenCode2 => Some(JsonMcpLocation::NestedMcpServers),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses. ZCode nests its servers the same way.
         McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => {
@@ -509,6 +522,7 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     validate_args(args)?;
     match args.client {
         McpClient::OpenCode => build_mcp_entry_opencode(args),
+        McpClient::OpenCode2 => build_mcp_entry_opencode2(args),
         McpClient::Openclaw => build_mcp_entry_openclaw(args),
         McpClient::Zero => build_mcp_entry_zero(args),
         McpClient::Zcode => build_mcp_entry_zcode(args),
@@ -755,6 +769,27 @@ fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> 
     entry.insert("type".into(), json!("remote"));
     entry.insert("url".into(), json!(server_url));
     entry.insert("enabled".into(), json!(true));
+    if let Some(b) = bearer {
+        entry.insert("headers".into(), json!({"Authorization": b}));
+    }
+    Ok(serde_json::Value::Object(entry))
+}
+
+/// OpenCode 2.0 beta MCP entry: `type: "remote"` + `url` + optional
+/// `headers` under `mcp.servers`. V2 has no `enabled` field (servers
+/// connect unless `disabled: true`), and header-credentialed servers
+/// must set `oauth: false` so the beta does not attempt OAuth discovery
+/// against ai-memory's local endpoint
+/// (https://opencode.ai/v2/docs/mcp-servers).
+fn build_mcp_entry_opencode2(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    let bearer = bearer_header_value(args.auth_token.as_deref());
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    let mut entry = serde_json::Map::new();
+    entry.insert("type".into(), json!("remote"));
+    entry.insert("url".into(), json!(server_url));
+    // `false`, not absence: without it the beta probes the endpoint for
+    // OAuth metadata on every connect.
+    entry.insert("oauth".into(), json!(false));
     if let Some(b) = bearer {
         entry.insert("headers".into(), json!({"Authorization": b}));
     }
@@ -1050,6 +1085,21 @@ fn render_opencode(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_opencode2(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# OpenCode 2.0 beta (`opencode2`) — merge into\n\
+         # ~/.config/opencode/opencode.json(c) under \"mcp\" → \"servers\":\n\
+         #\n\
+         # V2 nests servers under `mcp.servers` (v1 used top-level `mcp`)\n\
+         # and has no `enabled` field. Both keys coexist in the one file,\n\
+         # so v1 and the beta stay wired side by side. If your config is\n\
+         # `opencode.jsonc` with comments, re-run with\n\
+         # `--config-file ~/.config/opencode/opencode.jsonc`.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_cursor(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# Cursor — write to one of:\n\
@@ -1330,6 +1380,41 @@ mod tests {
             config_file: None,
             session_aware: false,
         }
+    }
+
+    #[test]
+    fn opencode2_entry_uses_v2_servers_shape() {
+        // V2 nests under `mcp.servers`, drops v1's `enabled`, and disables
+        // OAuth discovery: ai-memory authenticates with a static header.
+        let entry = build_json_mcp_entry(&args_with_token(McpClient::OpenCode2)).unwrap();
+        assert_eq!(entry["type"], json!("remote"));
+        assert_eq!(entry["url"], json!("http://127.0.0.1:49374/mcp"));
+        assert_eq!(entry["oauth"], json!(false));
+        assert!(entry.get("enabled").is_none());
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            json!("Bearer test-token-deadbeef")
+        );
+
+        let mut root = serde_json::Map::new();
+        upsert_json_mcp_entry(&mut root, &args_with_token(McpClient::OpenCode2)).unwrap();
+        assert!(root["mcp"]["servers"]["ai-memory"].is_object());
+        assert!(root.get("mcpServers").is_none());
+
+        // v1 still lands under top-level `mcp`, so both stay wired.
+        let mut v1 = serde_json::Map::new();
+        upsert_json_mcp_entry(&mut v1, &args_with_token(McpClient::OpenCode)).unwrap();
+        assert!(v1["mcp"]["ai-memory"].is_object());
+        assert!(v1["mcp"].get("servers").is_none());
+    }
+
+    #[test]
+    fn opencode2_render_points_at_v2_key() {
+        let out = render_opencode2(&args_for(McpClient::OpenCode2)).unwrap();
+        assert!(out.contains("opencode2"));
+        assert!(out.contains("mcp"));
+        assert!(out.contains("servers"));
+        assert!(out.contains("http://127.0.0.1:49374/mcp"));
     }
 
     #[test]
@@ -1681,6 +1766,7 @@ mod tests {
             McpClient::Codex => render_codex(&args),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
+            McpClient::OpenCode2 => render_opencode2(&args).unwrap(),
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
@@ -1709,6 +1795,7 @@ mod tests {
             McpClient::Codex,
             McpClient::Grok,
             McpClient::OpenCode,
+            McpClient::OpenCode2,
             McpClient::Cursor,
             McpClient::ClaudeDesktop,
             McpClient::GeminiCli,
@@ -1750,6 +1837,7 @@ mod tests {
             McpClient::Codex,
             McpClient::Grok,
             McpClient::OpenCode,
+            McpClient::OpenCode2,
             McpClient::Cursor,
             McpClient::ClaudeDesktop,
             McpClient::GeminiCli,
@@ -1783,6 +1871,7 @@ mod tests {
             McpClient::Codex => render_codex(&args),
             McpClient::Grok => render_grok(&args).unwrap(),
             McpClient::OpenCode => render_opencode(&args).unwrap(),
+            McpClient::OpenCode2 => render_opencode2(&args).unwrap(),
             McpClient::Cursor => render_cursor(&args).unwrap(),
             McpClient::ClaudeDesktop => render_claude_desktop(&args).unwrap(),
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),

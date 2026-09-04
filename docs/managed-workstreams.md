@@ -1,7 +1,7 @@
 # Managed cross-harness workstreams
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
-between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
+between Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro
 CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
@@ -42,7 +42,7 @@ file, and the current checkout remain authoritative.
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh]
-              [claude|codex|opencode|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
+              [claude|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
 
@@ -211,7 +211,20 @@ has a usable local session. It never chooses a newer but obsolete session from
 another harness merely because that file has a later timestamp. Kiro's v2 and
 v3 candidates share one server agent identity, but the selected native engine
 flavor remains exact. OMP, Grok, and Antigravity remain available explicitly
-but are not in the automatic pool.
+but are not in the automatic pool. OpenCode 2 is likewise explicit-only
+(`ai-memory run opencode2`): it shares v1's session store, so listing both
+would duplicate every candidate.
+
+OpenCode 2 sessions run inside a shared background service, so its plugin
+cannot see a managed run's environment the way in-process plugins do. Managed
+`run opencode2` legs launch with the correct resume selectors, capture through
+hooks, and import the beta transcript — all verified live — but the
+ledger-delta acknowledgement (`context_delivered`) does not fire, because the
+accept path requires the run id on the session-start hook. The failure mode is
+redelivery, never loss: a later leg into another harness may receive the range
+again. Until the beta offers per-invocation plugin context, cross-harness
+continuity into opencode2 arrives through the ordinary handoff loop rather
+than the ledger delta.
 
 Bare mode accepts wrapper options but not harness-native arguments or
 `--executable`, because their meaning depends on the selected harness. In a new
@@ -309,6 +322,7 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Claude Code | generated `--session-id` | `--resume <id>` | `~/.claude/projects/**/*.jsonl` |
 | Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl` |
 | OpenCode | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only |
+| OpenCode 2 beta | native default creation | `--session <id>` | same `opencode.db` as v1 (the beta channel keeps v1's filename; the beta adds `session_v2`/`session_message` tables beside v1's); launched via the `opencode2` binary |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
 | Crush | native default creation | `--session <id>` | `<project>/.crush/crush.db` opened read-only |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |

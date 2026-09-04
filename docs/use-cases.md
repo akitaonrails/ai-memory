@@ -81,7 +81,7 @@
   the workstream immediately. If a linked native transcript was deleted,
   ai-memory detects the orphan before launch and starts fresh; `--fresh` forces
   that recovery for one harness. Managed mode currently covers Claude Code,
-  Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP,
+  Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP,
   Grok Build CLI, and Antigravity CLI; direct harness launches remain unchanged. See
   [Managed cross-harness workstreams](docs/managed-workstreams.md).
 - **"Just put me back where I was."** From any directory, with no name to

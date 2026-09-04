@@ -16,6 +16,10 @@ pub enum ManagedHarness {
     Codex,
     /// OpenCode.
     OpenCode,
+    /// OpenCode 2.0 beta (`opencode2` binary, side-by-side with v1).
+    /// Shares v1's config dir, session store, and agent kind; only the
+    /// launched executable differs.
+    OpenCode2,
     /// Pi coding agent.
     Pi,
     /// Charmbracelet Crush.
@@ -44,6 +48,7 @@ impl ManagedHarness {
             "claude" | "claude-code" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "opencode" | "open-code" => Some(Self::OpenCode),
+            "opencode2" | "opencode-v2" | "open-code2" => Some(Self::OpenCode2),
             "pi" => Some(Self::Pi),
             "crush" => Some(Self::Crush),
             "omp" | "oh-my-pi" => Some(Self::Omp),
@@ -62,7 +67,7 @@ impl ManagedHarness {
         match self {
             Self::Claude => AgentKind::ClaudeCode,
             Self::Codex => AgentKind::Codex,
-            Self::OpenCode => AgentKind::OpenCode,
+            Self::OpenCode | Self::OpenCode2 => AgentKind::OpenCode,
             Self::Pi => AgentKind::Pi,
             Self::Crush => AgentKind::Crush,
             Self::Omp => AgentKind::Omp,
@@ -81,6 +86,7 @@ impl ManagedHarness {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
+            Self::OpenCode2 => "opencode2",
             Self::Pi => "pi",
             Self::Crush => "crush",
             Self::Omp => "omp",
@@ -105,6 +111,7 @@ impl ManagedHarness {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
+            Self::OpenCode2 => "opencode2",
             Self::Pi => "pi",
             Self::Crush => "crush",
             Self::Omp => "omp",
@@ -242,7 +249,7 @@ pub fn build_launch_plan(
                     expected = Some(id.to_string());
                 }
             }
-            ManagedHarness::OpenCode => {
+            ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => {
                 if let Some(id) = linked_session_id {
                     if first_arg_is(&args, "run") {
                         args.insert(1, OsString::from(id));
@@ -349,7 +356,7 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
     let flag = match harness {
         ManagedHarness::Claude => Some("--dangerously-skip-permissions"),
         ManagedHarness::Codex => Some("--dangerously-bypass-approvals-and-sandbox"),
-        ManagedHarness::OpenCode => Some("--auto"),
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => Some("--auto"),
         ManagedHarness::Pi => Some("--approve"),
         ManagedHarness::Crush => Some("--yolo"),
         ManagedHarness::Omp => None,
@@ -400,7 +407,7 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
     match harness {
         ManagedHarness::Claude => has_flag(args, &["--print", "-p"]),
         ManagedHarness::Codex => first_arg_is(args, "exec"),
-        ManagedHarness::OpenCode => first_arg_is(args, "run"),
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => first_arg_is(args, "run"),
         ManagedHarness::Crush => first_arg_is(args, "run"),
         ManagedHarness::Pi | ManagedHarness::Omp => has_flag(args, &["--print", "-p"]),
         ManagedHarness::Kimi => has_flag(args, &["--prompt", "-p"]),
@@ -525,6 +532,15 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "session",
             "plugin",
             "db",
+        ]
+        .as_slice(),
+        // Beta subcommands, verified on `opencode2 v0.0.0-beta-18999`
+        // (`opencode2 --help`). `run` stays session-bearing (see
+        // `noninteractive_invocation`); `mini` is the minimal interactive
+        // UI and also stays session-bearing.
+        ManagedHarness::OpenCode2 => [
+            "upgrade", "acp", "api", "debug", "console", "auth", "mcp", "plugin", "models",
+            "stats", "export", "import", "service", "pair", "serve",
         ]
         .as_slice(),
         ManagedHarness::Pi => {
@@ -694,7 +710,7 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
                 || args.first().and_then(|arg| arg.to_str()) == Some("exec")
                     && args.get(1).and_then(|arg| arg.to_str()) == Some("resume")
         }
-        ManagedHarness::OpenCode => {
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => {
             has_flag(args, &["--session", "-s", "--continue", "-c", "--fork"])
         }
         ManagedHarness::Pi => has_flag(
@@ -779,7 +795,9 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
                 positional_after_command(args, &["resume"])
             }
         }
-        ManagedHarness::OpenCode => flag_value(args, &["--session", "-s"]),
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => {
+            flag_value(args, &["--session", "-s"])
+        }
         ManagedHarness::Pi => flag_value(args, &["--session", "--session-id"]),
         ManagedHarness::Crush => flag_value(args, &["--session", "-s"]),
         ManagedHarness::Omp => flag_value(args, &["--resume", "-r"]),
@@ -888,7 +906,11 @@ fn environment_session_dir_with(
     match harness {
         ManagedHarness::Claude => value("CLAUDE_CONFIG_DIR").map(|dir| dir.join("projects")),
         ManagedHarness::Codex => value("CODEX_HOME").map(|dir| dir.join("sessions")),
-        ManagedHarness::OpenCode => value("XDG_DATA_HOME").map(|dir| dir.join("opencode")),
+        // The beta channel keeps v1's `opencode.db` filename (other channels
+        // get `opencode-<channel>.db`), so both harnesses share one store.
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => {
+            value("XDG_DATA_HOME").map(|dir| dir.join("opencode"))
+        }
         ManagedHarness::Pi => value("PI_CODING_AGENT_SESSION_DIR")
             .or_else(|| value("PI_CODING_AGENT_DIR").map(|dir| dir.join("sessions"))),
         ManagedHarness::Crush => None,
@@ -1058,6 +1080,62 @@ mod tests {
             ManagedHarness::CommandCode,
             &[OsString::from("--print"), OsString::from("continue here")]
         ));
+    }
+
+    #[test]
+    fn opencode2_shares_v1_session_contract_with_its_own_binary() {
+        for name in ["opencode2", "opencode-v2", "open-code2"] {
+            assert_eq!(
+                ManagedHarness::from_name(name),
+                Some(ManagedHarness::OpenCode2)
+            );
+        }
+        let beta = ManagedHarness::OpenCode2;
+        // Same store, same kind, same flags — only the executable differs,
+        // so `run opencode2` resumes v1 sessions and vice versa.
+        assert_eq!(beta.executable(), "opencode2");
+        assert_eq!(beta.as_str(), "opencode2");
+        assert_eq!(beta.agent_kind(), AgentKind::OpenCode);
+        assert_eq!(ManagedHarness::OpenCode.agent_kind(), AgentKind::OpenCode);
+
+        let plan = build_launch_plan(
+            beta,
+            None,
+            vec![OsString::from("run"), OsString::from("continue here")],
+            Some("shared-id"),
+        )
+        .unwrap();
+        assert_eq!(
+            strings(&plan.args),
+            ["run", "--session", "shared-id", "continue here"]
+        );
+        assert_eq!(plan.expected_session_id.as_deref(), Some("shared-id"));
+
+        let mut yolo = Vec::new();
+        apply_yolo(beta, &mut yolo);
+        apply_yolo(beta, &mut yolo);
+        assert_eq!(strings(&yolo), ["--auto"]);
+
+        assert!(allows_native_session_adoption(
+            beta,
+            &[OsString::from("--auto")]
+        ));
+        assert!(!allows_native_session_adoption(
+            beta,
+            &[OsString::from("run"), OsString::from("continue here")]
+        ));
+
+        for utility in ["service", "api", "auth"] {
+            let plan =
+                build_launch_plan(beta, None, vec![OsString::from(utility)], Some("shared-id"))
+                    .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{utility}");
+        }
+        // `mini` is the interactive UI, not a utility: it stays
+        // session-bearing.
+        let mini =
+            build_launch_plan(beta, None, vec![OsString::from("mini")], Some("shared-id")).unwrap();
+        assert_eq!(mini.mode, LaunchMode::Session);
     }
 
     #[test]

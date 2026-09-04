@@ -379,7 +379,11 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     }
     let generated = matches!(
         args.agent,
-        AgentChoice::OpenCode | AgentChoice::Omp | AgentChoice::Pi | AgentChoice::Openclaw
+        AgentChoice::OpenCode
+            | AgentChoice::OpenCode2
+            | AgentChoice::Omp
+            | AgentChoice::Pi
+            | AgentChoice::Openclaw
     );
     if generated || local_hook_policy_v1_supported() {
         eprintln!(
@@ -442,6 +446,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         args.project_strategy = install_project_strategy(&args);
         return match args.agent {
             AgentChoice::OpenCode => apply_to_opencode_plugin(&server_url, auth, &args),
+            AgentChoice::OpenCode2 => apply_to_opencode2_plugin(&server_url, auth, &args),
             AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args),
             AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args),
             AgentChoice::ClaudeCode => {
@@ -536,6 +541,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     match args.agent {
         AgentChoice::OpenCode => render_opencode_plugin(&server_url, auth, strategy),
+        AgentChoice::OpenCode2 => render_opencode2_plugin(&server_url, auth, strategy),
         AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy),
         AgentChoice::Omp => {
             render_omp_extension(&server_url, auth, strategy, args.profile.as_deref())
@@ -767,6 +773,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Cursor => cursor_hooks_path().ok()?,
             AgentChoice::GeminiCli => gemini_settings_path().ok()?,
             AgentChoice::OpenCode => opencode_plugin_path().ok()?,
+            AgentChoice::OpenCode2 => opencode2_plugin_path().ok()?,
             AgentChoice::Pi => pi_extension_path().ok()?,
             AgentChoice::Omp => omp_extension_path(args.profile.as_deref()).ok()?,
             AgentChoice::Openclaw => openclaw_plugin::default_plugin_dir()
@@ -793,9 +800,14 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
 /// TypeScript files carry an explicit ownership header.
 fn baked_project_strategy(agent: AgentChoice, existing: &str) -> Option<ProjectStrategyArg> {
     match agent {
-        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw => {
+        AgentChoice::OpenCode
+        | AgentChoice::OpenCode2
+        | AgentChoice::Pi
+        | AgentChoice::Omp
+        | AgentChoice::Openclaw => {
             let marker = match agent {
                 AgentChoice::OpenCode => "--agent opencode --apply`.",
+                AgentChoice::OpenCode2 => "--agent opencode2 --apply`.",
                 AgentChoice::Pi => "--agent pi --apply`.",
                 AgentChoice::Omp => "--agent omp --apply`.",
                 AgentChoice::Openclaw => "--agent openclaw --apply`.",
@@ -1022,6 +1034,11 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["mcp", "ai-memory"],
             "url",
         )),
+        McpClient::OpenCode2 => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp", "servers", "ai-memory"],
+            "url",
+        )),
         McpClient::Cursor => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
@@ -1131,6 +1148,7 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Cursor => Some(McpClient::Cursor),
         AgentChoice::GeminiCli => Some(McpClient::GeminiCli),
         AgentChoice::OpenCode => Some(McpClient::OpenCode),
+        AgentChoice::OpenCode2 => Some(McpClient::OpenCode2),
         AgentChoice::Omp => Some(McpClient::Omp),
         AgentChoice::Openclaw => Some(McpClient::Openclaw),
         AgentChoice::AntigravityCli => Some(McpClient::AntigravityCli),
@@ -2765,6 +2783,273 @@ fn render_opencode_plugin(
     Ok(())
 }
 
+/// `~/.config/opencode/plugins/ai-memory-opencode2.ts` — the OpenCode 2.0
+/// beta plugin file. The beta shares v1's config dir and session store but
+/// not its plugin API, so this is a distinct file from `ai-memory.ts`
+/// (uninstall keys each file to its own banner + agent constant).
+pub(crate) fn opencode2_plugin_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.config/opencode")?
+        .join(".config")
+        .join("opencode")
+        .join("plugins")
+        .join("ai-memory-opencode2.ts"))
+}
+
+/// Generate an OpenCode 2.0 beta plugin at
+/// `~/.config/opencode/plugins/ai-memory-opencode2.ts`.
+///
+/// The beta's plugin API (`Plugin.define({ id, setup })` with
+/// `ctx.session.hook` / `ctx.tool.hook` / `ctx.event.subscribe`) is
+/// incompatible with v1's function plugin, so the beta gets its own file.
+/// Both files share the one auto-loaded dir while the beta is side-by-side;
+/// a host may warn about its sibling's file (API mismatch) — that warning
+/// is benign, and `uninstall` removes each file only on its own ownership
+/// markers.
+fn apply_to_opencode2_plugin(
+    server_url: &str,
+    auth_token: Option<&str>,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => opencode2_plugin_path()?,
+    };
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let body = build_opencode2_plugin(server_url, auth_token, strategy)?;
+
+    let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new plugin file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    if !matches!(outcome, ApplyOutcome::NoOp) {
+        println!();
+        println!("OpenCode 2 auto-loads plugins from ~/.config/opencode/plugins/ on next start.");
+        println!("If you're already inside an `opencode2` session, restart it for the");
+        println!("new plugin to take effect.");
+    }
+    Ok(())
+}
+
+fn render_opencode2_plugin(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    println!(
+        "// OpenCode 2.0 beta plugin — write to ~/.config/opencode/plugins/ai-memory-opencode2.ts"
+    );
+    println!("// Or re-run with `--apply` to install it automatically.");
+    println!("// Restart OpenCode 2 after changing plugins; config is loaded at startup.");
+    println!();
+    println!(
+        "{}",
+        build_opencode2_plugin(server_url, auth_token, project_strategy)?
+    );
+    Ok(())
+}
+
+/// Build the beta plugin from the v1 template. The capture prelude (hook
+/// queue + spooling, marker resolution, capture policy, session maps,
+/// `/hook` + `/handoff` helpers) is host-independent and reused verbatim;
+/// only the host binding is rewritten for the V2 API. Anchors are plain
+/// rendered-TS constants like the spool patch's: a template edit that moves
+/// them fails loudly here instead of shipping a half-v1 plugin.
+fn build_opencode2_plugin(
+    server_url: &str,
+    auth_token: Option<&str>,
+    project_strategy: Option<&str>,
+) -> Result<String> {
+    let v1 = build_opencode_plugin(server_url, auth_token, project_strategy);
+    const BANNER_V1: &str =
+        "// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.";
+    const BANNER_V2: &str =
+        "// Auto-generated by `ai-memory install-hooks --agent opencode2 --apply`.";
+    const AGENT_V1: &str = "const AGENT = \"open-code\";";
+    const AGENT_V2: &str = "const AGENT = \"opencode2\";";
+    // Start of the v1 host binding through end of file. Everything before
+    // this line (including the spooled delivery path) is shared.
+    const V1_BINDING_ANCHOR: &str =
+        "\nexport const AiMemoryHooks: Plugin = async ({ directory }) => {";
+    // `replacen` silently keeps the v1 text when its anchor moves, which
+    // would ship a half-v1 plugin — fail loudly instead, like the spool
+    // patch's anchors do.
+    let out = replace_opencode_anchor(&v1, BANNER_V1, BANNER_V2, "banner")?;
+    let out = replace_opencode_anchor(&out, AGENT_V1, AGENT_V2, "agent constant")?;
+    let Some(binding_at) = out.find(V1_BINDING_ANCHOR) else {
+        anyhow::bail!("opencode2 template drifted: v1 host binding anchor not found");
+    };
+    let mut rebuilt = out[..binding_at].to_string();
+    rebuilt.push_str(OPENCODE2_BINDING);
+    Ok(rebuilt)
+}
+
+fn replace_opencode_anchor(haystack: &str, from: &str, to: &str, what: &str) -> Result<String> {
+    if !haystack.contains(from) {
+        anyhow::bail!("opencode2 template drifted: v1 {what} anchor not found");
+    }
+    Ok(haystack.replacen(from, to, 1))
+}
+
+/// V2 host binding for the shared capture prelude: the beta's `{ id, setup }`
+/// plugin shape with its session/tool/event hooks (verified against
+/// `@opencode-ai/plugin@beta`, including a `tsc --noEmit` pass over the
+/// rendered file). Lifecycle arrives on `ctx.event.subscribe` whose
+/// envelopes carry `{ type, data, location }` (v1's `event.properties`
+/// is kept as a fallback because the beta schema is still changing).
+/// Handoff injection moved from v1's removed
+/// `experimental.chat.system.transform` to the `context` hook, which edits
+/// the outgoing model call without persisting into history — guarded to
+/// inject once per session because it fires on every continuation.
+const OPENCODE2_BINDING: &str = r#"
+// `Plugin.define` is an identity wrapper, so the binding exports the
+// `{ id, setup }` shape directly and keeps the shared `import type` line:
+// a runtime import of `@opencode-ai/plugin` does not resolve from the
+// global plugins dir and fails the load.
+const AiMemoryOpencode2: Plugin = {
+  id: "ai-memory-opencode2",
+  setup: async (ctx) => {
+    const ctxAny = ctx as any;
+    const directory = ctxAny?.location?.directory;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        for await (const evt of ctx.event.subscribe({ signal: controller.signal })) {
+          const event = evt as any;
+          const type = event?.type;
+          const data = event?.data ?? event?.properties ?? {};
+          const info = data?.info ?? {};
+          const loc = data?.location?.directory ?? data?.directory
+            ?? event?.location?.directory ?? directory;
+          if (type === "session.created") {
+            const id = data?.sessionID ?? data?.id ?? info?.id;
+            startSession(id, data?.location?.directory ?? loc, {
+              title: data?.title ?? info?.title,
+              projectID: data?.projectID ?? info?.projectID,
+            });
+          }
+          if (type === "session.idle") {
+            const id = data?.sessionID ?? data?.id;
+            startSession(id, cwdFor(id, loc));
+            postHook("stop", { sessionID: id, cwd: cwdFor(id, loc) });
+          }
+          if (type === "session.deleted") {
+            const id = data?.sessionID ?? data?.id ?? info?.id;
+            endSession(id, loc, data?.directory ?? info?.directory);
+          }
+          if (type === "session.compaction.started") {
+            const id = data?.sessionID ?? data?.id;
+            postPreCompact(id, loc);
+          }
+          if (type === "session.compacted") {
+            const id = data?.sessionID ?? data?.id;
+            postPreCompact(id, loc);
+          }
+        }
+      } catch (_e) {
+        // The stream ends on unload. Capture is best-effort and must never
+        // break the host.
+      }
+    })();
+    const promptRegistration = await ctx.session.hook("prompt", (event) => {
+      const e = event as any;
+      const id = e?.sessionID;
+      const prompt = e?.prompt ?? {};
+      const cwd = cwdFor(id, directory);
+      startSession(id, cwd, { agent: prompt?.agent, model: prompt?.model });
+      postHook("user-prompt", {
+        sessionID: id,
+        cwd,
+        agent: prompt?.agent,
+        model: prompt?.model,
+        messageID: e?.messageID,
+        prompt: typeof prompt?.text === "string" ? prompt.text : textFromParts(prompt?.parts),
+      });
+    });
+    const handoffInjected = new Set<string>();
+    const contextRegistration = await ctx.session.hook("context", async (event) => {
+      const e = event as any;
+      const id = e?.sessionID;
+      if (!id || handoffInjected.has(id)) return;
+      startSession(id, cwdFor(id, directory));
+      let pending = handoffFetches.get(id);
+      if (!pending) {
+        pending = fetchHandoff(cwdFor(id, directory), id);
+        handoffFetches.set(id, pending);
+      }
+      const handoff = await pending;
+      if (handoff) {
+        // SystemPart is `{ type: "text", text }` — the `type` discriminator
+        // is required: without it the host fails the model call with a
+        // schema validation error (observed live on beta-18999).
+        e.system.push({ type: "text", text: handoff });
+        handoffInjected.add(id);
+      }
+    });
+    const beforeRegistration = await ctx.tool.hook("execute.before", (event) => {
+      const e = event as any;
+      const id = e?.sessionID;
+      startSession(id, cwdFor(id, directory));
+      postHook("pre-tool-use", {
+        sessionID: id,
+        cwd: cwdFor(id, directory),
+        tool: e?.tool,
+        callID: e?.id,
+        args: e?.input,
+      });
+    });
+    const afterRegistration = await ctx.tool.hook("execute.after", (event) => {
+      const e = event as any;
+      const id = e?.sessionID;
+      startSession(id, cwdFor(id, directory));
+      // The beta reports failures on the same channel (`status: "error"`,
+      // no `result`); keep the message where v1 kept output so the
+      // failure reason survives consolidation.
+      const failed = e?.status === "error";
+      postHook("post-tool-use", {
+        sessionID: id,
+        cwd: cwdFor(id, directory),
+        tool: e?.tool,
+        callID: e?.id,
+        args: e?.input,
+        title: failed ? undefined : e?.result?.title,
+        output: failed
+          ? String(e?.error?.message ?? e?.error ?? "tool failed")
+          : e?.result?.output,
+        metadata: failed ? undefined : e?.result?.metadata,
+      });
+    });
+    return async () => {
+      controller.abort();
+      for (const registration of [
+        promptRegistration,
+        contextRegistration,
+        beforeRegistration,
+        afterRegistration,
+      ]) {
+        try {
+          await registration.dispose();
+        } catch (_e) {
+          // Unload is best-effort; a dead host has nothing to unregister.
+        }
+      }
+      for (const id of Array.from(startedSessions)) {
+        endSession(id, directory);
+      }
+      await drainHookQueueForDispose();
+    };
+  },
+};
+
+export default AiMemoryOpencode2;
+"#;
 /// Emit the `applyMarkerParams` TypeScript function shared verbatim by the
 /// OpenCode plugin and the OMP extension.
 ///
@@ -5820,6 +6105,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
     fn baked_project_strategy_reads_every_owned_generated_integration() {
         for (agent, name) in [
             (AgentChoice::OpenCode, "opencode"),
+            (AgentChoice::OpenCode2, "opencode2"),
             (AgentChoice::Pi, "pi"),
             (AgentChoice::Omp, "omp"),
             (AgentChoice::Openclaw, "openclaw"),
@@ -7635,6 +7921,94 @@ model = "gpt-5"
                 .contains("projectStrategy === \"repo-root\" || projectStrategy === \"repo_root\"")
         );
         assert!(plugin.contains("url.searchParams.set(\"project\", repoProject)"));
+    }
+
+    #[test]
+    fn opencode2_plugin_binds_the_v2_api() {
+        let plugin = build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None).unwrap();
+
+        // Ownership markers the uninstall gate keys on.
+        assert!(plugin.contains("install-hooks --agent opencode2 --apply"));
+        assert!(plugin.contains("const AGENT = \"opencode2\";"));
+        // Type-only import: `Plugin.define` is identity, and a runtime
+        // import does not resolve from the global plugins dir (the beta
+        // refuses the load). The host only needs the `{ id, setup }` shape.
+        assert!(plugin.contains("import type { Plugin } from \"@opencode-ai/plugin\";"));
+        assert!(!plugin.contains("export default Plugin.define"));
+        assert!(!plugin.contains("Plugin.define({"));
+        assert!(plugin.contains("const AiMemoryOpencode2: Plugin = {"));
+        assert!(plugin.contains("export default AiMemoryOpencode2;"));
+        // Beta hooks, verified against `@opencode-ai/plugin@beta`.
+        assert!(plugin.contains("ctx.event.subscribe"));
+        assert!(plugin.contains("ctx.session.hook(\"prompt\""));
+        assert!(plugin.contains("ctx.session.hook(\"context\""));
+        assert!(plugin.contains("ctx.tool.hook(\"execute.before\""));
+        assert!(plugin.contains("ctx.tool.hook(\"execute.after\""));
+        // V2 lifecycle envelopes carry `{ type, data, location }`.
+        for event in [
+            "session.created",
+            "session.idle",
+            "session.deleted",
+            "session.compacted",
+        ] {
+            assert!(plugin.contains(event), "missing {event}");
+        }
+        // Handoff injection moved off v1's removed experimental hook and
+        // fires once per session (the context hook runs per model call).
+        // System items are `{ type: "text", text }` objects on the V2 API, not strings.
+        assert!(plugin.contains("handoffInjected"));
+        assert!(plugin.contains("system.push({ type: \"text\", text: handoff })"));
+        assert!(!plugin.contains("experimental."));
+        // Hook registrations are disposed on unload so a reload cannot
+        // leave stale callbacks capturing twice.
+        assert!(plugin.contains("registration.dispose()"));
+        // Pre-compaction arrives on its own start event; the completion
+        // event stays as the consolidation trigger, like v1.
+        assert!(plugin.contains("session.compaction.started"));
+        // Tool failures share the channel with the reason preserved.
+        assert!(plugin.contains("status === \"error\""));
+        // No v1 remnants.
+        assert!(!plugin.contains("export default AiMemoryHooks"));
+        assert!(!plugin.contains("chat.message"));
+        // Shared capture prelude survived the rewrite byte-identical.
+        for shared in [
+            "function startSession",
+            "function endSession",
+            "postHook(\"session-start\"",
+            "postHook(\"user-prompt\"",
+            "function applyMarkerParams",
+            "requestSpoolDrain();",
+        ] {
+            assert!(plugin.contains(shared), "missing {shared}");
+        }
+        // #625 made the generated adapters resolve the bearer at runtime
+        // (resolveToken() -> `${token}`) instead of the static `${TOKEN}`;
+        // the opencode2 plugin derives from v1 so it inherits that.
+        assert!(plugin.contains("Bearer ${token}"));
+        assert!(plugin.contains("tok"));
+    }
+
+    #[test]
+    fn opencode2_plugin_rejects_v1_template_drift() {
+        // The builder rewrites the v1 template, so a v1 edit that moves the
+        // binding anchor must fail loudly instead of shipping a hybrid.
+        let plugin =
+            build_opencode2_plugin("http://127.0.0.1:49374/", None, Some("repo-root")).unwrap();
+        assert!(plugin.contains("const TOKEN: string | null = null;"));
+        assert!(
+            plugin.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
+            "strategy bake-through must survive the v2 rewrite"
+        );
+    }
+
+    #[test]
+    fn opencode2_anchor_rewrite_fails_loudly_on_drift() {
+        let err =
+            replace_opencode_anchor("no v1 anchors here", "missing", "x", "banner").unwrap_err();
+        assert!(
+            err.to_string().contains("banner"),
+            "drift must name the moved anchor: {err:#}"
+        );
     }
 
     #[test]

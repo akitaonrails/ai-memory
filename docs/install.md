@@ -1110,6 +1110,51 @@ docker run --rm akitaonrails/ai-memory:latest \
 Restart OpenCode after installing or changing the plugin; plugins are
 loaded at startup.
 
+### OpenCode 2 (beta)
+
+The 2.0 beta installs side by side as `opencode2` and shares v1's config
+dir and session store, but its MCP schema and plugin API changed. Wire it
+with the `opencode2` client/agent names:
+
+```bash
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client opencode2 \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+# Plugin — write to ~/.config/opencode/plugins/ai-memory-opencode2.ts.
+# If you have the local wrapper installed, prefer `--apply`:
+ai-memory install-hooks --agent opencode2 --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+V2 nests servers under `mcp.servers` (no `enabled` field), so the v1
+(`mcp`) and v2 (`mcp.servers`) entries coexist in the one
+`~/.config/opencode/opencode.json(c)` file — the beta explicitly supports
+this mixed nesting, so keep both entries and do not "convert" the file by
+removing the v1 one
+(see [Migrate from V1](https://opencode.ai/v2/docs/migrate-v1)). `ai-memory run opencode2`
+resumes the same native sessions as `ai-memory run opencode` through the
+`opencode2` binary. Both plugins share the one auto-loaded dir while the
+beta is side-by-side; a host may warn about its sibling's file (the two
+plugin APIs are incompatible) — that warning is benign, and `uninstall`
+removes each file only on its own ownership markers.
+
+> **Back up `~/.local/share/opencode` before running the beta against
+> your real data.** The two binaries share the one `opencode.db` file and
+> the beta has migrated its schema in place before, leaving stable
+> `opencode` 1.x broken
+> ([upstream #42260](https://github.com/anomalyco/opencode/issues/42260)).
+> ai-memory only ever opens that database read-only; the migration risk
+> comes from launching `opencode2` itself, not from this integration.
+>
+> **The beta's background service defaults to port 49374 — ai-memory's own
+> default.** Running both on defaults crash-loops the opencode2 service
+> (`Managed service port 49374 ... is already in use`). Move one side:
+> `opencode2 service set port <free-port>`, or start ai-memory with
+> `--bind 127.0.0.1:<free-port>` (and matching `--server-url` installs).
+
 **On a Gemini/Vertex model, serve Gemini-safe schemas.** OpenCode forwards MCP
 tool schemas to the configured provider verbatim, and Google's `Schema`
 (Vertex/Gemini `functionDeclaration.parameters`) accepts only a single `type` per
@@ -1347,7 +1392,7 @@ docker run --rm akitaonrails/ai-memory:latest \
 ```
 
 The curl script installer supports
-`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi`
+`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|oh-my-pi|pi`
 and `--to <dir>`; `--help` prints the full flag list. OpenCode,
 OpenClaw, OMP / Oh My Pi, and Pi do not need script extraction because
 `install-hooks` generates TypeScript plugin/extension files for them
