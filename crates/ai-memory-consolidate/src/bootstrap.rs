@@ -461,16 +461,27 @@ impl Bootstrap {
                 .writer
                 .load_bootstrap_progress(fingerprint.clone())
                 .await?;
-            for record in recorded {
+            // Adopt only the CONTIGUOUS prefix of completed chunks (0, 1, 2, …).
+            // Each chunk's output depends on the pages the earlier chunks wrote,
+            // in order (`prior` below), so reusing a later chunk while an earlier
+            // one is missing — a gap left by a crash, or an unreadable row —
+            // would seed it with context a clean run never had, and a resumed run
+            // must not diverge from a fresh one (#635). Records arrive ordered by
+            // chunk_index; stop at the first gap or unreadable row and re-run
+            // everything from there (the re-run overwrites the stale later rows).
+            for (expected, record) in recorded.into_iter().enumerate() {
+                if record.chunk_index as usize != expected {
+                    break;
+                }
                 let pages: Vec<BootstrapPage> = match serde_json::from_str(&record.pages_json) {
                     Ok(pages) => pages,
                     Err(e) => {
                         warn!(
                             chunk = record.chunk_index,
                             error = %e,
-                            "skipping unreadable bootstrap progress row; will re-run this chunk"
+                            "unreadable bootstrap progress row; re-running from this chunk on"
                         );
-                        continue;
+                        break;
                     }
                 };
                 for page in pages {
@@ -2204,5 +2215,98 @@ mod tests {
             .await
             .unwrap();
         assert!(cleared.is_empty(), "a completed run clears its progress");
+    }
+
+    /// Three sources sized so `plan_bootstrap_chunks` splits them into exactly
+    /// three chunks under the same small budget as `two_chunk_sources`.
+    fn three_chunk_sources() -> Vec<BootstrapSource> {
+        (0..3u8)
+            .map(|i| BootstrapSource {
+                kind: SourceKind::GitCommit,
+                label: format!("git: {i}"),
+                text: ((b'a' + i) as char).to_string().repeat(2_000),
+            })
+            .collect()
+    }
+
+    fn one_page_json(path: &str) -> String {
+        serde_json::to_string(&vec![BootstrapPage {
+            path: path.into(),
+            title: path.into(),
+            body_markdown: "body".into(),
+            tags: vec![],
+        }])
+        .unwrap()
+    }
+
+    /// #635: a NON-CONTIGUOUS recorded set — chunk 0 and chunk 2 durable, chunk
+    /// 1 missing (the crash case this feature exists for) — must adopt only the
+    /// contiguous prefix `{0}` and re-run chunks 1 AND 2, so each sees the same
+    /// prior context a clean run would. The stale chunk-2 pages must NOT be
+    /// adopted; they are re-produced by the re-run.
+    #[tokio::test]
+    async fn resume_ignores_a_non_contiguous_gap_and_reruns_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sources = three_chunk_sources();
+        let chunk_budget = effective_chunk_budget(800, 100_000);
+        let planned = plan_bootstrap_chunks(sources.clone(), chunk_budget);
+        assert_eq!(planned.len(), 3, "fixture must produce three chunks");
+
+        // Re-run scripts chunk 1 -> b.md, chunk 2 -> c.md (the fresh chunk-2
+        // page, distinct from the stale one seeded below).
+        let llm = Arc::new(SequencedLlm {
+            calls: AtomicUsize::new(0),
+            responses: vec![
+                page_response("concepts/b.md", "chunk1"),
+                page_response("concepts/c.md", "chunk2"),
+            ],
+            fail_at: None,
+        });
+        let (store, bootstrap, ws, proj) = bootstrap_fixture(tmp.path(), llm.clone()).await;
+        let fingerprint = bootstrap_fingerprint(ws, proj, chunk_budget, &planned);
+
+        // Seed a GAP: chunk 0 (kept) and chunk 2 (stale, must be discarded);
+        // chunk 1 deliberately absent.
+        store
+            .writer
+            .record_bootstrap_chunk(
+                fingerprint.clone(),
+                0,
+                one_page_json("concepts/a.md"),
+                "c0".into(),
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .record_bootstrap_chunk(
+                fingerprint.clone(),
+                2,
+                one_page_json("concepts/stale.md"),
+                "c2-stale".into(),
+            )
+            .await
+            .unwrap();
+
+        let outcome = bootstrap
+            .process_sources(&resume_test_config(ws, proj, true), sources)
+            .await
+            .expect("resume completes");
+
+        // Only chunk 0 was contiguous → chunks 1 and 2 were both re-run.
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            2,
+            "chunk 2 must be re-run (not adopted across the gap), so both 1 and 2 call the LLM"
+        );
+        assert!(outcome.pages_written.contains(&"concepts/a.md".to_string()));
+        assert!(outcome.pages_written.contains(&"concepts/b.md".to_string()));
+        assert!(outcome.pages_written.contains(&"concepts/c.md".to_string()));
+        assert!(
+            !outcome
+                .pages_written
+                .contains(&"concepts/stale.md".to_string()),
+            "the stale chunk-2 page across the gap must not be adopted"
+        );
     }
 }

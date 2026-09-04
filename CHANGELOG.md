@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `bootstrap --resume` recovers an interrupted run from durable per-chunk
+  progress instead of re-paying for every LLM call (#621). Each chunk's pages
+  are recorded (keyed by a fingerprint of the pruned sources + chunk budget, so
+  a re-run after new commits re-chunks and starts fresh) and `--resume` seeds
+  them and skips those chunks; the wiki write stays atomic (nothing lands until
+  the whole run completes) and progress is cleared on success. It adopts only
+  the **contiguous** prefix of completed chunks and re-runs from the first gap
+  or unreadable row (#635), so a resumed run can never diverge from a clean one
+  by seeding a later chunk with context an earlier, still-missing chunk never
+  produced. Complements the transient-retry from 2.0.3 (#617): retry reduces
+  how often you need resume; resume covers the crash / restart case.
 - Added first-party OpenCode 2.0 beta (`opencode2`) support.
   `install-mcp --client opencode2` merges the V2 `mcp.servers` remote entry
   (no `enabled` field, `oauth: false` for header credentials);
