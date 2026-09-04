@@ -218,6 +218,10 @@ struct BootstrapRequest {
     /// Allow re-bootstrap when `wiki/bootstrap.md` already exists.
     #[serde(default)]
     force: bool,
+    /// Resume an interrupted bootstrap: reuse the chunks already completed
+    /// for the same sources instead of re-running them (#621).
+    #[serde(default)]
+    resume: bool,
 }
 
 fn default_max_input_tokens() -> usize {
@@ -1789,12 +1793,14 @@ async fn handle_bootstrap(
         since: None,
         dry_run: req.dry_run,
         force: req.force,
+        resume: req.resume,
     };
 
     let bootstrap = Bootstrap {
         reader: state.reader.clone(),
         wiki: state.wiki.clone(),
         llm,
+        writer: state.writer.clone(),
     };
 
     match bootstrap.process_sources(&cfg, req.sources).await {

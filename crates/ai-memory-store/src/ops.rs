@@ -3651,6 +3651,85 @@ pub fn scope_is_purged(
     Ok(found.is_some())
 }
 
+/// One recorded bootstrap chunk, as loaded by [`load_bootstrap_progress`].
+#[derive(Debug, Clone)]
+pub struct BootstrapChunkRecord {
+    /// Position of this chunk in the run's chunk plan (0-based).
+    pub chunk_index: u32,
+    /// The chunk's `BootstrapPage` batch, serialized as JSON.
+    pub pages_json: String,
+    /// The chunk's LLM-authored rationale.
+    pub rationale: String,
+}
+
+/// Durably record one completed bootstrap chunk's output (#621).
+///
+/// `INSERT OR REPLACE` makes this idempotent: a non-resume run still records
+/// every chunk (so a later `--resume` has something to reuse), and re-running
+/// the same chunk index just overwrites its row.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn record_bootstrap_chunk(
+    conn: &Connection,
+    fingerprint: &str,
+    chunk_index: u32,
+    pages_json: &str,
+    rationale: &str,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO bootstrap_chunk_progress \
+         (fingerprint, chunk_index, pages_json, rationale, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            fingerprint,
+            chunk_index,
+            pages_json,
+            rationale,
+            Timestamp::now().as_microsecond(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load every recorded chunk for `fingerprint`, ordered by `chunk_index` — the
+/// order `bootstrap --resume` needs to seed its `pages_by_path` accumulator.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn load_bootstrap_progress(
+    conn: &Connection,
+    fingerprint: &str,
+) -> StoreResult<Vec<BootstrapChunkRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_index, pages_json, rationale FROM bootstrap_chunk_progress \
+         WHERE fingerprint = ?1 ORDER BY chunk_index",
+    )?;
+    let rows = stmt
+        .query_map(params![fingerprint], |row| {
+            Ok(BootstrapChunkRecord {
+                chunk_index: row.get(0)?,
+                pages_json: row.get(1)?,
+                rationale: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Delete every recorded chunk for `fingerprint`. Called once a bootstrap run
+/// completes successfully — a fresh run has nothing left to resume.
+///
+/// # Errors
+/// Returns [`StoreError`] if the SQL statement fails.
+pub fn clear_bootstrap_progress(conn: &Connection, fingerprint: &str) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM bootstrap_chunk_progress WHERE fingerprint = ?1",
+        params![fingerprint],
+    )?;
+    Ok(())
+}
+
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -5079,6 +5158,39 @@ pub(crate) mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// Round-trip: recorded chunks come back ordered by index, and `clear`
+    /// empties them. A different fingerprint's rows are untouched (#621).
+    #[test]
+    fn bootstrap_chunk_progress_round_trips_and_clears() {
+        let (_tmp, conn, _ws, _proj) = fresh_db();
+
+        record_bootstrap_chunk(&conn, "fp-a", 1, r#"{"pages":[]}"#, "second chunk").unwrap();
+        record_bootstrap_chunk(&conn, "fp-a", 0, r#"{"pages":[]}"#, "first chunk").unwrap();
+        record_bootstrap_chunk(&conn, "fp-b", 0, r#"{"pages":[]}"#, "other run").unwrap();
+
+        let loaded = load_bootstrap_progress(&conn, "fp-a").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].chunk_index, 0);
+        assert_eq!(loaded[0].rationale, "first chunk");
+        assert_eq!(loaded[1].chunk_index, 1);
+        assert_eq!(loaded[1].rationale, "second chunk");
+
+        // Re-recording the same (fingerprint, chunk_index) replaces the row
+        // rather than duplicating it — `INSERT OR REPLACE` idempotency.
+        record_bootstrap_chunk(&conn, "fp-a", 0, r#"{"pages":[]}"#, "first chunk v2").unwrap();
+        let loaded = load_bootstrap_progress(&conn, "fp-a").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].rationale, "first chunk v2");
+
+        clear_bootstrap_progress(&conn, "fp-a").unwrap();
+        assert!(load_bootstrap_progress(&conn, "fp-a").unwrap().is_empty());
+        assert_eq!(
+            load_bootstrap_progress(&conn, "fp-b").unwrap().len(),
+            1,
+            "clearing one fingerprint must not touch another"
+        );
     }
 
     /// The default for a project purge is the same logical delete `#387`

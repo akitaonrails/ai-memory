@@ -1147,6 +1147,10 @@ pub struct BootstrapArgs {
     /// the same project (the manifest is `wiki/bootstrap.md`).
     #[arg(long)]
     pub force: bool,
+    /// Resume an interrupted bootstrap: reuse the chunks already completed
+    /// for the same sources instead of re-running them.
+    #[arg(long)]
+    pub resume: bool,
 }
 
 /// Arguments for `setup-agent`.
