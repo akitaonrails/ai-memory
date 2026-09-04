@@ -34,9 +34,11 @@ path (docker + Claude Code). This page covers everything else:
 The Docker image is published for `linux/amd64` and `linux/arm64`; Apple
 Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
 
-> **Podman.** The `bin/ai-memory` wrapper works with rootless podman, either
-> through the `podman-docker` `docker` shim or by pointing it at podman
-> directly with `AI_MEMORY_DOCKER=podman`. See
+> **Podman.** The `bin/ai-memory` wrapper automatically uses rootless Podman
+> when Docker is not installed. It also works through the `podman-docker`
+> `docker` shim; set `AI_MEMORY_DOCKER=podman` to force Podman when both engines
+> are installed. The default image name is fully qualified for non-interactive
+> Podman short-name resolution. See
 > [SELinux-enforcing hosts](#selinux-enforcing-hosts) for how it detects the
 > engine's rootless and SELinux state.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ai-memory — thin wrapper that invokes the dockerised ai-memory
+# ai-memory — thin wrapper that invokes the containerized ai-memory
 # binary with the right mounts so install-* commands can edit your
 # real config files, bootstrap can read your real project, and
 # data-dir commands hit the same volume your server uses.
@@ -17,8 +17,8 @@
 #                           Same: the rename is keyed on host repo identity.
 #
 # Env overrides:
-#   AI_MEMORY_IMAGE         docker image (default: akitaonrails/ai-memory:latest)
-#   AI_MEMORY_DOCKER        docker command (default: docker; e.g. "podman")
+#   AI_MEMORY_IMAGE         container image (default: docker.io/akitaonrails/ai-memory:latest)
+#   AI_MEMORY_DOCKER        container engine command (default: docker, then podman)
 #   AI_MEMORY_DATA_VOLUME   named volume mounted at /data (default: ai-memory-data)
 #   AI_MEMORY_DATA_DIR      host path to bind-mount at /data instead (rare)
 #   AI_MEMORY_SERVER_URL    server URL for thin-client commands; if unset,
@@ -39,8 +39,18 @@
 #                           paths under $HOME are covered by the home bind mount)
 set -euo pipefail
 
-IMAGE="${AI_MEMORY_IMAGE:-akitaonrails/ai-memory:latest}"
-DOCKER="${AI_MEMORY_DOCKER:-docker}"
+IMAGE="${AI_MEMORY_IMAGE:-docker.io/akitaonrails/ai-memory:latest}"
+if [ -n "${AI_MEMORY_DOCKER:-}" ]; then
+  DOCKER="${AI_MEMORY_DOCKER}"
+elif command -v docker >/dev/null 2>&1; then
+  DOCKER="docker"
+elif command -v podman >/dev/null 2>&1; then
+  DOCKER="podman"
+else
+  # Preserve the existing command-not-found error for containerized commands;
+  # native wrapper-only commands do not need either engine.
+  DOCKER="docker"
+fi
 DATA_VOLUME="${AI_MEMORY_DATA_VOLUME:-ai-memory-data}"
 CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/ai-memory"
 VERSION_CHECK_FILE="${CACHE_DIR}/last-version-check"
@@ -143,7 +153,7 @@ self_upgrade_script() {
 }
 
 
-# Reconstruct the `docker run` that created a running container, so a
+# Reconstruct the container-engine command that created a running container, so a
 # non-compose install can be recreated on the freshly pulled image without
 # the operator having to remember their original flags (issue #407).
 #
@@ -154,11 +164,12 @@ self_upgrade_script() {
 #
 # Reconstructs the flags that matter for an ai-memory container: name,
 # restart policy, published ports, mounts, operator-supplied environment,
-# and an overridden command. It does NOT reproduce every possible `docker
+# and an overridden command. It does NOT reproduce every possible container
 # run` flag (networks, capabilities, resource limits, devices); the script
 # says so in its own header so a reader can add anything exotic back.
 emit_docker_run_script() {
-  local container="$1" out="$2" image
+  local container="$1" out="$2" image engine
+  printf -v engine '%q' "${DOCKER}"
   image="$("${DOCKER}" inspect "${container}" --format '{{.Config.Image}}' 2>/dev/null)" || return 1
   [ -n "${image}" ] || return 1
 
@@ -212,9 +223,9 @@ ENVEOF
     echo "# else (custom network, capabilities, resource limits), re-add it."
     echo "set -euo pipefail"
     echo
-    echo "docker stop ${container}"
-    echo "docker rm ${container}"
-    printf 'docker run -d --name %s' "${container}"
+    printf '%s stop %q\n' "${engine}" "${container}"
+    printf '%s rm %q\n' "${engine}" "${container}"
+    printf '%s run -d --name %q' "${engine}" "${container}"
     [ -n "${restart}" ] && printf ' %s' "${restart}"
     [ -n "${ports}" ] && printf ' %s' "${ports% }"
     [ -n "${volumes}" ] && printf ' %s' "${volumes% }"
@@ -294,10 +305,10 @@ cmd_upgrade() {
   if "${DOCKER}" ps --filter "name=^ai-memory$" --format '{{.Names}}' 2>/dev/null \
        | grep -q '^ai-memory$'; then
     # A LOCAL ai-memory container is running. We've just pulled a new
-    # image; `docker restart` won't recreate from the new image, so we
-    # need to stop+remove+recreate. Use `docker compose up -d` only when
+    # image; a restart won't recreate from the new image, so we
+    # need to stop+remove+recreate. Use `compose up -d` only when
     # the discovered project owns this container; otherwise reconstruct
-    # the standalone `docker run` from its inspected runtime settings.
+    # the standalone container from its inspected runtime settings.
     local compose_dir=""
     if [ -f "$(pwd)/docker/docker-compose.yml" ]; then
       compose_dir="$(pwd)/docker"
@@ -307,13 +318,13 @@ cmd_upgrade() {
       compose_dir="${HOME}/deploy/ai-memory"
     fi
     if [ -n "${compose_dir}" ] && compose_manages_container "ai-memory" "${compose_dir}"; then
-      echo "→ restarting local ai-memory container via docker compose (${compose_dir})"
+      echo "→ restarting local ai-memory container via ${DOCKER} compose (${compose_dir})"
       ( cd "${compose_dir}" && "${DOCKER}" compose up -d ) \
-        || echo "  (compose restart failed; re-run manually: cd ${compose_dir} && docker compose up -d)"
+        || echo "  (compose restart failed; re-run manually: cd ${compose_dir} && ${DOCKER} compose up -d)"
     else
       if [ -n "${compose_dir}" ]; then
         echo "→ the compose file at ${compose_dir} does not manage the running ai-memory container"
-        echo "  Treating it as a standalone docker run install to avoid a container-name conflict."
+        echo "  Treating it as a standalone ${DOCKER} run install to avoid a container-name conflict."
       else
         echo "→ a local ai-memory container is running but no compose file"
         echo "  was found in \$PWD/docker-compose.yml, ./docker/docker-compose.yml,"
@@ -331,8 +342,8 @@ cmd_upgrade() {
       else
         echo "  Could not inspect the running container to reconstruct its"
         echo "  command. Restart it manually so the new image takes effect:"
-        echo "      docker stop ai-memory && docker rm ai-memory"
-        echo "      # then re-run your docker-run command from the README Quick start"
+        echo "      ${DOCKER} stop ai-memory && ${DOCKER} rm ai-memory"
+        echo "      # then re-run your container command from the README Quick start"
       fi
     fi
   fi
@@ -371,7 +382,7 @@ native_host_binary() {
     Linux) os="linux" ;;
     Darwin) os="macos" ;;
     *)
-      echo "ai-memory: the Docker wrapper cannot provide managed host launches on this OS" >&2
+      echo "ai-memory: the container wrapper cannot provide managed host launches on this OS" >&2
       echo "install the native release binary to use ai-memory run/show/continue/resume/workstreams/rename-workstream" >&2
       return 1
       ;;
@@ -455,7 +466,7 @@ case "${1:-}" in
     ;;
 esac
 
-# ---- normal pass-through to the binary inside docker ---------------------
+# ---- normal pass-through to the binary inside a container ----------------
 
 maybe_warn_outdated || true
 

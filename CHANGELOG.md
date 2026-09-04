@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dest_free_bytes`, so the same number is visible right before a migration.
 
 ### Fixed
+- The `bin/ai-memory` container wrapper now automatically uses Podman when
+  Docker is unavailable, uses a fully qualified Docker Hub image name to avoid
+  Podman's non-interactive short-name resolution failure, and preserves the
+  selected engine in standalone-container recovery scripts emitted by
+  `ai-memory upgrade` instead of hard-coding `docker` (#636).
 - Corrected `docs/MIGRATION-2.0.md`, which wrongly promised the automatic
   pre-migration archive could roll a store back to 1.x (#633). The archive is
   written *after* `Store::open` migrates the SQLite schema forward, so its

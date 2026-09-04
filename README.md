@@ -146,8 +146,8 @@ packaged unit. Full user-service, system-service, auth, and provider setup is in
 
 ### Docker
 
-You need: Docker + an agent CLI from the [Support Matrix](#support-matrix), or
-anything else that speaks MCP.
+You need: Docker or Podman + an agent CLI from the [Support Matrix](#support-matrix),
+or anything else that speaks MCP.
 
 The published Docker image includes `linux/amd64` and `linux/arm64` variants,
 so Apple Silicon Macs and ARM64 Linux hosts can pull `akitaonrails/ai-memory`
@@ -160,7 +160,7 @@ expose the server on the LAN; see [Security](#security) below.
 
 ```bash
 # 1. Install the ai-memory CLI wrapper (a small shell script that
-#    runs the binary inside docker with your $HOME mounted). This is
+#    runs the binary inside a container with your $HOME mounted). This is
 #    the only thing that needs to live on the host filesystem.
 mkdir -p ~/.local/bin
 wrapper_tmp="$(mktemp -d)"
@@ -197,7 +197,7 @@ docker run -d --name ai-memory \
     -e ANTHROPIC_API_KEY=sk-ant-... \
     -e AI_MEMORY_EMBEDDING_PROVIDER=openai \
     -e OPENAI_API_KEY=sk-... \
-    akitaonrails/ai-memory:latest
+    docker.io/akitaonrails/ai-memory:latest
 
 # 3. Wire your agent CLI in two commands. The wrapper takes care of
 #    mounts and each client's config-path detection. Re-run with
@@ -209,6 +209,10 @@ docker run -d --name ai-memory \
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
+
+The examples use `docker`; replace it with `podman` on a Podman host. The
+wrapper automatically uses Podman when Docker is not installed. Set
+`AI_MEMORY_DOCKER=podman` to force Podman when both engines are available.
 
 On Linux/macOS, that's it. Start a Claude Code session as usual - every
 prompt and tool call now lands in ai-memory, and the next session you
