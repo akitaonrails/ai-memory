@@ -95,14 +95,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
   Responses endpoint. Luna is not served through Chat Completions, where plain
   and structured ai-memory calls returned HTTP 500 (#618).
-- Corrected `docs/MIGRATION-2.0.md`, which wrongly promised the automatic
-  pre-migration archive could roll a store back to 1.x (#633). The archive is
-  written *after* `Store::open` migrates the SQLite schema forward, so its
-  `db/` is already at the 2.x schema and a 1.x binary refuses to open it. The
-  docs now state the archive is a 2.x recovery point and that a genuine 1.x
-  rollback requires a backup taken with the 1.x binary before upgrading.
-  (The underlying ordering — snapshotting before the DB migration runs — is
-  tracked separately.)
+- The pre-migration safety archive is now taken **before** the SQLite schema
+  is migrated, so it is a genuine pre-2.0 recovery point a 1.x binary can
+  reopen — restoring the documented "reversible upgrade" (#633). Previously the
+  archive was written inside the wiki migration, which runs *after*
+  `Store::open` has already advanced the DB schema, so the archived `db/` was
+  already at 2.x and a 1.x binary refused it — the documented rollback was
+  impossible. The snapshot now runs in the boot path before `Store::open`,
+  gated to the real 1.x→2.0 upgrade (a fresh install or already-migrated store
+  takes nothing, unchanged) and idempotent; the OKF migration reuses that
+  archive instead of taking a second one. An integration test asserts the
+  archived DB reflects the pre-migration state.
 - Typed edges (`relations`) now actually work on OpenAI-family providers
   (#630). `ConsolidatedPage.relations` was an open map
   (`BTreeMap<String, Vec<String>>`), which the strict structured-output

@@ -1,19 +1,14 @@
 # Upgrading to 2.0
 
 2.0 changes the wiki's on-disk format to the [Open Knowledge Format
-v0.2](okf.md). The upgrade is automatic and backup-gated. This page
-describes exactly what happens and what the automatic archive can and
-cannot restore.
+v0.2](okf.md). The upgrade is automatic, backup-gated, and reversible.
+This page describes exactly what happens and how to go back.
 
-> **Rollback to 1.x needs your own 1.x-era backup.** The automatic
-> archive below is written **after** the SQLite schema has already been
-> migrated forward, so its `db/` is at the 2.x schema and a 1.x binary
-> will refuse to open it (`store schema … newer than this ai-memory
-> build`). The archive is a full **2.x** recovery point (wiki content and
-> business state intact); it is **not** a 1.x rollback point. If you want
-> the option to return to 1.x, take a backup with the **1.x** binary (or
-> `ai-memory backup` on 1.x, or a filesystem copy of the data dir) before
-> the first 2.x start. See [#633](https://github.com/akitaonrails/ai-memory/issues/633).
+> **The safety archive is a true pre-migration recovery point.** It is
+> written **before** the SQLite schema is migrated forward (#633), so its
+> `db/` is still at the 1.x schema and restoring it lets you start the old
+> 1.x binary again. (Earlier 2.0.x builds took this archive *after* the DB
+> migration, which left it 2.x-only — fixed in 2.0.3.)
 
 ## What happens on the first 2.0 start
 
@@ -115,12 +110,11 @@ ai-memory status                      # server healthy, page counts unchanged
 grep -L "^type:" <data_dir>/wiki/*/*/*/*.md   # no output = all pages typed
 ```
 
-## Restoring the automatic archive
+## Restoring the backup
 
-Blunt and complete — returns the entire data directory to the state it
-had **the moment the OKF wiki migration began**. Note this is *after* the
-SQLite schema was migrated forward, so the restored `db/` is at the 2.x
-schema: reopen it with a **2.x** binary, not 1.x.
+Blunt and complete — returns the entire data directory to its exact
+pre-migration state (the archive is taken before both the DB schema and
+the wiki are migrated, #633), so you can start the old 1.x binary again:
 
 ```bash
 # 1. stop the server (docker compose down / systemctl stop ai-memory)
@@ -129,12 +123,8 @@ mv <data_dir> <data_dir>.post-migration
 # 3. unpack the archive as the new data dir
 mkdir <data_dir>
 tar -xzf ~/ai-memory-backup-okf-v0.2-<date>.tar.gz -C <data_dir>
-# 4. start ai-memory 2.x against it (a 1.x binary will refuse the DB)
+# 4. start the OLD (1.x) binary against it
 ```
-
-To actually roll **back to 1.x**, you need a backup taken with the 1.x
-binary before the upgrade (see the note at the top of this page); the
-automatic archive above cannot serve that purpose.
 
 Surgical alternative (keeps post-migration work, reverts only the wiki
 files): the `pre-okf-migration checkpoint` commit in the wiki's git
@@ -146,10 +136,11 @@ A 2.0-migrated data directory records the migration in the
 `wiki_migrations` table. A **newer** binary opening an **older** wiki
 migrates it (as above). An **older 2.0+** binary opening a **newer**
 wiki refuses to start with `NewerWikiFormat` instead of silently mixing
-formats. (1.x binaries predate the *wiki* guard, but the **SQLite** schema guard
-still stops them: a 1.x binary refuses a 2.x-migrated `db/` outright, so
-you cannot stay on 1.x by restoring the automatic archive — only by
-restoring a backup you took with the 1.x binary before upgrading.)
+formats. (1.x binaries predate the guard: they can open a migrated
+directory and will tolerate the extra frontmatter, but new writes from
+1.x will not carry the OKF keys — avoid mixing. To stay on 1.x cleanly,
+restore the pre-migration archive, which is captured before the DB
+migration and so reopens under 1.x.)
 
 ## Sharing bundles
 

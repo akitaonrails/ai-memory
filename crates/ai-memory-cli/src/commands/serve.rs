@@ -719,6 +719,20 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // second active-project pointer (#563). Held until `run` returns.
     let _serve_lock = acquire_serve_lock(&config.data_dir, args.force)?;
 
+    // #633: take the pre-migration safety archive BEFORE `Store::open` advances
+    // the SQLite schema, so the archive captures the true pre-2.0 state a 1.x
+    // binary can reopen. `Store::open` below runs the DB migrations; if the
+    // backup ran after it (as it used to, inside the wiki migration), the
+    // archived `db/` would already be at the 2.x schema and the documented
+    // rollback to 1.x would be impossible. A no-op for a fresh install or an
+    // already-migrated store; the OKF wiki migration reuses this archive instead
+    // of taking a second, post-DB-migration one.
+    let backup_dest_override = std::env::var("AI_MEMORY_BACKUP_DIR")
+        .ok()
+        .map(std::path::PathBuf::from);
+    migrations::snapshot_before_db_migration(&config.data_dir, backup_dest_override.as_deref())
+        .with_context(|| "taking the pre-migration safety backup")?;
+
     let store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
 

@@ -48,6 +48,50 @@ impl OkfConformance {
 
 const BACKUP_LABEL: &str = "okf-v0.2";
 
+/// Take the pre-migration safety archive **before** the store's DB schema is
+/// migrated, so it captures the true pre-2.0 state a 1.x binary can reopen
+/// (#633). Call this from the boot path *before* `Store::open`, which advances
+/// the SQLite schema — otherwise the archive's `db/` is already at 2.x and the
+/// documented 1.x rollback is impossible.
+///
+/// Gated to the real 1.x→2.0 upgrade and idempotent:
+/// - if a usable backup already exists (`pre-migration-backup.json` pointing at
+///   a present archive), reuse it — never overwrite a good pre-migration snapshot;
+/// - if the wiki has no pre-OKF files, this is a fresh install or an already
+///   conformant store — nothing to protect, take nothing (unchanged behaviour);
+/// - otherwise archive the whole data dir now.
+///
+/// `dest_override` is the destination directory (the serve path passes
+/// `AI_MEMORY_BACKUP_DIR`); `None` uses the default resolution. A `None`
+/// *return* means "no backup was needed/taken here".
+///
+/// # Errors
+/// [`WikiError`] if the wiki scan or the archive write fails.
+pub fn snapshot_before_db_migration(
+    data_dir: &Path,
+    dest_override: Option<&Path>,
+) -> WikiResult<Option<crate::backup::BackupReceipt>> {
+    if crate::backup::BackupReceipt::load(data_dir).is_some_and(|r| r.archive_present()) {
+        // A prior boot in this same upgrade already captured the pre-migration
+        // state; do not overwrite it with a now-partially-migrated snapshot.
+        return Ok(None);
+    }
+    let wiki_root = data_dir.join("wiki");
+    if nonconformant_files(&wiki_root)?.is_empty() {
+        // No pre-OKF wiki files → not a 1.x store being upgraded.
+        return Ok(None);
+    }
+    let receipt =
+        crate::backup::create_pre_migration_backup(data_dir, BACKUP_LABEL, dest_override)?;
+    tracing::info!(
+        archive = %receipt.archive_path.display(),
+        size_bytes = receipt.size_bytes,
+        dest_free_bytes = ?receipt.dest_free_bytes,
+        "pre-migration backup taken before the DB schema migration (#633: 1.x-restorable)"
+    );
+    Ok(Some(receipt))
+}
+
 #[async_trait::async_trait]
 impl WikiMigration for OkfConformance {
     fn name(&self) -> &'static str {
@@ -76,19 +120,36 @@ impl WikiMigration for OkfConformance {
             "OKF migration: taking the pre-migration backup first"
         );
 
-        // 1. Backup gate.
-        let receipt = crate::backup::create_pre_migration_backup(
-            data_dir,
-            BACKUP_LABEL,
-            self.dest_override.as_deref(),
-        )?;
-        tracing::info!(
-            archive = %receipt.archive_path.display(),
-            size_bytes = receipt.size_bytes,
-            entries = receipt.entries,
-            dest_free_bytes = ?receipt.dest_free_bytes,
-            "pre-migration backup verified"
-        );
+        // 1. Backup gate. The boot path takes this archive BEFORE `Store::open`
+        //    migrates the DB schema (#633), so a usable receipt normally already
+        //    exists here — reuse it rather than archive the now-DB-migrated tree
+        //    a second time. Only archive here for the rare path where the DB was
+        //    already at 2.x but the wiki was not yet conformant (no pre-open
+        //    snapshot was taken).
+        match crate::backup::BackupReceipt::load(data_dir)
+            .filter(crate::backup::BackupReceipt::archive_present)
+        {
+            Some(existing) => {
+                tracing::info!(
+                    archive = %existing.archive_path.display(),
+                    "reusing the pre-open pre-migration backup (#633)"
+                );
+            }
+            None => {
+                let receipt = crate::backup::create_pre_migration_backup(
+                    data_dir,
+                    BACKUP_LABEL,
+                    self.dest_override.as_deref(),
+                )?;
+                tracing::info!(
+                    archive = %receipt.archive_path.display(),
+                    size_bytes = receipt.size_bytes,
+                    entries = receipt.entries,
+                    dest_free_bytes = ?receipt.dest_free_bytes,
+                    "pre-migration backup verified"
+                );
+            }
+        }
 
         // 2. Checkpoint whatever the tree holds before touching it.
         let git = crate::git::GitAdapter::open_or_init(wiki_root)?;
@@ -479,6 +540,140 @@ mod tests {
             "fresh install created a backup archive"
         );
         assert!(crate::backup::BackupReceipt::load(tmp.path()).is_none());
+    }
+
+    // ---- #633: the safety archive must be taken BEFORE the DB migration ----
+
+    /// The core assertion for #633: the pre-open snapshot captures the DB as it
+    /// was at snapshot time, so a mutation applied afterwards — which is exactly
+    /// what `Store::open`'s schema migration is — is NOT in the archive. Prove
+    /// it end to end: write PRE, snapshot, overwrite to POST, and the extracted
+    /// archive must still read PRE. If it read POST, the archive would be
+    /// post-migration and a 1.x binary could not use it.
+    #[test]
+    fn snapshot_archive_captures_the_db_before_a_later_mutation() {
+        let tmp = TempDir::new().unwrap();
+        // A non-OKF wiki file makes this look like a 1.x store to the gate.
+        let proj_dir = tmp.path().join("wiki").join("w").join("p");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(proj_dir.join("note.md"), "# Note\n\nlegacy body\n").unwrap();
+        // A DB carrying a sentinel row.
+        let db_path = tmp.path().join("db").join("memory.sqlite");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE snapshot_marker(v TEXT); INSERT INTO snapshot_marker VALUES('PRE');",
+            )
+            .unwrap();
+        }
+
+        let dest = TempDir::new().unwrap();
+        let receipt = snapshot_before_db_migration(tmp.path(), Some(dest.path()))
+            .unwrap()
+            .expect("a legacy store must be snapshotted");
+
+        // Mutate the on-disk DB AFTER the snapshot, as a schema migration would.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("UPDATE snapshot_marker SET v = 'POST'", [])
+                .unwrap();
+        }
+
+        // Extract the archive and read its DB: it must still say PRE.
+        let extract = TempDir::new().unwrap();
+        {
+            let file = std::fs::File::open(&receipt.archive_path).unwrap();
+            let dec = flate2::read::GzDecoder::new(file);
+            tar::Archive::new(dec).unpack(extract.path()).unwrap();
+        }
+        let archived_db = extract.path().join("db").join("memory.sqlite");
+        let conn = rusqlite::Connection::open(&archived_db).unwrap();
+        let marker: String = conn
+            .query_row("SELECT v FROM snapshot_marker", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            marker, "PRE",
+            "the archive captured the DB after a later mutation — the backup is not pre-migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_backs_up_a_legacy_store() {
+        let (tmp, _store, _ws, _proj) = legacy_store().await;
+        let dest = TempDir::new().unwrap();
+        let receipt = snapshot_before_db_migration(tmp.path(), Some(dest.path())).unwrap();
+        assert!(
+            receipt.is_some(),
+            "a legacy store must be snapshotted pre-open"
+        );
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 1);
+        assert!(crate::backup::BackupReceipt::load(tmp.path()).is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshot_skips_a_conformant_or_fresh_store() {
+        let tmp = TempDir::new().unwrap();
+        let _store = Store::open(tmp.path()).unwrap();
+        std::fs::create_dir_all(tmp.path().join("wiki")).unwrap();
+        let dest = TempDir::new().unwrap();
+        assert!(
+            snapshot_before_db_migration(tmp.path(), Some(dest.path()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
+    }
+
+    /// The pre-open snapshot and the OKF migration must not both archive: the
+    /// migration reuses the receipt the boot path already wrote.
+    #[tokio::test]
+    async fn okf_migration_reuses_the_pre_open_snapshot() {
+        let (tmp, store, _ws, _proj) = legacy_store().await;
+        let pre_dest = TempDir::new().unwrap();
+        let receipt = snapshot_before_db_migration(tmp.path(), Some(pre_dest.path()))
+            .unwrap()
+            .expect("legacy store snapshotted pre-open");
+        assert_eq!(std::fs::read_dir(pre_dest.path()).unwrap().count(), 1);
+
+        // A different dest: if the migration re-archived, an artifact would land
+        // here. It must reuse the pre-open one instead.
+        let okf_dest = TempDir::new().unwrap();
+        let migration = OkfConformance {
+            dest_override: Some(okf_dest.path().to_path_buf()),
+        };
+        migration
+            .up(&store.writer, &tmp.path().join("wiki"))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(okf_dest.path()).unwrap().count(),
+            0,
+            "the OKF migration took a second backup instead of reusing the pre-open one"
+        );
+        assert!(
+            receipt.archive_present(),
+            "the reused archive must still exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_idempotent_and_never_overwrites() {
+        let (tmp, _store, _ws, _proj) = legacy_store().await;
+        let dest = TempDir::new().unwrap();
+        assert!(
+            snapshot_before_db_migration(tmp.path(), Some(dest.path()))
+                .unwrap()
+                .is_some()
+        );
+        let after_first = std::fs::read_dir(dest.path()).unwrap().count();
+        assert!(
+            snapshot_before_db_migration(tmp.path(), Some(dest.path()))
+                .unwrap()
+                .is_none(),
+            "a second snapshot when a usable backup exists must be a no-op"
+        );
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), after_first);
     }
 
     /// The gate itself: when the backup cannot be written, the migration
