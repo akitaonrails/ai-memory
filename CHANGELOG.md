@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot.
 
 ### Added
+- `ai-memory bootstrap --resume` reuses the chunks an interrupted run already
+  completed instead of paying for their LLM calls again (#621). A multi-chunk
+  bootstrap holds every page in memory until one post-loop write, so a crash,
+  a server restart, or a chunk that fails past its retry budget discarded
+  every chunk paid for so far — on a nine-chunk run, up to eight LLM calls and
+  ~20 minutes, and the retry started from the first chunk. Each chunk's pages
+  are now recorded as they complete and cleared once the run writes, so the
+  wiki write stays atomic. Progress is keyed by a fingerprint of the pruned
+  source set plus the chunk budget: chunks are addressed by position and
+  sources are re-read from git and `docs/` at run time, so a new commit or a
+  different `--chunk-input-tokens` changes the hash and starts a fresh run
+  rather than resuming into a plan that has shifted underneath.
 - `ai-memory status` and the pre-migration backup log now report the data
   directory's **filesystem free space** (#629). The OKF-migration backup gate
   proves the archive is writable but said nothing about disk headroom — an

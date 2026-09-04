@@ -16,6 +16,7 @@ use rusqlite::Connection;
 
 mod api_credentials;
 mod auto_improve;
+mod bootstrap_progress;
 pub mod decay;
 mod error;
 mod fts_query;
@@ -42,6 +43,7 @@ pub use auto_improve::{
     OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
     StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
+pub use bootstrap_progress::{BootstrapChunkProgress, load_progress as load_bootstrap_progress};
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
     retention_score_with_breadth, salience_after_feedback,

@@ -139,6 +139,7 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
         "chunk_input_tokens": args.chunk_input_tokens,
         "dry_run": args.dry_run,
         "force": args.force,
+        "resume": args.resume,
     });
     let outcome: BootstrapOutcome = post_json(&ep, "/admin/bootstrap", &body).await?;
 

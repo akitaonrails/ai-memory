@@ -190,6 +190,24 @@ pub(crate) enum WriteCmd {
         job: SessionConsolidationJob,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    RecordBootstrapChunk {
+        fingerprint: String,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        chunk_index: u32,
+        pages_json: String,
+        rationale: String,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    ClearBootstrapProgress {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
+    PruneBootstrapProgress {
+        older_than: i64,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
@@ -1037,6 +1055,67 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ReleaseSessionConsolidation { job, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record one completed bootstrap chunk so a later `--resume` can skip it.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_bootstrap_chunk(
+        &self,
+        fingerprint: String,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        chunk_index: u32,
+        pages_json: String,
+        rationale: String,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordBootstrapChunk {
+            fingerprint,
+            workspace_id,
+            project_id,
+            chunk_index,
+            pages_json,
+            rationale,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Drop a project's recorded bootstrap progress. Returns rows removed.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn clear_bootstrap_progress(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClearBootstrapProgress {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Sweep bootstrap progress older than `older_than`. Returns rows removed.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn prune_bootstrap_progress(&self, older_than: i64) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PruneBootstrapProgress {
+            older_than,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -2631,6 +2710,39 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ReleaseSessionConsolidation { job, reply } => {
                 let result = crate::session_consolidation::release(&mut conn, &job);
                 send_or_warn(reply, result, "release_session_consolidation");
+            }
+            WriteCmd::RecordBootstrapChunk {
+                fingerprint,
+                workspace_id,
+                project_id,
+                chunk_index,
+                pages_json,
+                rationale,
+                reply,
+            } => {
+                let result = crate::bootstrap_progress::record_chunk(
+                    &mut conn,
+                    &fingerprint,
+                    workspace_id,
+                    project_id,
+                    chunk_index,
+                    &pages_json,
+                    &rationale,
+                );
+                send_or_warn(reply, result, "record_bootstrap_chunk");
+            }
+            WriteCmd::ClearBootstrapProgress {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result =
+                    crate::bootstrap_progress::clear_progress(&mut conn, workspace_id, project_id);
+                send_or_warn(reply, result, "clear_bootstrap_progress");
+            }
+            WriteCmd::PruneBootstrapProgress { older_than, reply } => {
+                let result = crate::bootstrap_progress::prune_stale(&mut conn, older_than);
+                send_or_warn(reply, result, "prune_bootstrap_progress");
             }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);

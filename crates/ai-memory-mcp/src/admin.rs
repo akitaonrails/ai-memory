@@ -218,6 +218,9 @@ struct BootstrapRequest {
     /// Allow re-bootstrap when `wiki/bootstrap.md` already exists.
     #[serde(default)]
     force: bool,
+    /// Reuse chunks an interrupted run recorded for the same sources.
+    #[serde(default)]
+    resume: bool,
 }
 
 fn default_max_input_tokens() -> usize {
@@ -1789,6 +1792,7 @@ async fn handle_bootstrap(
         since: None,
         dry_run: req.dry_run,
         force: req.force,
+        resume: req.resume,
     };
 
     let bootstrap = Bootstrap {

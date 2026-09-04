@@ -1989,7 +1989,22 @@ remote or uses a custom host/port.
 --exclude-code             (skip Rust module headers)
 --dry-run                  (collect + estimate but don't call LLM or write)
 --force                    (re-bootstrap, overwrites the prior manifest)
+--resume                   (reuse the chunks an interrupted run completed)
 ```
+
+**Resuming an interrupted run.** A chunked bootstrap keeps every generated
+page in memory until one write at the end, so a crash, a server restart, or a
+chunk that fails past its retry budget used to discard the LLM calls already
+paid for. Each chunk is now recorded as it completes; `--resume` reuses those
+and only pays for the chunks that never finished.
+
+Progress is only reused when the sources and the chunk budget are unchanged —
+chunks are addressed by position, and sources are re-read from git and `docs/`
+on each run, so a new commit or a different `--chunk-input-tokens` starts a
+fresh run instead of resuming into a plan that has shifted. There is no
+failure mode where the wrong pages are reused; the worst case is paying for
+the run again. `--resume` on a project with nothing recorded is a normal full
+run, so it is safe to pass by default on a retry.
 
 **Cost.** With Kimi 2.6 via OpenRouter ($0.73/$3.49 per M):
 - 50k input tokens cap → ~$0.04 worst case input

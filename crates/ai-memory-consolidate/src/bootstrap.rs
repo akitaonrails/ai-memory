@@ -40,6 +40,7 @@ use ai_memory_wiki::{Wiki, WritePageRequest};
 use jiff::Timestamp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -277,6 +278,11 @@ pub struct BootstrapConfig {
     pub dry_run: bool,
     /// Allow re-running even when `wiki/bootstrap.md` already exists.
     pub force: bool,
+    /// Reuse the chunks a previous interrupted run already completed, instead
+    /// of paying for their LLM calls again. Only progress recorded under the
+    /// same source/budget fingerprint is eligible; anything else is ignored and
+    /// the run starts from the first chunk.
+    pub resume: bool,
 }
 
 /// Bootstrap driver. Holds the LLM provider + wiki handle + reader
@@ -331,7 +337,176 @@ async fn complete_chunk_with_retry(
     }
 }
 
+/// One chunk a resume can adopt instead of paying for it again.
+struct ReusedChunk {
+    /// One-based position in the chunk plan.
+    index: u32,
+    /// The pages that chunk produced.
+    pages: Vec<BootstrapPage>,
+    /// The rationale it reported, replayed into the manifest.
+    rationale: String,
+}
+
+/// Select the chunks a resume may reuse: the contiguous run starting at 1.
+///
+/// Later chunks are dropped even when they were recorded. Page dedup is
+/// first-write-wins in chunk order ([`insert_bootstrap_page`]), so adopting
+/// chunk 6 before re-running chunk 5 would let the later chunk keep a path the
+/// earlier one owns — a resumed run would then produce different pages than a
+/// clean one. A row whose pages will not parse ends the prefix for the same
+/// reason.
+fn reusable_prefix(recorded: Vec<ai_memory_store::BootstrapChunkProgress>) -> Vec<ReusedChunk> {
+    let mut out = Vec::new();
+    for (expected, entry) in (1_u32..).zip(recorded) {
+        if entry.chunk_index != expected {
+            debug!(
+                gap_at = expected,
+                found = entry.chunk_index,
+                "bootstrap --resume stopping at the first missing chunk",
+            );
+            break;
+        }
+        match serde_json::from_str::<Vec<BootstrapPage>>(&entry.pages_json) {
+            Ok(pages) => out.push(ReusedChunk {
+                index: entry.chunk_index,
+                pages,
+                rationale: entry.rationale,
+            }),
+            Err(error) => {
+                warn!(
+                    chunk = entry.chunk_index,
+                    %error,
+                    "unreadable bootstrap progress; re-running from that chunk",
+                );
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Hash the inputs that determine the chunk plan, for keying resumable
+/// progress (#621).
+///
+/// Recorded progress is addressed by chunk *position*, and `collect_sources`
+/// re-reads git and `docs/` at run time — so a stored `chunk_index` only refers
+/// to the same material while the planner's inputs are unchanged. Hashing the
+/// pruned source set together with the chunk budget makes that precise: equal
+/// fingerprints guarantee `plan_bootstrap_chunks` produces the same chunks, so
+/// skipping by index is sound; a new commit, an edited doc, or a different
+/// `--chunk-input-tokens` all change the hash and force a fresh run rather than
+/// silently resuming into a plan that has shifted underneath.
+///
+/// Order is part of the hash because the planner is order-sensitive: the same
+/// sources arranged differently chunk differently.
+fn bootstrap_fingerprint(sources: &[BootstrapSource], chunk_budget: usize) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ai-memory bootstrap chunk plan v1\n");
+    hasher.update(chunk_budget.to_le_bytes());
+    hasher.update(
+        u64::try_from(sources.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for source in sources {
+        // Length-prefix every field so that no rearrangement of the bytes can
+        // produce a colliding digest for a different source set. The kind's
+        // serde name is its stable identity — `drop_priority` would collide the
+        // moment two kinds shared a priority.
+        let kind = serde_json::to_string(&source.kind).unwrap_or_default();
+        hasher.update(u64::try_from(kind.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(kind.as_bytes());
+        hasher.update(
+            u64::try_from(source.label.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(source.label.as_bytes());
+        hasher.update(
+            u64::try_from(source.text.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(source.text.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 impl Bootstrap {
+    /// Read back the chunks a previous run recorded under this fingerprint.
+    ///
+    /// A store error here is not fatal to the run: the worst case is that the
+    /// chunks are processed again, which is exactly what would have happened
+    /// without `--resume`. Refusing to start because the optimisation is
+    /// unavailable would be the wrong trade.
+    async fn load_recorded_chunks(
+        &self,
+        fingerprint: &str,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> Result<Vec<ai_memory_store::BootstrapChunkProgress>, BootstrapError> {
+        let fingerprint = fingerprint.to_string();
+        let loaded = self
+            .reader
+            .with_conn(move |conn| {
+                ai_memory_store::load_bootstrap_progress(
+                    conn,
+                    &fingerprint,
+                    workspace_id,
+                    project_id,
+                )
+            })
+            .await;
+        match loaded {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                warn!(%error, "could not read bootstrap progress; running every chunk");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Persist one completed chunk so a later `--resume` can skip it.
+    ///
+    /// Recorded unconditionally, not only under `--resume`: a run cannot know
+    /// it is about to fail, so the progress has to already be there when the
+    /// next one asks for it. The cost is one small row per chunk, cleared when
+    /// the run writes its pages.
+    ///
+    /// Failing to record is logged and swallowed. The chunk itself succeeded,
+    /// and the only consequence is that a later resume pays for it again —
+    /// which is strictly better than discarding a run over bookkeeping.
+    async fn record_chunk_progress(
+        &self,
+        fingerprint: &str,
+        cfg: &BootstrapConfig,
+        chunk_no: u32,
+        batch: &BootstrapBatch,
+    ) {
+        let pages_json = match serde_json::to_string(&batch.pages) {
+            Ok(json) => json,
+            Err(error) => {
+                warn!(chunk = chunk_no, %error, "could not serialise chunk pages for resume");
+                return;
+            }
+        };
+        if let Err(error) = self
+            .wiki
+            .writer()
+            .record_bootstrap_chunk(
+                fingerprint.to_string(),
+                cfg.workspace_id,
+                cfg.project_id,
+                chunk_no,
+                pages_json,
+                batch.rationale.clone(),
+            )
+            .await
+        {
+            warn!(chunk = chunk_no, %error, "could not record bootstrap progress");
+        }
+    }
+
     /// Process pre-collected sources end-to-end: prune to budget,
     /// call the LLM, write pages, return the outcome. Server-side
     /// entry point — does NOT collect from disk.
@@ -398,6 +573,10 @@ impl Bootstrap {
         }
 
         // ---- LLM call(s) — chunked when over chunk_input_tokens ----
+        // Fingerprint before `kept` is consumed by the planner: it is the
+        // planner's own input, and it is what makes a stored chunk position
+        // meaningful on a later run.
+        let fingerprint = bootstrap_fingerprint(&kept, chunk_budget);
         let chunks = plan_bootstrap_chunks(kept, chunk_budget);
         let llm_chunks = chunks.len();
         info!(llm_chunks, chunk_budget, "bootstrap LLM chunk plan",);
@@ -405,7 +584,42 @@ impl Bootstrap {
         let mut pages_by_path = std::collections::BTreeMap::new();
         let mut rationales = Vec::with_capacity(llm_chunks);
 
+        // ---- resume: adopt whatever a previous run already paid for -------
+        let mut done: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
+        if cfg.resume {
+            let recorded = self
+                .load_recorded_chunks(&fingerprint, cfg.workspace_id, cfg.project_id)
+                .await?;
+            for reused in reusable_prefix(recorded) {
+                for page in reused.pages {
+                    insert_bootstrap_page(
+                        &mut pages_by_path,
+                        page,
+                        usize::try_from(reused.index).unwrap_or(usize::MAX),
+                    );
+                }
+                done.insert(reused.index, reused.rationale);
+            }
+            if done.is_empty() {
+                info!(
+                    "bootstrap --resume found no reusable progress for these sources; \
+                     starting from the first chunk",
+                );
+            } else {
+                info!(
+                    reused = done.len(),
+                    total = llm_chunks,
+                    "bootstrap --resume reusing completed chunks",
+                );
+            }
+        }
+
         for (idx, chunk) in chunks.iter().enumerate() {
+            let chunk_no = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+            if let Some(rationale) = done.get(&chunk_no) {
+                rationales.push(rationale.clone());
+                continue;
+            }
             let mut prior: Vec<String> = pages_by_path.keys().cloned().collect();
             prior.sort_unstable();
             let prior_refs: Vec<&str> = prior.iter().map(String::as_str).collect();
@@ -422,6 +636,10 @@ impl Bootstrap {
             );
             let batch: BootstrapBatch =
                 complete_chunk_with_retry(&*self.llm, request, BOOTSTRAP_CHUNK_RETRY_DELAY).await?;
+            // Record before merging: this chunk's own pages are what a resume
+            // needs, and `pages_by_path` has already absorbed the earlier ones.
+            self.record_chunk_progress(&fingerprint, cfg, chunk_no, &batch)
+                .await;
             rationales.push(batch.rationale);
             for page in batch.pages {
                 insert_bootstrap_page(&mut pages_by_path, page, idx + 1);
@@ -500,6 +718,18 @@ impl Bootstrap {
             "bootstrap: {llm_chunks} LLM chunk(s), ingested {collected} sources, wrote {} pages",
             written_paths.len() + 1,
         ));
+
+        // The pages are on disk, so the progress rows have nothing left to
+        // protect. Clearing by project also collects rows from earlier
+        // abandoned attempts whose fingerprints no longer match.
+        if let Err(error) = self
+            .wiki
+            .writer()
+            .clear_bootstrap_progress(cfg.workspace_id, cfg.project_id)
+            .await
+        {
+            warn!(%error, "could not clear bootstrap progress after a completed run");
+        }
 
         // Manifest is the last entry but conceptually first; list it.
         let mut out_paths = written_paths.clone();
@@ -1467,6 +1697,175 @@ mod tests {
             1,
             "a deterministic error must fail on the first call, no retries"
         );
+    }
+
+    fn src(kind: SourceKind, label: &str, text: &str) -> BootstrapSource {
+        BootstrapSource {
+            kind,
+            label: label.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    fn sample_sources() -> Vec<BootstrapSource> {
+        vec![
+            src(SourceKind::Readme, "README", "hello"),
+            src(SourceKind::DocFile, "docs/a.md", "world"),
+        ]
+    }
+
+    #[test]
+    fn fingerprint_is_stable_for_identical_inputs() {
+        // The whole resume guarantee rests on this: same sources and budget
+        // must produce the same key, or a resume can never match.
+        assert_eq!(
+            bootstrap_fingerprint(&sample_sources(), 24_000),
+            bootstrap_fingerprint(&sample_sources(), 24_000),
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_with_the_chunk_budget() {
+        // A different budget re-chunks the same sources, so stored chunk
+        // positions no longer refer to the same material.
+        assert_ne!(
+            bootstrap_fingerprint(&sample_sources(), 24_000),
+            bootstrap_fingerprint(&sample_sources(), 12_000),
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_source_changes() {
+        let mut edited = sample_sources();
+        edited[1].text = "world!".to_string();
+        assert_ne!(
+            bootstrap_fingerprint(&sample_sources(), 24_000),
+            bootstrap_fingerprint(&edited, 24_000),
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_source_is_added() {
+        let mut extra = sample_sources();
+        extra.push(src(SourceKind::GitCommit, "git: feat", "a commit"));
+        assert_ne!(
+            bootstrap_fingerprint(&sample_sources(), 24_000),
+            bootstrap_fingerprint(&extra, 24_000),
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_when_sources_are_reordered() {
+        // `plan_bootstrap_chunks` is order-sensitive, so the same sources in a
+        // different order are a different plan — and must not resume into one
+        // another.
+        let mut swapped = sample_sources();
+        swapped.reverse();
+        assert_ne!(
+            bootstrap_fingerprint(&sample_sources(), 24_000),
+            bootstrap_fingerprint(&swapped, 24_000),
+        );
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_kind_from_identical_text() {
+        // Length-prefixing keeps a label/text boundary from being ambiguous,
+        // and the kind is part of the identity even when the text matches.
+        let a = vec![src(SourceKind::Readme, "x", "same")];
+        let b = vec![src(SourceKind::DocFile, "x", "same")];
+        assert_ne!(
+            bootstrap_fingerprint(&a, 24_000),
+            bootstrap_fingerprint(&b, 24_000),
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_not_confused_by_shifting_a_field_boundary() {
+        // Without length prefixes, ("ab","c") and ("a","bc") would hash the
+        // same. This is the concatenation ambiguity the prefixes exist to stop.
+        let a = vec![src(SourceKind::Readme, "ab", "c")];
+        let b = vec![src(SourceKind::Readme, "a", "bc")];
+        assert_ne!(
+            bootstrap_fingerprint(&a, 24_000),
+            bootstrap_fingerprint(&b, 24_000),
+        );
+    }
+
+    fn progress(idx: u32, pages_json: &str) -> ai_memory_store::BootstrapChunkProgress {
+        ai_memory_store::BootstrapChunkProgress {
+            chunk_index: idx,
+            pages_json: pages_json.to_string(),
+            rationale: format!("chunk {idx}"),
+        }
+    }
+
+    const ONE_PAGE: &str = r#"[{"path":"a.md","title":"A","tags":[],"body_markdown":"x"}]"#;
+
+    #[test]
+    fn reusable_prefix_takes_a_complete_run_of_chunks() {
+        let taken = reusable_prefix(vec![
+            progress(1, ONE_PAGE),
+            progress(2, "[]"),
+            progress(3, "[]"),
+        ]);
+        assert_eq!(
+            taken.iter().map(|c| c.index).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn reusable_prefix_stops_at_the_first_gap() {
+        // The interrupted run failed on chunk 3 but had already recorded 4 and
+        // 5. Reusing those would let a later chunk win a page path that chunk 3
+        // owns, so a resumed run would differ from a clean one.
+        let taken = reusable_prefix(vec![
+            progress(1, "[]"),
+            progress(2, "[]"),
+            progress(4, "[]"),
+            progress(5, "[]"),
+        ]);
+        assert_eq!(
+            taken.iter().map(|c| c.index).collect::<Vec<_>>(),
+            vec![1, 2],
+            "everything from the gap onward must be re-run"
+        );
+    }
+
+    #[test]
+    fn reusable_prefix_is_empty_when_the_first_chunk_is_missing() {
+        let taken = reusable_prefix(vec![progress(2, "[]"), progress(3, "[]")]);
+        assert!(
+            taken.is_empty(),
+            "without chunk 1 there is no prefix to build on"
+        );
+    }
+
+    #[test]
+    fn reusable_prefix_stops_at_unreadable_pages() {
+        // Corrupt JSON ends the prefix rather than failing the run: the chunk
+        // is regenerable, and refusing here would strand a resume on data we
+        // can simply pay for again.
+        let taken = reusable_prefix(vec![
+            progress(1, "[]"),
+            progress(2, "{not json"),
+            progress(3, "[]"),
+        ]);
+        assert_eq!(taken.iter().map(|c| c.index).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn reusable_prefix_carries_pages_and_rationale() {
+        let taken = reusable_prefix(vec![progress(1, ONE_PAGE)]);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].pages.len(), 1);
+        assert_eq!(taken[0].pages[0].path, "a.md");
+        assert_eq!(taken[0].rationale, "chunk 1");
+    }
+
+    #[test]
+    fn reusable_prefix_of_nothing_is_nothing() {
+        assert!(reusable_prefix(Vec::new()).is_empty());
     }
 
     fn make_repo(tmp: &Path) -> Result<(), Box<dyn std::error::Error>> {

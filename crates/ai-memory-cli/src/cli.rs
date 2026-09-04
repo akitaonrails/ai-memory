@@ -1144,6 +1144,12 @@ pub struct BootstrapArgs {
     /// the same project (the manifest is `wiki/bootstrap.md`).
     #[arg(long)]
     pub force: bool,
+    /// Reuse the chunks an interrupted run already completed instead of
+    /// paying for their LLM calls again. Progress is only reused when the
+    /// sources and chunk budget are unchanged; otherwise the run starts
+    /// over on its own.
+    #[arg(long)]
+    pub resume: bool,
 }
 
 /// Arguments for `setup-agent`.
