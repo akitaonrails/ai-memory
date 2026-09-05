@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `ai-memory reindex` now names the exact missing or unreadable scope
+  `_meta.md` path instead of collapsing the filesystem error to a bare `No such
+  file or directory (os error 2)`. This makes the existing startup-backfill
+  workaround discoverable when a scope was first created during the server's
+  last run. (#643)
+
 ## [2.0.3] - 2026-09-04
 
 ### Changed

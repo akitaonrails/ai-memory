@@ -1351,14 +1351,29 @@ impl Wiki {
     /// Read a `_meta.md` scope-manifest's frontmatter from `dir`.
     fn read_scope_meta(dir: &Path) -> WikiResult<serde_json::Value> {
         let path = dir.join("_meta.md");
-        let meta = std::fs::symlink_metadata(&path)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|error| {
+            let message = if error.kind() == std::io::ErrorKind::NotFound {
+                format!("scope manifest {} is missing", path.display())
+            } else {
+                format!(
+                    "could not inspect scope manifest {}: {error}",
+                    path.display()
+                )
+            };
+            WikiError::Io(std::io::Error::new(error.kind(), message))
+        })?;
         if meta.file_type().is_symlink() {
             return Err(WikiError::Io(std::io::Error::other(format!(
                 "refusing to read symlinked scope manifest {}",
                 path.display()
             ))));
         }
-        let raw = std::fs::read_to_string(path)?;
+        let raw = std::fs::read_to_string(&path).map_err(|error| {
+            WikiError::Io(std::io::Error::new(
+                error.kind(),
+                format!("could not read scope manifest {}: {error}", path.display()),
+            ))
+        })?;
         Ok(parse(&raw)?.frontmatter)
     }
 
@@ -4402,6 +4417,50 @@ mod tests {
         assert_eq!(wiki.backfill_scope_manifests().await.unwrap(), 1);
         let healed = std::fs::read_to_string(&meta_path).unwrap();
         assert!(healed.contains("type: Scope Manifest"), "{healed}");
+    }
+
+    #[tokio::test]
+    async fn reindex_names_a_missing_workspace_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let missing = ws_dir.join("_meta.md");
+        std::fs::create_dir_all(ws_dir.join(proj.to_string())).unwrap();
+
+        let err = wiki.reindex_all().await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!("scope manifest {} is missing", missing.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_names_a_missing_project_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let proj_dir = ws_dir.join(proj.to_string());
+        let missing = proj_dir.join("_meta.md");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(
+            ws_dir.join("_meta.md"),
+            "---\nworkspace: acme\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+
+        let err = wiki.reindex_all().await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!("scope manifest {} is missing", missing.display())
+        );
     }
 
     #[cfg(any(unix, windows))]
