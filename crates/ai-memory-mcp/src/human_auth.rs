@@ -119,11 +119,10 @@ impl Cidr {
     }
 }
 
-/// Bounded per-IP and per-username login attempt windows.
+/// Bounded per-IP login attempt windows.
 #[derive(Debug, Default)]
 pub struct LoginLimiter {
     ip: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
-    user: Mutex<HashMap<[u8; 32], VecDeque<Instant>>>,
 }
 
 impl LoginLimiter {
@@ -181,14 +180,6 @@ impl LoginLimiter {
         let now = Instant::now();
         let mut map = self.ip.lock().unwrap_or_else(|e| e.into_inner());
         Self::record_failure(&mut map, ip, now);
-    }
-
-    /// Record a username failure in a fixed-size, bounded key space.
-    pub fn record_username_failure(&self, username: &str) {
-        let now = Instant::now();
-        let key = hash_session_secret(username);
-        let mut map = self.user.lock().unwrap_or_else(|e| e.into_inner());
-        Self::record_failure(&mut map, key, now);
     }
 }
 
@@ -559,12 +550,7 @@ async fn issue_cookies(
     Ok((secret, csrf, issued.expires_at))
 }
 
-async fn dummy_login_failure(
-    runtime: &HumanAuthRuntime,
-    ip: IpAddr,
-    username: &str,
-    password: String,
-) -> Response {
+async fn dummy_login_failure(runtime: &HumanAuthRuntime, ip: IpAddr, password: String) -> Response {
     match ai_memory_store::password::dummy_verify(password).await {
         Err(ai_memory_store::StoreError::InvalidState(msg)) if msg.contains("saturated") => {
             json_err(StatusCode::TOO_MANY_REQUESTS, "kdf saturated")
@@ -578,7 +564,6 @@ async fn dummy_login_failure(
         }
         Ok(()) => {
             runtime.limiter.record_ip_failure(ip);
-            runtime.limiter.record_username_failure(username);
             json_err(StatusCode::UNAUTHORIZED, "invalid credentials")
         }
     }
@@ -617,18 +602,17 @@ async fn handle_login(
 
     let fail = || {
         runtime.limiter.record_ip_failure(ip);
-        runtime.limiter.record_username_failure(&username);
         json_err(StatusCode::UNAUTHORIZED, "invalid credentials")
     };
 
     let Some(login) = login else {
-        return dummy_login_failure(runtime, ip, &username, password).await;
+        return dummy_login_failure(runtime, ip, password).await;
     };
     if login.user.disabled_at.is_some() {
-        return dummy_login_failure(runtime, ip, &username, password).await;
+        return dummy_login_failure(runtime, ip, password).await;
     }
     let Some(phc) = login.password_hash.clone() else {
-        return dummy_login_failure(runtime, ip, &username, password).await;
+        return dummy_login_failure(runtime, ip, password).await;
     };
     let ok = match ai_memory_store::password::verify_password(password, phc.clone()).await {
         Ok(v) => v,
@@ -1239,13 +1223,9 @@ mod tests {
         let limiter = LoginLimiter::default();
         for n in 0..(LOGIN_LIMITER_MAX_KEYS + 50) {
             limiter.record_ip_failure(IpAddr::V6(std::net::Ipv6Addr::from(n as u128)));
-            limiter.record_username_failure(&format!("attacker-controlled-{n}"));
         }
         assert!(
             limiter.ip.lock().unwrap_or_else(|e| e.into_inner()).len() <= LOGIN_LIMITER_MAX_KEYS
-        );
-        assert!(
-            limiter.user.lock().unwrap_or_else(|e| e.into_inner()).len() <= LOGIN_LIMITER_MAX_KEYS
         );
     }
 
