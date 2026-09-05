@@ -13,21 +13,20 @@
 //! both versions survive), then purge the source — there the episodic rows
 //! (sessions/observations/handoffs) are dropped by the purge.
 
+use super::common::post;
 use ai_memory_core::{AgentKind, PagePath, Sanitized, Sanitizer, Tier};
-use ai_memory_mcp::{AdminState, admin_router};
+use ai_memory_mcp::AdminState;
 use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
 use ai_memory_wiki::{
     AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig, Wiki, WritePageRequest,
 };
-use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post as axum_post;
 use axum::{Json, Router};
 use serde_json::json;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -99,17 +98,6 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
-}
-
-async fn post(state: AdminState, uri: &str, body: serde_json::Value) -> axum::response::Response {
-    let router = admin_router(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    router.oneshot(req).await.unwrap()
 }
 
 /// Seed `<ws>/<project>/<path>` with one page carrying `body`.

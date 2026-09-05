@@ -38,7 +38,7 @@ for command in cargo curl diff git jq script sqlite3; do
 done
 
 if [ ! -x "$BIN" ] || [ "${AI_MEMORY_ACCEPTANCE_REBUILD:-1}" = 1 ]; then
-  (cd "$ROOT" && TAILWIND_SKIP=1 cargo build -p ai-memory-cli)
+  (cd "$ROOT" && cargo build -p ai-memory-cli)
 fi
 
 mkdir -p "$DATA" "$REPO" "$CONFIG" "$LOGS"

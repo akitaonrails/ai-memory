@@ -61,6 +61,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header names only. ([#606])
 
 ### Changed
+- The build is self-contained on every platform: the vendored web stylesheet
+  is now the default and `TAILWIND_BUILD=1 cargo build -p ai-memory-web`
+  regenerates it, so no command needs `TAILWIND_SKIP=1` any more. CI
+  regenerates the bundle on Linux and fails if the committed
+  `static/tailwind.css` is stale, a check that did not exist before.
+- Developer loop: `cargo t` (everyday, skips `slow`/`stress` modules) and
+  `cargo tf` (everything) aliases over cargo-nextest, integration tests that
+  compile into each crate's own test harness from `tests/suite/` (78 test
+  binaries down to 11 in the everyday loop; only the CLI keeps a separate one,
+  and the evals harness builds only under `--workspace`), a dev profile that
+  keeps only line tables, and an opt-in pre-push hook that runs the full tier.
+  `bin/release` and the documented gate also run `git diff --check`. Measured:
+  workspace edit-to-result ~380s to ~150s on macOS; the warm everyday test run
+  28s to 19s on a 32-thread Windows box.
+
+### Fixed
+- Authentication-disabled HTTP servers now ignore stale or unexpected Bearer
+  headers and preserve anonymous access. Previously, a client retaining an old
+  `AI_MEMORY_AUTH_TOKEN` received `401 Unauthorized` even though the server
+  reported `auth=false`; invalid Bearers remain rejected whenever static or
+  human authentication is enabled. (#639)
+- Cursor sessions no longer land in the default `default/scratch` bucket.
+  Cursor sends the workspace directory only as `workspace_roots` — its
+  `sessionStart` / `sessionEnd` payloads carry no `cwd` key at all, and its
+  tool events send `cwd: ""` — so cwd resolution produced nothing and the
+  server fell back to its default project for every Cursor event. Both the
+  native `ai-memory hook` path and the POSIX/PowerShell hook scripts now read
+  `workspace_roots` (alongside Antigravity's `workspacePaths`) and treat an
+  empty `cwd` as absent rather than as an answer.
+- Cursor sessions are no longer attributed to `claude-code`. The Cursor CLI
+  also runs the hook commands declared in Claude Code's
+  `~/.claude/settings.json`, which `install-hooks --agent claude-code`
+  hardcoded to `--agent claude-code`, so a Cursor-driven session was stored
+  with `agent_kind = claude-code`. Hook payloads carrying Cursor's
+  `cursor_version` marker are now attributed to `cursor` regardless of the
+  `?agent=` the hook command declared.
+- A project that first materializes while the server is running is now
+  self-describing immediately, instead of only after the next startup
+  backfill (#643). Scope manifests (`_meta.md`) were written at startup and on
+  the rename/move admin paths, so a session in a checkout the server had not
+  seen before produced a scope directory with pages but no manifest. Stop the
+  server in that window and `reindex` could not rebuild that tree — the one
+  situation where an operator most needs the rebuild to work. The manifest is
+  now written with the scope's first page, one store lookup per scope per
+  process, byte-identical to what the backfill writes so restarts still do not
+  churn the wiki's git history. The startup backfill is unchanged and remains
+  the repair path for trees written by older releases.
+- `ai-memory reindex` now names the exact missing or unreadable scope
+  `_meta.md` path instead of collapsing the filesystem error to a bare `No such
+  file or directory (os error 2)`. This makes the existing startup-backfill
+  workaround discoverable when a scope was first created during the server's
+  last run. (#643)
+- Generated routing instructions and all project-scoped managed Agent Skills now
+  distinguish session-aware MCP clients from static clients. Static clients are
+  told to pass exact `workspace` + `project` values from `.ai-memory.toml` or
+  operator configuration on every project-scoped call, preventing another
+  session's last active project from capturing reads or writes; global searches
+  and global preference writes retain their scope-free argument rules (#372).
+- Consolidation prompt assembly no longer re-renders the whole observation
+  projection and re-scores every observation after each pruned one. With a few
+  hundred long observations the quadratic loop cost ~14s per prompt; pruning
+  now works from per-observation scores and block sizes computed once, with
+  byte-identical output.
+
+## [2.0.3] - 2026-09-04
+
+### Changed
 - Every LLM chat request now sends `User-Agent: ai-memory/<version>`.
   `reqwest` sends no user agent unless one is configured, so provider
   requests previously arrived anonymous, and gateways that require callers to

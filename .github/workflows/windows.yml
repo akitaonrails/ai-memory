@@ -14,23 +14,20 @@ name: windows
 # `continue-on-error` and therefore blocked nothing. Linux and macOS are
 # the priority platforms and now set the pull-request feedback time.
 #
-# Moving it here makes the coverage *stronger*, not weaker:
+# Keeping it separate preserves deliberate Windows coverage without adding it
+# to every merge:
 #
-#   * it runs on every push to `main`, so every merge is checked;
-#   * it no longer carries `continue-on-error`, so a real Windows break is
-#     a red run instead of a yellow one nobody reads. It cannot block a
-#     Linux/macOS merge from here, which was the original reason for the
-#     override;
 #   * a nightly run catches toolchain and dependency drift that no code
 #     change would trigger;
 #   * `workflow_dispatch` and the `windows` label give a pull request that
 #     touches platform-sensitive code — path handling, file locking, git
-#     plumbing — a way to opt in *before* merging.
+#     plumbing — a way to opt in before merging;
+#   * the job no longer carries `continue-on-error`, so failures in those
+#     scheduled, labelled, and manual runs are red rather than advisory.
 #
 # If you are changing any of those areas, add the `windows` label to the
-# pull request rather than finding out after the merge.
-# During feature iteration this workflow no longer runs on every push to
-# main: fast Linux CI gates each merge, and the full Windows suite runs
+# pull request. During feature iteration this workflow does not run on pushes
+# to main: fast Linux CI gates each merge, and the full Windows suite runs
 # nightly, on demand, and MANDATORILY right before a release (dispatch it
 # on the release-candidate SHA and wait for green — see AGENTS.md).
 on:
@@ -58,8 +55,8 @@ env:
 jobs:
   test:
     name: test (windows-latest)
-    # On a pull request, only when explicitly opted in. Pushes to main,
-    # the schedule, and manual dispatch always run.
+    # On a pull request, only when explicitly opted in. The schedule and
+    # manual dispatch always run.
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'windows')
@@ -69,5 +66,3 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo test --workspace --all-targets
-        env:
-          TAILWIND_SKIP: "1"

@@ -94,7 +94,7 @@ fn powershell_hook_posts_json_as_utf8_bytes() {
         ". '{script}'; function Read-AiMemoryStdin {{ $env:AI_MEMORY_TEST_PAYLOAD }}; \
          Invoke-AiMemoryHook -Event 'user-prompt' -Agent 'codex'"
     );
-    let output = Command::new("powershell.exe")
+    let output = Command::new(ai_memory_test_support::powershell_exe())
         .args([
             "-NoLogo",
             "-NoProfile",

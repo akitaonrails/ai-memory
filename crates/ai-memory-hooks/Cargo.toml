@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Hook payload schemas, sanitisation, and HTTP ingress for agent lifecycle hooks."
+# One integration-test binary instead of one per file. Each binary
+# statically links the whole dep graph and gets scanned by macOS on
+# first run.
 
 [dependencies]
 ai-memory-core.workspace = true
@@ -27,6 +30,7 @@ axum.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+ai-memory-test-support.workspace = true
 tempfile.workspace = true
 git2.workspace = true
 ai-memory-llm.workspace = true

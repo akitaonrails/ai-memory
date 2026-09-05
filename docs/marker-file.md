@@ -21,6 +21,14 @@ for the cases this marker file is built for:
 The marker file lets you declare these mappings without forking
 ai-memory or running CLI commands per directory.
 
+Static MCP clients also use the marker as the repository-owned source for
+explicit scope arguments. For safe concurrent use, declare both `workspace` and
+`project`: managed routing tells static clients to pass that pair on every
+project-scoped tool call because they cannot attach the real lifecycle-hook
+session id. If either value is absent, the agent must obtain it from the operator
+or server configuration rather than guessing from the checkout directory.
+Session-aware bridges keep automatic current-project routing.
+
 ## Where to put it
 
 `.ai-memory.toml` in **any allowed ancestor** of your `cwd`. Lifecycle hooks

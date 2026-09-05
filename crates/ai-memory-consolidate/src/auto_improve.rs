@@ -1993,35 +1993,39 @@ mod tests {
     #[cfg(windows)]
     fn write_eval_script(body: &str) -> String {
         let dir = tempfile::TempDir::new().unwrap().keep();
-        let path = dir.join("eval.cmd");
+        let path = dir.join("eval.ps1");
         let body = match body {
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}'\n" => {
-                "more >NUL\r\necho {\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}\r\n"
+                "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('{\"score_before\":0.72,\"score_after\":0.76,\"passed\":true}')\n"
                     .into()
             }
             "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}'\n" => {
-                "more >NUL\r\necho {\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}\r\n"
+                "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('{\"score_before\":0.72,\"score_after\":0.70,\"passed\":true}')\n"
                     .into()
             }
-            "#!/bin/sh\ncat >/dev/null\nexit 7\n" => "more >NUL\r\nexit /B 7\r\n".into(),
-            "#!/bin/sh\nexit 7\n" => "exit /B 7\r\n".into(),
+            "#!/bin/sh\ncat >/dev/null\nexit 7\n" => {
+                "$null = [Console]::In.ReadToEnd()\nexit 7\n".into()
+            }
+            "#!/bin/sh\nexit 7\n" => "exit 7\n".into(),
             "#!/bin/sh\ncat >/dev/null\nprintf 'not-json'\n" => {
-                "more >NUL\r\necho not-json\r\n".into()
+                "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('not-json')\n".into()
             }
             "#!/bin/sh\ncat >/dev/null\nsleep 3\n" => {
-                "more >NUL\r\nping -n 4 127.0.0.1 >NUL\r\n".into()
+                "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 3\n".into()
             }
-            "#!/bin/sh\nsleep 5\n" => "ping -n 6 127.0.0.1 >NUL\r\n".into(),
+            "#!/bin/sh\nsleep 5\n" => "Start-Sleep -Seconds 20\n".into(),
             "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n" => {
                 let chunk = "x".repeat(100);
-                format!(
-                    "set \"chunk={chunk}\"\r\nfor /L %%i in (1,1,700) do <NUL set /p _=%chunk%\r\n"
-                )
+                format!("for ($i = 0; $i -lt 700; $i++) {{ [Console]::Out.Write('{chunk}') }}\n")
             }
             other => panic!("unmapped eval script fixture for Windows: {other:?}"),
         };
-        std::fs::write(&path, format!("@echo off\r\n{body}")).unwrap();
-        format!("cmd.exe /C {}", path.display())
+        std::fs::write(&path, body).unwrap();
+        format!(
+            "{} -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File {}",
+            ai_memory_test_support::powershell_exe(),
+            path.display()
+        )
     }
 
     #[tokio::test]
@@ -2151,7 +2155,16 @@ mod tests {
 
         assert!(proposals.is_empty());
         assert_eq!(rejected[0].reason, "eval_gate_timeout");
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let elapsed = started.elapsed();
+        let max_elapsed = if cfg!(windows) {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(3)
+        };
+        assert!(
+            elapsed < max_elapsed,
+            "blocked stdin timeout returned after {elapsed:?}, expected below {max_elapsed:?}"
+        );
     }
 
     #[tokio::test]

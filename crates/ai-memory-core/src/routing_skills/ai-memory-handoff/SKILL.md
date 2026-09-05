@@ -18,7 +18,7 @@ Use this skill for single-use cross-session handoffs. Handoffs are for the next 
 
 The SessionStart hook usually fetches and consumes any pending handoff before the agent sees its first prompt. If the current context already contains a pending handoff block, answer from that block directly. Do not call the accept tool again to find it in another project, because handoffs are single-use and the tool will normally return null after SessionStart consumed it.
 
-If no pending handoff block is visible and the user asks where we left off, then use the accept tool. Keep the default current-project scope unless the user explicitly names a sibling workspace and project.
+If no pending handoff block is visible and the user asks where we left off, then use the accept tool with the client-aware project scope below.
 
 ## Creating a handoff
 
@@ -34,6 +34,11 @@ Cancel only when the user asks to discard a handoff or you created one by mistak
 
 Accept and cancel normally act only on the caller's own plus shared handoffs. `any_owner: true` is a root-only recovery action over another operator's context; use it only on an explicit user request.
 
-## Scope default
+## Project scope
 
-Default to the current project. Pass workspace and project together only when the user names a different project. Never pass scope arguments just because the user says this project, here, we, or our work.
+Choose scope from the MCP client's identity support:
+
+- **Session-aware MCP clients** that forward the real lifecycle-hook session id on every request should use automatic current-project routing. Omit `workspace`, `project`, and `cwd` for the current repository; pass explicit scope only when the user names a different project.
+- **Static MCP clients** (including clients with lifecycle hooks but no bridge connecting that hook session id to MCP requests) must pass `workspace` and `project` together on every project-scoped call, including requests about this project, here, or our work. Read the exact names from the nearest `.ai-memory.toml` when it declares both. If it does not, obtain the names from the operator or server configuration; never guess them from a directory name and never rely on the server's last active project.
+
+This rule applies only to project-scoped calls. For cross-project retrieval, `global=true` must omit `workspace`, `project`, and `scopes`. For a standing preference written with `scope: "global"`, omit `workspace` and `project`.

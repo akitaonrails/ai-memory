@@ -58,11 +58,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      # On macOS, rustls-tls-native-roots otherwise enumerates Keychain every
+      # time a test process builds a reqwest client. Scope the PEM-bundle
+      # shortcut to macOS CI instead of setting a repo-wide Cargo env var that
+      # breaks other local platforms.
+      - name: Use macOS PEM bundle
+        if: matrix.os == 'macos-latest'
+        run: echo "SSL_CERT_FILE=/etc/ssl/cert.pem" >> "$GITHUB_ENV"
+      # Linux regenerates the web stylesheet from source, so a stale vendored
+      # static/tailwind.css fails here instead of shipping.
+      - name: Regenerate the Tailwind bundle
+        if: matrix.os == 'ubuntu-latest'
+        run: echo "TAILWIND_BUILD=1" >> "$GITHUB_ENV"
       - run: cargo test --workspace --all-targets
+      - name: Vendored tailwind.css is current
+        if: matrix.os == 'ubuntu-latest'
+        run: git diff --exit-code -- crates/ai-memory-web/static/tailwind.css
 
   # Native Windows coverage lives in `.github/workflows/windows.yml`: it
-  # runs on every push to main, nightly, on demand, and on any pull request
-  # carrying the `windows` label. It was ~1000s here against ~250s for the
+  # runs nightly, on demand, and on any pull request carrying the `windows`
+  # label. It was ~1000s here against ~250s for the
   # same tests on Linux, which meant every pull request waited roughly
   # seventeen minutes when every gating job below finishes in about eight —
   # and it was `continue-on-error`, so those extra minutes gated nothing.
@@ -113,9 +128,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-      - env:
-          TAILWIND_SKIP: "1"
-        run: cargo build --release --bin ai-memory
+      - run: cargo build --release --bin ai-memory
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-ai-memory-${{ matrix.artifact }}
@@ -134,8 +147,6 @@ jobs:
           toolchain: "1.95"
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Install with a fresh dependency resolution
-        env:
-          TAILWIND_SKIP: "1"
         run: cargo install --path crates/ai-memory-cli --debug --root target/source-install
       - name: Smoke test installed binary
         run: target/source-install/bin/ai-memory --version

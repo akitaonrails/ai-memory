@@ -24,7 +24,7 @@ fn run_hook_full(data_dir: &Path, event: &str, payload: &[u8], capture_assistant
         "--agent".to_string(),
         "claude-code".to_string(),
         "--server-url".to_string(),
-        "http://127.0.0.1:1".to_string(),
+        ai_memory_test_support::dead_http_endpoint(),
     ];
     if capture_assistant {
         args.push("--capture-assistant".to_string());

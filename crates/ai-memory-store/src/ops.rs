@@ -5069,6 +5069,13 @@ pub(crate) mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.sqlite");
         let mut conn = Connection::open(&db_path).unwrap();
+        // A fixture needs no durability. SQLite's defaults (rollback journal,
+        // synchronous=FULL) fsync every transaction, and nextest runs ~120 of
+        // these in parallel, so the suite was disk-bound: 0.3s per test alone,
+        // 2s+ under load. Production sets WAL + NORMAL in `Store::open`; these
+        // tests exercise SQL, not the journal.
+        conn.pragma_update(None, "journal_mode", "MEMORY").unwrap();
+        conn.pragma_update(None, "synchronous", "OFF").unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::migrations::run(&mut conn).unwrap();
         let ws = get_or_create_workspace(&mut conn, "default").unwrap();

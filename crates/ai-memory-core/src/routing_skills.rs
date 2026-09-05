@@ -105,6 +105,12 @@ mod tests {
         ("memory_forget_sweep", "ai-memory-learning-maintenance"),
         ("memory_install_self_routing", "ai-memory-routing-install"),
     ];
+    const PROJECT_SCOPED_SKILLS: &[&str] = &[
+        "ai-memory-retrieval",
+        "ai-memory-handoff",
+        "ai-memory-durable-pages",
+        "ai-memory-learning-maintenance",
+    ];
 
     #[derive(Debug, serde::Deserialize)]
     struct Frontmatter {
@@ -209,6 +215,41 @@ mod tests {
                 vec![expected_skill],
                 "{tool} should appear in exactly one intended skill"
             );
+        }
+    }
+
+    #[test]
+    fn project_scoped_skills_share_the_static_client_contract() {
+        for skill_name in PROJECT_SCOPED_SKILLS {
+            let skill = MANAGED_SKILLS
+                .iter()
+                .find(|skill| skill.name == *skill_name)
+                .unwrap_or_else(|| panic!("missing managed skill {skill_name}"));
+            for required in [
+                "Session-aware MCP clients",
+                "Static MCP clients",
+                "must pass `workspace` and `project` together on every project-scoped call",
+                "nearest `.ai-memory.toml`",
+                "never guess them from a directory name",
+                "never rely on the server's last active project",
+                "`global=true` must omit `workspace`, `project`, and `scopes`",
+                "`scope: \"global\"`",
+            ] {
+                assert!(
+                    skill.content.contains(required),
+                    "{skill_name} is missing scope guidance: {required}"
+                );
+            }
+            for contradictory in [
+                "Pass workspace and project together only when",
+                "Never pass scope arguments",
+                "omit project, workspace, and cwd arguments unless",
+            ] {
+                assert!(
+                    !skill.content.contains(contradictory),
+                    "{skill_name} contains contradictory scope guidance: {contradictory}"
+                );
+            }
         }
     }
 

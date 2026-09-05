@@ -192,6 +192,16 @@ below the selected skill root. Skill files are ai-memory-managed only when they
 contain the managed marker, so unmanaged same-name skills should not be
 overwritten unless the human explicitly forces replacement.
 
+The installed snippet and all project-scoped managed skills use the same
+client-aware scope rule. A session-aware bridge that forwards the real hook
+session id may omit scope for the current repository. A static MCP client must
+send exact `workspace` and `project` values on every project-scoped call, even
+when lifecycle hooks are installed, because hooks alone do not identify the MCP
+request. Declare both names in the nearest [`.ai-memory.toml`](marker-file.md),
+or obtain them from the operator/server configuration; never infer them from a
+directory name or rely on the server's last active project. Global query and
+global preference modes still omit project scope arguments.
+
 From a terminal:
 
 ```bash

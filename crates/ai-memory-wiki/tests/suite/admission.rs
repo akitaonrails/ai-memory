@@ -29,8 +29,9 @@ async fn spawn_server(app: Router) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    // Give the runtime a tick to start accepting.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // No settle needed: the socket is listening as soon as `bind` returns, so a
+    // client connecting before the serve task is polled just queues in the
+    // backlog.
     format!("http://{addr}")
 }
 

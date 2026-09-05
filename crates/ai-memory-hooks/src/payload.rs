@@ -401,6 +401,26 @@ pub fn parse_agent(s: &str) -> AgentKind {
     AgentKind::from_wire(s)
 }
 
+/// Identify the harness from the payload itself when it carries an
+/// unambiguous vendor marker, overriding the `?agent=` the hook command
+/// declared.
+///
+/// The Cursor CLI also loads and runs the hook commands declared in Claude
+/// Code's `~/.claude/settings.json` (its Claude Code config compatibility
+/// path, alongside `~/.cursor/hooks.json`). Those commands were installed by
+/// `install-hooks --agent claude-code`, so they hardcode
+/// `--agent claude-code` — and a Cursor-driven session was therefore stored
+/// with `agent_kind = claude-code`. The query string is the *installer's*
+/// guess; `cursor_version` is stamped on every Cursor hook payload and never
+/// appears in a Claude Code one, so the body is the stronger evidence.
+///
+/// Returns `None` when the payload carries no vendor marker, leaving the
+/// declared `?agent=` untouched.
+#[must_use]
+pub fn agent_from_payload(raw: &serde_json::Value) -> Option<AgentKind> {
+    extract_string(raw, &["cursor_version"]).map(|_| AgentKind::Cursor)
+}
+
 impl HookEnvelope {
     /// Build an envelope from the parsed query + the body JSON. Performs
     /// best-effort extraction of `session_id` / `cwd` / a body excerpt
@@ -409,7 +429,8 @@ impl HookEnvelope {
     #[must_use]
     pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
-        let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
+        let agent = agent_from_payload(&raw)
+            .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
         // OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
         // tool.execute.*/session.* events; Claude Code uses `session_id`,
         // Codex `sessionId`, and Antigravity CLI uses `conversationId`.
@@ -441,8 +462,16 @@ impl HookEnvelope {
             )
         });
         let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
+        // Cursor spells the workspace directory `workspace_roots` (an array,
+        // normally one entry; multi-root workspaces carry several) and never
+        // sends a usable top-level `cwd`: its `sessionStart` / `sessionEnd`
+        // payloads omit `cwd` entirely, and its tool events send `cwd: ""`.
+        // Without this spelling every Cursor session resolved to no cwd at all
+        // and landed in the server-default `default/scratch` bucket.
         let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
-            .or_else(|| extract_first_string_array_item(&raw, &["workspacePaths"]))
+            .or_else(|| {
+                extract_first_string_array_item(&raw, &["workspacePaths", "workspace_roots"])
+            })
             .or_else(|| {
                 extract_string_path(
                     &raw,
@@ -1363,6 +1392,111 @@ mod tests {
         assert_eq!(env.session_id.as_deref(), Some("abc-123"));
         assert_eq!(env.cwd.as_deref(), Some("/tmp/x"));
         assert_eq!(env.title_hint.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    /// Cursor's `sessionStart` carries no `cwd` key at all — the workspace
+    /// directory arrives only as `workspace_roots`. Shape captured live from
+    /// Cursor CLI 2026.09.02-c22c1a3.
+    #[test]
+    fn envelope_resolves_cursor_session_start_cwd_from_workspace_roots() {
+        let q = HookQuery {
+            event: "session-start".into(),
+            agent: Some("cursor".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "conversation_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "is_background_agent": false,
+            "hook_event_name": "sessionStart",
+            "cursor_version": "2026.09.02-c22c1a3",
+            "workspace_roots": ["/checkouts/repo-a"],
+            "transcript_path": serde_json::Value::Null
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.event, HookEvent::SessionStart);
+        assert_eq!(env.agent, AgentKind::Cursor);
+        assert_eq!(
+            env.cwd.as_deref(),
+            Some("/checkouts/repo-a"),
+            "without workspace_roots the session resolves to no cwd and lands \
+             in the server-default scratch project"
+        );
+    }
+
+    /// Cursor's tool events DO carry a `cwd` key, but send it as an empty
+    /// string; resolution must fall through to `workspace_roots` instead of
+    /// accepting `""`.
+    #[test]
+    fn envelope_resolves_cursor_tool_event_cwd_despite_empty_cwd_string() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("cursor".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "conversation_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "tool_name": "Shell",
+            "tool_input": {"command": "echo cap > CAP.txt", "cwd": "", "timeout": 30000},
+            "tool_use_id": "b0fe7c49-7ee7-45e6-91ee-6ee68b7b17e2",
+            "cwd": "",
+            "hook_event_name": "postToolUse",
+            "cursor_version": "2026.09.02-c22c1a3",
+            "workspace_roots": ["/checkouts/repo-a"]
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.cwd.as_deref(), Some("/checkouts/repo-a"));
+    }
+
+    /// The Cursor CLI also runs the hook commands declared in Claude Code's
+    /// `~/.claude/settings.json`, which `install-hooks --agent claude-code`
+    /// hardcoded to `--agent claude-code`. The payload's `cursor_version`
+    /// identifies the real harness, so the session must not be filed as
+    /// Claude Code.
+    #[test]
+    fn envelope_attributes_cursor_payload_to_cursor_over_declared_claude_code() {
+        let q = HookQuery {
+            event: "session-start".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "conversation_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "hook_event_name": "sessionStart",
+            "cursor_version": "2026.09.02-c22c1a3",
+            "workspace_roots": ["/checkouts/repo-a"]
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.agent, AgentKind::Cursor);
+        assert_eq!(env.cwd.as_deref(), Some("/checkouts/repo-a"));
+    }
+
+    /// A genuine Claude Code payload carries no vendor marker, so the
+    /// declared `?agent=` still decides.
+    #[test]
+    fn envelope_keeps_declared_agent_when_payload_has_no_vendor_marker() {
+        let q = HookQuery {
+            event: "session-start".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "session_id": "abc-123",
+            "cwd": "/checkouts/repo-a",
+            "hook_event_name": "SessionStart"
+        });
+
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.agent, AgentKind::ClaudeCode);
     }
 
     #[test]

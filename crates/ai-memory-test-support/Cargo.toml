@@ -1,0 +1,20 @@
+[package]
+name = "ai-memory-test-support"
+description = "Helpers shared by this workspace's tests. Dev-dependency only; never shipped."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+# Helpers only; see the crate docs for why this ships no test binary.
+test = false
+doctest = false
+
+[dependencies]
+
+[lints]
+workspace = true

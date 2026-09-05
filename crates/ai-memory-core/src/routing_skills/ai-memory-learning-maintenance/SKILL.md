@@ -40,6 +40,11 @@ Prefer read-only linting or proposal mode before destructive cleanup. When a mai
 
 Generic ai-memory routing guidance, Agent Skill installation details, and temporary prompt-packaging instructions are not durable project knowledge. Do not turn them into wiki pages or project rules unless the user explicitly asks to remember a project-specific decision.
 
-## Scope default
+## Project scope
 
-Default to the current project. Pass workspace and project together only when the user explicitly names a different project.
+Choose scope from the MCP client's identity support:
+
+- **Session-aware MCP clients** that forward the real lifecycle-hook session id on every request should use automatic current-project routing. Omit `workspace`, `project`, and `cwd` for the current repository; pass explicit scope only when the user names a different project.
+- **Static MCP clients** (including clients with lifecycle hooks but no bridge connecting that hook session id to MCP requests) must pass `workspace` and `project` together on every project-scoped call, including requests about this project, here, or our work. Read the exact names from the nearest `.ai-memory.toml` when it declares both. If it does not, obtain the names from the operator or server configuration; never guess them from a directory name and never rely on the server's last active project.
+
+This rule applies only to project-scoped calls. For cross-project retrieval, `global=true` must omit `workspace`, `project`, and `scopes`. For a standing preference written with `scope: "global"`, omit `workspace` and `project`.
