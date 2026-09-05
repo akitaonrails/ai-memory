@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Authentication-disabled HTTP servers now ignore stale or unexpected Bearer
+  headers and preserve anonymous access. Previously, a client retaining an old
+  `AI_MEMORY_AUTH_TOKEN` received `401 Unauthorized` even though the server
+  reported `auth=false`; invalid Bearers remain rejected whenever static or
+  human authentication is enabled. (#639)
+
 ## [2.0.3] - 2026-09-04
 
 ### Changed

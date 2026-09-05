@@ -1019,22 +1019,22 @@ pub async fn require_dual_auth(
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    match crate::auth::authenticate_bearer(&state, &mut req).await {
+    let bearer = match crate::auth::authenticate_bearer(&state, &mut req).await {
         Ok(crate::auth::BearerAuth::Authenticated) => {
             req.extensions_mut().insert(state.clone());
             return next.run(req).await;
         }
         Err(resp) => return resp,
-        Ok(crate::auth::BearerAuth::Rejected) => {
-            return crate::auth::unauthorized_bearer();
-        }
-        Ok(crate::auth::BearerAuth::Absent) => {}
-    }
+        Ok(outcome) => outcome,
+    };
 
     let human_configured = match human_auth_configured(&state).await {
         Ok(configured) => configured,
         Err(response) => return response,
     };
+    if bearer == crate::auth::BearerAuth::Rejected && (state.enabled() || human_configured) {
+        return crate::auth::unauthorized_bearer();
+    }
     if !human_configured {
         if !state.enabled() {
             req.extensions_mut().insert(ActorContext::anonymous());
@@ -1370,6 +1370,23 @@ mod tests {
                 state.clone(),
                 require_dual_auth,
             ))
+    }
+
+    #[tokio::test]
+    async fn dual_auth_ignores_an_unexpected_bearer_when_auth_is_disabled() {
+        let resp = dual_router(Arc::new(AuthState::new(None)))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .header("authorization", "Bearer stale-client-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"anonymous");
     }
 
     async fn json_error(resp: axum::http::Response<axum::body::Body>) -> serde_json::Value {
