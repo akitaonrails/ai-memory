@@ -1,0 +1,12 @@
+# Cargo aliases for the two test tiers in .config/nextest.toml. Aliases only:
+# an env table here would apply to every cargo invocation on every platform.
+#
+# `cargo t` has no `--workspace`: it builds the workspace's default-members
+# (everything but the evals harness) and lets `cargo t -p <crate>` build just
+# that crate. `cargo tf` is the gate, so it covers the whole workspace. Neither
+# passes `--all-targets`: there are no examples or benches, and it would only
+# add harnesses for the two `test = false` targets. nextest filters still
+# apply, e.g. `cargo t -E 'test(/purge/)'`.
+[alias]
+t = "nextest run"
+tf = "nextest run --workspace -P full"

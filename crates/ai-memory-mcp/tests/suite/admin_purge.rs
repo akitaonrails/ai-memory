@@ -4,23 +4,22 @@
 //! [`AdminState`] over a tmpdir-backed store + wiki, drive the router
 //! with `tower::ServiceExt::oneshot`.
 
+use super::common::post;
 use ai_memory_core::{
     AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, ProjectId,
     Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
-use ai_memory_mcp::{AdminState, admin_router};
+use ai_memory_mcp::AdminState;
 use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
 use ai_memory_wiki::{
     AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig, Wiki, WritePageRequest,
 };
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use axum::routing::post as route_post;
 use serde_json::json;
 use std::path::Path;
 use tempfile::TempDir;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -59,17 +58,6 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
-}
-
-async fn post(state: AdminState, uri: &str, body: serde_json::Value) -> axum::response::Response {
-    let router = admin_router(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    router.oneshot(req).await.unwrap()
 }
 
 /// Seed two projects (`default/keep` and `default/doomed`), each with one

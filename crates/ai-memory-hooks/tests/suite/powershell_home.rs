@@ -28,7 +28,7 @@ fn marker_lookup_does_not_assign_to_powershell_home() {
              [Console]::Error.Write(($Error | Out-String)); exit 17 \
          }}; [Console]::Out.Write('ok')"
     );
-    let output = Command::new("powershell.exe")
+    let output = Command::new(ai_memory_test_support::powershell_exe())
         .args([
             "-NoLogo",
             "-NoProfile",

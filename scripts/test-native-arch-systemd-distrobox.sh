@@ -78,7 +78,6 @@ run_inside() {
   (cd packaging/aur && makepkg --printsrcinfo -p PKGBUILD-bin) >/tmp/ai-memory-bin.PKGBUILD.SRCINFO
 
   log "Building ai-memory release binary from current working tree"
-  export TAILWIND_SKIP=1
   cargo build --release -p ai-memory-cli
 
   log "Installing native package layout into the disposable distrobox"

@@ -1,19 +1,18 @@
 //! Build script for ai-memory-web.
 //!
-//! Downloads the standalone Tailwind CSS CLI (pinned version) and
-//! compiles `static/input.css` → `OUT_DIR/tailwind.css`.
+//! The shipped stylesheet is the vendored `static/tailwind.css`, checked in
+//! and copied to `OUT_DIR` on every build, so a plain `cargo build` needs no
+//! network and no environment variable on any platform.
 //!
-//! # Escape hatch
-//! Set `TAILWIND_SKIP=1` to skip the download entirely and use the
-//! vendored `static/tailwind.css` instead.
-//!
-//! # Incremental builds
-//! Also skips the download when `static/tailwind.css` is newer than
-//! every template file and `static/input.css`.
+//! # Regenerating the stylesheet
+//! `TAILWIND_BUILD=1 cargo build -p ai-memory-web` downloads the pinned
+//! standalone Tailwind CLI (checksum-verified), compiles `static/input.css`
+//! against `templates/`, and rewrites the vendored file for you to commit.
+//! CI runs that mode on Linux and fails if the committed file is stale, which
+//! is the only freshness check: mtimes on a fresh clone mean nothing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
 
@@ -30,87 +29,41 @@ const TAILWIND_WINDOWS_X64_SHA256: &str =
     "67f1c5e3f5a03406a7bf5badf5ada09b79f3ae78ec43450c15f7e983068da346";
 
 fn main() {
-    // Re-run triggers.
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=static/input.css");
-    println!("cargo:rerun-if-changed=templates/");
-    println!("cargo:rerun-if-env-changed=TAILWIND_SKIP");
+    println!("cargo:rerun-if-changed=static/tailwind.css");
+    println!("cargo:rerun-if-env-changed=TAILWIND_BUILD");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let out_css = out_dir.join("tailwind.css");
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-
-    // Escape hatch: TAILWIND_SKIP=1 → use the vendored file.
-    if std::env::var("TAILWIND_SKIP").as_deref() == Ok("1") {
-        let src = crate_dir.join("static/tailwind.css");
-        std::fs::copy(&src, &out_css)
-            .unwrap_or_else(|e| panic!("TAILWIND_SKIP=1 but static/tailwind.css missing: {e}"));
-        emit_env(&out_css);
-        return;
-    }
-
-    // Incremental: skip if static/tailwind.css is newer than all sources.
     let vendored = crate_dir.join("static/tailwind.css");
-    if is_vendored_fresh(&vendored, &crate_dir) {
-        std::fs::copy(&vendored, &out_css)
-            .expect("failed to copy vendored tailwind.css to OUT_DIR");
-        emit_env(&out_css);
-        return;
+
+    if std::env::var("TAILWIND_BUILD").as_deref() == Ok("1") {
+        println!("cargo:rerun-if-changed=static/input.css");
+        println!("cargo:rerun-if-changed=templates/");
+        let binary = download_tailwind(&out_dir);
+        compile_tailwind(&binary, &crate_dir, &out_css);
+        // This is the explicit "regenerate" mode, so refreshing the vendored
+        // copy in the source tree is the point, not a side effect.
+        std::fs::copy(&out_css, &vendored)
+            .expect("failed to refresh the vendored static/tailwind.css");
+    } else {
+        std::fs::copy(&vendored, &out_css).unwrap_or_else(|e| {
+            panic!(
+                "static/tailwind.css missing ({e}); regenerate it with \
+                 `TAILWIND_BUILD=1 cargo build -p ai-memory-web`"
+            )
+        });
     }
-
-    // Download the tailwind binary (cached by version in OUT_DIR's parent).
-    let binary = download_tailwind(&out_dir);
-
-    // Run tailwind.
-    compile_tailwind(&binary, &crate_dir, &out_css);
-    // Also update the vendored copy so the next build is incremental.
-    let _ = std::fs::copy(&out_css, &vendored);
 
     emit_env(&out_css);
 }
 
-fn emit_env(css_path: &Path) {
+fn emit_env(out_css: &Path) {
     println!(
         "cargo:rustc-env=AI_MEMORY_WEB_TAILWIND_CSS={}",
-        css_path.display()
+        out_css.display()
     );
-}
-
-/// True when `static/tailwind.css` is newer than all template files
-/// and `static/input.css`.
-fn is_vendored_fresh(vendored: &Path, crate_dir: &Path) -> bool {
-    let Ok(vmt) = mtime(vendored) else {
-        return false;
-    };
-    // Check input.css.
-    let input = crate_dir.join("static/input.css");
-    if mtime(&input).map(|t| t > vmt).unwrap_or(false) {
-        return false;
-    }
-    // Walk templates/.
-    let tmpl_dir = crate_dir.join("templates");
-    is_dir_older_than(&tmpl_dir, vmt)
-}
-
-fn is_dir_older_than(dir: &Path, threshold: SystemTime) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return true; // no templates → consider fresh
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if !is_dir_older_than(&path, threshold) {
-                return false;
-            }
-        } else if mtime(&path).map(|t| t > threshold).unwrap_or(false) {
-            return false;
-        }
-    }
-    true
-}
-
-fn mtime(p: &Path) -> std::io::Result<SystemTime> {
-    std::fs::metadata(p)?.modified()
 }
 
 /// Platform-specific download URL for the Tailwind CLI binary.
@@ -131,7 +84,7 @@ fn tailwind_slug() -> &'static str {
         ("macos", "aarch64") => "tailwindcss-macos-arm64",
         ("windows", "x86_64") => "tailwindcss-windows-x64.exe",
         _ => panic!(
-            "Unsupported platform {os}/{arch} — set TAILWIND_SKIP=1 and provide static/tailwind.css manually"
+            "Unsupported platform {os}/{arch} for TAILWIND_BUILD=1; regenerate static/tailwind.css on a supported one"
         ),
     }
 }
@@ -143,9 +96,7 @@ fn expected_tailwind_sha256() -> &'static str {
         "tailwindcss-macos-x64" => TAILWIND_MACOS_X64_SHA256,
         "tailwindcss-macos-arm64" => TAILWIND_MACOS_ARM64_SHA256,
         "tailwindcss-windows-x64.exe" => TAILWIND_WINDOWS_X64_SHA256,
-        other => panic!(
-            "No pinned Tailwind SHA-256 for {other}. Set TAILWIND_SKIP=1 and provide static/tailwind.css manually."
-        ),
+        other => panic!("No pinned Tailwind SHA-256 for {other}"),
     }
 }
 
@@ -199,9 +150,8 @@ fn download_tailwind(out_dir: &Path) -> PathBuf {
 
     if !success {
         panic!(
-            "Could not download Tailwind CSS CLI — curl, wget, and PowerShell all failed.\n\
-             Either install one of those download tools, OR set TAILWIND_SKIP=1 and place a compiled \
-             tailwind.css in crates/ai-memory-web/static/tailwind.css."
+            "Could not download the Tailwind CSS CLI: curl, wget, and PowerShell all failed. \
+             Install one of them, or regenerate static/tailwind.css on another machine."
         );
     }
 

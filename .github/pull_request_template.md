@@ -9,8 +9,9 @@
 ## Test plan
 
 - [ ] `cargo fmt --all -- --check` passes
+- [ ] `git diff --check` passes
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
+- [ ] `cargo tf` (or `cargo test --workspace --all-targets`) passes
 - [ ] Manual test: <!-- describe what you ran and what you observed -->
 
 ## Commit attribution

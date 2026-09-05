@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The build is self-contained on every platform: the vendored web stylesheet
+  is now the default and `TAILWIND_BUILD=1 cargo build -p ai-memory-web`
+  regenerates it, so no command needs `TAILWIND_SKIP=1` any more. CI
+  regenerates the bundle on Linux and fails if the committed
+  `static/tailwind.css` is stale, a check that did not exist before.
+- Developer loop: `cargo t` (everyday, skips `slow`/`stress` modules) and
+  `cargo tf` (everything) aliases over cargo-nextest, integration tests that
+  compile into each crate's own test harness from `tests/suite/` (78 test
+  binaries down to 11 in the everyday loop; only the CLI keeps a separate one,
+  and the evals harness builds only under `--workspace`), a dev profile that
+  keeps only line tables, and an opt-in pre-push hook that runs the full tier.
+  `bin/release` and the documented gate also run `git diff --check`. Measured:
+  workspace edit-to-result ~380s to ~150s on macOS; the warm everyday test run
+  28s to 19s on a 32-thread Windows box.
+
+### Fixed
+- Consolidation prompt assembly no longer re-renders the whole observation
+  projection and re-scores every observation after each pruned one. With a few
+  hundred long observations the quadratic loop cost ~14s per prompt; pruning
+  now works from per-observation scores and block sizes computed once, with
+  byte-identical output.
+
 ## [2.0.3] - 2026-09-04
 
 ### Changed

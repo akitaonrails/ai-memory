@@ -11,9 +11,27 @@ members = [
     "crates/ai-memory-web",
     "crates/ai-memory-cli",
     "crates/ai-memory-workstream",
+    # Test-only helpers shared across crates (dev-dependency, never shipped).
+    "crates/ai-memory-test-support",
     # Live A/B harness — not part of the shipped binary, but in
     # the workspace so it shares deps + builds with the rest.
     "evals",
+]
+# What a bare `cargo t` / `cargo build` at the root means: everything that
+# ships, plus test-support. The evals harness is two more test binaries nobody
+# iterates on; `--workspace` (CI, the pre-push hook, `cargo tf`) still covers it.
+default-members = [
+    "crates/ai-memory-core",
+    "crates/ai-memory-store",
+    "crates/ai-memory-wiki",
+    "crates/ai-memory-mcp",
+    "crates/ai-memory-hooks",
+    "crates/ai-memory-llm",
+    "crates/ai-memory-consolidate",
+    "crates/ai-memory-web",
+    "crates/ai-memory-cli",
+    "crates/ai-memory-workstream",
+    "crates/ai-memory-test-support",
 ]
 
 [workspace.package]
@@ -35,6 +53,7 @@ ai-memory-llm = { path = "crates/ai-memory-llm", version = "2.0.3" }
 ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "2.0.3" }
 ai-memory-web = { path = "crates/ai-memory-web", version = "2.0.3" }
 ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "2.0.3" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support" }
 
 # (Workspace shared deps follow below)
 
@@ -151,7 +170,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 futures-util = "0.3"
 async-trait = "0.1"
 
@@ -174,4 +193,19 @@ strip = "symbols"
 
 [profile.dev]
 opt-level = 0
-debug = true
+# Full debuginfo put ~190 MB in each of the 71 test binaries and made the
+# build linker-bound. Line tables keep file:line in panics; use
+# `RUSTFLAGS="-C debuginfo=2"` for a real debugger session.
+debug = "line-tables-only"
+
+# Deps are not what you step through, and they dominate the graph.
+# opt-level 1 costs one slow rebuild and buys faster tests: the store crate's
+# suite went 8.6s to 6.3s. Deps recompile rarely, so it amortises.
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+
+# Proc macros and build scripts are *run* by every crate that depends on them,
+# so optimising them speeds compilation rather than slowing it.
+[profile.dev.build-override]
+opt-level = 3

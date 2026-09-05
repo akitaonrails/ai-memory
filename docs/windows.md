@@ -265,10 +265,10 @@ cargo build --locked --release -p ai-memory-cli
 
 The version output should match the package version for the checkout.
 
-The Tailwind build step supports the pinned
+Normal builds use the vendored stylesheet and download nothing. Regenerating
+it (`TAILWIND_BUILD=1 cargo build -p ai-memory-web`) supports the pinned
 `tailwindcss-windows-x64.exe` binary and falls back to PowerShell
-`Invoke-WebRequest` when `curl`/`wget` are unavailable. You should not
-need `TAILWIND_SKIP=1` for normal Windows builds.
+`Invoke-WebRequest` when `curl`/`wget` are unavailable.
 
 Keep Git for Windows' `git.exe` on `PATH` for native builds and hook runs. When
 libgit2 hits a Windows path-resolution error while opening a newly initialized

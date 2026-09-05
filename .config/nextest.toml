@@ -1,0 +1,45 @@
+# cargo-nextest configuration. Two profiles for people, one for CI:
+#
+#   cargo t     everyday: everything except modules named slow* / stress*
+#   cargo tf    the gate: everything
+#
+# The skip is by name, so the convention is the whole mechanism: a test that
+# needs more than ~1s alone either gets fixed or moves into a `slow`/`stress`
+# module, and the 5s slow-timeout below surfaces new offenders in every run's
+# summary. Two independent things run the skipped tier anyway: the pre-push
+# hook (`scripts/install-git-hooks.sh`) and CI, which uses `cargo test` and
+# never reads this file.
+
+[profile.default]
+default-filter = "not test(/(^|::)(slow|stress)[a-z0-9_]*::/)"
+# One run shows every failure; fail-fast costs a whole extra loop to learn
+# about the second one.
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "fail"
+final-status-level = "slow"
+# Nothing in the everyday tier should take 5s alone, so a marker means "new
+# slow test" or "wedged". Kill at 2 minutes so a hung test cannot stall a loop.
+slow-timeout = { period = "5s", terminate-after = 24 }
+
+[profile.full]
+# `all()` is load-bearing: profiles inherit `default-filter` from
+# profile.default, so without it the gate would skip the very tier it covers.
+default-filter = "all()"
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "fail"
+# The slow tier legitimately sits in the 10-20s range.
+slow-timeout = { period = "30s", terminate-after = 8 }
+# No retries: no genuinely flaky test has been found in this suite, and a
+# local gate should tell the truth. Retries belong in profile.ci.
+
+[profile.ci]
+default-filter = "all()"
+# Runner contention is real and separate from flakiness.
+retries = 2
+failure-output = "immediate-final"
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"

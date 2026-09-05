@@ -6,7 +6,7 @@
 git clone https://github.com/akitaonrails/ai-memory
 cd ai-memory
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace --all-targets
 ```
 
 Rust 1.95 is required (pinned in `rust-toolchain.toml`). The build is
@@ -39,24 +39,54 @@ solely to change attribution because doing so invalidates commit hashes and
 breaks existing clones and forks. Maintainers use [`.mailmap`](.mailmap) to
 canonicalize accidental aliases without changing published commits.
 
-## Required gates before every PR
+## Required gates before push/merge
 
-All four must pass — the CI workflow enforces them and so does the `bin/release`
-script:
+All of these must pass; CI enforces them and so does `bin/release`. The build
+is self-contained, so none of them needs an environment variable.
 
 ```bash
-cargo fmt --all -- --check          # formatting
-cargo clippy --workspace --all-targets -- -D warnings   # lints
-cargo test --workspace              # tests
+cargo fmt --all -- --check
+git diff --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo tf                            # every test (alias: cargo nextest run -P full)
 cargo deny check                    # dependency policy
 ```
 
+`cargo tf` needs nextest (`cargo install cargo-nextest --locked`); without it,
+`cargo test --workspace --all-targets` is the equivalent and is what CI runs.
 If `cargo-deny` or `cargo-audit` are not installed:
 
 ```bash
 cargo install cargo-deny cargo-audit
 ```
 
+### The everyday loop
+
+```bash
+cargo t                        # all but the slow tier, ~20s warm
+cargo t -p ai-memory-store     # one crate: builds only its test binaries
+cargo t -E 'test(/purge/)'     # one topic (builds everything, runs a subset)
+```
+
+The everyday profile skips tests by name: any module segment starting with
+`slow` or `stress` (`packaging::slow::*` drives the real wrapper scripts and
+fake container engines at 10-20s each; `stress_*` modules hammer concurrency).
+The budget for everything else is about 1s per test alone, and the profile
+lists anything over 5s in its summary. Fix a slow test before tiering it.
+Skipped tests still count as "skipped" in the summary, never hidden, and two
+independent things run them anyway: the pre-push hook and CI.
+
+Install the hook once per clone with `scripts/install-git-hooks.sh` (from Git
+Bash on Windows). It appends or updates only ai-memory's managed block in
+`.git/hooks/pre-push`, preserving any existing hook body. Bypass it on a
+work-in-progress branch with `git push --no-verify`.
+
+Integration tests live in `tests/suite/` per crate and compile into the
+crate's own test harness (declare a new file with `mod name;` in
+`tests/suite/mod.rs`); only the CLI keeps a separate test binary, because its
+tests run the built executable. Helpers shared across crates go in
+`crates/ai-memory-test-support`. Platform-specific speedups
+(macOS Keychain, Windows linker and Defender) are in AGENTS.md.
 ## CHANGELOG is a merge gate
 
 Every **user-facing** change must add a `CHANGELOG.md` entry under

@@ -38,9 +38,12 @@ fn search_stderr(cwd: &Path, data_dir: &Path, extra_env: &[(&str, &str)], args: 
         .current_dir(cwd)
         .env("HOME", cwd)
         .env("AI_MEMORY_DATA_DIR", data_dir)
-        // Port 1 is reserved and never listening: the command resolves its
-        // scope, prints the notice, then fails on connect.
-        .env("AI_MEMORY_SERVER_URL", "http://127.0.0.1:1")
+        // A dead endpoint: the command resolves its scope, prints the notice,
+        // then fails on connect.
+        .env(
+            "AI_MEMORY_SERVER_URL",
+            ai_memory_test_support::dead_http_endpoint(),
+        )
         // `AI_MEMORY_HOME` outranks `$HOME` in `path_util::home_dir`, so an
         // exported one on the developer's machine would unpin the walk.
         .env_remove("AI_MEMORY_HOME")
