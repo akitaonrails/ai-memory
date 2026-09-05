@@ -60,6 +60,7 @@ pub mod copilot;
 pub mod embedding;
 pub mod error;
 pub mod factory;
+pub mod fallback;
 pub mod gemini;
 pub mod google;
 pub mod health;
@@ -94,10 +95,12 @@ pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
     default_embedding_dim, try_default_embedding_dim,
 };
+pub use fallback::{CIRCUIT_COOLDOWN, Candidate, FallbackLlmProvider};
 pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
-    ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
+    CandidateHealth, ProviderHealth, ProviderHealthSnapshot, ProviderHealthStatus,
+    ProviderRoleHealthSnapshot,
 };
 #[cfg(feature = "local-embeddings")]
 pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};

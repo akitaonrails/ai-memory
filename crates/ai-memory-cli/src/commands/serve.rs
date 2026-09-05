@@ -16,7 +16,7 @@ use ai_memory_hooks::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, WorkstreamState, hook_router,
     workstream_router,
 };
-use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
+use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder};
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
     AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
@@ -1985,7 +1985,14 @@ fn configure_consolidator(
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let retry_hint = llm_retry_hint(&provider_name, &model, cfg.base_url.as_deref());
-    let llm = build_provider(cfg).context("building LLM provider from config")?;
+    // Routes through the same construction `llm_provider_config` just
+    // confirmed is `Some`: wraps `[primary, fallbacks...]` in a
+    // `FallbackLlmProvider` when `llm_fallbacks` is non-empty, else returns
+    // the plain provider unchanged (existing single-provider behavior).
+    let llm = config
+        .llm_provider_chain()
+        .context("building LLM provider chain from config")?
+        .context("LLM provider configured but chain construction returned none")?;
     let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
     info!(
         provider = llm.name(),

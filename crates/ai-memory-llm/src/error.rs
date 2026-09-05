@@ -42,6 +42,20 @@ pub enum LlmError {
     /// JSON schema for structured output could not be derived.
     #[error("schema: {0}")]
     Schema(String),
+
+    /// Every eligible candidate in an ordered LLM fallback chain failed, or
+    /// every candidate's circuit was open. Carries only provider/model
+    /// labels and error classes/status — never response bodies or secrets.
+    /// See `docs/llm-provider-fallback.md`.
+    #[error("llm fallback chain exhausted after {attempted} candidate(s): {summary}")]
+    AllCandidatesFailed {
+        /// Number of candidates actually attempted (skipped open circuits
+        /// are excluded from this count).
+        attempted: usize,
+        /// Bounded `provider/model: class[ status]` summary, one entry per
+        /// attempt, joined with `"; "`.
+        summary: String,
+    },
 }
 
 impl LlmError {
@@ -61,6 +75,32 @@ impl LlmError {
             Self::Provider { status, .. } => *status == 429 || (500..=599).contains(status),
             Self::Http(e) => e.is_timeout() || e.is_connect(),
             _ => false,
+        }
+    }
+
+    /// HTTP status captured from this error, when the failure carries one.
+    #[must_use]
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Http(e) => e.status().map(|status| status.as_u16()),
+            Self::Provider { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// Redacted error category used for health reporting and the fallback
+    /// chain's aggregate error — never a response body or secret.
+    #[must_use]
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::Http(_) => "http",
+            Self::Provider { .. } => "provider",
+            Self::Serde(_) => "serde",
+            Self::UnexpectedShape(_) => "unexpected-shape",
+            Self::NotConfigured(_) => "not-configured",
+            Self::Auth(_) => "auth",
+            Self::Schema(_) => "schema",
+            Self::AllCandidatesFailed { .. } => "all-candidates-failed",
         }
     }
 }
@@ -114,5 +154,62 @@ mod tests {
         assert!(!LlmError::Serde("nope".into()).is_transient());
         assert!(!LlmError::UnexpectedShape("no tool block".into()).is_transient());
         assert!(!LlmError::NotConfigured("no key".into()).is_transient());
+    }
+
+    #[test]
+    fn all_candidates_failed_is_not_transient() {
+        // The aggregate error is terminal: nothing is left to advance to.
+        assert!(
+            !LlmError::AllCandidatesFailed {
+                attempted: 2,
+                summary: String::new(),
+            }
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn http_status_reads_provider_status_only() {
+        assert_eq!(
+            LlmError::Provider {
+                status: 503,
+                body: "boom".into()
+            }
+            .http_status(),
+            Some(503)
+        );
+        assert_eq!(LlmError::Schema("bad".into()).http_status(), None);
+    }
+
+    #[test]
+    fn class_is_a_stable_redacted_label_never_the_message() {
+        let cases: &[(LlmError, &str)] = &[
+            (
+                LlmError::Provider {
+                    status: 500,
+                    body: "secret upstream body".into(),
+                },
+                "provider",
+            ),
+            (LlmError::Serde("nope".into()), "serde"),
+            (
+                LlmError::UnexpectedShape("no tool block".into()),
+                "unexpected-shape",
+            ),
+            (LlmError::NotConfigured("no key".into()), "not-configured"),
+            (LlmError::Auth("expired".into()), "auth"),
+            (LlmError::Schema("bad".into()), "schema"),
+            (
+                LlmError::AllCandidatesFailed {
+                    attempted: 1,
+                    summary: String::new(),
+                },
+                "all-candidates-failed",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.class(), *expected, "unexpected class for {err}");
+            assert!(!err.class().contains("secret upstream body"));
+        }
     }
 }

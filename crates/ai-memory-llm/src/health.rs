@@ -21,14 +21,28 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 pub struct ProviderHealth {
     llm: ProviderRoleHealth,
     embedding: ProviderRoleHealth,
+    /// The configured LLM provider, held only so `snapshot()` can read its
+    /// [`LlmProvider::candidate_health`] — a plain provider always returns
+    /// empty here, a [`crate::fallback::FallbackLlmProvider`] returns its
+    /// ordered candidate list. Never dereferenced for anything but that
+    /// read, so this adds no behavior beyond passive reporting.
+    llm_provider: Arc<Mutex<Option<Arc<dyn LlmProvider>>>>,
 }
 
 impl ProviderHealth {
     /// Return a serializable snapshot of the latest recorded state.
     #[must_use]
     pub fn snapshot(&self) -> ProviderHealthSnapshot {
+        let llm_candidates = self
+            .llm_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|provider| provider.candidate_health())
+            .unwrap_or_default();
         ProviderHealthSnapshot {
             llm: self.llm.snapshot(),
+            llm_candidates,
             embedding: self.embedding.snapshot(),
         }
     }
@@ -44,6 +58,7 @@ impl ProviderHealth {
     ) -> Arc<dyn LlmProvider> {
         let health = self.llm.clone();
         health.configure(provider.into(), model.into(), None, retry_hint);
+        *self.llm_provider.lock().unwrap_or_else(|e| e.into_inner()) = Some(inner.clone());
         Arc::new(HealthRecordingLlmProvider { inner, health })
     }
 
@@ -95,8 +110,44 @@ impl ProviderHealthStatus {
 pub struct ProviderHealthSnapshot {
     /// LLM provider role.
     pub llm: ProviderRoleHealthSnapshot,
+    /// Ordered LLM fallback-chain candidate state (`llm_fallbacks`), in
+    /// declaration order (index 0 is the primary provider). Empty for a
+    /// single configured provider or no provider at all.
+    /// `#[serde(default)]` so a response from a server built before this
+    /// field existed still deserializes for a newer CLI.
+    #[serde(default)]
+    pub llm_candidates: Vec<CandidateHealth>,
     /// Embedding provider role.
     pub embedding: ProviderRoleHealthSnapshot,
+}
+
+/// One candidate's passive health state in an ordered LLM fallback chain.
+/// See `docs/llm-provider-fallback.md`. Every entry here is by construction
+/// a configured chain member; redaction is total — only labels, timestamps,
+/// an HTTP status, and a short error class are recorded, never a response
+/// body or credential.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateHealth {
+    /// Candidate provider label.
+    pub provider: String,
+    /// Candidate model id.
+    pub model: String,
+    /// Whether this candidate answered the most recently completed chain
+    /// call.
+    pub last_selected: bool,
+    /// Timestamp of the last call this candidate answered successfully.
+    pub last_success_at: Option<Timestamp>,
+    /// Timestamp of the last call this candidate failed.
+    pub last_error_at: Option<Timestamp>,
+    /// HTTP status captured from the last error, when available.
+    pub last_error_status: Option<u16>,
+    /// Redacted error class captured from the last error
+    /// ([`LlmError::class`]), never a response body or secret.
+    pub last_error_class: Option<String>,
+    /// When this candidate's circuit reopens, if a transient failure has it
+    /// currently open. `None` once the cooldown has elapsed, even if no
+    /// later call has explicitly closed it.
+    pub circuit_open_until: Option<Timestamp>,
 }
 
 /// Wire-format health snapshot for one provider role.
@@ -302,6 +353,10 @@ impl LlmProvider for HealthRecordingLlmProvider {
         let result = self.inner.complete_structured_raw(request, schema).await;
         self.health.record_result(&result);
         result
+    }
+
+    fn candidate_health(&self) -> Vec<CandidateHealth> {
+        self.inner.candidate_health()
     }
 }
 

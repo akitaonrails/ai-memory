@@ -65,6 +65,19 @@ pub trait LlmProvider: Send + Sync {
     ) -> LlmResult<serde_json::Value> {
         self.complete_structured_raw(request, schema).await
     }
+
+    /// Per-candidate health entries for an ordered LLM fallback chain.
+    ///
+    /// Empty for a plain, non-chained provider (the default). A wrapping
+    /// decorator (health recording) must forward this to its inner
+    /// provider; [`FallbackLlmProvider`](crate::fallback::FallbackLlmProvider)
+    /// is the only implementation that returns a non-empty list.
+    /// [`ProviderHealth`](crate::health::ProviderHealth) reads this at
+    /// snapshot time — it never probes providers or generates traffic on
+    /// its own.
+    fn candidate_health(&self) -> Vec<crate::health::CandidateHealth> {
+        Vec::new()
+    }
 }
 
 /// Typed wrapper around [`LlmProvider::complete_structured_raw`].

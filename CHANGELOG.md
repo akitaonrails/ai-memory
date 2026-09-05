@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Ordered LLM provider fallback chains (#648). `[[llm_fallbacks]]` in
+  `config.toml` configures one or more additional providers, each with its
+  own `provider`, `model`, optional `base_url`, and optional `api_key_env`
+  (the environment-variable *name* holding that profile's key — never the
+  key itself in config). The primary provider (`llm_provider`) always runs
+  first; fallbacks run only after a transient failure
+  (`LlmError::is_transient()`: 429, 5xx, timeout, connection error) advances
+  past the current candidate, in declaration order, with the original
+  request, JSON schema, and logical operation id preserved on every
+  attempt. A deterministic failure (400/401/403/404/422, an unsupported
+  schema, or a malformed response) still stops immediately — the same
+  policy a single provider already had. Each candidate carries a 30s
+  in-memory circuit: a transient failure opens it, a success closes it,
+  and a restart clears all circuit state. `Config::load` validates every
+  profile and resolves its credential once, at startup — a missing/empty
+  provider or model, an unknown provider, or a `RequiredApiKey` provider
+  with no resolved `api_key_env` fails startup rather than leaving a
+  latent fallback that only fails once the primary is already down; a
+  provider with a native credential source (OpenAI OAuth, Copilot) needs
+  no `api_key_env`. `GET /admin/status` (and `ai-memory status`) now
+  reports each candidate's provider/model label, last-selected/last
+  success/error state, and circuit-open-until timestamp alongside the
+  existing top-level LLM provider/model fields, which are unchanged for
+  every existing single-provider deployment.
 - `bootstrap --resume` recovers an interrupted run from durable per-chunk
   progress instead of re-paying for every LLM call (#621). Each chunk's pages
   are recorded (keyed by a fingerprint of the pruned sources + chunk budget, so

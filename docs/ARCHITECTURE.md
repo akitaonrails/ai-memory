@@ -626,6 +626,55 @@ GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override
 ```
 
+**Ordered LLM fallback chain** (opt-in, TOML only — see
+`docs/llm-provider-fallback.md`, #648): the primary provider above always
+runs first; `[[llm_fallbacks]]` entries run only after a transient failure
+(429, 5xx, timeout, connection error), in declaration order, with the
+original request/schema/operation id preserved on every attempt. A
+deterministic failure (4xx other than 429, an unsupported schema, a
+malformed response) still stops on the first candidate — no chain-wide
+retry loop.
+
+```toml
+llm_provider = "opencode"
+llm_model = "mimo-v2.5-free"
+
+[[llm_fallbacks]]
+provider = "openai-compat"          # same wire names as llm_provider
+model = "poolside/laguna-s-2.1-free"
+base_url = "http://127.0.0.1:49375/v1"   # required for openai-compat, as above
+api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"  # env var *name*; the key itself
+                                               # never lives in config.toml
+
+[[llm_fallbacks]]
+provider = "gemini"
+model = "gemini-3.5-flash"
+api_key_env = "GEMINI_API_KEY"
+```
+
+`api_key_env` is required for any provider that needs an API key
+(`anthropic`, `openai`, `gemini`, `opencode`; optional for `openai-compat`,
+which may run keyless) — it is never inherited from the primary's own
+fixed env var, so a fallback cannot look configured while actually
+resolving no credential. It is optional only for a provider with a native
+credential source (`openai-oauth`, `copilot`, `anthropic-oauth`), which
+shares the primary's process-wide token material. `Config::load` validates
+every profile and resolves its credential once, at startup: a
+missing/empty provider or model, an unknown provider, or a missing
+credential fails startup rather than leaving a latent fallback that only
+fails once the primary is already down. Each candidate carries its own
+30s in-memory circuit (`ai_memory_llm::fallback::CIRCUIT_COOLDOWN`): a
+transient failure opens it, a success closes it, and a restart clears all
+circuit state — there is no durable circuit or forced chain-wide deadline.
+
+`GET /admin/status` (`ai-memory status`) reports an `llm_candidates` list
+alongside the existing `llm`/`embedding` roles: each candidate's
+provider/model label, whether it answered the most recently completed
+call, its last success/error timestamp, a redacted error class + HTTP
+status (never a response body or credential), and its circuit-open-until
+timestamp. It is empty for a plain single-provider setup; the top-level
+`llm` role fields are unchanged.
+
 Every chat request carries `User-Agent: ai-memory/<version>`
 (`ai_memory_llm::DEFAULT_USER_AGENT`, layered in `build_provider`). `reqwest`
 sends no user agent unless configured, so provider requests used to arrive

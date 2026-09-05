@@ -7,10 +7,12 @@
 //! `getMergedEnv()`, masking the bug for weeks).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ai_memory_llm::{
-    AuthRequirement, EmbedderChoice, EmbedderConfig, ExtraHeaders, LlmError, LlmResult,
-    OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort,
+    AuthRequirement, Candidate, EmbedderChoice, EmbedderConfig, ExtraHeaders, FallbackLlmProvider,
+    LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice,
+    ProviderConfig, ReasoningEffort, build_provider,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -113,6 +115,31 @@ impl DecaySettings {
     }
 }
 
+/// One `[[llm_fallbacks]]` entry: an ordered LLM provider tried only after
+/// the primary (`llm_provider`) fails a transient call
+/// (`LlmError::is_transient()`). See `docs/llm-provider-fallback.md`.
+///
+/// `Config::load` validates every profile and resolves its credential once,
+/// at startup — a missing/empty provider or model, an unknown provider, or
+/// a missing credential fails startup rather than leaving a latent fallback
+/// that only fails under an outage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FallbackProfile {
+    /// Provider selection (same wire names as `llm_provider`).
+    pub provider: String,
+    /// Model id for this candidate.
+    pub model: String,
+    /// Optional base URL override (required for `openai-compat`, same as
+    /// the top-level `llm_base_url`).
+    pub base_url: Option<String>,
+    /// Environment-variable name holding this profile's API key. Optional
+    /// only for a provider with a native credential source (OpenAI OAuth,
+    /// Copilot); every other provider must set it — it is never inherited
+    /// from the primary provider's own env var.
+    pub api_key_env: Option<String>,
+}
+
 /// Top-level runtime configuration.
 ///
 /// `deny_unknown_fields` is intentionally NOT set: figment's
@@ -194,6 +221,32 @@ pub struct Config {
     /// replaces, so a duplicate would break the request instead of
     /// overriding it. Values are never logged.
     pub llm_headers: Vec<String>,
+    /// Ordered LLM fallback chain, tried after the primary provider only on
+    /// a transient failure (`LlmError::is_transient()`); empty by default
+    /// (no behavior change). See [`FallbackProfile`] and
+    /// `docs/llm-provider-fallback.md`. Configure via TOML:
+    /// ```toml
+    /// [[llm_fallbacks]]
+    /// provider = "openai-compat"
+    /// model = "poolside/laguna-s-2.1-free"
+    /// base_url = "http://127.0.0.1:49375/v1"
+    /// api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"
+    /// ```
+    /// No environment-variable shorthand: figment cannot round-trip
+    /// `Vec<Struct>` from `AI_MEMORY_*` env vars (see
+    /// `AI_MEMORY_ADMISSION_WEBHOOKS_JSON`'s comment below), and encoding
+    /// per-profile credential names into one env var would be ambiguous.
+    #[serde(default)]
+    pub llm_fallbacks: Vec<FallbackProfile>,
+    /// Validated [`ProviderConfig`] for each `llm_fallbacks` entry
+    /// (credentials included), resolved once by `Config::load` in
+    /// declaration order. Not a config-file key — see
+    /// [`Self::llm_provider_chain`]. `pub` (like [`Self::runtime_env`])
+    /// only so struct-update syntax (`..Config::default()`) keeps working
+    /// from every call site; construct it through `Config::load`, not by
+    /// hand.
+    #[serde(skip)]
+    pub llm_fallback_configs: Vec<ProviderConfig>,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -651,6 +704,8 @@ impl Default for Config {
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
+            llm_fallbacks: Vec::new(),
+            llm_fallback_configs: Vec::new(),
             consolidate_on_session_end: false,
             capture_assistant: false,
             strip_root_combinators: false,
@@ -1058,6 +1113,34 @@ impl Config {
             .context("parsing AI_MEMORY_LLM_HEADERS / llm_headers")?;
         validate_auth_secrets(&config.auth)?;
 
+        // Validated and resolved eagerly, unlike the primary provider (which
+        // stays lazily checked at `serve` startup): a fallback can otherwise
+        // sit unused for months and only fail once the primary is already
+        // down. The environment is read here, once, per invariant #1 (no
+        // `std::env::var` outside `load`).
+        let mut fallback_configs = Vec::with_capacity(config.llm_fallbacks.len());
+        for (i, profile) in config.llm_fallbacks.iter().enumerate() {
+            let resolved_key = match non_empty(profile.api_key_env.as_deref()) {
+                Some(name) => Some(SecretString::from(env_string(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "llm_fallbacks[{i}].api_key_env={name} is set but the environment \
+                         variable is missing or empty"
+                    )
+                })?)),
+                None => None,
+            };
+            let provider_cfg = config
+                .fallback_provider_config(i, profile, resolved_key)
+                .with_context(|| format!("validating llm_fallbacks[{i}]"))?;
+            // Constructed and discarded so a malformed profile (missing
+            // base_url, bad credential shape) fails startup instead of
+            // silently sitting unused until the primary has an outage.
+            build_provider(provider_cfg.clone())
+                .with_context(|| format!("building llm_fallbacks[{i}]"))?;
+            fallback_configs.push(provider_cfg);
+        }
+        config.llm_fallback_configs = fallback_configs;
+
         Ok(config)
     }
 
@@ -1087,22 +1170,12 @@ impl Config {
         let Some(provider_raw) = non_empty(self.llm_provider.as_deref()) else {
             return Ok(None);
         };
-        let provider = match provider_raw {
-            "anthropic" => ProviderChoice::Anthropic,
-            "openai" => ProviderChoice::OpenAi,
-            "gemini" | "google" => ProviderChoice::Gemini,
-            "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
-            "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
-            "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
-            "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
-            "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
-            other => {
-                return Err(LlmError::NotConfigured(format!(
-                    "AI_MEMORY_LLM_PROVIDER={other} is not one of \
-                     anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
-                )));
-            }
-        };
+        let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
+            LlmError::NotConfigured(format!(
+                "AI_MEMORY_LLM_PROVIDER={provider_raw} is not one of \
+                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+            ))
+        })?;
         let model = match non_empty(self.llm_model.as_deref()) {
             Some(s) => s.to_string(),
             None => match provider {
@@ -1138,6 +1211,133 @@ impl Config {
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
         }))
+    }
+
+    /// Resolve one `[[llm_fallbacks]]` profile into a validated
+    /// [`ProviderConfig`].
+    ///
+    /// `resolved_key` is the value already read from the profile's
+    /// `api_key_env` (or `None` when it sets none) — the environment is
+    /// read once, in [`Self::load`], and passed down as data so this stays
+    /// directly testable without mutating process env (`std::env::set_var`
+    /// is `unsafe` under edition 2024, forbidden workspace-wide).
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] for an empty provider/model, an
+    /// unknown provider, or a `RequiredApiKey` provider with no resolved
+    /// credential.
+    fn fallback_provider_config(
+        &self,
+        index: usize,
+        profile: &FallbackProfile,
+        resolved_key: Option<SecretString>,
+    ) -> LlmResult<ProviderConfig> {
+        let provider_raw = non_empty(Some(profile.provider.as_str())).ok_or_else(|| {
+            LlmError::NotConfigured(format!("llm_fallbacks[{index}].provider must not be empty"))
+        })?;
+        let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
+            LlmError::NotConfigured(format!(
+                "llm_fallbacks[{index}].provider={provider_raw} is not one of \
+                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+            ))
+        })?;
+        let model = non_empty(Some(profile.model.as_str()))
+            .ok_or_else(|| {
+                LlmError::NotConfigured(format!("llm_fallbacks[{index}].model must not be empty"))
+            })?
+            .to_string();
+        if resolved_key.is_none()
+            && matches!(
+                provider.auth_requirement(),
+                AuthRequirement::RequiredApiKey { .. }
+            )
+        {
+            return Err(LlmError::NotConfigured(format!(
+                "llm_fallbacks[{index}] provider={provider_raw} requires api_key_env \
+                 (no native credential source for this provider)"
+            )));
+        }
+        Ok(ProviderConfig {
+            provider,
+            model,
+            auth: self.fallback_provider_auth(provider, resolved_key),
+            base_url: non_empty(profile.base_url.as_deref()).map(str::to_string),
+            compat_strict: self.llm_compat_strict,
+            request_timeout_secs: self.llm_timeout_secs,
+            reasoning_effort: self.llm_reasoning_effort,
+            extra_headers: self.llm_extra_headers()?,
+        })
+    }
+
+    /// Auth resolution for a fallback profile. Deliberately distinct from
+    /// [`Self::provider_auth`]: that method falls back to the *primary*
+    /// provider's own fixed env var
+    /// (e.g. `ANTHROPIC_API_KEY`) when no override is given, which would let
+    /// a fallback profile silently reuse the primary's credential even
+    /// though it omitted `api_key_env` — defeating the "fails startup"
+    /// validation in [`Self::fallback_provider_config`]. Native credential
+    /// sources (OpenAI OAuth, Copilot, Anthropic OAuth) are process-wide by
+    /// nature and are still shared with the primary provider.
+    fn fallback_provider_auth(
+        &self,
+        provider: ProviderChoice,
+        resolved_key: Option<SecretString>,
+    ) -> ProviderAuth {
+        match provider.auth_requirement() {
+            AuthRequirement::RequiredApiKey { env_var } => {
+                ProviderAuth::required_api_key_from_env(env_var, resolved_key)
+            }
+            AuthRequirement::OptionalApiKey { env_var } => {
+                ProviderAuth::optional_api_key_from_env(env_var, resolved_key)
+            }
+            AuthRequirement::OpenAiOAuthToken => {
+                ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
+            }
+            AuthRequirement::CopilotToken => ProviderAuth::copilot(
+                self.copilot_token_path(),
+                self.runtime_env.copilot_github_token.clone(),
+                self.runtime_env.github_copilot_api_token.clone(),
+                self.runtime_env.copilot_api_url.clone(),
+            ),
+            AuthRequirement::AnthropicOAuthToken => {
+                ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
+            }
+        }
+    }
+
+    /// Build the configured LLM provider, including any ordered
+    /// `llm_fallbacks` chain.
+    ///
+    /// `None` when no LLM is configured; the plain provider when no
+    /// fallback is configured (existing single-provider callers are
+    /// unaffected); otherwise a [`FallbackLlmProvider`] wrapping the
+    /// primary and its fallbacks in declaration order. See
+    /// `docs/llm-provider-fallback.md`.
+    ///
+    /// # Errors
+    /// Propagates any error from constructing the primary or a fallback
+    /// provider (`build_provider` is the sole construction path for both).
+    pub fn llm_provider_chain(&self) -> LlmResult<Option<Arc<dyn LlmProvider>>> {
+        let Some(primary_cfg) = self.llm_provider_config()? else {
+            return Ok(None);
+        };
+        if self.llm_fallback_configs.is_empty() {
+            return Ok(Some(build_provider(primary_cfg)?));
+        }
+        let mut candidates = Vec::with_capacity(1 + self.llm_fallback_configs.len());
+        candidates.push(Candidate::new(
+            primary_cfg.provider.name(),
+            primary_cfg.model.clone(),
+            build_provider(primary_cfg)?,
+        ));
+        for cfg in &self.llm_fallback_configs {
+            candidates.push(Candidate::new(
+                cfg.provider.name(),
+                cfg.model.clone(),
+                build_provider(cfg.clone())?,
+            ));
+        }
+        Ok(Some(Arc::new(FallbackLlmProvider::new(candidates))))
     }
 
     /// OpenAI-compatible embedding key. `EMBEDDING_API_KEY` is checked first
@@ -1385,6 +1585,21 @@ impl Config {
             .clone()
             .or_else(|| self.runtime_env.llm_base_url.clone())
     }
+}
+
+/// Wire-name parsing shared by `llm_provider` and `llm_fallbacks[].provider`.
+fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
+    Some(match raw {
+        "anthropic" => ProviderChoice::Anthropic,
+        "openai" => ProviderChoice::OpenAi,
+        "gemini" | "google" => ProviderChoice::Gemini,
+        "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
+        "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+        "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
+        "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
+        "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
+        _ => return None,
+    })
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -2678,6 +2893,213 @@ mod tests {
                 "{spelling}"
             );
         }
+    }
+
+    fn load_with_toml(toml: &str) -> anyhow::Result<Config> {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, toml).unwrap();
+        Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+    }
+
+    #[test]
+    fn llm_fallbacks_default_to_empty_and_no_behavior_change() {
+        let cfg = Config::default();
+        assert!(cfg.llm_fallbacks.is_empty());
+        assert!(cfg.llm_fallback_configs.is_empty());
+    }
+
+    #[test]
+    fn load_rejects_an_empty_fallback_provider() {
+        let error = load_with_toml("[[llm_fallbacks]]\nprovider = \"\"\nmodel = \"m\"\n")
+            .expect_err("an empty provider must fail closed");
+        assert!(
+            format!("{error:#}").contains("llm_fallbacks[0].provider must not be empty"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_an_unknown_fallback_provider() {
+        let error = load_with_toml(
+            "[[llm_fallbacks]]\nprovider = \"not-a-real-provider\"\nmodel = \"m\"\n",
+        )
+        .expect_err("an unknown provider must fail closed");
+        assert!(
+            format!("{error:#}").contains("is not one of"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_an_empty_fallback_model() {
+        let error = load_with_toml("[[llm_fallbacks]]\nprovider = \"gemini\"\nmodel = \"\"\n")
+            .expect_err("an empty model must fail closed");
+        assert!(
+            format!("{error:#}").contains("llm_fallbacks[0].model must not be empty"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_a_required_api_key_provider_with_no_api_key_env() {
+        let error = load_with_toml("[[llm_fallbacks]]\nprovider = \"gemini\"\nmodel = \"m\"\n")
+            .expect_err("a RequiredApiKey provider needs api_key_env");
+        assert!(
+            format!("{error:#}").contains("requires api_key_env"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// The fallback never silently inherits the *primary*'s fixed env var
+    /// (`GEMINI_API_KEY`) — it must fail closed instead of looking healthy
+    /// until the primary has an outage.
+    #[test]
+    fn load_rejects_a_fallback_that_would_otherwise_inherit_the_primary_credential() {
+        let error = load_with_toml(
+            "llm_provider = \"gemini\"\n[[llm_fallbacks]]\nprovider = \"gemini\"\nmodel = \"m\"\n",
+        )
+        .expect_err("omitting api_key_env must not fall back to GEMINI_API_KEY");
+        assert!(
+            format!("{error:#}").contains("requires api_key_env"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_a_missing_or_empty_api_key_env_value() {
+        let error = load_with_toml(
+            "[[llm_fallbacks]]\nprovider = \"gemini\"\nmodel = \"m\"\n\
+             api_key_env = \"AI_MEMORY_TEST_FALLBACK_UNSET_KEY_648\"\n",
+        )
+        .expect_err("an unresolved api_key_env must fail closed");
+        assert!(
+            format!("{error:#}").contains(
+                "llm_fallbacks[0].api_key_env=AI_MEMORY_TEST_FALLBACK_UNSET_KEY_648 is set but \
+                 the environment variable is missing or empty"
+            ),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_an_openai_compat_fallback_with_no_base_url() {
+        let error =
+            load_with_toml("[[llm_fallbacks]]\nprovider = \"openai-compat\"\nmodel = \"m\"\n")
+                .expect_err("openai-compat needs a base_url");
+        assert!(
+            format!("{error:#}").contains("LLM_BASE_URL"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_a_well_formed_fallback_profile_with_no_primary() {
+        // `llm_fallbacks` is meaningful even without a primary configured
+        // (it is only ever consulted through `llm_provider_chain`, which
+        // returns `None` when there is no primary) — the profile itself
+        // must still validate independently.
+        let cfg = load_with_toml(
+            "[[llm_fallbacks]]\nprovider = \"openai-compat\"\nmodel = \"m\"\n\
+             base_url = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap();
+        let fallbacks = &cfg.llm_fallback_configs;
+        assert_eq!(fallbacks.len(), 1);
+        assert_eq!(fallbacks[0].provider, ProviderChoice::OpenAiCompat);
+        assert_eq!(fallbacks[0].model, "m");
+        assert_eq!(fallbacks[0].base_url.as_deref(), Some("http://127.0.0.1:9"));
+        assert!(cfg.llm_provider_chain().unwrap().is_none());
+    }
+
+    /// `fallback_provider_config` takes the resolved credential as a plain
+    /// parameter (see its doc comment): the environment is read once, in
+    /// `Config::load`, and passed down as data so the happy path stays
+    /// directly testable without mutating process env.
+    #[test]
+    fn fallback_provider_config_resolves_a_directly_supplied_credential() {
+        let cfg = Config::default();
+        let profile = FallbackProfile {
+            provider: "gemini".into(),
+            model: "gemini-3.5-flash".into(),
+            base_url: None,
+            api_key_env: Some("GEMINI_FALLBACK_KEY".into()),
+        };
+        let provider_cfg = cfg
+            .fallback_provider_config(0, &profile, Some(SecretString::from("sk-fallback-test")))
+            .unwrap();
+        assert_eq!(provider_cfg.provider, ProviderChoice::Gemini);
+        assert_eq!(provider_cfg.model, "gemini-3.5-flash");
+        assert_eq!(
+            provider_cfg.auth.require_api_key().unwrap().expose_secret(),
+            "sk-fallback-test"
+        );
+    }
+
+    /// `openai-oauth`/`copilot`/`anthropic-oauth` are native credential
+    /// sources: no `api_key_env` is required, and the fallback shares the
+    /// same process-wide token material as the primary.
+    #[test]
+    fn fallback_provider_config_allows_no_api_key_env_for_a_native_credential_provider() {
+        let cfg = Config::default();
+        let profile = FallbackProfile {
+            provider: "anthropic-oauth".into(),
+            model: "claude-sonnet-4-6".into(),
+            base_url: None,
+            api_key_env: None,
+        };
+        let provider_cfg = cfg.fallback_provider_config(0, &profile, None).unwrap();
+        assert_eq!(provider_cfg.provider, ProviderChoice::AnthropicOAuth);
+    }
+
+    #[test]
+    fn llm_provider_chain_is_the_plain_provider_when_no_fallback_is_configured() {
+        let cfg = Config {
+            llm_provider: Some("openai".into()),
+            runtime_env: RuntimeEnv {
+                openai_api_key: Some(SecretString::from("sk-test-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+        let chain = cfg.llm_provider_chain().unwrap().unwrap();
+        assert_eq!(chain.name(), "openai");
+        // A plain provider reports no candidates — only a fallback chain does.
+        assert!(chain.candidate_health().is_empty());
+    }
+
+    /// End-to-end happy path through `Config::load` -> `llm_provider_chain`:
+    /// a keyless `openai-compat` primary plus one keyless `openai-compat`
+    /// fallback (distinct base URLs, as `docs/llm-provider-fallback.md`'s
+    /// example does with distinct providers) produces a `FallbackLlmProvider`
+    /// exposing both candidates, in declaration order.
+    #[test]
+    fn llm_provider_chain_wraps_the_primary_and_every_fallback_in_order() {
+        let cfg = load_with_toml(
+            "llm_provider = \"openai-compat\"\n\
+             llm_model = \"primary-model\"\n\
+             llm_base_url = \"http://127.0.0.1:9\"\n\
+             [[llm_fallbacks]]\n\
+             provider = \"openai-compat\"\n\
+             model = \"fallback-model\"\n\
+             base_url = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap();
+
+        let chain = cfg.llm_provider_chain().unwrap().unwrap();
+        assert_eq!(chain.name(), "openai-compat");
+        assert_eq!(chain.model(), "primary-model");
+        let candidates = chain.candidate_health();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].provider, "openai-compat");
+        assert_eq!(candidates[0].model, "primary-model");
+        assert_eq!(candidates[1].provider, "openai-compat");
+        assert_eq!(candidates[1].model, "fallback-model");
+    }
+
+    #[test]
+    fn llm_provider_chain_none_when_no_llm_is_configured() {
+        assert!(Config::default().llm_provider_chain().unwrap().is_none());
     }
 
     #[test]
