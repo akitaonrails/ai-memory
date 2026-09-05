@@ -317,7 +317,11 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
         // directory and skip the whole thing at debug, instead of warning per
         // page indefinitely. If the row later appears (project recreated), the
         // check passes and the directory indexes normally on the next pass.
-        if let Err(e) = wiki.ensure_project_workspace(ws, proj).await {
+        // Rows only: reconcile runs outside the mutation guard, so it must
+        // not write a `_meta.md` into a directory a concurrent project move
+        // may be renaming away. These directories already have their
+        // manifests — written with their first page, or by the backfill.
+        if let Err(e) = wiki.ensure_project_scope_rows(ws, proj).await {
             debug!(
                 workspace = %ws,
                 project = %proj,

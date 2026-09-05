@@ -5840,6 +5840,49 @@ impl ReaderPool {
         .await
     }
 
+    /// Return one `(workspace, project)` scope by id, with the names and
+    /// `repo_path` its `_meta.md` manifest is written from. `None` when the
+    /// pair has no row.
+    ///
+    /// The single-scope counterpart of [`list_all_scopes`]: the wiki
+    /// materializes a manifest for one scope the first time it writes into
+    /// it, on a path where enumerating every scope in the store would be an
+    /// N+1 over the whole tree.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn scope_row_by_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<ScopeRow>> {
+        // (ws_name, proj_name, repo_path) — the ids are already known.
+        type RawScope = (String, String, Option<String>);
+        let raw: Option<RawScope> = self
+            .with_conn(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT w.name, p.name, p.repo_path \
+                         FROM projects p JOIN workspaces w ON w.id = p.workspace_id \
+                         WHERE p.id = ?1 AND p.workspace_id = ?2",
+                        params![project_id.as_bytes(), workspace_id.as_bytes()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                Ok(row)
+            })
+            .await?;
+        Ok(
+            raw.map(|(workspace_name, project_name, repo_path)| ScopeRow {
+                workspace_id,
+                workspace_name,
+                project_id,
+                project_name,
+                repo_path,
+            }),
+        )
+    }
+
     /// Return every `(workspace, project)` scope with its ids, names and
     /// `repo_path` — the data needed to write each scope's self-describing
     /// `_meta.md` manifest. Unlike [`list_projects_with_stats`], this carries
@@ -8494,6 +8537,53 @@ mod tests {
             .data_dir_free_bytes
             .expect("free space should be readable for a real temp dir");
         assert!(free > 0);
+    }
+
+    /// The single-scope manifest lookup the wiki resolves a new scope's
+    /// `_meta.md` names from. It carries `repo_path`, and it is keyed by the
+    /// full pair: a project id offered under the wrong workspace resolves to
+    /// nothing rather than leaking the other workspace's name into a
+    /// manifest.
+    #[tokio::test]
+    async fn scope_row_by_ids_returns_manifest_names_and_isolates_workspaces() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", Some("/repo/webapp".into()))
+            .await
+            .unwrap();
+        let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+
+        let row = store
+            .reader
+            .scope_row_by_ids(ws, proj)
+            .await
+            .unwrap()
+            .expect("the scope exists");
+        assert_eq!(row.workspace_name, "acme");
+        assert_eq!(row.project_name, "webapp");
+        assert_eq!(row.repo_path.as_deref(), Some("/repo/webapp"));
+
+        assert!(
+            store
+                .reader
+                .scope_row_by_ids(other_ws, proj)
+                .await
+                .unwrap()
+                .is_none(),
+            "a project id under the wrong workspace resolves to nothing"
+        );
+        assert!(
+            store
+                .reader
+                .scope_row_by_ids(ws, ai_memory_core::ProjectId::new())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown project id is None, not an error"
+        );
     }
 
     use super::{
