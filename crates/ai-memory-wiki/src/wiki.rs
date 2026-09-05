@@ -501,11 +501,12 @@ impl Wiki {
     }
 
     /// Ensure the store rows for a scope exist, without touching the wiki
-    /// tree. Only the watcher's reconcile pass wants this: it walks
-    /// directories that already exist (so their manifests were written when
-    /// their first page landed, or by the startup backfill), and it runs
-    /// outside the mutation guard — creating files there could drop a
-    /// manifest into a directory a concurrent project move is renaming away.
+    /// tree. The watcher's two orphan guards want this — the reconcile pass
+    /// and the directory-event path. Both run before `reindex_page` takes
+    /// the mutation guard, so creating a file there could drop a manifest
+    /// into a directory a concurrent project move is renaming away, and both
+    /// only ever see directories that already exist, whose manifests were
+    /// written with their first page or by the startup backfill.
     pub(crate) async fn ensure_project_scope_rows(
         &self,
         workspace_id: WorkspaceId,
