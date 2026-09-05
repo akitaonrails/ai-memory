@@ -225,9 +225,9 @@ cargo deny check                                          # dependency policy (i
   `.github/workflows/secret-scan.yml` runs the separate weekly/manual
   full-history gitleaks scan.
 - **Windows runs in its own workflow** (`.github/workflows/windows.yml`):
-  every push to `main`, nightly, on demand, and on any PR labelled
-  `windows`. It is the only place `#[cfg(windows)]` tests compile, and it
-  is ~4x slower than the same tests on Linux — keeping it out of `ci.yml`
+  nightly, on demand, and on any PR labelled `windows`. It is the only place
+  `#[cfg(windows)]` tests compile, and it is ~4x slower than the same tests on
+  Linux — keeping it out of `ci.yml`
   is what holds PR feedback near the eight minutes the gating jobs take.
   **Add the `windows` label** to a PR touching path handling, file
   locking, or git plumbing, so the check runs before the merge rather
