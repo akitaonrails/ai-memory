@@ -162,7 +162,21 @@ impl LoginLimiter {
     /// True when this IP has already spent its window. Call before Argon2.
     #[must_use]
     pub fn ip_blocked(&self, ip: IpAddr) -> bool {
-        let now = Instant::now();
+        self.ip_blocked_at(ip, Instant::now())
+    }
+
+    /// Record an IP failure.
+    pub fn record_ip_failure(&self, ip: IpAddr) {
+        self.record_ip_failure_at(ip, Instant::now());
+    }
+
+    // The `_at` forms take the reading instead of sampling it, because the
+    // window is 60s and a test that waits it out is not a test anyone runs.
+    // Without them `prune` is unobservable: delete its body and the suite
+    // stays green, while a spent window would stop reopening and one minute
+    // of failures would lock the account out until the process restarts.
+
+    fn ip_blocked_at(&self, ip: IpAddr, now: Instant) -> bool {
         let mut map = self.ip.lock().unwrap_or_else(|e| e.into_inner());
         let Some(q) = map.get_mut(&ip) else {
             return false;
@@ -175,9 +189,7 @@ impl LoginLimiter {
         blocked
     }
 
-    /// Record an IP failure.
-    pub fn record_ip_failure(&self, ip: IpAddr) {
-        let now = Instant::now();
+    fn record_ip_failure_at(&self, ip: IpAddr, now: Instant) {
         let mut map = self.ip.lock().unwrap_or_else(|e| e.into_inner());
         Self::record_failure(&mut map, ip, now);
     }
@@ -1216,6 +1228,68 @@ mod tests {
             peer_ip(&headers, &extensions, &trusted),
             "10.0.0.4".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn login_window_reopens_once_the_attempts_age_out() {
+        // `prune` is what makes this a *sliding* window rather than a
+        // permanent ban. Gut its body and every other test in this crate
+        // still passes, so the failure mode it guards -- a legitimate user
+        // locked out until the process restarts -- would ship unnoticed.
+        let limiter = LoginLimiter::default();
+        let ip = "198.51.100.7".parse::<IpAddr>().unwrap();
+        let t0 = Instant::now();
+
+        for _ in 0..LOGIN_IP_LIMIT {
+            limiter.record_ip_failure_at(ip, t0);
+        }
+        assert!(limiter.ip_blocked_at(ip, t0), "the limit must bite at all");
+
+        assert!(
+            !limiter.ip_blocked_at(ip, t0 + LOGIN_WINDOW + Duration::from_secs(1)),
+            "a spent window must reopen"
+        );
+    }
+
+    #[test]
+    fn login_window_holds_right_up_to_its_edge() {
+        let limiter = LoginLimiter::default();
+        let ip = "198.51.100.8".parse::<IpAddr>().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..LOGIN_IP_LIMIT {
+            limiter.record_ip_failure_at(ip, t0);
+        }
+
+        // Non-vacuity for the test above: it would also pass against a
+        // limiter that forgot everything immediately. `prune` drops an
+        // attempt only once it is *strictly* older than the window, so the
+        // exact boundary still blocks.
+        assert!(limiter.ip_blocked_at(ip, t0 + LOGIN_WINDOW - Duration::from_millis(1)));
+        assert!(limiter.ip_blocked_at(ip, t0 + LOGIN_WINDOW));
+        assert!(!limiter.ip_blocked_at(ip, t0 + LOGIN_WINDOW + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn login_window_ages_out_one_attempt_at_a_time() {
+        // A window that reopened wholesale on expiry would pass the two
+        // tests above. Attempts must expire individually: ten spread across
+        // the window means the block lifts as the oldest ages out, not in
+        // one step.
+        let limiter = LoginLimiter::default();
+        let ip = "198.51.100.9".parse::<IpAddr>().unwrap();
+        let t0 = Instant::now();
+        for n in 0..LOGIN_IP_LIMIT {
+            limiter.record_ip_failure_at(ip, t0 + Duration::from_secs(n as u64));
+        }
+        assert!(limiter.ip_blocked_at(ip, t0 + Duration::from_secs(9)));
+
+        // Just past the first attempt's expiry, and only that one: the
+        // second is still 59s old. Nine left, under the limit, so the caller
+        // gets exactly one attempt back -- not the whole window.
+        let after_first_expires = t0 + LOGIN_WINDOW + Duration::from_millis(1);
+        assert!(!limiter.ip_blocked_at(ip, after_first_expires));
+        limiter.record_ip_failure_at(ip, after_first_expires);
+        assert!(limiter.ip_blocked_at(ip, after_first_expires));
     }
 
     #[test]
