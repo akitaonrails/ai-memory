@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `agent_kind = claude-code`. Hook payloads carrying Cursor's
   `cursor_version` marker are now attributed to `cursor` regardless of the
   `?agent=` the hook command declared.
+- A project that first materializes while the server is running is now
+  self-describing immediately, instead of only after the next startup
+  backfill (#643). Scope manifests (`_meta.md`) were written at startup and on
+  the rename/move admin paths, so a session in a checkout the server had not
+  seen before produced a scope directory with pages but no manifest. Stop the
+  server in that window and `reindex` could not rebuild that tree — the one
+  situation where an operator most needs the rebuild to work. The manifest is
+  now written with the scope's first page, one store lookup per scope per
+  process, byte-identical to what the backfill writes so restarts still do not
+  churn the wiki's git history. The startup backfill is unchanged and remains
+  the repair path for trees written by older releases.
 
 ## [2.0.3] - 2026-09-04
 

@@ -259,7 +259,12 @@ async fn reindex_project_dir(
     // behaviour that pass was about — quieter here only because it needs an
     // event rather than firing every 30s. Checking once per directory also
     // saves walking a tree whose every page is going to fail scope resolution.
-    if let Err(e) = wiki.ensure_project_workspace(ws, proj).await {
+    //
+    // Rows only, for the same reason `reconcile` uses this form: the guard
+    // runs before `reindex_page` takes the mutation lock, so writing a
+    // `_meta.md` here could land it in a directory a concurrent project move
+    // is renaming away.
+    if let Err(e) = wiki.ensure_project_scope_rows(ws, proj).await {
         debug!(
             workspace = %ws,
             project = %proj,
@@ -317,7 +322,11 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
         // directory and skip the whole thing at debug, instead of warning per
         // page indefinitely. If the row later appears (project recreated), the
         // check passes and the directory indexes normally on the next pass.
-        if let Err(e) = wiki.ensure_project_workspace(ws, proj).await {
+        // Rows only: reconcile runs outside the mutation guard, so it must
+        // not write a `_meta.md` into a directory a concurrent project move
+        // may be renaming away. These directories already have their
+        // manifests — written with their first page, or by the backfill.
+        if let Err(e) = wiki.ensure_project_scope_rows(ws, proj).await {
             debug!(
                 workspace = %ws,
                 project = %proj,
@@ -880,6 +889,45 @@ mod tests {
             "a rowless directory must not index through a directory event, got {}",
             stranded.len()
         );
+    }
+
+    /// The directory-event orphan guard (#616 added it beside `reconcile`'s)
+    /// is the watcher's second caller that runs BEFORE `reindex_page` takes
+    /// the mutation lock, so it must stay rows-only for the same reason: a
+    /// `_meta.md` written from an unguarded path could land in a directory a
+    /// concurrent project move is renaming away. Pages found in the walk are
+    /// a different matter — `reindex_page` writes the manifest under the
+    /// guard, which is safe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn directory_events_do_not_write_scope_manifests() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", None)
+            .await
+            .unwrap();
+        // The reader is what lets a manifest be written at all; without it
+        // attached this would pass for the wrong reason.
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let proj_dir = ws_dir.join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+
+        assert!(
+            reindex_project_dir(&wiki, ws, proj, proj_dir.clone()).await,
+            "a scope the store knows is not an orphan"
+        );
+
+        assert!(
+            !ws_dir.join("_meta.md").exists(),
+            "the unguarded directory-event pre-check must not write files"
+        );
+        assert!(!proj_dir.join("_meta.md").exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

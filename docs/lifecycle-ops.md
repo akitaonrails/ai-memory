@@ -755,6 +755,15 @@ What is not rebuilt:
 - Sessions, observations, handoffs, users/tokens, audit rows, access counters,
   and embeddings. Those are DB-only state; keep a backup if you need them.
 
+Every scope directory carries the `_meta.md` manifest `reindex` reads its
+workspace/project name from. The manifest is written with the scope's first
+page, so a project that first appears while the server is running is
+rebuildable from that moment on — no restart required. The startup backfill
+still runs on every boot and repairs a tree written by an older release, or one
+whose manifests were removed by hand. If `reindex` reports a missing manifest,
+start the server once against that data directory and let the backfill write
+it, then stop the server and reindex again.
+
 ## Operator workflows
 
 ### "Fresh start" (wipe everything)
