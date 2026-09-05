@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Cursor sessions no longer land in the default `default/scratch` bucket.
+  Cursor sends the workspace directory only as `workspace_roots` — its
+  `sessionStart` / `sessionEnd` payloads carry no `cwd` key at all, and its
+  tool events send `cwd: ""` — so cwd resolution produced nothing and the
+  server fell back to its default project for every Cursor event. Both the
+  native `ai-memory hook` path and the POSIX/PowerShell hook scripts now read
+  `workspace_roots` (alongside Antigravity's `workspacePaths`) and treat an
+  empty `cwd` as absent rather than as an answer.
+- Cursor sessions are no longer attributed to `claude-code`. The Cursor CLI
+  also runs the hook commands declared in Claude Code's
+  `~/.claude/settings.json`, which `install-hooks --agent claude-code`
+  hardcoded to `--agent claude-code`, so a Cursor-driven session was stored
+  with `agent_kind = claude-code`. Hook payloads carrying Cursor's
+  `cursor_version` marker are now attributed to `cursor` regardless of the
+  `?agent=` the hook command declared.
+
 ## [2.0.3] - 2026-09-04
 
 ### Changed

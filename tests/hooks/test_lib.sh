@@ -87,6 +87,15 @@ assert_eq "extract cwd from antigravity workspacePaths" "/home/u/agy" "$(ai_memo
 PAYLOAD_WINDOWS='{"session_id":"x","cwd":"C:\\dev\\myproject"}'
 assert_eq "extract cwd unescapes Windows JSON path" 'C:\dev\myproject' \
     "$(ai_memory_extract_cwd "$PAYLOAD_WINDOWS")"
+# Cursor sends the workspace directory only as `workspace_roots`: its
+# sessionStart omits `cwd` and its tool events send `cwd: ""`. Both must
+# resolve or every Cursor event is filed under the default scratch project.
+PAYLOAD_CURSOR_START='{"session_id":"x","hook_event_name":"sessionStart","cursor_version":"2026.09.02","workspace_roots":["/home/u/cur"]}'
+assert_eq "extract cwd from cursor workspace_roots" "/home/u/cur" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_START")"
+PAYLOAD_CURSOR_TOOL='{"session_id":"x","cwd":"","hook_event_name":"postToolUse","workspace_roots":["/home/u/cur"]}'
+assert_eq "extract cwd falls through cursor empty cwd" "/home/u/cur" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_TOOL")"
 
 antigravity_initial() {
     if ai_memory_antigravity_is_initial_invocation "$1"; then

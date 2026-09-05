@@ -74,7 +74,8 @@ ai_memory_parse_toml_flag() {
 # Returns the value or nothing. This is intentionally a tiny shell fallback,
 # not a JSON parser; taking the first match preserves the top-level cwd when
 # tool payloads contain nested `cwd` fields later in the object. Antigravity
-# CLI sends `workspacePaths: ["/repo", ...]` instead of `cwd`.
+# CLI sends `workspacePaths: ["/repo", ...]` instead of `cwd`; Cursor sends
+# `workspace_roots: ["/repo", ...]`.
 # Undo the JSON string escapes that can appear in a path value: \\ -> \
 # and \/ -> /. Windows payloads carry cwd as "C:\\dev\\proj"; without this
 # the doubled backslashes leak into the query string (#188).
@@ -89,15 +90,26 @@ ai_memory_extract_cwd() {
         raw=$(printf '%s' "$rest" \
             | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
             | head -n 1)
-        ai_memory_json_unescape_path "$raw"
-        return 0
+        if [ -n "$raw" ]; then
+            ai_memory_json_unescape_path "$raw"
+            return 0
+        fi
     fi
-    rest=${payload#*\"workspacePaths\"}
-    [ "$rest" = "$payload" ] && return 0
-    raw=$(printf '%s' "$rest" \
-        | sed -n -E 's/^[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
-        | head -n 1)
-    ai_memory_json_unescape_path "$raw"
+    # Antigravity CLI sends `workspacePaths`, Cursor `workspace_roots`.
+    # Cursor never sends a usable `cwd`: `sessionStart` / `sessionEnd` omit it
+    # and its tool events send `cwd: ""`, so an empty match above must fall
+    # through to here rather than returning the empty string.
+    for key in workspacePaths workspace_roots; do
+        rest=${payload#*\"$key\"}
+        [ "$rest" = "$payload" ] && continue
+        raw=$(printf '%s' "$rest" \
+            | sed -n -E 's/^[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
+            | head -n 1)
+        if [ -n "$raw" ]; then
+            ai_memory_json_unescape_path "$raw"
+            return 0
+        fi
+    done
 }
 
 # Extract a harness-native session id from the common hook payload spellings.
