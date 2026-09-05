@@ -53,7 +53,7 @@ ai-memory-llm = { path = "crates/ai-memory-llm", version = "2.0.3" }
 ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "2.0.3" }
 ai-memory-web = { path = "crates/ai-memory-web", version = "2.0.3" }
 ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "2.0.3" }
-ai-memory-test-support = { path = "crates/ai-memory-test-support" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "2.0.3" }
 
 # (Workspace shared deps follow below)
 
