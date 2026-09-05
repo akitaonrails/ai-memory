@@ -61,8 +61,8 @@ jobs:
       - run: cargo test --workspace --all-targets
 
   # Native Windows coverage lives in `.github/workflows/windows.yml`: it
-  # runs on every push to main, nightly, on demand, and on any pull request
-  # carrying the `windows` label. It was ~1000s here against ~250s for the
+  # runs nightly, on demand, and on any pull request carrying the `windows`
+  # label. It was ~1000s here against ~250s for the
   # same tests on Linux, which meant every pull request waited roughly
   # seventeen minutes when every gating job below finishes in about eight —
   # and it was `continue-on-error`, so those extra minutes gated nothing.
