@@ -101,16 +101,26 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
     };
-    let cwd = direct(&["cwd", "current_dir", "working_dir", "directory"])
-        .or_else(|| {
+    // `workspacePaths` is Antigravity's spelling; `workspace_roots` is
+    // Cursor's. Cursor never sends a usable top-level `cwd` — `sessionStart`
+    // / `sessionEnd` omit it and its tool events send `cwd: ""` — so without
+    // this the whole session resolves to no cwd and lands in `default/scratch`.
+    let first_array_path = |keys: &[&str]| {
+        keys.iter().find_map(|key| {
             payload
-                .get("workspacePaths")
+                .get(*key)
                 .and_then(serde_json::Value::as_array)
-                .and_then(|paths| paths.first())
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty())
+                .and_then(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .find(|value| !value.trim().is_empty())
+                })
                 .map(str::to_owned)
         })
+    };
+    let cwd = direct(&["cwd", "current_dir", "working_dir", "directory"])
+        .or_else(|| first_array_path(&["workspacePaths", "workspace_roots"]))
         .or_else(|| {
             [
                 ["path", "cwd"].as_slice(),
@@ -704,6 +714,40 @@ mod tests {
         assert_eq!(
             canonical_context(&generated),
             (Some("/generated".into()), Some("nested".into()))
+        );
+    }
+
+    /// Cursor routes the workspace directory through `workspace_roots`:
+    /// `sessionStart` omits `cwd` entirely and tool events send `cwd: ""`.
+    /// Both must resolve, or every Cursor event reaches the server with no
+    /// cwd and is filed under the default `scratch` project. Shapes captured
+    /// live from Cursor CLI 2026.09.02-c22c1a3.
+    #[test]
+    fn canonical_context_reads_cursor_workspace_roots() {
+        let session_start = serde_json::json!({
+            "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "hook_event_name": "sessionStart",
+            "cursor_version": "2026.09.02-c22c1a3",
+            "workspace_roots": ["/checkouts/repo-a"]
+        });
+        assert_eq!(
+            canonical_context(&session_start),
+            (
+                Some("/checkouts/repo-a".into()),
+                Some("cf111450-8c45-4da1-a384-7a48e08099c3".into())
+            )
+        );
+
+        let tool_event = serde_json::json!({
+            "session_id": "cf111450-8c45-4da1-a384-7a48e08099c3",
+            "hook_event_name": "postToolUse",
+            "cursor_version": "2026.09.02-c22c1a3",
+            "cwd": "",
+            "workspace_roots": ["/checkouts/repo-a"]
+        });
+        assert_eq!(
+            canonical_context(&tool_event).0,
+            Some("/checkouts/repo-a".into())
         );
     }
 

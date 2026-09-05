@@ -7,16 +7,23 @@ function Get-AiMemoryCwd {
             $Value = $Parsed.$Name
             if ($Value -is [string] -and $Value.Length -gt 0) { return $Value }
         }
-        $Paths = $Parsed.workspacePaths
-        if ($null -ne $Paths -and $Paths.Count -gt 0 -and $Paths[0] -is [string] -and $Paths[0].Length -gt 0) {
-            return $Paths[0]
+        # `workspacePaths` is Antigravity's spelling, `workspace_roots`
+        # Cursor's. Cursor never sends a usable `cwd` (session events omit it,
+        # tool events send ""), so the empty checks above fall through here.
+        foreach ($Name in @("workspacePaths", "workspace_roots")) {
+            $Paths = $Parsed.$Name
+            if ($null -ne $Paths -and $Paths.Count -gt 0 -and $Paths[0] -is [string] -and $Paths[0].Length -gt 0) {
+                return $Paths[0]
+            }
         }
     } catch {
     }
-    $match = [regex]::Match($Payload, '"cwd"\s*:\s*"([^"]*)"')
+    $match = [regex]::Match($Payload, '"cwd"\s*:\s*"([^"]+)"')
     if ($match.Success) { return $match.Groups[1].Value }
-    $workspaceMatch = [regex]::Match($Payload, '"workspacePaths"\s*:\s*\[\s*"([^"]*)"')
-    if ($workspaceMatch.Success) { return $workspaceMatch.Groups[1].Value }
+    foreach ($Name in @("workspacePaths", "workspace_roots")) {
+        $workspaceMatch = [regex]::Match($Payload, '"' + $Name + '"\s*:\s*\[\s*"([^"]+)"')
+        if ($workspaceMatch.Success) { return $workspaceMatch.Groups[1].Value }
+    }
     return $null
 }
 
