@@ -731,6 +731,10 @@ volume.
 ai-memory reindex --data-dir <path>
 ```
 
+If reindex reports a missing scope `_meta.md`, the error includes its exact
+path. Restore the original DB, start and stop the current server once so its
+startup backfill writes missing manifests, then retry against a clean DB.
+
 Direct-disk lifecycle operation. Refuses if any sibling `ai-memory` process is
 alive, and also refuses if SQLite already contains rows. `reindex` is a
 rebuild-from-files path, not an in-place dirty-index repair.
