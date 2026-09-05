@@ -117,16 +117,40 @@ pub fn project_observations(
         };
     }
 
-    let mut selected = select_observation_indices(observations, cfg.max_selected_observations);
-    let mut rendered = render_projection(observations, &selected, cfg.per_body_excerpt_chars);
+    // Scores and rendered blocks depend only on an observation and its position
+    // in the full list, never on which other observations were selected, so
+    // both are computed once here. The prune loop below used to recompute
+    // every remaining score (each one scans the body) and re-render the whole
+    // text on every removal: quadratic, and 14s for 256 observations of 4k
+    // chars, in production consolidation as much as in the test.
+    let scores: Vec<i32> = observations
+        .iter()
+        .enumerate()
+        .map(|(idx, obs)| observation_score(obs, idx, observations.len()))
+        .collect();
+    let mut selected =
+        select_observation_indices(observations, cfg.max_selected_observations, &scores);
 
-    while rendered.text.chars().count() > cfg.max_total_chars && selected.len() > 1 {
-        let Some(remove_idx) = lowest_prunable_index(observations, &selected) else {
+    let block_chars: Vec<usize> = observations
+        .iter()
+        .enumerate()
+        .map(|(idx, obs)| {
+            render_observation_block(observations.len(), idx, obs, cfg.per_body_excerpt_chars)
+                .text
+                .chars()
+                .count()
+        })
+        .collect();
+    let mut total_chars: usize = selected.iter().map(|idx| block_chars[*idx]).sum();
+
+    while total_chars > cfg.max_total_chars && selected.len() > 1 {
+        let Some(remove_idx) = lowest_prunable_index(observations, &selected, &scores) else {
             break;
         };
         selected.retain(|idx| *idx != remove_idx);
-        rendered = render_projection(observations, &selected, cfg.per_body_excerpt_chars);
+        total_chars = total_chars.saturating_sub(block_chars[remove_idx]);
     }
+    let rendered = render_projection(observations, &selected, cfg.per_body_excerpt_chars);
 
     let omitted_count = observations.len().saturating_sub(selected.len());
     let mut text = rendered.text;
@@ -208,43 +232,61 @@ fn render_projection(
         let Some(obs) = observations.get(*idx) else {
             continue;
         };
-        let (body, truncated, omitted) = excerpt_body(&obs.body, per_body_excerpt_chars);
-        if truncated {
+        let block = render_observation_block(observations.len(), *idx, obs, per_body_excerpt_chars);
+        if block.truncated {
             truncated_bodies += 1;
         }
-        let title = cap_text_with_marker(&obs.title, MAX_RENDERED_TITLE_CHARS, "observation title");
-        text.push_str(&format!(
-            "\n--- observation {}/{} ---\nid: {}\nkind: {}\ntitle: {}\nimportance: {}\ncreated_at: {}\n",
-            idx + 1,
-            observations.len(),
-            obs.id,
-            obs.kind.as_str(),
-            title,
-            obs.importance,
-            obs.created_at,
-        ));
-        if let Some(extension) = obs.extension.as_deref().filter(|s| !s.trim().is_empty()) {
-            let extension = cap_text_with_marker(extension, MAX_RENDERED_SOURCE_CHARS, "extension");
-            text.push_str(&format!("extension: {extension}\n"));
-        }
-        if let Some(source_event) = obs.source_event.as_deref().filter(|s| !s.trim().is_empty()) {
-            let source_event =
-                cap_text_with_marker(source_event, MAX_RENDERED_SOURCE_CHARS, "source event");
-            text.push_str(&format!("source_event: {source_event}\n"));
-        }
-        text.push_str(&format!("body:\n{body}"));
-        if truncated {
-            text.push_str(&format!(
-                "\n[observation body truncated; {omitted} chars omitted; full original remains in SQLite as observation id {}]",
-                obs.id
-            ));
-        }
-        text.push('\n');
+        text.push_str(&block.text);
     }
     RenderedProjection {
         text,
         truncated_bodies,
     }
+}
+
+/// One observation's rendered block: header, optional provenance lines, body
+/// excerpt, and the truncation marker when the body was cut.
+struct RenderedBlock {
+    text: String,
+    truncated: bool,
+}
+
+fn render_observation_block(
+    total: usize,
+    idx: usize,
+    obs: &Observation,
+    per_body_excerpt_chars: usize,
+) -> RenderedBlock {
+    let (body, truncated, omitted) = excerpt_body(&obs.body, per_body_excerpt_chars);
+    let title = cap_text_with_marker(&obs.title, MAX_RENDERED_TITLE_CHARS, "observation title");
+    let mut text = format!(
+        "\n--- observation {}/{} ---\nid: {}\nkind: {}\ntitle: {}\nimportance: {}\ncreated_at: {}\n",
+        idx + 1,
+        total,
+        obs.id,
+        obs.kind.as_str(),
+        title,
+        obs.importance,
+        obs.created_at,
+    );
+    if let Some(extension) = obs.extension.as_deref().filter(|s| !s.trim().is_empty()) {
+        let extension = cap_text_with_marker(extension, MAX_RENDERED_SOURCE_CHARS, "extension");
+        text.push_str(&format!("extension: {extension}\n"));
+    }
+    if let Some(source_event) = obs.source_event.as_deref().filter(|s| !s.trim().is_empty()) {
+        let source_event =
+            cap_text_with_marker(source_event, MAX_RENDERED_SOURCE_CHARS, "source event");
+        text.push_str(&format!("source_event: {source_event}\n"));
+    }
+    text.push_str(&format!("body:\n{body}"));
+    if truncated {
+        text.push_str(&format!(
+            "\n[observation body truncated; {omitted} chars omitted; full original remains in SQLite as observation id {}]",
+            obs.id
+        ));
+    }
+    text.push('\n');
+    RenderedBlock { text, truncated }
 }
 
 fn excerpt_body(body: &str, max_chars: usize) -> (String, bool, usize) {
@@ -274,7 +316,11 @@ fn fit_text_to_budget(text: &str, max_chars: usize, marker: &str) -> String {
     out
 }
 
-fn select_observation_indices(observations: &[Observation], limit: usize) -> Vec<usize> {
+fn select_observation_indices(
+    observations: &[Observation],
+    limit: usize,
+    scores: &[i32],
+) -> Vec<usize> {
     if observations.len() <= limit {
         return (0..observations.len()).collect();
     }
@@ -290,8 +336,8 @@ fn select_observation_indices(observations: &[Observation], limit: usize) -> Vec
         .iter()
         .enumerate()
         .filter(|(idx, _)| !selected.contains(idx))
-        .map(|(idx, obs)| {
-            let mut score = observation_score(obs, idx, observations.len());
+        .map(|(idx, _)| {
+            let mut score = scores[idx];
             if even.contains(&idx) {
                 score += EVEN_SAMPLE_SCORE;
             }
@@ -326,17 +372,16 @@ fn even_sample_indices(total: usize) -> BTreeSet<usize> {
     out
 }
 
-fn lowest_prunable_index(observations: &[Observation], selected: &[usize]) -> Option<usize> {
+fn lowest_prunable_index(
+    observations: &[Observation],
+    selected: &[usize],
+    scores: &[i32],
+) -> Option<usize> {
     selected
         .iter()
         .copied()
         .filter(|idx| !is_hard_anchor(observations, *idx))
-        .map(|idx| {
-            (
-                observation_score(&observations[idx], idx, observations.len()),
-                idx,
-            )
-        })
+        .map(|idx| (scores[idx], idx))
         .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
         .map(|(_, idx)| idx)
 }

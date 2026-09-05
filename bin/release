@@ -56,11 +56,14 @@ cd "$REPO_ROOT"
 echo "==> cargo fmt --check"
 cargo fmt --all -- --check
 
+echo "==> git diff --check"
+git diff --check
+
 echo "==> cargo clippy"
 cargo clippy --workspace --all-targets -- -D warnings
 
-echo "==> cargo test"
-cargo test --workspace
+echo "==> cargo test --workspace --all-targets"
+cargo test --workspace --all-targets
 
 echo "==> cargo deny check (warn-only)"
 if command -v cargo-deny &>/dev/null; then

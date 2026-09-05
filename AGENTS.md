@@ -200,27 +200,96 @@ below.
 
 ## Build and test commands
 
-Rust 1.95 is required (the pinned toolchain installs automatically via
-rustup). Before claiming any Rust change is ready, run the full local
-gate — the same gates CI (`.github/workflows/ci.yml`) and `bin/release`
-enforce:
+Rust 1.95, pinned in `rust-toolchain.toml`; rustup selects it automatically.
+The build is self-contained (bundled SQLite, vendored libgit2, vendored
+Tailwind CSS), so no command below needs an environment variable.
+
+Two loops, and the split matters: iterate with the everyday tier, run the
+full gate once before handing work off.
 
 ```bash
-cargo fmt --all -- --check                                # formatting
-git diff --check                                          # whitespace
-TAILWIND_SKIP=1 cargo test --workspace                    # tests
-TAILWIND_SKIP=1 cargo clippy --workspace --all-targets -- -D warnings
-cargo deny check                                          # dependency policy (if installed)
+# Everyday loop (nextest: `cargo install cargo-nextest --locked`).
+cargo t                        # every shipped crate: 11 test binaries, ~20s warm
+cargo t -p ai-memory-store     # one crate: builds only its binary, ~5s
+cargo t -E 'test(/purge/)'     # one topic (still builds everything)
+
+# Before claiming a change is ready: the gates CI and bin/release enforce.
+cargo fmt --all -- --check
+git diff --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo tf                       # whole workspace, every test, slow tier included
+cargo deny check               # dependency policy (if installed)
 ```
 
-- `TAILWIND_SKIP=1` skips the Tailwind asset build in `ai-memory-web`'s
-  build script; use it for local test/clippy runs. CI's Linux/macOS test
-  job runs the full build without it.
+`cargo t` and `cargo tf` are aliases in `.cargo/config.toml` for
+`cargo nextest run` under the `default` and `full` profiles of
+`.config/nextest.toml`. Run them from the repo root. `cargo t` builds the
+workspace's default members, which is every shipped crate; the evals harness
+is two more test binaries that only `cargo tf`, the pre-push hook, and CI
+build (`--workspace`). Without nextest,
+`cargo test --workspace --all-targets` is what CI runs: everything, slower,
+no tiers.
+
+- **Slow tier.** A test whose module path has a segment starting with `slow`
+  or `stress` (`packaging::slow::*`, `stress_autoscope::*`) runs only under
+  `cargo tf`, the pre-push hook, and CI. Budget for everything else: about 1s
+  per test alone; the everyday profile lists anything over 5s in its summary.
+  Fix a slow test before tiering it: an injectable timeout, a smaller fixture,
+  `journal_mode=MEMORY` for a throwaway SQLite, an accept-and-close endpoint
+  instead of a closed port.
+- **Adding an integration test.** Put the file in the crate's `tests/suite/`
+  and declare it with `mod name;` in the entry file there. For every crate
+  but the CLI the entry is `mod.rs`, included from `src/lib.rs` under
+  `#[cfg(test)]`, so the tests compile into the lib's own harness and cost no
+  extra binary; the CLI keeps a separate `main.rs` target because its tests
+  run the built executable. Every test binary is a link and, on macOS and
+  Windows, a first-run malware scan, so each crate gets at most one. A
+  repo-layout test in the CLI suite fails on an undeclared file, a stray
+  top-level `tests/*.rs`, or a `mod.rs` that `lib.rs` never includes.
+- **Shared test helpers** live in `crates/ai-memory-test-support`
+  (dev-dependency only, no workspace dependencies, no test binary of its own).
+- **Pre-push hook.** `scripts/install-git-hooks.sh` (from Git Bash on Windows)
+  installs a hook that runs the full tier before every push and only touches
+  its own marked block in `.git/hooks/pre-push`. Bypass a work-in-progress
+  push with `git push --no-verify`.
+- **Regenerating the web stylesheet.** `TAILWIND_BUILD=1 cargo build -p
+  ai-memory-web` downloads the pinned Tailwind CLI and rewrites
+  `static/tailwind.css`; commit the result. CI regenerates it on Linux and
+  fails if the committed file is stale, so nothing else needs the download.
 - Run the companion importer separately:
   `cargo test --manifest-path companions/ai-memory-importer/Cargo.toml`
   (plus fmt/clippy on the same manifest). Root `--workspace` commands do
   not cover it.
-- Useful focused runs: `cargo test -p ai-memory-store`, etc.
+
+### Platform notes
+
+- **All.** `target/` grows without bound: every edit to a shared crate leaves
+  the previous copy of each 100-180 MB test binary behind (seen at 157 GiB).
+  `cargo install cargo-sweep --locked` once, then `cargo sweep --time 7`
+  weekly. Give rust-analyzer its own target dir
+  (`rust-analyzer.cargo.targetDir = true`) so a save-triggered check never
+  holds the lock a `cargo t` is waiting on.
+- **macOS.** `SSL_CERT_FILE=/etc/ssl/cert.pem cargo t` stops reqwest
+  re-reading the Keychain in every test process (workspace test time 75s to
+  41s); leave it unset if you rely on a private CA in your login Keychain.
+  After a `cargo clean`, `touch target/.metadata_never_index` keeps Spotlight
+  off the build artifacts.
+- **Windows, GNU toolchain.** Two per-machine fixes, each worth about 2x on
+  the loop. mingw's `ld` is ~3x slower than the lld the toolchain ships; in
+  `~/.cargo/config.toml`:
+
+  ```toml
+  [target.x86_64-pc-windows-gnu]
+  rustflags = ["-C", "link-arg=-fuse-ld=lld",
+               "-C", "link-arg=-B<sysroot>/lib/rustlib/x86_64-pc-windows-gnu/bin/gcc-ld"]
+  ```
+
+  with `<sysroot>` from `rustc --print sysroot`, forward slashes. And Defender
+  scans every freshly linked binary on first run (~1.7s each, which nextest
+  pays serially for all 11 before the first test starts); from an elevated
+  PowerShell: `Add-MpPreference -ExclusionPath "$PWD\target", "$HOME\.cargo",
+  "$HOME\.rustup"`.
+
 - Shell-level checks: `tests/hooks/test_lib.sh`,
   `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`.
 - CI additionally runs `cargo build --release --bin ai-memory` on
@@ -367,7 +436,8 @@ Additional boundary rules:
 - New disk+SQL mutations need recovery/rollback tests.
 - The recall-eval framework lives at
   `crates/ai-memory-consolidate/tests/recall_eval.rs`.
-- Tests run with `cargo test --workspace` (use `TAILWIND_SKIP=1` locally).
+- Tests run with `cargo t` locally and `cargo test --workspace --all-targets`
+  in CI.
 
 ## Security considerations
 

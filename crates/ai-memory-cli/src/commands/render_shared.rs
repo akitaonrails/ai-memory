@@ -1972,6 +1972,18 @@ mod tests {
         String::from_utf16(&utf16).expect("invalid UTF-16 PowerShell program")
     }
 
+    #[cfg(windows)]
+    fn command_for_available_powershell(command: &str, exe: &str) -> String {
+        if exe.eq_ignore_ascii_case("powershell.exe") {
+            command.to_owned()
+        } else {
+            format!(
+                "function powershell.exe {{ & {} @args }}; {command}",
+                powershell_quote(exe)
+            )
+        }
+    }
+
     fn build_posix_hook_payload(
         events: &[(&str, &str)],
         root: &Path,
@@ -2995,13 +3007,15 @@ $payload = [Console]::In.ReadToEnd()
             HookCommandContext::new(HookCommandPlatform::Windows, "antigravity-cli", None, None),
         );
 
-        let mut child = Command::new("powershell.exe")
+        let powershell = ai_memory_test_support::powershell_exe();
+        let outer_command = command_for_available_powershell(&command, powershell);
+        let mut child = Command::new(powershell)
             .args([
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                &command,
+                &outer_command,
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

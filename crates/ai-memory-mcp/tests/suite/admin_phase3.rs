@@ -7,24 +7,23 @@
 //! tmpdir-backed store + wiki, drive the router with
 //! `tower::ServiceExt::oneshot`.
 
+use super::common::{get, post};
 use ai_memory_core::{
     ActorContext, AgentKind, NewObservation, NewPage, NewSession, ObservationKind, PagePath,
     Sanitized, Sanitizer, SessionId, Tier,
 };
 use ai_memory_llm::SyntheticEmbedder;
-use ai_memory_mcp::{AdminState, admin_router};
+use ai_memory_mcp::AdminState;
 use ai_memory_store::{
     AutoImproveProposalOperation, AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal,
     StageAutoImproveRun, Store,
 };
 use ai_memory_wiki::Wiki;
 use ai_memory_wiki::WritePageRequest;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use serde_json::json;
 use std::sync::Arc;
 use tempfile::TempDir;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -66,27 +65,6 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
-}
-
-async fn post(state: AdminState, uri: &str, body: serde_json::Value) -> axum::response::Response {
-    let router = admin_router(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    router.oneshot(req).await.unwrap()
-}
-
-async fn get(state: AdminState, uri: &str) -> axum::response::Response {
-    let router = admin_router(state);
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    router.oneshot(req).await.unwrap()
 }
 
 fn telemetry_stage_input(

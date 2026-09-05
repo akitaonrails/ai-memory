@@ -102,3 +102,13 @@ pub use stored_token::StoredOAuthToken;
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, LlmOperationId, ReasoningEffort, Role, Usage,
 };
+
+// Integration tests compile into this crate's test harness instead of a
+// separate binary: every test binary is another link and, on macOS and
+// Windows, another first-run malware scan. They still exercise only the
+// public API; `extern crate self` lets them keep addressing it by crate name.
+#[cfg(test)]
+extern crate self as ai_memory_llm;
+#[cfg(test)]
+#[path = "../tests/suite/mod.rs"]
+mod integration;

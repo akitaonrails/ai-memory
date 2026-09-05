@@ -3,14 +3,13 @@
 //! the handler serves the store's faithful copy instead of 404ing
 //! (gotchas/read-page-by-query-misses), while real parse errors still surface.
 
+use super::common::get;
 use ai_memory_core::{NewPage, PagePath, Tier};
-use ai_memory_mcp::{AdminState, admin_router};
+use ai_memory_mcp::AdminState;
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::{Wiki, WritePageRequest};
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use tempfile::TempDir;
-use tower::ServiceExt;
 
 async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     let store = Store::open(tmp.path()).unwrap();
@@ -45,16 +44,6 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
-}
-
-async fn get(state: AdminState, uri: &str) -> axum::response::Response {
-    let router = admin_router(state);
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    router.oneshot(req).await.unwrap()
 }
 
 /// A page present in the store but NOT on disk (the index is ahead of the

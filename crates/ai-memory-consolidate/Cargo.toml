@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Karpathy-style ingest / query / lint consolidation pipeline."
+# One integration-test binary instead of one per file. Each binary
+# statically links the whole dep graph and gets scanned by macOS on
+# first run.
 
 [dependencies]
 ai-memory-core.workspace = true
@@ -25,6 +28,7 @@ tracing.workspace = true
 jiff.workspace = true
 
 [dev-dependencies]
+ai-memory-test-support.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true

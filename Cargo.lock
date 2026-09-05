@@ -41,6 +41,7 @@ dependencies = [
  "ai-memory-llm",
  "ai-memory-mcp",
  "ai-memory-store",
+ "ai-memory-test-support",
  "ai-memory-web",
  "ai-memory-wiki",
  "ai-memory-workstream",
@@ -85,6 +86,7 @@ dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
  "ai-memory-store",
+ "ai-memory-test-support",
  "ai-memory-wiki",
  "anyhow",
  "async-trait",
@@ -147,6 +149,7 @@ dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
  "ai-memory-store",
+ "ai-memory-test-support",
  "ai-memory-wiki",
  "anyhow",
  "async-trait",
@@ -185,7 +188,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
- "tokenizers 0.21.4",
+ "tokenizers",
  "tokio",
  "tracing",
  "uuid",
@@ -249,6 +252,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "ai-memory-test-support"
+version = "2.0.3"
 
 [[package]]
 name = "ai-memory-web"
@@ -666,7 +673,7 @@ dependencies = [
  "rayon",
  "safetensors",
  "thiserror 2.0.18",
- "tokenizers 0.22.2",
+ "tokenizers",
  "yoke",
  "zerocopy",
  "zip",
@@ -3998,39 +4005,6 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenizers"
-version = "0.21.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a620b996116a59e184c2fa2dfd8251ea34a36d0a514758c6f966386bd2e03476"
-dependencies = [
- "ahash",
- "aho-corasick",
- "compact_str",
- "dary_heap",
- "derive_builder",
- "esaxx-rs",
- "fancy-regex 0.14.0",
- "getrandom 0.3.4",
- "itertools",
- "log",
- "macro_rules_attribute",
- "monostate",
- "paste",
- "rand 0.9.4",
- "rayon",
- "rayon-cond",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "spm_precompiled",
- "thiserror 2.0.18",
- "unicode-normalization-alignments",
- "unicode-segmentation",
- "unicode_categories",
-]
-
-[[package]]
-name = "tokenizers"
 version = "0.22.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b238e22d44a15349529690fb07bd645cf58149a1b1e44d6cb5bd1641ff1a6223"
@@ -4041,6 +4015,7 @@ dependencies = [
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
+ "fancy-regex 0.14.0",
  "getrandom 0.3.4",
  "itertools",
  "log",

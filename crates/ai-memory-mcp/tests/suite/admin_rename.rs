@@ -4,6 +4,7 @@
 //! [`AdminState`] over a tmpdir-backed store + wiki, drive the router
 //! with `tower::ServiceExt::oneshot`.
 
+use super::common::post;
 use ai_memory_core::{PagePath, Tier};
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
@@ -51,17 +52,6 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
-}
-
-async fn post(state: AdminState, uri: &str, body: serde_json::Value) -> axum::response::Response {
-    let router = admin_router(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    router.oneshot(req).await.unwrap()
 }
 
 /// Seed `default/old-name` with one page. Returns the page path.

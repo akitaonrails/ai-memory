@@ -5,11 +5,13 @@
 //! the right design for SQLite but does make one question worth answering with
 //! a number: at what point does a shared server stop keeping up?
 //!
-//! Run it on demand; it is `#[ignore]`d so a throughput measurement never
-//! becomes a flaky CI gate on a loaded runner:
+//! This is the `stress` tier: the everyday nextest profile skips it and
+//! `-P full`, the pre-push hook, and CI run it. The measurement itself is also
+//! `#[ignore]`d so a throughput number never becomes a flaky gate on a loaded
+//! runner; run it on demand:
 //!
 //! ```text
-//! cargo test -p ai-memory-store --test writer_throughput -- --ignored --nocapture
+//! cargo nextest run -p ai-memory-store -E 'test(/stress_writer_throughput/)' --run-ignored all --no-capture
 //! ```
 
 use std::time::Instant;
@@ -74,7 +76,7 @@ fn observation(
 /// Reported as observations/second plus the implied budget in concurrent
 /// agents, taking one tool call per agent-second as a deliberately pessimistic
 /// stand-in for an actively working harness.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "throughput measurement; run explicitly"]
 async fn writer_throughput_under_concurrent_load() {
     let tmp = tempfile::tempdir().unwrap();
@@ -117,7 +119,7 @@ async fn writer_throughput_under_concurrent_load() {
 /// queue applies backpressure rather than dropping work or growing without
 /// limit. This asserts the property that matters operationally: every write in
 /// an over-queue burst lands.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_burst_larger_than_the_queue_applies_backpressure_and_loses_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(tmp.path()).unwrap();

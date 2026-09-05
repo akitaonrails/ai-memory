@@ -167,6 +167,6 @@ Run the repository's complete Rust gate before requesting review:
 ```bash
 cargo fmt --check
 git diff --check
-TAILWIND_SKIP=1 cargo test --workspace
-TAILWIND_SKIP=1 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```

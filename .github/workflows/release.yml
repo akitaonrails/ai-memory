@@ -83,8 +83,6 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Build release binary
-        env:
-          TAILWIND_SKIP: "1"
         run: cargo build --locked --release -p ai-memory-cli
 
       - name: Create release tarball
@@ -140,8 +138,6 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Build release binary
-        env:
-          TAILWIND_SKIP: "1"
         run: cargo build --locked --release -p ai-memory-cli
 
       # Mirrors the Linux tarball, swapping the Linux-only service assets
@@ -214,8 +210,6 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Build release binary
-        env:
-          TAILWIND_SKIP: "1"
         run: cargo build --locked --release -p ai-memory-cli
 
       # Mirrors the Linux tarball, minus the Linux-only service assets

@@ -26,3 +26,13 @@ pub use markdown::{Markdown, derive_title, emit, parse};
 pub use migrations::run_pending as run_wiki_migrations;
 pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{MoveSessionOutcome, SessionPageFile, Wiki, WritePageRequest};
+
+// Integration tests compile into this crate's test harness instead of a
+// separate binary: every test binary is another link and, on macOS and
+// Windows, another first-run malware scan. They still exercise only the
+// public API; `extern crate self` lets them keep addressing it by crate name.
+#[cfg(test)]
+extern crate self as ai_memory_wiki;
+#[cfg(test)]
+#[path = "../tests/suite/mod.rs"]
+mod integration;
