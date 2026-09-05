@@ -32,19 +32,23 @@ pub const SNIPPET_BODY: &str = r#"
 This project uses [ai-memory](https://github.com/akitaonrails/ai-memory)
 for cross-session continuity.
 
-**Default to the current project - always.** Every ai-memory tool
-auto-scopes to the project resolved from your session's working
-directory. **Do NOT pass `project`, `workspace`, or `cwd` arguments unless
-the user explicitly references a *different* project by name** (e.g. "what
-did we decide in the `other-app` project?"). Phrases like "this project",
-"here", "we", "our work", and "where did we leave off" all mean the
-*current* project, so call tools with no scoping args.
+**Choose project scope from the MCP client's identity support.**
 
-This default assumes the MCP client can identify the current agent
-session. Static MCP clients in parallel sessions for the same user cannot
-forward the real agent session id automatically; pass explicit
-`workspace` + `project` / `scopes`, or use a session-aware bridge that
-forwards the lifecycle-hook session id on MCP calls.
+- **Session-aware MCP clients** that forward the real lifecycle-hook session id
+  on every request should use automatic current-project routing. Omit `workspace`,
+  `project`, and `cwd` for the current repository; pass explicit scope only when
+  the user names a different project.
+- **Static MCP clients** (including clients with lifecycle hooks but no bridge
+  connecting that hook session id to MCP requests) must pass `workspace` and
+  `project` together on every project-scoped call, including requests about "this
+  project", "here", or "our work". Read the exact names from the nearest
+  `.ai-memory.toml` when it declares both. If it does not, obtain the names from
+  the operator or server configuration; never guess them from a directory name
+  and never rely on the server's last active project.
+
+This rule applies only to project-scoped calls. For cross-project retrieval,
+`global=true` must omit `workspace`, `project`, and `scopes`. For a standing
+preference written with `scope: "global"`, omit `workspace` and `project`.
 
 **Lifecycle hooks already capture sanitized, bounded prompt and tool-lifecycle
 observations automatically.** They are not complete native transcripts;
@@ -202,6 +206,18 @@ mod tests {
         assert_eq!(block.matches(MARKER_START).count(), 1);
         assert_eq!(block.matches(MARKER_END).count(), 1);
         assert!(block.trim_end().ends_with(MARKER_END));
+    }
+
+    #[test]
+    fn snippet_distinguishes_session_aware_and_static_scope_routing() {
+        assert!(SNIPPET_BODY.contains("Session-aware MCP clients"));
+        assert!(SNIPPET_BODY.contains("Static MCP clients"));
+        assert!(SNIPPET_BODY.contains("must pass `workspace` and"));
+        assert!(SNIPPET_BODY.contains("`project` together on every project-scoped call"));
+        assert!(SNIPPET_BODY.contains("nearest\n  `.ai-memory.toml`"));
+        assert!(SNIPPET_BODY.contains("never rely on the server's last active project"));
+        assert!(SNIPPET_BODY.contains("`global=true` must omit"));
+        assert!(SNIPPET_BODY.contains("`scope: \"global\"`"));
     }
 
     /// The committed root `AGENTS.md` carries this managed block between the

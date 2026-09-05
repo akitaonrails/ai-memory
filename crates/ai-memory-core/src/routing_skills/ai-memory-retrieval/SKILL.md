@@ -18,9 +18,14 @@ Use this skill for read-only ai-memory lookups, catch-up, and evaluating remembe
 - `memory_briefing` returns a structured read-only snapshot for agent consumption.
 - `memory_explore` returns a prose digest when the user asks for an open-ended catch-up.
 
-## Scope default
+## Project scope
 
-Default to the current project. The tools auto-scope from the working directory, so omit project, workspace, and cwd arguments unless the user explicitly names a different project. Phrases like this project, here, we, our work, and where did we leave off mean the current project.
+Choose scope from the MCP client's identity support:
+
+- **Session-aware MCP clients** that forward the real lifecycle-hook session id on every request should use automatic current-project routing. Omit `workspace`, `project`, and `cwd` for the current repository; pass explicit scope only when the user names a different project.
+- **Static MCP clients** (including clients with lifecycle hooks but no bridge connecting that hook session id to MCP requests) must pass `workspace` and `project` together on every project-scoped call, including requests about this project, here, or our work. Read the exact names from the nearest `.ai-memory.toml` when it declares both. If it does not, obtain the names from the operator or server configuration; never guess them from a directory name and never rely on the server's last active project.
+
+This rule applies only to project-scoped calls. For cross-project retrieval, `global=true` must omit `workspace`, `project`, and `scopes`. For a standing preference written with `scope: "global"`, omit `workspace` and `project`.
 
 ## Choose the smallest useful lookup
 
