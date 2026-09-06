@@ -1,13 +1,13 @@
-//! Integration tests for `POST /admin/purge-project`.
+//! Integration tests for destructive admin purge endpoints.
 //!
 //! Follows the same pattern as `admin_phase3.rs`: build a real
 //! [`AdminState`] over a tmpdir-backed store + wiki, drive the router
 //! with `tower::ServiceExt::oneshot`.
 
-use super::common::post;
+use super::common::{get, post, spawn_capture_hook};
 use ai_memory_core::{
-    AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath, ProjectId,
-    Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
+    ActorContext, AgentKind, NewHandoff, NewObservation, NewSession, ObservationKind, PagePath,
+    ProjectId, Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_mcp::AdminState;
 use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
@@ -18,7 +18,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::post as route_post;
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -26,8 +26,18 @@ use tempfile::TempDir;
 // ---------------------------------------------------------------------------
 
 async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
+    make_state_with_chain(tmp, None).await
+}
+
+async fn make_state_with_chain(
+    tmp: &TempDir,
+    chain: Option<AdmissionChain>,
+) -> (AdminState, Store) {
     let store = Store::open(tmp.path()).unwrap();
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    let mut wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    if let Some(chain) = chain {
+        wiki = wiki.with_admission_chain(chain);
+    }
     let db_path = store.db_path().to_path_buf();
     let state = AdminState {
         ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
@@ -58,6 +68,83 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+async fn post_purge_session(
+    state: AdminState,
+    workspace: &str,
+    project: &str,
+    session_id: SessionId,
+) -> axum::response::Response {
+    post(
+        state,
+        "/admin/purge-session",
+        json!({
+            "workspace": workspace,
+            "project": project,
+            "session_id": session_id.to_string(),
+            "confirm": true,
+        }),
+    )
+    .await
+}
+
+async fn seed_ended_session_summary(
+    store: &Store,
+    wiki: &Wiki,
+    workspace: &str,
+    project: &str,
+    session_id: SessionId,
+    body: &str,
+) -> (WorkspaceId, ProjectId, PagePath, PathBuf) {
+    let ws = store
+        .writer
+        .get_or_create_workspace(workspace)
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, project, None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .begin_session(NewSession {
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+
+    let page_path = PagePath::new(format!("sessions/{session_id}.md")).unwrap();
+    let page_id = wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: page_path.clone(),
+            frontmatter: json!({"title": "Session summary"}),
+            body: body.into(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: Some("Session summary".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .end_session(session_id, Some(page_id))
+        .await
+        .unwrap();
+
+    let summary_file = wiki.abs_path(ws, proj, &page_path);
+    (ws, proj, page_path, summary_file)
 }
 
 /// Seed two projects (`default/keep` and `default/doomed`), each with one
@@ -176,6 +263,163 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn purge_session_removes_session_summary_file_from_disk() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let session_id = SessionId::new();
+    let (_ws, _proj, page_path, summary_file) = seed_ended_session_summary(
+        &store,
+        &state.wiki,
+        "default",
+        "audit",
+        session_id,
+        "session summary body",
+    )
+    .await;
+
+    assert!(summary_file.exists(), "setup must create the summary file");
+
+    let resp = post_purge_session(state.clone(), "default", "audit", session_id).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["removed_paths"], json!([page_path.as_str()]));
+    assert_eq!(body["files_deleted"], json!([page_path.as_str()]));
+    assert_eq!(body["files_failed"], json!([]));
+    assert!(
+        !summary_file.exists(),
+        "purge-session must remove the wiki source file, not only DB rows"
+    );
+
+    let read = get(
+        state,
+        &format!(
+            "/admin/read-page?workspace=default&project=audit&path={}",
+            page_path.as_str()
+        ),
+    )
+    .await;
+    assert_eq!(
+        read.status(),
+        StatusCode::NOT_FOUND,
+        "a purged session page must not remain readable from disk"
+    );
+}
+
+#[tokio::test]
+async fn purge_session_keeps_same_path_in_sibling_project() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let session_id = SessionId::new();
+    let (ws, _target, page_path, target_file) = seed_ended_session_summary(
+        &store,
+        &state.wiki,
+        "default",
+        "audit",
+        session_id,
+        "target session summary",
+    )
+    .await;
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "keep", None)
+        .await
+        .unwrap();
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: sibling,
+            path: page_path.clone(),
+            frontmatter: json!({"title": "Sibling summary"}),
+            body: "sibling session summary".into(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: Some("Sibling summary".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+    let sibling_file = state.wiki.abs_path(ws, sibling, &page_path);
+    assert!(target_file.exists(), "setup must create target file");
+    assert!(sibling_file.exists(), "setup must create sibling file");
+
+    let resp = post_purge_session(state.clone(), "default", "audit", session_id).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!target_file.exists(), "target session file must be removed");
+    assert!(
+        sibling_file.exists(),
+        "same relative path in a sibling project must survive"
+    );
+
+    let read = get(
+        state,
+        &format!(
+            "/admin/read-page?workspace=default&project=keep&path={}",
+            page_path.as_str()
+        ),
+    )
+    .await;
+    assert_eq!(
+        read.status(),
+        StatusCode::OK,
+        "sibling project page must remain readable"
+    );
+}
+
+/// The SQL purge must commit even when the page file cannot be removed, and
+/// async `purge_session` observers must learn that the disk still holds it.
+#[tokio::test]
+async fn purge_session_reports_file_cleanup_failure_after_db_commit() {
+    let (url, rx) = spawn_capture_hook().await;
+
+    let tmp = TempDir::new().unwrap();
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "async-mirror".into(),
+        url,
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::PurgeSession],
+        blocking: false,
+    }])
+    .unwrap();
+    let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
+    let session_id = SessionId::new();
+    let (_ws, _proj, page_path, summary_file) = seed_ended_session_summary(
+        &store,
+        &state.wiki,
+        "default",
+        "audit",
+        session_id,
+        "session summary body",
+    )
+    .await;
+    std::fs::remove_file(&summary_file).unwrap();
+    std::fs::create_dir(&summary_file).unwrap();
+
+    let resp = post_purge_session(state, "default", "audit", session_id).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["removed_paths"], json!([page_path.as_str()]));
+    assert_eq!(body["files_deleted"], json!([]));
+    assert_eq!(body["files_failed"], json!([page_path.as_str()]));
+    assert!(
+        summary_file.is_dir(),
+        "failed cleanup must be reported without pretending the file path was removed"
+    );
+
+    let payload = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+        .await
+        .expect("async purge_session dispatch should fire")
+        .unwrap();
+    assert_eq!(payload["ctx"]["op"], "purge_session");
+    assert_eq!(payload["ctx"]["workspace"], "default");
+    assert_eq!(payload["ctx"]["project"], "audit");
+    assert_eq!(payload["ctx"]["partial_failure"], true);
+}
 
 /// Missing `confirm: true` must return 400.
 #[tokio::test]

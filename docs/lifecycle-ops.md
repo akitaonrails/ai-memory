@@ -48,6 +48,7 @@ regulatory erasure request rather than tidying up:
 |---|---|---|
 | Reachable through the API / MCP tools | no | no |
 | Returned by search (FTS) | no | no |
+| Live wiki Markdown file | no, best-effort | no, best-effort |
 | Bytes still present in `memory.sqlite` | **yes**, in free pages | no |
 | Text still in the wiki git history | **yes** | **yes** |
 | Present in backups taken before the purge | **yes** | **yes** |
@@ -97,7 +98,12 @@ derived pages are deleted by **id** rather than by path — two projects can
 hold the same `sessions/<uuid>.md`, and deleting by path would take the other
 one with it. `/admin/purge-session` runs the admission chain before any row is
 touched, so a `failure_policy = reject` webhook can still abort the whole
-operation while the data is intact.
+operation while the data is intact. After the SQL transaction commits, the
+server removes only the returned page paths under that same UUID-keyed project
+root; the response keeps `removed_paths` for the logical DB purge and reports
+actual cleanup in `files_deleted` / `files_failed`. If filesystem removal fails,
+the DB purge is not rolled back, the call still returns 200 with `files_failed`
+populated, and async `purge_session` observers receive `partial_failure: true`.
 
 
 ## What "project isolation" means here
