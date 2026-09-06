@@ -423,12 +423,15 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         println!("capture mode: {capture_mode}");
         if capture_mode == "allowlist" {
             println!("  repositories without a .ai-memory.toml marker emit no lifecycle events");
-            // The gate lives inside the native hook binary, immediately before
-            // the spool write. A script install POSTs to the server directly
-            // and never runs it, so the mode is stored but unenforced. Saying
-            // nothing would leave an operator trusting a protection this
-            // install does not have — the exact failure #446 is about.
-            if !local_hook_policy_v1_supported() {
+            // The gate runs inside the native hook binary (immediately before
+            // the spool write) and, since #661, inside the generated
+            // TypeScript integrations' shared `capturePolicy` (before any
+            // POST). The only install left that reaches the server with no
+            // gate at all is the raw script fallback: it POSTs directly and
+            // never runs either enforcement point. Saying nothing would leave
+            // an operator trusting a protection this install does not have —
+            // the exact failure #446 is about.
+            if !generated && !local_hook_policy_v1_supported() {
                 println!(
                     "  WARNING: this install uses script hooks, which POST directly and \
                      cannot enforce the mode. Allowlist is stored but NOT in force here."
@@ -445,10 +448,14 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         // per-agent plumbing.
         args.project_strategy = install_project_strategy(&args);
         return match args.agent {
-            AgentChoice::OpenCode => apply_to_opencode_plugin(&server_url, auth, &args),
-            AgentChoice::OpenCode2 => apply_to_opencode2_plugin(&server_url, auth, &args),
-            AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args),
-            AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args),
+            AgentChoice::OpenCode => {
+                apply_to_opencode_plugin(&server_url, auth, &args, &capture_mode)
+            }
+            AgentChoice::OpenCode2 => {
+                apply_to_opencode2_plugin(&server_url, auth, &args, &capture_mode)
+            }
+            AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args, &capture_mode),
+            AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args, &capture_mode),
             AgentChoice::ClaudeCode => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -509,7 +516,9 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_devin_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
-            AgentChoice::Openclaw => openclaw_plugin::apply(&server_url, auth, &args),
+            AgentChoice::Openclaw => {
+                openclaw_plugin::apply(&server_url, auth, &args, &capture_mode)
+            }
             AgentChoice::KimiCode => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -539,13 +548,24 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    // Preview must bake the same `CAPTURE_MODE` the next `--apply` would
+    // persist (#661) — resolved read-only so a bare preview never writes.
+    let preview_capture_mode = resolve_capture_mode(&config.data_dir, args.capture_mode);
     match args.agent {
-        AgentChoice::OpenCode => render_opencode_plugin(&server_url, auth, strategy),
-        AgentChoice::OpenCode2 => render_opencode2_plugin(&server_url, auth, strategy),
-        AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy),
-        AgentChoice::Omp => {
-            render_omp_extension(&server_url, auth, strategy, args.profile.as_deref())
+        AgentChoice::OpenCode => {
+            render_opencode_plugin(&server_url, auth, strategy, &preview_capture_mode)
         }
+        AgentChoice::OpenCode2 => {
+            render_opencode2_plugin(&server_url, auth, strategy, &preview_capture_mode)
+        }
+        AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy, &preview_capture_mode),
+        AgentChoice::Omp => render_omp_extension(
+            &server_url,
+            auth,
+            strategy,
+            args.profile.as_deref(),
+            &preview_capture_mode,
+        ),
         AgentChoice::ClaudeCode => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -639,7 +659,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             render_devin(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
         AgentChoice::Openclaw => {
-            openclaw_plugin::render(&server_url, auth, strategy);
+            openclaw_plugin::render(&server_url, auth, strategy, &preview_capture_mode);
             Ok(())
         }
         AgentChoice::KimiCode => {
@@ -690,6 +710,26 @@ fn install_project_strategy(args: &InstallHooksArgs) -> Option<ProjectStrategyAr
         .and_then(|existing| baked_project_strategy(args.agent, existing))
 }
 
+/// The capture failure mode (#446) currently in force: an explicit
+/// `--capture-mode` flag wins, otherwise the value stored under `data_dir`
+/// from an earlier `--apply`, otherwise the historical `denylist` default.
+/// Read-only — used by both [`persist_capture_mode`] and the print-only
+/// preview path so a preview's baked `CAPTURE_MODE` matches what the next
+/// `--apply` would actually persist (#661).
+fn resolve_capture_mode(data_dir: &Path, requested: Option<CaptureModeArg>) -> String {
+    let Some(requested) = requested else {
+        let path = data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE);
+        return match fs::read_to_string(&path) {
+            Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => "allowlist".to_string(),
+            _ => "denylist".to_string(),
+        };
+    };
+    match requested {
+        CaptureModeArg::Allowlist => "allowlist".to_string(),
+        CaptureModeArg::Denylist => "denylist".to_string(),
+    }
+}
+
 /// Settle and persist the capture failure mode (#446), returning the mode now
 /// in force.
 ///
@@ -698,26 +738,19 @@ fn install_project_strategy(args: &InstallHooksArgs) -> Option<ProjectStrategyAr
 /// auto-refresh inside `ai-memory upgrade` — can never quietly downgrade an
 /// existing opt-in back to capture-by-default.
 fn persist_capture_mode(data_dir: &Path, requested: Option<CaptureModeArg>) -> Result<String> {
-    let path = data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE);
-    let Some(requested) = requested else {
-        return Ok(match fs::read_to_string(&path) {
-            Ok(text) if text.trim().eq_ignore_ascii_case("allowlist") => "allowlist".to_string(),
-            _ => "denylist".to_string(),
-        });
-    };
-    let value = match requested {
-        CaptureModeArg::Allowlist => "allowlist",
-        CaptureModeArg::Denylist => "denylist",
-    };
-    fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
-    // Atomically, because every reader maps an unrecognised value onto
-    // `denylist`: a torn write would not corrupt the opt-in, it would silently
-    // revert it to capture-by-default (`CONTRIBUTING.md`, "Atomic file writes
-    // only").
-    ai_memory_wiki::write_atomic(&path, format!("{value}\n").as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(value.to_string())
+    let value = resolve_capture_mode(data_dir, requested);
+    if requested.is_some() {
+        let path = data_dir.join(crate::commands::hook::CAPTURE_MODE_FILE);
+        fs::create_dir_all(data_dir)
+            .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+        // Atomically, because every reader maps an unrecognised value onto
+        // `denylist`: a torn write would not corrupt the opt-in, it would
+        // silently revert it to capture-by-default (`CONTRIBUTING.md`,
+        // "Atomic file writes only").
+        ai_memory_wiki::write_atomic(&path, format!("{value}\n").as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(value)
 }
 
 /// Whether the Claude Code install should include its prompt-capture hook.
@@ -2739,13 +2772,14 @@ fn apply_to_opencode_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
+    capture_mode: &str,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => opencode_plugin_path()?,
     };
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
-    let body = build_opencode_plugin(server_url, auth_token, strategy);
+    let body = build_opencode_plugin(server_url, auth_token, strategy, capture_mode);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
     println!(
@@ -2771,6 +2805,7 @@ fn render_opencode_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> Result<()> {
     println!("// OpenCode plugin — write to ~/.config/opencode/plugins/ai-memory.ts");
     println!("// Or re-run with `--apply` to install it automatically.");
@@ -2778,7 +2813,7 @@ fn render_opencode_plugin(
     println!();
     println!(
         "{}",
-        build_opencode_plugin(server_url, auth_token, project_strategy)
+        build_opencode_plugin(server_url, auth_token, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -2810,13 +2845,14 @@ fn apply_to_opencode2_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
+    capture_mode: &str,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => opencode2_plugin_path()?,
     };
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
-    let body = build_opencode2_plugin(server_url, auth_token, strategy)?;
+    let body = build_opencode2_plugin(server_url, auth_token, strategy, capture_mode)?;
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
     println!(
@@ -2842,6 +2878,7 @@ fn render_opencode2_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> Result<()> {
     println!(
         "// OpenCode 2.0 beta plugin — write to ~/.config/opencode/plugins/ai-memory-opencode2.ts"
@@ -2851,7 +2888,7 @@ fn render_opencode2_plugin(
     println!();
     println!(
         "{}",
-        build_opencode2_plugin(server_url, auth_token, project_strategy)?
+        build_opencode2_plugin(server_url, auth_token, project_strategy, capture_mode)?
     );
     Ok(())
 }
@@ -2866,8 +2903,9 @@ fn build_opencode2_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> Result<String> {
-    let v1 = build_opencode_plugin(server_url, auth_token, project_strategy);
+    let v1 = build_opencode_plugin(server_url, auth_token, project_strategy, capture_mode);
     const BANNER_V1: &str =
         "// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.";
     const BANNER_V2: &str =
@@ -3240,12 +3278,13 @@ fn build_opencode_plugin(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> String {
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
     let apply_marker_params = ts_apply_marker_params(project_strategy);
-    let capture_policy = ts_capture_policy_v1();
+    let capture_policy = ts_capture_policy_v1(capture_mode);
     let body = format!(
         r#"// Auto-generated by `ai-memory install-hooks --agent opencode --apply`.
 // Edit by re-running the command, not by hand — install-hooks
@@ -3709,10 +3748,11 @@ fn apply_to_omp_extension(
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
+    capture_mode: &str,
 ) -> Result<()> {
     let path = resolve_omp_extension_path(args)?;
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
-    let body = build_omp_extension(server_url, auth_token, strategy);
+    let body = build_omp_extension(server_url, auth_token, strategy, capture_mode);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
     println!(
@@ -3769,6 +3809,7 @@ fn render_omp_extension(
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
     profile: Option<&str>,
+    capture_mode: &str,
 ) -> Result<()> {
     println!(
         "// Oh My Pi / OMP extension — write to {}",
@@ -3779,7 +3820,7 @@ fn render_omp_extension(
     println!();
     println!(
         "{}",
-        build_omp_extension(server_url, auth_token, project_strategy)
+        build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -3801,10 +3842,11 @@ fn apply_to_pi_extension(
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
+    capture_mode: &str,
 ) -> Result<()> {
     let path = resolve_pi_extension_path(args)?;
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
-    let body = build_pi_extension(server_url, auth_token, strategy);
+    let body = build_pi_extension(server_url, auth_token, strategy, capture_mode);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
     println!(
@@ -3833,6 +3875,7 @@ fn render_pi_extension(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> Result<()> {
     println!(
         "// Pi extension — write to {}",
@@ -3843,7 +3886,7 @@ fn render_pi_extension(
     println!();
     println!(
         "{}",
-        build_pi_extension(server_url, auth_token, project_strategy)
+        build_pi_extension(server_url, auth_token, project_strategy, capture_mode)
     );
     Ok(())
 }
@@ -3859,8 +3902,9 @@ fn build_pi_extension(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> String {
-    let lifecycle = build_omp_extension(server_url, auth_token, project_strategy)
+    let lifecycle = build_omp_extension(server_url, auth_token, project_strategy, capture_mode)
         .replace("install-hooks --agent omp --apply", "install-hooks --agent pi --apply")
         .replace("const AGENT = \"omp\";", "const AGENT = \"pi\";")
         .replace(
@@ -3973,12 +4017,13 @@ fn build_omp_extension(
     server_url: &str,
     auth_token: Option<&str>,
     project_strategy: Option<&str>,
+    capture_mode: &str,
 ) -> String {
     let token_line = auth_token
         .map(|t| format!("const TOKEN: string | null = {};\n", ts_string_literal(t)))
         .unwrap_or_else(|| "const TOKEN: string | null = null;\n".to_string());
     let apply_marker_params = ts_apply_marker_params(project_strategy);
-    let capture_policy = ts_capture_policy_v1();
+    let capture_policy = ts_capture_policy_v1(capture_mode);
     let body = format!(
         r#"// Auto-generated by `ai-memory install-hooks --agent omp --apply`.
 // Edit by re-running the command, not by hand — install-hooks
@@ -5521,6 +5566,17 @@ fn apply_to_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The marker-presence admit gate the shared `ts_capture_policy_v1`
+    /// template bakes into `capturePolicy` (#661). Under allowlist a
+    /// repository with no `.ai-memory.toml` marker must emit nothing —
+    /// mirroring `repository_admits_capture` in
+    /// `ai-memory-hooks::capture_policy`, the gate hook.rs's native path
+    /// runs before any per-event disposition. Keyed on `findMarker(cwd)`
+    /// presence rather than `config.state`, so a marker with an empty
+    /// `[capture]` section — `state` is "inactive" either way — still admits
+    /// capture.
+    const CAPTURE_ADMIT_GATE_TS: &str = "const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === \"allowlist\" && !markerPresent) return { disposition: \"drop\", payload };";
 
     /// #446's binding requirement: "a protection that disappears on upgrade
     /// without saying so is worse than no protection". A bare `--apply` — what
@@ -7751,15 +7807,15 @@ model = "gpt-5"
         for (name, source) in [
             (
                 "opencode",
-                build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None),
+                build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist"),
             ),
             (
                 "omp",
-                build_omp_extension("http://127.0.0.1:49374", Some("tok"), None),
+                build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist"),
             ),
             (
                 "pi",
-                build_pi_extension("http://127.0.0.1:49374", Some("tok"), None),
+                build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist"),
             ),
         ] {
             // The fire-and-forget delivery must be gone...
@@ -7848,7 +7904,7 @@ model = "gpt-5"
 
     #[test]
     fn opencode_plugin_uses_real_plugin_hooks() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert!(plugin.contains("event: async (input)"));
         assert!(plugin.contains(r#""chat.message": async"#));
@@ -7925,7 +7981,9 @@ model = "gpt-5"
 
     #[test]
     fn opencode2_plugin_binds_the_v2_api() {
-        let plugin = build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None).unwrap();
+        let plugin =
+            build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist")
+                .unwrap();
 
         // Ownership markers the uninstall gate keys on.
         assert!(plugin.contains("install-hooks --agent opencode2 --apply"));
@@ -7993,7 +8051,13 @@ model = "gpt-5"
         // The builder rewrites the v1 template, so a v1 edit that moves the
         // binding anchor must fail loudly instead of shipping a hybrid.
         let plugin =
-            build_opencode2_plugin("http://127.0.0.1:49374/", None, Some("repo-root")).unwrap();
+            build_opencode2_plugin(
+                "http://127.0.0.1:49374/",
+                None,
+                Some("repo-root"),
+                "denylist",
+            )
+            .unwrap();
         assert!(plugin.contains("const TOKEN: string | null = null;"));
         assert!(
             plugin.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
@@ -8012,8 +8076,33 @@ model = "gpt-5"
     }
 
     #[test]
+    fn opencode2_plugin_bakes_allowlist_admit_gate() {
+        // opencode2 reuses v1's capture prelude verbatim (see
+        // `build_opencode2_plugin`'s doc comment), so the gate must survive
+        // the anchor rewrite into the beta's `{ id, setup }` host binding.
+        let plugin = build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist")
+            .unwrap();
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{plugin}"
+        );
+        assert!(plugin.contains(CAPTURE_ADMIT_GATE_TS), "{plugin}");
+    }
+
+    #[test]
+    fn opencode2_plugin_denylist_bakes_inert_gate() {
+        let plugin = build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist")
+            .unwrap();
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{plugin}"
+        );
+        assert!(plugin.contains(CAPTURE_ADMIT_GATE_TS), "{plugin}");
+    }
+
+    #[test]
     fn opencode_plugin_normalizes_payloads_without_legacy_wrapper() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374/", None, None);
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374/", None, None, "denylist");
 
         assert!(plugin.contains("const SERVER = \"http://127.0.0.1:49374/\".replace"));
         assert!(plugin.contains("const TOKEN: string | null = null;"));
@@ -8031,7 +8120,12 @@ model = "gpt-5"
     #[test]
     fn opencode_plugin_bakes_repo_root_default() {
         let plugin =
-            build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), Some("repo-root"));
+            build_opencode_plugin(
+                "http://127.0.0.1:49374",
+                Some("tok"),
+                Some("repo-root"),
+                "denylist",
+            );
         assert!(
             plugin.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
             "repo-root install default must bake the const: {plugin}"
@@ -8048,7 +8142,7 @@ model = "gpt-5"
 
     #[test]
     fn opencode_plugin_default_omits_baked_strategy() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(
             !plugin.contains("DEFAULT_PROJECT_STRATEGY"),
             "basename default must bake no strategy: {plugin}"
@@ -8056,15 +8150,35 @@ model = "gpt-5"
     }
 
     #[test]
+    fn opencode_plugin_bakes_allowlist_admit_gate() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{plugin}"
+        );
+        assert!(plugin.contains(CAPTURE_ADMIT_GATE_TS), "{plugin}");
+    }
+
+    #[test]
+    fn opencode_plugin_denylist_bakes_inert_gate() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(
+            plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{plugin}"
+        );
+        assert!(plugin.contains(CAPTURE_ADMIT_GATE_TS), "{plugin}");
+    }
+
+    #[test]
     fn opencode_plugin_uses_bounded_hook_queue() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None);
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert_generated_ts_uses_bounded_hook_queue(&plugin);
     }
 
     #[test]
     fn opencode_plugin_resolves_token_at_runtime_when_not_embedded() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374", None, None);
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", None, None, "denylist");
         assert!(plugin.contains("function resolveToken("));
         assert!(plugin.contains("const token = resolveToken();"));
         assert!(plugin.contains("if (!response.ok) return undefined;"));
@@ -8072,7 +8186,7 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_resolves_token_at_runtime_when_not_embedded() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", None, None);
+        let extension = build_omp_extension("http://127.0.0.1:49374", None, None, "denylist");
         assert!(extension.contains("function resolveToken("));
         assert!(extension.contains("process.env.AI_MEMORY_AUTH_TOKEN"));
         assert!(extension.contains("auth-token"));
@@ -8081,7 +8195,7 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_prefers_statically_embedded_token() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(extension.contains("function resolveToken("));
         assert!(extension.contains("if (TOKEN) return TOKEN;"));
     }
@@ -8091,8 +8205,30 @@ model = "gpt-5"
     // ----------------------------------------------------------------
 
     #[test]
+    fn omp_extension_bakes_allowlist_admit_gate() {
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
+    fn omp_extension_denylist_bakes_inert_gate() {
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
     fn omp_extension_uses_native_lifecycle_events() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert!(extension.contains("export default function AiMemoryExtension"));
         assert!(extension.contains("const AGENT = \"omp\";"));
@@ -8141,7 +8277,12 @@ model = "gpt-5"
     #[test]
     fn omp_extension_bakes_repo_root_default() {
         let extension =
-            build_omp_extension("http://127.0.0.1:49374", Some("tok"), Some("repo-root"));
+            build_omp_extension(
+                "http://127.0.0.1:49374",
+                Some("tok"),
+                Some("repo-root"),
+                "denylist",
+            );
         assert!(
             extension.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
             "repo-root install default must bake the const: {extension}"
@@ -8154,7 +8295,7 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_default_omits_baked_strategy() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(
             !extension.contains("DEFAULT_PROJECT_STRATEGY"),
             "{extension}"
@@ -8163,7 +8304,7 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_uses_bounded_hook_queue() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None);
+        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert_generated_ts_uses_bounded_hook_queue(&extension);
     }
@@ -8481,8 +8622,33 @@ model = "gpt-5"
     }
 
     #[test]
+    fn pi_extension_bakes_allowlist_admit_gate() {
+        // Pi is `build_omp_extension` with the AGENT constant swapped, so the
+        // gate must survive that string-replace rewrite too.
+        let extension =
+            build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
+    fn pi_extension_denylist_bakes_inert_gate() {
+        let extension =
+            build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        assert!(
+            extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
+            "{extension}"
+        );
+        assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
+    }
+
+    #[test]
     fn pi_extension_contains_lifecycle_capture_and_mcp_bridge() {
-        let extension = build_pi_extension("http://127.0.0.1:49374/base", Some("tok"), None);
+        let extension =
+            build_pi_extension("http://127.0.0.1:49374/base", Some("tok"), None, "denylist");
 
         assert!(extension.contains("export default function AiMemoryExtension(pi: any): void"));
         assert!(extension.contains("const AGENT = \"pi\";"));

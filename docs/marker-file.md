@@ -172,11 +172,13 @@ direction whose failure you would rather explain.
 The mode is stored per install rather than per agent, and a later bare
 `install-hooks --apply` (including an upgrade refresh) leaves it in place.
 
-Like `ignore_paths` below, it is enforced by native `ai-memory hook` commands
-only — which is what `install-hooks --apply` writes by default. Script-based
-installs (the `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper, and
-`setup-agent` snippets) POST to the server directly without running that
-binary, so allowlist mode does not gate them.
+It is enforced both by native `ai-memory hook` commands and by the generated
+TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`, `openclaw`) —
+each bakes the selected mode in and carries the same marker-presence gate
+before it ever POSTs. Only the raw script-fallback paths (the
+`AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper, and
+`setup-agent` snippets) POST to the server directly without running either
+enforcement point, so allowlist mode does not gate them.
 
 ## Capture exclusions
 

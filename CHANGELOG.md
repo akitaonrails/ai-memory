@@ -19,6 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migrating. The check now reads past the frontmatter fence and classifies on
   the first body line, so a real page that happens to be named `log.md` is
   still indexed. (#660)
+- `install-hooks --apply --capture-mode allowlist` no longer captures
+  repositories with no `.ai-memory.toml` marker on the five generated
+  TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`,
+  `openclaw`). The native `ai-memory hook` path already gated every
+  lifecycle event on marker presence before spooling or sending anything
+  (`repository_admits_capture` in `ai-memory-hooks::capture_policy`), but
+  the generated adapters POST to `<server>/hook` directly and had only
+  ported the `ignore_paths` denylist logic into their shared
+  `capturePolicy` — never the allowlist admit gate — so an unmarked
+  repository was still fully captured while the CLI printed that the
+  protection was active. The shared template now bakes the selected
+  `--capture-mode` into a `CAPTURE_MODE` constant and gates on
+  marker *presence* (not on marker configuration state, so a marker with
+  an empty `[capture]` section still opts a repository in) before any
+  per-event disposition runs. The install-time "enforced"/"NOT in force"
+  messaging is corrected to match: a script-fallback install is now the
+  only path flagged as unenforced. (#661)
 
 ## [2.1.0] - 2026-09-06
 
