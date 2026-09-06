@@ -87,6 +87,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   header names only. ([#606])
 
 ### Changed
+- Every LLM chat request now sends `User-Agent: ai-memory/<version>`.
+  `reqwest` sends no user agent unless one is configured, so provider
+  requests previously arrived anonymous, and gateways that require callers to
+  identify themselves reported ai-memory as an unknown client. An
+  `AI_MEMORY_LLM_HEADERS` entry for `user-agent` overrides it. The Copilot
+  provider is unchanged: it keeps `GitHubCopilotChat/<version>`, the
+  editor-plugin agent GitHub's Copilot API expects. ([#606])
+- `x-opencode-session` and the `opencode` user agent, both shipped in 2.0.2,
+  are now operator-overridable like any other header: an
+  `AI_MEMORY_LLM_HEADERS` entry for either name takes precedence over the
+  provider's default. The default remains 2.0.2's — one `LlmOperationId` per
+  logical operation, stable across retries and the strict/tolerant fallback —
+  so nothing changes unless an operator asks for it. Override the session
+  header to tell several ai-memory instances apart in OpenCode's metrics.
+  ([#606])
 - The session-start brief's `[briefing] max_chars` now bounds the whole
   rendered brief, and its floor rose from 500 to 1500 chars. The scaffold the
   brief may never drop — the security notice plus both untrusted-history
@@ -110,6 +125,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   28s to 19s on a 32-thread Windows box.
 
 ### Fixed
+- The `bin/ai-memory` container wrapper now runs on Podman without Docker
+  (#636). It auto-selects the engine (`AI_MEMORY_DOCKER` override → `docker` →
+  `podman`), defaults to the fully-qualified `docker.io/akitaonrails/ai-memory`
+  image so Podman's non-interactive short-name resolution does not fail, and
+  preserves the selected engine in the standalone-container recovery script
+  `ai-memory upgrade` emits instead of hard-coding `docker`.
+- The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
+  Responses endpoint. Luna is not served through Chat Completions, where plain
+  and structured ai-memory calls returned HTTP 500 (#618).
+- `AI_MEMORY_LLM_BASE_URL` now works with `AI_MEMORY_LLM_PROVIDER=opencode`.
+  The provider hardcoded OpenCode's **Go** endpoint and the factory dropped
+  the configured base URL without a word, so Zen's general catalogue at
+  `https://opencode.ai/zen/v1` was unreachable through it — Zen and Go are
+  separate products, not two spellings of one. Go remains the default, so
+  existing setups are unaffected; an override keeps the `x-opencode-session`
+  default and the user agent, since both endpoints correlate requests the
+  same way. Model ids are per catalogue, so set `AI_MEMORY_LLM_MODEL`
+  explicitly when overriding. `OPENCODE_ZEN_BASE_URL` is deprecated in
+  favour of `OPENCODE_GO_BASE_URL`: the constant named Zen but has always
+  held Go's URL. It keeps its value, so code compiled against it is
+  unaffected. ([#606])
 - Fixed `purge-session` leaving the live `sessions/<id>.md` wiki file behind
   after deleting the session's SQLite rows. The admin endpoint now removes the
   scoped page file after the DB purge commits, reports actual cleanup through
@@ -179,24 +215,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now works from per-observation scores and block sizes computed once, with
   byte-identical output.
 
+### Security
+- A purged project or workspace can no longer be resurrected by a later
+  `reindex` (#607, data-layer audit follow-up, item 2). `purge_project` /
+  `delete_workspace` commit the DB deletion first and remove on-disk files
+  afterward, best-effort; a crash or failure in that window left the markdown
+  directory (`_meta.md` included) on disk with no row, and `reindex` rebuilt
+  the scope from that manifest — silently undoing the purge. Each purge now
+  writes a `purged_scopes` tombstone in the same transaction as the deletion
+  (a whole-workspace delete uses a `zeroblob(16)` sentinel project id), and
+  `reindex_all` skips any tombstoned scope instead of recreating it. The
+  inert files are left for a later purge or manual cleanup; reindex stays
+  non-destructive.
+- Concurrent writes to the *same* page path are now serialized (#607, item 3).
+  Per-page writes take the shared side of the wiki mutation lock, so two
+  writes to one `(workspace, project, path)` could interleave their
+  file-rename and DB-upsert and transiently leave the on-disk markdown
+  disagreeing with the DB `is_latest` row (self-healing on reindex, no data
+  loss). A per-path async lock now serializes same-path writers while
+  different paths still proceed concurrently; batches acquire their paths in a
+  fixed global order so they cannot deadlock.
+
 ## [2.0.3] - 2026-09-04
 
 ### Changed
-- Every LLM chat request now sends `User-Agent: ai-memory/<version>`.
-  `reqwest` sends no user agent unless one is configured, so provider
-  requests previously arrived anonymous, and gateways that require callers to
-  identify themselves reported ai-memory as an unknown client. An
-  `AI_MEMORY_LLM_HEADERS` entry for `user-agent` overrides it. The Copilot
-  provider is unchanged: it keeps `GitHubCopilotChat/<version>`, the
-  editor-plugin agent GitHub's Copilot API expects. ([#606])
-- `x-opencode-session` and the `opencode` user agent, both shipped in 2.0.2,
-  are now operator-overridable like any other header: an
-  `AI_MEMORY_LLM_HEADERS` entry for either name takes precedence over the
-  provider's default. The default remains 2.0.2's — one `LlmOperationId` per
-  logical operation, stable across retries and the strict/tolerant fallback —
-  so nothing changes unless an operator asks for it. Override the session
-  header to tell several ai-memory instances apart in OpenCode's metrics.
-  ([#606])
 - Release, Docker, and the `cargo install --git` snippet now build with
   `--locked` (#628). Without it `cargo install` re-resolves dependencies and
   ignores the committed `Cargo.lock`, so a source install could silently pull
@@ -224,15 +266,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dest_free_bytes`, so the same number is visible right before a migration.
 
 ### Fixed
-- The `bin/ai-memory` container wrapper now runs on Podman without Docker
-  (#636). It auto-selects the engine (`AI_MEMORY_DOCKER` override → `docker` →
-  `podman`), defaults to the fully-qualified `docker.io/akitaonrails/ai-memory`
-  image so Podman's non-interactive short-name resolution does not fail, and
-  preserves the selected engine in the standalone-container recovery script
-  `ai-memory upgrade` emits instead of hard-coding `docker`.
-- The OpenCode provider now sends `gpt-5.6-luna` requests to OpenCode Go's
-  Responses endpoint. Luna is not served through Chat Completions, where plain
-  and structured ai-memory calls returned HTTP 500 (#618).
 - The pre-migration safety archive is now taken **before** the SQLite schema
   is migrated, so it is a genuine pre-2.0 recovery point a 1.x binary can
   reopen — restoring the documented "reversible upgrade" (#633). Previously the
@@ -304,18 +337,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recognized", every hook failed, and the cp850 (non-UTF-8) error text
   aborted the whole `agy` session. Antigravity's command is now rendered
   bare; other Windows agents keep their quotes.
-- `AI_MEMORY_LLM_BASE_URL` now works with `AI_MEMORY_LLM_PROVIDER=opencode`.
-  The provider hardcoded OpenCode's **Go** endpoint and the factory dropped
-  the configured base URL without a word, so Zen's general catalogue at
-  `https://opencode.ai/zen/v1` was unreachable through it — Zen and Go are
-  separate products, not two spellings of one. Go remains the default, so
-  existing setups are unaffected; an override keeps the `x-opencode-session`
-  default and the user agent, since both endpoints correlate requests the
-  same way. Model ids are per catalogue, so set `AI_MEMORY_LLM_MODEL`
-  explicitly when overriding. `OPENCODE_ZEN_BASE_URL` is deprecated in
-  favour of `OPENCODE_GO_BASE_URL`: the constant named Zen but has always
-  held Go's URL. It keeps its value, so code compiled against it is
-  unaffected. ([#606])
 - The wiki watcher no longer logs a scope-resolution failure for every page
   in a project directory the store has no row for, on every pass, forever
   (#613). The OKF v0.2 migration seeded an `index.md` into orphan directories
@@ -332,27 +353,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of "does not belong to workspace X" (#612). A dangling id names no
   workspace mismatch to hunt for; the disambiguating lookup runs only on the
   failure path, so the common case still pays a single query.
-
-### Security
-- A purged project or workspace can no longer be resurrected by a later
-  `reindex` (#607, data-layer audit follow-up, item 2). `purge_project` /
-  `delete_workspace` commit the DB deletion first and remove on-disk files
-  afterward, best-effort; a crash or failure in that window left the markdown
-  directory (`_meta.md` included) on disk with no row, and `reindex` rebuilt
-  the scope from that manifest — silently undoing the purge. Each purge now
-  writes a `purged_scopes` tombstone in the same transaction as the deletion
-  (a whole-workspace delete uses a `zeroblob(16)` sentinel project id), and
-  `reindex_all` skips any tombstoned scope instead of recreating it. The
-  inert files are left for a later purge or manual cleanup; reindex stays
-  non-destructive.
-- Concurrent writes to the *same* page path are now serialized (#607, item 3).
-  Per-page writes take the shared side of the wiki mutation lock, so two
-  writes to one `(workspace, project, path)` could interleave their
-  file-rename and DB-upsert and transiently leave the on-disk markdown
-  disagreeing with the DB `is_latest` row (self-healing on reindex, no data
-  loss). A per-path async lock now serializes same-path writers while
-  different paths still proceed concurrently; batches acquire their paths in a
-  fixed global order so they cannot deadlock.
 
 ## [2.0.2] - 2026-09-03
 
