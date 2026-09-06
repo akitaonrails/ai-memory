@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   28s to 19s on a 32-thread Windows box.
 
 ### Fixed
+- OKF-conformed event ledgers are skipped by the indexer again, so a migrated
+  store stops growing without bound. The reserved-file check treated any
+  `log.md` / `log-YYYY-MM.md` carrying YAML frontmatter as an ordinary page,
+  but the OKF v0.2 migration stamps frontmatter on every `.md` under `wiki/`,
+  ledgers included. A migrated store therefore indexed its ledgers, and each
+  hook `append_event` superseded them: one `pages` row per appended line,
+  holding the whole multi-megabyte ledger body. One affected store reached
+  6,539 page versions and 14 GB from 101 live pages within four days of
+  migrating. The check now reads past the frontmatter fence and classifies on
+  the first body line, so a real page that happens to be named `log.md` is
+  still indexed.
 - Authentication-disabled HTTP servers now ignore stale or unexpected Bearer
   headers and preserve anonymous access. Previously, a client retaining an old
   `AI_MEMORY_AUTH_TOKEN` received `401 Unauthorized` even though the server
