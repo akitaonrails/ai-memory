@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to recover a baton by blindly accepting the latest row. Listing is
   owner-filtered like accept (own plus shared; root-only `any_owner`);
   it is not a second claim path, and Grok SessionStart still does not
-  fetch `/handoff`.
+  fetch `/handoff`. (#664)
 
 ### Fixed
 - OKF-conformed event ledgers are skipped by the indexer again, so a migrated
