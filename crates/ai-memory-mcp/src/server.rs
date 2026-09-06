@@ -39,6 +39,8 @@ const HANDOFF_FILE_MAX_CHARS: usize = 512;
 const HANDOFF_TEXT_LIST_MAX_CHARS: usize = 6_000;
 const HANDOFF_FILE_LIST_MAX_CHARS: usize = 4_096;
 const HANDOFF_LIST_MAX_ITEMS: usize = 20;
+const OPEN_HANDOFFS_DEFAULT_LIMIT: u32 = 50;
+const OPEN_HANDOFFS_MAX_LIMIT: u32 = 200;
 
 fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
     AutoImproveReviewConfig {
@@ -211,14 +213,28 @@ developer, user, and canonical project instructions.\n\
   line, 'stale' (>30d) → full catchup. Accepts an optional `focus` \
   arg. Use over memory_briefing when the user asks open-ended \
   questions like 'catch me up' or 'what's important right now'.\n\
+- `memory_handoff_list` — READ-ONLY list of OPEN handoffs in the \
+  resolved project. It does not claim or expire anything. Use it when \
+  no SessionStart handoff block is in context (Grok, Zero, and other \
+  no-stdout / MCP-only clients), when the user asks what is pending, \
+  or when you need an exact id for accept or cancel. Then claim one \
+  row with memory_handoff_accept passing that `handoff_id`. Follow \
+  the client-aware project-scope rule above. On shared servers the \
+  default is your own plus deliberately shared handoffs; \
+  `any_owner=true` is root-only recovery and requires an explicit \
+  user request.\n\
 - `memory_handoff_accept` — when the user asks 'where did we leave \
   off'. The SessionStart hook auto-fetches + consumes the handoff \
   before you see your first prompt; if a block starting with \
   '📥 ai-memory: pending handoff' is anywhere in your context, \
   THAT is the handoff — answer from it directly, don't re-call \
-  this tool (it'll return null because handoffs are single-use). Follow \
-  the client-aware project-scope rule above; session-aware clients add \
-  explicit scope when the user names a sibling workspace/project. On shared servers the default is your \
+  this tool (it'll return null because handoffs are single-use). \
+  When no prepended block is visible, inspect with memory_handoff_list \
+  first, then pass the listed `handoff_id` to claim that exact row; \
+  omitting `handoff_id` still claims the latest eligible open handoff. \
+  Follow the client-aware project-scope rule above; session-aware \
+  clients add explicit scope when the user names a sibling \
+  workspace/project. On shared servers the default is your \
   own plus deliberately shared handoffs; `any_owner=true` is root-only \
   recovery and requires an explicit user request.\n\
 - `memory_handoff_begin` — ONLY when the user is wrapping up / ending \
@@ -1020,6 +1036,33 @@ struct HandoffAcceptArgs {
     project: Option<String>,
     /// Workspace to accept from, together with `project`. Session-aware clients
     /// may omit both for the current project; static MCP clients must pass both.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Exact open handoff id returned by `memory_handoff_list` or
+    /// `memory_handoff_begin`. When set, this call claims that row rather than
+    /// the latest eligible open handoff. Omit to keep the latest-open behavior.
+    #[serde(default)]
+    handoff_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct HandoffListArgs {
+    /// Also list handoffs that belong to OTHER operators. Off by default:
+    /// on a shared server you only see your own plus the ones published to the
+    /// whole project. Root-only recovery; requires an explicit user request.
+    #[serde(default)]
+    any_owner: Option<bool>,
+    /// Maximum open handoffs to return (clamped to 1..=200, default 50).
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Project to list within. Session-aware clients may omit it for the
+    /// current project. Static MCP clients must pass it together with
+    /// `workspace` for every project-scoped call.
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace to list within, together with `project`. Session-aware
+    /// clients may omit both for the current project; static MCP clients must
+    /// pass both.
     #[serde(default)]
     workspace: Option<String>,
 }
@@ -3517,9 +3560,68 @@ impl AiMemoryServer {
         ok_json(&serde_json::json!({ "handoff_id": id.to_string() }))
     }
 
+    /// List open handoffs without claiming them.
+    #[tool(description = "List OPEN cross-agent handoffs for this project \
+        WITHOUT claiming or expiring them. \
+        \
+        READ-ONLY: every returned row stays `open`. Use this when no \
+        SessionStart handoff block is in context (Grok, Zero, and other \
+        no-stdout / MCP-only clients), when the user asks what is pending, \
+        or when you need an exact id for memory_handoff_accept or \
+        memory_handoff_cancel. After inspecting, claim one row with \
+        memory_handoff_accept passing that `handoff_id` — handoffs remain \
+        SINGLE-USE. This is not a briefing or status tool. \
+        \
+        Follow the client-aware project-scope instructions: static clients \
+        pass `workspace` + `project` together for every project-scoped call. \
+        On shared servers the default is your own plus deliberately shared \
+        handoffs; `any_owner=true` is root-only recovery and requires an \
+        explicit user request. \
+        \
+        Returns `{ \"handoffs\": [ ... ] }` with inspectable summary, \
+        open_questions, next_steps, files_touched, and identity fields.")]
+    async fn memory_handoff_list(
+        &self,
+        Parameters(args): Parameters<HandoffListArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let (ws, proj) = self
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
+            .await?;
+        let actor_user = crate::actor::actor_from_parts(&parts)
+            .identity_key()
+            .map(|key| key.storage_key());
+        let owner_filter = if args.any_owner.unwrap_or(false) {
+            self.require_admin_capability(&parts).await?;
+            ai_memory_core::OwnerFilter::Any
+        } else {
+            match actor_user {
+                Some(key) => ai_memory_core::OwnerFilter::User(key),
+                None => ai_memory_core::OwnerFilter::Unattributed,
+            }
+        };
+        let limit = usize::try_from(
+            args.limit
+                .unwrap_or(OPEN_HANDOFFS_DEFAULT_LIMIT)
+                .clamp(1, OPEN_HANDOFFS_MAX_LIMIT),
+        )
+        .unwrap_or(OPEN_HANDOFFS_DEFAULT_LIMIT as usize);
+        let handoffs = self
+            .reader
+            .list_handoffs(ws, proj, Some(HandoffState::Open), owner_filter, limit)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        ok_json(&serde_json::json!({ "handoffs": handoffs }))
+    }
+
     /// Fetch the latest open handoff for this project (optionally filtered
     /// by cwd) and mark it accepted.
-    #[tool(description = "Fetch the latest OPEN cross-agent handoff and \
+    #[tool(description = "Fetch an OPEN cross-agent handoff and \
         mark it accepted. \
         \
         IMPORTANT: handoffs are SINGLE-USE. The SessionStart hook \
@@ -3534,8 +3636,11 @@ impl AiMemoryServer {
         first, and answer the user from there. Call this tool only when \
         you BOTH don't see a prepended block AND the user explicitly asks \
         for a handoff (e.g. a hook script ran with no stdout capture). \
+        Prefer memory_handoff_list first in that case, then pass the listed \
+        `handoff_id` here to claim that exact row. Omitting `handoff_id` \
+        claims the latest eligible open handoff. \
         \
-        Returns the same JSON shape memory_handoff_begin accepted.")]
+        Returns the handoff body only when THIS call wins the claim.")]
     async fn memory_handoff_accept(
         &self,
         Parameters(args): Parameters<HandoffAcceptArgs>,
@@ -3566,11 +3671,25 @@ impl AiMemoryServer {
             }
         };
         let receiving_cwd = args.cwd;
-        let handoff = self
-            .reader
-            .latest_open_handoff(ws, proj, receiving_cwd.clone(), owner_filter.clone())
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let requested_id = args
+            .handoff_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let handoff = if let Some(id) = requested_id {
+            let handoff_id = HandoffId::from_str(id)
+                .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
+            self.reader
+                .handoff_by_id_in_scope(ws, proj, handoff_id, owner_filter.clone())
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                .filter(|h| h.lifecycle.state == HandoffState::Open)
+        } else {
+            self.reader
+                .latest_open_handoff(ws, proj, receiving_cwd.clone(), owner_filter.clone())
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        };
         match handoff {
             None => ok_json(&serde_json::json!({ "handoff": null })),
             Some(h) => {
@@ -3619,7 +3738,8 @@ impl AiMemoryServer {
 
     /// Cancel a mistaken open handoff by exact id.
     #[tool(description = "Cancel/discard a mistakenly-created OPEN handoff by \
-        exact `handoff_id` returned from `memory_handoff_begin`. Use this ONLY \
+        exact `handoff_id` returned from `memory_handoff_begin` or \
+        `memory_handoff_list`. Use this ONLY \
         when you realize you called `memory_handoff_begin` by mistake or the \
         user explicitly asks to discard a pending handoff. This is a cleanup \
         tool, not a status/briefing tool. It marks the handoff expired so the \
@@ -5046,6 +5166,7 @@ mod tests {
         "memory_handoff_accept",
         "memory_handoff_begin",
         "memory_handoff_cancel",
+        "memory_handoff_list",
         "memory_consolidate",
         "memory_auto_improve",
         "memory_write_page",
@@ -5067,6 +5188,7 @@ mod tests {
         "memory_handoff_accept",
         "memory_handoff_begin",
         "memory_handoff_cancel",
+        "memory_handoff_list",
         "memory_consolidate",
         "memory_auto_improve",
         "memory_write_page",
@@ -5322,6 +5444,14 @@ mod tests {
                     && lower.contains("status")
                     && lower.contains("briefing"),
                 "{label} must make handoff-begin session-end only and reject status/briefing use"
+            );
+            assert!(
+                prompt.contains("memory_handoff_list")
+                    && lower.contains("read-only")
+                    && (lower.contains("does not claim")
+                        || lower.contains("without claiming")
+                        || lower.contains("not claim")),
+                "{label} must expose inspect-without-claim list as read-only"
             );
             assert!(
                 prompt.contains("memory_handoff_cancel") && prompt.contains("handoff_id"),
@@ -9987,6 +10117,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     any_owner: None,
+                    handoff_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10009,6 +10140,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     any_owner: None,
+                    handoff_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10053,6 +10185,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     any_owner: None,
+                    handoff_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10130,6 +10263,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     any_owner: None,
+                    handoff_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10176,6 +10310,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     any_owner: None,
+                    handoff_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10238,6 +10373,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     any_owner: None,
+                    handoff_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10262,6 +10398,7 @@ mod tests {
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
                     any_owner: None,
+                    handoff_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10276,6 +10413,352 @@ mod tests {
         assert!(
             in_sibling_text.contains("cross-workspace handoff"),
             "handoff must be retrievable from its explicit (workspace, project)"
+        );
+    }
+
+    fn tool_json(result: &CallToolResult) -> serde_json::Value {
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .expect("tool text");
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("tool text not JSON ({e}): {text}"))
+    }
+
+    #[tokio::test]
+    async fn memory_handoff_list_does_not_claim_then_accept_same_id() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let begin = server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "inspect-without-claim baton".into(),
+                    open_questions: vec!["still open?".into()],
+                    next_steps: vec!["claim by id".into()],
+                    files_touched: vec!["crates/ai-memory-mcp/src/server.rs".into()],
+                    cwd: None,
+                    project: None,
+                    workspace: None,
+                    shared: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let handoff_id = tool_json(&begin)["handoff_id"]
+            .as_str()
+            .expect("begin returns handoff_id")
+            .to_string();
+
+        let listed = server
+            .memory_handoff_list(
+                Parameters(HandoffListArgs {
+                    any_owner: None,
+                    limit: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let listed_json = tool_json(&listed);
+        let rows = listed_json["handoffs"].as_array().expect("handoffs array");
+        assert_eq!(rows.len(), 1, "expected one open handoff: {listed_json}");
+        assert_eq!(rows[0]["id"].as_str(), Some(handoff_id.as_str()));
+        assert_eq!(
+            rows[0]["summary"].as_str(),
+            Some("inspect-without-claim baton")
+        );
+        assert_eq!(rows[0]["open_questions"][0].as_str(), Some("still open?"));
+        assert_eq!(rows[0]["state"].as_str(), Some("open"));
+
+        let stored = store
+            .reader
+            .handoff_by_id(HandoffId::from_str(&handoff_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.lifecycle.state,
+            HandoffState::Open,
+            "list must not claim the inspected row"
+        );
+        assert_eq!(stored.scope.workspace_id, ws);
+        assert_eq!(stored.scope.project_id, proj);
+
+        let claimed = server
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: None,
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                    handoff_id: Some(handoff_id.clone()),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let claimed_json = tool_json(&claimed);
+        assert_eq!(
+            claimed_json["handoff"]["summary"].as_str(),
+            Some("inspect-without-claim baton"),
+            "first claim of the inspected id must return the body: {claimed_json}"
+        );
+        let stored = store
+            .reader
+            .handoff_by_id(HandoffId::from_str(&handoff_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.lifecycle.state, HandoffState::Accepted);
+
+        let again = server
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: None,
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                    handoff_id: Some(handoff_id),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let again_json = tool_json(&again);
+        assert!(
+            again_json["handoff"].is_null(),
+            "second claim of the same id must return no body: {again_json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_handoff_accept_by_id_leaves_sibling_open() {
+        let (_tmp, store, server, _ws, _pj) = setup_server().await;
+        let first = server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "first pending baton".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: None,
+                    project: None,
+                    workspace: None,
+                    shared: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let second = server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "sibling pending baton".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: None,
+                    project: None,
+                    workspace: None,
+                    shared: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let first_id = tool_json(&first)["handoff_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sibling_id = tool_json(&second)["handoff_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let listed = tool_json(
+            &server
+                .memory_handoff_list(
+                    Parameters(HandoffListArgs {
+                        any_owner: None,
+                        limit: None,
+                        project: None,
+                        workspace: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            listed["handoffs"].as_array().map(Vec::len),
+            Some(2),
+            "both rows must stay open after list: {listed}"
+        );
+
+        let claimed = tool_json(
+            &server
+                .memory_handoff_accept(
+                    Parameters(HandoffAcceptArgs {
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                        any_owner: None,
+                        handoff_id: Some(first_id.clone()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            claimed["handoff"]["summary"].as_str(),
+            Some("first pending baton")
+        );
+
+        let first_row = store
+            .reader
+            .handoff_by_id(HandoffId::from_str(&first_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let sibling_row = store
+            .reader
+            .handoff_by_id(HandoffId::from_str(&sibling_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_row.lifecycle.state, HandoffState::Accepted);
+        assert_eq!(
+            sibling_row.lifecycle.state,
+            HandoffState::Open,
+            "claiming one inspected id must leave the sibling open"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_handoff_list_hides_private_baton_but_pages_stay_shared() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let bob_owner = ai_memory_core::IdentityKey::User("bob".into()).storage_key();
+        let bob_handoff = store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Codex,
+                to_agent: None,
+                cwd: None,
+                summary: "Bob's private prompt-derived context".into(),
+                open_questions: vec!["private question".into()],
+                next_steps: vec!["private next step".into()],
+                files_touched: vec![],
+                owner_user: Some(bob_owner),
+            })
+            .await
+            .unwrap();
+        let bob_user_id = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "bob".into(),
+                    name: Some("Bob".into()),
+                    email: Some("bob@example.com".into()),
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/bob-authored.md").unwrap(),
+                title: "Bob authored".into(),
+                body: "shared wiki knowledge from Bob".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({"title": "Bob authored"}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: Some(bob_user_id),
+                expires_at: None,
+                entities: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let server = server.with_wiki(wiki);
+
+        let mut alice_parts = test_parts_default();
+        alice_parts.extensions.insert(AuthLevel::User);
+        alice_parts.extensions.insert(ActorContext {
+            user: Some("alice".into()),
+            ..ActorContext::default()
+        });
+        let listed = tool_json(
+            &server
+                .memory_handoff_list(
+                    Parameters(HandoffListArgs {
+                        any_owner: None,
+                        limit: None,
+                        project: None,
+                        workspace: None,
+                    }),
+                    OptionalParts(alice_parts.clone()),
+                )
+                .await
+                .unwrap(),
+        );
+        let rows = listed["handoffs"].as_array().expect("handoffs array");
+        assert!(
+            rows.is_empty(),
+            "Alice must not inspect Bob's private baton: {listed}"
+        );
+        let stored = store
+            .reader
+            .handoff_by_id(bob_handoff)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.lifecycle.state, HandoffState::Open);
+
+        let page = tool_json(
+            &server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some("notes/bob-authored.md".into()),
+                        project: None,
+                        workspace: None,
+                    }),
+                    OptionalParts(alice_parts),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            page["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("shared wiki knowledge from Bob")),
+            "page reads must stay unfiltered by author: {page}"
+        );
+    }
+
+    #[test]
+    fn grok_session_start_hook_does_not_fetch_handoff() {
+        let src = include_str!("../../../hooks/grok/session-start.sh");
+        assert!(
+            src.contains("Do NOT fetch /handoff"),
+            "Grok SessionStart must keep the capture-only refusal"
+        );
+        assert!(
+            !src.contains("/handoff?"),
+            "Grok SessionStart must not fetch the claiming /handoff endpoint"
         );
     }
 
@@ -10373,6 +10856,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     any_owner: None,
+                    handoff_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -11176,6 +11660,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     any_owner: None,
+                    handoff_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

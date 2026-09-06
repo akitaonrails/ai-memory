@@ -363,7 +363,7 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (18 tools)
+## MCP tool surface (19 tools)
 
 | Tool | Hint | Purpose |
 |---|---|---|
@@ -375,10 +375,11 @@ invariants below.
 | `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
 | `memory_handoff_begin` | destructive | Open an owner-scoped handoff for the next agent; `shared=true` deliberately publishes it to the project. Optional `workspace` + `project` targets a named sibling workspace/project. |
-| `memory_handoff_accept` | destructive | Fetch + ack the latest own/shared handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
+| `memory_handoff_list` | read-only | List open own/shared handoffs with inspectable body and identity fields; does not claim or expire. Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
+| `memory_handoff_accept` | destructive | Fetch + ack an open own/shared handoff. Pass `handoff_id` from `memory_handoff_list` to claim that exact row; omitting it still claims the latest eligible open handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_cancel` | destructive | Mark an exact visible open handoff id expired when it was created by mistake; root-only `any_owner=true` recovers across operators. |
 
-`memory_handoff_cancel` needs an exact id. `ai-memory handoffs` lists the open
+`memory_handoff_list` is the inspect-without-claim path for clients that cannot inject SessionStart stdout. `memory_handoff_cancel` needs an exact id. `ai-memory handoffs` lists the open
 handoffs for a project, oldest first, with their ids — read-only, and
 content-free (identity, provenance and age, never the summary body). Automatic
 expiry deliberately spares manual and sibling-directory handoffs, so a
