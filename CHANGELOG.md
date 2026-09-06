@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   28s to 19s on a 32-thread Windows box.
 
 ### Fixed
+- Fixed `purge-session` leaving the live `sessions/<id>.md` wiki file behind
+  after deleting the session's SQLite rows. The admin endpoint now removes the
+  scoped page file after the DB purge commits, reports actual cleanup through
+  `files_deleted` / `files_failed`, and marks `purge_session` observer webhooks
+  with `partial_failure: true` when file cleanup fails, so a later wiki reindex
+  cannot resurrect the purged session. (#653)
 - Authentication-disabled HTTP servers now ignore stale or unexpected Bearer
   headers and preserve anonymous access. Previously, a client retaining an old
   `AI_MEMORY_AUTH_TOKEN` received `401 Unauthorized` even though the server

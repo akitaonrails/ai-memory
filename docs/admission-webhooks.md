@@ -65,7 +65,8 @@ Webhooks fire on these `op` values today (extensible enum):
   `/admin/purge-session`). Carries the workspace/project in `ctx`, **no** page
   path — the operation is driven by session id rather than by path. Fired
   before any row is deleted, so a `reject`-policy webhook can refuse the purge
-  while the session's data is still intact.
+  while the session's data is still intact. Non-blocking observers are
+  dispatched again after the SQL purge and page-file cleanup are durable.
 - `purge_workspace` — a whole workspace is purged (routed from
   `/admin/delete-workspace`). Carries the workspace in `ctx.workspace`, leaves
   `ctx.project` empty, and has **no** page path; fired before SQL/file
@@ -153,6 +154,10 @@ when the source is torn down. The `purge_project` event carries
 `partial_failure: true` if the SQL purge committed but the on-disk
 dir removal failed afterwards.
 
+`/admin/purge-session` emits `purge_session`. Its final async observer
+notification carries `partial_failure: true` if the SQL purge committed but
+the session page file could not be removed afterwards.
+
 `/admin/delete-workspace` emits `purge_workspace`. Its final async observer
 notification carries `partial_failure: true` if the SQL workspace cascade
 committed but `<wiki_root>/<workspace_id>` could not be removed.
@@ -220,11 +225,11 @@ the list, not a second header.)
       "client": "72836f52-...",              // DCR client UUID
       "session_id": "019e6d-..."
     },
-    "op": "write_page",                      // write_page | consolidate | delete | purge_project | purge_workspace | move_project | move_session
-    "partial_failure": true                  // purge_project/purge_workspace only, and ONLY when set
+    "op": "write_page",                      // write_page | consolidate | delete | purge_project | purge_session | purge_workspace | move_project | move_session
+    "partial_failure": true                  // purge_project/purge_session/purge_workspace only, and ONLY when set
                                              //   (skipped on the wire when false).
                                              //   true → the DB rows were purged but
-                                             //   `remove_project_dir` failed afterwards;
+                                             //   filesystem cleanup failed afterwards;
                                              //   a filesystem-tracking mirror (git push)
                                              //   should refuse to drop its own copy.
   }

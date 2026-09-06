@@ -961,7 +961,7 @@ impl Wiki {
             .admit_purge_project(workspace_id, project_id, admission_ctx)
             .await?;
         self.remove_project_dir(workspace_id, project_id).await?;
-        self.dispatch_purge_project(ctx.as_ref());
+        self.dispatch_purge(ctx.as_ref());
         Ok(())
     }
 
@@ -1171,17 +1171,36 @@ impl Wiki {
         }
     }
 
-    /// Dispatch non-blocking purge webhooks after the caller's purge has
-    /// completed its durable DB/filesystem work.
-    pub fn dispatch_purge_project(&self, admission_ctx: Option<&AdmissionContext>) {
-        if let (Some(chain), Some(ctx)) = (&self.admission_chain, admission_ctx) {
-            chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
+    /// Remove one on-disk page file without touching the store.
+    ///
+    /// Used after a scoped store purge has already deleted the authoritative
+    /// rows and returned the affected paths. A missing file is treated as
+    /// already removed; any other filesystem error is reported to the caller.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
+    pub async fn remove_page_file(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+    ) -> WikiResult<bool> {
+        let _guard = self.mutation_lock.write().await;
+        let abs = self.abs_path(workspace_id, project_id, path);
+        match std::fs::remove_file(&abs) {
+            Ok(()) => {
+                sync_parent_best_effort(&abs);
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(crate::WikiError::Io(e)),
         }
     }
 
-    /// Dispatch non-blocking purge-workspace webhooks after the caller's purge
-    /// has completed its durable DB/filesystem work.
-    pub fn dispatch_purge_workspace(&self, admission_ctx: Option<&AdmissionContext>) {
+    /// Dispatch non-blocking purge webhooks after the caller's purge has
+    /// completed its durable DB/filesystem work. The purge kind (project,
+    /// session, workspace) travels in `ctx.op`, set by the matching `admit_*`.
+    pub fn dispatch_purge(&self, admission_ctx: Option<&AdmissionContext>) {
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, admission_ctx) {
             chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
         }
