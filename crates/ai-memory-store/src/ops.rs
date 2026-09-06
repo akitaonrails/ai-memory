@@ -3385,7 +3385,7 @@ pub struct PurgeSessionSummary {
     /// `auto_improve_runs` rows removed.
     pub auto_improve_runs_deleted: u64,
     /// On-disk wiki paths whose rows are gone, for the caller to unlink.
-    pub removed_paths: Vec<String>,
+    pub removed_paths: Vec<PagePath>,
     /// Whether the freed bytes were reclaimed (`VACUUM` ran).
     pub compacted: bool,
 }
@@ -3472,7 +3472,7 @@ pub fn purge_session(
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let removed_paths: Vec<String> = if page_ids.is_empty() {
+    let removed_paths: Vec<PagePath> = if page_ids.is_empty() {
         Vec::new()
     } else {
         let mut stmt = tx.prepare(
@@ -3486,10 +3486,11 @@ pub fn purge_session(
                     row.get(0)
                 })
                 .optional()?;
-            if let Some(path) = found
-                && !paths.contains(&path)
-            {
-                paths.push(path);
+            if let Some(path) = found {
+                let path = PagePath::new(path)?;
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
             }
         }
         paths
@@ -5513,7 +5514,7 @@ pub(crate) mod tests {
         assert_eq!(summary.pages_deleted, 1);
         assert_eq!(
             summary.removed_paths,
-            vec!["sessions/target.md".to_string()]
+            vec![PagePath::new("sessions/target.md").unwrap()]
         );
     }
 

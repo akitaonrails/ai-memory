@@ -13,7 +13,7 @@
 //! both versions survive), then purge the source — there the episodic rows
 //! (sessions/observations/handoffs) are dropped by the purge.
 
-use super::common::post;
+use super::common::{post, spawn_capture_hook};
 use ai_memory_core::{AgentKind, PagePath, Sanitized, Sanitizer, Tier};
 use ai_memory_mcp::AdminState;
 use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
@@ -2185,24 +2185,7 @@ async fn delete_workspace_reject_policy_aborts_before_db_or_disk_destruction() {
 
 #[tokio::test]
 async fn delete_workspace_reports_partial_disk_failure_and_dispatches_notification() {
-    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
-    let tx = Arc::new(Mutex::new(Some(tx)));
-    let tx_for_route = tx.clone();
-    let app = Router::new().route(
-        "/hook",
-        axum_post(move |Json(payload): Json<serde_json::Value>| {
-            let tx_for_route = tx_for_route.clone();
-            async move {
-                if let Some(tx) = tx_for_route.lock().unwrap().take() {
-                    let _ = tx.send(payload);
-                }
-                StatusCode::NO_CONTENT
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/hook", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (url, rx) = spawn_capture_hook().await;
 
     let tmp = TempDir::new().unwrap();
     let chain = AdmissionChain::new(vec![WebhookConfig {

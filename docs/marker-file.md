@@ -104,10 +104,14 @@ default_global = "true"
 [briefing]
 inject_on_session_start = "true"
 
-# Optional. Char budget for the brief (~4 chars per token). Bodies over
-# budget are truncated with a visible note; crowded-out core pages are
-# listed by path so the agent can `memory_query` them. Clamped
-# server-side to [500, 20000]; defaults to 4000.
+# Optional. Char budget for the WHOLE brief (~4 chars per token), headers
+# and footers included. Bodies over budget are truncated with a visible
+# note; crowded-out core pages are listed by path so the agent can
+# `memory_query` them, degrading to a count when even the paths do not
+# fit. Page bodies are served first, then those pointer sections out of
+# what is left; the security notice and the untrusted-history markers are
+# never traded for content. Clamped server-side to [1500, 20000];
+# defaults to 4000.
 max_chars = 4000
 ```
 
@@ -127,6 +131,16 @@ values are ignored and behave like the default `basename(cwd)` strategy.
 (`true` / `1` / `yes` / `on`, quoted or bare — section-style keys are
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
+
+The session-start brief is **project-scoped**: it draws only from the
+session's resolved `(workspace, project)`, and the reserved `_global` scope
+is deliberately *not* unioned into it. A standing rule placed in
+`_global/_rules/` therefore does not reach the brief. It stays reachable on
+demand through `memory_query` (which *does* union `_global`), and a durable
+always-on rule belongs in the agent's own rules file (`CLAUDE.md` /
+`AGENTS.md`) — see the "Rules vs facts" guidance in `docs/usage.md`. The brief
+is compiled as *untrusted history*, so it is deliberately the wrong channel
+for instructions the agent is expected to obey every turn.
 
 `drop_subagent_captures` accepts a truthy string (`"true"` / `"1"` /
 `"yes"` / `"on"`); any other value, or its absence, leaves this project's

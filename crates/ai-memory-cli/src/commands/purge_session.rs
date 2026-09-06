@@ -81,11 +81,22 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
         n("pages_deleted"),
         n("auto_improve_runs_deleted"),
     );
-    if let Some(paths) = report["removed_paths"].as_array()
+    if let Some(paths) = report["files_deleted"].as_array()
         && !paths.is_empty()
     {
         println!("Wiki pages removed:");
         for path in paths.iter().filter_map(serde_json::Value::as_str) {
+            println!("  - {path}");
+        }
+    }
+    if let Some(failed) = report["files_failed"].as_array()
+        && !failed.is_empty()
+    {
+        println!(
+            "Warning: {} wiki page file(s) could not be removed from disk (DB rows are gone).",
+            failed.len()
+        );
+        for path in failed.iter().filter_map(serde_json::Value::as_str) {
             println!("  - {path}");
         }
     }
