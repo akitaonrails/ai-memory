@@ -104,10 +104,14 @@ default_global = "true"
 [briefing]
 inject_on_session_start = "true"
 
-# Optional. Char budget for the brief (~4 chars per token). Bodies over
-# budget are truncated with a visible note; crowded-out core pages are
-# listed by path so the agent can `memory_query` them. Clamped
-# server-side to [500, 20000]; defaults to 4000.
+# Optional. Char budget for the WHOLE brief (~4 chars per token), headers
+# and footers included. Bodies over budget are truncated with a visible
+# note; crowded-out core pages are listed by path so the agent can
+# `memory_query` them, degrading to a count when even the paths do not
+# fit. Page bodies are served first, then those pointer sections out of
+# what is left; the security notice and the untrusted-history markers are
+# never traded for content. Clamped server-side to [1500, 20000];
+# defaults to 4000.
 max_chars = 4000
 ```
 

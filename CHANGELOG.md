@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The session-start brief's `[briefing] max_chars` now bounds the whole
+  rendered brief, and its floor rose from 500 to 1500 chars. The scaffold the
+  brief may never drop — the security notice plus both untrusted-history
+  markers and the closing instruction — costs 832 chars by itself, so any
+  budget under that could only ever have been honoured by dropping the
+  boundary that marks the brief as untrusted. A project whose marker sets a
+  smaller `max_chars` now gets 1500. (#657)
 - The build is self-contained on every platform: the vendored web stylesheet
   is now the default and `TAILWIND_BUILD=1 cargo build -p ai-memory-web`
   regenerates it, so no command needs `TAILWIND_SKIP=1` any more. CI
@@ -30,6 +37,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `files_deleted` / `files_failed`, and marks `purge_session` observer webhooks
   with `partial_failure: true` when file cleanup fails, so a later wiki reindex
   cannot resurrect the purged session. (#653)
+- `[briefing] max_chars` is now the size of the brief the agent actually
+  receives. Page bodies were budgeted, but every section rendered *after*
+  them escaped the accounting: the truncation notice, the crowded-out core
+  page list, the recently-updated pointers, the closing untrusted-history
+  fence and the agent footer. The escape pass that neutralises an untrusted
+  `<!-- ai-memory:untrusted-history -->` marker inside a page body then
+  lengthened the text by a further 6 chars per marker, after the count. A
+  4000-char budget rendered 6577 chars, and the 500-char floor rendered
+  3054 — six times what the operator asked for, on every opted-in session
+  start. Bodies are now served first, the pointer sections are sized
+  against what the bodies left (the omitted list degrading to a bare count
+  when not even the paths fit), and the mandatory scaffold is reserved
+  before a single body char is spent. The regression test asserting this
+  was named `render_session_brief_enforces_budget` but only checked the
+  brief's contents, never its length. (#657)
 - Authentication-disabled HTTP servers now ignore stale or unexpected Bearer
   headers and preserve anonymous access. Previously, a client retaining an old
   `AI_MEMORY_AUTH_TOKEN` received `401 Unauthorized` even though the server
