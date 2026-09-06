@@ -132,6 +132,16 @@ values are ignored and behave like the default `basename(cwd)` strategy.
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
 
+The session-start brief is **project-scoped**: it draws only from the
+session's resolved `(workspace, project)`, and the reserved `_global` scope
+is deliberately *not* unioned into it. A standing rule placed in
+`_global/_rules/` therefore does not reach the brief. It stays reachable on
+demand through `memory_query` (which *does* union `_global`), and a durable
+always-on rule belongs in the agent's own rules file (`CLAUDE.md` /
+`AGENTS.md`) — see the "Rules vs facts" guidance in `docs/usage.md`. The brief
+is compiled as *untrusted history*, so it is deliberately the wrong channel
+for instructions the agent is expected to obey every turn.
+
 `drop_subagent_captures` accepts a truthy string (`"true"` / `"1"` /
 `"yes"` / `"on"`); any other value, or its absence, leaves this project's
 subagent captures stored as usual. Top-level (non-subagent) sessions are
