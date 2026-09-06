@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "jiff",
  "regex",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -255,11 +255,11 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "2.0.3"
+version = "2.1.0"
 
 [[package]]
 name = "ai-memory-web"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-store",
@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "ai-memory-core",
  "anyhow",

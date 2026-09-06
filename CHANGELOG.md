@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-06
+
 ### Added
 - Ordered LLM provider fallback chains (#648). `[[llm_fallbacks]]` in
   `config.toml` configures one or more additional providers, each with its
@@ -5190,7 +5192,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.2
 [2.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.1
