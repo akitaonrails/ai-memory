@@ -313,6 +313,9 @@ pub struct Config {
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Opt-in post-fusion ranking signals for `memory_query` (hotness boost,
+    /// lexical query-intent routing). All off by default.
+    pub retrieval: RetrievalSettings,
     /// Memory-slot behaviour.
     pub slots: SlotSettings,
     /// LLM consolidation prompt limits. Defaults are sized for a model with a
@@ -717,6 +720,7 @@ impl Default for Config {
             embedding_base_url: None,
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            retrieval: RetrievalSettings::default(),
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
@@ -979,6 +983,52 @@ impl Default for MaintenanceSettings {
             forget_sweep_interval_secs: 86_400,
             lint_interval_secs: 86_400,
             embedding_backfill_interval_secs: 0,
+        }
+    }
+}
+
+/// `[retrieval]` opt-in ranking signals layered on the RRF fusion in
+/// `memory_query`. Every default leaves ranking byte-identical to a store
+/// that never heard of this section.
+///
+/// Env form: `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`,
+/// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetrievalSettings {
+    /// Lexical session-recall routing: queries phrased as "find a past
+    /// session / what we did back then" ("上次 / …的会话 / last time /
+    /// yesterday …") hand session pages back their default kind/tier
+    /// authority penalty so they can compete for these queries.
+    pub query_intent: bool,
+    /// Extra authority granted to session pages when the routing fires,
+    /// on top of cancelling their default kind/tier penalty.
+    pub session_recall_bonus: f64,
+    /// Add the L0 abstract-embedding stream (`page_abstract_embeddings`) to
+    /// the RRF fusion. Pages gain an abstract vector when their frontmatter
+    /// carries `abstract:` and the embedding backfill runs.
+    pub abstract_vectors: bool,
+}
+
+impl Default for RetrievalSettings {
+    fn default() -> Self {
+        let base = ai_memory_store::RetrievalTuning::default();
+        Self {
+            query_intent: base.session_recall_routing,
+            session_recall_bonus: base.session_recall_bonus,
+            abstract_vectors: base.abstract_vectors,
+        }
+    }
+}
+
+impl RetrievalSettings {
+    /// Store-side tuning consumed by `ReaderPool::set_retrieval_tuning`.
+    #[must_use]
+    pub fn tuning(self) -> ai_memory_store::RetrievalTuning {
+        ai_memory_store::RetrievalTuning {
+            session_recall_routing: self.query_intent,
+            session_recall_bonus: self.session_recall_bonus.max(0.0),
+            abstract_vectors: self.abstract_vectors,
         }
     }
 }

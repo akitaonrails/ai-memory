@@ -1997,6 +1997,9 @@ impl Wiki {
             crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
         let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
         let entities = parse_entities(&path, &markdown.frontmatter)?;
+        // Read before the destructuring move below: the embed step needs the
+        // L0 `abstract:` line out of the final frontmatter.
+        let abstract_text = frontmatter_abstract(&markdown.frontmatter).map(str::to_owned);
 
         let Markdown {
             frontmatter: final_frontmatter,
@@ -2082,6 +2085,38 @@ impl Wiki {
                         )
                         .await;
                 }
+            }
+            // L0 abstract: the frontmatter `abstract:` line is embedded on
+            // its own so the opt-in abstract stream can rank on the sharp
+            // one-line summary. A page rewritten without the key has its
+            // stale abstract row removed, mirroring the body row's
+            // replace-on-write semantics.
+            match abstract_text.as_deref() {
+                Some(abstract_text) => match embedder.embed_document(abstract_text).await {
+                    Ok(vec) => {
+                        self.writer
+                            .store_abstract_embeddings(vec![ai_memory_store::EmbeddingWrite {
+                                page_id,
+                                vector_bytes: f32_vec_to_bytes(&vec),
+                                provider: embedder.provider().to_string(),
+                                model: embedder.model().to_string(),
+                                dim: embedder.dim(),
+                            }])
+                            .await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %page_id, "abstract embedding failed; page indexed without it");
+                        let _ = self
+                            .writer
+                            .record_embed_failure(
+                                page_id,
+                                ai_memory_store::EmbedOutcome::Failed,
+                                Some(e.to_string()),
+                            )
+                            .await;
+                    }
+                },
+                None => self.writer.delete_abstract_embedding(page_id).await?,
             }
         }
 
@@ -2289,6 +2324,15 @@ pub(crate) fn parse_expires_at(
 /// current file's value when nothing but the timestamp would change, so
 /// an idempotent rewrite emits byte-identical markdown (no git churn,
 /// and the store's modulo-`generated.at` comparison keeps the row).
+/// The frontmatter `abstract:` line, when it is a non-empty string.
+fn frontmatter_abstract(frontmatter: &serde_json::Value) -> Option<&str> {
+    frontmatter
+        .get("abstract")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 fn conform_frontmatter_for_disk(abs: &Path, page_path: &str, markdown: &mut Markdown) {
     ai_memory_core::okf::conform_frontmatter(page_path, &mut markdown.frontmatter);
     let inherited = std::fs::read_to_string(abs)
@@ -2922,6 +2966,68 @@ mod tests {
             .unwrap()
             .with_store_reader(store.reader.clone());
         (store, wiki, ws, proj)
+    }
+
+    #[tokio::test]
+    async fn write_page_embeds_frontmatter_abstract_and_cleans_stale_rows() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let embedder: Arc<dyn ai_memory_llm::Embedder> =
+            Arc::new(ai_memory_llm::SyntheticEmbedder::new(64));
+        let wiki = wiki.with_embedder(embedder);
+        let write_abs = |frontmatter: serde_json::Value| {
+            wiki.write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/abs.md").unwrap(),
+                frontmatter,
+                body: "alpha bravo".to_string(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ActorContext::anonymous(),
+            })
+        };
+
+        write_abs(serde_json::json!({"title": "abs", "abstract": "one-line summary"}))
+            .await
+            .unwrap();
+        let ids = store
+            .reader
+            .abstract_embedded_page_ids(
+                ws,
+                proj,
+                "synthetic".to_string(),
+                "bag-of-words-v1".to_string(),
+                64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "abstract embedded at write time");
+
+        // Rewriting without the key leaves the latest version without an
+        // abstract row; the superseded version's row stays behind, matching
+        // the body embedding's versioning semantics.
+        write_abs(serde_json::json!({"title": "abs"}))
+            .await
+            .unwrap();
+        let ids = store
+            .reader
+            .abstract_embedded_page_ids(
+                ws,
+                proj,
+                "synthetic".to_string(),
+                "bag-of-words-v1".to_string(),
+                64,
+            )
+            .await
+            .unwrap();
+        assert!(
+            ids.is_empty(),
+            "latest version must not carry an abstract row"
+        );
     }
 
     #[tokio::test]

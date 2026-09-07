@@ -1803,22 +1803,41 @@ pub fn store_embedding(
 
 /// Store / replace a batch of page embeddings in one transaction.
 pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) -> StoreResult<()> {
+    store_embeddings_in_table(conn, "page_embeddings", embeddings)
+}
+
+/// Store / replace a batch of L0 abstract embeddings
+/// (`page_abstract_embeddings`) in one transaction. Same row shape and
+/// upsert rule as [`store_embeddings`]; only the table differs.
+pub fn store_abstract_embeddings(
+    conn: &mut Connection,
+    embeddings: &[EmbeddingWrite],
+) -> StoreResult<()> {
+    store_embeddings_in_table(conn, "page_abstract_embeddings", embeddings)
+}
+
+fn store_embeddings_in_table(
+    conn: &mut Connection,
+    table: &'static str,
+    embeddings: &[EmbeddingWrite],
+) -> StoreResult<()> {
     if embeddings.is_empty() {
         return Ok(());
     }
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO page_embeddings (page_id, vector, provider, model, dim, created_at) \
+        let sql = format!(
+            "INSERT INTO {table} (page_id, vector, provider, model, dim, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(page_id) DO UPDATE SET \
                  vector = excluded.vector, \
                  provider = excluded.provider, \
                  model = excluded.model, \
                  dim = excluded.dim, \
-                 created_at = excluded.created_at",
-        )?;
+                 created_at = excluded.created_at"
+        );
+        let mut stmt = tx.prepare(&sql)?;
         for embedding in embeddings {
             stmt.execute(params![
                 embedding.page_id.as_bytes(),
@@ -1831,6 +1850,17 @@ pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) ->
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Remove a page's L0 abstract embedding row, if any. Called when a page is
+/// rewritten without its frontmatter `abstract:` so the abstract stream
+/// never ranks on a line the page no longer carries.
+pub fn delete_abstract_embedding(conn: &mut Connection, page_id: &PageId) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM page_abstract_embeddings WHERE page_id = ?1",
+        params![page_id.as_bytes()],
+    )?;
     Ok(())
 }
 

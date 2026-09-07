@@ -35,6 +35,7 @@ use crate::auto_improve::{
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
 use crate::maintenance::MaintenanceJob;
+use crate::retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 use crate::users::TOKEN_HASH_LEN;
 use crate::workstream::{ManagedRunContext, StoredManagedRunStatus, StoredWorkstreamSummary};
 
@@ -200,6 +201,9 @@ const AUTHORITY_MAX_EXTRA_CANDIDATES: usize = 300;
 #[derive(Debug, Clone, Copy)]
 struct PageAuthority {
     factor: f64,
+    /// Kind/tier penalty this page carries *because* it is a session page
+    /// (`0.0` for every other kind). A `session_recall` query gives it back.
+    session_penalty: f64,
 }
 
 impl PageAuthority {
@@ -215,18 +219,24 @@ impl PageAuthority {
         // out at 0.55x rather than excluding the page.
         let mut factor = 1.0_f64;
 
-        factor += match kind {
+        let kind_adjust = match kind {
             "rule" | "decision" => 0.15,
             "procedure" | "gotcha" => 0.12,
             "concept" | "slot" => 0.07,
             "session" => -0.15,
             _ => 0.0,
         };
-        factor += match tier {
+        let tier_adjust = match tier {
             "semantic" | "procedural" => 0.10,
             "episodic" => -0.08,
             "working" => -0.03,
             _ => 0.0,
+        };
+        factor += kind_adjust + tier_adjust;
+        let session_penalty = if kind == "session" {
+            -(kind_adjust + tier_adjust.min(0.0))
+        } else {
+            0.0
         };
         if pinned {
             factor += 0.08;
@@ -265,14 +275,53 @@ impl PageAuthority {
 
         Self {
             factor: factor.clamp(0.55, 1.50),
+            session_penalty,
         }
     }
 
     fn adjust_rank(&self, rank: f64) -> f64 {
-        if rank <= 0.0 {
-            rank * self.factor
+        apply_rank_multiplier(rank, self.factor)
+    }
+
+    /// Effective multiplier when the query routed to session-recall
+    /// retrieval: session pages get the kind/tier penalty they carry by
+    /// default handed back plus `bonus`, still inside the bounds every
+    /// other page lives in. Any other query leaves the factor alone.
+    fn factor_for(&self, session_recall: bool, bonus: f64) -> f64 {
+        if session_recall && self.session_penalty > 0.0 {
+            (self.factor + self.session_penalty + bonus).clamp(0.55, 1.50)
         } else {
-            rank / self.factor
+            self.factor
+        }
+    }
+}
+
+/// Scale a rank by a `> 0` multiplier so a larger multiplier always means a
+/// better (lower) rank, whichever sign convention the rank arrived in: fused
+/// RRF ranks are negated scores (`<= 0`), raw FTS5 ranks are positive.
+fn apply_rank_multiplier(rank: f64, multiplier: f64) -> f64 {
+    if rank <= 0.0 {
+        rank * multiplier
+    } else {
+        rank / multiplier
+    }
+}
+
+/// The two embedding tables share one schema; scans differ only by name.
+#[derive(Debug, Clone, Copy)]
+enum EmbeddingTable {
+    /// `page_embeddings`: one vector per page over the full body.
+    Body,
+    /// `page_abstract_embeddings`: one vector per page over its L0
+    /// frontmatter `abstract:` line (opt-in stream).
+    Abstract,
+}
+
+impl EmbeddingTable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Body => "page_embeddings",
+            Self::Abstract => "page_abstract_embeddings",
         }
     }
 }
@@ -477,6 +526,14 @@ pub struct RrfContributions {
     pub graph: f64,
     /// Entity-match stream contribution.
     pub entity: f64,
+    /// L0 abstract-embedding stream contribution (opt-in
+    /// `[retrieval] abstract_vectors`; 0.0 when off or missed).
+    #[serde(rename = "abstract", skip_serializing_if = "is_zero")]
+    pub abstract_vector: f64,
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Score transparency for one `memory_query` hit: where the hit ranked
@@ -500,6 +557,12 @@ pub struct SearchExplain {
     /// Cosine similarity against the query embedding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cosine: Option<f32>,
+    /// 1-based rank in the L0 abstract-embedding stream (opt-in).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abstract_rank: Option<usize>,
+    /// Cosine similarity of the page's abstract embedding against the query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abstract_cosine: Option<f32>,
     /// 1-based rank in the graph-neighbour stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_rank: Option<usize>,
@@ -528,6 +591,15 @@ pub struct SearchExplain {
     /// means it was considered and left alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authority: Option<f64>,
+    /// The routing decision for this query when `[retrieval] query_intent`
+    /// is on: `"session_recall"` for queries the lexical router recognised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<&'static str>,
+    /// Multiplier the routing applied to this hit: the session-page
+    /// authority lift expressed as a ratio over the un-routed factor.
+    /// `1.0` = considered and left alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_boost: Option<f64>,
     /// Relevance in `[0, 1]` assigned by the optional post-RRF
     /// reranker. `None` when no reranker is configured, when it
     /// degraded, or when the hit fell outside the bounded judged prefix.
@@ -1371,6 +1443,10 @@ pub struct HealthDetail {
 #[derive(Clone)]
 pub struct ReaderPool {
     inner: Arc<Inner>,
+    /// Opt-in post-fusion ranking signals (see [`RetrievalTuning`]). Lives
+    /// on the handle, so clones taken after [`Self::set_retrieval_tuning`]
+    /// share the operator's choice while the pool itself stays untouched.
+    tuning: RetrievalTuning,
 }
 
 struct Inner {
@@ -1392,7 +1468,20 @@ impl ReaderPool {
                 pool: Mutex::new(Vec::with_capacity(soft_cap.max(1))),
                 soft_cap: soft_cap.max(1),
             }),
+            tuning: RetrievalTuning::default(),
         })
+    }
+
+    /// Configure the opt-in ranking signals used by [`Self::hybrid_search`].
+    /// Only handles cloned from this one afterwards observe the change.
+    pub fn set_retrieval_tuning(&mut self, tuning: RetrievalTuning) {
+        self.tuning = tuning;
+    }
+
+    /// The ranking signals this handle applies (default: none).
+    #[must_use]
+    pub fn retrieval_tuning(&self) -> RetrievalTuning {
+        self.tuning
     }
 
     /// Run a synchronous closure against a pooled read-only connection.
@@ -3113,18 +3202,102 @@ impl ReaderPool {
         model: String,
         dim: u32,
     ) -> StoreResult<Vec<PageId>> {
+        self.embedded_page_ids_in_table(
+            EmbeddingTable::Body,
+            workspace_id,
+            project_id,
+            provider,
+            model,
+            dim,
+        )
+        .await
+    }
+
+    /// Page ids whose L0 abstract already has a matching embedding row
+    /// (`page_abstract_embeddings`). The backfill uses it to skip pages
+    /// whose abstract is already indexed under the current triple.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn abstract_embedded_page_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        provider: String,
+        model: String,
+        dim: u32,
+    ) -> StoreResult<Vec<PageId>> {
+        self.embedded_page_ids_in_table(
+            EmbeddingTable::Abstract,
+            workspace_id,
+            project_id,
+            provider,
+            model,
+            dim,
+        )
+        .await
+    }
+
+    /// Latest pages of a project whose frontmatter carries a non-empty
+    /// `abstract` string — the only pages the L0 stream can index. Lets the
+    /// backfill decide without reading every page off disk.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn abstract_bearing_page_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<PageId>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT page_embeddings.page_id \
-                 FROM page_embeddings \
-                 JOIN pages ON pages.id = page_embeddings.page_id \
+                "SELECT pages.id \
+                 FROM pages \
                  WHERE pages.workspace_id = ?1 \
                    AND pages.project_id = ?2 \
                    AND pages.is_latest = 1 \
-                   AND page_embeddings.provider = ?3 \
-                   AND page_embeddings.model = ?4 \
-                   AND page_embeddings.dim = ?5",
+                   AND json_type(pages.frontmatter_json, '$.abstract') = 'text' \
+                   AND length(trim(json_extract(pages.frontmatter_json, '$.abstract'))) > 0",
             )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    Ok(id_bytes)
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(PageId::from_slice(&row?)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn embedded_page_ids_in_table(
+        &self,
+        table: EmbeddingTable,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        provider: String,
+        model: String,
+        dim: u32,
+    ) -> StoreResult<Vec<PageId>> {
+        let table = table.name();
+        self.with_conn(move |conn| {
+            let sql = format!(
+                "SELECT {table}.page_id \
+                 FROM {table} \
+                 JOIN pages ON pages.id = {table}.page_id \
+                 WHERE pages.workspace_id = ?1 \
+                   AND pages.project_id = ?2 \
+                   AND pages.is_latest = 1 \
+                   AND {table}.provider = ?3 \
+                   AND {table}.model = ?4 \
+                   AND {table}.dim = ?5"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(
                 params![
                     workspace_id.as_bytes(),
@@ -3159,20 +3332,51 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: i64,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
+        self.top_embedding_hits_in_table(
+            EmbeddingTable::Body,
+            workspace_id,
+            project_id,
+            query_vec,
+            provider,
+            model,
+            dim,
+            limit,
+            expiry_cutoff_us,
+        )
+        .await
+    }
+
+    /// Cosine top-`limit` over one embedding table for the latest, unexpired
+    /// pages of a project. The body and L0-abstract tables share a schema,
+    /// so the scan differs only in which table it reads.
+    #[allow(clippy::too_many_arguments)]
+    async fn top_embedding_hits_in_table(
+        &self,
+        table: EmbeddingTable,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query_vec: Vec<f32>,
+        provider: String,
+        model: String,
+        dim: u32,
+        limit: usize,
+        expiry_cutoff_us: i64,
+    ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let table = table.name();
         self.with_conn(move |conn| {
             let sql = format!(
-                "SELECT page_embeddings.page_id, page_embeddings.vector, pages.path \
-                 FROM page_embeddings \
-                 JOIN pages ON pages.id = page_embeddings.page_id \
+                "SELECT {table}.page_id, {table}.vector, pages.path \
+                 FROM {table} \
+                 JOIN pages ON pages.id = {table}.page_id \
                  WHERE pages.workspace_id = ?1 \
                    AND pages.project_id = ?2 \
                    AND pages.is_latest = 1{not_expired} \
-                   AND page_embeddings.provider = ?3 \
-                   AND page_embeddings.model = ?4 \
-                   AND page_embeddings.dim = ?5",
+                   AND {table}.provider = ?3 \
+                   AND {table}.model = ?4 \
+                   AND {table}.dim = ?5",
                 not_expired = not_expired("pages", "?6"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -4069,6 +4273,10 @@ impl ReaderPool {
         explain: bool,
     ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        // The routing decision is read off the query before the FTS call
+        // consumes it; with routing disabled this is a no-op `false`.
+        let tuning = self.tuning;
+        let session_recall = tuning.session_recall_routing && is_session_recall_query(&query);
         // Authority is applied after RRF, so every stream needs the same
         // bounded candidate window used by FTS-only search. A `limit * 2`
         // window was too narrow at small limits for a canonical page to enter
@@ -4103,7 +4311,23 @@ impl ReaderPool {
             .map(|(hit, _authority)| hit)
             .collect();
         let mut vec_hits: Vec<(PageId, PagePath, f32)> = Vec::new();
+        let mut abstract_hits: Vec<(PageId, PagePath, f32)> = Vec::new();
         if let Some(qv) = query_vec {
+            if tuning.abstract_vectors {
+                abstract_hits = self
+                    .top_embedding_hits_in_table(
+                        EmbeddingTable::Abstract,
+                        workspace_id,
+                        project_id,
+                        qv.clone(),
+                        provider.clone(),
+                        model.clone(),
+                        dim,
+                        candidate_limit,
+                        cutoff,
+                    )
+                    .await?;
+            }
             vec_hits = self
                 .top_embedding_hits_for_project(
                     workspace_id,
@@ -4129,7 +4353,7 @@ impl ReaderPool {
                 }
             }
         }
-        for (id, path, _) in &vec_hits {
+        for (id, path, _) in vec_hits.iter().chain(abstract_hits.iter()) {
             if seed_seen.insert(*id) {
                 seed_ids.push(*id);
                 if let Some(paths) = &mut seed_paths {
@@ -4197,6 +4421,23 @@ impl ReaderPool {
                 details.vector_rank = Some(rank + 1);
                 details.cosine = Some(*cosine);
                 details.rrf.vector = contrib;
+                details.fused += contrib;
+            }
+        }
+        for (rank, (id, path, cosine)) in abstract_hits.iter().enumerate() {
+            let contrib = 1.0 / (k + (rank + 1) as f64);
+            let entry = fused.entry(*id).or_insert_with(|| Fused {
+                path: path.clone(),
+                title: String::new(),
+                snippet: String::new(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.abstract_rank = Some(rank + 1);
+                details.abstract_cosine = Some(*cosine);
+                details.rrf.abstract_vector = contrib;
                 details.fused += contrib;
             }
         }
@@ -4288,12 +4529,17 @@ impl ReaderPool {
         );
         for (hit, explain) in &mut out {
             if let Some(authority) = authorities.get(&hit.id) {
-                hit.rank = authority.adjust_rank(hit.rank);
+                let factor = authority.factor_for(session_recall, tuning.session_recall_bonus);
+                hit.rank = apply_rank_multiplier(hit.rank, factor);
                 // `fused` stays the raw RRF sum; without the multiplier
                 // beside it the explain could not account for the rank it
                 // returns, which is the whole point of the surface.
                 if let Some(details) = explain {
-                    details.authority = Some(authority.factor);
+                    details.authority = Some(factor);
+                    if session_recall {
+                        details.intent = Some("session_recall");
+                        details.intent_boost = Some(factor / authority.factor);
+                    }
                 }
             }
         }

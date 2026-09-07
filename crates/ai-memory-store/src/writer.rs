@@ -311,6 +311,14 @@ pub(crate) enum WriteCmd {
         embeddings: Vec<EmbeddingWrite>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    StoreAbstractEmbeddingBatch {
+        embeddings: Vec<EmbeddingWrite>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    DeleteAbstractEmbedding {
+        page_id: PageId,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     DeleteStalePageEmbeddings {
         workspace_id: WorkspaceId,
         project_id: Option<ProjectId>,
@@ -1289,6 +1297,38 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Store or replace a batch of L0 abstract embeddings
+    /// (`page_abstract_embeddings`) in one SQLite transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn store_abstract_embeddings(
+        &self,
+        embeddings: Vec<EmbeddingWrite>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StoreAbstractEmbeddingBatch {
+            embeddings,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Remove a page's L0 abstract embedding row (`page_abstract_embeddings`),
+    /// if any. Called when a page is rewritten without its frontmatter
+    /// `abstract:` so the abstract stream never ranks a line the page no
+    /// longer carries.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn delete_abstract_embedding(&self, page_id: PageId) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeleteAbstractEmbedding { page_id, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -2933,6 +2973,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::StoreEmbeddingBatch { embeddings, reply } => {
                 let result = ops::store_embeddings(&mut conn, &embeddings);
                 send_or_warn(reply, result, "store_embeddings");
+            }
+            WriteCmd::StoreAbstractEmbeddingBatch { embeddings, reply } => {
+                let result = ops::store_abstract_embeddings(&mut conn, &embeddings);
+                send_or_warn(reply, result, "store_abstract_embeddings");
+            }
+            WriteCmd::DeleteAbstractEmbedding { page_id, reply } => {
+                let result = ops::delete_abstract_embedding(&mut conn, &page_id);
+                send_or_warn(reply, result, "delete_abstract_embedding");
             }
             WriteCmd::DeleteStalePageEmbeddings {
                 workspace_id,
