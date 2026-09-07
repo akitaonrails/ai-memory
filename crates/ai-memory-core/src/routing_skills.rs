@@ -97,6 +97,7 @@ mod tests {
         ("memory_handoff_accept", "ai-memory-handoff"),
         ("memory_handoff_begin", "ai-memory-handoff"),
         ("memory_handoff_cancel", "ai-memory-handoff"),
+        ("memory_handoff_list", "ai-memory-handoff"),
         ("memory_write_page", "ai-memory-durable-pages"),
         ("memory_delete_page", "ai-memory-durable-pages"),
         ("memory_consolidate", "ai-memory-learning-maintenance"),

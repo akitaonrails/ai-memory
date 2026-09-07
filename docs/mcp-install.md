@@ -1232,6 +1232,7 @@ You: List the MCP tools you can call. Use one of them to check
 Model (any client): I can call: memory_query, memory_recent,
      memory_status, memory_briefing, memory_explore,
      memory_handoff_accept, memory_handoff_begin, memory_handoff_cancel,
+     memory_handoff_list,
      memory_consolidate, memory_auto_improve, memory_write_page,
      memory_read_page, memory_read_session_observations,
      memory_delete_page, memory_feedback,
@@ -1278,7 +1279,7 @@ that *starts* the next one - to play nicely with ai-memory:
 | Side | What's needed | Covered by |
 |---|---|---|
 | **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, OpenCode 2 beta, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero discard SessionStart stdout; Swival is MCP-only. Use (b) for those clients. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero discard SessionStart stdout; Swival is MCP-only. Use (b) for those clients. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. The OpenCode 2 beta plugin subscribes to the same event name on the

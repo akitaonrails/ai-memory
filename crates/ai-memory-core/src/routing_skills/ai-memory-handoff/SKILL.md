@@ -10,15 +10,16 @@ Use this skill for single-use cross-session handoffs. Handoffs are for the next 
 
 ## Tools in this cluster
 
-- `memory_handoff_accept` consumes the pending handoff when the user asks where we left off and no already-fetched handoff block is visible.
+- `memory_handoff_list` is the read-only inspect path: it returns open handoffs without claiming or expiring them. Use it when no SessionStart handoff block is in context (Grok, Zero, and other no-stdout / MCP-only clients), when the user asks what is pending, or when you need an exact id.
+- `memory_handoff_accept` consumes one open handoff. Prefer listing first when no prepended block is visible, then pass the listed `handoff_id` to claim that exact row. Omitting `handoff_id` claims the latest eligible open handoff. Use this when the user asks where we left off and no already-fetched handoff block is visible.
 - `memory_handoff_begin` creates a terse next-session handoff only when the user is wrapping up, ending the session, or explicitly asks to save context for the next session.
-- `memory_handoff_cancel` expires a mistaken pending handoff by exact handoff id.
+- `memory_handoff_cancel` expires a mistaken pending handoff by exact handoff id from begin or list.
 
 ## Single-use handoff behavior
 
 The SessionStart hook usually fetches and consumes any pending handoff before the agent sees its first prompt. If the current context already contains a pending handoff block, answer from that block directly. Do not call the accept tool again to find it in another project, because handoffs are single-use and the tool will normally return null after SessionStart consumed it.
 
-If no pending handoff block is visible and the user asks where we left off, then use the accept tool with the client-aware project scope below.
+If no pending handoff block is visible, inspect with `memory_handoff_list` first. Listing does not claim or expire anything. When the user asks where we left off, claim one listed row with `memory_handoff_accept` and that `handoff_id`, using the client-aware project scope below. Do not treat list as a second accept path.
 
 ## Creating a handoff
 
@@ -30,7 +31,7 @@ On a shared server, a handoff belongs to the operator who created it. Set `share
 
 ## Canceling a handoff
 
-Cancel only when the user asks to discard a handoff or you created one by mistake. Use the exact handoff id returned by the begin tool. Cancellation is idempotent from the user's point of view, but it should still target only the known handoff.
+Cancel only when the user asks to discard a handoff or you created one by mistake. Use the exact handoff id returned by the begin or list tool. Cancellation is idempotent from the user's point of view, but it should still target only the known handoff.
 
 Accept and cancel normally act only on the caller's own plus shared handoffs. `any_owner: true` is a root-only recovery action over another operator's context; use it only on an explicit user request.
 

@@ -190,7 +190,7 @@ to — and consumed by — the next session to start, whoever it belongs to.
   the same rule that decides the auth tier, so the proxy path gets real
   per-operator isolation rather than one shared bucket.
 - `memory_handoff_begin` takes `shared: true` to publish a baton deliberately.
-- `memory_handoff_accept` / `memory_handoff_cancel` take `any_owner: true` to
+- `memory_handoff_list` / `memory_handoff_accept` / `memory_handoff_cancel` take `any_owner: true` to
   act on somebody else's baton; that opt-out requires admin authority in
   multi-user mode.
 - `ai-memory finalize-session --all-owners` does the same for sessions, and

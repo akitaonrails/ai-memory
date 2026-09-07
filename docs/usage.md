@@ -38,7 +38,9 @@ $ codex   # in the same directory, later
 
 If an agent has MCP but no lifecycle hook surface, ask it to call
 `memory_handoff_begin` before quitting. The next hooked agent can still
-consume that handoff automatically.
+consume that handoff automatically. No-stdout clients (Grok, Zero) should
+call `memory_handoff_list` on resume, then `memory_handoff_accept` with
+the listed `handoff_id`; listing does not claim the row.
 
 On a server that distinguishes operators, handoffs belong to their creator by
 default: the next session for that operator sees their own plus deliberately
@@ -87,7 +89,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + entity/graph/vector RRF over compiled wiki pages, followed by bounded source-authority ranking and raw-observation fallback on a page miss. |
 | Before proposing architecture | `memory_query` | Checks prior decisions and gotchas before suggesting designs. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
-| "Where did we leave off?" | Existing handoff block, or `memory_handoff_accept` if no block exists | Resumes from the latest pending handoff. |
+| "Where did we leave off?" | Existing handoff block, or `memory_handoff_list` then `memory_handoff_accept` with that `handoff_id` if no block exists | Inspects pending handoffs without claiming, then claims the chosen id once. |
 | "Save context for the next session" | `memory_handoff_begin` | Writes a terse session-end handoff with open questions and next steps. Do not use for status or briefing requests. |
 | "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Marks an exact open handoff id expired before the next session can consume it. |
 | "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; a substantive session end otherwise writes a rule-based summary page). Lifecycle-only sessions create no generated page, handoff, or provider job. Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |

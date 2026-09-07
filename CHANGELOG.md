@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.712 → 0.779 (+9.4%). Both signals are visible per hit in
   `memory_query(explain=true)` (`intent`, `intent_boost`,
   `abstract_rank`, `rrf.abstract`). (#672)
+- `memory_handoff_list` lets no-stdout and MCP-only clients inspect open
+  project handoffs without claiming or expiring them, then
+  `memory_handoff_accept` can claim that exact `handoff_id` once. Grok,
+  Zero, and other clients that discard SessionStart stdout no longer have
+  to recover a baton by blindly accepting the latest row. Listing is
+  owner-filtered like accept (own plus shared; root-only `any_owner`);
+  it is not a second claim path, and Grok SessionStart still does not
+  fetch `/handoff`. (#664)
 
 ### Fixed
 - OKF-conformed event ledgers are skipped by the indexer again, so a migrated

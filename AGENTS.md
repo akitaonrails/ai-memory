@@ -489,7 +489,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 18 (see `docs/ARCHITECTURE.md`).
+  The tool count is currently 19 (see `docs/ARCHITECTURE.md`).
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
   subcommands, MCP tools, config keys, a new agent harness or LLM
   provider); major = breaking (on-disk format without migration, removed
