@@ -24,6 +24,7 @@ mod migrations;
 mod ops;
 pub mod password;
 mod reader;
+mod retrieval_tuning;
 mod scope;
 mod session_consolidation;
 pub mod users;
@@ -67,6 +68,7 @@ pub use reader::{
     StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
     f32_vec_to_bytes,
 };
+pub use retrieval_tuning::{QueryIntent, RetrievalTuning, detect_query_intent, hotness_score};
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
     create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,

@@ -733,8 +733,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     migrations::snapshot_before_db_migration(&config.data_dir, backup_dest_override.as_deref())
         .with_context(|| "taking the pre-migration safety backup")?;
 
-    let store = Store::open(&config.data_dir)
+    let mut store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
+    // Every reader handle below is cloned from this one, so the opt-in
+    // ranking signals are set once, here, and inherited everywhere.
+    store.reader.set_retrieval_tuning(config.retrieval.tuning());
+    let store = store;
 
     // One-shot legacy heal (issue #103): NULL out any project repo_path that
     // is a prefix-match catch-all. That means the $HOME and filesystem-root

@@ -2126,11 +2126,15 @@ impl AiMemoryServer {
             Vec::new()
         };
         let streams_active = explain.then(|| {
+            let mut streams = vec!["fts", "entity"];
             if query_vec.is_some() {
-                vec!["fts", "entity", "vector", "graph"]
-            } else {
-                vec!["fts", "entity", "graph"]
+                streams.push("vector");
+                if self.reader.retrieval_tuning().abstract_vectors {
+                    streams.push("abstract");
+                }
             }
+            streams.push("graph");
+            streams
         });
         let hits = hits
             .into_iter()

@@ -311,6 +311,10 @@ pub(crate) enum WriteCmd {
         embeddings: Vec<EmbeddingWrite>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    StoreAbstractEmbeddingBatch {
+        embeddings: Vec<EmbeddingWrite>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     DeleteStalePageEmbeddings {
         workspace_id: WorkspaceId,
         project_id: Option<ProjectId>,
@@ -1285,6 +1289,24 @@ impl WriterHandle {
     pub async fn store_embeddings(&self, embeddings: Vec<EmbeddingWrite>) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::StoreEmbeddingBatch {
+            embeddings,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Store or replace a batch of L0 abstract embeddings
+    /// (`page_abstract_embeddings`) in one SQLite transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn store_abstract_embeddings(
+        &self,
+        embeddings: Vec<EmbeddingWrite>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StoreAbstractEmbeddingBatch {
             embeddings,
             reply: tx,
         })
@@ -2933,6 +2955,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::StoreEmbeddingBatch { embeddings, reply } => {
                 let result = ops::store_embeddings(&mut conn, &embeddings);
                 send_or_warn(reply, result, "store_embeddings");
+            }
+            WriteCmd::StoreAbstractEmbeddingBatch { embeddings, reply } => {
+                let result = ops::store_abstract_embeddings(&mut conn, &embeddings);
+                send_or_warn(reply, result, "store_abstract_embeddings");
             }
             WriteCmd::DeleteStalePageEmbeddings {
                 workspace_id,
