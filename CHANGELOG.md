@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `[retrieval]` section with two opt-in ranking signals, both off by default
+  so unconfigured stores rank exactly as before. `query_intent` routes
+  lexically session-recall queries ("上次 / 之前那次…的会话 / last time /
+  yesterday …") past the default session-page authority penalty
+  (×0.77 combined kind/tier), with `session_recall_bonus` (default 0.25)
+  sizing the lift; `abstract_vectors` adds a fifth RRF stream over the new
+  `page_abstract_embeddings` table (V61) — the L0 layer: a page's
+  frontmatter `abstract:` line is embedded by the same backfill as its
+  body, and a one-line summary embeds far more sharply than a
+  multi-thousand-character body. Measured on a 138-query golden set over a
+  production two-year wiki (FTS5 + entity + vector + graph, mis-tei
+  Qwen3-Embedding-8B): hit@1 0.609 → 0.746 (+22%), NDCG@10 0.782 → 0.879
+  (+12%) with both enabled; every unrouted category keeps its exact
+  baseline ordering, and both signals are visible per hit in
+  `memory_query(explain=true)` (`intent`, `intent_boost`,
+  `abstract_rank`, `rrf.abstract`).
+
 ### Fixed
 - OKF-conformed event ledgers are skipped by the indexer again, so a migrated
   store stops growing without bound. The reserved-file check treated any

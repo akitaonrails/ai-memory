@@ -35,7 +35,7 @@ use crate::auto_improve::{
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
 use crate::maintenance::MaintenanceJob;
-use crate::retrieval_tuning::{QueryIntent, RetrievalTuning};
+use crate::retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 use crate::users::TOKEN_HASH_LEN;
 use crate::workstream::{ManagedRunContext, StoredManagedRunStatus, StoredWorkstreamSummary};
 
@@ -283,16 +283,15 @@ impl PageAuthority {
         apply_rank_multiplier(rank, self.factor)
     }
 
-    /// Effective multiplier under the detected query intent: a
-    /// `session_recall` query hands session pages back the kind/tier penalty
-    /// they carry by default and adds `bonus`, still inside the bounds every
-    /// other page lives in. Any other intent leaves the factor alone.
-    fn factor_for(&self, intent: Option<QueryIntent>, bonus: f64) -> f64 {
-        match intent {
-            Some(QueryIntent::SessionRecall) if self.session_penalty > 0.0 => {
-                (self.factor + self.session_penalty + bonus).clamp(0.55, 1.50)
-            }
-            _ => self.factor,
+    /// Effective multiplier when the query routed to session-recall
+    /// retrieval: session pages get the kind/tier penalty they carry by
+    /// default handed back plus `bonus`, still inside the bounds every
+    /// other page lives in. Any other query leaves the factor alone.
+    fn factor_for(&self, session_recall: bool, bonus: f64) -> f64 {
+        if session_recall && self.session_penalty > 0.0 {
+            (self.factor + self.session_penalty + bonus).clamp(0.55, 1.50)
+        } else {
+            self.factor
         }
     }
 }
@@ -592,19 +591,13 @@ pub struct SearchExplain {
     /// means it was considered and left alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authority: Option<f64>,
-    /// Hotness in `[0, 1]` — access frequency × update recency — when the
-    /// opt-in `[retrieval] hotness_alpha` boost is configured.
+    /// The routing decision for this query when `[retrieval] query_intent`
+    /// is on: `"session_recall"` for queries the lexical router recognised.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hotness: Option<f64>,
-    /// The `1 + alpha * hotness` multiplier folded into the returned rank.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hotness_boost: Option<f64>,
-    /// Lexically detected query intent when `[retrieval] query_intent` is on.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub intent: Option<QueryIntent>,
-    /// Multiplier the intent applied to this hit: the recency boost under
-    /// `recency`, or the session-page authority lift under `session_recall`
-    /// expressed as a ratio over the intent-free factor. `1.0` = untouched.
+    pub intent: Option<&'static str>,
+    /// Multiplier the routing applied to this hit: the session-page
+    /// authority lift expressed as a ratio over the un-routed factor.
+    /// `1.0` = considered and left alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent_boost: Option<f64>,
     /// Relevance in `[0, 1]` assigned by the optional post-RRF
@@ -4176,56 +4169,6 @@ impl ReaderPool {
         .await
     }
 
-    /// `access_count` and `updated_at` (µs) for the requested latest pages —
-    /// the two signals the opt-in hotness / recency boosts read. Fetched in
-    /// one round trip, and only when a boost is actually configured.
-    async fn page_signals_for_ids(
-        &self,
-        workspace_id: WorkspaceId,
-        project_id: ProjectId,
-        page_ids: Vec<PageId>,
-    ) -> StoreResult<std::collections::HashMap<PageId, (i64, i64)>> {
-        if page_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-        self.with_conn(move |conn| {
-            let mut values_clause = String::with_capacity(page_ids.len() * 5);
-            let mut sql_params = Vec::with_capacity(page_ids.len() + 2);
-            for (idx, page_id) in page_ids.iter().enumerate() {
-                if idx > 0 {
-                    values_clause.push_str(", ");
-                }
-                values_clause.push_str("(?)");
-                sql_params.push(Value::Blob(page_id.as_bytes().to_vec()));
-            }
-            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
-            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
-            let sql = format!(
-                "WITH requested(id) AS (VALUES {values_clause}) \
-                 SELECT pages.id, pages.access_count, pages.updated_at \
-                 FROM requested \
-                 JOIN pages ON pages.id = requested.id \
-                 WHERE pages.workspace_id = ? \
-                   AND pages.project_id = ? \
-                   AND pages.is_latest = 1"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
-                let id_bytes: Vec<u8> = row.get(0)?;
-                let access_count: i64 = row.get(1)?;
-                let updated_at: i64 = row.get(2)?;
-                Ok((id_bytes, access_count, updated_at))
-            })?;
-            let mut signals = std::collections::HashMap::new();
-            for row in rows {
-                let (id_bytes, access_count, updated_at) = row?;
-                signals.insert(PageId::from_slice(&id_bytes)?, (access_count, updated_at));
-            }
-            Ok(signals)
-        })
-        .await
-    }
-
     /// Hybrid search: RRF-fuse FTS5 results with cosine-similarity
     /// over the stored embeddings of the matching `(provider, model,
     /// dim)`, entity matches, and link-neighbour expansion — four RRF
@@ -4330,10 +4273,10 @@ impl ReaderPool {
         explain: bool,
     ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
-        // Intent is read off the query before the FTS call consumes it; with
-        // routing disabled this is a no-op `None`.
+        // The routing decision is read off the query before the FTS call
+        // consumes it; with routing disabled this is a no-op `false`.
         let tuning = self.tuning;
-        let intent = tuning.intent_for(&query);
+        let session_recall = tuning.session_recall_routing && is_session_recall_query(&query);
         // Authority is applied after RRF, so every stream needs the same
         // bounded candidate window used by FTS-only search. A `limit * 2`
         // window was too narrow at small limits for a canonical page to enter
@@ -4584,47 +4527,18 @@ impl ReaderPool {
             self.page_authorities_for_project(workspace_id, project_id, missing_authorities)
                 .await?,
         );
-        // Opt-in signals ride on the same pass as authority. Both default
-        // off, in which case no extra query runs and every multiplier is 1.
-        let signals = if tuning.needs_page_signals(intent) {
-            let ids: Vec<PageId> = out.iter().map(|(hit, _)| hit.id).collect();
-            self.page_signals_for_ids(workspace_id, project_id, ids)
-                .await?
-        } else {
-            std::collections::HashMap::new()
-        };
-        let now = now_us();
         for (hit, explain) in &mut out {
             if let Some(authority) = authorities.get(&hit.id) {
-                let factor = authority.factor_for(intent, tuning.session_recall_bonus);
+                let factor = authority.factor_for(session_recall, tuning.session_recall_bonus);
                 hit.rank = apply_rank_multiplier(hit.rank, factor);
                 // `fused` stays the raw RRF sum; without the multiplier
                 // beside it the explain could not account for the rank it
                 // returns, which is the whole point of the surface.
                 if let Some(details) = explain {
                     details.authority = Some(factor);
-                    if intent.is_some() {
-                        details.intent = intent;
+                    if session_recall {
+                        details.intent = Some("session_recall");
                         details.intent_boost = Some(factor / authority.factor);
-                    }
-                }
-            }
-            if let Some(&(access_count, updated_at)) = signals.get(&hit.id) {
-                let (hotness, hotness_boost) = tuning.hotness_boost(access_count, updated_at, now);
-                let recency_boost = if intent == Some(QueryIntent::Recency) {
-                    tuning.recency_boost(updated_at, now)
-                } else {
-                    1.0
-                };
-                hit.rank = apply_rank_multiplier(hit.rank, hotness_boost * recency_boost);
-                if let Some(details) = explain {
-                    if tuning.hotness_alpha > 0.0 {
-                        details.hotness = Some(hotness);
-                        details.hotness_boost = Some(hotness_boost);
-                    }
-                    if intent == Some(QueryIntent::Recency) {
-                        details.intent = intent;
-                        details.intent_boost = Some(recency_boost);
                     }
                 }
             }

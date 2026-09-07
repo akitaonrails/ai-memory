@@ -991,25 +991,17 @@ impl Default for MaintenanceSettings {
 /// `memory_query`. Every default leaves ranking byte-identical to a store
 /// that never heard of this section.
 ///
-/// Env form: `AI_MEMORY_RETRIEVAL__HOTNESS_ALPHA=0.3`,
-/// `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`.
+/// Env form: `AI_MEMORY_RETRIEVAL__QUERY_INTENT=true`,
+/// `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS=true`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrievalSettings {
-    /// Weight of the hotness boost (`1 + alpha * hotness`), where hotness is
-    /// access frequency × update recency in `[0, 1]`. `0` disables it.
-    pub hotness_alpha: f64,
-    /// Half-life, in days, of the recency term inside hotness.
-    pub hotness_half_life_days: f64,
-    /// Lexical query-intent routing: `recency` queries ("现在 / latest /
-    /// still …") get an update-recency boost, `session_recall` queries
-    /// ("上次 / last time / yesterday …") let session pages compete.
+    /// Lexical session-recall routing: queries phrased as "find a past
+    /// session / what we did back then" ("上次 / …的会话 / last time /
+    /// yesterday …") hand session pages back their default kind/tier
+    /// authority penalty so they can compete for these queries.
     pub query_intent: bool,
-    /// Weight of the recency boost under the `recency` intent.
-    pub recency_beta: f64,
-    /// Half-life, in days, of the recency boost under the `recency` intent.
-    pub recency_half_life_days: f64,
-    /// Extra authority granted to session pages under `session_recall`,
+    /// Extra authority granted to session pages when the routing fires,
     /// on top of cancelling their default kind/tier penalty.
     pub session_recall_bonus: f64,
     /// Add the L0 abstract-embedding stream (`page_abstract_embeddings`) to
@@ -1022,11 +1014,7 @@ impl Default for RetrievalSettings {
     fn default() -> Self {
         let base = ai_memory_store::RetrievalTuning::default();
         Self {
-            hotness_alpha: base.hotness_alpha,
-            hotness_half_life_days: base.hotness_half_life_days,
-            query_intent: base.query_intent,
-            recency_beta: base.recency_beta,
-            recency_half_life_days: base.recency_half_life_days,
+            query_intent: base.session_recall_routing,
             session_recall_bonus: base.session_recall_bonus,
             abstract_vectors: base.abstract_vectors,
         }
@@ -1038,11 +1026,7 @@ impl RetrievalSettings {
     #[must_use]
     pub fn tuning(self) -> ai_memory_store::RetrievalTuning {
         ai_memory_store::RetrievalTuning {
-            hotness_alpha: self.hotness_alpha.max(0.0),
-            hotness_half_life_days: self.hotness_half_life_days,
-            query_intent: self.query_intent,
-            recency_beta: self.recency_beta.max(0.0),
-            recency_half_life_days: self.recency_half_life_days,
+            session_recall_routing: self.query_intent,
             session_recall_bonus: self.session_recall_bonus.max(0.0),
             abstract_vectors: self.abstract_vectors,
         }

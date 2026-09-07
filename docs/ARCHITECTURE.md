@@ -588,6 +588,17 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1        # per project; scheduler ticks do not overlap
 min_session_age_secs = 600
+
+[retrieval]                       # opt-in ranking signals; all off by default
+query_intent = false              # lexical session-recall routing: queries phrased as
+                                  # "上次 / …的会话 / last time / yesterday" hand session
+                                  # pages back their default kind/tier authority penalty
+session_recall_bonus = 0.25       # extra authority on top of the cancelled penalty;
+                                  # lower it (e.g. 0.15) if rank drift on
+                                  # "之前/上次"-prefixed fact queries matters more
+abstract_vectors = false          # fifth RRF stream over page_abstract_embeddings
+                                  # (L0: each page's frontmatter `abstract:` line, embedded
+                                  # by the same backfill as the body)
 ```
 
 **LLM provider env** (opt-in):

@@ -208,24 +208,22 @@ pub async fn run_embedding_backfill(
                 }
             }
         }
-        if need_abstract {
-            if let Some(abstract_text) = frontmatter_abstract(&md.frontmatter) {
-                match embedder.embed_document(abstract_text).await {
-                    Ok(vec) => pending_abstract.push(EmbeddingWrite {
-                        page_id: cand.id,
-                        vector_bytes: f32_vec_to_bytes(&vec),
-                        provider: provider.clone(),
-                        model: model.clone(),
-                        dim,
-                    }),
-                    Err(e) => {
-                        warn!(path = %cand.path, error = %e, "embed: abstract provider call failed");
-                        counts.failed += 1;
-                    }
+        if need_abstract && let Some(abstract_text) = frontmatter_abstract(&md.frontmatter) {
+            match embedder.embed_document(abstract_text).await {
+                Ok(vec) => pending_abstract.push(EmbeddingWrite {
+                    page_id: cand.id,
+                    vector_bytes: f32_vec_to_bytes(&vec),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    dim,
+                }),
+                Err(e) => {
+                    warn!(path = %cand.path, error = %e, "embed: abstract provider call failed");
+                    counts.failed += 1;
                 }
-                if pending_abstract.len() >= EMBEDDING_WRITE_BATCH {
-                    flush_abstract_batch(writer, &mut pending_abstract, &mut counts).await;
-                }
+            }
+            if pending_abstract.len() >= EMBEDDING_WRITE_BATCH {
+                flush_abstract_batch(writer, &mut pending_abstract, &mut counts).await;
             }
         }
     }
