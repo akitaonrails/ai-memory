@@ -1853,6 +1853,17 @@ fn store_embeddings_in_table(
     Ok(())
 }
 
+/// Remove a page's L0 abstract embedding row, if any. Called when a page is
+/// rewritten without its frontmatter `abstract:` so the abstract stream
+/// never ranks on a line the page no longer carries.
+pub fn delete_abstract_embedding(conn: &mut Connection, page_id: &PageId) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM page_abstract_embeddings WHERE page_id = ?1",
+        params![page_id.as_bytes()],
+    )?;
+    Ok(())
+}
+
 /// Fold per-client MCP tool-call deltas into their `(client, day)`
 /// buckets. UPSERT per bucket inside one transaction: the buffer layer
 /// in the MCP server coalesces a minute of calls into a handful of
