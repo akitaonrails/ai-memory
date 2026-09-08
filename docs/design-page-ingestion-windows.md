@@ -1,12 +1,16 @@
 # Design: Page-grain ingestion windows + version-filtered `as_of` (issue #656)
 
-*Status: design, targeting the `release/2.2` line as an additive 2.2.0
-feature (v2.1.0 shipped; new features now ride the 2.2 train). Not implemented yet — this settles naming, the `as_of`+FTS
-reversal, and materialized-vs-view **before any schema change**, per the
-maintainer's review on #656. Scope here is Phase A only; Phase B stays
-deferred (§7). Note: v2.1.0 has since cut on this line, so the
-implementation PR lands as 2.1.x or rides the next minor at the
-maintainer's discretion (open question 1).*
+*Status: implemented on the `release/2.2` line (2.2.0) — V62 page-grain
+windows, version-filtered `as_of` FTS fused via the default path's RRF,
+`docs/temporal.md` updated. Scope stayed Phase A only; Phase B remains
+deferred (§7). Open question 1 resolved by the v2.1.0 cut (new features
+ride 2.2). Open question 2 resolved for the materialized pair
+(`valid_from` + `valid_to`): the symmetry with the V56 link windows was
+worth the duplicated column. Open question 3 resolved for RRF merge
+rather than bare fallback. One deliberate deviation from §3: the FTS leg
+evaluates TTL expiry at T while the entity leg ignores it (see
+`docs/temporal.md` "one asymmetry"); changing the entity leg's rule
+would alter existing behaviour and is out of scope.*
 
 ## 1. The problem, and why entity-link windows are not enough
 

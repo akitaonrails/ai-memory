@@ -5,25 +5,33 @@ window, so "what did we know about X as of June" is answerable from
 the store — the one mainstream graph-camp mechanism (Zep/Graphiti)
 worth having at our scale.
 
+*2.2, issue #656.* Page versions carry the same window at page grain
+(`pages.valid_from` / `valid_to`, V62), and `as_of` fuses the entity
+timeline with version-filtered full-text search. Vocabulary is pinned
+in `docs/design-page-ingestion-windows.md`: this is **ingestion time**
+("the version the store treated as current"), never world-time
+validity — "valid-time" stays reserved for the deferred Phase B.
+
 ## Honest scope
 
-- **Ingestion time only.** `valid_from` / `superseded_at` record when
-  ai-memory *learned* and *replaced* a fact, not when it was true in
-  the world. A world-time split (Graphiti's `valid_at`/`invalid_at`
-  extracted by an LLM) is deliberately out of scope: it requires
-  trusting an LLM to date facts, and our zero-LLM default path could
-  never populate it.
-- **Entity links only.** Page versions already form a timeline
-  (`supersedes` + `created_at`); entity links now inherit it. Typed
-  relation edges (item 3) die with their page version, which is
-  already a timeline — no extra columns needed there yet.
+- **Ingestion time only.** `valid_from` / `superseded_at` (link grain)
+  and `valid_from` / `valid_to` (page grain) record when ai-memory
+  *learned* and *replaced* a fact, not when it was true in the world. A
+  world-time split (Graphiti's `valid_at`/`invalid_at` extracted by an
+  LLM) is deliberately out of scope: it requires trusting an LLM to
+  date facts, and our zero-LLM default path could never populate it.
+- **Two grains, one semantic.** Entity links inherit their page
+  version's timeline (V56, repaired by V58); page versions now
+  materialize it directly (V62). Typed relation edges (item 3) die with
+  their page version, which is already a timeline — no extra columns
+  needed there yet.
 - **Deletion is deletion.** Purged pages cascade their entity links
   away; the timeline does not survive an explicit purge (that is what
   purge means here — see the purge docs).
 
 ## Schema
 
-`entity_page_links` gains two additive columns:
+`entity_page_links` carries two additive columns:
 
 | column | meaning |
 |---|---|
@@ -37,6 +45,23 @@ superseding version's `created_at` (found via `pages.supersedes`),
 insert, and the supersede path closes the outgoing version's windows
 in the same transaction — a link's window can never be open-ended in
 a superseded version.
+
+`pages` carries the same window at page grain (V62, issue #656):
+
+| column | meaning |
+|---|---|
+| `valid_from` | the version's own `created_at` |
+| `valid_to` | `created_at` of the superseding version; the retirement instant for successor-less retirements (decay tombstones, graveyard merges, move-regenerate rows — `COALESCE(superseded_at, updated_at)`, the V58 rule); `NULL` while the version is latest |
+
+The end is named `valid_to`, not `superseded_at`, because
+`pages.superseded_at` already exists with a different meaning: the V03
+decay-tombstone eviction marker, written exactly when `supersedes IS
+NULL`. Every retire path closes both grains in the same transaction
+(supersede, decay, reorg graveyard, move-regenerate); the V62 backfill
+covers existing stores with the same rules. No FTS rebuild is needed:
+the `pages_fts_*` triggers already index every version row, superseded
+ones included — version-filtered search is a join-predicate change,
+not an index change.
 
 ## When to reach for it
 
@@ -62,17 +87,44 @@ memory_query { "query": "postgres", "as_of": "2026-07-01T00:00:00Z" }
 //   superseded
 ```
 
+The entity leg needs the entity: it only answers when the query names
+a tracked entity the version carried. The FTS leg covers the rest — a
+version with no `entities:`/`tags:` frontmatter, or a question phrased
+without the exact retired term ("which database were we on during the
+outage?"), still resolves through the text that was live at T.
+
 ## Query
 
 `memory_query` accepts `as_of` (ISO-8601). When present the query is
-a **time-travel entity lookup**: the entity stream runs alone against
-links whose window contains the instant
-(`valid_from <= T AND (superseded_at IS NULL OR superseded_at > T)`),
-returning the page versions that carried the matched entities at that
-time. FTS / vector / graph streams are deliberately skipped — mixing
-"current text relevance" with "historical entity validity" in one
-ranked list would answer neither question honestly. Omit `as_of` and
-nothing changes.
+a **time-travel lookup over two streams, both past-tense at T**:
+
+- the **entity timeline**: links whose window contains the instant
+  (`valid_from <= T AND (superseded_at IS NULL OR superseded_at > T)`),
+  returning the page versions that carried the matched entities then;
+- **version-filtered FTS**: page versions whose page-grain window
+  contains the instant
+  (`valid_from <= T AND (valid_to IS NULL OR valid_to > T)`),
+  answering entity-less pages and paraphrased questions — "what would
+  search have said in July".
+
+The two streams merge with the default path's RRF (k=60) plus the same
+bounded authority adjustment, and `explain=true` reports both in
+`streams_active` (`["entity", "fts"]`) with per-stream ranks and RRF
+contributions. Constraining the FTS corpus to versions alive at T is
+what answers the original objection to FTS in `as_of` (that mixing
+present-tense relevance with past validity answers neither honestly):
+both signals are past-tense here.
+
+Still out of `as_of`: vector (embeddings are present-tense artifacts
+of the current text; version-scoped vectors are a separate project),
+graph neighbours (latest-scoped by construction), and the
+raw-observation fallback. Audit reads take no access bump and no
+rerank. Omit `as_of` and nothing changes.
+
+One asymmetry to know: the FTS leg hides pages already TTL-expired at
+T (the usual `not_expired` predicate evaluated at T); the entity leg
+ignores TTL, on the grounds that a page valid at T was still what we
+knew at T even if it expired since.
 
 ## Where entities come from
 

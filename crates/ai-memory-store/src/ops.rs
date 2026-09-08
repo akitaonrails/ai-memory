@@ -875,9 +875,11 @@ pub(crate) fn upsert_page_in_tx(
         }
         let frontmatter_str = stamped_frontmatter(conformed, now)?;
         let new_id = PageId::new();
+        // The page-grain ingestion window closes in the same statement,
+        // same instant (issue #656, docs/design-page-ingestion-windows.md).
         tx.execute(
-            "UPDATE pages SET is_latest = 0 WHERE id = ?1",
-            params![&existing.id],
+            "UPDATE pages SET is_latest = 0, valid_to = ?2 WHERE id = ?1",
+            params![&existing.id, now],
         )?;
         // Close the superseded version's entity-link windows at the new
         // version's birth instant (docs/temporal.md).
@@ -890,8 +892,8 @@ pub(crate) fn upsert_page_in_tx(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
               frontmatter_json, is_latest, supersedes, pinned, author_id, \
-              created_at, updated_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15)",
+              created_at, updated_at, expires_at, valid_from) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -931,8 +933,8 @@ pub(crate) fn upsert_page_in_tx(
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at, valid_from) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14, ?13)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -2125,7 +2127,7 @@ pub fn soft_delete_for_decay_if_latest(
     let tx = conn.transaction()?;
     let affected = tx.execute(
         "UPDATE pages \
-         SET is_latest = 0, superseded_at = ?1 \
+         SET is_latest = 0, superseded_at = ?1, valid_to = ?1 \
          WHERE id = ?2 \
            AND workspace_id = ?3 \
            AND project_id = ?4 \
@@ -2142,7 +2144,8 @@ pub fn soft_delete_for_decay_if_latest(
     if affected != 0 {
         // Retirement is supersession for the entity timeline too: an
         // open window on a tombstoned page made `as_of` resurrect
-        // retired knowledge forever (post-audit finding).
+        // retired knowledge forever (post-audit finding). The page-grain
+        // window closes in the same statement above (issue #656).
         tx.execute(
             "UPDATE entity_page_links SET superseded_at = ?1 \
              WHERE page_id = ?2 AND superseded_at IS NULL",
@@ -3174,16 +3177,19 @@ pub fn reorg_sessions(
         observations_updated += obs_rows;
     }
     // Graveyard only this workspace's latest pages; sibling workspaces may
-    // have already-consolidated pages that must remain current.
+    // have already-consolidated pages that must remain current. Both
+    // grains close at one shared instant (issue #656).
+    let retire_at = Timestamp::now().as_microsecond();
     tx.execute(
         "UPDATE entity_page_links SET superseded_at = ?2 \
          WHERE superseded_at IS NULL AND page_id IN ( \
              SELECT id FROM pages WHERE workspace_id = ?1 AND is_latest = 1)",
-        params![workspace_id.as_bytes(), Timestamp::now().as_microsecond()],
+        params![workspace_id.as_bytes(), retire_at],
     )?;
     let pages_graveyarded: usize = tx.execute(
-        "UPDATE pages SET is_latest = 0 WHERE workspace_id = ?1 AND is_latest = 1",
-        params![workspace_id.as_bytes()],
+        "UPDATE pages SET is_latest = 0, valid_to = ?2 \
+         WHERE workspace_id = ?1 AND is_latest = 1",
+        params![workspace_id.as_bytes(), retire_at],
     )?;
     tx.commit()?;
     Ok(ReorgSummary {
@@ -4528,7 +4534,10 @@ pub fn move_session(
             }
             PagesMode::Regenerate => {
                 // Close the retiring page's entity windows first (the
-                // predicate needs is_latest = 1, flipped just below).
+                // predicate needs is_latest = 1, flipped just below); the
+                // page-grain window closes with the flip, same instant
+                // (issue #656).
+                let retire_at = Timestamp::now().as_microsecond();
                 tx.execute(
                     &format!(
                         "UPDATE entity_page_links SET superseded_at = ?4 \
@@ -4540,15 +4549,20 @@ pub fn move_session(
                         page_scope_params.0,
                         page_scope_params.1,
                         page_path.as_str(),
-                        Timestamp::now().as_microsecond(),
+                        retire_at,
                     ],
                 )?;
                 summary.pages_regenerated = tx.execute(
                     &format!(
-                        "UPDATE pages SET is_latest = 0 \
+                        "UPDATE pages SET is_latest = 0, valid_to = ?4 \
                          WHERE {page_scope_sql} AND path = ?3 AND is_latest = 1"
                     ),
-                    params![page_scope_params.0, page_scope_params.1, page_path.as_str()],
+                    params![
+                        page_scope_params.0,
+                        page_scope_params.1,
+                        page_path.as_str(),
+                        retire_at
+                    ],
                 )? as u64;
                 // The session's summary pointer targeted the page just
                 // retired; the next consolidation sets it again.
