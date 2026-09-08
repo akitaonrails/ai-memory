@@ -27,7 +27,7 @@ use crate::config::Config;
 // Markers + the snippet body live in `ai_memory_core::routing_snippet`
 // so the `memory_install_self_routing` MCP tool can return the same
 // block this subcommand writes. Single source of truth.
-use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line, full_block};
+use ai_memory_core::{MARKER_END, MARKER_START, compact_block, find_marker_line, full_block};
 
 const LEGACY_ORPHAN_TAIL_LF: &str =
     "` markers without\ndisturbing the rest of the file.\n<!-- ai-memory:end -->\n";
@@ -48,7 +48,11 @@ pub(super) fn run_quiet(args: InstallInstructionsArgs) -> Result<()> {
 }
 
 fn run_inner(args: InstallInstructionsArgs, report: bool) -> Result<()> {
-    let block = full_block();
+    let block = if args.compact {
+        compact_block()
+    } else {
+        full_block()
+    };
     let targets = resolve_targets(args.target.as_ref())?;
     let skill_args = if args.no_skills {
         None
