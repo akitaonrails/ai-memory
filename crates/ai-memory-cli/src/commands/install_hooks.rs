@@ -3088,6 +3088,60 @@ const AiMemoryOpencode2: Plugin = {
 
 export default AiMemoryOpencode2;
 "#;
+/// `findSettingsMarker` mirrors the native `find_settings_marker` (`marker.rs`)
+/// and the shell `ai_memory_find_settings_marker` (`hooks/_lib.sh`), #668:
+/// the same ancestor walk and HOME/`.git` boundary as `findMarker`, but a
+/// marker that declares nothing beyond `[capture]` is transparent — the walk
+/// skips it and continues to the next ancestor. That keeps a nested
+/// capture-only marker (e.g. one that only sets `ignore_paths`) from
+/// shadowing an outer marker's `workspace`/`project`/etc, without changing
+/// `[capture]`/`ignore_paths` resolution itself (that stays on `findMarker`,
+/// the nearest marker, in the separate capture-policy template). The
+/// boundary walk is duplicated from `findMarker` rather than shared, on
+/// purpose: `findMarker` stays untouched, well-exercised, nearest-marker
+/// behavior for every other caller.
+pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(text: string): boolean {
+  for (const key of ["workspace", "project", "project_strategy", "drop_subagent_captures"]) {
+    if (tomlKey(text, key) !== undefined) return true;
+  }
+  for (const key of ["default_global", "inject_on_session_start", "max_chars"]) {
+    if (tomlFlag(text, key) !== undefined) return true;
+  }
+  return false;
+}
+
+function findSettingsMarker(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined;
+  let dir = resolve(cwd);
+  const home = homedir();
+  let boundary: string | undefined;
+  if (home && (dir === home || dir.startsWith(home.endsWith(sep) ? home : home + sep))) {
+    boundary = home;
+  } else if (home) {
+    let probe = dir;
+    while (probe && probe !== dirname(probe)) {
+      if (existsSync(join(probe, ".git"))) {
+        boundary = probe;
+        break;
+      }
+      probe = dirname(probe);
+    }
+    boundary ??= dir;
+  }
+  while (dir && dir !== dirname(dir)) {
+    const marker = join(dir, ".ai-memory.toml");
+    if (existsSync(marker)) {
+      try {
+        if (declaresSettings(readFileSync(marker, "utf8"))) return marker;
+      } catch (_e) {
+      }
+    }
+    if (boundary && dir === boundary) return undefined;
+    dir = dirname(dir);
+  }
+  return undefined;
+}"#;
+
 /// Emit the `applyMarkerParams` TypeScript function shared verbatim by the
 /// OpenCode plugin and the OMP extension.
 ///
@@ -3097,14 +3151,18 @@ export default AiMemoryOpencode2;
 /// that install-time default when no marker pins a `project_strategy` (#128).
 /// A marker's own `project` / `project_strategy` still take precedence (§3.3),
 /// and repo-root is resolved host-side via `repoRootProject`.
+///
+/// Scope/settings resolution walks past a capture-only marker to the nearest
+/// ancestor marker that declares a setting (#668) via `findSettingsMarker`,
+/// emitted alongside this function.
 fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     let Some(default) = default_strategy else {
         return format!(
-            "{TS_TOML_FLAG}\n{}",
+            "{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   const managedRun = process.env.AI_MEMORY_RUN_ID;
   if (managedRun) url.searchParams.set("managed_run", managedRun);
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (!marker || !cwd) return;
   url.searchParams.set("cwd", cwd);
   try {
@@ -3144,7 +3202,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let defaultGlobal: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
       const body = readFileSync(marker, "utf8");
@@ -3172,7 +3230,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{body}",
         ts_string_literal(default)
     )
 }
@@ -7932,6 +7990,21 @@ model = "gpt-5"
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        // #668: applyMarkerParams resolves scope/settings via the
+        // settings-walk, not the nearest-marker findMarker, so a nested
+        // capture-only marker does not shadow an outer marker's scope.
+        assert!(plugin.contains("function findSettingsMarker"));
+        assert!(plugin.contains("function declaresSettings"));
+        assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(plugin.contains(
+            "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\"])"
+        ));
+        assert!(plugin.contains(
+            "for (const key of [\"default_global\", \"inject_on_session_start\", \"max_chars\"])"
+        ));
+        assert!(
+            plugin.contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
+        );
         assert!(plugin.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
@@ -8138,6 +8211,10 @@ model = "gpt-5"
             plugin.contains("if (repoProject) project = repoProject;"),
             "{plugin}"
         );
+        assert!(
+            plugin.contains("const marker = findSettingsMarker(cwd);"),
+            "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
+        );
     }
 
     #[test]
@@ -8255,6 +8332,16 @@ model = "gpt-5"
         assert!(extension.contains("tomlFlag(body, \"default_global\")"));
         assert!(extension.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(extension.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        // #668: same settings-walk as the OpenCode plugin (shared
+        // `ts_apply_marker_params`), so a nested capture-only marker does
+        // not shadow an outer marker's scope for the OMP/pi extensions.
+        assert!(extension.contains("function findSettingsMarker"));
+        assert!(extension.contains("function declaresSettings"));
+        assert!(extension.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(
+            extension
+                .contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
+        );
         assert!(extension.contains(
             "applyMarkerParams(url, typeof payload.cwd === \"string\" ? payload.cwd : undefined);"
         ));
@@ -8292,6 +8379,10 @@ model = "gpt-5"
         assert!(
             extension.contains("if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;"),
             "{extension}"
+        );
+        assert!(
+            extension.contains("const marker = findSettingsMarker(cwd);"),
+            "the default-strategy variant must also walk past a capture-only marker (#668): {extension}"
         );
     }
 

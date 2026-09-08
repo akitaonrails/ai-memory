@@ -40,6 +40,17 @@ hook scripts also forward the current `cwd` so
 workspace-only markers can still resolve `project = basename(cwd)` for
 handoff lookups.
 
+A marker whose only content is a `[capture]` section (see
+[Capture exclusions](#capture-exclusions) below) is **transparent** to this
+walk: `workspace`, `project`, `project_strategy`, and the other forwarded
+settings (`drop_subagent_captures`, `[recall] default_global`, `[briefing]`
+keys) are resolved from the nearest ancestor marker that declares at least
+one of them, skipping past any nearer marker that declares nothing but
+`[capture]`. A subdirectory marker added only to exclude some paths from
+capture therefore no longer resets scope to `default` / basename for that
+subtree. `[capture]`/`ignore_paths` itself is unaffected by this and always
+comes from the nearest marker, even a capture-only one.
+
 The marker path is shared by the POSIX/PowerShell hook scripts and the
 generated OpenCode / OMP / Pi / OpenClaw TypeScript integrations. In all cases,
 hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,

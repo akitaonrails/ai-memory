@@ -180,6 +180,45 @@ assert_eq "closer marker wins" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&worksp
 QS3=$(ai_memory_marker_qs "$TMP/nonexistent")
 assert_eq "no marker -> cwd only" "&cwd=$(ai_memory_url_encode "$TMP/nonexistent")" "$QS3"
 
+# --- capture-only marker transparency (#668) ---------------------------
+# A nested marker whose only content is [capture] must not shadow an outer
+# marker's workspace/project: ai_memory_marker_qs skips it and forwards the
+# OUTER marker's fields, while ai_memory_find_marker (used for [capture]
+# itself) still resolves the INNER (nearest) marker.
+mkdir -p "$TMP/scope/inner"
+printf 'workspace = "acme"\nproject = "infra"\n' >"$TMP/scope/.ai-memory.toml"
+printf '[capture]\nignore_paths = ["secret/**"]\n' >"$TMP/scope/inner/.ai-memory.toml"
+
+assert_eq "capture-only marker: find_marker still resolves nearest" \
+    "$TMP/scope/inner/.ai-memory.toml" \
+    "$(ai_memory_find_marker "$TMP/scope/inner")"
+assert_eq "capture-only marker: find_settings_marker skips it for the outer" \
+    "$TMP/scope/.ai-memory.toml" \
+    "$(ai_memory_find_settings_marker "$TMP/scope/inner")"
+assert_eq "capture-only marker: marker_qs forwards the OUTER scope" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker" \
+    "$(ai_memory_marker_qs "$TMP/scope/inner")"
+
+# A marker declaring [briefing] but no workspace/project is NOT capture-only
+# (it declares a forwarded setting), so it stays a resolution boundary: the
+# outer marker's scope must not leak through it.
+printf '[briefing]\ninject_on_session_start = true\n' >"$TMP/scope/inner/.ai-memory.toml"
+assert_eq "briefing-only marker is a settings boundary, not transparent" \
+    "" "$(ai_memory_parse_toml_key "$(ai_memory_find_settings_marker "$TMP/scope/inner")" workspace)"
+assert_eq "marker_qs stops at the briefing-only boundary" \
+    "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")" \
+    "$(ai_memory_marker_qs "$TMP/scope/inner")"
+
+# A capture-only marker with no scope-declaring ancestor: still transparent,
+# and resolution falls back exactly as it does with no marker at all.
+mkdir -p "$TMP/no-outer-scope/inner"
+printf '[capture]\nignore_paths = ["a/**"]\n' >"$TMP/no-outer-scope/inner/.ai-memory.toml"
+assert_eq "capture-only marker with no ancestor scope: settings walk finds none" \
+    "" "$(ai_memory_find_settings_marker "$TMP/no-outer-scope/inner")"
+assert_eq "capture-only marker with no ancestor scope: marker_qs is cwd-only" \
+    "&cwd=$(ai_memory_url_encode "$TMP/no-outer-scope/inner")" \
+    "$(ai_memory_marker_qs "$TMP/no-outer-scope/inner")"
+
 # --- repo-root strategy: host-side resolution -------------------------
 # Outside any git repo the helper stays silent (caller keeps basename(cwd)).
 assert_eq "repo_root_project on non-git path is empty" "" \

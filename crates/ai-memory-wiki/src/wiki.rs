@@ -17,7 +17,6 @@ use ai_memory_store::{
 use tokio::sync::RwLock;
 
 use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
-use crate::atomic;
 use crate::error::{WikiError, WikiResult};
 use crate::git::{Checkpoint, GitAdapter};
 use crate::markdown::{Markdown, derive_title, emit, parse};
@@ -252,6 +251,22 @@ impl Wiki {
         self.git.commit_all(message)
     }
 
+    /// Append `bytes` to `<project root>/<file_name>` (the hook ledger)
+    /// and report the write.
+    ///
+    /// # Errors
+    /// Propagates the filesystem error.
+    pub fn append_under_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> std::io::Result<PathBuf> {
+        let path = self.project_root(workspace_id, project_id).join(file_name);
+        self.git.append(&path, bytes)?;
+        Ok(path)
+    }
     /// Return the most recent wiki git checkpoints, newest first.
     ///
     /// # Errors
@@ -348,7 +363,7 @@ impl Wiki {
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::rename(&src, &dst)?;
+            self.git.rename(&src, &dst)?;
             true
         } else {
             // Nothing on disk to move (a project with zero written pages).
@@ -371,7 +386,7 @@ impl Wiki {
                     if let Some(parent) = src.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    if let Err(rollback_err) = std::fs::rename(&dst, &src) {
+                    if let Err(rollback_err) = self.git.rename(&dst, &src) {
                         return Err(crate::WikiError::Io(std::io::Error::other(format!(
                             "INCONSISTENT STATE: files moved but DB re-stamp failed ({e}) and dir rename-back also failed ({rollback_err}); manually move {} -> {} or finish the re-stamp",
                             dst.display(),
@@ -453,7 +468,7 @@ impl Wiki {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::rename(&src, &target)?;
+            self.git.rename(&src, &target)?;
             Some(target)
         } else {
             None
@@ -471,7 +486,7 @@ impl Wiki {
                     (Some(tmp), PagesMode::Regenerate) => {
                         // The rows are retired; a leftover temp file is
                         // ignored by the watcher, so this is best-effort.
-                        if let Err(e) = std::fs::remove_file(tmp) {
+                        if let Err(e) = self.git.remove_file(tmp) {
                             tracing::warn!(
                                 error = %e,
                                 path = %tmp.display(),
@@ -488,7 +503,7 @@ impl Wiki {
             }
             Err(e) => {
                 if let Some(target) = parked
-                    && let Err(rollback_err) = std::fs::rename(&target, &src)
+                    && let Err(rollback_err) = self.git.rename(&target, &src)
                 {
                     return Err(WikiError::Io(std::io::Error::other(format!(
                         "INCONSISTENT STATE: session page file moved but DB re-stamp failed ({e}) and moving it back also failed ({rollback_err}); manually move {} -> {}",
@@ -574,11 +589,14 @@ impl Wiki {
         if let Some(repo_path) = scope.repo_path {
             project_fm["repo_path"] = serde_json::Value::String(repo_path);
         }
-        let written = Self::write_scope_manifest(
-            &ws_dir,
-            serde_json::json!({ "workspace": scope.workspace_name }),
-        )
-        .and_then(|_| Self::write_scope_manifest(&ws_dir.join(project_id.to_string()), project_fm));
+        let written = self
+            .write_scope_manifest(
+                &ws_dir,
+                serde_json::json!({ "workspace": scope.workspace_name }),
+            )
+            .and_then(|_| {
+                self.write_scope_manifest(&ws_dir.join(project_id.to_string()), project_fm)
+            });
         match written {
             Ok(_) => {
                 self.manifested_scopes
@@ -659,7 +677,7 @@ impl Wiki {
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        atomic::write_atomic(&abs, raw.as_bytes())?;
+        self.git.write_atomic(&abs, raw.as_bytes())?;
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -853,7 +871,7 @@ impl Wiki {
             resolved_ctx = Some(ctx);
         }
         let abs = self.abs_path(workspace_id, project_id, path);
-        let quarantined = match quarantine_file(&abs) {
+        let quarantined = match quarantine_file(&self.git, &abs) {
             Ok(path) => path,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(crate::WikiError::Io(e)),
@@ -890,17 +908,17 @@ impl Wiki {
         let deleted = match delete_result {
             Ok(deleted) => deleted,
             Err(e) => {
-                restore_quarantined_file(&quarantined, &abs, path);
+                restore_quarantined_file(&self.git, &quarantined, &abs, path);
                 return Err(e.into());
             }
         };
         if !deleted {
-            restore_quarantined_file(&quarantined, &abs, path);
+            restore_quarantined_file(&self.git, &quarantined, &abs, path);
             return Ok(false);
         }
 
         if let Some(quarantine) = quarantined {
-            std::fs::remove_file(&quarantine)?;
+            self.git.remove_file(&quarantine)?;
         }
 
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
@@ -1165,7 +1183,7 @@ impl Wiki {
     ) -> WikiResult<()> {
         let _guard = self.mutation_lock.write().await;
         let root = self.project_root(workspace_id, project_id);
-        match std::fs::remove_dir_all(&root) {
+        match self.git.remove_dir_all(&root) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(crate::WikiError::Io(e)),
@@ -1181,7 +1199,7 @@ impl Wiki {
     pub async fn remove_workspace_dir(&self, workspace_id: WorkspaceId) -> WikiResult<()> {
         let _guard = self.mutation_lock.write().await;
         let root = self.root.join(workspace_id.to_string());
-        match std::fs::remove_dir_all(&root) {
+        match self.git.remove_dir_all(&root) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(crate::WikiError::Io(e)),
@@ -1204,7 +1222,7 @@ impl Wiki {
     ) -> WikiResult<bool> {
         let _guard = self.mutation_lock.write().await;
         let abs = self.abs_path(workspace_id, project_id, path);
-        match std::fs::remove_file(&abs) {
+        match self.git.remove_file(&abs) {
             Ok(()) => {
                 sync_parent_best_effort(&abs);
                 Ok(true)
@@ -1264,7 +1282,7 @@ impl Wiki {
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
-        atomic::write_atomic(&path, content.as_bytes())?;
+        self.git.write_atomic(&path, content.as_bytes())?;
         Ok(path)
     }
 
@@ -1362,7 +1380,8 @@ impl Wiki {
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
             let abs = self.abs_path(workspace_id, project_id, &path);
-            let installed = replace_file_with_rollback_snapshot(&abs, emitted.as_bytes())?;
+            let installed =
+                replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?;
             match self
                 .writer
                 .approve_auto_improve_proposal(ApproveAutoImproveProposal {
@@ -1381,13 +1400,14 @@ impl Wiki {
                 }
                 Ok(ApproveAutoImproveProposalResult::Conflict) => {
                     rollback_or_inconsistent(
+                        &self.git,
                         std::slice::from_ref(&installed),
                         &"proposal conflict",
                     )?;
                     ApproveAutoImproveProposalResult::Conflict
                 }
                 Err(e) => {
-                    rollback_or_inconsistent(std::slice::from_ref(&installed), &e)?;
+                    rollback_or_inconsistent(&self.git, std::slice::from_ref(&installed), &e)?;
                     return Err(e.into());
                 }
             }
@@ -1602,7 +1622,11 @@ impl Wiki {
     /// Write a `_meta.md` scope manifest under `dir` from `frontmatter`,
     /// idempotently — unchanged content is left untouched so a startup
     /// backfill never churns the wiki git history. Returns `true` if written.
-    fn write_scope_manifest(dir: &Path, mut frontmatter: serde_json::Value) -> WikiResult<bool> {
+    fn write_scope_manifest(
+        &self,
+        dir: &Path,
+        mut frontmatter: serde_json::Value,
+    ) -> WikiResult<bool> {
         // OKF conformance at the manifest choke point: every non-reserved
         // .md needs a `type`, and the startup backfill's byte-compare must
         // agree with what the OKF migration writes — a typeless emit here
@@ -1634,7 +1658,7 @@ impl Wiki {
             Ok(_) | Err(_) => {}
         }
         std::fs::create_dir_all(dir)?;
-        crate::atomic::write_atomic(&path, content.as_bytes())?;
+        self.git.write_atomic(&path, content.as_bytes())?;
         Ok(true)
     }
 
@@ -1656,7 +1680,7 @@ impl Wiki {
         let mut written = 0;
         for ws in workspaces {
             let ws_dir = self.root().join(ws.workspace_id.to_string());
-            if Self::write_scope_manifest(
+            if self.write_scope_manifest(
                 &ws_dir,
                 serde_json::json!({ "workspace": ws.workspace_name }),
             )? {
@@ -1669,7 +1693,7 @@ impl Wiki {
             if let Some(rp) = s.repo_path {
                 fm["repo_path"] = serde_json::Value::String(rp);
             }
-            if Self::write_scope_manifest(&ws_dir.join(s.project_id.to_string()), fm)? {
+            if self.write_scope_manifest(&ws_dir.join(s.project_id.to_string()), fm)? {
                 written += 1;
             }
         }
@@ -1817,10 +1841,10 @@ impl Wiki {
             let mut installed = Vec::with_capacity(staged_files.len());
             let mut dispatches = Vec::with_capacity(staged_files.len());
             for (req, tmp, abs, ctx) in staged_files {
-                let install = match persist_tmp_with_rollback_snapshot(tmp, &abs) {
+                let install = match persist_tmp_with_rollback_snapshot(&self.git, tmp, &abs) {
                     Ok(install) => install,
                     Err(e) => {
-                        rollback_or_inconsistent(&installed, &e)?;
+                        rollback_or_inconsistent(&self.git, &installed, &e)?;
                         return Err(e);
                     }
                 };
@@ -1831,7 +1855,7 @@ impl Wiki {
             let ids = match self.writer.upsert_pages_batch(pages).await {
                 Ok(ids) => ids,
                 Err(e) => {
-                    rollback_or_inconsistent(&installed, &e)?;
+                    rollback_or_inconsistent(&self.git, &installed, &e)?;
                     return Err(e.into());
                 }
             };
@@ -2025,7 +2049,8 @@ impl Wiki {
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let installed = replace_file_with_rollback_snapshot(&abs, emitted.as_bytes())?;
+            let installed =
+                replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?;
 
             match self
                 .writer
@@ -2047,7 +2072,7 @@ impl Wiki {
             {
                 Ok(id) => id,
                 Err(e) => {
-                    rollback_or_inconsistent(std::slice::from_ref(&installed), &e)?;
+                    rollback_or_inconsistent(&self.git, std::slice::from_ref(&installed), &e)?;
                     return Err(e.into());
                 }
             }
@@ -2442,11 +2467,12 @@ fn sync_parent_best_effort(path: &Path) {
 }
 
 fn persist_tmp_with_rollback_snapshot(
+    git: &GitAdapter,
     tmp: tempfile::NamedTempFile,
     path: &Path,
 ) -> WikiResult<InstalledFile> {
     let previous = snapshot_existing_file(path)?;
-    let persisted = crate::atomic::persist_with_retry(tmp, path)?;
+    let persisted = git.persist(tmp, path)?;
     persisted.sync_data()?;
     sync_parent_best_effort(path);
     Ok(InstalledFile {
@@ -2455,22 +2481,24 @@ fn persist_tmp_with_rollback_snapshot(
     })
 }
 
-fn replace_file_with_rollback_snapshot(path: &Path, bytes: &[u8]) -> WikiResult<InstalledFile> {
+fn replace_file_with_rollback_snapshot(
+    git: &GitAdapter,
+    path: &Path,
+    bytes: &[u8],
+) -> WikiResult<InstalledFile> {
     let previous = snapshot_existing_file(path)?;
-    atomic::write_atomic(path, bytes)?;
+    git.write_atomic(path, bytes)?;
     Ok(InstalledFile {
         path: path.to_path_buf(),
         previous,
     })
 }
 
-fn rollback_installed_files(installed: &[InstalledFile]) -> WikiResult<()> {
+fn rollback_installed_files(git: &GitAdapter, installed: &[InstalledFile]) -> WikiResult<()> {
     for file in installed.iter().rev() {
         match &file.previous {
-            Some(bytes) => {
-                atomic::write_atomic(&file.path, bytes)?;
-            }
-            None => match std::fs::remove_file(&file.path) {
+            Some(bytes) => git.write_atomic(&file.path, bytes)?,
+            None => match git.remove_file(&file.path) {
                 Ok(()) => sync_parent_best_effort(&file.path),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(WikiError::Io(e)),
@@ -2481,10 +2509,11 @@ fn rollback_installed_files(installed: &[InstalledFile]) -> WikiResult<()> {
 }
 
 fn rollback_or_inconsistent<E: std::fmt::Display>(
+    git: &GitAdapter,
     installed: &[InstalledFile],
     cause: &E,
 ) -> WikiResult<()> {
-    if let Err(rollback_err) = rollback_installed_files(installed) {
+    if let Err(rollback_err) = rollback_installed_files(git, installed) {
         return Err(WikiError::Io(std::io::Error::other(format!(
             "INCONSISTENT STATE: wiki files changed but store write failed ({cause}) and rollback failed ({rollback_err})"
         ))));
@@ -2492,7 +2521,7 @@ fn rollback_or_inconsistent<E: std::fmt::Display>(
     Ok(())
 }
 
-fn quarantine_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
+fn quarantine_file(git: &GitAdapter, path: &Path) -> std::io::Result<Option<PathBuf>> {
     let Some(parent) = path.parent() else {
         return Err(std::io::Error::other(
             "page path has no parent (cannot quarantine delete)",
@@ -2502,19 +2531,24 @@ fn quarantine_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
         .prefix(".ai-memory-delete.")
         .tempfile_in(parent)?;
     let (_file, quarantine) = tmp.keep().map_err(|e| e.error)?;
-    std::fs::remove_file(&quarantine)?;
-    match std::fs::rename(path, &quarantine) {
+    git.remove_file(&quarantine)?;
+    match git.rename(path, &quarantine) {
         Ok(()) => Ok(Some(quarantine)),
         Err(e) => {
-            let _ = std::fs::remove_file(&quarantine);
+            let _ = git.remove_file(&quarantine);
             Err(e)
         }
     }
 }
 
-fn restore_quarantined_file(quarantined: &Option<PathBuf>, path: &Path, page_path: &PagePath) {
+fn restore_quarantined_file(
+    git: &GitAdapter,
+    quarantined: &Option<PathBuf>,
+    path: &Path,
+    page_path: &PagePath,
+) {
     if let Some(quarantine) = quarantined
-        && let Err(error) = std::fs::rename(quarantine, path)
+        && let Err(error) = git.rename(quarantine, path)
     {
         tracing::error!(
             path = %page_path.as_str(),
@@ -2595,6 +2629,7 @@ fn is_slot_path(path: &PagePath) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::admission::{FailurePolicy, WebhookConfig};

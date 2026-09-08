@@ -4,8 +4,18 @@
 //! a repo. Auto-commits fire from the hook router on `SessionEnd` and
 //! from the M7 consolidator. Author/email are fixed so the wiki history
 //! can't accidentally leak the maintainer's git identity.
+//!
+//! A commit stages the paths reported through `mark_written` since the
+//! last one; the adapter's own write methods report for their caller and
+//! the crate's `clippy.toml` refuses the raw calls. The full walk is the
+//! safety net, decided in `take_staging`. The repository stays open
+//! between commits: reopening it dropped libgit2's index tree cache, so
+//! every commit rebuilt every directory tree.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use git2::{ErrorCode, IndexAddOption, ObjectType, Repository, Signature};
 use tracing::{debug, warn};
@@ -18,10 +28,74 @@ pub const COMMIT_AUTHOR_NAME: &str = "ai-memory";
 /// Author email used for ai-memory's own commits.
 pub const COMMIT_AUTHOR_EMAIL: &str = "ai-memory@local";
 
-/// Thin handle over the wiki repo. Cheap to clone — internally a `PathBuf`.
+/// Thin handle over the wiki repo. Cheap to clone — a `PathBuf` and a
+/// shared lock.
 #[derive(Clone)]
 pub struct GitAdapter {
     root: PathBuf,
+    /// One commit at a time per repository: libgit2 fails a concurrent
+    /// commit with "the index is locked" instead of waiting. Also holds
+    /// the repository kept open between commits. Clones share it; a
+    /// second adapter opened on the same root does not.
+    commit_lock: Arc<Mutex<Option<Open>>>,
+    /// Paths written since the last commit; shared by clones like the lock.
+    written: Arc<Mutex<Written>>,
+}
+
+/// The repository kept open between commits, so libgit2's cached index
+/// (tree cache included) survives them. `Index` itself is not `Send`.
+struct Open {
+    repo: Repository,
+    commits_since_index_write: u32,
+    /// HEAD as this adapter last left it; moved by another writer, the
+    /// kept index is re-read and the next commit walks.
+    head: Option<git2::Oid>,
+}
+
+/// The index file is written after a walk and every this many
+/// path-scoped commits.
+const INDEX_WRITE_EVERY: u32 = 50;
+
+#[derive(Debug, Default)]
+struct Written {
+    /// Relative to the root; a directory covers its subtree.
+    paths: BTreeSet<PathBuf>,
+    walk_needed: bool,
+    /// `None` before the first commit, which walks.
+    last_walk: Option<Instant>,
+    /// Everything reported since the last walk, so the walk can name
+    /// what nobody reported.
+    since_walk: BTreeSet<PathBuf>,
+    unreported_writes: u64,
+    last_unreported: Vec<PathBuf>,
+}
+
+/// A path-scoped commit this long after the last walk walks instead.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+
+const UNREPORTED_SAMPLE: usize = 5;
+
+/// Retries for a commit whose staging read a file mid-write.
+const RACY_READ_ATTEMPTS: u32 = 4;
+const RACY_READ_BACKOFF: Duration = Duration::from_millis(25);
+
+/// libgit2's "file changed before we could read it": a writer was mid-write.
+fn is_racy_read(e: &git2::Error) -> bool {
+    e.class() == git2::ErrorClass::Filesystem && e.message().contains("changed before")
+}
+
+/// Writes that reached the tree without a report: a writer bypassed the wiki.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepSnapshot {
+    /// Over the adapter's life.
+    pub unreported_writes: u64,
+    /// Up to [`UNREPORTED_SAMPLE`] of them from the last walk.
+    pub last_unreported: Vec<PathBuf>,
+}
+
+enum Staging {
+    Everything,
+    Paths(BTreeSet<PathBuf>),
 }
 
 /// One git checkpoint in the wiki repository.
@@ -57,7 +131,65 @@ impl GitAdapter {
         }
         Ok(Self {
             root: root.to_path_buf(),
+            commit_lock: Arc::new(Mutex::new(None)),
+            written: Arc::new(Mutex::new(Written::default())),
         })
+    }
+
+    fn written(&self) -> MutexGuard<'_, Written> {
+        self.written.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Report a path written, moved or removed (absolute or relative to
+    /// the root); the next commit stages it. A path outside the root is
+    /// a caller's bug: logged, and the next commit walks.
+    pub fn mark_written(&self, path: &Path) {
+        let rel = if path.is_absolute() {
+            path.strip_prefix(&self.root).ok()
+        } else {
+            Some(path)
+        };
+        // The watcher reports git's own writes too; never stage them.
+        if rel.is_some_and(|rel| rel.starts_with(".git")) {
+            return;
+        }
+        let mut written = self.written();
+        match rel {
+            Some(rel) if !rel.as_os_str().is_empty() => {
+                written.paths.insert(rel.to_path_buf());
+                written.since_walk.insert(rel.to_path_buf());
+            }
+            _ => {
+                warn!(path = %path.display(), "reported path is not under the wiki root");
+                written.walk_needed = true;
+            }
+        }
+    }
+
+    /// Drop the kept repository, as a restart would.
+    #[cfg(test)]
+    pub(crate) fn close(&self) {
+        *self.commit_lock.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Make the next path-scoped commit walk, as if the sweep were due.
+    #[cfg(test)]
+    pub(crate) fn age_last_walk(&self) {
+        self.written().last_walk = Instant::now().checked_sub(SWEEP_INTERVAL);
+    }
+
+    /// What the sweeps found; see [`SweepSnapshot`].
+    #[must_use]
+    pub fn sweep_snapshot(&self) -> SweepSnapshot {
+        let written = self.written();
+        SweepSnapshot {
+            unreported_writes: written.unreported_writes,
+            last_unreported: written.last_unreported.clone(),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn written_paths(&self) -> Vec<PathBuf> {
+        self.written().paths.iter().cloned().collect()
     }
 
     /// Path of the wiki root.
@@ -66,9 +198,9 @@ impl GitAdapter {
         &self.root
     }
 
-    /// Stage *everything* in the wiki root, then commit with `message`.
-    /// Returns `Ok(None)` if there were no changes to commit (working
-    /// tree clean), or `Ok(Some(commit_oid))` on a successful commit.
+    /// Stage the reported paths (or walk the tree; see `take_staging`)
+    /// and commit with `message`. Returns `Ok(None)` when nothing
+    /// changed, `Ok(Some(commit_oid))` on a commit.
     ///
     /// # Errors
     /// Propagates any underlying libgit2 error.
@@ -83,29 +215,168 @@ impl GitAdapter {
     }
 
     fn commit_all_git2(&self, message: &str) -> Result<Option<git2::Oid>, CommitGit2Error> {
-        let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
+        let mut slot = self.commit_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
+            *slot = Some(Open {
+                repo,
+                commits_since_index_write: 0,
+                head: None,
+            });
+        }
+        let open = slot.as_mut().expect("opened above");
+        let head_now = open.repo.head().ok().and_then(|h| h.target());
+        if open.head.is_some() && open.head != head_now {
+            warn!("HEAD moved under the kept index; re-reading it and walking");
+            open.repo
+                .index()
+                .and_then(|mut index| index.read(true))
+                .map_err(CommitGit2Error::Other)?;
+            self.written().walk_needed = true;
+        }
+        let staging = self.take_staging();
+        let mut attempt = 0u32;
+        let result = loop {
+            attempt += 1;
+            match self.commit_staged(open, message, &staging) {
+                // A writer outside the lock was mid-write; it settles in
+                // milliseconds.
+                Err(CommitGit2Error::Other(e))
+                    if is_racy_read(&e) && attempt < RACY_READ_ATTEMPTS =>
+                {
+                    debug!(attempt, "a file changed under the commit; retrying");
+                    std::thread::sleep(RACY_READ_BACKOFF);
+                }
+                other => break other,
+            }
+        };
+        if let Ok(oid) = &result {
+            open.head = oid.or(head_now);
+        }
+        if let Err(e) = &result {
+            *slot = None;
+            let racy = matches!(e, CommitGit2Error::Other(e) if is_racy_read(e));
+            self.keep_pending(staging, racy);
+        }
+        result
+    }
 
-        // Stage everything (including deletions). Clear the index first so
-        // every entry is re-hashed from the working tree: libgit2 keeps a
-        // stat cache and will skip re-reading a file whose size/mtime look
-        // unchanged, trusting the cached blob OID. When that cached OID is
-        // stale or its blob is absent from the object database — which a
-        // store carried across libgit2/git versions or an interrupted
-        // earlier operation can leave behind — `write_tree` below aborts
-        // with "invalid object specified … class=Tree" and, since the wiki
-        // migration commits through this path, the server crash-loops and
-        // never starts (#594). Clearing drops the stat cache, so `add_all`
-        // re-hashes each working-tree file into the ODB and every entry the
-        // tree references is guaranteed present.
+    /// After a failed commit: the paths stay reported, and unless the
+    /// failure was a racy read the next commit walks.
+    fn keep_pending(&self, staging: Staging, racy: bool) {
+        let mut written = self.written();
+        if let Staging::Paths(paths) = staging {
+            written.since_walk.extend(paths.iter().cloned());
+            written.paths.extend(paths);
+        }
+        written.walk_needed |= !racy;
+    }
+    /// Walk when told to, when nothing was reported, or when the sweep is
+    /// due; otherwise stage the reported paths. Called under the commit lock.
+    fn take_staging(&self) -> Staging {
+        let mut written = self.written();
+        let sweep_due = written
+            .last_walk
+            .is_none_or(|at| at.elapsed() >= SWEEP_INTERVAL);
+        if written.walk_needed || written.paths.is_empty() || sweep_due {
+            written.walk_needed = false;
+            written.paths.clear();
+            Staging::Everything
+        } else {
+            Staging::Paths(std::mem::take(&mut written.paths))
+        }
+    }
+
+    /// After a walk: name what nobody reported since the last one and
+    /// start the next interval. The first walk has nothing to compare
+    /// against.
+    fn record_walk(&self, walked: &[PathBuf]) {
+        let mut written = self.written();
+        if written.last_walk.is_some() {
+            // A report covers its subtree.
+            let mut unreported: Vec<PathBuf> = walked
+                .iter()
+                .filter(|path| !path.ancestors().any(|a| written.since_walk.contains(a)))
+                .cloned()
+                .collect();
+            if !unreported.is_empty() {
+                warn!(
+                    count = unreported.len(),
+                    first = ?unreported.iter().take(UNREPORTED_SAMPLE).collect::<Vec<_>>(),
+                    "the sweep staged writes nobody reported: a writer bypassed the wiki"
+                );
+            }
+            written.unreported_writes += unreported.len() as u64;
+            unreported.truncate(UNREPORTED_SAMPLE);
+            written.last_unreported = unreported;
+        }
+        written.since_walk.clear();
+        written.last_walk = Some(Instant::now());
+    }
+
+    fn commit_staged(
+        &self,
+        open: &mut Open,
+        message: &str,
+        staging: &Staging,
+    ) -> Result<Option<git2::Oid>, CommitGit2Error> {
+        let Open {
+            repo,
+            commits_since_index_write,
+            ..
+        } = open;
         let mut index = repo.index().map_err(CommitGit2Error::Other)?;
-        index.clear().map_err(CommitGit2Error::Other)?;
-        index
-            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .map_err(CommitGit2Error::Other)?;
-        index.write().map_err(CommitGit2Error::Other)?;
+        // Stage through libgit2's stat cache: an entry whose size and mtime
+        // are unchanged keeps its cached blob OID and is not re-read, so a
+        // commit costs what changed rather than the whole tree. The cache can
+        // name a blob that is gone from the object database (a store carried
+        // across libgit2/git versions, or an interrupted operation); then
+        // `write_tree` fails, and through the wiki migration that crash-looped
+        // the server at boot (#594). That is the recovery path: drop the index
+        // and hash every file again, once.
+        let touched = match staging {
+            Staging::Everything => {
+                let walked = stage_working_tree(&mut index).map_err(CommitGit2Error::Other)?;
+                self.record_walk(&walked);
+                walked.len()
+            }
+            Staging::Paths(paths) => {
+                stage_paths(&self.root, &mut index, paths).map_err(CommitGit2Error::Other)?
+            }
+        };
+        // The index file is the stat cache across restarts; serializing it
+        // costs the size of the tree, so not per commit.
+        let write_index = match staging {
+            Staging::Everything => true,
+            Staging::Paths(_) => {
+                *commits_since_index_write += 1;
+                *commits_since_index_write >= INDEX_WRITE_EVERY
+            }
+        };
+        if write_index {
+            index.write().map_err(CommitGit2Error::Other)?;
+            *commits_since_index_write = 0;
+        }
+        debug!(
+            touched,
+            walked = matches!(staging, Staging::Everything),
+            "staged"
+        );
+        let tree_oid = match index.write_tree() {
+            Ok(oid) => oid,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "index could not be written as a tree; re-hashing the working tree (#594)"
+                );
+                index.clear().map_err(CommitGit2Error::Other)?;
+                stage_working_tree(&mut index).map_err(CommitGit2Error::Other)?;
+                index.write().map_err(CommitGit2Error::Other)?;
+                index.write_tree().map_err(CommitGit2Error::Other)?
+            }
+        };
 
         // If the index matches HEAD, there is nothing to commit.
-        let tree_oid = index.write_tree().map_err(CommitGit2Error::Other)?;
         if let Ok(head) = repo.head()
             && let Some(target) = head.target()
             && let Ok(parent_commit) = repo.find_commit(target)
@@ -222,6 +493,145 @@ impl GitAdapter {
         })?;
         Ok(blob.content().to_vec())
     }
+}
+
+/// The writes into the tree, each reporting its path; `clippy.toml`
+/// refuses the raw calls. Each holds the commit lock for the write, so a
+/// commit never reads a file mid-write ("file changed before we could
+/// read it" would drop the commit).
+#[allow(clippy::disallowed_methods)]
+impl GitAdapter {
+    fn writing(&self) -> MutexGuard<'_, Option<Open>> {
+        self.commit_lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Write `bytes` to `path` atomically (tmp, rename, fsync).
+    ///
+    /// # Errors
+    /// Propagates the filesystem error.
+    pub fn write_atomic(&self, path: &Path, bytes: &[u8]) -> WikiResult<()> {
+        let _writing = self.writing();
+        crate::atomic::write_atomic(path, bytes)?;
+        self.mark_written(path);
+        Ok(())
+    }
+
+    /// Persist a temp file over `path` and return the persisted file.
+    pub(crate) fn persist(
+        &self,
+        tmp: tempfile::NamedTempFile,
+        path: &Path,
+    ) -> Result<std::fs::File, tempfile::PersistError> {
+        let _writing = self.writing();
+        let file = crate::atomic::persist_with_retry(tmp, path)?;
+        self.mark_written(path);
+        Ok(file)
+    }
+
+    /// Append `bytes` to `path`, creating it and its parent as needed.
+    ///
+    /// # Errors
+    /// Propagates the filesystem error.
+    pub fn append(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let _writing = self.writing();
+        use std::io::Write as _;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_data()?;
+        self.mark_written(path);
+        Ok(())
+    }
+
+    /// Move `from` to `to`.
+    ///
+    /// # Errors
+    /// Propagates the filesystem error.
+    pub fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        let _writing = self.writing();
+        std::fs::rename(from, to)?;
+        self.mark_written(from);
+        self.mark_written(to);
+        Ok(())
+    }
+
+    /// Remove one file.
+    ///
+    /// # Errors
+    /// Propagates the filesystem error.
+    pub fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        let _writing = self.writing();
+        std::fs::remove_file(path)?;
+        self.mark_written(path);
+        Ok(())
+    }
+
+    /// Remove a directory and everything under it.
+    ///
+    /// # Errors
+    /// Propagates the filesystem error.
+    pub fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        let _writing = self.writing();
+        std::fs::remove_dir_all(path)?;
+        self.mark_written(path);
+        Ok(())
+    }
+}
+
+/// Forward slashes whatever the platform, for pathspecs and page paths.
+pub(crate) fn slash_path(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Bring the index in line with the working tree: refresh modified
+/// entries, drop deleted ones, add untracked files. libgit2 does all three
+/// from one index-to-workdir diff. Returns the paths touched; does not
+/// write the index file.
+fn stage_working_tree(index: &mut git2::Index) -> Result<Vec<PathBuf>, git2::Error> {
+    let mut touched = Vec::new();
+    index.add_all(
+        ["*"].iter(),
+        IndexAddOption::DEFAULT,
+        Some(&mut |path: &Path, _: &[u8]| {
+            touched.push(path.to_path_buf());
+            0
+        }),
+    )?;
+    Ok(touched)
+}
+/// Stage only `paths`: a file by path, a directory with its subtree, a
+/// gone path by removing its entries. Does not write the index file.
+fn stage_paths(
+    root: &Path,
+    index: &mut git2::Index,
+    paths: &BTreeSet<PathBuf>,
+) -> Result<usize, git2::Error> {
+    for rel in paths {
+        let abs = root.join(rel);
+        if abs.is_dir() {
+            let spec = slash_path(rel);
+            index.add_all(
+                [spec.as_str()].iter(),
+                IndexAddOption::DISABLE_PATHSPEC_MATCH,
+                None,
+            )?;
+        } else if abs.is_file() {
+            index.add_path(rel)?;
+        } else if index.get_path(rel, 0).is_some() {
+            index.remove_path(rel)?;
+        } else {
+            // Gone and not a file in the index: a directory, or nothing.
+            index.remove_dir(rel, 0)?;
+        }
+    }
+    Ok(paths.len())
 }
 
 #[cfg(windows)]
@@ -359,7 +769,7 @@ fn file_at_rev_fallback(
     original: WikiError,
 ) -> WikiResult<Vec<u8>> {
     warn!(error = %original, root = %root.display(), "libgit2 show failed; trying git CLI fallback");
-    let rel = path.to_string_lossy().replace('\\', "/");
+    let rel = slash_path(path);
     let spec = format!("{rev}:{rel}");
     let out = git_output(root, ["show", &spec])?;
     Ok(out.stdout)
@@ -449,6 +859,7 @@ fn map_git_err(e: git2::Error) -> WikiError {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -488,39 +899,496 @@ mod tests {
         assert_eq!(adapter.commit_count(), 1);
     }
 
-    /// #594 hardening: the commit re-hashes every file from the working
-    /// tree rather than trusting cached index blob OIDs. A store carried
-    /// across libgit2/git versions (or an interrupted operation) can leave
-    /// the index's stat cache pointing at a blob absent from the object
-    /// database; `write_tree` then aborts with "invalid object specified"
-    /// and the migration crash-loops. The fix clears the index before
-    /// `add_all`. We can't fabricate a missing-blob entry through git2's
-    /// safe API (it validates the OID on `add`), so we verify the
-    /// behaviour the clear guarantees: the *current* working-tree content
-    /// is what gets committed, even after the same path was committed
-    /// before — i.e. staging always reflects disk, never a cache.
+    /// #594 as it happens: the index trusts a cached blob OID whose object
+    /// is gone from the store. Stat-cache staging cannot see that, so the
+    /// tree write refuses it and the commit must recover by re-hashing.
     #[test]
-    fn commit_all_commits_current_working_tree_content() {
+    fn commit_all_recovers_when_the_index_names_a_missing_blob() {
         let tmp = tempdir();
         let root = tmp.path().join("wiki");
         let adapter = GitAdapter::open_or_init(&root).unwrap();
+        std::fs::write(root.join("cached.md"), "content the index remembers").unwrap();
+        adapter.commit_all("first").unwrap();
 
-        std::fs::write(root.join("log-2026-07.md"), "v1").unwrap();
-        adapter.commit_all("v1").unwrap();
+        // Remove the blob the index entry points at. The file on disk is
+        // untouched, so its size and mtime still match the cached entry.
+        let blob = {
+            let repo = Repository::open(&root).unwrap();
+            let index = repo.index().unwrap();
+            index.get_path(Path::new("cached.md"), 0).unwrap().id
+        };
+        let hex = blob.to_string();
+        let object = root
+            .join(".git")
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        std::fs::remove_file(&object).expect("a fresh repo stores the blob loose");
 
-        // Overwrite in place and commit again: the committed blob must be v2.
-        std::fs::write(root.join("log-2026-07.md"), "v2 rewritten").unwrap();
-        let oid = adapter.commit_all("v2").unwrap();
-        assert!(oid.is_some(), "a content change must produce a commit");
-
-        let committed = adapter
-            .file_at_rev("HEAD", Path::new("log-2026-07.md"))
-            .unwrap();
+        std::fs::write(root.join("other.md"), "a second file").unwrap();
+        let oid = adapter
+            .commit_all("second")
+            .expect("the commit recovers by re-hashing the tree");
+        assert!(oid.is_some());
+        assert!(object.exists(), "the re-hash wrote the blob back");
         assert_eq!(
-            committed, b"v2 rewritten",
-            "commit must reflect the working-tree file, re-hashed from disk"
+            adapter.file_at_rev("HEAD", Path::new("cached.md")).unwrap(),
+            b"content the index remembers"
         );
         assert_eq!(adapter.commit_count(), 2);
+    }
+
+    /// The cost of a commit is what changed, not the size of the wiki: after
+    /// a hundred files are committed, changing one must stage one path.
+    #[test]
+    fn commit_stages_only_what_changed_since_the_last_one() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        for i in 0..100 {
+            std::fs::write(root.join(format!("page-{i}.md")), format!("page {i}")).unwrap();
+        }
+        adapter.commit_all("hundred pages").unwrap();
+
+        let staged = |root: &Path| {
+            let repo = Repository::open(root).unwrap();
+            let mut index = repo.index().unwrap();
+            let touched = stage_working_tree(&mut index).unwrap().len();
+            index.write().unwrap();
+            touched
+        };
+        assert_eq!(staged(&root), 0, "a clean tree stages nothing");
+        std::fs::write(root.join("page-7.md"), "page 7, revised").unwrap();
+        assert_eq!(staged(&root), 1, "one changed file stages one path");
+        std::fs::remove_file(root.join("page-8.md")).unwrap();
+        std::fs::write(root.join("page-100.md"), "new page").unwrap();
+        assert_eq!(staged(&root), 2, "a delete and an add stage two paths");
+        assert!(adapter.commit_all("edits").unwrap().is_some());
+        assert_eq!(adapter.commit_count(), 2);
+    }
+
+    fn head_blob(adapter: &GitAdapter, rel: &str) -> Option<String> {
+        adapter
+            .file_at_rev("HEAD", Path::new(rel))
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// `files` committed by the fixture's own walk.
+    fn committed(files: &[(&str, &str)]) -> (TempDir, PathBuf, GitAdapter) {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        for (rel, body) in files {
+            write(&root, rel, body);
+        }
+        adapter.commit_all("initial").unwrap();
+        (tmp, root, adapter)
+    }
+
+    #[test]
+    fn a_commit_stages_the_reported_paths_only() {
+        let (_tmp, root, adapter) = committed(&[("page-7.md", "page 7"), ("page-8.md", "page 8")]);
+        write(&root, "page-7.md", "seven, revised");
+        write(&root, "page-8.md", "eight, revised");
+        adapter.mark_written(&root.join("page-7.md"));
+        assert_eq!(adapter.written_paths(), vec![PathBuf::from("page-7.md")]);
+        assert!(adapter.commit_all("seven").unwrap().is_some());
+        assert_eq!(
+            head_blob(&adapter, "page-7.md").as_deref(),
+            Some("seven, revised")
+        );
+        assert_eq!(
+            head_blob(&adapter, "page-8.md").as_deref(),
+            Some("page 8"),
+            "the unreported edit is not in this commit"
+        );
+        assert!(adapter.written_paths().is_empty(), "the report is consumed");
+
+        // Nothing reported: the tree is walked and the edit lands.
+        assert!(adapter.commit_all("sweep").unwrap().is_some());
+        assert_eq!(
+            head_blob(&adapter, "page-8.md").as_deref(),
+            Some("eight, revised")
+        );
+    }
+
+    #[test]
+    fn reported_deletions_and_directories_are_staged() {
+        let (_tmp, root, adapter) =
+            committed(&[("ws/proj/sessions/a.md", "a"), ("gone.md", "gone")]);
+        std::fs::remove_file(root.join("gone.md")).unwrap();
+        write(&root, "ws/proj/sessions/b.md", "b");
+        adapter.mark_written(Path::new("gone.md"));
+        adapter.mark_written(&root.join("ws/proj/sessions"));
+        assert!(adapter.commit_all("delete and add").unwrap().is_some());
+        assert!(head_blob(&adapter, "gone.md").is_none());
+        assert_eq!(
+            head_blob(&adapter, "ws/proj/sessions/b.md").as_deref(),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn the_repository_directory_is_never_reported() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
+        adapter.mark_written(Path::new(".git/logs/HEAD"));
+        adapter.mark_written(&root.join(".git/index"));
+        adapter.mark_written(Path::new(".git"));
+        assert!(adapter.written_paths().is_empty());
+    }
+
+    #[test]
+    fn the_adapters_writes_report_their_paths() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
+        adapter.write_atomic(&root.join("b.md"), b"b").unwrap();
+        adapter.append(&root.join("log.md"), b"line\n").unwrap();
+        adapter
+            .rename(&root.join("a.md"), &root.join("c.md"))
+            .unwrap();
+        adapter.remove_file(&root.join("b.md")).unwrap();
+        let reported: Vec<PathBuf> = adapter.written_paths();
+        assert_eq!(
+            reported,
+            ["a.md", "b.md", "c.md", "log.md"]
+                .map(PathBuf::from)
+                .to_vec()
+        );
+        adapter.commit_all("writes").unwrap();
+        assert!(head_blob(&adapter, "a.md").is_none());
+        assert!(head_blob(&adapter, "b.md").is_none());
+        assert_eq!(head_blob(&adapter, "c.md").as_deref(), Some("a"));
+        assert_eq!(head_blob(&adapter, "log.md").as_deref(), Some("line\n"));
+    }
+
+    #[test]
+    fn the_tree_is_swept_on_the_interval_and_when_a_report_is_untrusted() {
+        let (tmp, root, adapter) = committed(&[("tracked.md", "0"), ("bypassed.md", "old")]);
+        write(&root, "bypassed.md", "edited behind the wiki");
+        write(&root, "tracked.md", "1");
+        adapter.mark_written(Path::new("tracked.md"));
+        adapter.commit_all("session 1").unwrap();
+        assert_eq!(
+            head_blob(&adapter, "bypassed.md").as_deref(),
+            Some("old"),
+            "a path-scoped commit within the interval leaves the bypassed edit"
+        );
+
+        adapter.age_last_walk();
+        write(&root, "tracked.md", "2");
+        adapter.mark_written(Path::new("tracked.md"));
+        adapter.commit_all("session 2").unwrap();
+        assert_eq!(
+            head_blob(&adapter, "bypassed.md").as_deref(),
+            Some("edited behind the wiki"),
+            "the sweep walks the tree"
+        );
+
+        write(&root, "bypassed.md", "edited again");
+        write(&root, "tracked.md", "x");
+        adapter.mark_written(Path::new("tracked.md"));
+        adapter.mark_written(tmp.path().join("elsewhere.md").as_path());
+        adapter.commit_all("untrusted report").unwrap();
+        assert_eq!(
+            head_blob(&adapter, "bypassed.md").as_deref(),
+            Some("edited again"),
+            "a report naming a path outside the root walks the tree"
+        );
+    }
+
+    /// A directory report covers its subtree.
+    #[test]
+    fn the_sweep_names_the_writes_nobody_reported() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/a.md", "a")]);
+        assert_eq!(adapter.sweep_snapshot(), SweepSnapshot::default());
+
+        write(&root, "ws/proj/a.md", "a2");
+        write(&root, "ws/proj/b.md", "nobody reported this");
+        adapter.mark_written(Path::new("ws/proj/a.md"));
+        adapter.age_last_walk();
+        adapter.commit_all("sweep").unwrap();
+        assert_eq!(
+            adapter.sweep_snapshot(),
+            SweepSnapshot {
+                unreported_writes: 1,
+                last_unreported: vec![PathBuf::from("ws/proj/b.md")],
+            }
+        );
+
+        write(&root, "ws/proj/c.md", "c");
+        adapter.mark_written(Path::new("ws/proj"));
+        adapter.age_last_walk();
+        adapter.commit_all("sweep again").unwrap();
+        let snapshot = adapter.sweep_snapshot();
+        assert_eq!(snapshot.unreported_writes, 1, "the count is cumulative");
+        assert!(snapshot.last_unreported.is_empty());
+    }
+
+    #[test]
+    fn concurrent_appends_do_not_fail_a_commit() {
+        let (_tmp, root, adapter) = committed(&[("ws/proj/log.md", "")]);
+        let ledger = root.join("ws/proj/log.md");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..3)
+            .map(|_| {
+                let adapter = adapter.clone();
+                let ledger = ledger.clone();
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        adapter
+                            .append(&ledger, b"2026-09-08T00:00:00Z stop x\n")
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for i in 0..30 {
+            std::thread::sleep(Duration::from_millis(2));
+            adapter.mark_written(&ledger);
+            adapter
+                .commit_all(&format!("session {i}"))
+                .unwrap_or_else(|e| panic!("commit {i} failed: {e}"));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert!(adapter.commit_count() >= 2);
+    }
+
+    /// Not a test: run by hand with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_commit_cost_on_a_large_tree() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let projects = 120usize;
+        let per_project = 150usize;
+        for p in 0..projects {
+            let dir = root.join(format!("ws/proj-{p:04}/sessions"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..per_project {
+                std::fs::write(dir.join(format!("s-{f:04}.md")), "# session\n\nbody\n").unwrap();
+            }
+        }
+        let t = Instant::now();
+        adapter.commit_all("initial walk").unwrap();
+        println!(
+            "files {}: initial walk {:?}",
+            projects * per_project,
+            t.elapsed()
+        );
+
+        let t = Instant::now();
+        adapter.commit_all("clean walk").unwrap();
+        println!("clean walk (nothing reported) {:?}", t.elapsed());
+
+        let mut scoped = Vec::new();
+        for i in 0..10 {
+            let rel = format!("ws/proj-{:04}/sessions/new-{i}.md", i % projects);
+            std::fs::write(root.join(&rel), "# new\n\nbody\n").unwrap();
+            adapter.mark_written(Path::new(&rel));
+            let t = Instant::now();
+            adapter.commit_all(&format!("scoped {i}")).unwrap();
+            scoped.push(t.elapsed());
+        }
+        println!("path-scoped commits: {scoped:?}");
+    }
+    /// A later adapter's first commit walks from the stale index file
+    /// and still commits everything.
+    #[test]
+    fn a_stale_index_file_costs_a_later_adapter_only_a_walk() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
+        for i in 0..3 {
+            write(&root, "a.md", &format!("a{i}"));
+            adapter.mark_written(Path::new("a.md"));
+            adapter.commit_all(&format!("scoped {i}")).unwrap();
+        }
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a2"));
+        write(&root, "b.md", "b");
+        let later = GitAdapter::open_or_init(&root).unwrap();
+        assert!(later.commit_all("from a fresh adapter").unwrap().is_some());
+        assert_eq!(head_blob(&later, "a.md").as_deref(), Some("a2"));
+        assert_eq!(head_blob(&later, "b.md").as_deref(), Some("b"));
+        // The first adapter's kept index predates that commit.
+        write(&root, "a.md", "a3");
+        adapter.mark_written(Path::new("a.md"));
+        adapter.commit_all("after the other adapter").unwrap();
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a3"));
+        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_racy_read_is_the_filesystem_error_that_names_it() {
+        let racy = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Filesystem,
+            "file changed before we could read it",
+        );
+        assert!(is_racy_read(&racy));
+        let other_class = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "file changed before we could read it",
+        );
+        assert!(!is_racy_read(&other_class));
+        let other_message = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Filesystem,
+            "failed to open",
+        );
+        assert!(!is_racy_read(&other_message));
+    }
+
+    /// A racy read keeps the commit path-scoped; any other failure walks.
+    #[test]
+    fn a_racy_read_failure_does_not_escalate_to_a_walk() {
+        let (_tmp, _root, adapter) = committed(&[("a.md", "a")]);
+        adapter.mark_written(Path::new("a.md"));
+        let staging = adapter.take_staging();
+        assert!(matches!(staging, Staging::Paths(_)));
+        adapter.keep_pending(staging, true);
+        assert_eq!(adapter.written_paths(), vec![PathBuf::from("a.md")]);
+        let staging = adapter.take_staging();
+        assert!(matches!(&staging, Staging::Paths(p) if p.len() == 1));
+
+        adapter.keep_pending(staging, false);
+        assert_eq!(adapter.written_paths(), vec![PathBuf::from("a.md")]);
+        assert!(matches!(adapter.take_staging(), Staging::Everything));
+    }
+
+    #[test]
+    fn persist_and_remove_dir_all_report_their_paths() {
+        let (_tmp, root, adapter) = committed(&[("d/x.md", "x"), ("d/y.md", "y")]);
+        let mut tmp = tempfile::NamedTempFile::new_in(&root).unwrap();
+        std::io::Write::write_all(&mut tmp, b"p").unwrap();
+        adapter.persist(tmp, &root.join("p.md")).unwrap();
+        adapter.remove_dir_all(&root.join("d")).unwrap();
+        assert_eq!(
+            adapter.written_paths(),
+            ["d", "p.md"].map(PathBuf::from).to_vec()
+        );
+        assert!(adapter.commit_all("persist and remove").unwrap().is_some());
+        assert_eq!(head_blob(&adapter, "p.md").as_deref(), Some("p"));
+        assert!(head_blob(&adapter, "d/x.md").is_none());
+        assert!(head_blob(&adapter, "d/y.md").is_none());
+    }
+
+    #[test]
+    fn the_index_file_is_written_after_a_walk_and_every_fifty_commits() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
+        let index_file = root.join(".git/index");
+        let after_walk = std::fs::read(&index_file).unwrap();
+        for i in 1..=INDEX_WRITE_EVERY {
+            let rel = format!("n-{i}.md");
+            write(&root, &rel, "n");
+            adapter.mark_written(Path::new(&rel));
+            assert!(adapter.commit_all(&rel).unwrap().is_some());
+            let now = std::fs::read(&index_file).unwrap();
+            if i < INDEX_WRITE_EVERY {
+                assert_eq!(now, after_walk, "commit {i} wrote the index file");
+            } else {
+                assert_ne!(now, after_walk, "commit {i} did not write the index file");
+            }
+        }
+        let before_walk = std::fs::read(&index_file).unwrap();
+        write(&root, "b.md", "b");
+        adapter.mark_written(Path::new("b.md"));
+        adapter.age_last_walk();
+        assert!(adapter.commit_all("sweep").unwrap().is_some());
+        assert_ne!(std::fs::read(&index_file).unwrap(), before_walk);
+        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_failed_commit_keeps_the_reported_paths() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
+        write(&root, "a.md", "a2");
+        adapter.mark_written(Path::new("a.md"));
+        // Break the repository; the kept one is dropped first, as a restart would.
+        adapter.close();
+        let git_dir = root.join(".git");
+        std::fs::rename(&git_dir, root.join(".git-parked")).unwrap();
+        assert!(adapter.commit_all("broken").is_err());
+        std::fs::rename(root.join(".git-parked"), &git_dir).unwrap();
+        assert_eq!(adapter.written_paths(), vec![PathBuf::from("a.md")]);
+        assert!(adapter.commit_all("retry").unwrap().is_some());
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a2"));
+    }
+    /// The stat cache's blind spot: a file rewritten with the same size and
+    /// an mtime no newer than the index looks unchanged by stat alone. git
+    /// treats an entry whose mtime is not older than the index as "racy"
+    /// and re-reads it; the commit must carry the new content, or a page
+    /// saved right after a session end would be snapshotted stale. The
+    /// rewritten file is given the index file's own mtime so the case is
+    /// forced rather than left to the clock.
+    #[test]
+    fn a_same_size_rewrite_with_an_unchanged_mtime_is_still_committed() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let file = root.join("racy.md");
+        std::fs::write(&file, "version A").unwrap();
+        adapter.commit_all("A").unwrap();
+
+        std::fs::write(&file, "version B").unwrap();
+        let index_written = std::fs::metadata(root.join(".git").join("index"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(index_written)
+            .unwrap();
+
+        adapter.commit_all("B").unwrap();
+        assert_eq!(
+            adapter.file_at_rev("HEAD", Path::new("racy.md")).unwrap(),
+            b"version B"
+        );
+        assert_eq!(adapter.commit_count(), 2);
+    }
+
+    /// Two session ends at once used to collide on libgit2's index lock and
+    /// one of them lost its snapshot; now they queue.
+    #[test]
+    fn concurrent_commits_queue_instead_of_failing() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let adapter = adapter.clone();
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    std::fs::write(root.join(format!("s{i}.md")), format!("session {i}")).unwrap();
+                    adapter.commit_all(&format!("session {i}")).unwrap()
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // Every file is in HEAD whether its own commit ran or a later one
+        // swept it up; nothing was dropped.
+        for i in 0..8 {
+            assert_eq!(
+                adapter
+                    .file_at_rev("HEAD", Path::new(&format!("s{i}.md")))
+                    .unwrap(),
+                format!("session {i}").as_bytes()
+            );
+        }
     }
 
     #[test]

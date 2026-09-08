@@ -1301,10 +1301,18 @@ fn end_lifecycle_only_session_in_tx(
     tx: &Transaction<'_>,
     session_id: &SessionId,
 ) -> StoreResult<LifecycleOnlyEndOutcome> {
+    // Substantive is defined POSITIVELY: at least one observation that is
+    // real work (a user prompt or a tool use). This MUST stay in sync with
+    // `is_ephemeral_session` in ai-memory-hooks/src/router.rs — both sides
+    // must classify every observation set identically, or this atomic
+    // re-check would silently revert the router's verdict. Everything else,
+    // including `stop` and `notification` (some harnesses, e.g. OpenCode,
+    // fire these for purely internal work), is ephemeral.
     let has_substantive_observation: bool = tx.query_row(
         "SELECT EXISTS( \
              SELECT 1 FROM observations \
-             WHERE session_id = ?1 AND kind NOT IN ('session-start', 'session-end') \
+             WHERE session_id = ?1 \
+               AND kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use') \
          )",
         params![session_id.as_bytes()],
         |row| row.get(0),
@@ -7161,6 +7169,94 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(state, "accepted");
+    }
+
+    /// Pins the two-sided invariant with `is_ephemeral_session` in
+    /// ai-memory-hooks/src/router.rs: a session with only `session-start`,
+    /// `stop`, `session-end` (the #662 OpenCode internal-session shape) has
+    /// no positive-work observation and must end as `Ended`, not
+    /// `Substantive`.
+    #[test]
+    fn end_lifecycle_only_session_treats_stop_only_session_as_ended() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let receiver = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        insert_observation(
+            &mut conn,
+            &NewObservation {
+                session_id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::Stop,
+                extension: None,
+                source_event: None,
+                title: "stop".into(),
+                body: String::new(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
+            LifecycleOnlyEndOutcome::Ended {
+                reopened_handoff: None
+            },
+            "a Stop-only session has no user-prompt/pre-tool-use/post-tool-use \
+             observation, so it must be classified ended, not substantive"
+        );
+    }
+
+    /// Companion to the Stop-only case above: a `user-prompt` observation
+    /// alone (no lifecycle bookends yet inserted beyond SessionStart) makes
+    /// the session substantive.
+    #[test]
+    fn end_lifecycle_only_session_treats_user_prompt_as_substantive() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let receiver = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        insert_observation(
+            &mut conn,
+            &NewObservation {
+                session_id: receiver,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "hello".into(),
+                body: "do the thing".into(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            end_lifecycle_only_session(&mut conn, &receiver).unwrap(),
+            LifecycleOnlyEndOutcome::Substantive
+        );
     }
 
     #[test]

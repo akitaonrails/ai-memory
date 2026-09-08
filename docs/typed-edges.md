@@ -67,11 +67,13 @@ gain `.md`.
 
 - **You**, in any page's frontmatter (the wiki files are plain
   markdown — edit and `reindex`, or let the watcher pick it up).
-- **The consolidator**, sparingly: the session-end prompt may declare
-  a relation when the session's evidence states it plainly (a fix
+- **The consolidator**, sparingly: both single-page consolidation and
+  `memory_consolidate` with `multi_page=true` can preserve a relation
+  when the session's evidence states it plainly (a fix
   landed for a documented gotcha; new evidence contradicts a stored
   decision). The output is JSON-schema constrained and filtered to the
-  vocabulary again at the write boundary.
+  vocabulary again at the write boundary. Empty relation kinds are
+  omitted from frontmatter; older outputs without `relations` still work.
 
 Storage detail: edges ride the existing `links.link_type` column
 (default `references`), so this needed no schema migration and old

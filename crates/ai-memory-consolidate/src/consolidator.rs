@@ -17,7 +17,9 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::projection::{ObservationProjectionConfig, project_observations};
-use crate::types::{ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome, SlotKind};
+use crate::types::{
+    ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome, Relations, SlotKind,
+};
 
 /// Errors raised by the consolidator.
 #[derive(Debug, Error)]
@@ -678,6 +680,7 @@ fn build_update(
             serde_json::Value::String(upd.slot_kind.as_str().into()),
         );
     }
+    insert_relations(&mut fm, &upd.relations);
     fm.insert("consolidated".into(), serde_json::Value::Bool(true));
 
     let req = WritePageRequest {
@@ -884,9 +887,10 @@ fn build_batch_request_with_slots(
          - \"kind\"            (string)  required — one of: decision | gotcha | rule | fact\n\
          - \"tags\"            (array of string)  required — may be empty `[]`, but the key must be present\n\
          - \"entities\"        (array of string)  required — may be empty `[]`, but the key must be present; see below\n\
+         - \"relations\"       (object) optional — keys: \"causes\", \"fixes\", \"contradicts\"; each contains an array of existing wiki paths. Declare only evidence-backed edges; empty arrays are normal.\n\
          - \"slot_kind\"       (string) optional — ONLY for `_slots/*`; one of \"state\" or \"invariant\"; this is the SLOT WRITE REGIME, NOT a tier value\n\
-         - \"summary\"         (string) optional — ONE line of plain prose saying what the page covers, shown beside the title in listings. NOT a heading, NOT a `- **key:** value` bullet, NOT a list item, NOT a repeat of the title: a summary shaped like any of those is discarded and the page ends up described worse than if you had omitted it. Omit the key rather than guessing.\n\
-         No other keys except optional `slot_kind` on `_slots/*` and optional `summary`. No `body`, no `content`. Field names \
+         - \"summary\"         (string) optional — ONE line of plain prose describing the page, shown beside its title. Headings, `- **key:** value` bullets, list items, and repeated titles are discarded. Omit rather than guess.\n\
+         Use only the keys listed above. No `body`, no `content`. Field names \
          are case-sensitive and the `_markdown` suffix matters.\n\
          \n## `entities` field — the specific nouns the page is about\n\
          Up to 10 short names (max 64 chars each), lowercase, taken from \
@@ -1279,11 +1283,16 @@ fn build_frontmatter(
     if let Some(summary) = usable_summary(page.summary.as_deref(), &page.title) {
         map.insert("summary".into(), serde_json::Value::String(summary));
     }
+    insert_relations(&mut map, &page.relations);
+    map.insert("consolidated".into(), serde_json::Value::Bool(true));
+    serde_json::Value::Object(map)
+}
+
+fn insert_relations(map: &mut serde_json::Map<String, serde_json::Value>, relations: &Relations) {
     // Typed edges (2.0 item 3): only vocabulary keys survive — an LLM
     // inventing `blames:` must not mint a new edge kind. The wiki write
     // boundary parses this frontmatter into typed links.
-    let relations: serde_json::Map<String, serde_json::Value> = page
-        .relations
+    let relations: serde_json::Map<String, serde_json::Value> = relations
         .non_empty()
         .map(|(relation, targets)| {
             (
@@ -1300,8 +1309,6 @@ fn build_frontmatter(
     if !relations.is_empty() {
         map.insert("relations".into(), serde_json::Value::Object(relations));
     }
-    map.insert("consolidated".into(), serde_json::Value::Bool(true));
-    serde_json::Value::Object(map)
 }
 
 fn stamp_session_origin(
@@ -1402,7 +1409,6 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Relations;
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
 
@@ -1720,6 +1726,7 @@ mod tests {
             summary: summary.map(str::to_owned),
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: Vec::new(),
         }
     }
@@ -1863,6 +1870,130 @@ mod tests {
     }
 
     #[test]
+    fn batch_relations_schema_uses_the_closed_vocabulary() {
+        let request = build_batch_request(SessionId::new(), &[]);
+        assert!(request.messages[0].content.contains("- \"relations\""));
+        let schema = serde_json::to_value(schemars::schema_for!(ConsolidatedBatch)).unwrap();
+        let update = &schema["$defs"]["ConsolidatedPageUpdate"];
+        assert_eq!(
+            update["properties"]["relations"]["$ref"], "#/$defs/Relations",
+            "the batch prompt's relations field must be expressible in structured output"
+        );
+        let relations = &schema["$defs"]["Relations"];
+        let properties = relations["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 3);
+        for kind in ["causes", "fixes", "contradicts"] {
+            assert_eq!(properties[kind]["type"], "array");
+            assert_eq!(properties[kind]["items"]["type"], "string");
+        }
+        assert!(!relations["additionalProperties"].is_object());
+    }
+
+    #[tokio::test]
+    async fn batch_relations_reach_frontmatter_and_typed_link_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let target = "gotchas/linker.md";
+        let target_id = wiki
+            .write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(target).unwrap(),
+                frontmatter: serde_json::json!({}),
+                body: "The linker runs out of memory.".into(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: Some("Linker memory limit".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+            })
+            .await
+            .unwrap();
+        let path = PagePath::new("notes/linker-investigation.md").unwrap();
+        let relations = serde_json::json!({
+            "causes": [target], "fixes": [target], "contradicts": [target]
+        });
+        let mut response = batch_targeting(path.as_str(), "The session investigated the linker.");
+        response["updates"][0]["relations"] = relations.clone();
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stored = wiki.read_page(ws, proj, &path).unwrap();
+        assert_eq!(stored.frontmatter["relations"], relations);
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let rows: Vec<(String, Vec<u8>)> = db
+            .prepare(
+                "SELECT link_type, to_page_id FROM links WHERE from_page_id = ?1 \
+                 ORDER BY link_type",
+            )
+            .unwrap()
+            .query_map([outcomes[0].page_id.unwrap().as_bytes()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            ["causes", "contradicts", "fixes"]
+                .into_iter()
+                .map(|kind| (kind.to_string(), target_id.as_bytes().to_vec()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn batch_relations_omit_empty_and_unknown_kinds() {
+        for supplied in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"causes": [], "fixes": [], "contradicts": []})),
+            Some(
+                serde_json::json!({"fixes": ["gotchas/linker.md"], "causes": [], "blames": ["notes/a.md"]}),
+            ),
+        ] {
+            let mut response = batch_targeting("notes/fix.md", "Fixed the linker.");
+            if let Some(ref relations) = supplied {
+                response["updates"][0]["relations"] = relations.clone();
+            }
+            let batch: ConsolidatedBatch = serde_json::from_value(response).unwrap();
+            let (req, _) = build_update(
+                WorkspaceId::new(),
+                ProjectId::new(),
+                &batch.updates[0],
+                false,
+                &ai_memory_core::ActorContext::anonymous(),
+                None,
+            )
+            .unwrap();
+            if supplied.as_ref().is_some_and(|r| r.get("blames").is_some()) {
+                assert_eq!(
+                    req.frontmatter["relations"],
+                    serde_json::json!({"fixes": ["gotchas/linker.md"]})
+                );
+            } else {
+                assert!(req.frontmatter.get("relations").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn pages_without_relations_omit_the_key() {
         let page = ConsolidatedPage {
             title: "T".into(),
@@ -1886,6 +2017,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: Vec::new(),
         };
         let (req, _) = build_update(
@@ -1911,6 +2043,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: Vec::new(),
         };
         let actor = ai_memory_core::ActorContext {
@@ -1951,6 +2084,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: Vec::new(),
         };
         let (req, outcome) = build_update(
@@ -1981,6 +2115,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            relations: Relations::default(),
             entities: vec![
                 " SQLite ".into(),
                 "sqlite".into(),
@@ -2017,6 +2152,7 @@ mod tests {
             summary: None,
             tags: Vec::new(),
             slot_kind: SlotKind::Invariant,
+            relations: Relations::default(),
             entities: Vec::new(),
         };
         let (req, _) = build_update(

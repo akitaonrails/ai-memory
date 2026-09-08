@@ -2694,7 +2694,7 @@ async fn process_authorized(
                 Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
             }
             let observations = state.reader.observations_for_session(session_id).await?;
-            if !is_lifecycle_only_session(&observations) {
+            if !is_ephemeral_session(&observations) {
                 enqueue_session_end_consolidation(
                     state,
                     session_id,
@@ -2803,7 +2803,7 @@ async fn process_authorized(
     // Substantive sessions synthesize the summary page and auto-handoff below.
     if matches!(env.event, HookEvent::SessionEnd) {
         let mut observations = state.reader.observations_for_session(session_id).await?;
-        if is_lifecycle_only_session(&observations) {
+        if is_ephemeral_session(&observations) {
             let outcome = state
                 .writer
                 .end_admitted_lifecycle_only_session(admitted.clone())
@@ -2837,7 +2837,7 @@ async fn process_authorized(
                     );
                     // The writer observed substantive work, so the refreshed
                     // set cannot still satisfy the lifecycle-only predicate.
-                    debug_assert!(!is_lifecycle_only_session(&observations));
+                    debug_assert!(!is_ephemeral_session(&observations));
                 }
             }
         }
@@ -3028,14 +3028,23 @@ fn resolve_native_session_id(raw: &str) -> SessionId {
         .unwrap_or_else(|_| SessionId(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
 }
 
-fn is_lifecycle_only_session(observations: &[ai_memory_core::Observation]) -> bool {
-    !observations.is_empty()
-        && observations.iter().all(|observation| {
-            matches!(
-                observation.kind,
-                ObservationKind::SessionStart | ObservationKind::SessionEnd
-            )
-        })
+/// A session is substantive iff it logged at least one `UserPrompt`,
+/// `PreToolUse`, or `PostToolUse` observation. Everything else — including
+/// `Stop` and `Notification`, which some harnesses (e.g. OpenCode) fire for
+/// purely internal work such as branch-naming — is ephemeral/no-op and must
+/// not synthesize a session page. This positive definition MUST stay in sync
+/// with the store-side SQL in `end_lifecycle_only_session_in_tx`
+/// (ai-memory-store/src/ops.rs): both sides classify every observation set
+/// identically, or the atomic store re-check silently reverts this verdict.
+fn is_ephemeral_session(observations: &[ai_memory_core::Observation]) -> bool {
+    !observations.iter().any(|observation| {
+        matches!(
+            observation.kind,
+            ObservationKind::UserPrompt
+                | ObservationKind::PreToolUse
+                | ObservationKind::PostToolUse
+        )
+    })
 }
 
 fn build_auto_handoff(
@@ -3354,7 +3363,7 @@ async fn consolidate_or_synth(
         }
     }
     let observations = state.reader.observations_for_session(session_id).await?;
-    if observations.is_empty() {
+    if is_ephemeral_session(&observations) {
         return Ok(());
     }
     let new_page = synthesize_session_page(
@@ -8046,6 +8055,49 @@ mod tests {
         );
     }
 
+    /// Reproduces the #662 OpenCode bug: an internal session (e.g.
+    /// branch-naming) that fires only lifecycle + `Stop` events, with no
+    /// user prompt and no tool use, must not flood the wiki with an
+    /// ephemeral `sessions/<id>.md` page.
+    #[tokio::test]
+    async fn stop_only_session_ends_without_writing_a_page() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "14141414-1414-1414-1414-141414141414";
+        for event in ["session-start", "stop", "session-end"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("opencode".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid }),
+            );
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+
+        let pages = state
+            .reader
+            .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+            .await
+            .unwrap();
+        assert!(
+            pages
+                .iter()
+                .all(|page| !page.path.as_str().starts_with("sessions/")),
+            "a Stop-only session with no prompt and no tool use must not synthesize a page; got {:?}",
+            pages.iter().map(|p| p.path.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            Some(sid.parse().unwrap())
+        );
+    }
+
     #[tokio::test]
     async fn stop_does_not_end_session() {
         let tmp = TempDir::new().unwrap();
@@ -11488,6 +11540,19 @@ mod tests {
         );
         process(&state, start, None, Vec::new()).await.unwrap();
 
+        // #662: checkpointing now gates on the same positive "has real work"
+        // test as SessionEnd, so a prompt must precede compaction for the
+        // rule-based checkpoint to have anything substantive to write.
+        let prompt = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("devin".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": sid }),
+        );
+        process(&state, prompt, None, Vec::new()).await.unwrap();
+
         let pages_before = state
             .reader
             .recent_pages_for_project(state.workspace_id, state.project_id, 20)
@@ -12307,6 +12372,56 @@ mod tests {
             importance: 5,
             created_at: jiff::Timestamp::now(),
         }
+    }
+
+    // ── is_ephemeral_session: positive substantive-work predicate ─────────
+
+    #[test]
+    fn ephemeral_session_pure_lifecycle_and_stop_has_no_real_work() {
+        let observations = vec![
+            mk_obs(ObservationKind::SessionStart, "start", ""),
+            mk_obs(ObservationKind::Stop, "stop", ""),
+            mk_obs(ObservationKind::SessionEnd, "end", ""),
+        ];
+        assert!(
+            is_ephemeral_session(&observations),
+            "a Stop-only session (no prompt, no tool use) must be classified ephemeral, \
+             matching OpenCode's internal session.created/session.idle no-op sessions"
+        );
+    }
+
+    #[test]
+    fn ephemeral_session_empty_observations_is_ephemeral() {
+        assert!(is_ephemeral_session(&[]));
+    }
+
+    #[test]
+    fn ephemeral_session_with_user_prompt_is_not_ephemeral() {
+        let observations = vec![
+            mk_obs(ObservationKind::SessionStart, "start", ""),
+            mk_obs(ObservationKind::UserPrompt, "hello", "do the thing"),
+            mk_obs(ObservationKind::Stop, "stop", ""),
+            mk_obs(ObservationKind::SessionEnd, "end", ""),
+        ];
+        assert!(
+            !is_ephemeral_session(&observations),
+            "a session with a real user prompt must synthesize a page"
+        );
+    }
+
+    #[test]
+    fn ephemeral_session_with_tool_use_but_no_prompt_is_not_ephemeral() {
+        let observations = vec![
+            mk_obs(ObservationKind::SessionStart, "start", ""),
+            mk_obs(ObservationKind::PreToolUse, "Read", "README.md"),
+            mk_obs(ObservationKind::PostToolUse, "Read", "README.md"),
+            mk_obs(ObservationKind::Stop, "stop", ""),
+            mk_obs(ObservationKind::SessionEnd, "end", ""),
+        ];
+        assert!(
+            !is_ephemeral_session(&observations),
+            "tool-only work with no user prompt still counts as substantive"
+        );
     }
 
     #[test]

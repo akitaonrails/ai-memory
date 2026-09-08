@@ -20,8 +20,6 @@
 //! `forget-sweep --logs --older-than 12m` could delete cold files if
 //! it becomes worthwhile.
 
-use std::io::Write;
-
 use ai_memory_core::{ProjectId, WorkspaceId};
 use ai_memory_wiki::Wiki;
 use jiff::{Timestamp, tz::TimeZone};
@@ -52,23 +50,10 @@ pub fn append_event(
     event: HookEvent,
     title: &str,
 ) -> std::io::Result<()> {
-    let log_path = wiki
-        .project_root(workspace_id, project_id)
-        .join(log_filename_for(when));
+    let file_name = log_filename_for(when);
     let line = format_line(when, event, title);
-    debug!(path = %log_path.display(), bytes = line.len(), "appending log entry");
-
-    if let Some(parent) = log_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    file.write_all(line.as_bytes())?;
-    file.sync_data()?;
+    let path = wiki.append_under_project(workspace_id, project_id, &file_name, line.as_bytes())?;
+    debug!(path = %path.display(), bytes = line.len(), "appended log entry");
     Ok(())
 }
 

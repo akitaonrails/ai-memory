@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::commands::path_util::home_dir;
-use crate::marker::{find_marker, is_truthy, parse_toml_flag, parse_toml_key, repo_root_project};
+use crate::marker::{
+    find_marker, find_settings_marker, is_truthy, parse_toml_flag, parse_toml_key,
+    repo_root_project,
+};
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
 use ai_memory_hooks::{CaptureConfig, CapturePolicy, CaptureSource};
 
@@ -235,12 +238,15 @@ pub fn marker_query_suffix_without_briefing(cwd: &str, default_strategy: Option<
     marker_query_suffix_impl(cwd, default_strategy, false)
 }
 
-/// Whether the nearest marker explicitly enables the compiled project brief.
+/// Whether the nearest settings-declaring marker explicitly enables the
+/// compiled project brief (see [`find_settings_marker`]: a nested
+/// capture-only marker does not shadow an outer marker's `[briefing]`
+/// opt-in, #668).
 ///
 /// Kimi Code uses this before creating its local once-per-session marker so
 /// repositories that did not opt in do not accumulate marker files.
 pub fn marker_requests_briefing(cwd: &str) -> bool {
-    find_marker(cwd)
+    find_settings_marker(cwd)
         .and_then(|marker| parse_toml_flag(&marker, "inject_on_session_start"))
         .is_some_and(|value| is_truthy(&value))
 }
@@ -254,7 +260,10 @@ fn marker_query_suffix_impl(
     let (mut workspace, mut project, mut strategy, mut drop_subagent, mut default_global) =
         (None, None, None, None, None);
     let (mut briefing, mut briefing_budget) = (None, None);
-    if let Some(marker) = find_marker(cwd) {
+    // The nearest marker that declares more than `[capture]` (#668): a
+    // nested capture-only marker (e.g. one that only sets `ignore_paths`)
+    // must not shadow an outer marker's workspace/project/briefing/etc.
+    if let Some(marker) = find_settings_marker(cwd) {
         workspace = parse_toml_key(&marker, "workspace");
         project = parse_toml_key(&marker, "project");
         strategy = parse_toml_key(&marker, "project_strategy");
@@ -1036,6 +1045,77 @@ drop_subagent_captures = "true"
     // `project_src` must faithfully separate the two ways a `project` override
     // is produced — that distinction is the whole basis for `[routing]
     // mid_session = "sticky"` honoring markers while overruling derivation.
+    /// A nested capture-only marker (only `[capture]`) must not shadow an
+    /// outer marker's `workspace`/`project` — `marker_query_suffix` forwards
+    /// those from the OUTER marker — while `capture_policy` for the SAME cwd
+    /// still resolves the INNER (nearest) marker's `ignore_paths`: scope and
+    /// capture deliberately read different markers (#668).
+    #[test]
+    fn marker_query_suffix_skips_nested_capture_only_marker_for_scope() {
+        use ai_memory_core::AgentKind;
+        use ai_memory_hooks::CaptureDisposition;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A `.git` dir makes tmp.path() the checkout boundary the walk-up
+        // stops at, so it is actually consulted (a plain non-git directory
+        // outside $HOME only checks its exact cwd — see `checkout_root`).
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\nproject = \"infra\"\n",
+        )
+        .unwrap();
+        let inner = tmp.path().join("sub");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(
+            inner.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let inner_str = inner.to_str().unwrap();
+
+        let qs = marker_query_suffix(inner_str, None);
+        assert!(qs.contains("&workspace=acme"), "{qs}");
+        assert!(qs.contains("&project=infra"), "{qs}");
+
+        // Same cwd: capture policy still comes from the INNER (nearest)
+        // marker, so its `ignore_paths` still applies.
+        let policy = capture_policy(inner_str);
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": format!("{inner_str}/secret/token.txt")},
+            "session_id": "s",
+            "cwd": inner_str,
+        });
+        let decision = policy.inspect(AgentKind::ClaudeCode, &raw, inner_str);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+    }
+
+    /// The predicate is conservative: a marker declaring `[capture]` PLUS a
+    /// scope key is a settings boundary, not capture-only, so its own
+    /// `project` wins rather than an outer marker's.
+    #[test]
+    fn marker_query_suffix_capture_plus_project_is_a_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"acme\"\nproject = \"infra\"\n",
+        )
+        .unwrap();
+        let inner = tmp.path().join("sub");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(
+            inner.join(".ai-memory.toml"),
+            "project = \"x\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+
+        let qs = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(qs.contains("&project=x"), "{qs}");
+        assert!(!qs.contains("&workspace=acme"), "{qs}");
+    }
+
     #[test]
     fn marker_query_suffix_tags_project_provenance() {
         let tmp = tempfile::TempDir::new().unwrap();

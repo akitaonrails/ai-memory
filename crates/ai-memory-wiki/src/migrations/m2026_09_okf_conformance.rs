@@ -17,7 +17,6 @@
 //!
 //! Idempotent: on a conformant store both passes find nothing and the
 //! backup gate never engages (fresh installs never create archives).
-
 use std::path::{Path, PathBuf};
 
 use ai_memory_store::WriterHandle;
@@ -173,9 +172,9 @@ impl WikiMigration for OkfConformance {
 
         // 4. File pass.
         for file in file_pending {
-            conform_file(wiki_root, &file, &at_by_page)?;
+            conform_file(&git, &file, &at_by_page)?;
         }
-        ensure_bundle_indexes(wiki_root)?;
+        ensure_bundle_indexes(&git)?;
 
         // 5. One commit for the whole rewrite.
         git.commit_all("okf-migration: conform wiki to OKF v0.2")?;
@@ -210,6 +209,7 @@ fn nonconformant_files(wiki_root: &Path) -> WikiResult<Vec<PathBuf>> {
             } else if ft.is_file()
                 && path.extension().is_some_and(|e| e == "md")
                 && path.file_name().is_none_or(|n| n != "index.md")
+                && !is_ledger_file(&path)
             {
                 let Ok(raw) = std::fs::read_to_string(&path) else {
                     continue;
@@ -235,15 +235,35 @@ fn is_meta_manifest(path: &Path) -> bool {
     path.file_name().is_some_and(|n| n == "_meta.md")
 }
 
+/// The raw hook event ledger (`log.md` / `log-YYYY-MM.md`) never carries OKF
+/// frontmatter and must not be migrated: stamping `type: Note` onto it would
+/// recreate the frontmatter #660 already taught the watcher's indexer to
+/// treat as an ordinary (huge) page, and it would make every `serve` boot
+/// re-archive the whole data dir here (#669), since this scan feeds the
+/// pre-migration backup gate.
+///
+/// Content-gated, matching the watcher's own check (#660): a reserved-looking
+/// filename is only excluded when its first body line is a hook log entry, so
+/// an ordinary page literally named `log-2026-09.md` is still migrated.
+fn is_ledger_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Ok(page_path) = ai_memory_core::PagePath::new(name) else {
+        return false;
+    };
+    crate::ledger::is_log_ledger_filename(&page_path) && crate::ledger::opens_with_log_ledger(path)
+}
+
 /// Conform one file in place: same body, frontmatter filled. Manifests
 /// (`_meta.md`) get their `type` only — they are identity records, not
 /// concept pages with provenance.
 fn conform_file(
-    wiki_root: &Path,
+    git: &crate::git::GitAdapter,
     rel: &Path,
     at_by_page: &std::collections::HashMap<(String, String, String), String>,
 ) -> WikiResult<()> {
-    let abs = wiki_root.join(rel);
+    let abs = git.root().join(rel);
     let raw = std::fs::read_to_string(&abs)?;
     let mut md = parse(&raw).unwrap_or_else(|_| Markdown {
         frontmatter: serde_json::Value::Object(serde_json::Map::new()),
@@ -285,9 +305,7 @@ fn conform_file(
 
     let emitted = emit(&md)?;
     if emitted != raw {
-        let tmp = tempfile::NamedTempFile::new_in(abs.parent().unwrap_or(wiki_root))?;
-        std::fs::write(tmp.path(), emitted.as_bytes())?;
-        crate::atomic::persist_with_retry(tmp, &abs)?;
+        git.write_atomic(&abs, emitted.as_bytes())?;
     }
     Ok(())
 }
@@ -306,8 +324,8 @@ fn mtime_iso(path: &Path) -> String {
 /// Each project directory is one OKF bundle: give it an `index.md`
 /// declaring `okf_version` when absent (the only place index.md may
 /// carry frontmatter, per spec).
-fn ensure_bundle_indexes(wiki_root: &Path) -> WikiResult<()> {
-    let Ok(workspaces) = std::fs::read_dir(wiki_root) else {
+fn ensure_bundle_indexes(git: &crate::git::GitAdapter) -> WikiResult<()> {
+    let Ok(workspaces) = std::fs::read_dir(git.root()) else {
         return Ok(());
     };
     for ws in workspaces.flatten() {
@@ -341,13 +359,14 @@ fn ensure_bundle_indexes(wiki_root: &Path) -> WikiResult<()> {
             let body =
                 format!("# Bundle index\n\nConcept files live in these directories:\n\n{listing}");
             let content = format!("---\nokf_version: \"0.2\"\n---\n\n{body}");
-            std::fs::write(&index, content)?;
+            git.write_atomic(&index, content.as_bytes())?;
         }
     }
     Ok(())
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use ai_memory_core::{PagePath, Tier};
     use ai_memory_store::Store;
@@ -542,6 +561,35 @@ mod tests {
         assert!(crate::backup::BackupReceipt::load(tmp.path()).is_none());
     }
 
+    /// The file pass leaves the body untouched, and a UTF-8 BOM is not part
+    /// of the body: it means "this file is UTF-8" only at offset zero. A
+    /// hand-edited page a Windows editor saved with one and no frontmatter
+    /// used to come back through `parse` with the mark still on the front of
+    /// the body, so this pass wrote it out AFTER the frontmatter fence, where
+    /// it is a stray zero-width no-break space ahead of the H1.
+    #[test]
+    fn conforming_a_bom_prefixed_page_does_not_move_the_mark_into_the_body() {
+        let tmp = TempDir::new().unwrap();
+        let rel = Path::new("w/p/notes/hand-written.md");
+        let abs = tmp.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "\u{FEFF}# Hand written\n\nBody.\n").unwrap();
+
+        let git = crate::git::GitAdapter::open_or_init(tmp.path()).unwrap();
+        conform_file(&git, rel, &std::collections::HashMap::new()).unwrap();
+
+        let conformed = std::fs::read_to_string(&abs).unwrap();
+        assert!(
+            !conformed.contains('\u{FEFF}'),
+            "the mark survived the file pass: {conformed:?}"
+        );
+        assert!(
+            conformed.ends_with("---\n# Hand written\n\nBody.\n"),
+            "the body must reach disk exactly as it was authored: {conformed:?}"
+        );
+        assert_eq!(parse(&conformed).unwrap().frontmatter["type"], "Note");
+    }
+
     // ---- #633: the safety archive must be taken BEFORE the DB migration ----
 
     /// The core assertion for #633: the pre-open snapshot captures the DB as it
@@ -702,6 +750,150 @@ mod tests {
         assert!(
             !ai_memory_core::okf::is_conformant(&fm),
             "files were touched despite the failed backup"
+        );
+    }
+
+    // ---- #669: a raw event ledger must never look like a pending 1.x file ----
+
+    /// A fully OKF-conformant wiki plus a frontmatter-less monthly ledger
+    /// must not be treated as a 1.x store: the ledger is excluded from
+    /// `nonconformant_files` by content (#660's own check), so `serve`
+    /// never re-archives the whole data dir just because a ledger exists.
+    #[tokio::test]
+    async fn a_conformant_store_with_a_ledger_skips_the_backup() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/setup.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "setup"}),
+            body: "how it was set up".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::write(
+            proj_dir.join("log-2026-09.md"),
+            "## [2026-09-01T00:00:00Z] session started\n",
+        )
+        .unwrap();
+
+        let wiki_root = tmp.path().join("wiki");
+        let pending = nonconformant_files(&wiki_root).unwrap();
+        assert!(
+            pending.is_empty(),
+            "the ledger must not be listed as nonconformant: {pending:?}"
+        );
+
+        let dest = TempDir::new().unwrap();
+        let receipt = snapshot_before_db_migration(tmp.path(), Some(dest.path())).unwrap();
+        assert!(
+            receipt.is_none(),
+            "a conformant store plus a ledger must not trigger a backup"
+        );
+        assert_eq!(
+            std::fs::read_dir(dest.path()).unwrap().count(),
+            0,
+            "the ledger caused a full data-dir archive"
+        );
+    }
+
+    /// Control: an ordinary page still missing its `type` frontmatter must
+    /// still be flagged, so the ledger exclusion is not swallowing real 1.x
+    /// pages.
+    #[tokio::test]
+    async fn a_page_missing_type_frontmatter_is_still_flagged_alongside_a_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("notes.md"),
+            "# Notes\n\nno frontmatter at all\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj_dir.join("log-2026-09.md"),
+            "## [2026-09-01T00:00:00Z] session started\n",
+        )
+        .unwrap();
+
+        let wiki_root = tmp.path().join("wiki");
+        let pending = nonconformant_files(&wiki_root).unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "notes.md")),
+            "a real pre-OKF page must still be flagged: {pending:?}"
+        );
+        assert!(
+            pending
+                .iter()
+                .all(|p| p.file_name().is_none_or(|n| n != "log-2026-09.md")),
+            "the ledger must not be flagged even alongside a real pre-OKF page: {pending:?}"
+        );
+    }
+
+    /// Content-gating, not filename-only: a page that merely happens to be
+    /// named like a ledger but whose body is prose must still migrate.
+    #[tokio::test]
+    async fn a_prose_page_named_like_a_ledger_is_still_flagged() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("log-2026-09.md"),
+            "# September retro\n\nJust an ordinary page someone named this way.\n",
+        )
+        .unwrap();
+
+        let wiki_root = tmp.path().join("wiki");
+        let pending = nonconformant_files(&wiki_root).unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "log-2026-09.md")),
+            "a prose page named like a ledger must still migrate: {pending:?}"
         );
     }
 }

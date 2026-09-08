@@ -523,7 +523,7 @@ where
         payload = serde_json::to_string(&json)?;
     }
     let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
-    let inspection_cwd = policy_cwd.as_deref().map(canonical_capture_cwd);
+    let inspection_cwd = policy_cwd.as_deref().map(lexical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
     let tool_event = is_tool_event(&args.event);
     let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
@@ -844,12 +844,28 @@ fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option
     }
 }
 
-fn canonical_capture_cwd(cwd: &str) -> String {
-    Path::new(cwd)
-        .canonicalize()
-        .ok()
-        .and_then(|path| path.into_os_string().into_string().ok())
-        .unwrap_or_else(|| cwd.to_owned())
+/// Normalize the raw hook `cwd` into the base `policy.inspect` joins a tool
+/// event's relative candidate path onto — lexically, via
+/// `marker::absolute_normalized`, NOT `fs::canonicalize` (#671).
+///
+/// `capture_policy(policy_cwd)` resolves `[capture] ignore_paths` against a
+/// marker directory that is itself lexically normalized (never symlink- or
+/// verbatim-prefix-resolved). Canonicalizing only this side used to resolve
+/// a symlinked cwd to its real target while the marker directory stayed at
+/// the symlinked path, so a relative candidate (joined onto the
+/// canonicalized cwd) and the marker's `ignore_paths` directory_base ended
+/// up in two different path namespaces and never matched
+/// (`capture_drop_handles_symlinked_cwd` regressed this way). Normalizing
+/// both sides with the same lexical function — instead of resolving either
+/// against the filesystem — keeps them in one namespace on every platform,
+/// including for a candidate file that doesn't exist on disk (canonicalize
+/// would `Err` on that and silently fall back to the raw, un-normalized
+/// cwd).
+fn lexical_capture_cwd(cwd: &str) -> String {
+    crate::marker::absolute_normalized(Path::new(cwd))
+        .into_os_string()
+        .into_string()
+        .unwrap_or_else(|_| cwd.to_owned())
 }
 
 /// File under the data dir holding the per-install capture mode (#446).

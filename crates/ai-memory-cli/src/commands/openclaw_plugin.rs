@@ -215,15 +215,21 @@ pub(crate) fn manifest_json() -> String {
 /// default when no marker pins a `project_strategy` (#128); a marker's own
 /// `project` / `project_strategy` still win (§3.3). Mirrors the opencode/omp
 /// `ts_apply_marker_params` in `install_hooks.rs`.
+///
+/// Scope/settings resolution walks past a capture-only marker to the nearest
+/// ancestor marker that declares a setting (#668) via `findSettingsMarker`
+/// (`TS_FIND_SETTINGS_MARKER`, shared with `ts_apply_marker_params` so both
+/// copies stay equivalent).
 fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
     let toml_flag = super::install_hooks::TS_TOML_FLAG;
+    let find_settings_marker = super::install_hooks::TS_FIND_SETTINGS_MARKER;
     let Some(default) = default_strategy else {
         return format!(
-            "{toml_flag}\n{}",
+            "{toml_flag}\n{find_settings_marker}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   if (!cwd) return;
   url.searchParams.set("cwd", cwd);
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (!marker) return;
   try {
     const body = readFileSync(marker, "utf8");
@@ -266,7 +272,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   let defaultGlobal: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
-  const marker = findMarker(cwd);
+  const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
       const body = readFileSync(marker, "utf8");
@@ -301,7 +307,7 @@ fn apply_marker_params_ts(default_strategy: Option<&str>) -> String {
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{toml_flag}\n{find_settings_marker}\n{body}",
         ts_string_literal(default)
     )
 }
@@ -636,6 +642,16 @@ mod tests {
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
+        // #668: same settings-walk as the shared ts_apply_marker_params
+        // (install_hooks.rs) — the two applyMarkerParams copies stay
+        // equivalent, so a nested capture-only marker does not shadow an
+        // outer marker's scope here either.
+        assert!(plugin.contains("function findSettingsMarker"));
+        assert!(plugin.contains("function declaresSettings"));
+        assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
+        assert!(
+            plugin.contains("if (declaresSettings(readFileSync(marker, \"utf8\"))) return marker;")
+        );
         assert!(plugin.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(
             plugin.contains("import { basename, dirname, join, resolve, sep } from \"node:path\";")
@@ -685,6 +701,10 @@ mod tests {
         assert!(
             plugin.contains("if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;"),
             "must apply the default when a marker pins no strategy: {plugin}"
+        );
+        assert!(
+            plugin.contains("const marker = findSettingsMarker(cwd);"),
+            "the default-strategy variant must also walk past a capture-only marker (#668): {plugin}"
         );
     }
 

@@ -43,6 +43,10 @@ pub struct ConsolidatedPage {
 /// object the wiki write boundary already parses, so nothing downstream
 /// changes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+// Keep implementation history out of the model's input budget.
+#[schemars(
+    description = "Typed edges to existing wiki pages. Declare only relations supported by the session's evidence; empty arrays are the normal case."
+)]
 pub struct Relations {
     /// Wiki paths this page describes a cause of.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -165,6 +169,7 @@ pub struct ConsolidatedPageUpdate {
     /// `{ "type": "string" }` with no constraint, and both Kimi
     /// and qwen3 routinely emitted `tier: 2` (integer) instead of
     /// the documented string values.
+    #[schemars(description = "Tier classification: working, episodic, semantic, or procedural.")]
     pub tier: Tier,
     /// Semantic classification. Defaults to `fact` if the LLM
     /// doesn't supply one — existing consolidations without this
@@ -182,6 +187,9 @@ pub struct ConsolidatedPageUpdate {
     /// this field verbatim. Omit it rather than guessing. Defaults to absent
     /// so existing structured outputs still deserialise.
     #[serde(default)]
+    #[schemars(
+        description = "One plain sentence describing the page. No heading, bullet, list item, or repeated title. Omit rather than guess."
+    )]
     pub summary: Option<String>,
     /// Optional tags surfaced into frontmatter.
     #[serde(default)]
@@ -199,6 +207,10 @@ pub struct ConsolidatedPageUpdate {
     /// to empty so older structured outputs still deserialise.
     #[serde(default)]
     pub entities: Vec<String>,
+    /// Typed edges to existing pages, using the same closed vocabulary as
+    /// single-page consolidation. Older outputs may omit the field.
+    #[serde(default)]
+    pub relations: Relations,
 }
 
 /// Batch produced by [`ConsolidatorMulti`].

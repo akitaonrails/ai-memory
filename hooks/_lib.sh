@@ -70,6 +70,71 @@ ai_memory_parse_toml_flag() {
         "$file" | head -n 1 | sed 's/[[:space:]]*$//'
 }
 
+# Whether "$1" (a marker file) declares anything beyond a `[capture]`
+# section: any root-level scope key (workspace/project/project_strategy), or
+# any of the other settings ai_memory_marker_qs / ai_memory_briefing_qs
+# forward (drop_subagent_captures, default_global, [briefing] keys). Mirrors
+# `declares_more_than_capture` in marker.rs. A marker with any of these is a
+# resolution boundary; only a marker whose only content is `[capture]` (e.g.
+# ignore_paths) is scope/settings-transparent (#668).
+ai_memory_marker_declares_settings() {
+    file="$1"
+    [ -f "$file" ] || return 1
+    for key in workspace project project_strategy drop_subagent_captures; do
+        [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
+    done
+    for key in default_global inject_on_session_start max_chars; do
+        [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
+    done
+    return 1
+}
+
+# Like ai_memory_find_marker, but skips a marker that declares nothing beyond
+# `[capture]` (see ai_memory_marker_declares_settings) and continues the walk
+# to the next ancestor. Resolves workspace/project/project_strategy and the
+# other root-level settings ai_memory_marker_qs / ai_memory_briefing_qs
+# forward, so a nested capture-only marker no longer resets them to their
+# fallback (#668). [capture]/ignore_paths itself keeps using
+# ai_memory_find_marker (the nearest marker, unchanged). Boundary logic is
+# duplicated rather than shared with ai_memory_find_marker on purpose: this
+# file is sourced by every supported agent's hook scripts, so the existing,
+# well-exercised walk stays untouched.
+ai_memory_find_settings_marker() {
+    dir="$1"
+    [ -z "$dir" ] && return 0
+    boundary=""
+    if [ -n "${HOME:-}" ]; then
+        case "$dir" in
+            "$HOME"|"$HOME"/*) boundary="$HOME" ;;
+            *)
+                probe="$dir"
+                while [ -n "$probe" ] && [ "$probe" != "/" ]; do
+                    if [ -e "$probe/.git" ]; then
+                        boundary="$probe"
+                        break
+                    fi
+                    parent=$(dirname "$probe")
+                    [ "$parent" = "$probe" ] && break
+                    probe="$parent"
+                done
+                [ -n "$boundary" ] || boundary="$dir"
+                ;;
+        esac
+    fi
+    while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+        if [ -f "$dir/.ai-memory.toml" ] && ai_memory_marker_declares_settings "$dir/.ai-memory.toml"; then
+            printf '%s\n' "$dir/.ai-memory.toml"
+            return 0
+        fi
+        if [ -n "$boundary" ] && [ "$dir" = "$boundary" ]; then
+            return 0
+        fi
+        parent=$(dirname "$dir")
+        [ "$parent" = "$dir" ] && return 0
+        dir="$parent"
+    done
+}
+
 # Extract the first cwd-like path from a JSON payload on stdin or in $1.
 # Returns the value or nothing. This is intentionally a tiny shell fallback,
 # not a JSON parser; taking the first match preserves the top-level cwd when
@@ -235,7 +300,10 @@ ai_memory_marker_qs() {
     # deliberate marker rescope from a host-derived repo-root name. Only the
     # latter may yield to session-sticky attribution (#394).
     ps=""
-    marker=$(ai_memory_find_marker "$cwd")
+    # The nearest marker that declares more than `[capture]` (#668): a nested
+    # capture-only marker (e.g. one that only sets ignore_paths) must not
+    # shadow an outer marker's workspace/project/etc.
+    marker=$(ai_memory_find_settings_marker "$cwd")
     if [ -n "$marker" ]; then
         ws=$(ai_memory_parse_toml_key "$marker" workspace)
         pr=$(ai_memory_parse_toml_key "$marker" project)
@@ -285,7 +353,9 @@ ai_memory_marker_qs() {
 ai_memory_briefing_qs() {
     cwd="$1"
     [ -z "$cwd" ] && return 0
-    marker=$(ai_memory_find_marker "$cwd")
+    # Settings walk (#668): a nested capture-only marker must not shadow an
+    # outer marker's [briefing] opt-in.
+    marker=$(ai_memory_find_settings_marker "$cwd")
     [ -n "$marker" ] || return 0
     qs=""
     briefing=$(ai_memory_parse_toml_flag "$marker" inject_on_session_start)

@@ -28,7 +28,10 @@ managed `ai-memory run` launches add the portable visible-event ledger. Do not
 manually write routine notes. Only write durable memory when the user explicitly asks
 to remember or annotate something permanently. For an explicitly time-bounded note,
 set `expires_at`; expired pages are hidden from normal reads and deleted by the next
-forget sweep, and a TTL outranks `pinned`.
+forget sweep, and a TTL outranks `pinned`. ai-memory is the cross-harness memory of
+record for this project: if the harness you run in has its own local memory feature,
+do not keep durable project facts there in parallel — a harness-local store is
+invisible to every other agent and fragments continuity, so capture them here instead.
 
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker

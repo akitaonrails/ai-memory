@@ -1,0 +1,14 @@
+# A write into the wiki tree must report its path (GitAdapter::mark_written)
+# or the next auto-commit does not stage it. Write through the adapter's
+# methods; a site that reports another way carries an `allow` with the reason.
+disallowed-methods = [
+    { path = "std::fs::write", reason = "report the write: GitAdapter::write_atomic" },
+    { path = "std::fs::rename", reason = "report the move: GitAdapter::rename" },
+    { path = "std::fs::remove_file", reason = "report the removal: GitAdapter::remove_file" },
+    { path = "std::fs::remove_dir_all", reason = "report the removal: GitAdapter::remove_dir_all" },
+    { path = "std::fs::copy", reason = "report the write: GitAdapter::write_atomic" },
+    { path = "ai_memory_wiki::atomic::write_atomic", reason = "report the write: GitAdapter::write_atomic" },
+    { path = "ai_memory_wiki::atomic::persist_with_retry", reason = "report the write: GitAdapter::persist" },
+    { path = "tempfile::NamedTempFile::persist", reason = "report the write: GitAdapter::persist" },
+    { path = "tempfile::NamedTempFile::persist_noclobber", reason = "report the write: GitAdapter::persist" },
+]

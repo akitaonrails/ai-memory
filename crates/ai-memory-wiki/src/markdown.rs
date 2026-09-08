@@ -28,6 +28,12 @@ pub struct Markdown {
 /// Recognises only the canonical `---\n<yaml>\n---\n` block at the very
 /// start of the document. Anything else is treated as body.
 ///
+/// A leading UTF-8 BOM is dropped either way. It only means "this file is
+/// UTF-8" while it sits at offset zero; carried into `body` it is a
+/// zero-width no-break space in front of the first line, which hides an H1
+/// from [`derive_title`] and rides into the body a later re-emit writes
+/// back after the frontmatter fence.
+///
 /// # Errors
 /// Returns [`WikiError::Yaml`] if the frontmatter block exists but does
 /// not parse as YAML.
@@ -47,7 +53,7 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
     }
     Ok(Markdown {
         frontmatter: serde_json::Value::Null,
-        body: input.to_string(),
+        body: trimmed.to_string(),
     })
 }
 
@@ -549,6 +555,26 @@ mod tests {
         let md = parse(src).unwrap();
         assert_eq!(md.frontmatter["title"], "Hello");
         assert_eq!(md.body, "Body\n");
+    }
+
+    /// A page a Windows editor saved with a UTF-8 BOM and no frontmatter:
+    /// the mark belongs to the file, not to the first line. Left in `body`
+    /// it sits in front of the `#`, so the H1 stops being a heading and the
+    /// page is indexed under its filename instead of its title.
+    #[test]
+    fn parses_bom_prefixed_body_without_frontmatter() {
+        let src = "\u{FEFF}# Hand written\n\nBody.\n";
+        let md = parse(src).unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, "# Hand written\n\nBody.\n");
+        assert_eq!(
+            derive_title(
+                &md.frontmatter,
+                &md.body,
+                &PagePath::new("notes/hand-written.md").unwrap(),
+            ),
+            "Hand written"
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@
 //! where home is small), and a receipt is recorded at
 //! `<data_dir>/pre-migration-backup.json` so the wiki homepage can show
 //! where it is until the user deletes it.
+// Backups are written outside the wiki tree and are not part of its history.
+#![allow(clippy::disallowed_methods)]
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
