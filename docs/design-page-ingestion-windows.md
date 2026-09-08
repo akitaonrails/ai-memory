@@ -74,15 +74,15 @@ A version's window closes at exactly one of:
    `is_latest` flip (mirrors the link-window close in `upsert_page_in_tx`).
 2. **Retire without successor** — decay tombstone, purge-regenerate,
    graveyard merge (the V58 class). `valid_to` = the retirement instant
-   (`updated_at` at retire time, as V58 did for links), closed in the same
+   (recorded explicitly on both grains), closed in the same
    transaction as the retire. New retire paths must close both grains;
    V58's audit is the checklist.
 3. **Open** — `valid_to IS NULL` while the version is the latest live one.
 
 Deletion stays deletion: purged pages cascade away and the timeline does
 not survive a purge, exactly as `docs/temporal.md` already states for
-links. Expiry/TTL is orthogonal: an expired page is hidden from both the
-default path and `as_of` (same `not_expired` predicate, evaluated at T).
+links. Expiry/TTL is orthogonal: the FTS leg applies `not_expired` at T;
+the entity leg preserves its existing ignore-expiry behavior.
 
 ## 4. Materialized columns vs. a view/join
 
@@ -131,7 +131,9 @@ renamed surface, no changed defaults) — but additive is not free:
 - **Refinery migration**, one step: add the nullable columns, backfill
   (`valid_from = created_at`; `valid_to` from the superseding version's
   `created_at` via `pages.supersedes`, `NULL` for latest;
-  successor-less retired rows closed at their `updated_at` per V58),
+  successor-less retired rows closed at the decay marker, else the
+  earliest existing entity-link close, else `updated_at` as an
+  approximation when no retirement timestamp survived),
   create the `(valid_from, valid_to)` index. Idempotent re-run migrates
   zero rows.
 - **Backup gate.** The migration refuses to run without a verified
@@ -140,9 +142,10 @@ renamed surface, no changed defaults) — but additive is not free:
   when the archive cannot be written or verified). This is the step the
   issue understates, stated here so the implementation PR is sized
   honestly.
-- **Rollback.** Nullable columns are ignored by older binaries, so a
-  downgrade reads the migrated store; deletion of the columns is never
-  required. Forward re-runs are no-ops.
+- **Rollback.** Restore the verified pre-migration snapshot from #633
+  before starting the older binary. Refinery rejects newer applied
+  schema versions; an older binary cannot read the migrated store.
+  Forward re-runs are no-ops.
 
 ## 6. `as_of` gains version-filtered FTS: the explicit reversal
 
@@ -157,9 +160,12 @@ silent scope slip:
 
 - The original objection is about mixing **present-tense relevance** with
   **past validity**. Constraining the FTS corpus to versions whose
-  ingestion window contains T makes *both* signals past-tense: relevance
-  *at T* over knowledge *valid at T*. That is "what would search have
-  said in July", asked honestly.
+  ingestion window contains T makes the retrieved content historical.
+  Ranking is not a historical snapshot: FTS5 BM25 still uses the current
+  index's statistics, including later versions and other projects.
+  Later writes can change ordering and the limited result set at a
+  fixed T. Phase A retrieves historical versions with current-index
+  relevance; it does not reproduce what search would have ranked then.
 - Concretely, `as_of` runs two streams at T and merges via the existing
   RRF: the unchanged entity-window lookup plus FTS over page versions
   with `valid_from <= T AND (valid_to IS NULL OR valid_to > T)` (and the

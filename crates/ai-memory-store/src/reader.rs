@@ -1854,8 +1854,9 @@ impl ReaderPool {
     }
 
     /// Authority-adjusted full-text candidates over the page versions
-    /// whose ingestion windows contain `as_of_us` (issue #656): "what
-    /// would search have said at T". Same candidate shape as
+    /// whose ingestion windows contain `as_of_us` (issue #656).
+    /// BM25 uses the current index's statistics, not a snapshot at T.
+    /// Same candidate shape as
     /// [`Self::search_page_candidates_for_project`], but the corpus is
     /// versions alive at `T` instead of latest versions. TTL expiry is
     /// evaluated at `T`: a page already expired then was already hidden
@@ -1953,7 +1954,7 @@ impl ReaderPool {
     /// unchanged, plus version-filtered FTS over the page ingestion
     /// windows alive at `as_of_us`, fused with the same RRF (k=60) the
     /// default path uses and the same bounded authority adjustment —
-    /// relevance *at T* over knowledge *valid at T*. Vector, graph, and
+    /// current-index relevance over knowledge *valid at T*. Vector, graph, and
     /// the raw-observation fallback stay out of audit mode: embeddings
     /// and links are present-tense artifacts with no version scope, and
     /// audit reads must not perturb access stats (no bump, no rerank).

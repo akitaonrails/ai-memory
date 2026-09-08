@@ -51,7 +51,12 @@ a superseded version.
 | column | meaning |
 |---|---|
 | `valid_from` | the version's own `created_at` |
-| `valid_to` | `created_at` of the superseding version; the retirement instant for successor-less retirements (decay tombstones, graveyard merges, move-regenerate rows — `COALESCE(superseded_at, updated_at)`, the V58 rule); `NULL` while the version is latest |
+| `valid_to` | `created_at` of the superseding version; the retirement instant for successor-less retirements; `NULL` while the version is latest |
+
+For existing successor-less retirements, V62 uses the decay marker first,
+then the earliest recorded entity-link close, then `updated_at` as an
+approximation when no retirement timestamp survived. Reorg and
+move-regenerate historically recorded the close only in entity links.
 
 The end is named `valid_to`, not `superseded_at`, because
 `pages.superseded_at` already exists with a different meaning: the V03
@@ -96,7 +101,7 @@ outage?"), still resolves through the text that was live at T.
 ## Query
 
 `memory_query` accepts `as_of` (ISO-8601). When present the query is
-a **time-travel lookup over two streams, both past-tense at T**:
+a **lookup over historical versions using two streams**:
 
 - the **entity timeline**: links whose window contains the instant
   (`valid_from <= T AND (superseded_at IS NULL OR superseded_at > T)`),
@@ -104,16 +109,16 @@ a **time-travel lookup over two streams, both past-tense at T**:
 - **version-filtered FTS**: page versions whose page-grain window
   contains the instant
   (`valid_from <= T AND (valid_to IS NULL OR valid_to > T)`),
-  answering entity-less pages and paraphrased questions — "what would
-  search have said in July".
+  answering questions through lexical matches even without entity metadata.
 
 The two streams merge with the default path's RRF (k=60) plus the same
 bounded authority adjustment, and `explain=true` reports both in
 `streams_active` (`["entity", "fts"]`) with per-stream ranks and RRF
-contributions. Constraining the FTS corpus to versions alive at T is
-what answers the original objection to FTS in `as_of` (that mixing
-present-tense relevance with past validity answers neither honestly):
-both signals are past-tense here.
+contributions. The time filter selects historical versions, but FTS5
+BM25 uses statistics from the current index, including later versions
+and other projects. Later writes can therefore change ordering and the
+limited result set for the same T. This retrieves historical content;
+it does not reproduce the ranking a search would have returned at T.
 
 Still out of `as_of`: vector (embeddings are present-tense artifacts
 of the current text; version-scoped vectors are a separate project),

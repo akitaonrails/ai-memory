@@ -6486,8 +6486,7 @@ mod tests {
     /// path produces: `valid_from` from each version's `created_at`,
     /// `valid_to` from the earliest superseding version, NULL for
     /// latest; successor-less retirements close at
-    /// `COALESCE(superseded_at, updated_at)` (the V58 rule at page
-    /// grain). Mirrors `v56_backfill_reconstructs_the_windows`.
+    /// the decay marker, existing link close, or updated_at fallback.
     #[tokio::test]
     async fn v62_backfill_reconstructs_page_windows() {
         let tmp = TempDir::new().unwrap();
@@ -6543,19 +6542,16 @@ mod tests {
         assert!(live[2].2.is_none(), "latest stays open");
         assert!(live[3].2.is_some(), "tombstone is closed");
 
-        // Fabricate the pre-V62 state, then replay the migration's
-        // backfill statements verbatim.
-        db.execute("UPDATE pages SET valid_from = NULL, valid_to = NULL", [])
-            .unwrap();
+        // Replay the actual migration against the pre-V62 schema.
         db.execute_batch(
-            "UPDATE pages SET valid_from = created_at; \
-             UPDATE pages SET valid_to = ( \
-                 SELECT MIN(s.created_at) FROM pages s WHERE s.supersedes = pages.id \
-             ) WHERE EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id); \
-             UPDATE pages SET valid_to = COALESCE(superseded_at, updated_at) \
-             WHERE is_latest = 0 AND valid_to IS NULL \
-               AND NOT EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id);",
+            "DROP INDEX idx_pages_validity; \
+             ALTER TABLE pages DROP COLUMN valid_from; \
+             ALTER TABLE pages DROP COLUMN valid_to;",
         )
+        .unwrap();
+        db.execute_batch(include_str!(
+            "../migrations/V62__page_ingestion_windows.sql"
+        ))
         .unwrap();
         let backfilled: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
             .prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY created_at")
@@ -6569,6 +6565,61 @@ mod tests {
             assert_eq!(live_row.0, back_row.0, "row {i} page id");
             assert_eq!(live_row.1, back_row.1, "row {i} valid_from");
             assert_eq!(live_row.2, back_row.2, "row {i} valid_to");
+        }
+    }
+
+    /// Pre-V62 reorg/move retirements kept their instant only at link grain.
+    #[test]
+    fn v62_backfill_preserves_retired_link_windows() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE pages (
+                id INTEGER PRIMARY KEY, workspace_id INTEGER, project_id INTEGER,
+                created_at INTEGER, updated_at INTEGER, superseded_at INTEGER,
+                supersedes INTEGER, is_latest INTEGER);
+             CREATE TABLE entity_page_links (page_id INTEGER, superseded_at INTEGER);
+             INSERT INTO pages VALUES
+                (1,1,1,100,100,NULL,NULL,0),
+                (2,1,1,100,100,NULL,NULL,0),
+                (3,1,1,100,150,NULL,NULL,0),
+                (4,2,2,100,100,NULL,NULL,1),
+                (5,1,1,100,100,350,NULL,0);
+             INSERT INTO entity_page_links VALUES
+                (1,300),(1,300),(2,300),(4,300),(5,100);",
+        )
+        .unwrap();
+        db.execute_batch(include_str!(
+            "../migrations/V62__page_ingestion_windows.sql"
+        ))
+        .unwrap();
+        // Reorg and move keep [100,300); missing evidence falls back;
+        // a sibling scope's live page stays open; the decay marker wins.
+        for (id, expected) in [
+            (1, Some(300)),
+            (2, Some(300)),
+            (3, Some(150)),
+            (4, None),
+            (5, Some(350)),
+        ] {
+            let window: (i64, Option<i64>) = db
+                .query_row(
+                    "SELECT valid_from, valid_to FROM pages WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(window, (100, expected), "page {id}");
+        }
+        for (instant, expected) in [(99, 0), (100, 2), (200, 2), (299, 2), (300, 0)] {
+            let count: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM pages WHERE id IN (1,2)
+                 AND valid_from <= ?1 AND (valid_to IS NULL OR valid_to > ?1)",
+                    [instant],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "instant {instant}");
         }
     }
 

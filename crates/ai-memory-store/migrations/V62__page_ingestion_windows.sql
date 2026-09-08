@@ -30,10 +30,15 @@ UPDATE pages SET valid_to = (
 
 -- Successor-less retirements (decay tombstones, graveyard merges,
 -- move-regenerate rows — the V58 class): close at the decay eviction
--- marker when present, else the row's own updated_at — the best
--- available retirement instant, the same rule V58 used for the link
--- grain. Latest versions keep valid_to NULL (still current).
-UPDATE pages SET valid_to = COALESCE(superseded_at, updated_at)
+-- marker when present, else the existing link-window close. Reorg and
+-- move-regenerate recorded their retirement there without updating the
+-- page's updated_at. Only fall back to updated_at when neither grain
+-- retained the retirement instant. Latest versions stay open.
+UPDATE pages SET valid_to = COALESCE(
+    superseded_at,
+    (SELECT MIN(l.superseded_at) FROM entity_page_links l WHERE l.page_id = pages.id),
+    updated_at
+)
 WHERE is_latest = 0 AND valid_to IS NULL
   AND NOT EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id);
 
