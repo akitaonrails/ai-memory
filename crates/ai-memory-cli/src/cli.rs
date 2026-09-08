@@ -1016,6 +1016,10 @@ pub struct InstallInstructionsArgs {
     /// Skip installing/updating the managed ai-memory Agent Skills.
     #[arg(long)]
     pub no_skills: bool,
+    /// Write a compact routing snippet that delegates to installed Agent Skills
+    /// instead of inlining full operational guidance.
+    #[arg(long)]
+    pub compact: bool,
     /// Scope for managed ai-memory skill installation.
     #[arg(long = "skills-scope", value_enum)]
     pub skills_scope: Option<InstallSkillsScope>,

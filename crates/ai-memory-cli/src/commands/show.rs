@@ -605,6 +605,7 @@ fn install_context_files(harness: RunHarnessChoice, path: &Path) -> Result<()> {
         target: Some(path.join(instruction)),
         print: false,
         no_skills: false,
+        compact: false,
         skills_scope: None,
         skills_agent: Some(agent),
         skills_target_dir: Some(skill_root),

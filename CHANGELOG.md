@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owner-filtered like accept (own plus shared; root-only `any_owner`);
   it is not a second claim path, and Grok SessionStart still does not
   fetch `/handoff`. (#664)
+- `install-instructions --compact` writes a slimmer managed routing block for
+  projects that already have the detailed ai-memory Agent Skills installed. The
+  compact block keeps the same start/end markers (so refresh/uninstall still
+  find it), the untrusted-history security scaffold, and the cross-harness
+  memory-of-record guidance; `full_block` and the default remain unchanged.
+  (#675)
 
 ### Fixed
 - Wiki auto-commits stage what the wiki wrote instead of walking the

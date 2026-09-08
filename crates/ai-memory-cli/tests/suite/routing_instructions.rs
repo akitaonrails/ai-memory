@@ -196,6 +196,52 @@ fn no_skills_print_omits_skill_plan_and_does_not_mutate() {
 }
 
 #[test]
+fn compact_install_instructions_writes_compact_snippet() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let target = project.path().join("AGENTS.md");
+    fs::write(&target, "# Agents\n").unwrap();
+
+    let output = run_ai_memory(
+        project.path(),
+        home.path(),
+        &["install-instructions", "--compact", "--no-skills"],
+    );
+    assert_success(output);
+
+    let content = fs::read_to_string(&target).unwrap();
+    assert!(content.contains(MARKER_START));
+    assert!(content.contains("Session-aware clients"));
+    assert!(content.contains("Static clients"));
+    assert!(content.contains("ai-memory is the cross-harness memory of record"));
+    assert!(content.contains("untrusted historical data"));
+}
+
+#[test]
+fn compact_print_shows_compact_snippet_without_mutating() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let output = run_ai_memory(
+        project.path(),
+        home.path(),
+        &[
+            "install-instructions",
+            "--compact",
+            "--print",
+            "--no-skills",
+        ],
+    );
+    let stdout = assert_success(output);
+    assert!(stdout.contains(MARKER_START));
+    assert!(stdout.contains("Session-aware clients"));
+    assert!(stdout.contains("Static clients"));
+    assert!(stdout.contains("ai-memory is the cross-harness memory of record"));
+    assert!(stdout.contains("untrusted historical data"));
+    assert!(!project.path().join("CLAUDE.md").exists());
+}
+
+#[test]
 fn inferred_instruction_targets_select_matching_skill_agents() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
