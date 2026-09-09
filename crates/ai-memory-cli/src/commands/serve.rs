@@ -909,6 +909,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             service.waiting().await?;
         }
         TransportKind::Http => {
+            seed_active_project_fallback(&store.reader, &active_project).await;
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());
             let cancel = CancellationToken::new();
             let (session_consolidation_notify, session_consolidation_task) =
@@ -2138,6 +2139,58 @@ fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     })
 }
 
+/// Seed the single-slot active-project fallback from the most recently active
+/// project already on disk.
+///
+/// The pointer lives only in process memory, so restarting the daemon
+/// mid-session drops it. An unscoped read then resolves through the baked
+/// default scope and answers zero counts for a project holding thousands of
+/// observations — through the SUCCESS path, with nothing in the log, so
+/// neither the agent nor the operator can tell it apart from a genuinely
+/// empty project (#678). Failing such a read closed is not the fix: a keyed
+/// miss is also the normal shape of the pre-publish window (hooks are
+/// fire-and-forget) and of TTL/cap eviction, both of which must keep
+/// degrading gracefully.
+///
+/// So make the degraded answer a real one. Only the shared slot is seeded, so
+/// a keyed hit still wins and the first hook event publishes straight over it.
+/// The recency bound is the pointer's own per-key TTL: activity older than
+/// that would have aged out of a live pointer anyway. Non-fatal — a server
+/// that cannot read this starts exactly as it does today.
+async fn seed_active_project_fallback(reader: &ReaderPool, active_project: &ActiveProject) {
+    if active_project.get().is_some() {
+        return;
+    }
+    let ttl_us = i64::try_from(active_project.per_key_ttl().as_micros()).unwrap_or(i64::MAX);
+    let since = jiff::Timestamp::now()
+        .as_microsecond()
+        .saturating_sub(ttl_us);
+    match reader.most_recently_active_scope(since).await {
+        Ok(Some((workspace_id, project_id))) => {
+            active_project.set(workspace_id, project_id);
+            let workspace = reader
+                .workspace_name_by_id(workspace_id)
+                .await
+                .ok()
+                .flatten();
+            let project = reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .ok()
+                .flatten();
+            info!(
+                workspace = workspace.as_deref().unwrap_or("<unknown>"),
+                project = project.as_deref().unwrap_or("<unknown>"),
+                "seeded active-project fallback from the last recorded activity"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "active-project fallback seed skipped (non-fatal)");
+        }
+    }
+}
+
 fn host_without_port(host: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[')
         && let Some((inside, _)) = rest.split_once(']')
@@ -2931,6 +2984,116 @@ mod tests {
                 }))
             })
         }
+    }
+
+    /// #678: the pointer is process memory, so `systemctl restart` mid-session
+    /// drops it. An unscoped read then resolved through the baked default scope
+    /// and reported zero counts for a project holding thousands of observations,
+    /// through the success path. Seeding the shared slot from the last recorded
+    /// activity makes that degraded answer a real one.
+    #[tokio::test]
+    async fn a_restart_seeds_the_active_project_fallback_from_the_last_activity() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        // The baked default scope: empty, and where the bug parked every read.
+        let scratch = store
+            .writer
+            .get_or_create_project(workspace_id, "scratch", None)
+            .await
+            .unwrap();
+        let worked_in = store
+            .writer
+            .get_or_create_project(workspace_id, "real-project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id: worked_in,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id: worked_in,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "work".into(),
+                    body: "the session that outlived the daemon".into(),
+                    importance: 5,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+
+        // A pointer as empty as it is one instruction after a restart.
+        let active_project = ActiveProject::new();
+        seed_active_project_fallback(&store.reader, &active_project).await;
+        assert_eq!(
+            active_project.get(),
+            Some((workspace_id, worked_in)),
+            "the shared slot must name the project the last activity landed in"
+        );
+
+        // The live session's keyed entry died with the process, so its read
+        // misses the map — and must now degrade to real data, not to `scratch`.
+        let actor = ai_memory_core::ActorKey {
+            user: None,
+            session_id: Some(session_id.to_string()),
+        };
+        let resolved = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
+            .with_active_project(&active_project)
+            .resolve_read_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.as_tuple(),
+            (workspace_id, worked_in),
+            "an unscoped read after a restart must not silently answer for the baked default"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeding_never_overwrites_a_pointer_a_hook_already_published() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let published = store
+            .writer
+            .get_or_create_project(workspace_id, "published", None)
+            .await
+            .unwrap();
+
+        let active_project = ActiveProject::new();
+        active_project.set(workspace_id, published);
+        seed_active_project_fallback(&store.reader, &active_project).await;
+
+        assert_eq!(
+            active_project.get(),
+            Some((workspace_id, published)),
+            "a live pointer outranks anything the DB remembers"
+        );
     }
 
     #[tokio::test]

@@ -415,6 +415,18 @@ impl ActiveProject {
         self.mode
     }
 
+    /// The effective TTL of a per-key entry, after the zero-means-default
+    /// normalization the backing map applies.
+    ///
+    /// `serve` uses it as the recency bound when it seeds the single-slot
+    /// fallback from disk at startup (#678): activity older than this would
+    /// have aged out of the live pointer anyway, so it must not come back
+    /// through the restart path either.
+    #[must_use]
+    pub fn per_key_ttl(&self) -> Duration {
+        self.per_actor.read().unwrap_or_else(|e| e.into_inner()).ttl
+    }
+
     /// Publish the project the agent is currently active in. Called by the
     /// hook router after it resolves an event's `cwd` to a real project.
     ///
