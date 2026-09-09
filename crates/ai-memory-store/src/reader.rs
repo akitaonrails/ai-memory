@@ -1853,7 +1853,248 @@ impl ReaderPool {
         .await
     }
 
-    /// Run a full-text search against raw observations scoped to one project.
+    /// Authority-adjusted full-text candidates over the page versions
+    /// whose ingestion windows contain `as_of_us` (issue #656).
+    /// BM25 uses the current index's statistics, not a snapshot at T.
+    /// Same candidate shape as
+    /// [`Self::search_page_candidates_for_project`], but the corpus is
+    /// versions alive at `T` instead of latest versions. TTL expiry is
+    /// evaluated at `T`: a page already expired then was already hidden
+    /// from search then.
+    async fn search_page_candidates_for_project_at(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        candidate_limit: usize,
+        as_of_us: i64,
+    ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
+        let fts_query = normalize_fts_query(&query);
+        if fts_query.is_empty() || candidate_limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
+            let sql = format!(
+                "SELECT pages.id, pages.path, pages.title, \
+                        snippet(pages_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        pages_fts.rank, pages.tier, pages.pinned, \
+                        pages.frontmatter_json, {kind_expr} AS kind \
+                 FROM pages_fts \
+                 JOIN pages ON pages.rowid = pages_fts.rowid \
+                 WHERE pages_fts MATCH ?1 \
+                   AND pages.workspace_id = ?2 \
+                   AND pages.project_id = ?3 \
+                   AND pages.valid_from <= ?4 \
+                   AND (pages.valid_to IS NULL OR pages.valid_to > ?5){not_expired} \
+                 ORDER BY pages_fts.rank \
+                 LIMIT ?7",
+                not_expired = not_expired("pages", "?6"),
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            #[allow(clippy::cast_possible_wrap)]
+            let rows = stmt.query_map(
+                params![
+                    fts_query,
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    as_of_us,
+                    as_of_us,
+                    as_of_us,
+                    candidate_limit as i64
+                ],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    let path: String = row.get(1)?;
+                    let title: String = row.get(2)?;
+                    let snippet: String = row.get(3)?;
+                    let rank: f64 = row.get(4)?;
+                    let tier: String = row.get(5)?;
+                    let pinned = row.get::<_, i64>(6)? != 0;
+                    let frontmatter_json: String = row.get(7)?;
+                    let kind: String = row.get(8)?;
+                    Ok((
+                        id_bytes,
+                        path,
+                        title,
+                        snippet,
+                        rank,
+                        tier,
+                        pinned,
+                        frontmatter_json,
+                        kind,
+                    ))
+                },
+            )?;
+
+            let mut candidates = Vec::new();
+            for row in rows {
+                let (id_bytes, path, title, snippet, rank, tier, pinned, frontmatter_json, kind) =
+                    row?;
+                let authority =
+                    PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter_json);
+                candidates.push((
+                    PageHit {
+                        id: PageId::from_slice(&id_bytes)?,
+                        path: PagePath::new(path)?,
+                        title,
+                        snippet,
+                        rank,
+                    },
+                    authority,
+                ));
+            }
+            Ok(candidates)
+        })
+        .await
+    }
+
+    /// Time-travel search backing `memory_query(as_of)`
+    /// (docs/temporal.md, issue #656): the entity-window lookup
+    /// unchanged, plus version-filtered FTS over the page ingestion
+    /// windows alive at `as_of_us`, fused with the same RRF (k=60) the
+    /// default path uses and the same bounded authority adjustment —
+    /// current-index relevance over knowledge *valid at T*. Vector, graph, and
+    /// the raw-observation fallback stay out of audit mode: embeddings
+    /// and links are present-tense artifacts with no version scope, and
+    /// audit reads must not perturb access stats (no bump, no rerank).
+    ///
+    /// `explain` mirrors [`Self::hybrid_search`]: `false` drops the
+    /// per-hit [`SearchExplain`]; `streams_active` reporting stays with
+    /// the MCP caller.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn search_pages_for_project_at(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        limit: usize,
+        as_of_us: i64,
+        explain: bool,
+    ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let candidate_limit = authority_candidate_limit(limit);
+        let entity_hits = self
+            .entity_hits_for_project_at(
+                workspace_id,
+                project_id,
+                &query,
+                candidate_limit,
+                None,
+                Some(as_of_us),
+            )
+            .await?;
+        let fts_candidates = self
+            .search_page_candidates_for_project_at(
+                workspace_id,
+                project_id,
+                query,
+                candidate_limit,
+                as_of_us,
+            )
+            .await?;
+        let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
+            .iter()
+            .map(|(hit, authority)| (hit.id, *authority))
+            .collect();
+        // Entity-only hits never passed through an FTS candidate row;
+        // read their authority off the version row itself (no latest
+        // filter — audit mode ranks superseded versions too).
+        let missing: Vec<PageId> = entity_hits
+            .iter()
+            .map(|e| e.hit.id)
+            .filter(|id| !authorities.contains_key(id))
+            .collect();
+        authorities.extend(
+            self.page_authorities_for_versions(workspace_id, project_id, missing)
+                .await?,
+        );
+
+        // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over the two streams.
+        let k = 60.0_f64;
+        struct FusedAt {
+            path: PagePath,
+            title: String,
+            snippet: String,
+            score: f64,
+            explain: Option<SearchExplain>,
+        }
+        let mut fused: std::collections::HashMap<PageId, FusedAt> =
+            std::collections::HashMap::new();
+        for (rank, h) in fts_candidates.iter().map(|(hit, _)| hit).enumerate() {
+            let contrib = 1.0 / (k + (rank + 1) as f64);
+            let entry = fused.entry(h.id).or_insert_with(|| FusedAt {
+                path: h.path.clone(),
+                title: h.title.clone(),
+                snippet: h.snippet.clone(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.fts_rank = Some(rank + 1);
+                details.fts_score = Some(h.rank);
+                details.rrf.fts = contrib;
+                details.fused += contrib;
+            }
+        }
+        for (rank, e) in entity_hits.iter().enumerate() {
+            let contrib = 1.0 / (k + (rank + 1) as f64);
+            let entry = fused.entry(e.hit.id).or_insert_with(|| FusedAt {
+                path: e.hit.path.clone(),
+                title: e.hit.title.clone(),
+                snippet: e.hit.snippet.clone(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.entity_rank = Some(rank + 1);
+                details.entity_weight = Some(e.weight);
+                details.matched_entities = e.matched.clone();
+                details.rrf.entity = contrib;
+                details.fused += contrib;
+            }
+        }
+
+        let mut out: Vec<(PageHit, Option<SearchExplain>)> = fused
+            .into_iter()
+            .map(|(id, entry)| {
+                (
+                    PageHit {
+                        id,
+                        path: entry.path,
+                        title: entry.title,
+                        snippet: entry.snippet,
+                        rank: -entry.score, // lower = better (matches FTS5 convention)
+                    },
+                    entry.explain,
+                )
+            })
+            .collect();
+        // No session-recall routing in audit mode; the plain authority
+        // factor keeps maintained pages' bounded advantage at T.
+        for (hit, details) in &mut out {
+            if let Some(authority) = authorities.get(&hit.id) {
+                hit.rank = authority.adjust_rank(hit.rank);
+                if let Some(explain) = details {
+                    explain.authority = Some(authority.factor);
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            a.0.rank
+                .partial_cmp(&b.0.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -4118,6 +4359,30 @@ impl ReaderPool {
         project_id: ProjectId,
         page_ids: Vec<PageId>,
     ) -> StoreResult<std::collections::HashMap<PageId, PageAuthority>> {
+        self.page_authorities_for_ids(workspace_id, project_id, page_ids, true)
+            .await
+    }
+
+    /// Authority inputs for specific page versions, without the
+    /// latest-only filter: audit mode ranks superseded versions too
+    /// (issue #656).
+    async fn page_authorities_for_versions(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_ids: Vec<PageId>,
+    ) -> StoreResult<std::collections::HashMap<PageId, PageAuthority>> {
+        self.page_authorities_for_ids(workspace_id, project_id, page_ids, false)
+            .await
+    }
+
+    async fn page_authorities_for_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_ids: Vec<PageId>,
+        latest_only: bool,
+    ) -> StoreResult<std::collections::HashMap<PageId, PageAuthority>> {
         if page_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -4135,6 +4400,11 @@ impl ReaderPool {
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
 
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
+            let latest_filter = if latest_only {
+                "AND pages.is_latest = 1"
+            } else {
+                ""
+            };
             let sql = format!(
                 "WITH requested(id) AS (VALUES {values_clause}) \
                  SELECT pages.id, pages.path, pages.tier, pages.pinned, \
@@ -4143,7 +4413,7 @@ impl ReaderPool {
                  JOIN pages ON pages.id = requested.id \
                  WHERE pages.workspace_id = ? \
                    AND pages.project_id = ? \
-                   AND pages.is_latest = 1"
+                   {latest_filter}"
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {

@@ -6424,6 +6424,416 @@ mod tests {
         assert!(before.is_empty(), "{before:?}");
     }
 
+    /// Issue #656 (Phase A): every version row carries its ingestion
+    /// window — `valid_from` is the version's own `created_at`,
+    /// `valid_to` is the superseding version's `created_at`, NULL while
+    /// the version is latest.
+    #[tokio::test]
+    async fn page_windows_follow_supersession() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        let v1_id = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/db.md", "we use postgres"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let v2_id = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/db.md", "we use sqlite"))
+            .await
+            .unwrap();
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let window = |id: PageId| {
+            db.query_row(
+                "SELECT valid_from, valid_to, created_at FROM pages WHERE id = ?1",
+                rusqlite::params![id.as_bytes()],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let (v1_from, v1_to, v1_created) = window(v1_id);
+        let (v2_from, v2_to, v2_created) = window(v2_id);
+        assert_eq!(v1_from, Some(v1_created), "valid_from opens at birth");
+        assert_eq!(
+            v1_to,
+            Some(v2_created),
+            "supersede closes the outgoing window at the new version's birth"
+        );
+        assert_eq!(v2_from, Some(v2_created));
+        assert_eq!(v2_to, None, "latest version's window stays open");
+    }
+
+    /// The V62 backfill reconstructs the same page windows the write
+    /// path produces: `valid_from` from each version's `created_at`,
+    /// `valid_to` from the earliest superseding version, NULL for
+    /// latest; successor-less retirements close at
+    /// the decay marker, existing link close, or updated_at fallback.
+    #[tokio::test]
+    async fn v62_backfill_reconstructs_page_windows() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "backfill", None)
+            .await
+            .unwrap();
+        for body in ["v1", "v2", "v3"] {
+            store
+                .writer
+                .upsert_page(sample_page(ws, proj, "notes/x.md", body))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        // A successor-less retirement: decay-tombstoned, never replaced.
+        let tomb_id = store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/old.md", "stale"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .soft_delete_for_decay_if_latest(
+                    ws,
+                    proj,
+                    PagePath::new("notes/old.md").unwrap(),
+                    tomb_id
+                )
+                .await
+                .unwrap()
+        );
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let live: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
+            .prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY created_at")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // Three chain versions (two closed, one open) + one tombstone.
+        assert_eq!(live.len(), 4);
+        assert!(live[0].2.is_some() && live[1].2.is_some());
+        assert!(live[2].2.is_none(), "latest stays open");
+        assert!(live[3].2.is_some(), "tombstone is closed");
+
+        // Replay the actual migration against the pre-V62 schema.
+        db.execute_batch(
+            "DROP INDEX idx_pages_validity; \
+             ALTER TABLE pages DROP COLUMN valid_from; \
+             ALTER TABLE pages DROP COLUMN valid_to;",
+        )
+        .unwrap();
+        db.execute_batch(include_str!(
+            "../migrations/V62__page_ingestion_windows.sql"
+        ))
+        .unwrap();
+        let backfilled: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
+            .prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY created_at")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(backfilled.len(), 4);
+        for (i, (live_row, back_row)) in live.iter().zip(backfilled.iter()).enumerate() {
+            assert_eq!(live_row.0, back_row.0, "row {i} page id");
+            assert_eq!(live_row.1, back_row.1, "row {i} valid_from");
+            assert_eq!(live_row.2, back_row.2, "row {i} valid_to");
+        }
+    }
+
+    /// Pre-V62 reorg/move retirements kept their instant only at link grain.
+    #[test]
+    fn v62_backfill_preserves_retired_link_windows() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE pages (
+                id INTEGER PRIMARY KEY, workspace_id INTEGER, project_id INTEGER,
+                created_at INTEGER, updated_at INTEGER, superseded_at INTEGER,
+                supersedes INTEGER, is_latest INTEGER);
+             CREATE TABLE entity_page_links (page_id INTEGER, superseded_at INTEGER);
+             INSERT INTO pages VALUES
+                (1,1,1,100,100,NULL,NULL,0),
+                (2,1,1,100,100,NULL,NULL,0),
+                (3,1,1,100,150,NULL,NULL,0),
+                (4,2,2,100,100,NULL,NULL,1),
+                (5,1,1,100,100,350,NULL,0);
+             INSERT INTO entity_page_links VALUES
+                (1,300),(1,300),(2,300),(4,300),(5,100);",
+        )
+        .unwrap();
+        db.execute_batch(include_str!(
+            "../migrations/V62__page_ingestion_windows.sql"
+        ))
+        .unwrap();
+        // Reorg and move keep [100,300); missing evidence falls back;
+        // a sibling scope's live page stays open; the decay marker wins.
+        for (id, expected) in [
+            (1, Some(300)),
+            (2, Some(300)),
+            (3, Some(150)),
+            (4, None),
+            (5, Some(350)),
+        ] {
+            let window: (i64, Option<i64>) = db
+                .query_row(
+                    "SELECT valid_from, valid_to FROM pages WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(window, (100, expected), "page {id}");
+        }
+        for (instant, expected) in [(99, 0), (100, 2), (200, 2), (299, 2), (300, 0)] {
+            let count: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM pages WHERE id IN (1,2)
+                 AND valid_from <= ?1 AND (valid_to IS NULL OR valid_to > ?1)",
+                    [instant],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "instant {instant}");
+        }
+    }
+
+    /// Issue #656 acceptance: `postgres → sqlite → postgres` (+ revert).
+    /// `as_of` inside the middle window returns that version via the
+    /// entity stream AND via version-filtered FTS — the middle version
+    /// deliberately carries no entities, so the entity leg alone would
+    /// miss it. The default query path is unchanged.
+    #[tokio::test]
+    async fn as_of_fuses_entity_and_fts_at_t() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        let mut v1 = sample_page(ws, proj, "notes/db.md", "we use postgres");
+        v1.entities = vec!["postgres".into()];
+        let v1_id = store.writer.upsert_page(v1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let t_first = jiff::Timestamp::now().as_microsecond();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+
+        // Entity-less on purpose: only the FTS leg can find this.
+        let v2_id = store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                "notes/db.md",
+                "we migrated to sqlite",
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let t_middle = jiff::Timestamp::now().as_microsecond();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+
+        let mut v3 = sample_page(ws, proj, "notes/db.md", "we moved back to postgres");
+        v3.entities = vec!["postgres".into()];
+        let v3_id = store.writer.upsert_page(v3).await.unwrap();
+        assert_ne!(v1_id, v2_id);
+        assert_ne!(v2_id, v3_id);
+
+        // First window, entity-phrased: both streams agree on v1.
+        let first = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "postgres".into(), 10, t_first, true)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(first[0].0.id, v1_id);
+        let details = first[0].1.as_ref().expect("explain=true");
+        assert!(details.entity_rank.is_some(), "entity leg: {details:?}");
+        assert!(details.fts_rank.is_some(), "FTS leg: {details:?}");
+
+        // Middle window, entity-less version: the FTS leg carries it.
+        let middle = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "sqlite".into(), 10, t_middle, true)
+            .await
+            .unwrap();
+        assert_eq!(middle.len(), 1, "{middle:?}");
+        assert_eq!(middle[0].0.id, v2_id);
+        let details = middle[0].1.as_ref().expect("explain=true");
+        assert_eq!(details.entity_rank, None, "no entities: {details:?}");
+        assert!(details.fts_rank.is_some(), "FTS leg: {details:?}");
+
+        // Middle window, retired entity: v1 is dead, v3 unborn.
+        let gone = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "postgres".into(), 10, t_middle, false)
+            .await
+            .unwrap();
+        assert!(gone.is_empty(), "{gone:?}");
+
+        // Default path unchanged: latest only.
+        let now_default = store
+            .reader
+            .search_pages_for_project(ws, proj, "postgres".into(), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(now_default.len(), 1);
+        assert_eq!(now_default[0].id, v3_id);
+        let sqlite_default = store
+            .reader
+            .search_pages_for_project(ws, proj, "sqlite".into(), 10, None)
+            .await
+            .unwrap();
+        assert!(sqlite_default.is_empty(), "{sqlite_default:?}");
+    }
+
+    /// V58-style control at page grain: the decay retire path closes
+    /// the page window in the same transaction, so `as_of` after the
+    /// eviction cannot resurrect the tombstone. Reopening the window
+    /// (the bug V58 repaired at link grain) makes the same query find
+    /// it again — proving the close is what holds the guarantee.
+    #[tokio::test]
+    async fn decay_close_keeps_as_of_from_resurrecting() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        let mut page = sample_page(ws, proj, "notes/legacy.md", "legacy token alpha");
+        page.entities = vec!["alpha".into()];
+        let page_id = store.writer.upsert_page(page).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        assert!(
+            store
+                .writer
+                .soft_delete_for_decay_if_latest(
+                    ws,
+                    proj,
+                    PagePath::new("notes/legacy.md").unwrap(),
+                    page_id
+                )
+                .await
+                .unwrap()
+        );
+        let after = jiff::Timestamp::now().as_microsecond();
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let valid_to: Option<i64> = db
+            .query_row(
+                "SELECT valid_to FROM pages WHERE id = ?1",
+                rusqlite::params![page_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(valid_to.is_some(), "retire path must close the page window");
+
+        let buried = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "alpha".into(), 10, after, false)
+            .await
+            .unwrap();
+        assert!(buried.is_empty(), "{buried:?}");
+
+        // Control: the V58-class bug (window left open) resurrects it.
+        db.execute(
+            "UPDATE pages SET valid_to = NULL WHERE id = ?1",
+            rusqlite::params![page_id.as_bytes()],
+        )
+        .unwrap();
+        let resurrected = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "alpha".into(), 10, after, false)
+            .await
+            .unwrap();
+        assert_eq!(resurrected.len(), 1, "open window must answer again");
+        assert_eq!(resurrected[0].0.id, page_id);
+    }
+
+    /// Deletion stays deletion: a removed page leaves no rows behind,
+    /// so `as_of` has nothing to return — the timeline does not survive
+    /// an explicit delete (docs/temporal.md).
+    #[tokio::test]
+    async fn purge_destroys_page_windows() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "temporal", None)
+            .await
+            .unwrap();
+
+        let mut page = sample_page(ws, proj, "notes/gone.md", "ephemeral token beta");
+        page.entities = vec!["beta".into()];
+        store.writer.upsert_page(page).await.unwrap();
+        let before = jiff::Timestamp::now().as_microsecond();
+        let found = store
+            .reader
+            .search_pages_for_project_at(ws, proj, "beta".into(), 10, before, false)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+
+        store
+            .writer
+            .delete_page(ws, proj, PagePath::new("notes/gone.md").unwrap(), None)
+            .await
+            .unwrap();
+        let after = jiff::Timestamp::now().as_microsecond();
+        for instant in [before, after] {
+            let hits = store
+                .reader
+                .search_pages_for_project_at(ws, proj, "beta".into(), 10, instant, false)
+                .await
+                .unwrap();
+            assert!(hits.is_empty(), "t={instant}: {hits:?}");
+        }
+    }
+
     /// End to end: a page written with only `tags` (no explicit
     /// `entities`) — the shape of essentially every page on a mature
     /// store — has no entity index until the one-shot startup backfill

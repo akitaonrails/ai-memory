@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Page-grain ingestion windows (`pages.valid_from` / `valid_to`, V62) and
+  a second `as_of` stream: `memory_query(as_of=T)` now fuses the entity
+  timeline with version-filtered full-text search over the page versions
+  alive at T, using the default path's RRF (k=60) plus the same bounded
+  authority adjustment — current-index relevance over knowledge valid at T. This
+  answers entity-less pages and paraphrased audit questions ("which
+  database were we on during the outage?") that the entity-only lookup
+  missed. `explain=true` reports both streams (`streams_active:
+  ["entity", "fts"]`) with per-stream ranks and RRF contributions.
+  Vector, graph, and the raw-observation fallback stay out of audit mode;
+  the default (no `as_of`) path is unchanged. Every retire path
+  (supersede, decay, reorg graveyard, move-regenerate) closes both grains
+  in the same transaction, and the V62 backfill closes successor-less
+  retirements at the decay marker, existing entity-link close, or
+  `updated_at` fallback, preserving recorded reorg/move history.
+  Phase B world-time stays deferred. (#656)
 - `[retrieval]` section with two opt-in ranking signals, both off by default
   so unconfigured stores rank exactly as before. `query_intent` routes
   lexically session-recall queries ("上次 / 之前那次…的会话 / last time /
@@ -43,6 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#675)
 
 ### Fixed
+- Preserved recorded entity-link retirement timestamps when backfilling
+  page ingestion windows for historical reorg/move-regenerate pages,
+  preventing empty page windows when `updated_at` still held creation
+  time. Clarified current-index ranking and snapshot-based rollback. (#682)
 - Wiki auto-commits stage what the wiki wrote instead of walking the
   whole tree, keep the repository open between commits, and no longer
   drop the commit when another session is writing a file at the same

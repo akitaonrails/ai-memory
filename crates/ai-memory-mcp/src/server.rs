@@ -337,7 +337,8 @@ project name. `global=true` cannot be combined with \
 `scopes`/`project`/`workspace`. Don't conclude 'we never recorded \
 it' after one project misses. For \"what did we know about X back \
 then\" questions, pass `as_of` (ISO-8601 instant) — the query becomes \
-an entity-timeline lookup returning the page versions valid at that \
+a time-travel lookup fusing the entity timeline with version-filtered \
+ full-text search, returning the page versions valid at that \
 moment, including ones superseded since. Note also that `memory_query` returns \
 SNIPPETS, not full page bodies — an empty or short snippet does NOT \
 mean the page is empty (a large page can match outside the snippet \
@@ -527,11 +528,12 @@ struct QueryArgs {
     #[serde(default)]
     explain: Option<bool>,
     /// Time-travel: an ISO-8601 instant (e.g. `2026-06-01T00:00:00Z`).
-    /// When set, the query becomes an ENTITY-TIMELINE lookup: it returns
-    /// the page versions whose entity-link validity windows contained
-    /// that instant — what the store knew about the named entities then,
-    /// including versions superseded since (docs/temporal.md). FTS /
-    /// vector / graph streams are skipped in this mode; cannot be
+    /// When set, the query becomes a time-travel lookup: the entity
+    /// timeline fused (default-path RRF) with version-filtered full-text
+    /// search over the page versions whose ingestion windows contained
+    /// that instant — what the store knew then, including versions
+    /// superseded since (docs/temporal.md). Vector / graph streams and
+    /// the raw-observation fallback are skipped in this mode; cannot be
     /// combined with `global` or `scopes`. Omit for a normal search.
     #[serde(default)]
     as_of: Option<String>,
@@ -615,6 +617,7 @@ struct MemoryQueryResponse {
     /// the primary search. Project/scopes retrieval always runs `fts` and
     /// `entity`, and `graph`; `vector` is present only when an embedder
     /// produced a query vector. Cross-project `global=true` retrieval is FTS-only.
+    /// An `as_of` query runs `entity` plus version-filtered `fts`.
     #[serde(skip_serializing_if = "Option::is_none")]
     streams_active: Option<Vec<&'static str>>,
 }
@@ -1960,8 +1963,11 @@ impl AiMemoryServer {
             ));
         }
 
-        // Time-travel entity lookup (docs/temporal.md): entity stream
-        // only, against the ingestion-time validity windows.
+        // Time-travel lookup (docs/temporal.md, issue #656): the
+        // entity-window stream plus version-filtered FTS over the page
+        // ingestion windows alive at T, fused with the default path's
+        // RRF. Vector, graph, and the raw-observation fallback stay out
+        // of audit mode.
         if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
             if args.global.unwrap_or(false) || !args.scopes.is_empty() {
                 return Err(McpError::internal_error(
@@ -1979,24 +1985,30 @@ impl AiMemoryServer {
                     &aps_actor,
                 )
                 .await?;
-            let hits = self
+            let fused = self
                 .reader
-                .entity_hits_for_project_at(
+                .search_pages_for_project_at(
                     ws,
                     proj,
-                    &args.query,
+                    args.query.clone(),
                     limit,
-                    None,
-                    Some(instant.as_microsecond()),
+                    instant.as_microsecond(),
+                    explain,
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryQueryResponse {
-                hits: hits.into_iter().map(|h| QueryHit::from(h.hit)).collect(),
+                hits: fused
+                    .into_iter()
+                    .map(|(hit, details)| QueryHit {
+                        hit,
+                        score_details: details,
+                    })
+                    .collect(),
                 raw_hits: Vec::new(),
                 global_hits: Vec::new(),
                 global_scope_hits: Vec::new(),
-                streams_active: explain.then(|| vec!["entity"]),
+                streams_active: explain.then(|| vec!["entity", "fts"]),
             });
         }
 
@@ -6627,9 +6639,11 @@ mod tests {
         );
     }
 
-    /// `as_of` turns memory_query into an entity-timeline lookup
-    /// (docs/temporal.md): a superseded version answers for the instant
-    /// it was valid, the current version answers for now, and the mode
+    /// `as_of` turns memory_query into a time-travel lookup
+    /// (docs/temporal.md, issue #656): entity timeline fused with
+    /// version-filtered FTS. A superseded version answers for the
+    /// instant it was valid, the current version answers for now, an
+    /// entity-less version answers via the FTS leg alone, and the mode
     /// refuses to combine with global/scopes.
     #[tokio::test]
     async fn memory_query_as_of_travels_the_entity_timeline() {
@@ -6683,7 +6697,41 @@ mod tests {
             .text
             .clone();
         assert!(text.contains("notes/db.md"), "{text}");
-        assert!(text.contains("\"entity\""), "entity-only mode: {text}");
+        assert!(text.contains("\"entity\""), "entity stream ran: {text}");
+        assert!(text.contains("\"fts\""), "FTS stream ran: {text}");
+        assert!(text.contains("entity_rank"), "entity provenance: {text}");
+        assert!(text.contains("fts_rank"), "FTS provenance: {text}");
+
+        // FTS-leg end to end: "migrated" matches no entity (v2 carries
+        // `sqlite`), but the live version's body says "we migrated" —
+        // audit mode at now still finds it through version-filtered FTS.
+        let fts_now = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "migrated".into(),
+                    limit: Some(5),
+                    project: Some("scratch".into()),
+                    scopes: Vec::new(),
+                    workspace: Some("default".into()),
+                    global: None,
+                    include_expired: None,
+                    explain: Some(true),
+                    as_of: Some(jiff::Timestamp::now().to_string()),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let fts_text = fts_now
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .unwrap()
+            .text
+            .clone();
+        assert!(fts_text.contains("notes/db.md"), "{fts_text}");
+        assert!(fts_text.contains("fts_rank"), "{fts_text}");
+        assert!(!fts_text.contains("entity_rank"), "{fts_text}");
 
         // Same query without as_of → no postgres hit anymore... the FTS
         // stream may still match old text? No: default searches latest
