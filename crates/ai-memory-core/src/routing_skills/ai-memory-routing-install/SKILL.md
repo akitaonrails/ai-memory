@@ -10,7 +10,7 @@ Use this skill when the user wants ai-memory's agent-facing routing instructions
 
 ## Tools in this cluster
 
-- `memory_install_self_routing` returns the canonical markered instruction block, marker strings, filename hints, notes, and managed skill payloads for agents that cannot let the MCP server write the host filesystem directly.
+- `memory_install_self_routing` returns the canonical markered instruction block, marker strings, filename hints, notes, and managed skill payloads for agents that cannot let the MCP server write the host filesystem directly. Pass `compact: true` when managed Agent Skills are installed or when refreshing a file that already uses the compact snippet.
 
 ## Managed instruction marker
 
@@ -50,6 +50,6 @@ Use platform-aware path joining. Do not build paths by string concatenation.
 
 ## Refresh guidance
 
-For an agent-side refresh, call the install-routing tool. Its returned `target_hints` are authoritative for skill roots: choose the right instruction filename from `agent_filenames`, write the markered block with the agent's file-edit tool, and write each managed skill file below the selected hint using its `relative_path`. Claude Code normally uses `CLAUDE.md` and `.claude/skills`; Codex, OpenCode, Cursor, Gemini CLI, and AGENTS-aware clients normally use `AGENTS.md` and `.agents/skills`; Grok Build CLI uses `AGENTS.md` and `.grok/skills` unless the project says otherwise.
+For an agent-side refresh, call the install-routing tool (pass `compact: true` if the target file already uses the compact snippet or if managed Agent Skills handle detailed routing). Its returned `target_hints` are authoritative for skill roots: choose the right instruction filename from `agent_filenames`, write the markered block with the agent's file-edit tool, and write each managed skill file below the selected hint using its `relative_path`. Claude Code normally uses `CLAUDE.md` and `.claude/skills`; Codex, OpenCode, Cursor, Gemini CLI, and AGENTS-aware clients normally use `AGENTS.md` and `.agents/skills`; Grok Build CLI uses `AGENTS.md` and `.grok/skills` unless the project says otherwise.
 
 For a CLI refresh, prefer the canonical install command. The snippet and skills must be updated from the same core-owned assets so they do not drift.
