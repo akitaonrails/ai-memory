@@ -221,6 +221,28 @@ fn aur_packages_install_all_native_assets() {
         );
     }
 
+    // The from-source PKGBUILD builds and runs `check()` on the AUR host.
+    // Two things keep that green (see #677): `!lto` avoids the release-LTO
+    // link step that OOM-killed the build on constrained AUR builders, and
+    // pinning CARGO_HOME to the real registry before the HOME override lets
+    // the `--frozen` check() resolve the packages build() already fetched.
+    let src_pkgbuild = read_repo("packaging/aur/PKGBUILD");
+    assert!(
+        src_pkgbuild.contains("options=('!debug' '!lto')"),
+        "from-source PKGBUILD must disable LTO to survive constrained AUR builders"
+    );
+    let cargo_home = src_pkgbuild
+        .find("export CARGO_HOME=")
+        .expect("check() must pin CARGO_HOME");
+    let home_override = src_pkgbuild
+        .find(r#"export HOME="$srcdir/test-home""#)
+        .expect("check() must override HOME");
+    assert!(
+        cargo_home < home_override,
+        "CARGO_HOME must be pinned to the real registry before HOME is repointed, \
+         or --frozen check() cannot resolve the fetched packages"
+    );
+
     let install = read_repo("packaging/aur/ai-memory.install");
     assert!(install.contains("sudo -u ai-memory ai-memory --data-dir /var/lib/ai-memory"));
     assert!(!install.contains("sudo ai-memory --data-dir /var/lib/ai-memory"));

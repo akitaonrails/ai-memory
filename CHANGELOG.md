@@ -58,17 +58,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory-of-record guidance; `full_block` and the default remain unchanged.
   (#675)
 
+### Changed
+- The managed routing snippet now states that Claude Code loads `CLAUDE.md` and
+  does not read `AGENTS.md`: a project whose canonical instruction file is
+  `AGENTS.md` needs a bare `@AGENTS.md` import line in `CLAUDE.md`, or the rules
+  written there are absent from context at session start and reach the agent only
+  if it opens the file. `docs/install.md` and `docs/usage.md` carry the same note
+  beside the `--target AGENTS.md` guidance, and this repository's own `CLAUDE.md`
+  now uses the import instead of a prose pointer (#680).
+
 ### Fixed
 - Preserved recorded entity-link retirement timestamps when backfilling
   page ingestion windows for historical reorg/move-regenerate pages,
   preventing empty page windows when `updated_at` still held creation
   time. Clarified current-index ranking and snapshot-based rollback. (#682)
+- The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
+  builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
+  final link no longer gets OOM-killed on low-memory build hosts, and the
+  `check()` step pins `CARGO_HOME` to the registry `build()` already
+  populated before it repoints `HOME` at an empty test home, so the
+  `--frozen` test run can resolve the packages it fetched instead of
+  failing offline (#677).
+- CLI server errors now name the request. A non-2xx response from the
+  configured server printed only `server returned 404 Not Found: <body>`,
+  so a failure gave no clue which endpoint answered. The message now leads
+  with the request method and path: `GET /admin/open-sessions: server
+  returned 404 Not Found: <body>`. The error keeps the path only, so a
+  token in the URL userinfo or query string never reaches a log line.
 - Wiki auto-commits stage what the wiki wrote instead of walking the
   whole tree, keep the repository open between commits, and no longer
   drop the commit when another session is writing a file at the same
   time. A session end now costs what it wrote, not the size of the wiki,
   and the git history no longer silently misses snapshots under
   concurrent sessions (#674).
+- The generated pi/omp and OpenClaw TypeScript integrations registered their
+  session-end lifecycle event (`session_shutdown` for pi/omp, `session_end`
+  for OpenClaw) with a synchronous, fire-and-forget handler. The host tears
+  down the runtime as soon as a synchronous handler returns, killing the
+  in-flight `session-end` POST before it completes, so the server never
+  learned the session had ended: `sessions.ended_at` stayed `NULL`, and no
+  summary or handoff was produced. The handlers are now `async` and await a
+  bounded (2s) drain of the pending request(s) before returning, mirroring
+  the joinable dispose-drain already used by the OpenCode integration (#676).
+- The `bin/ai-memory` container wrapper now matches multi-architecture image
+  manifests against the host's platform architecture, eliminating a
+  false-positive "a newer image is available on Docker Hub" warning on x86_64
+  and Podman. Additionally, `emit_docker_run_script` now preserves volume mount
+  modes (such as `:Z` on SELinux/Podman environments) and filters transient
+  runtime environment variables (`HOSTNAME`, `container=podman`).
 
 ## [2.1.1] - 2026-09-07
 

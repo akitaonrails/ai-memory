@@ -124,6 +124,12 @@ legacy long snippets between `<!-- ai-memory:start -->` /
 `<!-- ai-memory:end -->` are replaced in place with the slim snippet, and
 managed Agent Skills are installed or updated alongside it.
 
+If you install into `AGENTS.md` and the project is also used from Claude Code,
+make `CLAUDE.md` import it with a bare `@AGENTS.md` first line. Claude Code
+loads `CLAUDE.md` and does not read `AGENTS.md`, so without that import the
+installed block is absent from context at session start. See
+[Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
+
 ---
 
 ## Configuring the CLI URL and auth

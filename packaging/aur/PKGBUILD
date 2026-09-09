@@ -27,7 +27,7 @@ optdepends=(
 )
 backup=('etc/ai-memory/config.toml' 'etc/ai-memory/env')
 install=ai-memory.install
-options=('!debug')
+options=('!debug' '!lto')
 conflicts=('ai-memory-bin')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
@@ -51,6 +51,10 @@ check() {
     export RUSTUP_TOOLCHAIN=1.95
     export CARGO_TARGET_DIR=target
     export TAILWIND_SKIP=1
+    # Pin CARGO_HOME to the real registry (populated by build()) before the
+    # HOME override below points cargo at an empty ~/.cargo, or --frozen fails
+    # to resolve the vendored registry it already downloaded.
+    export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
     export HOME="$srcdir/test-home"
     mkdir -p "$HOME"
     cargo test --frozen --release -p ai-memory-cli --bin ai-memory

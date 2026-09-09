@@ -60,16 +60,71 @@ WRAPPER_SHA256_URL="${AI_MEMORY_WRAPPER_SHA256_URL:-${WRAPPER_URL}.sha256}"
 
 # ---- version-check helpers (best-effort; never block the wrapper) --------
 
-local_digest() {
-  "${DOCKER}" image inspect --format='{{index .RepoDigests 0}}' "${IMAGE}" 2>/dev/null \
-    | sed 's/.*@//' || true
+local_repo_digests() {
+  "${DOCKER}" image inspect --format='{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}" 2>/dev/null \
+    | sed 's/.*@//' | grep -v '^$' || true
+}
+
+local_instance_digest() {
+  # Podman (and containerd image store) exposes .Digest for the per-arch child image.
+  # Docker classic has no .Digest field in types.ImageInspect; fail gracefully.
+  "${DOCKER}" image inspect --format='{{println .Digest}}' "${IMAGE}" 2>/dev/null \
+    | sed 's/.*@//' | grep -v '^$' || true
+}
+
+local_digests() {
+  local_repo_digests
+  local_instance_digest
+}
+
+remote_list_digest() {
+  # Docker standard: buildx imagetools inspect outputs the manifest list (index) digest
+  # matching Docker's classic .RepoDigests.
+  "${DOCKER}" buildx imagetools inspect "${IMAGE}" 2>/dev/null \
+    | awk '/^Digest:[[:space:]]+/ { print $2; exit }' || true
+}
+
+remote_arch_digest() {
+  local host_arch
+  case "$(uname -m 2>/dev/null || true)" in
+    x86_64 | amd64) host_arch="amd64" ;;
+    aarch64 | arm64) host_arch="arm64" ;;
+    *) host_arch="" ;;
+  esac
+
+  # docker manifest inspect was experimental pre-20.10; on modern
+  # docker and podman it's stable. Silent on failure (offline, etc.).
+  "${DOCKER}" manifest inspect "${IMAGE}" 2>/dev/null | awk -v target_arch="${host_arch}" '
+    BEGIN { RS="}" }
+    {
+      block = $0
+      arch = ""
+      digest = ""
+      if (match(block, /sha256:[a-f0-9]{64}/)) {
+        digest = substr(block, RSTART, RLENGTH)
+        if (first_d == "") first_d = digest
+      }
+      if (match(block, /"architecture"[[:space:]]*:[[:space:]]*"[^"]+"/)) {
+        s = substr(block, RSTART, RLENGTH)
+        sub(/.*"architecture"[[:space:]]*:[[:space:]]*"/, "", s)
+        sub(/".*/, "", s)
+        arch = s
+      }
+      if (arch == target_arch && digest != "") {
+        print digest
+        found = 1
+        exit
+      }
+    }
+    END {
+      if (!found && first_d != "") print first_d
+    }
+  ' || true
 }
 
 remote_digest() {
-  # docker manifest inspect was experimental pre-20.10; on modern
-  # docker it's stable. Silent on failure (offline, podman, etc.).
-  "${DOCKER}" manifest inspect "${IMAGE}" 2>/dev/null \
-    | grep -oE 'sha256:[a-f0-9]{64}' | head -n 1 || true
+  remote_list_digest
+  remote_arch_digest
 }
 
 maybe_warn_outdated() {
@@ -83,14 +138,45 @@ maybe_warn_outdated() {
   fi
   mkdir -p "${CACHE_DIR}"
   touch "${VERSION_CHECK_FILE}"
-  local local_d remote_d
-  local_d=$(local_digest)
-  remote_d=$(remote_digest)
-  [ -n "${local_d}" ] && [ -n "${remote_d}" ] || return 0
-  if [ "${local_d}" != "${remote_d}" ]; then
-    printf '\033[33mai-memory: a newer image is available on Docker Hub.\033[0m\n' >&2
-    printf '           run `ai-memory upgrade` to pull it + refresh hooks.\n' >&2
+
+  local local_repos local_inst remote_list remote_arch
+  local_repos="$(local_repo_digests)"
+  local_inst="$(local_instance_digest)"
+  remote_list="$(remote_list_digest)"
+  remote_arch="$(remote_arch_digest)"
+
+  # If both remote sources failed (offline, timeout, etc.), skip.
+  [ -n "${remote_list}" ] || [ -n "${remote_arch}" ] || return 0
+  # If local has no digests at all, skip.
+  [ -n "${local_repos}" ] || [ -n "${local_inst}" ] || return 0
+
+  # 1. If remote list digest is available, compare against local repo digests (Docker matching).
+  if [ -n "${remote_list}" ] && [ -n "${local_repos}" ]; then
+    if printf '%s\n' "${local_repos}" | grep -qxF "${remote_list}"; then
+      return 0
+    fi
   fi
+
+  # 2. If per-arch remote digest is available:
+  if [ -n "${remote_arch}" ]; then
+    local local_per_arch="${local_inst}"
+    if [ -z "${local_per_arch}" ] && [ "$(printf '%s\n' "${local_repos}" | grep -c .)" -gt 1 ]; then
+      local_per_arch="${local_repos}"
+    fi
+
+    if [ -n "${local_per_arch}" ]; then
+      if printf '%s\n' "${local_per_arch}" | grep -qxF "${remote_arch}"; then
+        return 0
+      fi
+    elif [ -z "${remote_list}" ]; then
+      # Classic Docker without buildx: local only has manifest-list digest,
+      # remote only has per-arch digest. We cannot reliably compare them; gate out.
+      return 0
+    fi
+  fi
+
+  printf '\033[33mai-memory: a newer image is available on Docker Hub.\033[0m\n' >&2
+  printf '           run `ai-memory upgrade` to pull it + refresh hooks.\n' >&2
 }
 
 # ---- upgrade subcommand --------------------------------------------------
@@ -177,7 +263,7 @@ emit_docker_run_script() {
   ports="$("${DOCKER}" inspect "${container}" --format \
     '{{range $p, $bindings := .HostConfig.PortBindings}}{{range $bindings}}-p {{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$p}} {{end}}{{end}}' 2>/dev/null)"
   volumes="$("${DOCKER}" inspect "${container}" --format \
-    '{{range .Mounts}}{{if eq .Type "volume"}}-v {{.Name}}:{{.Destination}} {{else}}-v {{.Source}}:{{.Destination}} {{end}}{{end}}' 2>/dev/null)"
+    '{{range .Mounts}}{{if eq .Type "volume"}}-v {{.Name}}:{{.Destination}}{{if .Mode}}:{{.Mode}}{{end}} {{else}}-v {{.Source}}:{{.Destination}}{{if .Mode}}:{{.Mode}}{{end}} {{end}}{{end}}' 2>/dev/null)"
   restart="$("${DOCKER}" inspect "${container}" --format \
     '{{with .HostConfig.RestartPolicy.Name}}{{if ne . "no"}}--restart {{.}}{{end}}{{end}}' 2>/dev/null)"
 
@@ -204,6 +290,9 @@ emit_docker_run_script() {
     if printf '%s\n' "${image_env}" | grep -qxF -- "${kv}"; then
       continue
     fi
+    case "${kv}" in
+      HOSTNAME=*|container=*) continue ;;
+    esac
     env_flags="${env_flags} -e $(printf '%q' "${kv}")"
   done <<ENVEOF
 ${container_env}

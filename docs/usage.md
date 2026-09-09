@@ -231,6 +231,15 @@ instruction target unless you override it: `CLAUDE.md` implies
 both skill roots. For Grok Build CLI, select `--skills-agent grok` so skills
 install under its `.grok/skills` root.
 
+When a project keeps `AGENTS.md` as its canonical instruction file, give it a
+`CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code loads
+`CLAUDE.md` and does not read `AGENTS.md`, so without that import a block
+installed with `--target AGENTS.md`, along with every project rule in the same
+file, is absent from context at session start. A prose "read AGENTS.md" pointer
+does not load the file; it asks the agent to open it, which leaves adherence to
+whether the agent does. See
+[Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
+
 To refresh only the managed Agent Skills:
 
 ```bash

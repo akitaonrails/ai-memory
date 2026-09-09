@@ -98,6 +98,11 @@ Many projects use CLAUDE.md for Claude Code and
 AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
 but if the project says one file is canonical, use that file.
 
+Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
+where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md` import
+line. Without it a rule written to `AGENTS.md` is absent from context at
+session start and reaches Claude Code only if the agent opens the file.
+
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
 to ai-memory's reserved global scope instead — the durable-pages skill
@@ -304,7 +309,8 @@ mod tests {
     /// (`ai-memory install-instructions --target AGENTS.md`) and committed
     /// separately, so nothing forces it to track [`SNIPPET_BODY`]. This guard
     /// fails when the two drift — regenerate to fix it. Only `AGENTS.md` is
-    /// checked (root `CLAUDE.md` is a pointer; `README.md` is prose).
+    /// checked (root `CLAUDE.md` imports it with `@AGENTS.md` and carries no
+    /// block of its own; `README.md` is prose).
     #[test]
     fn committed_agents_md_matches_snippet_body() {
         // From `crates/ai-memory-core` up to the repo root.

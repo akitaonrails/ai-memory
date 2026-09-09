@@ -4114,12 +4114,14 @@ const HOOK_FLUSH_INTERVAL_MS = 2000;
 const HOOK_FLUSH_THRESHOLD = 20;
 const HOOK_INTER_REQUEST_DELAY_MS = 50;
 const HOOK_REQUEST_TIMEOUT_MS = 2000;
+const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;
 const HOOK_IMMEDIATE_EVENTS = new Set(["session-start", "stop", "session-end", "pre-compact"]);
 
 type HookQueueItem = {{ event: string; url: URL; payload: Record<string, unknown> }};
 const hookQueue: HookQueueItem[] = [];
 let hookFlushTimer: ReturnType<typeof setTimeout> | undefined;
 let hookDraining = false;
+let hookDrainPromise: Promise<void> | undefined;
 
 function sleep(ms: number): Promise<void> {{
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -4129,16 +4131,37 @@ function scheduleHookFlush(): void {{
   if (hookFlushTimer) return;
   hookFlushTimer = setTimeout(() => {{
     hookFlushTimer = undefined;
-    void drainHookQueue();
+    void requestHookDrain();
   }}, HOOK_FLUSH_INTERVAL_MS);
   hookFlushTimer.unref?.();
+}}
+
+function requestHookDrain(): Promise<void> {{
+  if (!hookDrainPromise) {{
+    hookDrainPromise = drainHookQueue().finally(() => {{
+      hookDrainPromise = undefined;
+      if (hookQueue.length > 0) void requestHookDrain();
+    }});
+  }}
+  return hookDrainPromise;
+}}
+
+function disposeDrainTimeout(): Promise<void> {{
+  return new Promise((resolve) => {{
+    const timer = setTimeout(resolve, HOOK_DISPOSE_DRAIN_BUDGET_MS);
+    timer.unref?.();
+  }});
+}}
+
+async function drainHookQueueForDispose(): Promise<void> {{
+  await Promise.race([requestHookDrain(), disposeDrainTimeout()]);
 }}
 
 function enqueueHook(event: string, url: URL, payload: Record<string, unknown>): void {{
   if (hookQueue.length >= HOOK_QUEUE_MAX) hookQueue.shift();
   hookQueue.push({{ event, url, payload }});
   if (HOOK_IMMEDIATE_EVENTS.has(event) || hookQueue.length >= HOOK_FLUSH_THRESHOLD) {{
-    void drainHookQueue();
+    void requestHookDrain();
   }} else {{
     scheduleHookFlush();
   }}
@@ -4169,7 +4192,6 @@ async function drainHookQueue(): Promise<void> {{
     }}
   }} finally {{
     hookDraining = false;
-    if (hookQueue.length > 0) void drainHookQueue();
   }}
 }}
 
@@ -4402,9 +4424,10 @@ export default function AiMemoryExtension(api: any): void {{
     postHook("stop", sessionPayload(ctx));
   }});
 
-  api.on("session_shutdown", (_event: any, ctx: any) => {{
+  api.on("session_shutdown", async (_event: any, ctx: any) => {{
     startSession(ctx);
     postHook("session-end", sessionPayload(ctx));
+    await drainHookQueueForDispose();
   }});
 }}
 "#,
@@ -8362,6 +8385,22 @@ model = "gpt-5"
                 .contains("projectStrategy === \"repo-root\" || projectStrategy === \"repo_root\"")
         );
         assert!(extension.contains("url.searchParams.set(\"project\", repoProject)"));
+        // #676: pi/omp await session_shutdown's dispose flush instead of
+        // returning immediately, so the runtime teardown that follows a sync
+        // handler no longer kills the in-flight session-end fetch.
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(extension.contains("let hookDrainPromise: Promise<void> | undefined;"));
+        assert!(extension.contains("function requestHookDrain(): Promise<void>"));
+        assert!(extension.contains("function disposeDrainTimeout(): Promise<void>"));
+        assert!(extension.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(
+            extension.contains("api.on(\"session_shutdown\", async (_event: any, ctx: any) => {")
+        );
+        assert!(extension.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !extension.contains("api.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
+            "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
     }
 
     #[test]
@@ -8793,6 +8832,20 @@ model = "gpt-5"
         assert!(!extension.contains(".omp"));
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
+        // #676: the pi string-transform (api.on( -> pi.on() must still
+        // produce an async session_shutdown handler that awaits the bounded
+        // dispose flush, mirroring the omp source it derives from.
+        assert!(extension.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(extension.contains("function requestHookDrain(): Promise<void>"));
+        assert!(extension.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(
+            extension.contains("pi.on(\"session_shutdown\", async (_event: any, ctx: any) => {")
+        );
+        assert!(extension.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !extension.contains("pi.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
+            "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
     }
 
     // Windows 11 + Git Bash support matters for regulated enterprise setups

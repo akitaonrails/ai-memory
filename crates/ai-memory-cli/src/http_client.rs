@@ -26,6 +26,8 @@ use ai_memory_web::normalize_prefix;
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
 pub(crate) struct ServerResponseError {
+    method: reqwest::Method,
+    path: String,
     status: reqwest::StatusCode,
     body: String,
 }
@@ -44,14 +46,48 @@ impl ServerResponseError {
 
 impl fmt::Display for ServerResponseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "server returned {}: {}", self.status, self.body)
+        write!(
+            formatter,
+            "{} {}: server returned {}: {}",
+            self.method, self.path, self.status, self.body
+        )
     }
 }
 
 impl std::error::Error for ServerResponseError {}
 
-fn server_response_error(status: reqwest::StatusCode, body: String) -> anyhow::Error {
-    ServerResponseError { status, body }.into()
+fn server_response_error(
+    method: reqwest::Method,
+    url: &reqwest::Url,
+    status: reqwest::StatusCode,
+    body: String,
+) -> anyhow::Error {
+    ServerResponseError {
+        method,
+        path: url.path().to_owned(),
+        status,
+        body,
+    }
+    .into()
+}
+
+/// Pass a 2xx response through, else consume the body into a
+/// [`ServerResponseError`].
+///
+/// Only the request path reaches the error, so userinfo and query
+/// credentials in the URL never land in a message. `reqwest` does not carry
+/// the request method on the response, so callers supply it.
+async fn require_success(
+    method: reqwest::Method,
+    resp: reqwest::Response,
+) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let url = resp.url().clone();
+    let body = resp.text().await.unwrap_or_default();
+    Err(server_response_error(method, &url, status, body))
 }
 
 /// Resolved server target — origin URL + base-path prefix + optional bearer token.
@@ -227,11 +263,7 @@ pub async fn get_json<T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(server_response_error(status, body));
-    }
+    let resp = require_success(reqwest::Method::GET, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from GET {url}"))
@@ -253,11 +285,7 @@ pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(server_response_error(status, body));
-    }
+    let resp = require_success(reqwest::Method::PATCH, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from PATCH {url}"))
@@ -288,11 +316,7 @@ pub async fn post_json_no_content<B: Serialize>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(server_response_error(status, body));
-    }
+    require_success(reqwest::Method::POST, resp).await?;
     Ok(())
 }
 
@@ -305,11 +329,7 @@ pub async fn post_empty(endpoint: &ServerEndpoint, path: &str) -> Result<()> {
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(server_response_error(status, body));
-    }
+    require_success(reqwest::Method::POST, resp).await?;
     Ok(())
 }
 
@@ -331,11 +351,7 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(server_response_error(status, body));
-    }
+    let resp = require_success(reqwest::Method::POST, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from POST {url}"))
@@ -417,15 +433,11 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     let client = reqwest::Client::new();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url));
-    let mut resp = req
+    let resp = req
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(server_response_error(status, body));
-    }
+    let mut resp = require_success(reqwest::Method::POST, resp).await?;
     let file = private_output_file(dest)
         .with_context(|| format!("creating output file {}", dest.display()))?;
     let mut writer = BufWriter::new(file);
@@ -473,6 +485,34 @@ mod tests {
             std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn response_errors_include_method_and_credential_free_path() {
+        let url = reqwest::Url::parse(
+            "https://username:password@example.test/workstream/runs?access_token=secret",
+        )
+        .expect("test URL parses");
+        let error = server_response_error(
+            reqwest::Method::POST,
+            &url,
+            reqwest::StatusCode::NOT_FOUND,
+            "missing".to_owned(),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "POST /workstream/runs: server returned 404 Not Found: missing"
+        );
+        let structured = error
+            .downcast_ref::<ServerResponseError>()
+            .expect("response errors retain their structured type");
+        assert_eq!(structured.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(structured.body(), "missing");
+        assert!(!error.to_string().contains("username"));
+        assert!(!error.to_string().contains("password"));
+        assert!(!error.to_string().contains("access_token"));
+        assert!(!error.to_string().contains("secret"));
     }
 
     // ----------------------------------------------------------------

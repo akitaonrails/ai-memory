@@ -450,6 +450,28 @@ const startedSessions = new Set<string>();
 const handoffChecked = new Set<string>();
 const preCompactLast = new Map<string, number>();
 
+const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;
+const pendingHookRequests = new Set<Promise<void>>();
+
+function trackHookRequest(request: Promise<void>): void {{
+  pendingHookRequests.add(request);
+  void request.finally(() => pendingHookRequests.delete(request));
+}}
+
+function disposeDrainTimeout(): Promise<void> {{
+  return new Promise((resolve) => {{
+    const timer = setTimeout(resolve, HOOK_DISPOSE_DRAIN_BUDGET_MS);
+    timer.unref?.();
+  }});
+}}
+
+async function drainHookQueueForDispose(): Promise<void> {{
+  await Promise.race([
+    Promise.allSettled(Array.from(pendingHookRequests)),
+    disposeDrainTimeout(),
+  ]);
+}}
+
 function rememberSession(event: any, ctx: any): void {{
   const id = sessionID(event, ctx);
   if (!id || startedSessions.has(id)) return;
@@ -478,7 +500,9 @@ function postPreCompact(event: any, ctx: any): void {{
     // Fire-and-forget, but never silent loss: an unreachable server or
     // 5xx spools the event in the CLI hook-spool format for a later
     // drain (#580); a delivered post opportunistically drains backlog.
-    void fetch(url, {{
+    // Tracked in pendingHookRequests so session_end can await a bounded
+    // flush instead of letting teardown kill the in-flight fetch (#676).
+    const request = fetch(url, {{
       method: "POST",
       headers: {{ "Content-Type": "application/json", ...authHeaders() }},
       body: JSON.stringify(policy.payload),
@@ -490,6 +514,7 @@ function postPreCompact(event: any, ctx: any): void {{
         else requestSpoolDrain();
       }})
       .catch(() => undefined);
+    trackHookRequest(request);
   }} catch (_e) {{
     try {{ spoolFailedHook(url, policy.payload); }} catch (_e2) {{}}
   }}
@@ -523,9 +548,10 @@ export default definePluginEntry({{
       rememberSession(event, ctx);
     }});
 
-    api.on("session_end", (event: any, ctx: any) => {{
+    api.on("session_end", async (event: any, ctx: any) => {{
       rememberSession(event, ctx);
       postHook("session-end", payload(event, ctx, {{ reason: event?.reason }}));
+      await drainHookQueueForDispose();
     }});
 
     api.on("before_prompt_build", async (event: any, ctx: any) => {{
@@ -627,6 +653,19 @@ mod tests {
         assert!(plugin.contains("definePluginEntry"));
         assert!(plugin.contains("api.on(\"session_start\""));
         assert!(plugin.contains("api.on(\"session_end\""));
+        // #676: session_end must be async and await a bounded flush of the
+        // in-flight postHook fetch, otherwise the gateway tears the plugin
+        // down before the session-end request reaches the server.
+        assert!(plugin.contains("const HOOK_DISPOSE_DRAIN_BUDGET_MS = 2000;"));
+        assert!(plugin.contains("function disposeDrainTimeout(): Promise<void>"));
+        assert!(plugin.contains("async function drainHookQueueForDispose(): Promise<void>"));
+        assert!(plugin.contains("function trackHookRequest("));
+        assert!(plugin.contains("api.on(\"session_end\", async (event: any, ctx: any) => {"));
+        assert!(plugin.contains("await drainHookQueueForDispose();"));
+        assert!(
+            !plugin.contains("api.on(\"session_end\", (event: any, ctx: any) => {"),
+            "session_end must not regress to the sync fire-and-forget form: {plugin}"
+        );
         assert!(plugin.contains("api.on(\"before_prompt_build\""));
         assert!(plugin.contains("api.on(\"before_tool_call\""));
         assert!(plugin.contains("api.on(\"after_tool_call\""));

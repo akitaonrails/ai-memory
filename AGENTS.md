@@ -70,6 +70,11 @@ Many projects use CLAUDE.md for Claude Code and
 AGENTS.md for Codex / OpenCode / OpenCode 2 / Cursor / Gemini CLI / Grok Build CLI / Kimi Code / Kiro CLI / Command Code,
 but if the project says one file is canonical, use that file.
 
+Claude Code loads `CLAUDE.md` and does not read `AGENTS.md`. In a project
+where `AGENTS.md` is canonical, give `CLAUDE.md` a bare `@AGENTS.md` import
+line. Without it a rule written to `AGENTS.md` is absent from context at
+session start and reaches Claude Code only if the agent opens the file.
+
 If the rule is a standing *user/team* preference that should apply to
 every project (tech choices, code style, personal conventions), save it
 to ai-memory's reserved global scope instead — the durable-pages skill
@@ -462,7 +467,7 @@ Additional boundary rules:
 - **Auth ladder:** static root bearer token → DB-user tokens
   (attribution only, no admin) → OIDC device tokens at the hook edge.
   `/admin/*` becomes root-only the moment the first DB user exists.
-- **Dependency policy:** `cargo deny check --all-features` and
+- **Dependency policy:** `cargo deny --all-features check` and
   `cargo audit` run in CI; do not add dependencies without checking the
   project doesn't already have the capability, and match existing
   versions/idioms.
