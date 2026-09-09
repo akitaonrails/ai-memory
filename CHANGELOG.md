@@ -84,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a failure gave no clue which endpoint answered. The message now leads
   with the request method and path: `GET /admin/open-sessions: server
   returned 404 Not Found: <body>`. The error keeps the path only, so a
-  token in the URL userinfo or query string never reaches a log line.
+  token in the URL userinfo or query string never reaches a log line. (#679)
 - Wiki auto-commits stage what the wiki wrote instead of walking the
   whole tree, keep the repository open between commits, and no longer
   drop the commit when another session is writing a file at the same
@@ -105,7 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   false-positive "a newer image is available on Docker Hub" warning on x86_64
   and Podman. Additionally, `emit_docker_run_script` now preserves volume mount
   modes (such as `:Z` on SELinux/Podman environments) and filters transient
-  runtime environment variables (`HOSTNAME`, `container=podman`).
+  runtime environment variables (`HOSTNAME`, `container=podman`). (#673)
 
 ## [2.1.1] - 2026-09-07
 
