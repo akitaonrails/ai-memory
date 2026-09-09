@@ -7,6 +7,33 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
+The launcher resolves its executable name through `PATH` directly — it does
+not go through an interactive shell, so a `claude` defined only as a shell
+`alias` in `.bashrc`/`.zshrc` is invisible to it. If you switch Claude
+accounts by alias, put a same-named script or shim earlier on `PATH` instead
+(or pass `--executable PATH`, which also resolves a bare name through
+`PATH`), so the resolved `claude` process actually is the one you meant.
+
+**Multiple Claude accounts (e.g. Corporate and Personal).** Any harness name
+starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
+and always selects the Claude harness — the exact spelling never changes
+the agent kind, session store, or transcript import.
+Combine that wildcard with `--executable` to launch the right account's
+binary while keeping each account's managed workstream distinguishable in
+your shell history:
+
+```bash
+# ~/bin/claude-corp and ~/bin/claude-personal are wrapper scripts (earlier on
+# PATH than the bare `claude`) that each exec the real claude binary with
+# that account's config/credentials directory.
+ai-memory run claude-corp --executable claude-corp --model opus
+ai-memory run claude-personal --executable claude-personal
+```
+
+Only the `--executable` value matters for which binary actually runs; the
+positional name is free-form as long as it starts with `claude`, so pick
+whatever reads clearly to you.
+
 ```bash
 cd /path/to/project
 
@@ -15,6 +42,8 @@ ai-memory run claude
 ai-memory run codex --yolo
 # return to Claude Code later; ai-memory supplies Claude's native --resume
 ai-memory run claude --model opus
+# any `claude*` name is accepted (see "Multiple Claude accounts" above)
+ai-memory run claude-corp
 # Kimi Code installs `kimi`; `kimi-cli` is accepted as a launcher alias
 ai-memory run kimi-cli
 # Command Code uses `command-code` on Unix and `cmdc` on native Windows
@@ -42,7 +71,7 @@ file, and the current checkout remain authoritative.
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh]
-              [claude|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
+              [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
 
