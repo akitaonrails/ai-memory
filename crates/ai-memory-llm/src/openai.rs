@@ -599,7 +599,7 @@ fn model_requires_default_temperature(model: &str) -> bool {
     model_requires_max_completion_tokens(model)
 }
 
-fn is_openrouter_base(url: &str) -> bool {
+pub(crate) fn is_openrouter_base(url: &str) -> bool {
     url.to_ascii_lowercase().contains("openrouter.ai")
 }
 

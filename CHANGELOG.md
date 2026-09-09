@@ -59,7 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#675)
 - `memory_install_self_routing` accepts `compact: Option<bool>` so agent-driven
   refreshes of a compact-installed file preserve the compact routing block
-  instead of rewriting it back to full.
+  instead of rewriting it back to full. (#685)
+- The `openai-compat` provider now sends OpenRouter's app-attribution
+  headers (`HTTP-Referer`, `X-Title`) by default when its base URL points
+  at `openrouter.ai`, so ai-memory's usage shows up on OpenRouter's app
+  leaderboard. An explicit `AI_MEMORY_LLM_HEADERS` entry for either header
+  still wins, and a non-OpenRouter compat endpoint (Ollama, vLLM, LM
+  Studio) never receives them. (#686)
 
 ### Changed
 - The managed routing snippet now states that Claude Code loads `CLAUDE.md` and
