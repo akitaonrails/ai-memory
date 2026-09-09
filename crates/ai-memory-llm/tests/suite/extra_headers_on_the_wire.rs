@@ -11,7 +11,8 @@
 
 use ai_memory_llm::types::ChatRequest;
 use ai_memory_llm::{
-    DEFAULT_USER_AGENT, ExtraHeaders, ProviderAuth, ProviderChoice, ProviderConfig, build_provider,
+    DEFAULT_USER_AGENT, ExtraHeaders, OPENROUTER_HTTP_REFERER, OPENROUTER_X_TITLE, ProviderAuth,
+    ProviderChoice, ProviderConfig, build_provider,
 };
 use secrecy::SecretString;
 use serde_json::json;
@@ -119,6 +120,61 @@ async fn provider_owned_headers_survive_alongside_operator_headers() {
         1,
         "provider auth must be sent exactly once"
     );
+}
+
+/// A base URL that is not OpenRouter must not receive OpenRouter's
+/// attribution headers — a self-hosted Ollama/vLLM/LM Studio endpoint has no
+/// leaderboard to attribute to.
+#[tokio::test]
+async fn a_non_openrouter_compat_endpoint_does_not_receive_openrouter_headers() {
+    let request = captured_request(ExtraHeaders::default()).await;
+    assert!(values(&request, "http-referer").is_empty());
+    assert!(values(&request, "x-title").is_empty());
+}
+
+/// OpenRouter attributes usage on its app leaderboard by `HTTP-Referer` and
+/// `X-Title`; without these on the wire, ai-memory's requests would arrive
+/// unattributed.
+#[tokio::test]
+async fn openrouter_app_headers_reach_the_provider_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .mount(&server)
+        .await;
+
+    // `is_openrouter_base` only checks for the substring `openrouter.ai`, so
+    // a fake path segment on the local mock server exercises the same code
+    // path a real `https://openrouter.ai/api/v1` base URL would.
+    let base_url = format!("{}/openrouter.ai", server.uri());
+    let provider = build_provider(ProviderConfig {
+        provider: ProviderChoice::OpenAiCompat,
+        model: "anthropic/claude-sonnet-4.6".into(),
+        auth: ProviderAuth::optional_api_key_from_env("LLM_API_KEY", None),
+        base_url: Some(base_url),
+        compat_strict: false,
+        request_timeout_secs: 30,
+        reasoning_effort: None,
+        extra_headers: ExtraHeaders::default(),
+    })
+    .expect("provider builds");
+
+    provider
+        .complete(ChatRequest::user_prompt("hi"))
+        .await
+        .expect("mock responds 200");
+
+    let received = server
+        .received_requests()
+        .await
+        .expect("mock recorded requests");
+    assert_eq!(received.len(), 1, "expected exactly one upstream request");
+    let request = &received[0];
+    assert_eq!(
+        values(request, "http-referer"),
+        vec![OPENROUTER_HTTP_REFERER]
+    );
+    assert_eq!(values(request, "x-title"), vec![OPENROUTER_X_TITLE]);
 }
 
 /// The `opencode` provider defaults to Go, so a base URL an operator sets

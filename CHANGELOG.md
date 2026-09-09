@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The `openai-compat` provider now sends OpenRouter's app-attribution
+  headers (`HTTP-Referer`, `X-Title`) by default when its base URL points
+  at `openrouter.ai`, so ai-memory's usage shows up on OpenRouter's app
+  leaderboard. An explicit `AI_MEMORY_LLM_HEADERS` entry for either header
+  still wins, and a non-OpenRouter compat endpoint (Ollama, vLLM, LM
+  Studio) never receives them.
+
 ### Changed
 - The managed routing snippet now states that Claude Code loads `CLAUDE.md` and
   does not read `AGENTS.md`: a project whose canonical instruction file is

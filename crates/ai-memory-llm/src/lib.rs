@@ -54,6 +54,19 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 /// it.
 pub const DEFAULT_USER_AGENT: &str = concat!("ai-memory/", env!("CARGO_PKG_VERSION"));
 
+/// `HTTP-Referer` ai-memory sends to OpenRouter.
+///
+/// OpenRouter attributes usage to an app on its public leaderboard by
+/// `HTTP-Referer` and [`OPENROUTER_X_TITLE`]; without them, ai-memory's
+/// requests show up unattributed. Layered under `AI_MEMORY_LLM_HEADERS` by
+/// [`factory::build_provider`] only when the `openai-compat` base URL points
+/// at `openrouter.ai`, so a non-OpenRouter compat endpoint (Ollama, vLLM,
+/// LM Studio) never receives these.
+pub const OPENROUTER_HTTP_REFERER: &str = "https://github.com/akitaonrails/ai-memory";
+
+/// `X-Title` ai-memory sends to OpenRouter. See [`OPENROUTER_HTTP_REFERER`].
+pub const OPENROUTER_X_TITLE: &str = "ai-memory";
+
 pub mod anthropic;
 pub mod auth;
 pub mod copilot;
