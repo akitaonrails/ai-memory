@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- A bare `LLM_BASE_URL` in the environment no longer redirects providers that
+  talk to a fixed vendor endpoint. The variable is a cross-tool convention an
+  operator exports once for a local Ollama, and ai-memory fed it to every
+  provider: a `gemini` server then POSTed to
+  `http://localhost:11434/v1beta/models/<model>:generateContent` and got Ollama's
+  plain-text `404 page not found`, surfacing as
+  `502 Bad Gateway: {"error":"provider error 404: 404 page not found"}` on
+  bootstrap and consolidation. It now reaches only the dialects whose endpoint
+  the operator supplies anyway — `openai-compat`, which has none without it, and
+  `opencode`, whose Zen catalogue is an override — and is ignored elsewhere with
+  a startup `warn!` naming the provider and the URL. An explicit `llm_base_url`
+  (or `AI_MEMORY_LLM_BASE_URL`) still configures any provider, so proxying a
+  vendor endpoint on purpose is unchanged. `ai-memory llm-test` resolves the base
+  URL the same way, so it reproduces what `serve` will do instead of inheriting
+  the same ambient override (#691).
 - The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
   builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
   final link no longer gets OOM-killed on low-memory build hosts, and the

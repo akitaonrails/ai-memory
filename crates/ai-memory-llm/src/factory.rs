@@ -82,6 +82,22 @@ impl ProviderChoice {
             },
         }
     }
+
+    /// Whether the operator, rather than the vendor, decides where this
+    /// provider's endpoint lives.
+    ///
+    /// True for the self-hosted / aggregator dialects: `openai-compat` has
+    /// no endpoint at all without one, and `opencode` reaches Zen's general
+    /// catalogue only through an override. Every other provider talks to a
+    /// fixed vendor host, and a base URL aimed elsewhere does not speak its
+    /// dialect — a Gemini request against an Ollama host is a 404, not a
+    /// degraded answer. Callers use this to decide whether an *ambient*
+    /// base URL (the cross-tool `LLM_BASE_URL` convention) may configure the
+    /// provider; an explicit ai-memory setting always may.
+    #[must_use]
+    pub const fn endpoint_is_operator_chosen(self) -> bool {
+        matches!(self, Self::OpenAiCompat | Self::OpenCode)
+    }
 }
 
 /// All settings needed to construct one LLM provider instance.
@@ -388,6 +404,33 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exhaustive on purpose: adding a provider must be a decision about whose
+    // endpoint it is, not a default inherited from whichever arm was copied.
+    #[test]
+    fn only_the_operator_supplied_dialects_accept_an_ambient_base_url() {
+        for choice in [ProviderChoice::OpenAiCompat, ProviderChoice::OpenCode] {
+            assert!(
+                choice.endpoint_is_operator_chosen(),
+                "{} has no endpoint without an operator-supplied one",
+                choice.name()
+            );
+        }
+        for choice in [
+            ProviderChoice::Anthropic,
+            ProviderChoice::OpenAi,
+            ProviderChoice::Gemini,
+            ProviderChoice::OpenAiOAuth,
+            ProviderChoice::Copilot,
+            ProviderChoice::AnthropicOAuth,
+        ] {
+            assert!(
+                !choice.endpoint_is_operator_chosen(),
+                "{} talks to a fixed vendor host",
+                choice.name()
+            );
+        }
+    }
 
     #[test]
     fn provider_choices_declare_current_auth_requirements() {
