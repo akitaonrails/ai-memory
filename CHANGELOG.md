@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- Admin requests that fail for a reason the server owns are now logged
+  server-side instead of existing only in the response body. `POST
+  /admin/bootstrap` and the auto-improve routes serialized the error into JSON
+  and told the log nothing, so an upstream provider failure could break every
+  bootstrap while the log showed only the run starting — and a scheduled
+  auto-improve tick, which has no client to print the body, failed with no
+  operator-visible trace at all. A 5xx now emits a `warn!` naming the status,
+  the operation, and the error. A 4xx stays quiet: the caller was told and the
+  caller was at fault, so logging those would let any client fill the log at
+  will (#692).
 - The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
   builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
   final link no longer gets OOM-killed on low-memory build hosts, and the
