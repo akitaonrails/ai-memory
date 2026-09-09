@@ -1125,6 +1125,14 @@ struct ExploreArgs {
     #[serde(default)]
     workspace: Option<String>,
 }
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+struct InstallSelfRoutingArgs {
+    /// Return the compact routing block instead of full operational guidance.
+    /// Use when managed Agent Skills are installed or when refreshing a file that
+    /// already uses the compact snippet.
+    #[serde(default)]
+    compact: Option<bool>,
+}
 
 // The "you MUST pass exactly one of path/query" contract lives in the
 // field descriptions and the runtime validation, NOT in a root-level
@@ -3968,8 +3976,11 @@ impl AiMemoryServer {
         `markered_block` for the slim CLAUDE.md / AGENTS.md snippet, \
         `agent_filenames` for rules-file targets, `managed_skills` for \
         Agent Skill files, and `target_hints` for project/global \
-        `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, `$GROK_HOME/skills` (default `~/.grok/skills`), and Devin Windows global roots. Use when the user \
-        asks to install or refresh ai-memory routing in this project. \
+        `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, \
+        `$GROK_HOME/skills` (default `~/.grok/skills`), and Devin Windows global roots. \
+        Use when the user asks to install or refresh ai-memory routing in this project. \
+        Pass `compact: true` to return the compact routing block that delegates \
+        to installed Agent Skills, or when refreshing a file that already uses the compact snippet. \
         After calling, use your Write/Edit tool to preserve non-ai-memory \
         user content: replace only an existing `<!-- ai-memory:start -->` \
         / `<!-- ai-memory:end -->` block whose delimiters appear alone on \
@@ -3981,7 +3992,10 @@ impl AiMemoryServer {
         managed marker; do not overwrite unmanaged same-name skills unless \
         the human explicitly forces replacement."
     )]
-    async fn memory_install_self_routing(&self) -> Result<CallToolResult, McpError> {
+    async fn memory_install_self_routing(
+        &self,
+        Parameters(args): Parameters<InstallSelfRoutingArgs>,
+    ) -> Result<CallToolResult, McpError> {
         let managed_skills: Vec<_> = ai_memory_core::routing_skills::MANAGED_SKILLS
             .iter()
             .map(|skill| {
@@ -3993,8 +4007,15 @@ impl AiMemoryServer {
                 })
             })
             .collect();
+        let is_compact = args.compact.unwrap_or(false);
+        let markered_block = if is_compact {
+            ai_memory_core::compact_block()
+        } else {
+            ai_memory_core::full_block()
+        };
         let response = serde_json::json!({
-            "markered_block": ai_memory_core::full_block(),
+            "markered_block": markered_block,
+            "compact": is_compact,
             "marker_start": ai_memory_core::MARKER_START,
             "marker_end": ai_memory_core::MARKER_END,
             "agent_filenames": {
@@ -4037,6 +4058,7 @@ impl AiMemoryServer {
             "notes": [
                 "Pick the filename matching your own agent identity.",
                 "If the target file already contains <!-- ai-memory:start --> / <!-- ai-memory:end --> delimiters alone on their own lines, replace ONLY that line-delimited block in place; ignore inline mentions and preserve every other line.",
+                "If the target file already uses the compact routing block (or if managed Agent Skills handle detailed routing), call memory_install_self_routing with compact: true so the compact format is preserved.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
                 "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path>, .agents/skills/<relative_path>, .devin/skills/<relative_path>, .grok/skills/<relative_path>, $GROK_HOME/skills/<relative_path> (default ~/.grok/skills), or %APPDATA%\\devin\\skills\\<relative_path> on Windows global Devin installs.",
@@ -5725,7 +5747,13 @@ mod tests {
     async fn memory_install_self_routing_response_includes_managed_skills_and_targets() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
 
-        let response = call_tool_json(server.memory_install_self_routing().await.unwrap());
+        let response = call_tool_json(
+            server
+                .memory_install_self_routing(Parameters(InstallSelfRoutingArgs::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(!response["compact"].as_bool().unwrap());
 
         assert_eq!(
             response["markered_block"].as_str().unwrap(),
@@ -5882,6 +5910,25 @@ mod tests {
         assert!(notes.contains("%APPDATA%\\devin\\skills"));
         assert!(notes.contains("explicitly forces replacement"));
     }
+    #[tokio::test]
+    async fn memory_install_self_routing_compact_returns_compact_block() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+
+        let response = call_tool_json(
+            server
+                .memory_install_self_routing(Parameters(InstallSelfRoutingArgs {
+                    compact: Some(true),
+                }))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(
+            response["markered_block"].as_str().unwrap(),
+            ai_memory_core::compact_block()
+        );
+        assert!(response["compact"].as_bool().unwrap());
+    }
 
     #[tokio::test]
     async fn memory_install_self_routing_tool_description_covers_snippet_and_skills() {
@@ -5915,6 +5962,10 @@ mod tests {
         assert!(
             desc.contains("unmanaged same-name skills") && desc.contains("explicitly forces"),
             "tool description must mention safe overwrite behavior; got: {desc}"
+        );
+        assert!(
+            desc.contains("compact: true"),
+            "tool description must mention compact option; got: {desc}"
         );
     }
 

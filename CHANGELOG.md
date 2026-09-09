@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   find it), the untrusted-history security scaffold, and the cross-harness
   memory-of-record guidance; `full_block` and the default remain unchanged.
   (#675)
+- `memory_install_self_routing` accepts `compact: Option<bool>` so agent-driven
+  refreshes of a compact-installed file preserve the compact routing block
+  instead of rewriting it back to full.
 
 ### Fixed
 - Wiki auto-commits stage what the wiki wrote instead of walking the
