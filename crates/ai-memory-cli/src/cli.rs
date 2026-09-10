@@ -1671,6 +1671,22 @@ pub enum McpClient {
     /// `context_servers` map. This integration is MCP-only because Zed
     /// does not expose ai-memory-compatible lifecycle hooks.
     Zed,
+    /// Muse Code (Meta) — `~/.config/muse/settings.json`, servers under a
+    /// top-level snake_case `mcp_servers` map with `transport:
+    /// "streamable_http"` + `url` + `headers`.
+    ///
+    /// Two documented constraints shape the generated entry. The settings
+    /// file must carry `"schema_version": 1` or *every* Muse Code command
+    /// fails at startup with `malformed settings file`, so the writer adds
+    /// the key when it is absent and never rewrites an existing value. And
+    /// `mode` defaults to `required`, which aborts the whole Muse run when
+    /// the server is unreachable; ai-memory augments a session rather than
+    /// gating it, so the entry sets `mode: "optional"` explicitly.
+    ///
+    /// MCP-only: Muse Code's hook surface is documented but its
+    /// `SessionStart` output contract is not, so lifecycle capture and
+    /// managed workstreams are not claimed. See `install-mcp --client muse`.
+    Muse,
 }
 
 /// Arguments for `commit`.

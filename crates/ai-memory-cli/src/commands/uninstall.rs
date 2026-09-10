@@ -358,6 +358,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             KiroCli,
             CommandCode,
             Swival,
+            Muse,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -1121,6 +1122,9 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Zed => Some(&["context_servers"]),
+        // Muse Code spells the key snake_case; the camelCase spelling the
+        // clients above use would leave the entry behind.
+        McpClient::Muse => Some(&["mcp_servers"]),
         McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
     }
 }

@@ -38,8 +38,8 @@ ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
 not. Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop, VS Code Copilot, and Zed are **MCP-only** here: they
-expose long-term memory to their LLMs via ai-memory's MCP tools
+Claude Desktop, VS Code Copilot, Zed, and Muse Code are **MCP-only** here:
+they expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
 endpoint. The trade-off:
@@ -120,7 +120,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / vscode-copilot / zed / muse
 > ```
 
 ---
@@ -334,6 +334,75 @@ resuming when you need manual continuity.
 
 Sources: <https://zed.dev/docs/ai/mcp>,
 <https://zed.dev/docs/configuring-zed>.
+
+---
+
+## Muse Code
+
+**Status:** MCP supported through Muse Code's native streamable-HTTP
+transport, including bearer authentication. No lifecycle-hook integration
+and no managed-workstream adapter.
+
+**Config file:** `~/.config/muse/settings.json`. Muse also reads
+`$XDG_CONFIG_HOME` for its skill roots; on a non-default XDG setup pass the
+concrete path with `--config-file`.
+
+Servers live under the top-level snake_case `mcp_servers` key. Note the
+casing: `mcpServers`, which most other clients use, is ignored here.
+
+```json
+{
+  "schema_version": 1,
+  "mcp_servers": {
+    "ai-memory": {
+      "transport": "streamable_http",
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      },
+      "enabled": true,
+      "mode": "optional"
+    }
+  }
+}
+```
+
+Print or apply the configuration with:
+
+```bash
+ai-memory install-mcp --client muse
+ai-memory install-mcp --client muse --apply \
+  --server-url "http://homelab:49374/mcp" \
+  --auth-token "$TOKEN"
+```
+
+Two details of Muse's schema are worth knowing before hand-editing the file:
+
+- **`"schema_version": 1` is mandatory.** A settings file that omits it fails
+  *every* `muse` command at startup with `malformed settings file`. `--apply`
+  adds the key when it is missing and never rewrites an existing value, so a
+  future schema is not silently downgraded.
+- **`mode` defaults to `required`**, and a required server that fails to start
+  aborts the whole Muse run. ai-memory writes `"mode": "optional"` explicitly
+  so an unreachable memory server costs you recall rather than the session.
+
+A non-default `framing` value is rejected on `streamable_http`, so the
+generated entry omits the key.
+
+**Skills:** no extra step is needed. Muse Code loads user skills from
+`$XDG_CONFIG_HOME/muse/skills` and `~/.agents/skills`, and
+`ai-memory install-skills` already writes the cross-client `~/.agents/skills`
+root, so the ai-memory routing skills are visible to Muse. Confirm with
+`muse skills list`.
+
+Muse Code documents a lifecycle hook surface, but the output contract of its
+`SessionStart` event is not specified, so automatic capture and automatic
+handoff injection are not claimed here. Ask the agent to call
+`memory_handoff_begin` before leaving and `memory_handoff_accept` when
+resuming when you need continuity.
+
+Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
+<https://dev.meta.ai/docs/muse-code/extending>.
 
 ---
 
