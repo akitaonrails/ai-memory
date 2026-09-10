@@ -743,10 +743,28 @@ docker run --rm akitaonrails/ai-memory:latest \
         --auth-token "$TOKEN"
 ```
 
-Codex still does not expose a reliable true session-end hook. Its `Stop` hook is
-captured as a turn/stop observation only; ai-memory does **not** treat it as
-SessionEnd. When you need the final session summary, handoff, and
-auto-improvement eligibility for the current project, run:
+Native Codex tool hooks use top-level `tool_name`, `tool_input`, `tool_response`,
+and `tool_use_id` fields (verified against CLI 0.154.0). ai-memory records the
+tool family and call ID on `PreToolUse` and `PostToolUse`; recognized tools such
+as `Bash` and `apply_patch` also retain a sanitized response excerpt on
+`PostToolUse`, capped at 2 KB including metadata. Structured JSON responses are
+flattened using the same bounded excerpt path. Inputs are not copied into
+observations, and unknown tools (including unrecognized MCP names) retain only
+metadata. `PostToolUse` alone does not prove success, so Codex outcomes remain
+`unknown`.
+
+Capture exclusions still run before native spooling. Codex's `apply_patch`
+passes patch text in `tool_input.command`, which does not provide direct file
+paths to the capture policy. With active `ignore_paths`, those events retain
+only metadata; ai-memory does not parse patch or shell text to infer paths.
+Tool events are delivered at the normal 32-event catch-up threshold or a
+lifecycle drain boundary, so a small active turn may still have queued events.
+
+Codex CLI 0.145.0 and later expose a native `SessionEnd` hook. `Stop` is captured
+as a turn boundary and leaves the session open; a native `SessionEnd` triggers
+the final summary, handoff, and auto-improvement eligibility. See the
+[Codex hook lifecycle](https://learn.chatgpt.com/docs/hooks#sessionend) for when
+Codex ends a session. For older clients or a missed session-end delivery, run:
 
 ```bash
 ai-memory finalize-session

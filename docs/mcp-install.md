@@ -1288,11 +1288,13 @@ still-active sessions from `dispose` during normal plugin teardown; abrupt
 process exits can still lose that fallback, so `session.deleted` remains the
 primary close path.
 
-Codex and Antigravity `Stop` events are not session ends. Their hook installs
-intentionally omit `SessionEnd`; `ai-memory finalize-session` defaults to
-Codex, while `--agent antigravity-cli` selects Antigravity. The command finds
-the latest matching open session for the current workspace/project and posts a
-synthetic `session-end` event through the same server path as real hook clients.
+Codex and Antigravity `Stop` events are not session ends. Codex's hook install
+registers native `SessionEnd` for CLI 0.145.0 and later; Antigravity still needs
+explicit finalization. `ai-memory finalize-session` defaults to Codex for older
+clients or a missed native end, while `--agent antigravity-cli` selects
+Antigravity. The command finds the latest matching open session for the current
+workspace/project and posts a synthetic `session-end` event through the same
+server path as real hook clients.
 Use `--all` only when you want to close every matching open session for the
 selected agent in that scope.
 
