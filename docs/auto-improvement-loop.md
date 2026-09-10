@@ -515,6 +515,10 @@ non-indexed sidecars plus SQLite rows, with list/diff/approve/reject commands
 and audit rows. Approval applies through the existing wiki mutation boundaries
 with the `auto_improve` actor preserved in proposal provenance.
 
+Only the project-root `_pending/` directory is reserved proposal storage and
+excluded from the OKF migration scan. A nested path such as
+`notes/_pending/legacy.md` remains an ordinary wiki page and must still migrate.
+
 Tests:
 
 1. Pending proposals survive restart.

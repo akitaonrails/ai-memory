@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- Limited the OKF migration's `_pending/` exclusion to project roots, so
+  ordinary nested pages such as `notes/_pending/legacy.md` still trigger a
+  safety backup and migrate. Project-root proposal sidecars remain excluded
+  (#695).
 - The Docker wrapper (`bin/ai-memory`) now forwards `GEMINI_API_KEY` and
   `GOOGLE_API_KEY` into the container. Every other provider credential was on
   the `-e` forwarding allowlist, but these two were missing, so
