@@ -931,11 +931,15 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     // stdin on a blocking thread that cannot be cancelled, and
                     // dropping the runtime waits for blocking tasks, so the
                     // process would sit there until the client closed the pipe.
-                    // Leaving here is exactly what the default disposition
-                    // already does for a server that is not PID 1 — the same
-                    // abruptness, now reachable inside the image too — and 0
-                    // matches the HTTP arm's exit for an operator-requested
-                    // stop.
+                    // Exiting here skips what unwinding would run: the store
+                    // writer's `Shutdown`-and-join and the runtime's own
+                    // shutdown, so whatever is still queued on the writer is
+                    // dropped. That is what the default disposition already
+                    // does today for a server that is not PID 1 — the same
+                    // abruptness, made reachable inside the image too, not a
+                    // new one. Only the exit code matches the HTTP arm, which
+                    // reaches its 0 by unwinding after
+                    // `with_graceful_shutdown`.
                     std::process::exit(0);
                 }
             }
