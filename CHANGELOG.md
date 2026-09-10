@@ -42,6 +42,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the operation, and the error. A 4xx stays quiet: the caller was told and the
   caller was at fault, so logging those would let any client fill the log at
   will (#692).
+- `serve --transport stdio` ignored Ctrl-C. The stdio arm awaited the MCP
+  service without installing a signal handler, so the interrupt was left to the
+  default disposition — which the kernel discards when the process is PID 1 in
+  its namespace, as it is under the container entrypoint. The server stayed up
+  with its watcher and scheduler still ticking, and only closing stdin stopped
+  it. `serve` now watches for Ctrl-C from before the `initialize` handshake, so
+  a server started by hand and never contacted by a client is interruptible
+  too, and exits instead of parking on the uncancellable blocking read of
+  stdin. That exit is abrupt — it drops whatever is still queued on the store
+  writer — which is what an interrupt already does to a server that is not
+  PID 1. The HTTP transport already had this (#699).
 - The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
   builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
   final link no longer gets OOM-killed on low-memory build hosts, and the
