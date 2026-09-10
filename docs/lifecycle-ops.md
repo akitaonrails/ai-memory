@@ -89,6 +89,13 @@ purge needs. Rebuilding only the indexes a given caller "should" have touched
 is what leaves a managed agent's transcript text in the file after an operator
 asked for it to be reclaimed.
 
+Session purges hold the wiki mutation guard across the database deletion and
+file cleanup. In-flight page writes and watcher reindexes finish before the
+purge starts; new ones wait until cleanup completes. This also serializes the
+purge with wiki project/session moves. Admission webhooks run before this guard.
+File cleanup failures still leave the database purge committed and are reported
+in `files_failed`; this coordination does not provide crash-atomic rollback.
+
 ### Scope containment
 
 The session id is never authority on its own. Every statement is filtered on

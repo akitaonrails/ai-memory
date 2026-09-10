@@ -22,6 +22,16 @@ use crate::git::{Checkpoint, GitAdapter};
 use crate::markdown::{Markdown, derive_title, emit, parse};
 use crate::watcher::is_pending_path;
 
+/// Store deletion and best-effort file cleanup from [`Wiki::purge_session`].
+pub struct PurgeSessionOutcome {
+    /// Committed database deletion counts and paths.
+    pub summary: ai_memory_store::PurgeSessionSummary,
+    /// Paths successfully removed from disk.
+    pub files_deleted: Vec<PagePath>,
+    /// Paths whose file cleanup failed after the database committed.
+    pub files_failed: Vec<PagePath>,
+}
+
 /// Summary of a [`Wiki::reindex_all`] run.
 #[derive(Debug, Default, Clone)]
 pub struct ReindexSummary {
@@ -1206,30 +1216,49 @@ impl Wiki {
         }
     }
 
-    /// Remove one on-disk page file without touching the store.
-    ///
-    /// Used after a scoped store purge has already deleted the authoritative
-    /// rows and returned the affected paths. A missing file is treated as
-    /// already removed; any other filesystem error is reported to the caller.
+    /// Purge a session and its page files under one exclusive mutation guard.
+    /// Admission must run before this call. File failures do not roll back the
+    /// committed database purge and are returned for partial-failure reporting.
+    /// Holding the guard before submitting SQL prevents a watcher reindex,
+    /// page write or project move from landing between SQL and file cleanup.
     ///
     /// # Errors
-    /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
-    pub async fn remove_page_file(
+    /// Returns the store error without removing files if the database purge fails.
+    pub async fn purge_session(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
-        path: &PagePath,
-    ) -> WikiResult<bool> {
+        session_id: SessionId,
+        author_id: Option<UserId>,
+        compaction: ai_memory_store::Compaction,
+    ) -> ai_memory_store::StoreResult<PurgeSessionOutcome> {
         let _guard = self.mutation_lock.write().await;
-        let abs = self.abs_path(workspace_id, project_id, path);
-        match self.git.remove_file(&abs) {
-            Ok(()) => {
-                sync_parent_best_effort(&abs);
-                Ok(true)
+        let summary = self
+            .writer
+            .purge_session(workspace_id, project_id, session_id, author_id, compaction)
+            .await?;
+        let mut files_deleted = Vec::new();
+        let mut files_failed = Vec::new();
+        for path in &summary.removed_paths {
+            let abs = self.abs_path(workspace_id, project_id, path);
+            match self.git.remove_file(&abs) {
+                Ok(()) => {
+                    sync_parent_best_effort(&abs);
+                    files_deleted.push(path.clone());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(operation = "purge-session", path = path.as_str(),
+                        error = %error, "session purge failed to remove wiki page file");
+                    files_failed.push(path.clone());
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(crate::WikiError::Io(e)),
         }
+        Ok(PurgeSessionOutcome {
+            summary,
+            files_deleted,
+            files_failed,
+        })
     }
 
     /// Dispatch non-blocking purge webhooks after the caller's purge has
@@ -5131,6 +5160,90 @@ mod tests {
         .await
         .unwrap();
         (store, wiki, ws, src, dst, sid, path)
+    }
+
+    #[tokio::test]
+    async fn purge_session_waits_for_in_flight_reindex_before_deleting_rows() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, _, sid, path) = session_with_page(&tmp).await;
+        let page_id = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        store.writer.end_session(sid, Some(page_id)).await.unwrap();
+
+        // Model a watcher that has acquired the shared guard but has not
+        // indexed its file yet. Poll the purge once, then fence the writer
+        // queue: any SQL it submitted must finish before this command replies.
+        let reader_guard = wiki.mutation_lock.read().await;
+        let purge = wiki.purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip);
+        tokio::pin!(purge);
+        tokio::select! {
+            biased;
+            result = &mut purge => panic!("purge bypassed an active reader: {}", result.is_ok()),
+            () = std::future::ready(()) => {}
+        }
+        store
+            .writer
+            .get_or_create_workspace("queue-fence")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_some(),
+            "purge must wait for the wiki guard before deleting SQL rows"
+        );
+        // Finish the already-admitted reindex without recursively locking.
+        wiki.reindex_page_locked(ws, proj, path.clone())
+            .await
+            .unwrap();
+        drop(reader_guard);
+        let outcome = purge.await.unwrap();
+        assert_eq!(outcome.files_deleted, vec![path.clone()]);
+        assert!(outcome.files_failed.is_empty());
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!wiki.abs_path(ws, proj, &path).exists());
+        assert!(wiki.reindex_page(ws, proj, path).await.is_err());
+        assert!(
+            store
+                .reader
+                .search_pages("consolidated".into(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_session_store_failure_preserves_page_file() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, other, sid, path) = session_with_page(&tmp).await;
+        let abs = wiki.abs_path(ws, proj, &path);
+        let before = std::fs::read(&abs).unwrap();
+        let result = wiki
+            .purge_session(ws, other, sid, None, ai_memory_store::Compaction::Skip)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ai_memory_store::StoreError::NotFound(_))
+        ));
+        assert_eq!(std::fs::read(&abs).unwrap(), before);
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     fn leftover_tempfiles(dir: &Path) -> Vec<String> {
