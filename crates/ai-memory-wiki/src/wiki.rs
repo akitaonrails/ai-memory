@@ -11,8 +11,8 @@ use ai_memory_core::{
 use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagesMode, ReaderPool, WriterHandle,
-    artifact_path_for, f32_vec_to_bytes,
+    FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagesMode, PurgeSessionSummary,
+    ReaderPool, WriterHandle, artifact_path_for, f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
@@ -23,9 +23,10 @@ use crate::markdown::{Markdown, derive_title, emit, parse};
 use crate::watcher::is_pending_path;
 
 /// Store deletion and best-effort file cleanup from [`Wiki::purge_session`].
+#[derive(Debug, Clone)]
 pub struct PurgeSessionOutcome {
     /// Committed database deletion counts and paths.
-    pub summary: ai_memory_store::PurgeSessionSummary,
+    pub summary: PurgeSessionSummary,
     /// Paths successfully removed from disk.
     pub files_deleted: Vec<PagePath>,
     /// Paths whose file cleanup failed after the database committed.
@@ -1223,7 +1224,8 @@ impl Wiki {
     /// page write or project move from landing between SQL and file cleanup.
     ///
     /// # Errors
-    /// Returns the store error without removing files if the database purge fails.
+    /// Returns [`WikiError::Store`] without removing files if the database
+    /// purge fails.
     pub async fn purge_session(
         &self,
         workspace_id: WorkspaceId,
@@ -1231,13 +1233,13 @@ impl Wiki {
         session_id: SessionId,
         author_id: Option<UserId>,
         compaction: ai_memory_store::Compaction,
-    ) -> ai_memory_store::StoreResult<PurgeSessionOutcome> {
+    ) -> WikiResult<PurgeSessionOutcome> {
         let _guard = self.mutation_lock.write().await;
         let summary = self
             .writer
             .purge_session(workspace_id, project_id, session_id, author_id, compaction)
             .await?;
-        let mut files_deleted = Vec::new();
+        let mut files_deleted = Vec::with_capacity(summary.removed_paths.len());
         let mut files_failed = Vec::new();
         for path in &summary.removed_paths {
             let abs = self.abs_path(workspace_id, project_id, path);
@@ -1248,8 +1250,12 @@ impl Wiki {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    tracing::warn!(operation = "purge-session", path = path.as_str(),
-                        error = %error, "session purge failed to remove wiki page file");
+                    tracing::warn!(
+                        operation = "purge-session",
+                        path = path.as_str(),
+                        error = %error,
+                        "session purge failed to remove wiki page file",
+                    );
                     files_failed.push(path.clone());
                 }
             }
@@ -5177,7 +5183,7 @@ mod tests {
         tokio::pin!(purge);
         tokio::select! {
             biased;
-            result = &mut purge => panic!("purge bypassed an active reader: {}", result.is_ok()),
+            result = &mut purge => panic!("purge bypassed an active reader: {result:?}"),
             () = std::future::ready(()) => {}
         }
         store
@@ -5222,6 +5228,56 @@ mod tests {
         );
     }
 
+    /// The writer's half of the same claim. `purge_session` holds the
+    /// exclusive guard across SQL and cleanup — proved by
+    /// `purge_session_waits_for_in_flight_reindex_before_deleting_rows` — and
+    /// `write_page` takes the shared one, so a write cannot install its file
+    /// while a purge owns the guard and would otherwise delete it during
+    /// cleanup. Removing the shared guard from `write_page` makes this fail.
+    #[tokio::test]
+    async fn page_write_cannot_land_while_the_purge_guard_is_held() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, _, _sid, _path) = session_with_page(&tmp).await;
+        let target = PagePath::new("decisions/keep.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &target);
+
+        let purge_guard = wiki.mutation_lock.write().await;
+        let write = wiki.write_page(req(
+            ws,
+            proj,
+            target.as_str(),
+            "kept body",
+            serde_json::json!({ "title": "Keep" }),
+        ));
+        tokio::pin!(write);
+        // A single poll would only prove the write did not finish in one
+        // step, which is true even without the guard: `write_page` parks on
+        // the writer queue before it touches disk. Give it real time instead.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut write)
+                .await
+                .is_err(),
+            "the page write must not complete while a purge owns the guard"
+        );
+        assert!(
+            !abs.exists(),
+            "no page file may be installed while a purge owns the guard"
+        );
+
+        drop(purge_guard);
+        write.await.unwrap();
+        assert!(abs.exists(), "the write completes once the purge releases");
+        assert!(
+            !store
+                .reader
+                .search_pages("kept".into(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "disk and index agree after the guard is released"
+        );
+    }
+
     #[tokio::test]
     async fn purge_session_store_failure_preserves_page_file() {
         let tmp = TempDir::new().unwrap();
@@ -5233,7 +5289,7 @@ mod tests {
             .await;
         assert!(matches!(
             result,
-            Err(ai_memory_store::StoreError::NotFound(_))
+            Err(WikiError::Store(ai_memory_store::StoreError::NotFound(_)))
         ));
         assert_eq!(std::fs::read(&abs).unwrap(), before);
         assert!(

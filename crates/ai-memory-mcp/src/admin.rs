@@ -3673,7 +3673,7 @@ async fn handle_purge_session(
     {
         Ok(s) => s,
         // Absent from this scope (or already purged) is a 404, not a fault.
-        Err(e @ StoreError::NotFound(_)) => {
+        Err(WikiError::Store(e @ StoreError::NotFound(_))) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": e.to_string() })),
