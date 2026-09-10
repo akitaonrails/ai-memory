@@ -1925,6 +1925,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_native_capture_policy_runs_before_spool_and_preserves_identity() {
+        for (tool, input, disposition) in [
+            (
+                "read_file",
+                serde_json::json!({"path": "secret/private.txt"}),
+                CaptureDisposition::Drop,
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({"command": "*** Begin Patch\n*** Add File: secret/private.txt\n+PRIVATE_CONTENT\n*** End Patch"}),
+                CaptureDisposition::MetadataOnly,
+            ),
+            (
+                "apply_patch",
+                serde_json::json!(null),
+                CaptureDisposition::MetadataOnly,
+            ),
+        ] {
+            for event in ["pre-tool-use", "post-tool-use"] {
+                let tmp = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    tmp.path().join(".ai-memory.toml"),
+                    "workspace = \"native\"\nproject = \"codex\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+                ).unwrap();
+                let data_dir = tmp.path().join("data");
+                let mut args = devin_hook_args(event);
+                args.agent = "codex".into();
+                let raw = serde_json::json!({
+                    "session_id": "native-codex", "cwd": tmp.path(), "turn_id": "turn-1",
+                    "hook_event_name": if event == "pre-tool-use" { "PreToolUse" } else { "PostToolUse" },
+                    "tool_name": tool, "tool_input": input, "tool_use_id": "call-native-1",
+                    "tool_response": {"content": [{"type": "text", "text": "PRIVATE_CONTENT"}]},
+                });
+                let mut stdout = Vec::new();
+                run_with_payload(
+                    Some(data_dir.clone()),
+                    args,
+                    raw.to_string(),
+                    &mut stdout,
+                    |_, _| {
+                        panic!("tool events below the threshold must only spool");
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(stdout, b"{}\n");
+                let spool = hook_spool::spool_dir(&data_dir);
+                if disposition == CaptureDisposition::Drop {
+                    assert!(!spool.exists());
+                } else {
+                    let entries = read_spooled_entries(&spool);
+                    assert_eq!(entries.len(), 1);
+                    let entry = &entries[0];
+                    assert_eq!(query_param(&entry.url, "agent"), Some("codex"));
+                    assert_eq!(query_param(&entry.url, "workspace"), Some("native"));
+                    assert_eq!(query_param(&entry.url, "project"), Some("codex"));
+                    assert!(query_param(&entry.url, "ingest_key").is_some());
+                    assert!(!entry.body.contains("PRIVATE_CONTENT"));
+                    assert!(!entry.body.contains("private.txt"));
+                    let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                    assert_eq!(body["session_id"], "native-codex");
+                    assert_eq!(body["tool_call_id"], "call-native-1");
+                    assert_eq!(body["_ai_memory_capture"]["disposition"], "metadata-only");
+                    assert_eq!(
+                        body["_ai_memory_capture"]["extraction_state"],
+                        "missing-or-malformed"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn hermes_file_exclusion_drops_before_spool_or_drain() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
