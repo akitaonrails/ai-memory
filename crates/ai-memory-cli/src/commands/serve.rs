@@ -1,6 +1,6 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -69,6 +69,98 @@ const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
 
 /// Lock file guarding a data dir against a second `ai-memory serve` (#563).
 const SERVE_LOCK_FILE: &str = ".serve.lock";
+
+/// How long a wait on the shutdown path may run before the drain it is
+/// waiting for is abandoned. axum's graceful shutdown waits for every
+/// in-flight connection and a stateful or SSE MCP client can hold one open
+/// indefinitely, so an unbounded drain is indistinguishable from ignoring the
+/// signal: `docker stop` and `systemctl stop` would still burn their own
+/// grace period and finish with SIGKILL (#699). Each wait is bounded on its
+/// own, so a stop can take a small multiple of this.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// The signals that stop a running server, listened for on both transports.
+///
+/// Installed before the transport starts. The server runs as PID 1 under
+/// `docker run` (no init shim), and for PID 1 the kernel discards any signal
+/// whose handler is not installed — so a SIGTERM arriving during a slow boot
+/// (the pre-migration archive, wiki migrations) must already have a listener
+/// waiting for it. A tokio `Signal` queues a signal received before the first
+/// `recv`, so registering early loses nothing (#699).
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    /// Install the listeners.
+    ///
+    /// A listener that cannot be registered degrades to the remaining one with
+    /// a warning: losing one way to stop the server is bad, refusing to start
+    /// over it is worse.
+    #[cfg(unix)]
+    fn install() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        fn listen(kind: SignalKind, name: &str) -> Option<tokio::signal::unix::Signal> {
+            match signal(kind) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        signal = name,
+                        "cannot listen for this shutdown signal; the server will not stop on it"
+                    );
+                    None
+                }
+            }
+        }
+
+        Self {
+            interrupt: listen(SignalKind::interrupt(), "SIGINT"),
+            terminate: listen(SignalKind::terminate(), "SIGTERM"),
+        }
+    }
+
+    /// Install the listeners. Non-unix has only ctrl-c.
+    #[cfg(not(unix))]
+    fn install() -> Self {
+        Self {}
+    }
+
+    /// Resolve with the name of the first shutdown signal to arrive.
+    #[cfg(unix)]
+    async fn recv(&mut self) -> &'static str {
+        match (self.interrupt.as_mut(), self.terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => tokio::select! {
+                _ = interrupt.recv() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+            },
+            (Some(interrupt), None) => {
+                interrupt.recv().await;
+                "SIGINT"
+            }
+            (None, Some(terminate)) => {
+                terminate.recv().await;
+                "SIGTERM"
+            }
+            // Both registrations failed: there is nothing left to wait for.
+            (None, None) => std::future::pending().await,
+        }
+    }
+
+    /// Resolve with the name of the first shutdown signal to arrive.
+    #[cfg(not(unix))]
+    async fn recv(&mut self) -> &'static str {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "ctrl-c listener failed; the server will not stop on it");
+            std::future::pending::<()>().await;
+        }
+        "ctrl-c"
+    }
+}
 
 /// The single-instance guard for `ai-memory serve`: an exclusive `flock` on
 /// `<data-dir>/.serve.lock` held for the process lifetime. The OS releases it
@@ -707,6 +799,11 @@ async fn run_session_consolidation_worker(
 /// Returns an error if the store cannot be opened, the watcher cannot
 /// install, or the transport setup fails.
 pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
+    // Before anything slow: boot takes the pre-migration archive and runs the
+    // wiki migrations, and a signal arriving in that window has to be caught
+    // rather than fall through to the default disposition (#699).
+    let mut shutdown = ShutdownSignals::install();
+
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
@@ -905,42 +1002,48 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     match args.transport {
         TransportKind::Stdio => {
             info!("MCP server ready on stdio (Ctrl-C to stop)");
-            // Ctrl-C has to be observed, and from before the transport is up.
-            // Two things conspire otherwise (#699). The default disposition is
-            // not enough: the container entrypoint runs this binary directly
-            // (`ENTRYPOINT ["/usr/local/bin/ai-memory"]`, no init), so the
-            // server is PID 1 in its namespace and the kernel drops a
-            // default-disposition signal sent to a namespace's init. And a
-            // handler installed *after* `serve()` would never be reached,
-            // because `serve()` blocks on the MCP `initialize` handshake — a
-            // server started by hand, with no client writing to stdin, sits
-            // there while the watcher and scheduler keep ticking. Racing the
-            // whole session covers both windows. The HTTP arm below has always
-            // had this, through `with_graceful_shutdown`.
-            let session = async {
-                let service = server.serve(stdio()).await?;
-                service.waiting().await?;
-                anyhow::Ok(())
+            // `serve` resolves only once a client has completed the MCP
+            // `initialize` handshake, so the signal races the handshake as
+            // well as the session that follows it: a Ctrl-C before any client
+            // connected is the exact state a launched-but-unused server sits
+            // in, and until #699 nothing here listened for one at all.
+            let service = tokio::select! {
+                service = server.serve(stdio()) => Some(service?),
+                signal = shutdown.recv() => {
+                    info!(signal, "shutdown signal received before a client connected; stopping");
+                    None
+                }
             };
-            tokio::select! {
-                result = session => result?,
-                _ = tokio::signal::ctrl_c() => {
-                    info!("ctrl-c received; shutting down");
-                    // Returning through `run()` would park on runtime
-                    // shutdown instead of exiting: the stdio transport reads
-                    // stdin on a blocking thread that cannot be cancelled, and
-                    // dropping the runtime waits for blocking tasks, so the
-                    // process would sit there until the client closed the pipe.
-                    // Exiting here skips what unwinding would run: the store
-                    // writer's `Shutdown`-and-join and the runtime's own
-                    // shutdown, so whatever is still queued on the writer is
-                    // dropped. That is what the default disposition already
-                    // does today for a server that is not PID 1 — the same
-                    // abruptness, made reachable inside the image too, not a
-                    // new one. Only the exit code matches the HTTP arm, which
-                    // reaches its 0 by unwinding after
-                    // `with_graceful_shutdown`.
-                    std::process::exit(0);
+            if let Some(service) = service {
+                // Take the token before `waiting` consumes the service:
+                // stopping the transport is the only way out of that await.
+                let stop = service.cancellation_token();
+                let mut waiting = std::pin::pin!(service.waiting());
+                let signal = tokio::select! {
+                    result = &mut waiting => {
+                        result?;
+                        None
+                    }
+                    signal = shutdown.recv() => Some(signal),
+                };
+                if let Some(signal) = signal {
+                    info!(
+                        signal,
+                        "shutdown signal received; stopping the stdio transport"
+                    );
+                    stop.cancel();
+                    // A signal is a normal stop, so nothing below turns it
+                    // into a failing exit — but neither does it wait forever.
+                    match tokio::time::timeout(SHUTDOWN_GRACE, waiting).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "stdio transport ended abnormally during shutdown");
+                        }
+                        Err(_) => tracing::warn!(
+                            grace_secs = SHUTDOWN_GRACE.as_secs(),
+                            "stdio transport did not stop within the shutdown grace period; exiting anyway"
+                        ),
+                    }
                 }
             }
         }
@@ -1323,23 +1426,58 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             }
             let shutdown_cancel = cancel.clone();
-            let serve_result = axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                info!("ctrl-c received; shutting down");
-                shutdown_cancel.cancel();
-            })
-            .await;
+            let serve_result = {
+                let serve = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let signal = shutdown.recv().await;
+                    info!(signal, "shutdown signal received; draining");
+                    shutdown_cancel.cancel();
+                })
+                .into_future();
+                let mut serve = std::pin::pin!(serve);
+                // Bound the drain. axum waits for every in-flight connection
+                // to close, and a stateful or SSE MCP client never closes one
+                // on its own — without this the shutdown outlives the
+                // supervisor's own patience and ends in SIGKILL (#699).
+                tokio::select! {
+                    result = &mut serve => Some(result),
+                    () = async {
+                        cancel.cancelled().await;
+                        tokio::time::sleep(SHUTDOWN_GRACE).await;
+                    } => {
+                        tracing::warn!(
+                            grace_secs = SHUTDOWN_GRACE.as_secs(),
+                            "connections still open past the shutdown grace period; exiting anyway"
+                        );
+                        None
+                    }
+                }
+            };
             cancel.cancel();
-            if let Some(task) = session_consolidation_task
-                && let Err(error) = task.await
-            {
-                tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+            if let Some(task) = session_consolidation_task {
+                // Bounded like the drain above. The worker can be parked in
+                // `claim_session_consolidation` or `release_session_consolidation`,
+                // neither of which races the cancellation, behind the
+                // single-writer actor's queue — an unbounded join here would
+                // sit outside the shutdown bound entirely (#699).
+                match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+                    }
+                    Err(_) => tracing::warn!(
+                        grace_secs = SHUTDOWN_GRACE.as_secs(),
+                        "SessionEnd consolidation worker did not stop within the shutdown \
+                         grace period; exiting anyway"
+                    ),
+                }
             }
-            serve_result?;
+            if let Some(serve_result) = serve_result {
+                serve_result?;
+            }
         }
     }
     Ok(())
