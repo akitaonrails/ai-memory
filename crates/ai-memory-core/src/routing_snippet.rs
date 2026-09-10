@@ -60,6 +60,10 @@ forget sweep, and a TTL outranks `pinned`. ai-memory is the cross-harness memory
 record for this project: if the harness you run in has its own local memory feature,
 do not keep durable project facts there in parallel — a harness-local store is
 invisible to every other agent and fragments continuity, so capture them here instead.
+A reviewed decision record kept in the repository (an ADR directory, a Keep the Why
+`context/` tree) is not a harness-local store: when the project keeps one, record
+decisions there under the project's convention; ai-memory keeps recall, handoffs and
+session history and does not duplicate that record as a page.
 
 For ranking diagnosis, opt-in query explanations add bounded score provenance
 to project/scopes hits. Cross-project search uses a distinct FTS-only ranker
