@@ -2139,7 +2139,7 @@ fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     })
 }
 
-/// Seed the single-slot active-project fallback from the most recently active
+/// Seed the read-side active-project fallback from the most recently active
 /// project already on disk.
 ///
 /// The pointer lives only in process memory, so restarting the daemon
@@ -2152,11 +2152,13 @@ fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
 /// fire-and-forget) and of TTL/cap eviction, both of which must keep
 /// degrading gracefully.
 ///
-/// So make the degraded answer a real one. Only the shared slot is seeded, so
-/// a keyed hit still wins and the first hook event publishes straight over it.
-/// The recency bound is the pointer's own per-key TTL: activity older than
-/// that would have aged out of a live pointer anyway. Non-fatal — a server
-/// that cannot read this starts exactly as it does today.
+/// So make the degraded answer a real one. The seed lands in a slot only READS
+/// consult: a keyed hit still wins, an unscoped write from an unrecognized
+/// caller still fails closed rather than being attributed to a reconstructed
+/// project, and the first hook event publishes straight over it. The recency
+/// bound is the pointer's own per-key TTL: activity older than that would have
+/// aged out of a live pointer anyway. Non-fatal — a server that cannot read
+/// this starts exactly as it does today.
 async fn seed_active_project_fallback(reader: &ReaderPool, active_project: &ActiveProject) {
     if active_project.get().is_some() {
         return;
@@ -2167,7 +2169,7 @@ async fn seed_active_project_fallback(reader: &ReaderPool, active_project: &Acti
         .saturating_sub(ttl_us);
     match reader.most_recently_active_scope(since).await {
         Ok(Some((workspace_id, project_id))) => {
-            active_project.set(workspace_id, project_id);
+            active_project.seed_read_fallback(workspace_id, project_id);
             let workspace = reader
                 .workspace_name_by_id(workspace_id)
                 .await
@@ -3047,9 +3049,14 @@ mod tests {
         let active_project = ActiveProject::new();
         seed_active_project_fallback(&store.reader, &active_project).await;
         assert_eq!(
-            active_project.get(),
+            active_project.seeded(),
             Some((workspace_id, worked_in)),
-            "the shared slot must name the project the last activity landed in"
+            "the seed must name the project the last activity landed in"
+        );
+        assert_eq!(
+            active_project.get(),
+            None,
+            "a reconstruction is not a publish: the shared slot stays empty"
         );
 
         // The live session's keyed entry died with the process, so its read
@@ -3068,6 +3075,22 @@ mod tests {
             (workspace_id, worked_in),
             "an unscoped read after a restart must not silently answer for the baked default"
         );
+
+        // ...while an unscoped WRITE from a caller the pointer cannot place is
+        // untouched by the seed: it resolves exactly where it did before, so a
+        // page is never attributed to a project reconstructed from a session
+        // that is not this caller's.
+        let written = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
+            .with_writer(&store.writer)
+            .with_active_project(&active_project)
+            .resolve_write_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            written.as_tuple(),
+            (workspace_id, scratch),
+            "the seed must not retarget unscoped writes"
+        );
     }
 
     #[tokio::test]
@@ -3084,6 +3107,44 @@ mod tests {
             .get_or_create_project(workspace_id, "published", None)
             .await
             .unwrap();
+        // Activity in a DIFFERENT project, or the seed no-ops and this test
+        // passes with the guard deleted.
+        let elsewhere = store
+            .writer
+            .get_or_create_project(workspace_id, "elsewhere", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id: elsewhere,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id: elsewhere,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "work".into(),
+                    body: "activity the seed would otherwise reach for".into(),
+                    importance: 5,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
 
         let active_project = ActiveProject::new();
         active_project.set(workspace_id, published);
@@ -3093,6 +3154,11 @@ mod tests {
             active_project.get(),
             Some((workspace_id, published)),
             "a live pointer outranks anything the DB remembers"
+        );
+        assert_eq!(
+            active_project.seeded(),
+            None,
+            "no seed is taken while a real publish already stands"
         );
     }
 

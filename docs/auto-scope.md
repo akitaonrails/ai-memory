@@ -202,19 +202,25 @@ default scope and report an empty project through the success path. Nothing in
 the answer or the log said "scope unresolved", so an agent asking "what do we
 have here?" was told "nothing" while thousands of observations sat in the DB.
 
-`serve` therefore seeds the **shared slot** at startup from the most recently
-active project already recorded in SQLite, so a keyed miss right after a
-restart degrades to real data instead of an empty default. Three bounds keep
+`serve` therefore seeds a **read-side fallback slot** at startup from the most
+recently active project already recorded in SQLite, so a keyed miss right after
+a restart degrades to real data instead of an empty default. Four bounds keep
 that narrow:
 
-- Only the shared fallback slot is seeded. Keyed entries are never
-  reconstructed, so a keyed hit still wins and per-actor isolation is
-  unchanged.
-- The seed is bounded by the same TTL as a per-key entry (`session_ttl_secs`,
-  default one hour). Activity older than that would have aged out of a live
-  pointer, so a server that was down overnight starts with no fallback at all.
-- The first foreground hook event publishes straight over it, exactly as it
-  overwrites any other shared-slot value.
+- **Reads only.** The seed is a reconstruction, not an observed publish, so it
+  lives in its own slot. An unscoped **write** still resolves as if nothing
+  were published — it fails closed on a genuine mismatch and otherwise uses the
+  configured default, exactly as before. Nothing in a restart should retarget
+  where a page lands.
+- **Keyed entries are never reconstructed**, so a keyed hit still wins and
+  per-actor isolation is unchanged.
+- **Bounded by the same TTL as a per-key entry** (`session_ttl_secs`, default
+  one hour). Activity older than that would have aged out of a live pointer, so
+  a server that was down overnight starts with no fallback at all.
+- **The first foreground hook event supersedes it** for every caller, exactly
+  as it overwrites any other shared-slot value. Admin invalidations
+  (`purge-project`, `move-project`, workspace removal) reach the seed too, so a
+  scope that no longer exists cannot keep answering from it.
 
 Reads deliberately do **not** fail closed on an unresolved pointer. A keyed
 miss is also the normal shape of the pre-publish window (hooks are

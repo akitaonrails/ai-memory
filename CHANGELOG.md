@@ -24,11 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unscoped read then resolved through the baked default scope and answered
   zero counts through the success path, with nothing in the log to
   distinguish "scope unresolved" from "project genuinely empty". `serve` now
-  seeds the shared fallback slot at startup from the most recently active
-  project recorded in the database, bounded by the same TTL as a per-key
-  entry, so a keyed miss right after a restart degrades to real data. Keyed
-  per-actor entries are never reconstructed and the first hook event
-  publishes over the seed, so pre-publish and eviction reads keep degrading
+  seeds a read-side fallback at startup from the most recently active project
+  recorded in the database, bounded by the same TTL as a per-key entry, so a
+  keyed miss right after a restart degrades to real data. The seed serves
+  reads only: keyed per-actor entries are never reconstructed, an unscoped
+  write resolves exactly where it did before, and the first hook event
+  supersedes the seed — so pre-publish and eviction reads keep degrading
   exactly as they do today (#678).
 - The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
   builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
