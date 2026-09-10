@@ -905,8 +905,40 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     match args.transport {
         TransportKind::Stdio => {
             info!("MCP server ready on stdio (Ctrl-C to stop)");
-            let service = server.serve(stdio()).await?;
-            service.waiting().await?;
+            // Ctrl-C has to be observed, and from before the transport is up.
+            // Two things conspire otherwise (#699). The default disposition is
+            // not enough: the container entrypoint runs this binary directly
+            // (`ENTRYPOINT ["/usr/local/bin/ai-memory"]`, no init), so the
+            // server is PID 1 in its namespace and the kernel drops a
+            // default-disposition signal sent to a namespace's init. And a
+            // handler installed *after* `serve()` would never be reached,
+            // because `serve()` blocks on the MCP `initialize` handshake — a
+            // server started by hand, with no client writing to stdin, sits
+            // there while the watcher and scheduler keep ticking. Racing the
+            // whole session covers both windows. The HTTP arm below has always
+            // had this, through `with_graceful_shutdown`.
+            let session = async {
+                let service = server.serve(stdio()).await?;
+                service.waiting().await?;
+                anyhow::Ok(())
+            };
+            tokio::select! {
+                result = session => result?,
+                _ = tokio::signal::ctrl_c() => {
+                    info!("ctrl-c received; shutting down");
+                    // Returning through `run()` would park on runtime
+                    // shutdown instead of exiting: the stdio transport reads
+                    // stdin on a blocking thread that cannot be cancelled, and
+                    // dropping the runtime waits for blocking tasks, so the
+                    // process would sit there until the client closed the pipe.
+                    // Leaving here is exactly what the default disposition
+                    // already does for a server that is not PID 1 — the same
+                    // abruptness, now reachable inside the image too — and 0
+                    // matches the HTTP arm's exit for an operator-requested
+                    // stop.
+                    std::process::exit(0);
+                }
+            }
         }
         TransportKind::Http => {
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());

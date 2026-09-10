@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- `serve --transport stdio` ignored Ctrl-C. The stdio arm awaited the MCP
+  service without installing a signal handler, so the interrupt was left to the
+  default disposition — which the kernel discards when the process is PID 1 in
+  its namespace, as it is under the container entrypoint. The server stayed up
+  with its watcher and scheduler still ticking, and only closing stdin stopped
+  it. `serve` now watches for Ctrl-C from before the `initialize` handshake, so
+  a server started by hand and never contacted by a client is interruptible
+  too, and exits instead of parking on the uncancellable blocking read of
+  stdin. The HTTP transport already had this (#699).
 - The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
   builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
   final link no longer gets OOM-killed on low-memory build hosts, and the
