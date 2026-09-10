@@ -11676,6 +11676,171 @@ mod tests {
         assert_eq!(inspect_capture_envelope(env).unwrap().raw, raw);
     }
 
+    #[tokio::test]
+    async fn codex_native_tools_are_sanitized_scoped_and_idempotent_until_session_end() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec!["PRIVATE_CONTENT".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let mut projects = Vec::new();
+        for project in ["codex-a", "codex-b"] {
+            let sid = SessionId::new();
+            let envelope = |event: &str| {
+                HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("codex".into()),
+                        workspace: Some("default".into()),
+                        project: Some(project.into()),
+                        ingest_key: Some(format!("native-{event}")),
+                        ..Default::default()
+                    },
+                    serde_json::json!({
+                        "session_id": sid.to_string(), "cwd": "/repo", "turn_id": "turn-1",
+                        "hook_event_name": event, "tool_name": "Bash",
+                        "tool_use_id": "call-native-1", "tool_input": {"command": "PRIVATE_INPUT"},
+                        "tool_response": {"content": [{"type": "text", "text": format!("{project}: PRIVATE_CONTENT")} ]},
+                    }),
+                )
+            };
+            for event in [
+                "SessionStart",
+                "PreToolUse",
+                "PostToolUse",
+                "PreToolUse",
+                "PostToolUse",
+                "Stop",
+            ] {
+                process(&state, envelope(event), None, Vec::new())
+                    .await
+                    .unwrap();
+            }
+            let (ws, proj) = state
+                .reader
+                .session_project_ids(sid)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !projects.contains(&proj),
+                "the same ingest keys must work in both projects"
+            );
+            projects.push(proj);
+            let observations = state.reader.observations_for_session(sid).await.unwrap();
+            assert_eq!(
+                observations.len(),
+                4,
+                "tool retries must not append observations"
+            );
+            assert!(
+                observations
+                    .iter()
+                    .all(|o| o.workspace_id == ws && o.project_id == proj)
+            );
+            assert!(observations.iter().all(|o| !o.body.contains("PRIVATE_")));
+            let pre = observations
+                .iter()
+                .find(|o| o.kind == ObservationKind::PreToolUse)
+                .unwrap();
+            assert_eq!(
+                pre.body,
+                "tool_family: non-file\ntool_call_id: call-native-1"
+            );
+            let post = observations
+                .iter()
+                .find(|o| o.kind == ObservationKind::PostToolUse)
+                .unwrap();
+            assert_eq!(
+                post.body,
+                format!(
+                    "tool_family: non-file\ntool_call_id: call-native-1\noutcome: unknown\n---\n{project}: [REDACTED]"
+                )
+            );
+            assert!(
+                state
+                    .reader
+                    .open_session_for_scope_agent_by_id(
+                        ws,
+                        proj,
+                        AgentKind::Codex,
+                        ai_memory_core::OwnerFilter::Any,
+                        sid
+                    )
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "Stop must leave the Codex session open"
+            );
+            assert!(
+                state
+                    .reader
+                    .latest_open_handoff(ws, proj, None, ai_memory_core::OwnerFilter::Any)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            process(&state, envelope("SessionEnd"), None, Vec::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                state
+                    .reader
+                    .session_end_disposition(sid, ws, proj, AgentKind::Codex)
+                    .await
+                    .unwrap(),
+                ai_memory_store::SessionEndDisposition::AlreadyEnded
+            );
+            assert!(
+                state
+                    .reader
+                    .latest_open_handoff(ws, proj, None, ai_memory_core::OwnerFilter::Any)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn codex_native_patch_capture_backstop_discards_unproven_output() {
+        for protocol in [
+            capture_protocol("keep", "active", "file", 1, "extracted"),
+            serde_json::json!({"version": 99}),
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "PostToolUse".into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "native-codex", "cwd": "/repo", "tool_name": "apply_patch",
+                    "tool_input": {"command": "*** Begin Patch\n*** Add File: secret/private.txt\n+PRIVATE_CONTENT\n*** End Patch"},
+                    "tool_use_id": "call-patch", "tool_response": "PRIVATE_CONTENT",
+                    "_ai_memory_capture": protocol,
+                }),
+            );
+            assert!(
+                env.body_excerpt
+                    .as_ref()
+                    .unwrap()
+                    .contains("PRIVATE_CONTENT")
+            );
+            let safe = inspect_capture_envelope(env).unwrap();
+            assert_eq!(safe.agent, AgentKind::Codex);
+            assert_eq!(
+                safe.body_excerpt.as_deref(),
+                Some("tool_family: file\ntool_call_id: call-patch\noutcome: unknown")
+            );
+            assert!(!safe.raw.to_string().contains("PRIVATE_CONTENT"));
+            assert!(!safe.raw.to_string().contains("private.txt"));
+        }
+    }
+
     #[test]
     fn capture_protocol_keep_file_mismatch_becomes_metadata_only() {
         let env = HookEnvelope::from_query_and_body(

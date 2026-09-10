@@ -2473,6 +2473,43 @@ impl ReaderPool {
         .await
     }
 
+    /// Return the `(workspace_id, project_id)` with the most recent recorded
+    /// activity at or after `since_us` (wall clock, microseconds).
+    ///
+    /// Observations are the complete activity log — every lifecycle hook event
+    /// lands as one, stamped with the scope it was routed to — so the newest
+    /// row is the project the operator was last working in. Used at startup to
+    /// seed the in-memory active-project fallback, which a restart otherwise
+    /// drops (#678). The caller supplies the cutoff so a long-idle server does
+    /// not resurrect a scope the live pointer would have expired anyway.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn most_recently_active_scope(
+        &self,
+        since_us: i64,
+    ) -> StoreResult<Option<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT workspace_id, project_id FROM observations \
+                     WHERE created_at >= ?1 \
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![since_us],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()?;
+            match row {
+                Some((ws, proj)) => Ok(Some((
+                    WorkspaceId::from_slice(&ws)?,
+                    ProjectId::from_slice(&proj)?,
+                ))),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     /// Return the latest completed session for a project.
     ///
     /// Used by read-only review tools that need a natural default when the user

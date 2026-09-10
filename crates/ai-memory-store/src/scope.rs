@@ -388,7 +388,13 @@ impl<'a> ScopeResolver<'a> {
         explicit_project: Option<&str>,
         actor: &ActorKey,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
-        let active = self.active_project.and_then(|a| a.get_for(actor));
+        // Read path, so `get_for_read`: it adds the startup seed for a caller
+        // the pointer knows nothing about, which is every caller in the window
+        // between a restart and the first hook event (#678). `resolve_write_args`
+        // below deliberately stays on `get_for` / `lookup_for` — a write must
+        // not be attributed to a project reconstructed from history the caller
+        // never named.
+        let active = self.active_project.and_then(|a| a.get_for_read(actor));
         if let Some(project) = trimmed_opt(explicit_project) {
             if let Some((active_ws, _)) = active
                 && let Some(project_id) = self
@@ -1141,5 +1147,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scope.as_tuple(), (default_ws, default_proj));
+    }
+
+    #[tokio::test]
+    async fn the_startup_seed_answers_reads_and_never_retargets_a_write() {
+        // #678: after a restart the pointer is empty, so an unscoped read
+        // resolved through the baked default and reported an empty project.
+        // The seed fixes the read. It must not follow into the write path:
+        // `resolve_write_args` still resolves as if nothing were published, so
+        // no page is attributed to a project rebuilt from someone else's
+        // history.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, default_ws, default_proj, team_ws, team_proj) = scoped_fixture(&tmp).await;
+
+        let active_project = ActiveProject::new();
+        active_project.seed_read_fallback(team_ws, team_proj);
+
+        for actor in [
+            // The session that outlived the daemon: coordinate intact, keyed
+            // entry gone with the process.
+            ActorKey {
+                user: Some("alice".into()),
+                session_id: Some("s1".into()),
+            },
+            // And a caller with no coordinate at all.
+            ActorKey::default(),
+        ] {
+            let read = ScopeResolver::new(&store.reader, default_ws, default_proj)
+                .with_active_project(&active_project)
+                .resolve_read_args(None, None, &actor)
+                .await
+                .unwrap();
+            assert_eq!(
+                read.as_tuple(),
+                (team_ws, team_proj),
+                "read must degrade to the seeded scope, not the empty default"
+            );
+
+            let write = ScopeResolver::new(&store.reader, default_ws, default_proj)
+                .with_writer(&store.writer)
+                .with_active_project(&active_project)
+                .resolve_write_args(None, None, &actor)
+                .await
+                .unwrap();
+            assert_eq!(
+                write.as_tuple(),
+                (default_ws, default_proj),
+                "write target must be exactly what it was before the seed existed"
+            );
+        }
+
+        // A named project still resolves inside the workspace the seed points
+        // at — that is a find-only read, and cross-workspace isolation holds:
+        // `real-work` exists only in `team`.
+        let named = ScopeResolver::new(&store.reader, default_ws, default_proj)
+            .with_active_project(&active_project)
+            .resolve_read_args(None, Some("real-work"), &ActorKey::default())
+            .await
+            .unwrap();
+        assert_eq!(named.as_tuple(), (team_ws, team_proj));
     }
 }

@@ -81,6 +81,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page ingestion windows for historical reorg/move-regenerate pages,
   preventing empty page windows when `updated_at` still held creation
   time. Clarified current-index ranking and snapshot-based rollback. (#682)
+- A bare `LLM_BASE_URL` in the environment no longer redirects providers that
+  talk to a fixed vendor endpoint. The variable is a cross-tool convention an
+  operator exports once for a local Ollama, and ai-memory fed it to every
+  provider: a `gemini` server then POSTed to
+  `http://localhost:11434/v1beta/models/<model>:generateContent` and got Ollama's
+  plain-text `404 page not found`, surfacing as
+  `502 Bad Gateway: {"error":"provider error 404: 404 page not found"}` on
+  bootstrap and consolidation. It now reaches only the dialects whose endpoint
+  the operator supplies anyway — `openai-compat`, which has none without it, and
+  `opencode`, whose Zen catalogue is an override — and is ignored elsewhere with
+  a startup `warn!` naming the provider and the URL. An explicit `llm_base_url`
+  (or `AI_MEMORY_LLM_BASE_URL`) still configures any provider, so proxying a
+  vendor endpoint on purpose is unchanged. `ai-memory llm-test` resolves the base
+  URL the same way, so it reproduces what `serve` will do instead of inheriting
+  the same ambient override (#691).
+- Admin requests that fail for a reason the server owns are now logged
+  server-side instead of existing only in the response body. `POST
+  /admin/bootstrap` and the auto-improve routes serialized the error into JSON
+  and told the log nothing, so an upstream provider failure could break every
+  bootstrap while the log showed only the run starting — and a scheduled
+  auto-improve tick, which has no client to print the body, failed with no
+  operator-visible trace at all. A 5xx now emits a `warn!` naming the status,
+  the operation, and the error. A 4xx stays quiet: the caller was told and the
+  caller was at fault, so logging those would let any client fill the log at
+  will (#692).
+- `serve --transport stdio` ignored Ctrl-C. The stdio arm awaited the MCP
+  service without installing a signal handler, so the interrupt was left to the
+  default disposition — which the kernel discards when the process is PID 1 in
+  its namespace, as it is under the container entrypoint. The server stayed up
+  with its watcher and scheduler still ticking, and only closing stdin stopped
+  it. `serve` now watches for Ctrl-C from before the `initialize` handshake, so
+  a server started by hand and never contacted by a client is interruptible
+  too, and exits instead of parking on the uncancellable blocking read of
+  stdin. That exit is abrupt — it drops whatever is still queued on the store
+  writer — which is what an interrupt already does to a server that is not
+  PID 1. The HTTP transport already had this (#699).
+- `purge-session` took the wiki mutation guard only for the file cleanup, after
+  the database deletion had already committed. A watcher reindex could reinsert
+  the still-present page in that gap and keep only the row, and a concurrent page
+  write could lose its file to the cleanup. The purge now holds the guard across
+  both steps, so reindexes, page writes and wiki moves finish before it starts
+  and wait until it is done (#696, follow-up to #653).
+- Fixed empty native Codex tool observations by recognizing its top-level
+  tool fields and preserving safe tool-family/call-ID metadata plus bounded,
+  sanitized responses for recognized tools. Unknown tools and capture-excluded
+  file operations retained their existing content restrictions; buffering,
+  retry idempotency, and Stop/SessionEnd semantics were preserved. Corrected
+  the install guide's outdated claim that Codex lacks native SessionEnd (#697).
+- Reads no longer report an empty project after the daemon restarts
+  mid-session. The active-project pointer lives in process memory, so a
+  restart — the one the packages' own post-upgrade note tells you to run —
+  dropped it, and `memory_status`, `memory_briefing`, and every other
+  unscoped read then resolved through the baked default scope and answered
+  zero counts through the success path, with nothing in the log to
+  distinguish "scope unresolved" from "project genuinely empty". `serve` now
+  seeds a read-side fallback at startup from the most recently active project
+  recorded in the database, bounded by the same TTL as a per-key entry, so a
+  keyed miss right after a restart degrades to real data. The seed serves
+  reads only: keyed per-actor entries are never reconstructed, an unscoped
+  write resolves exactly where it did before, and the first hook event
+  supersedes the seed — so pre-publish and eviction reads keep degrading
+  exactly as they do today (#678).
 - The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
   builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
   final link no longer gets OOM-killed on low-memory build hosts, and the

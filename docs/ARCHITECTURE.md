@@ -610,7 +610,15 @@ AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
                            opencode (defaults to the Go endpoint, set
-                           https://opencode.ai/zen/v1 for Zen's catalogue)
+                           https://opencode.ai/zen/v1 for Zen's catalogue).
+                           Applies to any provider: naming ai-memory is how an
+                           operator says a vendor endpoint is proxied on purpose
+LLM_BASE_URL               the unprefixed cross-tool convention, accepted for
+                           openai-compat and opencode only. Providers with a
+                           fixed vendor endpoint (anthropic, openai, gemini,
+                           the OAuth backends, copilot) ignore it and log why —
+                           an operator's leftover Ollama URL must not silently
+                           rewrite every Gemini request into a 404
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort

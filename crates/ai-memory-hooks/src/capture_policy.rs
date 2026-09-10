@@ -164,7 +164,9 @@ pub(crate) fn tool_observation_metadata(
         // ZCode tool payloads carry Claude Code's snake_case aliases
         // (`tool_name`, `tool_use_id`, `tool_input`) alongside the native
         // camelCase — all captured live (engine v0.16.5, #512).
-        AgentKind::ClaudeCode | AgentKind::CommandCode | AgentKind::Zcode => (
+        // Native Codex 0.154 uses these same top-level fields, including
+        // `tool_use_id` on both sides of a tool call.
+        AgentKind::ClaudeCode | AgentKind::CommandCode | AgentKind::Codex | AgentKind::Zcode => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -206,6 +208,7 @@ pub(crate) fn tool_observation_metadata(
                         agent,
                         AgentKind::ClaudeCode
                             | AgentKind::CommandCode
+                            | AgentKind::Codex
                             | AgentKind::Hermes
                             | AgentKind::KiroCli
                             | AgentKind::Pool
@@ -262,6 +265,9 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         {
             ToolOutcome::Error
         }
+        // Codex PostToolUse also fires for failed commands. Its native exec
+        // response is output text, with no separate success/exit-code field;
+        // neither the event nor arbitrary response JSON proves an outcome.
         _ => ToolOutcome::Unknown,
     }
 }

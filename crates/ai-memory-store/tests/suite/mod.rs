@@ -9,6 +9,7 @@ mod auto_improve_staging;
 mod client_activity;
 mod fts_drift_status;
 mod handoff_ownership;
+mod most_recently_active_scope;
 mod multi_session;
 mod retrieval_tuning_streams;
 mod session_ids_touching_scope;

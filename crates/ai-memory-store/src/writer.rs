@@ -1575,6 +1575,11 @@ impl WriterHandle {
     /// deleted. See [`ops::purge_session`] for what is and is not removed —
     /// in particular, handoffs this session *accepted* are left alone.
     ///
+    /// Server callers must go through `Wiki::purge_session` instead, which
+    /// holds the wiki mutation guard across this deletion and the page-file
+    /// cleanup. Calling this directly commits the rows with no guard, so a
+    /// watcher reindex can reinsert the page before the file is removed (#653).
+    ///
     /// # Errors
     /// [`StoreError::NotFound`] when the session is absent from that scope,
     /// [`StoreError::WriterClosed`], or a propagated SQL error.

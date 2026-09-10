@@ -192,6 +192,43 @@ no `users` row) only when the client/bridge forwards the session id on
 MCP calls. Claude Code has the opt-in bridge above; with other stock static MCP
 configs, use explicit `workspace` + `project` arguments for concurrent windows.
 
+## Surviving a restart
+
+The pointer is process memory: restarting the daemon — which is exactly what
+the packages tell you to do after an upgrade — empties it, including for
+sessions that are still open. Until the next foreground hook event lands, every
+keyed read misses, and an unscoped read used to resolve through the baked
+default scope and report an empty project through the success path. Nothing in
+the answer or the log said "scope unresolved", so an agent asking "what do we
+have here?" was told "nothing" while thousands of observations sat in the DB.
+
+`serve` therefore seeds a **read-side fallback slot** at startup from the most
+recently active project already recorded in SQLite, so a keyed miss right after
+a restart degrades to real data instead of an empty default. Four bounds keep
+that narrow:
+
+- **Reads only.** The seed is a reconstruction, not an observed publish, so it
+  lives in its own slot. An unscoped **write** still resolves as if nothing
+  were published — it fails closed on a genuine mismatch and otherwise uses the
+  configured default, exactly as before. Nothing in a restart should retarget
+  where a page lands.
+- **Keyed entries are never reconstructed**, so a keyed hit still wins and
+  per-actor isolation is unchanged.
+- **Bounded by the same TTL as a per-key entry** (`session_ttl_secs`, default
+  one hour). Activity older than that would have aged out of a live pointer, so
+  a server that was down overnight starts with no fallback at all.
+- **The first foreground hook event supersedes it** for every caller, exactly
+  as it overwrites any other shared-slot value. Admin invalidations
+  (`purge-project`, `move-project`, workspace removal) reach the seed too, so a
+  scope that no longer exists cannot keep answering from it.
+
+Reads deliberately do **not** fail closed on an unresolved pointer. A keyed
+miss is also the normal shape of the pre-publish window (hooks are
+fire-and-forget, so a session's first read can arrive before its `SessionStart`
+write lands) and of TTL/cap eviction on a busy server. Erroring there would
+turn both into spurious failures; seeding a real fallback fixes the silent
+answer without touching them.
+
 ## Memory footprint
 
 Per-key entries are tiny: two `Uuid`-sized ids + an `Instant`. With
