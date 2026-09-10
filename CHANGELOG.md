@@ -36,9 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_pending/` sidecars exist. The OKF conformance scan that feeds the backup
   gate flagged those staging sidecars (which carry no frontmatter and are never
   migrated — SQLite owns their approval state) as nonconformant, so it kept
-  falling through to a full archive. The scan now skips the `_pending/` subtree,
-  matching the watcher indexer and the existing ledger skip (#695, same class as
-  #669).
+  falling through to a full archive. The scan now skips the project-root
+  `_pending/` subtree — a nested `notes/_pending/` page still migrates — matching
+  the watcher indexer and the existing ledger skip (#695, same class as #669).
 - A bare `LLM_BASE_URL` in the environment no longer redirects providers that
   talk to a fixed vendor endpoint. The variable is a cross-tool convention an
   operator exports once for a local Ollama, and ai-memory fed it to every

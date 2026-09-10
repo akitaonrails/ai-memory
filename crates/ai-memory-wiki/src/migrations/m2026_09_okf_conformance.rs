@@ -212,9 +212,14 @@ fn nonconformant_files(wiki_root: &Path) -> WikiResult<Vec<PathBuf>> {
                 // every boot, and since this scan feeds the pre-migration
                 // backup gate, that re-archives the whole data dir each time
                 // once the receipt's archive is gone (#695, same class as the
-                // ledger skip for #669). Skip the subtree, matching the
-                // watcher indexer's own `_pending/` exclusion.
-                if path.file_name().is_some_and(|n| n == "_pending") {
+                // ledger skip for #669). Only the project-root subtree is
+                // reserved, matching the watcher indexer's `_pending/` rule;
+                // a nested path like notes/_pending still contains pages.
+                if path.file_name().is_some_and(|n| n == "_pending")
+                    && path
+                        .strip_prefix(wiki_root)
+                        .is_ok_and(|relative| relative.components().count() == 3)
+                {
                     continue;
                 }
                 stack.push(path);
@@ -826,6 +831,26 @@ mod tests {
             std::fs::read_dir(dest.path()).unwrap().count(),
             0,
             "the ledger caused a full data-dir archive"
+        );
+    }
+
+    #[test]
+    fn a_nested_pending_directory_still_requires_a_migration_backup() {
+        let tmp = TempDir::new().unwrap();
+        let wiki_root = tmp.path().join("wiki");
+        let relative = PathBuf::from("w/p/notes/_pending/legacy.md");
+        let path = wiki_root.join(&relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "# Ordinary old page\n").unwrap();
+        let page = PagePath::new("notes/_pending/legacy.md").unwrap();
+        assert!(!crate::watcher::is_pending_path(&page));
+        assert_eq!(nonconformant_files(&wiki_root).unwrap(), vec![relative]);
+        let dest = TempDir::new().unwrap();
+        assert!(
+            snapshot_before_db_migration(tmp.path(), Some(dest.path()))
+                .unwrap()
+                .is_some(),
+            "ordinary legacy pages still require a pre-migration backup"
         );
     }
 
