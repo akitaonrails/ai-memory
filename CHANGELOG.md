@@ -66,6 +66,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaderboard. An explicit `AI_MEMORY_LLM_HEADERS` entry for either header
   still wins, and a non-OpenRouter compat endpoint (Ollama, vLLM, LM
   Studio) never receives them. (#686)
+- `ai-memory run` now accepts any `claude*`-prefixed harness name
+  (`claude-corp`, `claude-personal`, ...), all resolving to the same
+  `ManagedHarness::Claude`/`AgentKind::ClaudeCode` — no new session store,
+  migration, or agent kind. This is for callers juggling more than one
+  Claude account (e.g. Corporate and Personal): name each account's `PATH`
+  wrapper script `claude-<account>` and pair it with `--executable
+  claude-<account>` (bare names already resolve through `PATH`) so
+  `ai-memory run claude-corp --executable claude-corp` and `ai-memory run
+  claude-personal --executable claude-personal` each launch the right
+  binary while reading clearly in shell history (#687).
 
 ### Changed
 - The managed routing snippet now states that Claude Code loads `CLAUDE.md` and

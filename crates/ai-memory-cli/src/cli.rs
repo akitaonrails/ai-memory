@@ -244,8 +244,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub fresh: bool,
     /// Agent harness to launch. When omitted, continue the newest managed or
-    /// checkout-local session among the auto-detected harnesses.
-    #[arg(value_enum)]
+    /// checkout-local session among the auto-detected harnesses. Any value
+    /// starting with `claude` (e.g. `claude-corp`, `claude-personal`) also
+    /// selects the Claude harness — see `parse_run_harness_choice`.
+    #[arg(value_parser = parse_run_harness_choice)]
     pub harness: Option<RunHarnessChoice>,
     /// Native harness arguments, forwarded byte-for-byte and in order.
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -255,7 +257,9 @@ pub struct RunArgs {
 /// Harnesses supported by managed workstreams.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum RunHarnessChoice {
-    /// Anthropic Claude Code (`claude`).
+    /// Anthropic Claude Code (`claude`). Any `claude*`-prefixed name (e.g.
+    /// `claude-corp`, `claude-personal`) also selects this harness — see
+    /// `parse_run_harness_choice`.
     #[value(alias = "claude-code")]
     Claude,
     /// OpenAI Codex CLI.
@@ -293,6 +297,40 @@ pub enum RunHarnessChoice {
     /// Google Antigravity CLI (`agy`).
     #[value(name = "antigravity", alias = "antigravity-cli", alias = "agy")]
     Antigravity,
+}
+
+/// Parses the `run` harness positional, additionally wildcarding every
+/// `claude*` spelling onto [`RunHarnessChoice::Claude`].
+///
+/// Callers who juggle more than one Claude account (e.g. Corporate and
+/// Personal) commonly resolve `claude` to different accounts through a
+/// `PATH`-visible wrapper script per account (a plain shell `alias` is
+/// invisible to us — `ai-memory run` execs directly, without going through
+/// an interactive shell). Naming those wrappers `claude-corp` /
+/// `claude-personal` and then passing `--executable claude-corp` (bare names
+/// resolve through `PATH` just like the default) already selects the right
+/// binary; this parser just stops the harness argument itself from being
+/// rejected as an unknown value, so `ai-memory run claude-corp --executable
+/// claude-corp` (or any other `claude*` spelling used consistently) reads
+/// naturally instead of forcing every account onto the literal `claude`
+/// token.
+fn parse_run_harness_choice(value: &str) -> Result<RunHarnessChoice, String> {
+    use clap::ValueEnum as _;
+    if let Ok(choice) = RunHarnessChoice::from_str(value, true) {
+        return Ok(choice);
+    }
+    if value.len() > "claude".len() && value.to_ascii_lowercase().starts_with("claude") {
+        return Ok(RunHarnessChoice::Claude);
+    }
+    let known = RunHarnessChoice::value_variants()
+        .iter()
+        .filter_map(clap::ValueEnum::to_possible_value)
+        .map(|value| value.get_name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "invalid value '{value}' for harness; expected one of: {known}, or any `claude*` spelling"
+    ))
 }
 
 /// Arguments for `show`.
@@ -2883,6 +2921,42 @@ mod tests {
             };
             assert!(matches!(args.harness, Some(RunHarnessChoice::OpenCode2)));
         }
+    }
+
+    #[test]
+    fn claude_wildcard_names_parse_to_the_claude_harness() {
+        // A caller juggling several Claude accounts (Corporate, Personal, ...)
+        // names each account's PATH wrapper `claude-<account>`; every such
+        // spelling must resolve to the Claude harness rather than being
+        // rejected as an unknown value. Case is not significant, and this
+        // covers both the fixed `claude`/`claude-code` names and the
+        // `claude*` wildcard fallback so there is one alias mechanism, not
+        // two overlapping ones.
+        for name in [
+            "claude",
+            "claude-code",
+            "claude-corp",
+            "claude-personal",
+            "CLAUDE-WORK",
+            "claudex",
+        ] {
+            let cli = Cli::try_parse_from(["ai-memory", "run", name])
+                .unwrap_or_else(|error| panic!("failed to parse run {name}: {error}"));
+            let Command::Run(args) = cli.command else {
+                panic!("expected run for claude wildcard name {name}");
+            };
+            assert!(matches!(args.harness, Some(RunHarnessChoice::Claude)));
+        }
+    }
+
+    #[test]
+    fn non_claude_unknown_harness_is_still_rejected() {
+        let error = Cli::try_parse_from(["ai-memory", "run", "banana"])
+            .expect_err("unknown non-claude harness must still be rejected");
+        assert!(
+            error.to_string().contains("expected one of"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
