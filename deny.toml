@@ -3,7 +3,11 @@
 # and pin to the official crates.io registry.
 
 [graph]
-all-features = false
+# CI runs cargo-deny with --all-features (see .github/workflows/ci.yml), so build
+# the same graph here. This keeps the documented local gate `cargo deny check`
+# (AGENTS.md, CONTRIBUTING.md) checking the exact feature set CI enforces, instead
+# of the narrower default-features graph.
+all-features = true
 no-default-features = false
 
 [output]
