@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- A `purge-session` whose page-file cleanup failed was undone by the next
+  watcher pass. The cleanup failure is reported in `files_failed` and leaves
+  the database rows deleted while `sessions/<id>.md` is still on disk; nothing
+  on the reindex path consulted the `purged_sessions` tombstone, so the
+  reconcile tick 30 seconds later indexed the leftover file and the purged
+  session's body was searchable again. The wiki reindex now skips a page whose
+  session is tombstoned, the way it already skips a tombstoned scope, loading
+  the tombstones once per directory per pass rather than once per page. The
+  pass reports them as `skipped_purged_sessions` (#701).
 - The Docker wrapper (`bin/ai-memory`) now forwards `GEMINI_API_KEY` and
   `GOOGLE_API_KEY` into the container. Every other provider credential was on
   the `-e` forwarding allowlist, but these two were missing, so

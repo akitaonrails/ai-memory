@@ -46,6 +46,25 @@ pub struct ReindexSummary {
     /// tombstoned (#607) — a purge whose on-disk removal did not complete.
     /// Their pages are deliberately not resurrected.
     pub skipped_purged: usize,
+    /// Session pages skipped because the session was purged and tombstoned
+    /// (#701) — the same case one level down, for a purge whose page-file
+    /// removal did not complete.
+    pub skipped_purged_sessions: usize,
+}
+
+/// Whether `path` is the page of a session this scope has tombstoned.
+///
+/// Only `sessions/<id>.md` can be resurrected this way: every other page is
+/// unrelated to a session purge, so the set is consulted for nothing else.
+pub(crate) fn is_purged_session_page(path: &PagePath, purged: &HashSet<SessionId>) -> bool {
+    if purged.is_empty() {
+        return false;
+    }
+    path.as_str()
+        .strip_prefix("sessions/")
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .and_then(|id| id.parse::<SessionId>().ok())
+        .is_some_and(|id| purged.contains(&id))
 }
 
 enum PageStoreRemoval {
@@ -1217,6 +1236,27 @@ impl Wiki {
         }
     }
 
+    /// Session ids this scope has tombstoned, as a set for the reindex gate.
+    ///
+    /// The session-level twin of [`WriterHandle::scope_is_purged`], and read
+    /// the same way: once per directory per reindex pass, by the callers that
+    /// walk a tree, rather than once per page (#701).
+    ///
+    /// # Errors
+    /// Propagates the store error.
+    pub async fn purged_sessions(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<HashSet<SessionId>> {
+        Ok(self
+            .writer
+            .purged_session_ids(workspace_id, project_id)
+            .await?
+            .into_iter()
+            .collect())
+    }
+
     /// Purge a session and its page files under one exclusive mutation guard.
     /// Admission must run before this call. File failures do not roll back the
     /// committed database purge and are returned for partial-failure reporting.
@@ -1646,7 +1686,16 @@ impl Wiki {
             let pages = tokio::task::spawn_blocking(move || crate::watcher::walk_markdown(&pr))
                 .await
                 .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
+            let purged = self.purged_sessions(ws, proj).await?;
             for path in pages {
+                if is_purged_session_page(&path, &purged) {
+                    tracing::debug!(
+                        path = %path,
+                        "skipping reindex of a purged (tombstoned) session page",
+                    );
+                    summary.skipped_purged_sessions += 1;
+                    continue;
+                }
                 self.reindex_page(ws, proj, path).await?;
                 summary.pages += 1;
             }

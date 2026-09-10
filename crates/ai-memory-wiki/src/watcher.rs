@@ -255,6 +255,16 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         if is_reserved_page_file(raw_path, &page_path) {
             continue;
         }
+        // A tombstoned session's page must not come back from a file its
+        // purge could not remove (#701). One query, for one event.
+        match wiki.purged_sessions(ws, proj).await {
+            Ok(purged) if crate::wiki::is_purged_session_page(&page_path, &purged) => {
+                debug!(path = %page_path, "ignoring event for a purged session page");
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(path = %page_path, error = %e, "purged-session lookup failed"),
+        }
         match wiki.reindex_page(ws, proj, page_path.clone()).await {
             Ok(_) => debug!(path = %page_path, "reindexed via watcher"),
             Err(e) => warn!(path = %page_path, error = %e, "watcher reindex failed"),
@@ -303,7 +313,15 @@ async fn reindex_project_dir(
         }
     };
 
+    let purged = wiki.purged_sessions(ws, proj).await.unwrap_or_else(|e| {
+        warn!(error = %e, "purged-session lookup failed; not gating this pass");
+        std::collections::HashSet::new()
+    });
     for path in pages {
+        if crate::wiki::is_purged_session_page(&path, &purged) {
+            debug!(path = %path, "skipping a purged session page");
+            continue;
+        }
         match wiki.reindex_page(ws, proj, path.clone()).await {
             Ok(_) => debug!(path = %path, "reindexed via watcher directory event"),
             Err(e) => warn!(path = %path, error = %e, "watcher directory reindex failed"),
@@ -321,6 +339,9 @@ pub(crate) struct ReconcileStats {
     /// These are skipped wholesale rather than failing scope resolution on
     /// every page, every pass, forever (see #613).
     pub skipped_orphans: usize,
+    /// Session pages left on disk by a purge whose file cleanup failed, and
+    /// deliberately not re-indexed (#701).
+    pub skipped_purged_sessions: usize,
 }
 
 async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
@@ -357,7 +378,19 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
         let pages = tokio::task::spawn_blocking(move || walk_markdown(&proj_root))
             .await
             .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
+        // Once per directory, not once per page: a project accumulates one
+        // tombstone per purge, and the set is only consulted for the
+        // `sessions/<id>.md` paths that a session purge could have left behind.
+        let purged = wiki.purged_sessions(ws, proj).await?;
         for path in pages {
+            if crate::wiki::is_purged_session_page(&path, &purged) {
+                debug!(
+                    path = %path,
+                    "skipping reconcile of a purged (tombstoned) session page",
+                );
+                stats.skipped_purged_sessions += 1;
+                continue;
+            }
             if let Err(e) = wiki.reindex_page(ws, proj, path.clone()).await {
                 warn!(path = %path, error = %e, "reconcile reindex failed");
             } else {
@@ -368,6 +401,7 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
     info!(
         indexed = stats.indexed,
         skipped_orphans = stats.skipped_orphans,
+        skipped_purged_sessions = stats.skipped_purged_sessions,
         "reconciliation pass complete",
     );
     Ok(stats)
@@ -600,6 +634,104 @@ mod tests {
             .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         (tmp, store, wiki, ws, proj)
+    }
+
+    /// A purge whose page-file cleanup failed must not be undone by the next
+    /// tick (#701).
+    ///
+    /// The guard #696 added closes the window where a reindex interleaves
+    /// between the database delete and the file cleanup. It cannot cover the
+    /// case where the file *outlives* the purge: a cleanup failure is a
+    /// reported, already-tested outcome, and after one the rows are gone while
+    /// the markdown is still on disk. Reverting the tombstone gate fails this.
+    #[tokio::test]
+    async fn purged_session_page_is_not_resurrected_by_a_reconcile_tick() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let sid = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+
+        let sessions_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string())
+            .join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let abs = sessions_dir.join(format!("{sid}.md"));
+        std::fs::write(&abs, "---\ntitle: Session\n---\n\nzimbabwe pineapple\n").unwrap();
+        let path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        let page_id = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        store.writer.end_session(sid, Some(page_id)).await.unwrap();
+        assert_eq!(
+            store
+                .reader
+                .search_pages("zimbabwe".into(), 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "precondition: the session page is indexed",
+        );
+
+        // Make the unlink fail the way a read-only mount or a stray permission
+        // does — the markdown itself stays intact and readable.
+        let original = std::fs::metadata(&sessions_dir).unwrap().permissions();
+        let mut locked = original.clone();
+        locked.set_readonly(true);
+        std::fs::set_permissions(&sessions_dir, locked).unwrap();
+        let outcome = wiki
+            .purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip)
+            .await
+            .unwrap();
+        std::fs::set_permissions(&sessions_dir, original).unwrap();
+
+        // Preconditions: this is the reported `files_failed` state.
+        assert_eq!(
+            outcome.files_failed,
+            vec![path.clone()],
+            "precondition: the unlink must have failed",
+        );
+        assert!(abs.exists(), "precondition: the page file survived");
+        assert!(
+            store
+                .reader
+                .search_pages("zimbabwe".into(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "precondition: the purge made the page unsearchable",
+        );
+
+        let stats = reconcile(&wiki).await.unwrap();
+        assert_eq!(
+            stats.skipped_orphans, 0,
+            "a session purge leaves the project row, so the orphan guard passes",
+        );
+        assert_eq!(
+            stats.skipped_purged_sessions, 1,
+            "the leftover page is skipped, and the pass says so",
+        );
+
+        let back = store
+            .reader
+            .search_pages("zimbabwe".into(), 10)
+            .await
+            .unwrap();
+        assert!(
+            back.is_empty(),
+            "a purged session's page must not be resurrected from a leftover file: {back:?}",
+        );
     }
 
     /// `extract_project_ids` must parse a valid `<ws>/<proj>/<path>` triplet.
