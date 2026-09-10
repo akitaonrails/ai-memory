@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- The Docker wrapper (`bin/ai-memory`) now forwards `GEMINI_API_KEY` and
+  `GOOGLE_API_KEY` into the container. Every other provider credential was on
+  the `-e` forwarding allowlist, but these two were missing, so
+  `AI_MEMORY_LLM_PROVIDER=gemini` (or the gemini embedder) reached the server
+  while its key did not — the process then failed with `provider not
+  configured: GEMINI_API_KEY or GOOGLE_API_KEY` even though the operator had
+  exported it (#698).
+- `serve` no longer re-archives the whole data directory on every boot once the
+  pre-migration backup receipt's archive has been deleted and auto-improve
+  `_pending/` sidecars exist. The OKF conformance scan that feeds the backup
+  gate flagged those staging sidecars (which carry no frontmatter and are never
+  migrated — SQLite owns their approval state) as nonconformant, so it kept
+  falling through to a full archive. The scan now skips the `_pending/` subtree,
+  matching the watcher indexer and the existing ledger skip (#695, same class as
+  #669).
 - A bare `LLM_BASE_URL` in the environment no longer redirects providers that
   talk to a fixed vendor endpoint. The variable is a cross-tool convention an
   operator exports once for a local Ollama, and ai-memory fed it to every

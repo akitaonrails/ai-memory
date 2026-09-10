@@ -489,6 +489,32 @@ fn posix_wrapper_auto_selects_podman_when_docker_is_unavailable() {
 }
 
 #[test]
+fn wrapper_forwards_every_supported_provider_api_key() {
+    // The wrapper runs the server in a container, so any provider credential
+    // the operator exports must be on the `-e` forwarding allowlist or it
+    // never reaches the process and the provider reports "not configured".
+    // Gemini/Google were missing while every other provider key was
+    // forwarded (#698), so the guard names each key the config layer reads.
+    let wrapper = read_repo("bin/ai-memory");
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "VOYAGE_API_KEY",
+        "COPILOT_GITHUB_TOKEN",
+        "LLM_API_KEY",
+        "EMBEDDING_API_KEY",
+    ] {
+        assert!(
+            wrapper.contains(&format!("  {key} \\")),
+            "wrapper must forward {key} into the container"
+        );
+    }
+}
+
+#[test]
 fn wrapper_updates_and_install_docs_use_verified_release_assets() {
     let wrapper = read_repo("bin/ai-memory");
     assert!(wrapper.contains("releases/latest/download/ai-memory-wrapper"));
