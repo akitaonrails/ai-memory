@@ -89,6 +89,20 @@ purge needs. Rebuilding only the indexes a given caller "should" have touched
 is what leaves a managed agent's transcript text in the file after an operator
 asked for it to be reclaimed.
 
+Session purges hold the wiki mutation guard across the database deletion and
+file cleanup. In-flight page writes and watcher reindexes finish before the
+purge starts; new ones wait until cleanup completes. This also serializes the
+purge with wiki project/session moves. Admission webhooks run before this guard.
+File cleanup failures still leave the database purge committed and are reported
+in `files_failed`; this coordination does not provide crash-atomic rollback.
+
+The guard is taken before the purge is submitted to the writer actor, so it also
+covers the wait for whatever that single queue is already draining, and — with
+`compact: true` — the `VACUUM` that runs after the delete commits. A purge on a
+busy server therefore holds up wiki mutations for longer than the delete itself.
+The git checkpoints taken before and after the purge sit outside the guard: they
+bracket it, they do not snapshot it.
+
 ### Scope containment
 
 The session id is never authority on its own. Every statement is filtered on

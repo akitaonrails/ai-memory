@@ -3614,38 +3614,6 @@ pub struct PurgeSessionReport {
     pub checkpoint: Option<String>,
 }
 
-async fn remove_purged_session_storage(
-    state: &AdminState,
-    workspace_id: WorkspaceId,
-    project_id: ProjectId,
-    removed_paths: &[PagePath],
-) -> (Vec<PagePath>, Vec<PagePath>) {
-    let mut files_deleted = Vec::with_capacity(removed_paths.len());
-    let mut files_failed = Vec::new();
-
-    for path in removed_paths {
-        match state
-            .wiki
-            .remove_page_file(workspace_id, project_id, path)
-            .await
-        {
-            Ok(true) => files_deleted.push(path.clone()),
-            Ok(false) => {}
-            Err(error) => {
-                warn!(
-                    operation = "purge-session",
-                    path = path.as_str(),
-                    error = %error,
-                    "session purge failed to remove wiki page file"
-                );
-                files_failed.push(path.clone());
-            }
-        }
-    }
-
-    (files_deleted, files_failed)
-}
-
 /// `POST /admin/purge-session` — delete one session and everything derived
 /// from it, inside a single workspace/project scope.
 async fn handle_purge_session(
@@ -3714,14 +3682,14 @@ async fn handle_purge_session(
         ai_memory_store::Compaction::Skip
     };
 
-    let summary = match state
-        .writer
+    let outcome = match state
+        .wiki
         .purge_session(ws_id, proj_id, session_id, author_id, compaction)
         .await
     {
         Ok(s) => s,
         // Absent from this scope (or already purged) is a 404, not a fault.
-        Err(e @ StoreError::NotFound(_)) => {
+        Err(WikiError::Store(e @ StoreError::NotFound(_))) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": e.to_string() })),
@@ -3730,8 +3698,11 @@ async fn handle_purge_session(
         Err(e) => return internal_err(e.to_string()),
     };
 
-    let (files_deleted, files_failed) =
-        remove_purged_session_storage(&state, ws_id, proj_id, &summary.removed_paths).await;
+    let ai_memory_wiki::PurgeSessionOutcome {
+        summary,
+        files_deleted,
+        files_failed,
+    } = outcome;
     if !files_failed.is_empty()
         && let Some(ref mut ctx) = dispatch_ctx
     {

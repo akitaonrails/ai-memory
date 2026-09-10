@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stdin. That exit is abrupt — it drops whatever is still queued on the store
   writer — which is what an interrupt already does to a server that is not
   PID 1. The HTTP transport already had this (#699).
+- `purge-session` took the wiki mutation guard only for the file cleanup, after
+  the database deletion had already committed. A watcher reindex could reinsert
+  the still-present page in that gap and keep only the row, and a concurrent page
+  write could lose its file to the cleanup. The purge now holds the guard across
+  both steps, so reindexes, page writes and wiki moves finish before it starts
+  and wait until it is done (#696, follow-up to #653).
 - The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
   builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
   final link no longer gets OOM-killed on low-memory build hosts, and the
