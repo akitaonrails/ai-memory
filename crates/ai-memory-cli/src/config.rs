@@ -1199,13 +1199,7 @@ impl Config {
             provider,
             model,
             auth: self.provider_auth(provider, None),
-            // base_url falls back to the runtime env (LLM_BASE_URL), mirroring
-            // how auth is sourced — otherwise openai-compat is only
-            // configurable via config.toml even though the key comes from env.
-            base_url: self
-                .llm_base_url
-                .clone()
-                .or_else(|| self.runtime_env.llm_base_url.clone()),
+            base_url: self.resolve_base_url(provider),
             compat_strict: self.llm_compat_strict,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
@@ -1576,14 +1570,44 @@ impl Config {
         }
     }
 
+    /// Base URL for `provider`, from the two sources that can supply one.
+    ///
+    /// An explicit ai-memory setting (`llm_base_url` in `config.toml`, or
+    /// `AI_MEMORY_LLM_BASE_URL`) configures any provider: naming ai-memory is
+    /// how an operator says they mean it, and proxying a vendor endpoint is a
+    /// legitimate deployment.
+    ///
+    /// The bare `LLM_BASE_URL` is different in kind — a cross-tool convention
+    /// an operator exports once for a local Ollama and forgets. It reaches
+    /// only the providers whose endpoint is theirs to choose anyway; sending
+    /// it to a vendor-fixed endpoint silently rewrites every request onto a
+    /// host that does not speak the dialect (#691), so it is ignored and the
+    /// reason is logged rather than left for a 404 to explain.
+    fn resolve_base_url(&self, provider: ProviderChoice) -> Option<String> {
+        if let Some(explicit) = non_empty(self.llm_base_url.as_deref()) {
+            return Some(explicit.to_string());
+        }
+        let ambient = non_empty(self.runtime_env.llm_base_url.as_deref())?;
+        if provider.endpoint_is_operator_chosen() {
+            return Some(ambient.to_string());
+        }
+        tracing::warn!(
+            provider = provider.name(),
+            base_url = ambient,
+            "ignoring ambient LLM_BASE_URL: this provider talks to a fixed vendor \
+             endpoint. Set llm_base_url (or AI_MEMORY_LLM_BASE_URL) to point it \
+             somewhere else on purpose."
+        );
+        None
+    }
+
     /// Base URL fallback for `llm-test`. Resolves exactly as
     /// [`Self::provider_config`] does, so `llm-test` exercises the endpoint
-    /// `serve` will use — including an `opencode` override onto Zen.
+    /// `serve` will use — including an `opencode` override onto Zen, and the
+    /// same refusal to inherit an ambient `LLM_BASE_URL`.
     #[must_use]
-    pub fn llm_test_base_url(&self) -> Option<String> {
-        self.llm_base_url
-            .clone()
-            .or_else(|| self.runtime_env.llm_base_url.clone())
+    pub fn llm_test_base_url(&self, provider: ProviderChoice) -> Option<String> {
+        self.resolve_base_url(provider)
     }
 }
 
@@ -3147,4 +3171,113 @@ fn llm_provider_config_gemini_uses_default_base_url_when_none_provided() {
     let provider = cfg.llm_provider_config().unwrap().unwrap();
     assert_eq!(provider.provider, ProviderChoice::Gemini);
     assert_eq!(provider.base_url, None);
+}
+
+// #691: `LLM_BASE_URL` is an ambient, cross-tool convention — an operator who
+// once pointed it at Ollama for `openai-compat` keeps it exported. Feeding it
+// to Gemini builds `http://localhost:11434/v1beta/models/<model>:generateContent`,
+// which Ollama answers with a plain-text `404 page not found`; the bootstrap
+// surfaces that as a 502 with no server-side log line to explain it.
+#[test]
+fn ambient_llm_base_url_does_not_override_gemini() {
+    let cfg = Config {
+        llm_provider: Some("gemini".into()),
+        llm_base_url: None,
+        runtime_env: RuntimeEnv {
+            gemini_api_key: Some(SecretString::from("dummy")),
+            llm_base_url: Some("http://localhost:11434".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(provider.provider, ProviderChoice::Gemini);
+    assert_eq!(provider.base_url, None);
+}
+
+// The other half of #691: the ambient fallback exists *for* the dialects whose
+// endpoint the operator supplies, and narrowing it must not take that away.
+// `openai-compat` has no endpoint at all without one.
+#[test]
+fn ambient_llm_base_url_still_configures_openai_compat() {
+    let cfg = Config {
+        llm_provider: Some("openai-compat".into()),
+        llm_model: Some("gemma4:26b-mlx".into()),
+        llm_base_url: None,
+        runtime_env: RuntimeEnv {
+            llm_base_url: Some("http://localhost:11434/v1".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(provider.provider, ProviderChoice::OpenAiCompat);
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("http://localhost:11434/v1")
+    );
+}
+
+// `opencode` defaults to Go and reaches Zen's general catalogue only through an
+// override, so it is operator-chosen too.
+#[test]
+fn ambient_llm_base_url_still_configures_opencode() {
+    let cfg = Config {
+        llm_provider: Some("opencode".into()),
+        runtime_env: RuntimeEnv {
+            opencode_api_key: Some(SecretString::from("dummy")),
+            llm_base_url: Some("https://opencode.ai/zen/v1".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(provider.provider, ProviderChoice::OpenCode);
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("https://opencode.ai/zen/v1")
+    );
+}
+
+// Naming ai-memory is how an operator says they mean it: proxying Gemini stays
+// possible, and the explicit setting outranks an ambient one that disagrees.
+#[test]
+fn explicit_llm_base_url_still_overrides_gemini_over_an_ambient_one() {
+    let cfg = Config {
+        llm_provider: Some("gemini".into()),
+        llm_base_url: Some("https://gemini-proxy.internal".into()),
+        runtime_env: RuntimeEnv {
+            gemini_api_key: Some(SecretString::from("dummy")),
+            llm_base_url: Some("http://localhost:11434".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    let provider = cfg.llm_provider_config().unwrap().unwrap();
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some("https://gemini-proxy.internal")
+    );
+}
+
+// `llm-test` is the tool an operator reaches for to reproduce what `serve`
+// does. It resolved base_url through its own copy of the old chain, so before
+// this fix it hit the ambient endpoint too — and agreed with the broken server
+// instead of exposing it.
+#[test]
+fn llm_test_base_url_resolves_per_provider_like_serve_does() {
+    let cfg = Config {
+        llm_base_url: None,
+        runtime_env: RuntimeEnv {
+            llm_base_url: Some("http://localhost:11434".into()),
+            ..RuntimeEnv::default()
+        },
+        ..Config::default()
+    };
+    assert_eq!(cfg.llm_test_base_url(ProviderChoice::Gemini), None);
+    assert_eq!(
+        cfg.llm_test_base_url(ProviderChoice::OpenAiCompat)
+            .as_deref(),
+        Some("http://localhost:11434")
+    );
 }
