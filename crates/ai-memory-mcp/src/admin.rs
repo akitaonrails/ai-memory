@@ -1830,7 +1830,22 @@ fn bootstrap_error_response(
         BootstrapError::Llm(_) => StatusCode::BAD_GATEWAY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    log_server_error(status, "bootstrap", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
+}
+
+/// Record a failure the server owns.
+///
+/// A 5xx says the request was fine and *we* could not serve it, so the reason
+/// belongs in the server's log: the response body reaches one client once and
+/// is gone when its process exits, which is how an upstream provider 404
+/// managed to fail every bootstrap while the log showed only the run starting
+/// (#692). A 4xx stays quiet — the caller was told, and the caller was at
+/// fault.
+fn log_server_error(status: StatusCode, operation: &str, error: &dyn std::fmt::Display) {
+    if status.is_server_error() {
+        warn!(%status, operation, %error, "admin request failed");
+    }
 }
 
 /// Build a dry-run [`BootstrapOutcome`] without an LLM by applying the
@@ -2290,6 +2305,7 @@ fn auto_improve_error_response(
         AutoImproveError::Memory(_) => StatusCode::BAD_REQUEST,
         AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    log_server_error(status, "auto-improve", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
 }
 

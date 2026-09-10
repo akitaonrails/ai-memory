@@ -10,6 +10,7 @@ mod admin_bootstrap;
 mod admin_move;
 mod admin_move_session;
 mod admin_phase3;
+mod admin_provider_error_logging;
 mod admin_purge;
 mod admin_read_page;
 mod admin_rename;
