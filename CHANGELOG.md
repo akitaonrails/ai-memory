@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The managed routing snippet distinguishes a reviewed decision record kept in
+  the repository (an ADR directory, a Keep the Why `context/` tree) from a
+  harness-local memory store: decisions go into the repo's record under its
+  convention, ai-memory keeps recall, handoffs and session history and does not
+  duplicate the record as a page. `docs/usage.md` ("Repo-native decision
+  records") and `docs/marker-file.md` say to list such a directory in
+  `[capture] ignore_paths`, and why (#700).
 - The managed routing snippet now states that Claude Code loads `CLAUDE.md` and
   does not read `AGENTS.md`: a project whose canonical instruction file is
   `AGENTS.md` needs a bare `@AGENTS.md` import line in `CLAUDE.md`, or the rules

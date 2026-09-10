@@ -201,6 +201,14 @@ below to keep recognized file-tool activity under matching paths out of capture:
 ignore_paths = ["private/**", "~/personal-notes/**"]
 ```
 
+A repository that keeps its decision records in the tree — an ADR directory,
+a [Keep the Why](https://github.com/oliver-zehentleitner/keep-the-why)
+`context/` tree — belongs here too: `ignore_paths = ["docs/adr/**"]` or
+`["context/**"]`. The repo owns that record; without the exclusion an agent's
+read of it is captured and consolidation compiles it into wiki pages that do
+not follow the repo, so the copy is stale the moment the record is superseded
+(see the "Repo-native decision records" section of [`usage.md`](usage.md)).
+
 The **nearest** `.ai-memory.toml` is authoritative; marker sections do not
 merge. A missing `[capture]` section or `ignore_paths = []` is inactive and
 preserves current behavior. `[capture]` accepts only `ignore_paths`: unknown
