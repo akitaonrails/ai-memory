@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- Fixed empty native Codex tool observations by recognizing its top-level
+  tool fields and preserving safe tool-family/call-ID metadata plus bounded,
+  sanitized responses for recognized tools. Unknown tools and capture-excluded
+  file operations retained their existing content restrictions; buffering,
+  retry idempotency, and Stop/SessionEnd semantics were preserved. Corrected
+  the install guide's outdated claim that Codex lacks native SessionEnd (#697).
 - The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
   builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
   final link no longer gets OOM-killed on low-memory build hosts, and the
