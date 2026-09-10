@@ -15,3 +15,4 @@ mod removal;
 mod repo_layout;
 mod routing_instructions;
 mod routing_skills;
+mod shutdown_signals;

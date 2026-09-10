@@ -51,6 +51,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Podman. Additionally, `emit_docker_run_script` now preserves volume mount
   modes (such as `:Z` on SELinux/Podman environments) and filters transient
   runtime environment variables (`HOSTNAME`, `container=podman`). (#673)
+- `ai-memory serve` now stops on Ctrl-C and on SIGTERM, on both transports.
+  The stdio transport listened for no signal at all, and the HTTP transport
+  listened for SIGINT alone — so SIGTERM, what `docker stop`, `docker compose
+  down` and `systemctl stop` send, reached no handler on either. What that
+  cost depended on whether the server was PID 1. In the container it is (the
+  image's ENTRYPOINT is exec form, with no init shim), and for PID 1 the
+  kernel discards a signal whose handler is not installed: the signal was not
+  merely unhandled, it was invisible, so `docker stop` sat out its whole grace
+  period and ended in SIGKILL, `docker kill` was the only way out, and Ctrl-C
+  on stdio did nothing at all. Everywhere else — under the native systemd
+  unit, or a plain `ai-memory serve` in a terminal — the process is not PID 1,
+  so the same signal fell through to the kernel's default disposition and
+  killed it instantly instead, with no drain at all: the durable SessionEnd
+  consolidation worker was cut off mid-flight rather than drained. Both
+  transports now listen for SIGINT and SIGTERM, log which one arrived, and
+  bound the drain at five seconds so a stateful or SSE MCP client holding a
+  connection open cannot stall the exit — a stop that used to be instant and
+  unclean now takes up to those five seconds and drains. The listeners are
+  installed before the transport starts, so a signal arriving during a slow
+  boot — migrations, the pre-migration archive — is handled rather than lost,
+  and no container init shim (`tini`, `docker run --init`) is needed for the
+  server to stop as PID 1 (#699).
 
 ## [2.1.1] - 2026-09-07
 
