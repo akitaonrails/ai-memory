@@ -46,7 +46,10 @@ mod slow {
 
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg(r#"trap "" INT; exec "$1" serve"#)
+            // Explicit transport: the default is stdio today, and a test that
+            // rides that default would quietly start testing something else if
+            // it ever changed.
+            .arg(r#"trap "" INT; exec "$1" serve --transport stdio"#)
             .arg("sh")
             .arg(BIN)
             .env("AI_MEMORY_DATA_DIR", data_dir.path())
