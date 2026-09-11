@@ -836,6 +836,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_rejects_recovery_that_does_not_replace_the_access_token() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        write_auth(&auth_path, "old-token", "account-secret");
+        fs::write(dir.path().join("fake-mode"), "no-change").unwrap();
+        Mock::given(method("POST"))
+            .and(request_path("/responses"))
+            .respond_with(UnauthorizedUntilRotated)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = CodexProvider::new(
+            CodexAuth {
+                auth_file: auth_path.clone(),
+                executable: compile_fake_codex(dir.path()),
+            },
+            "gpt-5.6-luna",
+        )
+        .unwrap()
+        .with_responses_url(format!("{}/responses", server.uri()));
+
+        let error = provider
+            .complete(ChatRequest::user_prompt("test"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("without replacing the access token"));
+        assert!(error.contains("codex login status"));
+        assert!(!error.contains("old-token"));
+        assert_eq!(
+            read_credentials(&auth_path)
+                .unwrap()
+                .access_token
+                .expose_secret(),
+            "old-token"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_unauthorized_calls_share_one_recovery() {
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();

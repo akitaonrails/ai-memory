@@ -30,7 +30,7 @@ cargo test -p ai-memory-cli codex --no-default-features
 
 Observed results:
 
-- Codex unit/recovery suite: 9 passed.
+- Codex unit/recovery suite: 10 passed.
 - Existing openai-oauth regression suite: 18 passed.
 - Codex-related CLI/config tests: 17 passed.
 
@@ -52,6 +52,10 @@ output, reload-before-retry, and the one-retry ceiling.
   passed until two unrelated `ai-memory-core::routing_skills` assertions hit
   CRLF bytes in the existing Windows checkout. Neither the embedded skill
   assets nor their tests are changed by this branch.
+- The complementary run excluding `ai-memory-core`, followed by all other
+  `ai-memory-core` tests with only those two checkout-sensitive assertions
+  skipped, passed. The standalone companion importer suite also passed (19
+  tests).
 - `cargo llvm-cov` was unavailable locally, so the 80% target was not measured;
   the new parser, HTTP/retry path, structured output, protocol limits, native
   process recovery, failure cleanup, and concurrent recovery are directly
