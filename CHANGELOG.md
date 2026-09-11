@@ -110,6 +110,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this release, not a ranking input. The confidence-into-`PageAuthority`
   step described in the design doc is deferred behind the planned R2
   retrieval eval.
+- Standing-answer boot surfacing (P4, `docs/design-hindsight-borrowings.md`
+  §5): `memory_briefing` accepts an opt-in `settled_first: bool` (default
+  `false`, unchanged briefing shape). When `true`, the snapshot's new
+  `settled` array leads with the project's highest-standing `rule`/`decision`
+  pages — up to 8, ordered by `page_evidence` count (P2) then recency — so an
+  agent can boot from settled answers instead of re-deriving them. Pure SQL,
+  no LLM call; every other briefing field, and the default `settled_first:
+  false` path, are byte-for-byte unchanged.
 
 ### Changed
 - The privacy sanitizer now redacts to a **typed marker** — `[REDACTED:<kind>]`

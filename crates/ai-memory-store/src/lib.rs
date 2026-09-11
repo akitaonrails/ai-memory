@@ -64,9 +64,9 @@ pub use reader::{
     ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
     OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
     ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
-    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, StatusCounts,
-    StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
-    f32_vec_to_bytes,
+    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, SettledPage,
+    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow,
+    WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -1925,14 +1925,14 @@ mod tests {
         // Briefing degree: app depends on 1 project; infra has 1 dependent.
         let app_brief = store
             .reader
-            .briefing_for_project(ws, app, 5, ai_memory_core::OwnerFilter::Any)
+            .briefing_for_project(ws, app, 5, ai_memory_core::OwnerFilter::Any, false)
             .await
             .unwrap();
         assert_eq!(app_brief.cross_project_dependencies, 1);
         assert_eq!(app_brief.cross_project_dependents, 0);
         let infra_brief = store
             .reader
-            .briefing_for_project(ws, infra, 5, ai_memory_core::OwnerFilter::Any)
+            .briefing_for_project(ws, infra, 5, ai_memory_core::OwnerFilter::Any, false)
             .await
             .unwrap();
         assert_eq!(infra_brief.cross_project_dependents, 1);
@@ -4436,7 +4436,7 @@ mod tests {
         );
         let project_briefing = store
             .reader
-            .briefing_for_project(ws, proj, 100, ai_memory_core::OwnerFilter::Any)
+            .briefing_for_project(ws, proj, 100, ai_memory_core::OwnerFilter::Any, false)
             .await
             .unwrap();
         assert_briefing_kinds(&project_briefing.recent_pages);
@@ -4507,6 +4507,112 @@ mod tests {
                 .unwrap()
                 .kind,
             "procedure"
+        );
+    }
+
+    /// P4 (docs/design-hindsight-borrowings.md §5): `settled_first` is
+    /// opt-in and additive. `false` (the default) leaves `settled` empty
+    /// and every other field of the snapshot untouched; `true` populates
+    /// it with the project's `rule`/`decision` pages, ordered by evidence
+    /// count then recency, and excludes every other kind.
+    #[tokio::test]
+    async fn briefing_settled_first_orders_by_evidence_then_recency() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "settled-test", None)
+            .await
+            .unwrap();
+
+        let mut decision_a = sample_page(ws, proj, "decisions/decision-a.md", "body a");
+        decision_a.evidence = vec![
+            PageEvidence {
+                kind: PageEvidenceKind::Session,
+                source_id: "session-1".into(),
+            },
+            PageEvidence {
+                kind: PageEvidenceKind::Session,
+                source_id: "session-2".into(),
+            },
+        ];
+        store.writer.upsert_page(decision_a).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "_rules/rule-a.md", "body rule"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        // Written last (and with zero evidence), so among the two
+        // zero-evidence pages this one must sort first on recency.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "decisions/decision-b.md", "body b"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/plain-note.md", "body note"))
+            .await
+            .unwrap();
+
+        let unchanged = store
+            .reader
+            .briefing_for_project(ws, proj, 10, ai_memory_core::OwnerFilter::Any, false)
+            .await
+            .unwrap();
+        assert!(
+            unchanged.settled.is_empty(),
+            "settled_first=false must leave settled empty"
+        );
+        assert_eq!(unchanged.recent_pages.len(), 4);
+
+        let settled_first = store
+            .reader
+            .briefing_for_project(ws, proj, 10, ai_memory_core::OwnerFilter::Any, true)
+            .await
+            .unwrap();
+        let settled_paths: Vec<&str> = settled_first
+            .settled
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(
+            settled_paths,
+            vec![
+                "decisions/decision-a.md",
+                "decisions/decision-b.md",
+                "_rules/rule-a.md",
+            ],
+            "expected evidence-count-then-recency order: {settled_paths:?}"
+        );
+        assert!(
+            !settled_paths.contains(&"notes/plain-note.md"),
+            "a plain note must not appear in settled"
+        );
+        assert_eq!(settled_first.settled[0].evidence_count, 2);
+        assert_eq!(settled_first.settled[1].evidence_count, 0);
+        assert_eq!(settled_first.settled[2].evidence_count, 0);
+        assert_eq!(settled_first.settled[0].kind, "decision");
+        assert_eq!(settled_first.settled[2].kind, "rule");
+        // Every other field is identical to the settled_first=false snapshot.
+        assert_eq!(
+            settled_first.recent_pages.len(),
+            unchanged.recent_pages.len()
+        );
+        assert_eq!(
+            settled_first.counts.pages_latest,
+            unchanged.counts.pages_latest
         );
     }
 

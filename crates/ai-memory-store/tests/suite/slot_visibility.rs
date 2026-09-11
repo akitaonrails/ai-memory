@@ -308,6 +308,7 @@ async fn briefing_slots_follow_the_same_visibility_rule() {
                 10,
                 ai_memory_core::OwnerFilter::Any,
                 &SlotVisibility::default(),
+                false,
             )
             .await
             .unwrap(),
@@ -328,6 +329,7 @@ async fn briefing_slots_follow_the_same_visibility_rule() {
                 10,
                 ai_memory_core::OwnerFilter::Any,
                 &mine,
+                false,
             )
             .await
             .unwrap(),
@@ -398,6 +400,7 @@ async fn recent_pages_hide_other_operators_personal_slots() {
             100,
             ai_memory_core::OwnerFilter::Any,
             &mine,
+            false,
         )
         .await
         .unwrap()
@@ -477,6 +480,7 @@ async fn foreign_slots_do_not_consume_the_viewers_query_limit() {
             1,
             ai_memory_core::OwnerFilter::Any,
             &visibility,
+            false,
         )
         .await
         .unwrap();

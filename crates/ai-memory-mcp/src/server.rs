@@ -1105,6 +1105,11 @@ struct BriefingArgs {
     /// omit both for the current project; static MCP clients must pass both.
     #[serde(default)]
     workspace: Option<String>,
+    /// Lead the briefing with the project's settled rule/decision pages
+    /// (highest-standing, ordered by evidence then recency). Default `false`
+    /// leaves the briefing shape unchanged.
+    #[serde(default)]
+    settled_first: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -3875,7 +3880,9 @@ impl AiMemoryServer {
         deterministic, and READ-ONLY: it never creates handoffs or mutates \
         project state. Use this when you want a programmatic view of \
         project state; use `memory_explore` if you want an LLM-composed \
-        prose summary on top of the same data.")]
+        prose summary on top of the same data. Pass `settled_first: true` \
+        to also lead the briefing with the project's settled rule/decision \
+        pages (highest-standing, ordered by evidence then recency).")]
     async fn memory_briefing(
         &self,
         Parameters(args): Parameters<BriefingArgs>,
@@ -3883,6 +3890,7 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.recent_pages_limit.unwrap_or(10);
+        let settled_first = args.settled_first.unwrap_or(false);
         let (ws, proj) = self
             .effective_ids_for_read_args_with_actor(
                 args.workspace.as_deref(),
@@ -3900,6 +3908,7 @@ impl AiMemoryServer {
                 limit,
                 ai_memory_core::OwnerFilter::for_actor_context(&actor),
                 &visibility,
+                settled_first,
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -3944,6 +3953,7 @@ impl AiMemoryServer {
                 limit,
                 ai_memory_core::OwnerFilter::for_actor_context(&actor),
                 &visibility,
+                false,
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -9063,6 +9073,7 @@ mod tests {
                     recent_pages_limit: Some(5),
                     project: None,
                     workspace: None,
+                    settled_first: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9093,6 +9104,67 @@ mod tests {
         assert!(
             text.contains("\"sessions\": 0"),
             "expected lifetime sessions: 0\n{text}"
+        );
+        // settled_first defaults to false: `settled` stays empty and is
+        // therefore omitted from the JSON entirely (P4,
+        // docs/design-hindsight-borrowings.md §5).
+        assert!(
+            !text.contains("\"settled\""),
+            "settled must be omitted by default:\n{text}"
+        );
+    }
+
+    /// P4 (docs/design-hindsight-borrowings.md §5): `settled_first: true`
+    /// leads the briefing with the project's `rule`/`decision` pages.
+    /// Tool-level companion to the reader-level ordering test.
+    #[tokio::test]
+    async fn memory_briefing_settled_first_surfaces_rule_and_decision_pages() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("decisions/pick-rust.md").unwrap(),
+                title: "Pick Rust".into(),
+                body: "we chose rust".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .memory_briefing(
+                Parameters(BriefingArgs {
+                    recent_pages_limit: Some(5),
+                    project: None,
+                    workspace: None,
+                    settled_first: Some(true),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("\"settled\":"),
+            "settled_first=true must include settled:\n{text}"
+        );
+        assert!(
+            text.contains("decisions/pick-rust.md"),
+            "settled must surface the decision page:\n{text}"
         );
     }
 
@@ -10187,6 +10259,7 @@ mod tests {
                     recent_pages_limit: Some(5),
                     project: None,
                     workspace: None,
+                    settled_first: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10919,6 +10992,7 @@ mod tests {
                     recent_pages_limit: Some(5),
                     project: None,
                     workspace: None,
+                    settled_first: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10959,6 +11033,7 @@ mod tests {
                     recent_pages_limit: Some(5),
                     project: None,
                     workspace: None,
+                    settled_first: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

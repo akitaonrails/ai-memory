@@ -120,6 +120,7 @@ pub async fn run_experience_review(
             project_id,
             100,
             ai_memory_core::OwnerFilter::Any,
+            false,
         )
         .await?;
     let patchable_pages = load_patchable_pages(

@@ -408,6 +408,7 @@ impl Consolidator {
                 // surfaced from here, so no owner scoping applies.
                 ai_memory_core::OwnerFilter::Any,
                 &visibility,
+                false,
             )
             .await?;
         let mut slots = Vec::with_capacity(briefing.slots.len());

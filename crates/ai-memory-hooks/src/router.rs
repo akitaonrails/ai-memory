@@ -4857,7 +4857,7 @@ mod tests {
 
         let briefing = state
             .reader
-            .briefing_for_project(ws, proj, 1, ai_memory_core::OwnerFilter::Any)
+            .briefing_for_project(ws, proj, 1, ai_memory_core::OwnerFilter::Any, false)
             .await
             .unwrap();
         assert_eq!(
@@ -7422,6 +7422,7 @@ mod tests {
                 state.project_id,
                 1,
                 ai_memory_core::OwnerFilter::Any,
+                false,
             )
             .await
             .unwrap()
@@ -7469,7 +7470,8 @@ mod tests {
                     state.workspace_id,
                     state.project_id,
                     1,
-                    ai_memory_core::OwnerFilter::Any
+                    ai_memory_core::OwnerFilter::Any,
+                    false
                 )
                 .await
                 .unwrap()
@@ -9636,6 +9638,7 @@ mod tests {
                 project_id,
                 1,
                 ai_memory_core::OwnerFilter::Any,
+                false,
             )
             .await
             .unwrap();

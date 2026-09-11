@@ -473,6 +473,7 @@ pub async fn run_auto_improve_review(
             100,
             // Internal review pass: the pending-handoff count is not surfaced.
             ai_memory_core::OwnerFilter::Any,
+            false,
         )
         .await?;
     let session_page_path = format!("sessions/{session_id}.md");

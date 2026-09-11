@@ -1173,6 +1173,14 @@ pub struct BriefingSnapshot {
     /// Distinct other projects this project's pages link OUT to (what we
     /// depend on). Project-scoped briefings only; `0` otherwise.
     pub cross_project_dependencies: u64,
+    /// The project's highest-standing `rule`/`decision` pages, ordered by
+    /// evidence count then recency. Populated only when the caller opts
+    /// in via `settled_first: true` on `memory_briefing` /
+    /// `briefing_for_project(_with_slot_visibility)` (P4,
+    /// docs/design-hindsight-borrowings.md §5); empty and omitted from
+    /// JSON otherwise so the default briefing shape is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settled: Vec<SettledPage>,
 }
 
 /// Trimmed page view for the briefing — path, title, kind, updated_at
@@ -1189,6 +1197,24 @@ pub struct BriefingPage {
     pub kind: String,
     /// ISO-8601 timestamp of the last update.
     pub updated_at: String,
+}
+
+/// One of a project's highest-standing `rule`/`decision` pages, surfaced
+/// by [`ReaderPool::briefing_for_project_with_slot_visibility`] only when
+/// the caller opts in via `settled_first: true` (P4,
+/// docs/design-hindsight-borrowings.md §5) — a bounded list an agent can
+/// boot from instead of re-deriving settled answers from scratch.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettledPage {
+    /// Relative wiki path.
+    pub path: String,
+    /// Page title (first H1 / frontmatter title).
+    pub title: String,
+    /// Semantic classification — always `rule` or `decision` here.
+    pub kind: String,
+    /// Number of `page_evidence` rows citing this page version (0 when
+    /// none have accrued yet).
+    pub evidence_count: u32,
 }
 
 /// One core page of the session-start project brief — body included,
@@ -5269,6 +5295,7 @@ impl ReaderPool {
                 recent_pages,
                 cross_project_dependents: 0,
                 cross_project_dependencies: 0,
+                settled: Vec::new(),
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -5277,6 +5304,11 @@ impl ReaderPool {
     }
 
     /// Assemble a project-scoped [`BriefingSnapshot`].
+    ///
+    /// `settled_first` opts into populating [`BriefingSnapshot::settled`]
+    /// with the project's highest-standing `rule`/`decision` pages (P4,
+    /// docs/design-hindsight-borrowings.md §5); `false` leaves the
+    /// snapshot byte-for-byte as before.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -5287,6 +5319,7 @@ impl ReaderPool {
         project_id: ProjectId,
         recent_pages_limit: usize,
         owner_filter: OwnerFilter,
+        settled_first: bool,
     ) -> StoreResult<BriefingSnapshot> {
         self.briefing_for_project_with_slot_visibility(
             workspace_id,
@@ -5294,11 +5327,13 @@ impl ReaderPool {
             recent_pages_limit,
             owner_filter,
             &ai_memory_core::SlotVisibility::All,
+            settled_first,
         )
         .await
     }
 
-    /// Assemble a project briefing while filtering operator-owned slot pages.
+    /// Assemble a project briefing while filtering operator-owned slot
+    /// pages. See [`ReaderPool::briefing_for_project`] for `settled_first`.
     pub async fn briefing_for_project_with_slot_visibility(
         &self,
         workspace_id: WorkspaceId,
@@ -5306,6 +5341,7 @@ impl ReaderPool {
         recent_pages_limit: usize,
         owner_filter: OwnerFilter,
         slot_visibility: &ai_memory_core::SlotVisibility,
+        settled_first: bool,
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
         let slot_visibility = slot_visibility.clone();
@@ -5440,6 +5476,32 @@ impl ReaderPool {
 
             let (cross_project_dependents, cross_project_dependencies) =
                 cross_project_degree(conn, workspace_id, project_id)?;
+
+            let settled: Vec<SettledPage> = if settled_first {
+                let settled_kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
+                let mut settled_stmt = conn.prepare_cached(&format!(
+                    "SELECT pages.path, pages.title, {settled_kind_expr} AS kind, \
+                            COUNT(page_evidence.source_id) AS evidence_count \
+                     FROM pages \
+                     LEFT JOIN page_evidence ON page_evidence.page_id = pages.id \
+                     WHERE pages.workspace_id = ?1 AND pages.project_id = ?2 \
+                       AND pages.is_latest = 1 \
+                       AND ({settled_kind_expr}) IN ('rule', 'decision'){not_expired} \
+                     GROUP BY pages.id \
+                     ORDER BY evidence_count DESC, pages.updated_at DESC \
+                     LIMIT 8",
+                    not_expired = not_expired("pages", "?3"),
+                ))?;
+                settled_stmt
+                    .query_map(
+                        params![workspace_id.as_bytes(), project_id.as_bytes(), now_us],
+                        settled_page_from_row,
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
+
             let mut snapshot = BriefingSnapshot {
                 counts,
                 activity_7d,
@@ -5451,6 +5513,7 @@ impl ReaderPool {
                 recent_pages,
                 cross_project_dependents,
                 cross_project_dependencies,
+                settled,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -5862,6 +5925,7 @@ impl ReaderPool {
                 recent_pages,
                 cross_project_dependents: 0,
                 cross_project_dependencies: 0,
+                settled: Vec::new(),
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -9088,6 +9152,22 @@ fn briefing_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResu
                 "bad updated_at: {e}"
             )))
         }))
+}
+
+/// Materialise one row from the briefing's `settled_first` query into a
+/// [`SettledPage`]. The row shape is `(path, title, kind,
+/// evidence_count)`.
+fn settled_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SettledPage> {
+    let path: String = row.get(0)?;
+    let title: String = row.get(1)?;
+    let kind: String = row.get(2)?;
+    let evidence_count: i64 = row.get(3)?;
+    Ok(SettledPage {
+        path,
+        title,
+        kind,
+        evidence_count: u32::try_from(evidence_count).unwrap_or(u32::MAX),
+    })
 }
 
 /// Reject cwds that can't safely participate in a `repo_path` prefix

@@ -715,7 +715,7 @@ async fn an_owner_name_with_a_quote_filters_like_any_other() {
             .pending_handoff_count,
         store
             .reader
-            .briefing_for_project(ws, proj, 5, filter())
+            .briefing_for_project(ws, proj, 5, filter(), false)
             .await
             .unwrap()
             .pending_handoff_count,

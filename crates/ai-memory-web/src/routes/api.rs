@@ -454,6 +454,7 @@ async fn briefing_handler(
             project_id,
             query.limit.clamp(1, 100),
             owner_filter_for(actor),
+            false,
         )
         .await
         .map_err(internal_error)?;
@@ -800,7 +801,7 @@ async fn project_overview_handler(
 
     let briefing = state
         .reader
-        .briefing_for_project(workspace_id, project_id, limit, owner_filter)
+        .briefing_for_project(workspace_id, project_id, limit, owner_filter, false)
         .await
         .map_err(internal_error)?;
 
