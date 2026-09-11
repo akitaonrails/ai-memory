@@ -2,12 +2,14 @@
 
 Date: 2026-09-11
 
-This development branch intentionally has no issue/PR reference and no
-`CHANGELOG.md` entry yet. It is a local validation branch, not merge-ready.
+Development started as a local validation branch with no issue, PR, or
+`CHANGELOG.md` reference. After the local smokes passed, issue #716 was opened
+and the real reference was added to `CHANGELOG.md` before publication.
 
 ## RED
 
-Commit: `3b215cb8 test: add codex provider configuration reproducers`
+Commit after rebasing onto v2.1.2: `6a375344 test: add codex provider
+configuration reproducers`
 
 Command:
 
@@ -32,7 +34,7 @@ Observed results:
 
 - Codex unit/recovery suite: 10 passed.
 - Existing openai-oauth regression suite: 18 passed.
-- Codex-related CLI/config tests: 17 passed.
+- Codex-related CLI/config tests: 20 passed after rebasing onto v2.1.2.
 
 The recovery suite compiles a fake Codex executable from Rust source. It runs
 without network access or a real home directory and covers handshake messages,
@@ -47,7 +49,8 @@ output, reload-before-retry, and the one-retry ceiling.
 - `git diff --check`: passed.
 - `TAILWIND_SKIP=1 cargo clippy --workspace --all-targets -- -D warnings`:
   passed.
-- `cargo deny check`: passed (`advisories`, `bans`, `licenses`, `sources`).
+- `cargo deny --all-features check`: passed (`advisories`, `bans`, `licenses`,
+  `sources`).
 - `TAILWIND_SKIP=1 cargo test --workspace`: provider and downstream suites
   passed until two unrelated `ai-memory-core::routing_skills` assertions hit
   CRLF bytes in the existing Windows checkout. Neither the embedded skill
