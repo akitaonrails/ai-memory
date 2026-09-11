@@ -17,14 +17,20 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(ai_memory_cli::run());
-    // `run` has returned, so every guard it owns — the log-flush guard, the
-    // store, the wiki watcher, the serve lock — has already been dropped in
-    // order. What can still be parked is the MCP stdio transport's read of
-    // stdin: tokio serves it from a blocking thread, a blocking read cannot be
-    // cancelled, and dropping a runtime waits for in-flight blocking work
-    // forever. That await is what kept `serve --transport stdio` alive after a
-    // handled Ctrl-C (#699). Nothing is waiting on that read's result any more,
-    // so stop waiting for it and let the process exit.
+    // `run` has returned and dropped the handles it owned, but the store
+    // writer's `Shutdown`-and-join does NOT run here: the maintenance
+    // scheduler's detached tasks (and, once a client has connected, the
+    // client-activity flush loop) hold surviving `WriterHandle` clones, so
+    // `WriterInner::drop` never fires and `shutdown_timeout(ZERO)` abandons
+    // those tasks rather than letting them finish. Writes still queued on the
+    // writer at signal time are dropped — the same abruptness an un-handled
+    // interrupt already imposes on a server that is not PID 1 (#703, #710).
+    // What this DOES cure is the stdio hang: the MCP stdio transport reads
+    // stdin on a blocking thread that cannot be cancelled, and dropping the
+    // runtime would otherwise wait for that read forever, which is what kept
+    // `serve --transport stdio` alive after a handled Ctrl-C (#699). Nothing
+    // awaits that read's result any more, so stop waiting and let the process
+    // exit.
     runtime.shutdown_timeout(Duration::ZERO);
     result
 }
