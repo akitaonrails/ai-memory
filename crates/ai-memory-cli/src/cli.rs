@@ -1909,6 +1909,9 @@ pub struct LlmTestArgs {
     /// Prompt to send.
     #[arg(long)]
     pub prompt: String,
+    /// Request a small JSON-schema response instead of plain text.
+    #[arg(long)]
+    pub structured: bool,
     /// Base URL override (required for openai-compat).
     #[arg(long)]
     pub base_url: Option<String>,
@@ -3346,6 +3349,28 @@ mod tests {
         assert!(matches!(args.provider, LlmProviderChoice::AnthropicOauth));
         assert_eq!(args.model, "claude-sonnet-4-6");
         assert_eq!(args.prompt, "ping");
+    }
+
+    #[test]
+    fn llm_test_codex_structured_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "llm-test",
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-5.6-luna",
+            "--prompt",
+            "ping",
+            "--structured",
+        ])
+        .unwrap();
+
+        let Command::LlmTest(args) = cli.command else {
+            panic!("expected llm-test command");
+        };
+        assert!(matches!(args.provider, LlmProviderChoice::Codex));
+        assert!(args.structured);
     }
 
     #[test]

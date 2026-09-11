@@ -70,6 +70,7 @@ export AI_MEMORY_LLM_PROVIDER=codex
 export AI_MEMORY_LLM_MODEL=gpt-5.6-luna
 export AI_MEMORY_LLM_REASONING_EFFORT=medium
 ai-memory llm-test --provider codex --model gpt-5.6-luna --prompt "Reply with OK"
+ai-memory llm-test --provider codex --model gpt-5.6-luna --structured --prompt "Return a short answer"
 ```
 
 Codex credential storage mode `file` is supported. `auto` works only when its
