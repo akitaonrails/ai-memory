@@ -1,6 +1,15 @@
 # Design / implementation plan: borrowings from the Hindsight study
 
-*Status: proposed (design only, no code). Targets the `release/2.2` line
+*Status: **implemented on the `release/2.2` line (2.2.0)**, additive and
+default-behavior-unchanged. Shipped: **P1** typed redaction labels
+(`[REDACTED:<kind>]`); **P2** the `page_evidence` substrate (V63) + an
+`evidence_count` explain field, ranking-inert; **P3** the typed edge kind in
+`graph_via.edge` explain, ranking unchanged; **P4** an opt-in `settled_first`
+briefing (default off); **P5** the no-API-key subscription docs. The
+**eval-gated activations remain deferred behind the R2 harness** (which does not
+yet exist): P2's confidence→authority factor and P3's typed-edge rank weighting /
+`contradicts` cap are NOT wired into ranking — the data and explanations land,
+the default-rank flips wait for a number. Targets the `release/2.2` line
 (2.2.x — every item here is additive). Derived from
 [`research-hindsight.md`](research-hindsight.md) §11 ("Strengths worth
 borrowing") and the landscape recommendations R3/R5 in
