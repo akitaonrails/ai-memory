@@ -684,16 +684,33 @@ mod tests {
             "precondition: the session page is indexed",
         );
 
-        // Make the unlink fail the way a read-only mount or a stray permission
-        // does — the markdown itself stays intact and readable.
+        // Make the unlink fail the way a read-only mount or a sharing
+        // violation does — the markdown itself stays intact and readable.
+        #[cfg(unix)]
         let original = std::fs::metadata(&sessions_dir).unwrap().permissions();
-        let mut locked = original.clone();
-        locked.set_readonly(true);
-        std::fs::set_permissions(&sessions_dir, locked).unwrap();
+        #[cfg(unix)]
+        {
+            let mut locked = original.clone();
+            locked.set_readonly(true);
+            std::fs::set_permissions(&sessions_dir, locked).unwrap();
+        }
+        #[cfg(windows)]
+        let _file_lock = {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            // Windows checks the file handle's share mode when unlinking;
+            // a readonly directory does not prevent deletion there.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x0000_0001 | 0x0000_0002) // FILE_SHARE_READ | FILE_SHARE_WRITE
+                .open(&abs)
+                .unwrap()
+        };
         let outcome = wiki
             .purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip)
             .await
             .unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&sessions_dir, original).unwrap();
 
         // Preconditions: this is the reported `files_failed` state.
