@@ -340,6 +340,19 @@ curl -sI http://127.0.0.1:49374/handoff
 
 ### LLM provider login with native services
 
+> **You do not need a paid platform API key.** ai-memory's LLM features
+> (consolidation, lint, auto-improve) are opt-in, and when you enable them you
+> can authenticate with a **subscription you already pay for** instead of a
+> metered API key: a Claude Pro/Max plan via `anthropic-oauth`
+> (`claude setup-token`), a ChatGPT Plus/Pro/Codex plan via `openai-oauth`
+> (`ai-memory auth login openai-oauth`), or a GitHub Copilot plan via `copilot`
+> (`ai-memory auth login copilot`). See
+> [`docs/llm-providers.md`](llm-providers.md) for the full table. And you can
+> skip an LLM entirely: the default zero-LLM path still captures, searches
+> (FTS), and writes rule-based summaries with no provider at all —
+> [`docs/local-embeddings.md`](local-embeddings.md) makes vector search
+> keyless too.
+
 API-key providers go in the relevant env file:
 
 ```bash
