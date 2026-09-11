@@ -810,6 +810,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();

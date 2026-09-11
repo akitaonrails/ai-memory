@@ -44,6 +44,7 @@ async fn embedding_backfill_embeds_frontmatter_abstract() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();
@@ -89,6 +90,7 @@ async fn embedding_backfill_embeds_frontmatter_abstract() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();

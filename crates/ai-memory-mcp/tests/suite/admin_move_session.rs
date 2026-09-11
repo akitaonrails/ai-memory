@@ -215,6 +215,7 @@ async fn seed_session(
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();
@@ -451,6 +452,7 @@ async fn move_session_page_collision_returns_409_and_leaves_source_intact() {
             author_id: None,
             expires_at: None,
             entities: vec![],
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

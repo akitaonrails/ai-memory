@@ -55,6 +55,7 @@ async fn write_slot(store: &Store, ws: WorkspaceId, proj: ProjectId, path: &str)
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -561,6 +562,7 @@ async fn expiry_and_slot_visibility_both_apply() {
                 author_id: None,
                 expires_at,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();

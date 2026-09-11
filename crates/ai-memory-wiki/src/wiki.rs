@@ -733,6 +733,7 @@ impl Wiki {
                 author_id: None,
                 expires_at: meta.expires_at,
                 entities: meta.entities,
+                evidence: Vec::new(),
             })
             .await?;
         Ok(id)
@@ -1458,6 +1459,7 @@ impl Wiki {
             author_id,
             expires_at,
             entities,
+            evidence: Vec::new(),
         };
 
         let result = {
@@ -1572,6 +1574,7 @@ impl Wiki {
                 author_id: None,
                 expires_at: meta.expires_at,
                 entities: meta.entities,
+                evidence: Vec::new(),
             })
             .await?;
         Ok(id)
@@ -1924,6 +1927,7 @@ impl Wiki {
                         author_id: req.author_id,
                         expires_at: parse_expires_at(&req.path, &req.frontmatter)?,
                         entities: parse_entities(&req.path, &req.frontmatter)?,
+                        evidence: req.evidence.clone(),
                     })
                 })
                 .collect::<WikiResult<Vec<_>>>()?;
@@ -2049,6 +2053,7 @@ impl Wiki {
             admission_ctx,
             author_id,
             actor,
+            evidence,
         } = req;
 
         // Defence-in-depth: scrub the body before we touch disk or the
@@ -2161,6 +2166,7 @@ impl Wiki {
                     author_id,
                     expires_at,
                     entities,
+                    evidence,
                 })
                 .await
             {
@@ -2295,6 +2301,12 @@ pub struct WritePageRequest {
     /// (consolidator, lint rewriters) that build `WritePageRequest`
     /// without an HTTP request layer.
     pub author_id: Option<ai_memory_core::UserId>,
+    /// Evidence sources backing this write (P2,
+    /// docs/design-hindsight-borrowings.md §3), forwarded verbatim to
+    /// [`ai_memory_core::NewPage::evidence`]. Populated by the
+    /// consolidator from the session(s) it drew on; empty for every
+    /// other caller (MCP tool, admin endpoints, lint rewriters).
+    pub evidence: Vec<ai_memory_core::PageEvidence>,
     /// Identity carried in the on-disk frontmatter's `last_modified_by`
     /// block AND the admission webhook payload's `ctx.actor`. The auth
     /// middleware fills this from the four-rung resolution (injected as
@@ -2997,6 +3009,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         }
     }
 
@@ -3117,6 +3130,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
         };
 
@@ -4017,6 +4031,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .collect();
         let ids = wiki.apply_batch(batch).await.unwrap();
@@ -4183,6 +4198,7 @@ mod tests {
                 }),
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             }])
             .await
             .unwrap();
@@ -4337,6 +4353,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -4353,6 +4370,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -4476,6 +4494,7 @@ mod tests {
             }),
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -4626,6 +4645,7 @@ mod tests {
                 email: Some("alice@example.com".into()),
                 ..ai_memory_core::ActorContext::default()
             },
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -4684,6 +4704,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -4769,6 +4790,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         };
 
         // Many rounds so any interleave window is likely to be exercised.
@@ -4827,6 +4849,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -5588,6 +5611,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: vec![],
+                evidence: Vec::new(),
             })
             .await
             .unwrap();

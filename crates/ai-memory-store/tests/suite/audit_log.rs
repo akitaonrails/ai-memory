@@ -26,6 +26,7 @@ async fn seed_page(
             author_id,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

@@ -41,6 +41,7 @@ async fn page_fts_rows_report_index_drift() {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

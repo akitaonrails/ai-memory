@@ -198,8 +198,9 @@ mod tests {
     use ai_memory_core::{
         ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, LinkTarget,
         ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewWorkstreamEvent,
-        ObservationId, ObservationKind, PageId, PagePath, ProjectId, Sanitized, Sanitizer,
-        SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind, WorkstreamId,
+        ObservationId, ObservationKind, PageEvidence, PageEvidenceKind, PageId, PagePath,
+        ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
+        WorkstreamId,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -246,6 +247,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 
@@ -2954,6 +2956,139 @@ mod tests {
         );
     }
 
+    /// P2 (docs/design-hindsight-borrowings.md §3), ship scope for 2.2.0:
+    /// evidence is substrate + explain surfacing ONLY. `hybrid_search_explained`
+    /// reports `evidence_count`, but citing a page from two distinct sessions
+    /// must not move the default (non-explained) path's ranking at all —
+    /// same hit order, same `rank` scores, before and after evidence accrues.
+    #[tokio::test]
+    async fn hybrid_search_explained_reports_evidence_count_without_moving_default_ranking() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        let page_a = sample_page(ws, proj, "a.md", "evidence probe alpha content");
+        let page_b = sample_page(ws, proj, "b.md", "evidence probe beta content");
+        store.writer.upsert_page(page_a.clone()).await.unwrap();
+        store.writer.upsert_page(page_b).await.unwrap();
+
+        let query = || "evidence probe".to_string();
+        let baseline = store
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                query(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        let baseline_paths: Vec<&str> = baseline.iter().map(|h| h.path.as_str()).collect();
+        let baseline_ranks: Vec<f64> = baseline.iter().map(|h| h.rank).collect();
+
+        // Cite `a.md` from two distinct sessions. The body/frontmatter are
+        // byte-identical each time, so this hits the content short-circuit
+        // (ops::upsert_page_in_tx) — same page id, no new version, nothing
+        // that could feed `fused`/`authority` changes — and only the
+        // `page_evidence` rows accrue.
+        let mut with_evidence = page_a.clone();
+        with_evidence.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-1".into(),
+        }];
+        store
+            .writer
+            .upsert_page(with_evidence.clone())
+            .await
+            .unwrap();
+        with_evidence.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-2".into(),
+        }];
+        store.writer.upsert_page(with_evidence).await.unwrap();
+
+        let after = store
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                query(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        let after_paths: Vec<&str> = after.iter().map(|h| h.path.as_str()).collect();
+        let after_ranks: Vec<f64> = after.iter().map(|h| h.rank).collect();
+        assert_eq!(
+            baseline_paths, after_paths,
+            "evidence must not reorder hits"
+        );
+        assert_eq!(
+            baseline_ranks, after_ranks,
+            "evidence must not change the rank score on the default path"
+        );
+
+        let explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                query(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        let (_, a_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "a.md")
+            .unwrap();
+        let (_, b_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "b.md")
+            .unwrap();
+        assert_eq!(
+            a_details.evidence_count,
+            Some(2),
+            "two distinct sessions cited a.md"
+        );
+        assert_eq!(
+            b_details.evidence_count,
+            Some(0),
+            "b.md has no evidence rows — explained still reports Some(0), not None"
+        );
+        // Explain must still agree with the default path's own ordering.
+        let explained_paths: Vec<&str> =
+            explained.iter().map(|(hit, _)| hit.path.as_str()).collect();
+        assert_eq!(
+            after_paths, explained_paths,
+            "explain must not change ranking"
+        );
+    }
+
     #[tokio::test]
     async fn observation_fts_finds_raw_fallback_hits() {
         let tmp = TempDir::new().unwrap();
@@ -4336,6 +4471,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         };
         store.writer.upsert_page(page).await.unwrap();
 

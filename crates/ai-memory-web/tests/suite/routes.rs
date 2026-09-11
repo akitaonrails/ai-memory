@@ -40,6 +40,7 @@ fn new_page(
         author_id: None,
         expires_at: None,
         entities: Vec::new(),
+        evidence: Vec::new(),
     }
 }
 
@@ -61,6 +62,7 @@ fn wiki_req(
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     }
 }
 
@@ -623,6 +625,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -644,6 +647,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -2598,6 +2602,7 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();
@@ -2679,6 +2684,7 @@ async fn api_page_handler_etag_differs_per_page() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();
@@ -2694,6 +2700,7 @@ async fn api_page_handler_etag_differs_per_page() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();

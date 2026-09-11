@@ -6044,6 +6044,7 @@ async fn copy_purge_merge(
                 }),
                 author_id: None,
                 actor: actor.clone(),
+                evidence: Vec::new(),
             })
             .await
         {
@@ -6538,6 +6539,7 @@ async fn handle_write_page(
             admission_ctx,
             author_id,
             actor,
+            evidence: Vec::new(),
         })
         .await
         .map_err(|e| internal_err(e.to_string()))?;
@@ -8613,6 +8615,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -8768,6 +8771,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -8907,6 +8911,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -9024,6 +9029,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

@@ -89,6 +89,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SessionStart` event is not specified, so capture and managed workstreams
   are not claimed. Skills need no extra step — Muse reads `~/.agents/skills`,
   which `install-skills` already writes (#659).
+- Belief-strength evidence substrate (P2, `docs/design-hindsight-borrowings.md`
+  §3): a new append-only `page_evidence` table (V63,
+  `(page_id, source_kind, source_id, created_at)`, `source_kind` one of
+  `session`/`observation`/`feedback`/`reconsolidation`) records what
+  produced or reaffirmed each page version, written in the same
+  transaction as the page upsert. Rule-based and zero-LLM — the
+  consolidator cites the session(s) it drew on for both the single-page
+  and batch write paths, so the substrate populates on the default path
+  with no provider configured. `hybrid_search_explained` (and therefore
+  `memory_query(explain=true)`) now reports `evidence_count` per hit,
+  batch-fetched once after fusion; the default (non-explained) path and
+  ranking are unchanged — evidence is inert data and an explain field
+  this release, not a ranking input. The confidence-into-`PageAuthority`
+  step described in the design doc is deferred behind the planned R2
+  retrieval eval.
 
 ### Changed
 - The privacy sanitizer now redacts to a **typed marker** — `[REDACTED:<kind>]`

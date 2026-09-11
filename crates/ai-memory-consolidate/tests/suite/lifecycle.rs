@@ -204,6 +204,7 @@ async fn m8_retention_lifecycle_end_to_end() {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .expect("write page");
@@ -512,6 +513,7 @@ async fn ttl_expiry_lifecycle_end_to_end() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
     };
 
@@ -759,6 +761,7 @@ async fn aged_decay_cleanup_stays_within_the_requested_scope() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .expect("write tombstone fixture");
@@ -869,6 +872,7 @@ async fn rewritten_decay_eviction_removes_the_file_and_entire_version_chain() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     };
     let first = wiki
         .write_page(write("# Rewritten\nfirst-version-marker", "first-entity"))
@@ -971,6 +975,7 @@ async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     };
     let first = wiki
         .write_page(write("# Recreated\nold one"))

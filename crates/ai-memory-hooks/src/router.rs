@@ -2863,6 +2863,7 @@ async fn process_authorized(
                 // identity. NULL stays anonymous/shared, including rows that
                 // predate owner recording.
                 actor: session_actor.clone(),
+                evidence: Vec::new(),
             })
             .await?;
         // The baton follows the SESSION's owner, so it reaches the person who
@@ -3391,6 +3392,7 @@ async fn consolidate_or_synth(
             }),
             author_id: None,
             actor,
+            evidence: Vec::new(),
         })
         .await?;
     let _ = state
@@ -9582,6 +9584,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -10316,6 +10319,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 

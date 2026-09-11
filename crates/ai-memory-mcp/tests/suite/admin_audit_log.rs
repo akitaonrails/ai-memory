@@ -63,6 +63,7 @@ async fn seed_page(store: &Store, workspace: &str, project: &str, path: &str, bo
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

@@ -77,6 +77,7 @@ async fn write(
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();

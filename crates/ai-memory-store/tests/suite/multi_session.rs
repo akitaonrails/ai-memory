@@ -78,6 +78,7 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
         author_id: None,
         expires_at: None,
         entities: Vec::new(),
+        evidence: Vec::new(),
     }
 }
 

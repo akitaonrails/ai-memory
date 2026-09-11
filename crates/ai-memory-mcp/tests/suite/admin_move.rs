@@ -153,6 +153,7 @@ async fn seed_page_with_metadata(
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();
@@ -677,6 +678,7 @@ async fn true_move_stale_source_write_fails_before_creating_file() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap_err();

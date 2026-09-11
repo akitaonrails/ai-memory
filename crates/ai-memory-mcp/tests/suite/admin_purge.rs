@@ -134,6 +134,7 @@ async fn seed_ended_session_summary(
             admission_ctx: None,
             author_id: None,
             actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -180,6 +181,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();
@@ -196,6 +198,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .unwrap();
@@ -340,6 +343,7 @@ async fn purge_session_keeps_same_path_in_sibling_project() {
             admission_ctx: None,
             author_id: None,
             actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

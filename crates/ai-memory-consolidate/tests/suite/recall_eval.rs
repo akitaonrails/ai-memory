@@ -138,6 +138,7 @@ async fn recall_at_5_baseline() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .expect("write page");
@@ -197,6 +198,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .expect("write target");
@@ -212,6 +214,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .expect("write source");
@@ -287,6 +290,7 @@ async fn entity_stream_recovers_a_probe_fts_and_graph_both_miss() {
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
     })
     .await
     .expect("write page");

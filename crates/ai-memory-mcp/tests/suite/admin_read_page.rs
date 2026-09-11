@@ -80,6 +80,7 @@ async fn read_page_falls_back_to_db_when_file_missing() {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -130,6 +131,7 @@ async fn read_page_serves_on_disk_page() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -180,6 +182,7 @@ async fn read_page_does_not_fall_back_when_disk_frontmatter_is_malformed() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

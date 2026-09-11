@@ -213,6 +213,10 @@ impl Consolidator {
                 }),
                 author_id,
                 actor,
+                evidence: vec![ai_memory_core::PageEvidence {
+                    kind: ai_memory_core::PageEvidenceKind::Session,
+                    source_id: session_id.to_string(),
+                }],
             })
             .await?;
         // Auto-commit the result so the supersession lands in git.
@@ -497,6 +501,10 @@ impl Consolidator {
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
             }
+            req.evidence = vec![ai_memory_core::PageEvidence {
+                kind: ai_memory_core::PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+            }];
             // A slot the engine writes belongs to the operator whose session
             // produced it, and `build_update` keeps the model's path verbatim
             // for every non-Rule kind — so the path here is attacker-reachable
@@ -699,6 +707,7 @@ fn build_update(
         }),
         author_id,
         actor: actor.clone(),
+        evidence: Vec::new(),
     };
     let outcome = ConsolidationOutcome {
         path,
@@ -1907,6 +1916,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -2418,6 +2428,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -2510,6 +2521,50 @@ mod tests {
         }
     }
 
+    /// P2 (docs/design-hindsight-borrowings.md §3): the single-page
+    /// consolidation write cites the session it consolidated as evidence,
+    /// in the same transaction as the page upsert — purely rule-based, no
+    /// LLM involvement in the citation itself.
+    #[tokio::test]
+    async fn single_page_consolidation_records_session_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "title": "Queue decision",
+            "body_markdown": "The queue is bounded.",
+            "tags": [],
+        });
+
+        let outcome = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let page_id = outcome.page_id.unwrap();
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let rows: Vec<(String, String)> = db
+            .prepare("SELECT source_kind, source_id FROM page_evidence WHERE page_id = ?1")
+            .unwrap()
+            .query_map([page_id.as_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![("session".to_string(), session.to_string())]);
+    }
+
     /// The multi-page provider path uses the same provenance contract for its
     /// canonical session anchor, while non-session pages remain outside item 1
     /// of #494.
@@ -2540,7 +2595,7 @@ mod tests {
             ]
         });
 
-        Consolidator::new(
+        let outcomes = Consolidator::new(
             store.reader.clone(),
             store.writer.clone(),
             wiki.clone(),
@@ -2569,6 +2624,27 @@ mod tests {
             .unwrap();
         assert!(concept.frontmatter.get("agent").is_none());
         assert!(concept.frontmatter.get("session_id").is_none());
+
+        // P2 (docs/design-hindsight-borrowings.md §3): unlike the anchor-only
+        // `session_id`/`agent` frontmatter stamp above, EVERY page a batch
+        // produces cites the session that produced it as evidence.
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        for outcome in &outcomes {
+            let page_id = outcome.page_id.unwrap();
+            let rows: Vec<(String, String)> = db
+                .prepare("SELECT source_kind, source_id FROM page_evidence WHERE page_id = ?1")
+                .unwrap()
+                .query_map([page_id.as_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![("session".to_string(), session.to_string())],
+                "path {} must cite the batch's session as evidence",
+                outcome.path.as_str()
+            );
+        }
     }
 
     /// A batch whose single update targets `path` — the model chooses this
@@ -3184,6 +3260,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -3220,6 +3297,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -3252,6 +3330,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();

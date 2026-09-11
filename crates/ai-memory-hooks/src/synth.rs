@@ -69,6 +69,7 @@ pub fn synthesize_session_page(
         author_id: None,
         expires_at: None,
         entities: Vec::new(),
+        evidence: Vec::new(),
     }
 }
 

@@ -411,7 +411,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 62, "update the pin when adding a migration");
+        assert_eq!(version, 63, "update the pin when adding a migration");
         let cols: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'token_hash'",
@@ -420,6 +420,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cols, 1);
+    }
+
+    #[test]
+    fn v63_page_evidence_table_applies_and_is_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        // Re-running (refinery's own idempotency: already-applied versions
+        // are skipped) must not fail or duplicate the migration history row.
+        crate::migrations::run(&mut conn).unwrap();
+        let history_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 63",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_rows, 1, "V63 must be recorded exactly once");
+        let cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('page_evidence')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 4, "page_id, source_kind, source_id, created_at");
     }
 
     #[test]

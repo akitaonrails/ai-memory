@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 
 use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, NewHandoff,
-    NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter, PageId,
-    PagePath, ProjectId, SessionId, WorkspaceId,
+    NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter, PageEvidence,
+    PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -871,7 +871,13 @@ pub(crate) fn upsert_page_in_tx(
             && existing.tier == tier_str
             && existing.pinned == i64::from(page.pinned)
         {
-            return PageId::from_slice(&existing.id).map_err(StoreError::from);
+            let unchanged_id = PageId::from_slice(&existing.id).map_err(StoreError::from)?;
+            // The content short-circuit skips a new version row, but a
+            // reconsolidation from a different session still cites the
+            // page it reaffirmed (P2, docs/design-hindsight-borrowings.md
+            // §3) — record the evidence against the still-current id.
+            insert_evidence_in_tx(tx, &unchanged_id, &page.evidence, now)?;
+            return Ok(unchanged_id);
         }
         let frontmatter_str = stamped_frontmatter(conformed, now)?;
         let new_id = PageId::new();
@@ -915,6 +921,7 @@ pub(crate) fn upsert_page_in_tx(
         replace_links_in_tx(tx, &new_id, page)?;
         attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
+        insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
         audit(
             tx,
             "supersede_page",
@@ -955,6 +962,7 @@ pub(crate) fn upsert_page_in_tx(
     replace_links_in_tx(tx, &new_id, page)?;
     attach_entities_in_tx(tx, &new_id, page, now)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
+    insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
     audit(
         tx,
         "create_page",
@@ -1051,6 +1059,28 @@ fn replace_links_in_tx(
                 link.relation
                     .map_or("references", ai_memory_core::Relation::as_str),
             ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record a page write's evidence sources (P2,
+/// docs/design-hindsight-borrowings.md §3), in the same transaction as the
+/// page upsert. `INSERT OR IGNORE` on the `(page_id, source_kind,
+/// source_id)` PK makes re-citing the same source a no-op — a session that
+/// reconsolidates the same path twice does not inflate the count. Empty
+/// `evidence` (every pre-2.2 caller) inserts nothing.
+fn insert_evidence_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page_id: &PageId,
+    evidence: &[PageEvidence],
+    now: i64,
+) -> StoreResult<()> {
+    for e in evidence {
+        tx.execute(
+            "INSERT OR IGNORE INTO page_evidence (page_id, source_kind, source_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![page_id.as_bytes(), e.kind.as_str(), e.source_id, now],
         )?;
     }
     Ok(())
@@ -4709,8 +4739,8 @@ pub(crate) mod tests {
     //! one-line diff instead of a cascading e2e failure.
     use super::*;
     use ai_memory_core::{
-        FeedbackKind, LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier,
-        UserId, WorkspaceId,
+        FeedbackKind, LinkTarget, NewHandoff, NewPage, NewSession, PageEvidence, PageEvidenceKind,
+        PagePath, ProjectId, Tier, UserId, WorkspaceId,
     };
     use rusqlite::Connection;
     use std::io::Write;
@@ -6276,6 +6306,7 @@ pub(crate) mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 
@@ -6742,6 +6773,102 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(total, 1, "no duplicate row for unchanged content");
+    }
+
+    fn evidence_count(conn: &Connection, page_id: &PageId) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM page_evidence WHERE page_id = ?1",
+            params![page_id.as_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// P2 (docs/design-hindsight-borrowings.md §3): a page write's cited
+    /// evidence accrues in-transaction with the upsert. Reconsolidating the
+    /// same (unchanged) content from a different session still hits the
+    /// content short-circuit — same page id, no new version — but the new
+    /// session's citation lands, and the SAME session citing it again is a
+    /// no-op (`INSERT OR IGNORE` on the `(page_id, source_kind, source_id)`
+    /// PK), never inflating the count.
+    #[test]
+    fn reconsolidating_the_same_page_accrues_evidence_per_distinct_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "notes/foo.md", "same body");
+        p.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-a".into(),
+        }];
+        let id = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(evidence_count(&conn, &id), 1);
+
+        p.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-b".into(),
+        }];
+        let id2 = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(id2, id, "unchanged content must not create a new version");
+        assert_eq!(evidence_count(&conn, &id), 2);
+
+        let id3 = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(id3, id);
+        assert_eq!(
+            evidence_count(&conn, &id),
+            2,
+            "re-citing the same session is a no-op"
+        );
+    }
+
+    /// A page written with no evidence stays at count 0 ("unknown"), and a
+    /// version created by a real content change (not the idempotent
+    /// short-circuit) starts its own, separate evidence trail.
+    #[test]
+    fn upsert_page_with_no_evidence_stays_at_zero_and_new_versions_start_fresh() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let id1 = upsert_page(&mut conn, &page(ws, proj, "notes/foo.md", "v1 body")).unwrap();
+        assert_eq!(evidence_count(&conn, &id1), 0);
+
+        let mut p2 = page(ws, proj, "notes/foo.md", "v2 body");
+        p2.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-a".into(),
+        }];
+        let id2 = upsert_page(&mut conn, &p2).unwrap();
+        assert_ne!(id2, id1, "changed body supersedes to a new version");
+        assert_eq!(
+            evidence_count(&conn, &id1),
+            0,
+            "the old version is untouched"
+        );
+        assert_eq!(evidence_count(&conn, &id2), 1);
+    }
+
+    /// Purging a page must take its evidence with it (`ON DELETE CASCADE`,
+    /// V63) — evidence never outlives the page version it supports.
+    #[test]
+    fn deleting_a_page_cascades_its_evidence_rows() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut p = page(ws, proj, "notes/foo.md", "body");
+        p.evidence = vec![PageEvidence {
+            kind: PageEvidenceKind::Session,
+            source_id: "session-a".into(),
+        }];
+        let id = upsert_page(&mut conn, &p).unwrap();
+        assert_eq!(evidence_count(&conn, &id), 1);
+
+        delete_page(
+            &mut conn,
+            ws,
+            proj,
+            &PagePath::new("notes/foo.md").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_count(&conn, &id),
+            0,
+            "ON DELETE CASCADE must drop evidence with the page"
+        );
     }
 
     /// OKF conformance happens at this choke point for every writer

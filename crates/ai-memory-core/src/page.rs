@@ -81,6 +81,76 @@ pub struct NewPage {
     /// that don't declare any.
     #[serde(default)]
     pub entities: Vec<String>,
+    /// Evidence sources backing this write (P2,
+    /// docs/design-hindsight-borrowings.md §3): what produced or
+    /// reaffirmed this page version. The store inserts one
+    /// `page_evidence` row per entry, in the same transaction as the
+    /// page upsert (V63), `INSERT OR IGNORE` so re-citing the same
+    /// source is a no-op. Empty for hand-written pages and every
+    /// pre-2.2 caller — inert data this release, not fed into ranking
+    /// or [`crate::PageAuthority`].
+    #[serde(default)]
+    pub evidence: Vec<PageEvidence>,
+}
+
+/// One piece of evidence supporting a page write (P2,
+/// docs/design-hindsight-borrowings.md §3). Additive substrate only this
+/// release: recorded and surfaced via `SearchExplain::evidence_count`,
+/// never consulted by ranking.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageEvidence {
+    /// What kind of source this is.
+    pub kind: PageEvidenceKind,
+    /// The source's own identifier (a session id, observation id,
+    /// feedback row id, or reconsolidation run id) — opaque to the
+    /// store, unique within `kind` for this page.
+    pub source_id: String,
+}
+
+/// The closed vocabulary of evidence sources a page write can cite.
+/// Matches the `page_evidence.source_kind` CHECK constraint (V63).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PageEvidenceKind {
+    /// A consolidated session that produced or touched this page.
+    Session,
+    /// A raw observation cited directly (bypassing session-grain
+    /// consolidation).
+    Observation,
+    /// User/agent feedback that reaffirmed the page.
+    Feedback,
+    /// A reconsolidation pass that rewrote or re-confirmed the page.
+    Reconsolidation,
+}
+
+impl PageEvidenceKind {
+    /// Canonical short string for storage. Matches the
+    /// `page_evidence.source_kind` CHECK constraint (V63).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Observation => "observation",
+            Self::Feedback => "feedback",
+            Self::Reconsolidation => "reconsolidation",
+        }
+    }
+}
+
+impl FromStr for PageEvidenceKind {
+    type Err = crate::MemoryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "session" => Ok(Self::Session),
+            "observation" => Ok(Self::Observation),
+            "feedback" => Ok(Self::Feedback),
+            "reconsolidation" => Ok(Self::Reconsolidation),
+            other => Err(crate::MemoryError::MalformedRecord(format!(
+                "unknown page evidence kind: {other}"
+            ))),
+        }
+    }
 }
 
 /// Longest accepted entity name; longer values are rejected rather than
@@ -465,6 +535,19 @@ mod tests {
             .map(|i| format!("entity{i}"))
             .collect();
         assert_eq!(normalize_entities(&many).len(), MAX_ENTITIES_PER_PAGE);
+    }
+
+    #[test]
+    fn page_evidence_kind_round_trips() {
+        for k in [
+            PageEvidenceKind::Session,
+            PageEvidenceKind::Observation,
+            PageEvidenceKind::Feedback,
+            PageEvidenceKind::Reconsolidation,
+        ] {
+            assert_eq!(k.as_str().parse::<PageEvidenceKind>().unwrap(), k);
+        }
+        assert!("nope".parse::<PageEvidenceKind>().is_err());
     }
 
     #[test]

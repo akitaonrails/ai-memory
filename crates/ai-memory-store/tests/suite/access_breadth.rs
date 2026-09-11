@@ -125,6 +125,7 @@ async fn per_actor_rows_accumulate_without_replacing_the_scalar() {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -224,6 +225,7 @@ async fn a_stale_page_id_does_not_cost_the_rest_of_the_batch_its_bump() {
                     author_id: None,
                     expires_at: None,
                     entities: Vec::new(),
+                    evidence: Vec::new(),
                 })
                 .await
                 .unwrap(),

@@ -579,6 +579,7 @@ impl Bootstrap {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             });
         }
         // Plus the manifest itself.
@@ -609,6 +610,7 @@ impl Bootstrap {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         });
 
         let _ids = self.wiki.apply_batch(requests).await?;

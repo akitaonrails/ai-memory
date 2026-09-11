@@ -605,6 +605,15 @@ pub struct SearchExplain {
     /// degraded, or when the hit fell outside the bounded judged prefix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rerank_score: Option<f32>,
+    /// Number of `page_evidence` rows citing this page version (P2,
+    /// docs/design-hindsight-borrowings.md §3) — how many
+    /// sessions/observations/feedback/reconsolidation passes produced or
+    /// reaffirmed it. Populated only on the explained path
+    /// ([`Reader::hybrid_search_explained`]), batch-fetched after fusion;
+    /// `None` on the default (non-explained) path. Inert this release: it
+    /// never feeds `fused`/`authority` or changes ranking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_count: Option<u32>,
 }
 
 /// One hit returned by [`ReaderPool::search_pages`].
@@ -3891,6 +3900,53 @@ impl ReaderPool {
         .await
     }
 
+    /// Number of `page_evidence` rows for each of `page_ids` (P2,
+    /// docs/design-hindsight-borrowings.md §3): what produced or
+    /// reaffirmed that page version. One batch query for the whole
+    /// result page — never one per hit — so
+    /// [`Self::hybrid_search_explained`] can attach
+    /// `SearchExplain::evidence_count` without touching the hot,
+    /// non-explained default path. A page id with zero evidence rows is
+    /// simply absent from the map; callers read that as count 0
+    /// ("unknown", not "unsupported").
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_evidence_counts(
+        &self,
+        page_ids: &[PageId],
+    ) -> StoreResult<std::collections::HashMap<PageId, u32>> {
+        if page_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let page_id_blobs: Vec<Value> = page_ids
+            .iter()
+            .map(|id| Value::Blob(id.as_bytes().to_vec()))
+            .collect();
+        self.with_conn(move |conn| {
+            let placeholders = std::iter::repeat_n("?", page_id_blobs.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT page_id, COUNT(*) FROM page_evidence \
+                 WHERE page_id IN ({placeholders}) GROUP BY page_id"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(page_id_blobs.iter()), |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                Ok((id, u32::try_from(n).unwrap_or(u32::MAX)))
+            })?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (id, n) = r?;
+                out.insert(PageId::from_slice(&id)?, n);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Rank pages by how many of the query's tokens match their indexed
     /// entities, weighting each match by inverse entity frequency — a
     /// query token matching an entity that appears on 2 pages is a much
@@ -4546,7 +4602,7 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<(PageHit, SearchExplain)>> {
-        Ok(self
+        let hits = self
             .hybrid_search_inner(
                 workspace_id,
                 project_id,
@@ -4559,9 +4615,19 @@ impl ReaderPool {
                 expiry_cutoff_us,
                 true,
             )
-            .await?
+            .await?;
+        // Evidence counts (P2, docs/design-hindsight-borrowings.md §3) are
+        // explain-only: one batch query over the already-fused result page
+        // ids, never a per-hit query on the hot default path.
+        let page_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
+        let counts = self.page_evidence_counts(&page_ids).await?;
+        Ok(hits
             .into_iter()
-            .map(|(hit, explain)| (hit, explain.unwrap_or_default()))
+            .map(|(hit, explain)| {
+                let mut explain = explain.unwrap_or_default();
+                explain.evidence_count = Some(counts.get(&hit.id).copied().unwrap_or(0));
+                (hit, explain)
+            })
             .collect())
     }
 

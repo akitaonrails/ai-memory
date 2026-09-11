@@ -480,6 +480,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -509,6 +510,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -589,6 +591,7 @@ async fn lint_dry_run_returns_lint_report_shape() {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -758,6 +761,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -775,6 +779,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -867,6 +872,7 @@ async fn commit_with_new_page_returns_committed_true_and_40char_oid() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -917,6 +923,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -936,6 +943,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

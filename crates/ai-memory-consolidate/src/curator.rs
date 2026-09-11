@@ -386,6 +386,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap()
@@ -551,6 +552,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();

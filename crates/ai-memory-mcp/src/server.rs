@@ -3078,6 +3078,7 @@ impl AiMemoryServer {
                 admission_ctx,
                 author_id,
                 actor,
+                evidence: Vec::new(),
             })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -4788,6 +4789,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -5084,6 +5086,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -6023,6 +6026,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: Vec::new(),
+            evidence: Vec::new(),
         };
         let target_id = store
             .writer
@@ -6712,6 +6716,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: vec!["postgres".into()],
+            evidence: Vec::new(),
         };
         store.writer.upsert_page(v1.clone()).await.unwrap();
         let between = jiff::Timestamp::now().to_string();
@@ -6914,6 +6919,7 @@ mod tests {
             author_id: None,
             expires_at: None,
             entities: vec!["nats jetstream".into()],
+            evidence: Vec::new(),
         };
         store.writer.upsert_page(entity_only.clone()).await.unwrap();
         entity_only.path = PagePath::new("concepts/linked.md").unwrap();
@@ -6936,6 +6942,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -7025,6 +7032,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -7566,6 +7574,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -7649,6 +7658,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -8110,6 +8120,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -8162,6 +8173,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -8642,6 +8654,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -8660,6 +8673,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -8678,6 +8692,7 @@ mod tests {
                 author_id: None,
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -8775,6 +8790,7 @@ mod tests {
                     author_id: None,
                     expires_at: None,
                     entities: Vec::new(),
+                    evidence: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -8794,6 +8810,7 @@ mod tests {
                 author_id: None,
                 expires_at: Some("2020-01-01T23:59:59Z".parse().unwrap()),
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
@@ -8912,6 +8929,7 @@ mod tests {
                     author_id: None,
                     expires_at: None,
                     entities: Vec::new(),
+                    evidence: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -9200,6 +9218,7 @@ mod tests {
                     author_id: None,
                     expires_at: None,
                     entities: Vec::new(),
+                    evidence: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -10792,6 +10811,7 @@ mod tests {
                 author_id: Some(bob_user_id),
                 expires_at: None,
                 entities: Vec::new(),
+                evidence: Vec::new(),
             })
             .await
             .unwrap();
