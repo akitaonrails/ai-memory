@@ -818,6 +818,7 @@ mod tests {
             ("oversized", "exceeded its limit"),
             ("stderr", "stderr exceeded its limit"),
             ("exit", "ended before replying"),
+            ("exit-nonzero", "ended before replying"),
         ] {
             fs::write(dir.path().join("fake-mode"), mode).unwrap();
             let error = recover_with_codex(&auth, Duration::from_secs(3))
