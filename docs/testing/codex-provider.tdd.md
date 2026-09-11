@@ -39,9 +39,21 @@ Observed results:
 The recovery suite compiles a fake Codex executable from Rust source. It runs
 without network access or a real home directory and covers handshake messages,
 interleaved notifications, wrong IDs, invalid and oversized output, stderr
-limits, premature process exit, timeout, process cleanup, and auth-file
-rotation. HTTP mocks cover account headers, model, reasoning, SSE, structured
-output, reload-before-retry, and the one-retry ceiling.
+limits, premature process exit (both zero and non-zero status), timeout,
+process cleanup, and auth-file rotation. HTTP mocks cover account headers,
+model, reasoning, SSE, structured output, reload-before-retry, and the
+one-retry ceiling.
+
+### Non-zero recovery exit follow-up
+
+- RED commit: `76cfc1b6 test: reproduce non-zero Codex recovery exit`.
+- RED command: `cargo test -p ai-memory-llm
+  rust_fake_codex_exercises_recovery_and_defensive_failures -- --nocapture`.
+- RED result: the new `exit-nonzero` mode timed out because the fake executable
+  did not yet implement it.
+- GREEN implementation: the fake executable now exits with status 17, proving
+  that an app-server failure before a JSON-RPC reply is rejected as a
+  sanitized premature-exit error.
 
 ## Local gates and smoke
 

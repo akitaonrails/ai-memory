@@ -24,6 +24,9 @@ fn main() {
     if mode.trim() == "exit" {
         return;
     }
+    if mode.trim() == "exit-nonzero" {
+        std::process::exit(17);
+    }
     if mode.trim() == "stderr" {
         io::stderr().write_all(&vec![b'x'; 70 * 1024]).unwrap();
         io::stderr().flush().unwrap();
