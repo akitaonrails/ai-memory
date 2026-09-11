@@ -2810,6 +2810,48 @@ mod tests {
     }
 
     #[test]
+    fn codex_provider_uses_codex_home_auth_and_default_model() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("custom-codex-home");
+        let cfg = Config {
+            llm_provider: Some("codex".into()),
+            runtime_env: RuntimeEnv {
+                codex_home: Some(codex_home.clone()),
+                codex_executable: Some(PathBuf::from("codex-custom")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_codex_auth().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::Codex);
+        assert_eq!(provider.model, "gpt-5.6-luna");
+        assert_eq!(auth.auth_file, codex_home.join("auth.json"));
+        assert_eq!(auth.executable, Path::new("codex-custom"));
+    }
+
+    #[test]
+    fn codex_provider_falls_back_to_platform_home() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            llm_provider: Some("codex".into()),
+            runtime_env: RuntimeEnv {
+                home_dir: Some(tmp.path().display().to_string()),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_codex_auth().unwrap();
+
+        assert_eq!(auth.auth_file, tmp.path().join(".codex").join("auth.json"));
+        assert_eq!(auth.executable, Path::new("codex"));
+    }
+
+    #[test]
     fn provider_config_forwards_the_operator_headers() {
         let tmp = TempDir::new().unwrap();
         let cfg = Config {

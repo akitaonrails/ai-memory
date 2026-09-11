@@ -462,6 +462,11 @@ mod tests {
             ProviderChoice::OpenAiOAuth.auth_requirement(),
             AuthRequirement::OpenAiOAuthToken
         );
+        assert_eq!(ProviderChoice::Codex.name(), "codex");
+        assert_eq!(
+            ProviderChoice::Codex.auth_requirement(),
+            AuthRequirement::CodexAuthFile
+        );
         assert_eq!(
             ProviderChoice::Copilot.auth_requirement(),
             AuthRequirement::CopilotToken

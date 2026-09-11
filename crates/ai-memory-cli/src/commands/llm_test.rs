@@ -88,6 +88,14 @@ mod tests {
     }
 
     #[test]
+    fn codex_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::Codex),
+            ProviderChoice::Codex
+        );
+    }
+
+    #[test]
     fn llm_test_exercises_pipeline_sampling_compatibility() {
         let request = representative_request("diagnostic".into());
 

@@ -420,4 +420,19 @@ mod tests {
         let auth = ProviderAuth::anthropic_oauth_token(Some(SecretString::from("tok")));
         assert!(auth.optional_api_key().is_none());
     }
+
+    #[test]
+    fn codex_auth_round_trips_only_resolved_paths() {
+        let auth = ProviderAuth::codex(
+            "/tmp/.codex/auth.json",
+            "/opt/codex/bin/codex",
+        );
+        let codex = auth.require_codex_auth().unwrap();
+
+        assert_eq!(auth.requirement(), AuthRequirement::CodexAuthFile);
+        assert_eq!(auth.source(), CredentialSource::TokenFile);
+        assert_eq!(codex.auth_file, Path::new("/tmp/.codex/auth.json"));
+        assert_eq!(codex.executable, Path::new("/opt/codex/bin/codex"));
+        assert!(!format!("{codex:?}").contains("token"));
+    }
 }
