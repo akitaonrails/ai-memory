@@ -109,6 +109,35 @@ to *expect* persistent memory, which makes the cross-machine,
 cross-agent, multi-user version - what v1.39.0 hardened - the durable
 value. Native memory is the funnel, not the competitor.
 
+**Best-funded new entrant: `vectorize-io/hindsight`** (~23.5K stars,
+MIT, a company behind it, a preprint paper arXiv:2512.12818, and a
+LongMemEval claim of 91.4%). It is the most serious competitor in this
+series, and it is useful precisely because it *agrees with our core
+bet from the opposite substrate*: Hindsight is Postgres/pgvector-primary
+and LLM-required, yet its top memory tier is **"mental models" - living
+markdown pages of settled knowledge that a background process
+continuously rewrites as the bank learns**, which an agent "boots" from
+instead of rediscovering context each session. That is our `wiki/` +
+auto-improve loop under another name, arrived at independently and backed
+by a paper - the strongest external validation of pages-over-facts in
+this whole research series. Two more things to carry forward: its
+consolidation is **belief-strength, not binary supersession** (evidence-
+backed observations with quotes + a proof count; new evidence
+strengthens/weakens/extends rather than replaces), a richer model than
+ours; and its **"bank" = strict per-(user|agent|project) isolation, no
+cross-bank leakage** is the deliberate *opposite* of our shared-within-a-
+project invariant (#16) - and the natural prior art for issue #708
+(per-project authorization) and #709 (project identity), where the design
+should layer a bank-like boundary *above* sharing rather than replacing
+it. Read skeptically where it earns it: the "independently reproduced"
+LongMemEval number is from the *co-developing* labs (two of seven authors
+are Virginia Tech Sanghani faculty; the Post is a named collaborator), it
+is a preprint, and it reports accuracy rather than the R@5 others quote -
+still the most credible benchmark claim here (a paper with per-category
+sub-scores, gains concentrated where structured temporal memory should
+help), and a reminder the serious players now publish numbers. Full
+analysis in [`research-hindsight.md`](research-hindsight.md).
+
 ## 4. Research developments worth knowing
 
 - **"Rethinking How to Remember: Beyond Atomic Facts in Lifelong LLM
@@ -174,7 +203,13 @@ are being audited (mempalace) and honest numbers are being published
 (mcp-memory-service). We cannot say where we stand, and "experienced
 colleague over long horizons" is literally our pitch. Harness in-repo,
 runnable on demand like `writer_throughput`, numbers in docs with the
-run command - never a marketing claim without the harness.
+run command - never a marketing claim without the harness. Hindsight
+(`research-hindsight.md`) sharpens this further: a funded competitor now
+ships a *paper* with per-category LongMemEval sub-scores (91.4%), so the
+bar is no longer "publish a number" but "publish a harness and a metric
+someone else can re-run" - fix the split and the metric (theirs is
+accuracy, agentmemory/mcp-memory-service quote R@5; pick one and state
+it) so our result is comparable, not just present.
 
 **R3 - Typed relation edges (small-medium).** `causes` / `fixes` /
 `contradicts` on our existing `links`/`entities` model, from the
@@ -193,6 +228,13 @@ gap).** A periodic consolidation that reads *across* recent sessions
 per project and rewrites pattern/preference pages - the cross-trajectory
 abstraction both the survey and TriMem's narrative layer point at.
 auto-improve is the natural host; today it is per-session-triggered.
+Hindsight's **mental-model tier + reflect loop** (`research-hindsight.md`)
+is the shipped reference implementation for exactly this - a background
+job that rewrites standing-answer pages across accumulated evidence, that
+an agent boots from - and it is worth reading before designing ours. Its
+consolidation-as-belief-strength (evidence count + quotes, strengthen/
+weaken/extend) also points at how R3/R4 could carry *confidence*, not
+just supersession order.
 
 **R6 - Local embeddings via ONNX (medium; already reserved).**
 `models/` has been reserved for exactly this since M9.5 planning.
@@ -219,6 +261,14 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
 - mempalace: github.com/MemPalace/mempalace (BENCHMARKS.md, issue #29);
   arXiv:2604.21284 "Spatial Metaphors for LLM Memory: A Critical
   Analysis of the MemPalace Architecture".
+- Hindsight: github.com/vectorize-io/hindsight (README, MIT);
+  arXiv:2512.12818 (Latimer, Boschi, Neeser, Bartholomew, Srivastava,
+  Wang, Ramakrishnan - "Hindsight is 20/20", preprint 2025-12-14);
+  vectorize.io/blog "Introducing Hindsight"; PRNewswire "Vectorize
+  Breaks 90% on LongMemEval"; VentureBeat 91%-accuracy coverage.
+  LongMemEval reproduction attributed to Virginia Tech Sanghani Center +
+  The Washington Post (co-developing collaborators, not arms-length).
+  Full analysis: [`research-hindsight.md`](research-hindsight.md).
 - Zep/Graphiti: arXiv:2501.13956; getzep.com temporal-KG explainer;
   Neo4j "Graphiti: Knowledge graph memory for an agentic world".
 - Letta: "Is a Filesystem All You Need?" (letta.com blog, Aug 2025).
