@@ -256,14 +256,24 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
             continue;
         }
         // A tombstoned session's page must not come back from a file its
-        // purge could not remove (#701). One query, for one event.
-        match wiki.purged_sessions(ws, proj).await {
-            Ok(purged) if crate::wiki::is_purged_session_page(&page_path, &purged) => {
-                debug!(path = %page_path, "ignoring event for a purged session page");
-                continue;
+        // purge could not remove (#701). The path shape decides whether the
+        // lookup is worth a round trip: only `sessions/<id>.md` can be that
+        // file, so an ordinary edit to `index.md` or a decision page never
+        // queries. The sweep paths amortise the same set over a whole
+        // directory instead; this one sees a single file per event.
+        if let Some(session) = crate::wiki::session_id_for_page(&page_path) {
+            match wiki.purged_sessions(ws, proj).await {
+                Ok(purged) if purged.contains(&session) => {
+                    debug!(path = %page_path, "ignoring event for a purged session page");
+                    continue;
+                }
+                Ok(_) => {}
+                // Fails open, deliberately: a transient lookup error must not
+                // stop the watcher from indexing edits. The cost of failing
+                // open here is bounded — the next reconcile pass loads the set
+                // again and skips the page then.
+                Err(e) => warn!(path = %page_path, error = %e, "purged-session lookup failed"),
             }
-            Ok(_) => {}
-            Err(e) => warn!(path = %page_path, error = %e, "purged-session lookup failed"),
         }
         match wiki.reindex_page(ws, proj, page_path.clone()).await {
             Ok(_) => debug!(path = %page_path, "reindexed via watcher"),
@@ -313,6 +323,10 @@ async fn reindex_project_dir(
         }
     };
 
+    // Fails open for the same reason the single-event path does: a lookup
+    // error must not stop a directory event from indexing. `Wiki::reindex_all`
+    // is the one caller that fails closed, because an operator-triggered
+    // reindex should report the failure rather than quietly skip the gate.
     let purged = wiki.purged_sessions(ws, proj).await.unwrap_or_else(|e| {
         warn!(error = %e, "purged-session lookup failed; not gating this pass");
         std::collections::HashSet::new()

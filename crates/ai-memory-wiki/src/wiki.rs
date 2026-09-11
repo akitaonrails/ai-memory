@@ -52,19 +52,29 @@ pub struct ReindexSummary {
     pub skipped_purged_sessions: usize,
 }
 
-/// Whether `path` is the page of a session this scope has tombstoned.
+/// The session a page belongs to, for paths that name one.
 ///
-/// Only `sessions/<id>.md` can be resurrected this way: every other page is
-/// unrelated to a session purge, so the set is consulted for nothing else.
-pub(crate) fn is_purged_session_page(path: &PagePath, purged: &HashSet<SessionId>) -> bool {
-    if purged.is_empty() {
-        return false;
-    }
+/// Pure path shape, no I/O: only `sessions/<id>.md` can be resurrected by a
+/// purge whose file cleanup failed, so this is what decides whether the
+/// tombstone set is worth consulting — or, on the single-event path, whether
+/// it is worth loading at all.
+pub(crate) fn session_id_for_page(path: &PagePath) -> Option<SessionId> {
     path.as_str()
         .strip_prefix("sessions/")
         .and_then(|rest| rest.strip_suffix(".md"))
         .and_then(|id| id.parse::<SessionId>().ok())
-        .is_some_and(|id| purged.contains(&id))
+}
+
+/// Whether `path` is the page of a session this scope has tombstoned.
+///
+/// For callers that already hold the scope's set. The empty-set and
+/// path-shape checks come first so a sweep over a project with no purges
+/// never parses an id.
+pub(crate) fn is_purged_session_page(path: &PagePath, purged: &HashSet<SessionId>) -> bool {
+    if purged.is_empty() {
+        return false;
+    }
+    session_id_for_page(path).is_some_and(|id| purged.contains(&id))
 }
 
 enum PageStoreRemoval {
