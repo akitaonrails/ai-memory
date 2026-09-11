@@ -56,6 +56,7 @@ pub const DEFAULT_USER_AGENT: &str = concat!("ai-memory/", env!("CARGO_PKG_VERSI
 
 pub mod anthropic;
 pub mod auth;
+pub mod codex;
 pub mod copilot;
 pub mod embedding;
 pub mod error;
@@ -76,12 +77,16 @@ pub mod reranker;
 pub mod types;
 
 mod auth_file;
+mod codex_responses;
 mod response;
 mod stored_token;
 mod text;
 
 pub use anthropic::AnthropicProvider;
-pub use auth::{AuthRequirement, CopilotAuth, Credential, CredentialSource, ProviderAuth};
+pub use auth::{
+    AuthRequirement, CodexAuth, CopilotAuth, Credential, CredentialSource, ProviderAuth,
+};
+pub use codex::CodexProvider;
 pub use copilot::{
     COPILOT_INTEGRATION_ID, CopilotProvider, CopilotToken, DEFAULT_COPILOT_API_BASE_URL,
     GITHUB_ACCESS_TOKEN_URL, GITHUB_COPILOT_CLIENT_ID, GITHUB_COPILOT_TOKEN_URL,

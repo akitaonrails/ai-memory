@@ -69,6 +69,7 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::Gemini => Self::Gemini,
             LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
             LlmProviderChoice::OpenaiOauth => Self::OpenAiOAuth,
+            LlmProviderChoice::Codex => Self::Codex,
             LlmProviderChoice::Copilot => Self::Copilot,
             LlmProviderChoice::Opencode => Self::OpenCode,
         }

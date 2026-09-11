@@ -1696,6 +1696,8 @@ pub enum LlmProviderChoice {
     OpenaiCompat,
     /// OpenAI ChatGPT/Codex OAuth backend.
     OpenaiOauth,
+    /// Reuse Codex CLI authentication and delegated refresh.
+    Codex,
     /// GitHub Copilot Chat backend.
     Copilot,
     /// OpenCode cloud API (Go by default; AI_MEMORY_LLM_BASE_URL selects Zen).
