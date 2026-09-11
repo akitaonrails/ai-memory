@@ -517,6 +517,23 @@ mod tests {
         second_status: u16,
     }
 
+    #[derive(Clone)]
+    struct UnauthorizedUntilRotated;
+
+    impl Respond for UnauthorizedUntilRotated {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let authorization = request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok());
+            if authorization == Some("Bearer new-token") {
+                ResponseTemplate::new(200).set_body_string(completed_sse("ok"))
+            } else {
+                ResponseTemplate::new(401).set_body_string("expired")
+            }
+        }
+    }
+
     impl Respond for RotateThenRespond {
         fn respond(&self, request: &Request) -> ResponseTemplate {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -816,5 +833,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_unauthorized_calls_share_one_recovery() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        write_auth(&auth_path, "old-token", "account-secret");
+        fs::write(dir.path().join("fake-mode"), "success").unwrap();
+        Mock::given(method("POST"))
+            .and(request_path("/responses"))
+            .respond_with(UnauthorizedUntilRotated)
+            .mount(&server)
+            .await;
+        let provider = Arc::new(
+            CodexProvider::new(
+                CodexAuth {
+                    auth_file: auth_path,
+                    executable: compile_fake_codex(dir.path()),
+                },
+                "gpt-5.6-luna",
+            )
+            .unwrap()
+            .with_responses_url(format!("{}/responses", server.uri())),
+        );
+
+        let first = provider.complete(ChatRequest::user_prompt("first"));
+        let second = provider.complete(ChatRequest::user_prompt("second"));
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap().text, "ok");
+        assert_eq!(second.unwrap().text, "ok");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("fake-invocations"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
     }
 }

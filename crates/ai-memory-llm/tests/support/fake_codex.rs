@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::thread;
@@ -6,6 +6,15 @@ use std::time::Duration;
 
 fn main() {
     let codex_home = PathBuf::from(std::env::var_os("CODEX_HOME").expect("CODEX_HOME"));
+    writeln!(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(codex_home.join("fake-invocations"))
+            .unwrap(),
+        "started"
+    )
+    .unwrap();
     let mode = fs::read_to_string(codex_home.join("fake-mode"))
         .unwrap_or_else(|_| "success".into());
     if mode.trim() == "sleep" {
