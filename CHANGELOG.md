@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-09-11
+
 ### Changed
 - The managed routing snippet distinguishes a reviewed decision record kept in
   the repository (an ADR directory, a Keep the Why `context/` tree) from a
@@ -5450,7 +5452,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.1.2...HEAD
+[2.1.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.1.2
 [2.1.1]: https://github.com/akitaonrails/ai-memory/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...v2.0.3
