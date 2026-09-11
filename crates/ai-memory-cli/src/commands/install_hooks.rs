@@ -1139,6 +1139,14 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             &["context_servers", "ai-memory"],
             "url",
         )),
+        // MCP-only client: no AgentChoice counterpart routes here. Muse
+        // Code's hook surface is documented, but its SessionStart output
+        // contract is not, so no lifecycle integration claims it yet.
+        McpClient::Muse => Ok(infer_json_mcp_config(
+            &content,
+            &["mcp_servers", "ai-memory"],
+            "url",
+        )),
     }
 }
 

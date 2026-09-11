@@ -76,6 +76,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory run claude-corp --executable claude-corp` and `ai-memory run
   claude-personal --executable claude-personal` each launch the right
   binary while reading clearly in shell history (#687).
+- `install-mcp --client muse` registers ai-memory with Meta's Muse Code,
+  merging a native streamable-HTTP entry with bearer `headers` into the
+  snake_case `mcp_servers` map of `~/.config/muse/settings.json` and
+  preserving sibling servers. The writer adds the mandatory
+  `"schema_version": 1` when it is absent — without that key every `muse`
+  command fails at startup with `malformed settings file` — and never
+  rewrites an existing value, so a future schema is not downgraded. The entry
+  sets `"mode": "optional"` because Muse defaults it to `required`, which
+  aborts the whole run when the memory server is unreachable. MCP-only:
+  Muse documents a lifecycle hook surface, but the output contract of its
+  `SessionStart` event is not specified, so capture and managed workstreams
+  are not claimed. Skills need no extra step — Muse reads `~/.agents/skills`,
+  which `install-skills` already writes (#659).
 
 ### Changed
 - The managed routing snippet distinguishes a reviewed decision record kept in

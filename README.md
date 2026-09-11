@@ -113,6 +113,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Pool | Hooks-only |
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
+| Muse Code | MCP-only |
 | Hermes Agent | Community |
 | LLM/auth providers | Supported |
 | Embedding providers | Supported |
