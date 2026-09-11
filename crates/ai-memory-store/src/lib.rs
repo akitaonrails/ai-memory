@@ -2891,6 +2891,8 @@ mod tests {
         let via = target_details.graph_via.as_ref().unwrap();
         assert_eq!(via.seed_path, "source.md");
         assert_eq!(via.direction, "outgoing");
+        // P3: a plain `references` link carries no typed edge kind.
+        assert_eq!(via.edge.as_deref(), None);
 
         for (hit, details) in [(source_hit, source_details), (target_hit, target_details)] {
             let authority = details.authority.unwrap();
@@ -2953,6 +2955,70 @@ mod tests {
             !target_vector_hit.snippet.is_empty(),
             "a vector-ranked hit must carry a snippet, got {:?}",
             target_vector_hit.snippet
+        );
+    }
+
+    /// P3 (docs/design-hindsight-borrowings.md): a typed edge (`fixes`) is
+    /// surfaced as the graph_via `edge` kind in explain. Ranking is untouched;
+    /// only the explanation names why the neighbour was reached.
+    #[tokio::test]
+    async fn graph_via_reports_the_typed_edge_kind() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "target.md", "neighbor-only content"))
+            .await
+            .unwrap();
+        let mut source = sample_page(ws, proj, "source.md", "needle source content");
+        source.links = vec![ai_memory_core::LinkTarget {
+            workspace: None,
+            project: None,
+            path: PagePath::new("target.md").unwrap(),
+            relation: Some(ai_memory_core::Relation::Fixes),
+        }];
+        store.writer.upsert_page(source).await.unwrap();
+
+        let explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                "needle".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (_, target_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "target.md")
+            .expect("the fixes-linked neighbour must surface via the graph stream");
+        let via = target_details
+            .graph_via
+            .as_ref()
+            .expect("target reached via the graph stream");
+        assert_eq!(via.seed_path, "source.md");
+        assert_eq!(
+            via.edge.as_deref(),
+            Some("fixes"),
+            "the typed edge kind must be reported in explain"
         );
     }
 

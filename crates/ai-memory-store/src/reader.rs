@@ -502,6 +502,10 @@ struct GraphNeighbor {
     seed_ord: usize,
     /// `true` when the neighbour links TO the seed (backlink).
     incoming: bool,
+    /// The typed edge the neighbour was reached by (`causes` / `fixes` /
+    /// `contradicts`), or `None` for a plain `references` link. Informational
+    /// only — it is surfaced in `explain` and does not affect ranking.
+    edge: Option<String>,
 }
 
 /// Which seed page pulled a hit in via graph expansion, and the link
@@ -513,6 +517,12 @@ pub struct GraphVia {
     /// `outgoing` = seed links to the hit; `incoming` = hit links to
     /// the seed (backlink).
     pub direction: &'static str,
+    /// The typed edge kind followed (`causes` / `fixes` / `contradicts`),
+    /// omitted for a plain `references` link. Informational: it explains *why*
+    /// a neighbour surfaced; it does not weight ranking (typed-edge weighting
+    /// and `contradicts` capping are deferred behind the eval harness).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge: Option<String>,
 }
 
 /// Per-stream RRF contributions (`1/(k+rank)`, k=60) for one hit.
@@ -4263,7 +4273,8 @@ impl ReaderPool {
                  neighbors AS ( \
                    SELECT tp.id AS id, tp.path AS path, tp.title AS title, \
                           {out_descriptor} AS snippet, \
-                          seeds.seed_ord * 2 AS stream_ord, tp.updated_at AS updated_at \
+                          seeds.seed_ord * 2 AS stream_ord, tp.updated_at AS updated_at, \
+                          l.link_type AS link_type \
                    FROM seeds \
                    JOIN links l ON l.from_page_id = seeds.seed_id \
                    JOIN pages tp ON tp.id = l.to_page_id \
@@ -4271,13 +4282,14 @@ impl ReaderPool {
                    UNION ALL \
                    SELECT fp.id AS id, fp.path AS path, fp.title AS title, \
                           {in_descriptor} AS snippet, \
-                          seeds.seed_ord * 2 + 1 AS stream_ord, fp.updated_at AS updated_at \
+                          seeds.seed_ord * 2 + 1 AS stream_ord, fp.updated_at AS updated_at, \
+                          l.link_type AS link_type \
                    FROM seeds \
                    JOIN links l ON l.to_page_id = seeds.seed_id \
                    JOIN pages fp ON fp.id = l.from_page_id \
                    WHERE fp.workspace_id = ? AND fp.project_id = ? AND fp.is_latest = 1{in_not_expired} \
                  ) \
-                 SELECT id, path, title, snippet, stream_ord \
+                 SELECT id, path, title, snippet, stream_ord, link_type \
                  FROM neighbors \
                  WHERE NOT EXISTS (SELECT 1 FROM seeds s WHERE s.seed_id = neighbors.id) \
                  ORDER BY stream_ord ASC, updated_at DESC, path ASC"
@@ -4291,11 +4303,12 @@ impl ReaderPool {
                 let title: String = row.get(2)?;
                 let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
                 let stream_ord: i64 = row.get(4)?;
-                Ok((id_bytes, path, title, snippet, stream_ord))
+                let link_type: String = row.get(5)?;
+                Ok((id_bytes, path, title, snippet, stream_ord, link_type))
             })?;
 
             for row in rows {
-                let (id_bytes, path, title, snippet, stream_ord) = row?;
+                let (id_bytes, path, title, snippet, stream_ord, link_type) = row?;
                 let id = PageId::from_slice(&id_bytes)?;
                 if !seen.insert(id) {
                     continue;
@@ -4312,6 +4325,7 @@ impl ReaderPool {
                     },
                     seed_ord,
                     incoming: stream_ord % 2 == 1,
+                    edge: (link_type != "references").then_some(link_type),
                 });
                 if out.len() >= limit {
                     break;
@@ -4851,6 +4865,7 @@ impl ReaderPool {
                         .cloned()
                         .unwrap_or_default(),
                     direction: if n.incoming { "incoming" } else { "outgoing" },
+                    edge: n.edge.clone(),
                 });
                 details.rrf.graph = contrib;
                 details.fused += contrib;

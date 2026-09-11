@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Retrieval `explain` now names the **typed edge** a graph-stream neighbour
+  was reached by: `memory_query(explain=true)` reports `graph_via.edge` =
+  `causes` / `fixes` / `contradicts` (omitted for a plain `references` link), so
+  it is visible *why* a page surfaced through the link graph. Retrieval ranking
+  is unchanged — this is explanation only; typed-edge weighting and `contradicts`
+  capping are deferred behind the eval harness (docs/design-hindsight-borrowings.md P3).
 - Page-grain ingestion windows (`pages.valid_from` / `valid_to`, V62) and
   a second `as_of` stream: `memory_query(as_of=T)` now fuses the entity
   timeline with version-filtered full-text search over the page versions
