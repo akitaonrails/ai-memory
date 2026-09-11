@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added an independent `codex` LLM provider that follows the Codex CLI account
+  selected by `CODEX_HOME`, reloads its read-only `auth.json` credentials before
+  each operation, and delegates expired-token recovery to
+  `codex app-server --stdio` (#716).
+
 ## [2.1.2] - 2026-09-11
 
 ### Changed
@@ -495,7 +501,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loss). A per-path async lock now serializes same-path writers while
   different paths still proceed concurrently; batches acquire their paths in a
   fixed global order so they cannot deadlock.
-
 ## [2.0.3] - 2026-09-04
 
 ### Changed
