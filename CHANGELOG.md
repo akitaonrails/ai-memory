@@ -91,6 +91,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which `install-skills` already writes (#659).
 
 ### Changed
+- The privacy sanitizer now redacts to a **typed marker** — `[REDACTED:<kind>]`
+  (e.g. `[REDACTED:github_token]`, `[REDACTED:jwt]`, `[REDACTED:env_secret]`,
+  `[REDACTED:custom]` for operator patterns) — instead of a bare `[REDACTED]`,
+  so a later reader knows *what kind* of secret was present without it leaking.
+  Redaction stays complete and idempotent; the trust boundary is unchanged.
+  Note: this changes the durable sanitized string, so pages written before the
+  upgrade keep `[REDACTED]` while new writes carry the label (see
+  `docs/design-hindsight-borrowings.md` P1).
 - The managed routing snippet distinguishes a reviewed decision record kept in
   the repository (an ADR directory, a Keep the Why `context/` tree) from a
   harness-local memory store: decisions go into the repo's record under its

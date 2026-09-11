@@ -3193,7 +3193,7 @@ mod tests {
             .await
             .expect("page body becomes instructions");
         assert!(from_page.contains("Prefer the `infra` tag."));
-        assert!(from_page.contains("[REDACTED]"));
+        assert!(from_page.contains("[REDACTED:api_key]"));
         assert!(!from_page.contains("deadbeef"));
         assert!(
             from_page.chars().count() <= MAX_PROJECT_INSTRUCTIONS_CHARS,

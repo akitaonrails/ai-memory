@@ -337,7 +337,10 @@ mod tests {
         assert!(out.captured);
         let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
         assert!(!excerpt.contains(&secret), "secret survived: {excerpt}");
-        assert!(excerpt.contains("[REDACTED]"), "not redacted: {excerpt}");
+        assert!(
+            excerpt.contains("[REDACTED:aws_key]"),
+            "not redacted: {excerpt}"
+        );
     }
 
     #[test]

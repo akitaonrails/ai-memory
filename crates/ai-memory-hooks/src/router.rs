@@ -11756,7 +11756,7 @@ mod tests {
             assert_eq!(
                 post.body,
                 format!(
-                    "tool_family: non-file\ntool_call_id: call-native-1\noutcome: unknown\n---\n{project}: [REDACTED]"
+                    "tool_family: non-file\ntool_call_id: call-native-1\noutcome: unknown\n---\n{project}: [REDACTED:custom]"
                 )
             );
             assert!(
@@ -12199,7 +12199,7 @@ mod tests {
         }));
         assert!(observations.iter().any(|observation| {
             observation.kind == ObservationKind::Stop
-                && observation.body == "completed safely: [REDACTED]"
+                && observation.body == "completed safely: [REDACTED:custom]"
         }));
         for sentinel in [TOOL_SENTINEL, ASSISTANT_SENTINEL] {
             assert!(

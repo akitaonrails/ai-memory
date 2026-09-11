@@ -5988,7 +5988,7 @@ mod tests {
             "x".repeat(700)
         );
         let reason = sanitize_feedback_reason(&Sanitizer::builtin(), Some(&raw)).unwrap();
-        assert!(reason.contains("[REDACTED]"));
+        assert!(reason.contains("[REDACTED:bearer_token]"));
         assert!(!reason.contains("abcdef0123456789"));
         assert!(!reason.contains('\n'));
         assert!(!reason.contains('\r'));
@@ -6085,7 +6085,7 @@ mod tests {
         let findings = store.reader.open_feedback_findings(ws, proj).await.unwrap();
         assert_eq!(findings.len(), 1);
         let reason = findings[0].reason.as_deref().unwrap();
-        assert!(reason.contains("[REDACTED]"));
+        assert!(reason.contains("[REDACTED:bearer_token]"));
         assert!(!reason.contains("abcdef0123456789"));
         assert!(!reason.contains('\n'));
         assert!(reason.chars().count() <= MAX_FEEDBACK_REASON_CHARS);
@@ -6120,7 +6120,7 @@ mod tests {
             .expect("stale feedback must appear in memory_lint");
         assert_eq!(feedback_finding["pages"][0], path.to_string());
         let lint_message = feedback_finding["message"].as_str().unwrap();
-        assert!(lint_message.contains("[REDACTED]"));
+        assert!(lint_message.contains("[REDACTED:bearer_token]"));
         assert!(!lint_message.contains("abcdef0123456789"));
         assert!(!lint_message.contains('\n'));
 

@@ -3201,7 +3201,7 @@ mod tests {
         .await;
         let sidecar = wiki.write_auto_improve_sidecar(ws, proj, id).await.unwrap();
         let content = std::fs::read_to_string(sidecar).unwrap();
-        assert!(content.contains("[REDACTED]"));
+        assert!(content.contains("[REDACTED:"));
         assert!(!content.contains("sk-ant-leak"));
         assert!(!content.contains("hunter2"));
         assert!(!content.contains("ghp_"));
@@ -3534,7 +3534,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(stored.body.contains("[REDACTED]"));
+        assert!(stored.body.contains("[REDACTED:"));
         assert!(!stored.body.contains("sk-ant-leak"));
         assert!(
             std::fs::read_to_string(wiki.abs_path(
@@ -3543,7 +3543,7 @@ mod tests {
                 &PagePath::new("notes/mutated.md").unwrap()
             ))
             .unwrap()
-            .contains("[REDACTED]")
+            .contains("[REDACTED:")
         );
     }
 
@@ -3930,7 +3930,7 @@ mod tests {
         // The on-disk page must not contain any of the planted
         // secrets; each should have been replaced with [REDACTED].
         assert!(
-            on_disk.contains("[REDACTED]"),
+            on_disk.contains("[REDACTED:"),
             "expected redaction in: {on_disk}"
         );
         assert!(
@@ -4194,7 +4194,7 @@ mod tests {
             &PagePath::new("batch/admitted.md").unwrap(),
         ))
         .unwrap();
-        assert!(on_disk.contains("[REDACTED]"), "{on_disk}");
+        assert!(on_disk.contains("[REDACTED:api_key]"), "{on_disk}");
         assert!(!on_disk.contains("sk-1234567890abcdef"), "{on_disk}");
 
         let hits = store

@@ -3068,7 +3068,10 @@ mod tests {
             })
             .unwrap();
         for col in [&title, &body] {
-            assert!(col.contains("[REDACTED]"), "expected scrub in: {col}");
+            assert!(
+                col.contains("[REDACTED:bearer_token]"),
+                "expected scrub in: {col}"
+            );
             assert!(
                 !col.contains("abcdef0123"),
                 "secret reached disk unscrubbed: {col}"

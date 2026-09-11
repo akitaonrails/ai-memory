@@ -48,20 +48,20 @@ pub const OBSERVATION_BODY_MAX_BYTES: usize = 16 * 1024;
 /// Compile-time list of redaction patterns. Order is intentional:
 /// more-specific patterns first. False positives are acceptable —
 /// better to redact a stray hash than to leak a credential.
-const BUILTIN_PATTERN_STRS: &[&str] = &[
+const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // Bearer-style tokens.
-    r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#,
+    (r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#, "bearer_token"),
     // Vendor-prefixed API keys.
-    r"sk-[A-Za-z0-9_\-]{16,}",
+    (r"sk-[A-Za-z0-9_\-]{16,}", "api_key"),
     // Stripe secret *and* restricted keys. `rk_live_` is scoped rather than
     // full-access, but the scope is operator-chosen and routinely includes
     // charges/refunds — not meaningfully safer than `sk_live_`.
-    r"(?:sk|rk)_live_[A-Za-z0-9_\-]{16,}",
+    (r"(?:sk|rk)_live_[A-Za-z0-9_\-]{16,}", "stripe_key"),
     // Every GitHub token prefix, not only personal-access: `gho_` (OAuth —
     // what `gh auth login` stores on disk), `ghu_` (user-to-server),
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
-    r"gh[pousr]_[A-Za-z0-9]{20,}",
-    r"github_pat_[A-Za-z0-9_]{20,}",
+    (r"gh[pousr]_[A-Za-z0-9]{20,}", "github_token"),
+    (r"github_pat_[A-Za-z0-9_]{20,}", "github_token"),
     // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
     //
     // Anchored to the exact published format — a 4-character prefix plus
@@ -72,16 +72,16 @@ const BUILTIN_PATTERN_STRS: &[&str] = &[
     // BEFORE storage and is irreversible: the observation loses the text with
     // no error and no way to recover it. The word boundaries keep a real key
     // from being missed when it sits inside punctuation.
-    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+    (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "aws_key"),
     // Naked Google / Gemini API keys.
-    r"AIza[A-Za-z0-9_\-]{30,}",
+    (r"AIza[A-Za-z0-9_\-]{30,}", "google_api_key"),
     // Google OAuth refresh tokens. Longer-lived than the AIza keys above:
     // they mint fresh access tokens until explicitly revoked, so a leaked
     // one outlives the session it came from.
-    r"1//[0-9A-Za-z_\-]{20,}",
+    (r"1//[0-9A-Za-z_\-]{20,}", "google_oauth"),
     // Meta / Facebook Graph API access tokens (ad accounts, pages,
     // business management).
-    r"EAA[A-Za-z0-9]{20,}",
+    (r"EAA[A-Za-z0-9]{20,}", "meta_token"),
     // Telegram bot tokens: <bot-id>:<secret>. Grants full control of the bot,
     // including reading every message it can see. Two branches on purpose:
     //  - `AA…` is the shape every issued token has taken, left open-ended so a
@@ -93,7 +93,10 @@ const BUILTIN_PATTERN_STRS: &[&str] = &[
     //    `<short-sha>:<hex>` pairs.
     // Thanks to @tahazarif10 for spotting that the documented example fell
     // outside the original `\d{8,10}:AA…` form.
-    r"\b\d{6,10}:(?:AA[A-Za-z0-9_\-]{30,}|[A-Za-z0-9_\-]{34,35})\b",
+    (
+        r"\b\d{6,10}:(?:AA[A-Za-z0-9_\-]{30,}|[A-Za-z0-9_\-]{34,35})\b",
+        "telegram_token",
+    ),
     // GoHighLevel Private Integration Tokens. The `pit-` prefix is what the
     // vendor documents (their MCP guide shows `Bearer pit-your-token`); the
     // tail is NOT documented anywhere, and every token observed in the wild
@@ -101,16 +104,28 @@ const BUILTIN_PATTERN_STRS: &[&str] = &[
     // tail is deliberate: `pit-` is also an English fragment, so
     // `pit-[A-Za-z0-9\-]{20,}` would redact "pit-stop-strategy-analysis".
     // These tokens do not expire until manually revoked.
-    r"pit-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+    (
+        r"pit-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        "ghl_token",
+    ),
     // Slack tokens (bot/user/admin/app-level/refresh).
-    r"xox[abprs]-[A-Za-z0-9\-]{10,}",
-    r"xapp-[A-Za-z0-9\-]{10,}",
+    (r"xox[abprs]-[A-Za-z0-9\-]{10,}", "slack_token"),
+    (r"xapp-[A-Za-z0-9\-]{10,}", "slack_token"),
     // JWTs (three base64url segments separated by dots).
-    r"eyJ[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}",
+    (
+        r"eyJ[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}",
+        "jwt",
+    ),
     // PEM private key blocks — multi-line, lazy match.
-    r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    (
+        r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        "private_key",
+    ),
     // URL-embedded credentials: scheme://user:pass@host.
-    r"[a-zA-Z][a-zA-Z0-9+\-.]*://[^:/\s]+:[^@\s]+@[^\s]+",
+    (
+        r"[a-zA-Z][a-zA-Z0-9+\-.]*://[^:/\s]+:[^@\s]+@[^\s]+",
+        "url_credentials",
+    ),
     // Auth-bearing HTTP headers carrying an opaque value: AWS SigV4's
     // `X-Amz-Security-Token`, `X-Api-Key`, GitLab's `Private-Token`, Azure's
     // `Ocp-Apim-Subscription-Key`. Neither of the rules above reaches these:
@@ -129,20 +144,32 @@ const BUILTIN_PATTERN_STRS: &[&str] = &[
     // `Access-Control-Allow-Credentials: true` intact. It is not what
     // protects an already-redacted value: `[REDACTED]` starts with `[`,
     // which the value character class excludes outright.
-    r#"(?i)\b[A-Za-z0-9-]*(?:authentication|authorization|credentials?|password|passwd|apikey|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))\s*:\s*[A-Za-z0-9._~+/=-]{8,}"#,
+    (
+        r#"(?i)\b[A-Za-z0-9-]*(?:authentication|authorization|credentials?|password|passwd|apikey|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))\s*:\s*[A-Za-z0-9._~+/=-]{8,}"#,
+        "auth_header",
+    ),
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
     // even without `sk-` shape).
-    r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)\s*[=:]\s*\S+"#,
+    (
+        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)\s*[=:]\s*\S+"#,
+        "env_secret",
+    ),
     // Generic env-var catch-all: any *_KEY / *_TOKEN / *_SECRET /
     // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
-    r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)\s*[=:]\s*\S+"#,
+    (
+        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)\s*[=:]\s*\S+"#,
+        "env_secret",
+    ),
     // Filesystem paths that commonly contain credentials.
-    r"(?:/[^/\s]+)*/\.ssh(?:/[^\s]+)?",
-    r"(?:/[^/\s]+)*/\.aws(?:/[^\s]+)?",
-    r"(?:/[^/\s]+)*/\.kube(?:/[^\s]+)?",
-    r"(?:/[^/\s]+)*/\.config/gcloud(?:/[^\s]+)?",
-    r"(?:/[^/\s]+)*/\.gnupg(?:/[^\s]+)?",
+    (r"(?:/[^/\s]+)*/\.ssh(?:/[^\s]+)?", "credential_path"),
+    (r"(?:/[^/\s]+)*/\.aws(?:/[^\s]+)?", "credential_path"),
+    (r"(?:/[^/\s]+)*/\.kube(?:/[^\s]+)?", "credential_path"),
+    (
+        r"(?:/[^/\s]+)*/\.config/gcloud(?:/[^\s]+)?",
+        "credential_path",
+    ),
+    (r"(?:/[^/\s]+)*/\.gnupg(?:/[^\s]+)?", "credential_path"),
 ];
 
 /// Stateful sanitizer. Cheap to clone — wraps an `Arc` of compiled
@@ -153,7 +180,7 @@ pub struct Sanitizer {
 }
 
 struct SanitizerInner {
-    patterns: Vec<Regex>,
+    patterns: Vec<(Regex, &'static str)>,
     allowlist: Vec<String>,
 }
 
@@ -189,13 +216,12 @@ impl Sanitizer {
     /// Returns [`regex::Error`] when an entry in `extra_patterns` is
     /// not a valid regex.
     pub fn new(cfg: &SanitizeConfig) -> Result<Self, regex::Error> {
-        let mut patterns =
-            Vec::with_capacity(BUILTIN_PATTERN_STRS.len() + cfg.extra_patterns.len());
-        for p in BUILTIN_PATTERN_STRS {
-            patterns.push(Regex::new(p)?);
+        let mut patterns = Vec::with_capacity(BUILTIN_PATTERNS.len() + cfg.extra_patterns.len());
+        for (p, label) in BUILTIN_PATTERNS {
+            patterns.push((Regex::new(p)?, *label));
         }
         for p in &cfg.extra_patterns {
-            patterns.push(Regex::new(p)?);
+            patterns.push((Regex::new(p)?, "custom"));
         }
         Ok(Self {
             inner: Arc::new(SanitizerInner {
@@ -212,13 +238,13 @@ impl Sanitizer {
         Self::new(&SanitizeConfig::default()).expect("built-in patterns compile")
     }
 
-    /// Scrub a single string. Each match is replaced with `[REDACTED]`
-    /// unless the matched substring contains an allowlist entry, in
-    /// which case it is left alone.
+    /// Scrub a single string. Each match is replaced with
+    /// `[REDACTED:<kind>]` unless the matched substring contains an
+    /// allowlist entry, in which case it is left alone.
     #[must_use]
     pub fn scrub(&self, input: &str) -> String {
         let mut out = input.to_string();
-        for re in &self.inner.patterns {
+        for (re, label) in &self.inner.patterns {
             out = re
                 .replace_all(&out, |caps: &regex::Captures<'_>| {
                     let m = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
@@ -226,7 +252,7 @@ impl Sanitizer {
                         m.to_string()
                     } else {
                         debug!(pattern = re.as_str(), "sanitize: redacted match");
-                        "[REDACTED]".to_string()
+                        format!("[REDACTED:{label}]")
                     }
                 })
                 .into_owned();
@@ -367,14 +393,14 @@ mod tests {
     #[test]
     fn scrubs_bearer_token() {
         let out = s().scrub("Authorization: Bearer abcdef0123456789ABCDEF0123456789");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("abcdef0123"));
     }
 
     #[test]
     fn scrubs_openrouter_key_via_sk_prefix() {
         let out = s().scrub("key=sk-or-v1-deadbeefcafebabe1234567890abcdef");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("deadbeef"));
     }
 
@@ -391,7 +417,7 @@ mod tests {
         // this file. Google's rule only needs `AIza` plus 30, so the shorter
         // fixture still exercises it.
         let out = s().scrub("the key AIzaSyFAKEfake0123456789abcdefghijkl is leaked");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("AIzaSy"));
     }
 
@@ -412,7 +438,7 @@ mod tests {
             "ghr_FAKEfakeFAKEfakeFAKEfake012345678",
         ] {
             let out = s().scrub(&format!("token={tok}"));
-            assert!(out.contains("[REDACTED]"), "not redacted: {tok}");
+            assert!(out.contains("[REDACTED:"), "not redacted: {tok}");
             assert!(!out.contains("FAKEfake"), "leaked: {tok}");
         }
     }
@@ -461,7 +487,7 @@ mod tests {
             "\"ASIAFAKEFAKEFAKEFAKE\",",
         ] {
             let out = s.scrub(text);
-            assert!(out.contains("[REDACTED]"), "not redacted: {text}");
+            assert!(out.contains("[REDACTED:"), "not redacted: {text}");
             assert!(!out.contains("FAKEFAKE"), "leaked: {text}");
         }
     }
@@ -470,21 +496,21 @@ mod tests {
     fn scrubs_aws_temporary_session_key_id() {
         // ASIA… is an STS short-lived key id; AKIA… was already covered.
         let out = s().scrub("aws_access_key_id ASIAFAKEFAKEFAKEFAKE");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("ASIAFAKE"));
     }
 
     #[test]
     fn scrubs_stripe_restricted_key() {
         let out = s().scrub("stripe=rk_live_FAKEfakeFAKE1234");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("FAKEfakeFAKE"));
     }
 
     #[test]
     fn scrubs_meta_graph_access_token() {
         let out = s().scrub("fb=EAAFAKEfakeFAKEfake0123456789");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("FAKEfake"));
     }
 
@@ -495,20 +521,20 @@ mod tests {
         // the {20,} tail is what stops `EAA…` from matching every base64
         // blob that happens to contain it.
         let out = s().scrub("harmless b3BlbnNzaC1rZXktdjEAAAAA value");
-        assert!(!out.contains("[REDACTED]"));
+        assert!(!out.contains("[REDACTED:"));
     }
 
     #[test]
     fn scrubs_google_oauth_refresh_token() {
         let out = s().scrub("refresh_token: 1//0gFAKEfakeFAKEfake0123456789");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("FAKEfake"));
     }
 
     #[test]
     fn scrubs_telegram_bot_token() {
         let out = s().scrub("TG 123456789:AAFAKEfakeFAKEfakeFAKEfake0123456789 done");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("FAKEfake"));
         assert!(out.contains("done"), "should not swallow trailing context");
     }
@@ -520,7 +546,7 @@ mod tests {
         // `AA` prefix — which the original `\d{8,10}:AA…` form could not match.
         // This is the vendor's placeholder, not a live token.
         let out = s().scrub("token 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11 ok");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("ABC-DEF1234"));
         assert!(out.contains("ok"), "should not swallow trailing context");
     }
@@ -538,7 +564,7 @@ mod tests {
             "commit 12345678:deadbeefcafebabe0123456789abcdef",
         ] {
             let out = s().scrub(benign);
-            assert!(!out.contains("[REDACTED]"), "false positive on: {benign}");
+            assert!(!out.contains("[REDACTED:"), "false positive on: {benign}");
         }
     }
 
@@ -548,7 +574,7 @@ mod tests {
         // pattern accepts both. DEADBEEF/CAFEBABE keeps the fixture
         // unmistakably synthetic.
         let out = s().scrub("ghl=pit-DEADBEEF-FACE-4B0B-BEEF-CAFEBABE1234");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("DEADBEEF"));
     }
 
@@ -557,13 +583,13 @@ mod tests {
         // Negative control, and the reason the tail is UUID-anchored rather
         // than permissive: `pit-` is an ordinary English fragment.
         let out = s().scrub("planning the pit-stop-strategy-analysis for turn 4");
-        assert!(!out.contains("[REDACTED]"));
+        assert!(!out.contains("[REDACTED:"));
     }
 
     #[test]
     fn scrubs_slack_bot_token() {
         let out = s().scrub("slack=xoxb-1234567890-abcdefghij");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("xoxb-1234"));
     }
 
@@ -571,7 +597,7 @@ mod tests {
     fn scrubs_pem_private_key_block() {
         let pem = "before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\nafter";
         let out = s().scrub(pem);
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("b3BlbnNz"));
         assert!(out.contains("before"));
         assert!(out.contains("after"));
@@ -580,18 +606,18 @@ mod tests {
     #[test]
     fn scrubs_url_embedded_credentials() {
         let out = s().scrub("connect to postgres://admin:hunter2@db.internal/prod");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("hunter2"));
     }
 
     #[test]
     fn scrubs_generic_env_var_assignments() {
         let out = s().scrub("MY_INTERNAL_API_KEY=aaaaaaaaaaaa");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         let out2 = s().scrub("SOMETHING_SECRET=foo");
-        assert!(out2.contains("[REDACTED]"));
+        assert!(out2.contains("[REDACTED:"));
         let out3 = s().scrub("DB_PASSWORD=hunter2");
-        assert!(out3.contains("[REDACTED]"));
+        assert!(out3.contains("[REDACTED:"));
     }
 
     /// The value character class excludes `[`, so a value already replaced
@@ -600,7 +626,7 @@ mod tests {
     #[test]
     fn auth_header_pattern_does_not_re_eat_an_earlier_redaction() {
         let out = s().scrub("X-Api-Key: Bearer FAKEfakeFAKEfake0123456789");
-        assert_eq!(out, "X-Api-Key: [REDACTED]");
+        assert_eq!(out, "X-Api-Key: [REDACTED:bearer_token]");
     }
 
     /// The header name is matched with a flat character class rather than
@@ -614,7 +640,7 @@ mod tests {
 
         let matching = format!("{long_name}-auth-token: {secret}");
         let out = s().scrub(&matching);
-        assert!(out.contains("[REDACTED]"), "adversarial match not redacted");
+        assert!(out.contains("[REDACTED:"), "adversarial match not redacted");
         assert!(!out.contains(&secret), "leaked under adversarial input");
 
         let non_matching = format!("{long_name}-harmless: {secret}");
@@ -645,9 +671,9 @@ mod tests {
     #[test]
     fn scrubs_cloud_credential_paths() {
         let out = s().scrub("read /home/user/.aws/credentials");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
         let out2 = s().scrub("set KUBECONFIG=/home/user/.kube/config");
-        assert!(out2.contains("[REDACTED]"));
+        assert!(out2.contains("[REDACTED:"));
     }
 
     /// Opaque auth headers reach capture via tool output echoing curl. The
@@ -675,7 +701,7 @@ mod tests {
             "x-api-key: FAKEfakeFAKEfake0123456789",
         ] {
             let out = s().scrub(header);
-            assert!(out.contains("[REDACTED]"), "not redacted: {header}");
+            assert!(out.contains("[REDACTED:"), "not redacted: {header}");
             assert!(!out.contains("FAKEfake"), "leaked: {header}");
         }
     }
@@ -711,8 +737,8 @@ mod tests {
             importance: 5,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
-        assert!(scrubbed.title.contains("[REDACTED]"));
-        assert!(scrubbed.body.contains("[REDACTED]"));
+        assert!(scrubbed.title.contains("[REDACTED:"));
+        assert!(scrubbed.body.contains("[REDACTED:"));
     }
 
     #[test]
@@ -734,7 +760,7 @@ mod tests {
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.body.len() <= OBSERVATION_BODY_MAX_BYTES);
-        assert!(scrubbed.body.contains("[REDACTED]"));
+        assert!(scrubbed.body.contains("[REDACTED:"));
         // Head-tail truncation preserves the tail sentinel so the LLM
         // consolidator sees both the start and the end of the original body.
         assert!(scrubbed.body.contains("TAIL_SENTINEL"));
@@ -792,7 +818,42 @@ mod tests {
         };
         let sn = Sanitizer::new(&cfg).unwrap();
         let out = sn.scrub("found CANARY-42 here");
-        assert!(out.contains("[REDACTED]"));
+        assert!(out.contains("[REDACTED:"));
+    }
+
+    /// Typed labels let a later reader distinguish secret kinds without
+    /// reconstructing them from context — the point of P1.
+    #[test]
+    fn typed_labels_identify_the_secret_kind() {
+        let out = s().scrub("token=ghp_FAKEfakeFAKEfakeFAKEfake012345678");
+        assert!(out.contains("[REDACTED:github_token]"), "got: {out}");
+
+        let out = s().scrub("jwt=eyJFAKEfakeFAKEfake.eyJFAKEfakeFAKEfake.FAKEfakeFAKEfakeFAKEfake");
+        assert!(out.contains("[REDACTED:jwt]"), "got: {out}");
+
+        let out = s().scrub("OPENAI_API_KEY=sk-leak-1234567890abcdef");
+        assert!(out.contains("[REDACTED:env_secret]"), "got: {out}");
+    }
+
+    #[test]
+    fn extra_pattern_match_is_labeled_custom() {
+        let cfg = SanitizeConfig {
+            extra_patterns: vec![r"CANARY-[0-9]+".to_string()],
+            allowlist: vec![],
+        };
+        let sn = Sanitizer::new(&cfg).unwrap();
+        let out = sn.scrub("found CANARY-42 here");
+        assert_eq!(out, "found [REDACTED:custom] here");
+    }
+
+    /// The value character class excludes `[`, so an already-labeled marker
+    /// cannot be swallowed by a later pattern and lose its kind.
+    #[test]
+    fn double_scrub_is_idempotent() {
+        let once = s().scrub("token=ghp_FAKEfakeFAKEfakeFAKEfake012345678");
+        assert!(once.contains("[REDACTED:github_token]"));
+        let twice = s().scrub(&once);
+        assert_eq!(once, twice);
     }
 
     #[test]
