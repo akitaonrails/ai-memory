@@ -3696,6 +3696,36 @@ pub fn scope_is_purged(
     Ok(found.is_some())
 }
 
+/// Session ids tombstoned by `purge_session` in one scope.
+///
+/// The scope-level twin of [`scope_is_purged`], read the same way and for the
+/// same reason: a purge whose page-file removal did not complete leaves the
+/// markdown on disk, and the wiki reindex must not put it back (#701). Loaded
+/// once per directory per reindex pass rather than once per page — a purged
+/// scope is one row, but a project accumulates one purged session per purge.
+///
+/// # Errors
+/// Propagates SQL errors.
+pub fn purged_session_ids(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+) -> StoreResult<Vec<SessionId>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id FROM purged_sessions \
+         WHERE workspace_id = ?1 AND project_id = ?2",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![workspace_id.as_bytes(), project_id.as_bytes()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(SessionId::from_slice(&row?)?);
+    }
+    Ok(out)
+}
+
 /// One recorded bootstrap chunk, as loaded by [`load_bootstrap_progress`].
 #[derive(Debug, Clone)]
 pub struct BootstrapChunkRecord {

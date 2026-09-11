@@ -78,6 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary while reading clearly in shell history (#687).
 
 ### Changed
+- The managed routing snippet distinguishes a reviewed decision record kept in
+  the repository (an ADR directory, a Keep the Why `context/` tree) from a
+  harness-local memory store: decisions go into the repo's record under its
+  convention, ai-memory keeps recall, handoffs and session history and does not
+  duplicate the record as a page. `docs/usage.md` ("Repo-native decision
+  records") and `docs/marker-file.md` say to list such a directory in
+  `[capture] ignore_paths`, and why (#700).
 - The managed routing snippet now states that Claude Code loads `CLAUDE.md` and
   does not read `AGENTS.md`: a project whose canonical instruction file is
   `AGENTS.md` needs a bare `@AGENTS.md` import line in `CLAUDE.md`, or the rules
@@ -91,6 +98,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page ingestion windows for historical reorg/move-regenerate pages,
   preventing empty page windows when `updated_at` still held creation
   time. Clarified current-index ranking and snapshot-based rollback. (#682)
+- A `purge-session` whose page-file cleanup failed was undone by the next
+  watcher pass. The cleanup failure is reported in `files_failed` and leaves
+  the database rows deleted while `sessions/<id>.md` is still on disk; nothing
+  on the reindex path consulted the `purged_sessions` tombstone, so the
+  reconcile tick 30 seconds later indexed the leftover file and the purged
+  session's body was searchable again. The wiki reindex now skips a page whose
+  session is tombstoned, the way it already skips a tombstoned scope, loading
+  the tombstones once per directory per pass rather than once per page. The
+  pass reports them as `skipped_purged_sessions` (#701).
+- The Docker wrapper (`bin/ai-memory`) now forwards `GEMINI_API_KEY` and
+  `GOOGLE_API_KEY` into the container. Every other provider credential was on
+  the `-e` forwarding allowlist, but these two were missing, so
+  `AI_MEMORY_LLM_PROVIDER=gemini` (or the gemini embedder) reached the server
+  while its key did not — the process then failed with `provider not
+  configured: GEMINI_API_KEY or GOOGLE_API_KEY` even though the operator had
+  exported it (#698).
+- `serve` no longer re-archives the whole data directory on every boot once the
+  pre-migration backup receipt's archive has been deleted and auto-improve
+  `_pending/` sidecars exist. The OKF conformance scan that feeds the backup
+  gate flagged those staging sidecars (which carry no frontmatter and are never
+  migrated — SQLite owns their approval state) as nonconformant, so it kept
+  falling through to a full archive. The scan now skips the project-root
+  `_pending/` subtree — a nested `notes/_pending/` page still migrates — matching
+  the watcher indexer and the existing ledger skip (#695, same class as #669).
 - A bare `LLM_BASE_URL` in the environment no longer redirects providers that
   talk to a fixed vendor endpoint. The variable is a cross-tool convention an
   operator exports once for a local Ollama, and ai-memory fed it to every
@@ -116,17 +147,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the operation, and the error. A 4xx stays quiet: the caller was told and the
   caller was at fault, so logging those would let any client fill the log at
   will (#692).
-- `serve --transport stdio` ignored Ctrl-C. The stdio arm awaited the MCP
-  service without installing a signal handler, so the interrupt was left to the
-  default disposition — which the kernel discards when the process is PID 1 in
-  its namespace, as it is under the container entrypoint. The server stayed up
-  with its watcher and scheduler still ticking, and only closing stdin stopped
-  it. `serve` now watches for Ctrl-C from before the `initialize` handshake, so
-  a server started by hand and never contacted by a client is interruptible
-  too, and exits instead of parking on the uncancellable blocking read of
-  stdin. That exit is abrupt — it drops whatever is still queued on the store
-  writer — which is what an interrupt already does to a server that is not
-  PID 1. The HTTP transport already had this (#699).
 - `purge-session` took the wiki mutation guard only for the file cleanup, after
   the database deletion had already committed. A watcher reindex could reinsert
   the still-present page in that gap and keep only the row, and a concurrent page
@@ -187,6 +207,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Podman. Additionally, `emit_docker_run_script` now preserves volume mount
   modes (such as `:Z` on SELinux/Podman environments) and filters transient
   runtime environment variables (`HOSTNAME`, `container=podman`). (#673)
+- `ai-memory serve` now stops on Ctrl-C and on SIGTERM, on both transports.
+  The stdio transport listened for no signal at all, and the HTTP transport
+  listened for SIGINT alone — so SIGTERM, what `docker stop`, `docker compose
+  down` and `systemctl stop` send, reached no handler on either. What that
+  cost depended on whether the server was PID 1. In the container it is (the
+  image's ENTRYPOINT is exec form, with no init shim), and for PID 1 the
+  kernel discards a signal whose handler is not installed: the signal was not
+  merely unhandled, it was invisible, so `docker stop` sat out its whole grace
+  period and ended in SIGKILL, `docker kill` was the only way out, and Ctrl-C
+  on stdio did nothing at all. Everywhere else — under the native systemd
+  unit, or a plain `ai-memory serve` in a terminal — the process is not PID 1,
+  so the same signal fell through to the kernel's default disposition and
+  killed it instantly instead, with no drain at all: the durable SessionEnd
+  consolidation worker was cut off mid-flight rather than drained. Both
+  transports now listen for SIGINT and SIGTERM, log which one arrived, and
+  bound the drain at five seconds so a stateful or SSE MCP client holding a
+  connection open cannot stall the exit — a stop that used to be instant and
+  unclean now takes up to those five seconds and drains. The listeners are
+  installed before the transport starts, so a signal arriving during a slow
+  boot — migrations, the pre-migration archive — is handled rather than lost,
+  and no container init shim (`tini`, `docker run --init`) is needed for the
+  server to stop as PID 1 (#699).
 
 ## [2.1.1] - 2026-09-07
 

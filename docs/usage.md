@@ -486,30 +486,48 @@ ai-memory never edits the rules file on its own. The lint suggestion is
 the whole workflow: copy the rule if it should apply every turn, ignore
 it if it was temporary context.
 
-## Architecture Decision Records (ADRs)
+## Repo-native decision records
 
-Two facts frame how ADRs and ai-memory interact:
+Some projects keep the reasoning behind the code in the repository itself: an
+ADR directory such as `docs/adr/`, maintained by hand or by a dedicated ADR
+tool/MCP server (e.g. [joshrotenberg/adrs](https://github.com/joshrotenberg/adrs)),
+or a [Keep the Why](https://github.com/oliver-zehentleitner/keep-the-why)
+`context/` tree (decisions, rejected alternatives, constraints, reviewed in
+pull requests). Three facts frame how such a record and ai-memory interact:
 
 1. **ai-memory never touches files in your repository.** Its wiki lives
    in the server's data dir; the background jobs (consolidation,
    curation, retention decay, auto-improvement) read and write wiki
-   pages only. A `docs/adr/` directory in the repo — maintained by hand
-   or by a dedicated ADR tool/MCP server (e.g.
-   [joshrotenberg/adrs](https://github.com/joshrotenberg/adrs)) — is
-   categorically outside ai-memory's write surface. Run both side by
-   side without ceremony: the ADR tool owns the canonical log, ai-memory
-   owns cross-session recall.
+   pages only. A decision-record directory in the repo is categorically
+   outside ai-memory's write surface. Run both side by side without
+   ceremony: the repo owns the canonical record, ai-memory owns
+   cross-session recall.
 
-2. **Wiki pages marked `pinned: true` are immutable to automation.**
+2. **Keep the record directory out of capture.** An agent reading the
+   record is captured like any other file read, and consolidation compiles
+   what it saw into wiki pages — including a `decisions/` page that says
+   "active" long after the repo has superseded it, ranked first by
+   `memory_query` because it matches the topic. List the directory in the
+   marker's `[capture]` section so the copy is never made:
+
+   ```toml
+   [capture]
+   ignore_paths = ["docs/adr/**"]   # or ["context/**"] for Keep the Why
+   ```
+
+   The repo owns that record; a compiled copy goes stale the moment the
+   repo moves. Details and bounds in [`docs/marker-file.md`](marker-file.md).
+
+3. **Wiki pages marked `pinned: true` are immutable to automation.**
    Retention decay and curation skip them, and the auto-improvement
    apply path hard-refuses to rewrite them (the proposal is recorded as
    a conflict with the reason). Unpinning is the explicit opt-out.
 
-For decisions recorded *in* the wiki, the managed durable-pages Agent
-Skill teaches agents the recipe: `decisions/<slug>.md`, ADR structure
-(Status / Context / Decision / Consequences, including rejected
-alternatives), `pinned: true`, and supersede-by-new-page instead of
-editing history. Ask an agent to "record this as an architectural
+For a project without a repo-side record, decisions go *in* the wiki, and
+the managed durable-pages Agent Skill teaches agents the recipe:
+`decisions/<slug>.md`, ADR structure (Status / Context / Decision /
+Consequences, including rejected alternatives), `pinned: true`, and
+supersede-by-new-page instead of editing history. Ask an agent to "record this as an architectural
 decision" and the skill does the rest; the structured shape also
 retrieves noticeably better through `memory_query` than free-form
 prose.

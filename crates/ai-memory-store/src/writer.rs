@@ -82,6 +82,11 @@ pub(crate) enum WriteCmd {
         project_id: ProjectId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    PurgedSessionIds {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<Vec<SessionId>>>,
+    },
     RecordBootstrapChunk {
         fingerprint: String,
         chunk_index: u32,
@@ -768,6 +773,29 @@ impl WriterHandle {
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ScopeIsPurged {
+            workspace_id,
+            project_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Session ids tombstoned by `purge_session` in this scope. The wiki
+    /// reindex consults these so a purge whose page-file removal did not
+    /// complete cannot be undone by the next pass (#701). Loaded once per
+    /// directory per pass, not once per page. Routed through the writer actor
+    /// for the same reason [`Self::scope_is_purged`] is.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn purged_session_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<SessionId>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::PurgedSessionIds {
             workspace_id,
             project_id,
             reply: tx,
@@ -2595,6 +2623,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::scope_is_purged(&conn, &workspace_id, &project_id);
                 send_or_warn(reply, result, "scope_is_purged");
+            }
+            WriteCmd::PurgedSessionIds {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = ops::purged_session_ids(&conn, &workspace_id, &project_id);
+                send_or_warn(reply, result, "purged_session_ids");
             }
             WriteCmd::RecordBootstrapChunk {
                 fingerprint,

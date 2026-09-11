@@ -16,3 +16,4 @@ mod repo_layout;
 mod routing_instructions;
 mod routing_skills;
 mod serve_shutdown;
+mod shutdown_signals;
