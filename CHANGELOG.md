@@ -501,6 +501,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loss). A per-path async lock now serializes same-path writers while
   different paths still proceed concurrently; batches acquire their paths in a
   fixed global order so they cannot deadlock.
+
 ## [2.0.3] - 2026-09-04
 
 ### Changed
