@@ -25,6 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a missed window now spools instead of dropping (above). The handoff GET keeps
   its 1 s: it is fed synchronously to the agent's context, and truncating an
   almost-ready handoff costs more than it saves (#719).
+- `ai-memory restore` no longer rejects the GNU-sparse SQLite entry that
+  `ai-memory backup` itself produces. `tar::Builder`'s default sparse
+  detection archives `db/memory.sqlite` as a GNU-sparse entry (header type
+  `S`) whenever the SQLite snapshot has real holes on disk, which
+  `validate_restore_entry`'s `is_file()`/`is_dir()` check rejected as an
+  "unsupported entry type" — a verified, valid backup could not be restored,
+  with no recovery path but hand-editing the archive. `tar` already expands
+  GNU-sparse blocks to their full logical content while iterating entries, so
+  restore now accepts the type and unpacks it exactly like a regular file
+  (#718).
 
 ## [2.2.0] - 2026-09-12
 
