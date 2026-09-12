@@ -41,6 +41,9 @@ regexes = [
     '''github_pat_FAKE[A-Z0-9_]+''',
     '''AKIAFAKE[A-Z0-9]+''',
     '''ASIAFAKE[A-Z0-9]+''',
+    # JWT fixture (P1 typed-redaction tests): three `eyJFAKEfake…`/`FAKEfake…`
+    # segments — obviously fake, never an issued token.
+    '''eyJFAKEfake[A-Za-z0-9_.\-]{10,}''',
     # Stripe *restricted* key fixture, same FAKE convention as the keys above.
     '''rk_live_FAKEfake[A-Za-z0-9]+''',
     # Telegram bot-token fixture: the example Telegram itself publishes in its
