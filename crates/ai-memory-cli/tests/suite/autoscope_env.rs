@@ -152,7 +152,33 @@ fn spawn_and_wait_for_exit(envs: &[(&str, &str)], timeout: Duration) -> (bool, S
 }
 
 const STARTUP_NEEDLE: &str = "active-project isolation mode";
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Wall-clock budget for the server to reach its startup log line.
+///
+/// Deliberately generous, because it measures the wrong thing on purpose. The
+/// server's own startup work is well under a second; what this actually bounds
+/// is ten copies of an unoptimised debug binary being spawned, linked and paged
+/// in at once by the test harness. That cost tracks binary size and machine
+/// load rather than anything about the product, so a tight budget turns a busy
+/// machine into a test failure.
+///
+/// A real startup regression still fails here. It just has to be a large one,
+/// which is the correct trade for a test whose failure would otherwise be read
+/// as noise. Concretely, the measured spread while writing this was 5.06s on a
+/// quiet machine and 28.5s under parallel load, so 45s trips on roughly a 9x
+/// regression against a quiet run and a 1.6x one against the worst observed.
+/// That is the inverse bound: anything subtler than that belongs in a
+/// benchmark, not here.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long a bad config gets to be rejected before the harness calls it a hang.
+///
+/// Same measurement problem as [`STARTUP_TIMEOUT`] and the same reason for the
+/// size: this bounds process spawn plus config parse, and "still running" is
+/// read as a failure to fail fast. Too tight, and a slow spawn under parallel
+/// load is indistinguishable from a config error that was silently accepted —
+/// which is the bug these tests exist to catch.
+const FAILFAST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The shipped default keys the active-project pointer by whatever coordinate
 /// the caller has, so two harnesses in one project — or two operators on one
@@ -245,7 +271,7 @@ fn invalid_mode_value_fails_fast() {
     // want to catch in CI long before it reaches prod.
     let (exited_ok, all) = spawn_and_wait_for_exit(
         &[("AI_MEMORY_AUTO_SCOPE__MODE", "per_universe")],
-        Duration::from_secs(5),
+        FAILFAST_TIMEOUT,
     );
     assert!(
         !exited_ok,
@@ -317,10 +343,8 @@ fn empty_mode_string_fails_fast() {
     // `""` is not a valid serde enum variant. Just like
     // `per_universe`, this must abort startup — never quietly default
     // to single.
-    let (exited_ok, all) = spawn_and_wait_for_exit(
-        &[("AI_MEMORY_AUTO_SCOPE__MODE", "")],
-        Duration::from_secs(5),
-    );
+    let (exited_ok, all) =
+        spawn_and_wait_for_exit(&[("AI_MEMORY_AUTO_SCOPE__MODE", "")], FAILFAST_TIMEOUT);
     assert!(
         !exited_ok,
         "empty `mode` must NOT result in a successful startup.\nstderr:\n{all}"
@@ -335,7 +359,7 @@ fn pascalcase_mode_fails_fast() {
     // both forms (which would mask a future case-sensitivity bug).
     let (exited_ok, all) = spawn_and_wait_for_exit(
         &[("AI_MEMORY_AUTO_SCOPE__MODE", "PerSession")],
-        Duration::from_secs(5),
+        FAILFAST_TIMEOUT,
     );
     assert!(
         !exited_ok,
