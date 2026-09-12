@@ -128,6 +128,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Note: this changes the durable sanitized string, so pages written before the
   upgrade keep `[REDACTED]` while new writes carry the label (see
   `docs/design-hindsight-borrowings.md` P1).
+
+### Fixed
+- Preserved recorded entity-link retirement timestamps when backfilling
+  page ingestion windows for historical reorg/move-regenerate pages,
+  preventing empty page windows when `updated_at` still held creation
+  time. Clarified current-index ranking and snapshot-based rollback. (#682)
+
+## [2.1.2] - 2026-09-11
+
+### Changed
 - The managed routing snippet distinguishes a reviewed decision record kept in
   the repository (an ADR directory, a Keep the Why `context/` tree) from a
   harness-local memory store: decisions go into the repo's record under its
@@ -144,10 +154,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
-- Preserved recorded entity-link retirement timestamps when backfilling
-  page ingestion windows for historical reorg/move-regenerate pages,
-  preventing empty page windows when `updated_at` still held creation
-  time. Clarified current-index ranking and snapshot-based rollback. (#682)
 - A `purge-session` whose page-file cleanup failed was undone by the next
   watcher pass. The cleanup failure is reported in `files_failed` and leaves
   the database rows deleted while `sessions/<id>.md` is still on disk; nothing
@@ -5574,7 +5580,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.1.2...HEAD
+[2.1.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.1.2
 [2.1.1]: https://github.com/akitaonrails/ai-memory/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...v2.1.0
 [2.0.3]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...v2.0.3
