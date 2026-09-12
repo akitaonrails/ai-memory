@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added an independent `codex` LLM provider that follows the Codex CLI account
+  selected by `CODEX_HOME`, reloads its read-only `auth.json` credentials before
+  each operation, and delegates expired-token recovery to
+  `codex app-server --stdio` (#716).
+
 ## [2.2.0] - 2026-09-12
 
 ### Added

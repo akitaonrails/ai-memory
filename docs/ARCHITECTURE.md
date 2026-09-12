@@ -605,7 +605,7 @@ abstract_vectors = false          # fifth RRF stream over page_abstract_embeddin
 
 **LLM provider env** (opt-in):
 ```
-AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | copilot |
+AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | codex | copilot |
                            gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
@@ -643,6 +643,7 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
                            `llm_headers = [...]` in config.toml for that.
 AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
+AI_MEMORY_CODEX_EXECUTABLE optional Codex executable; defaults to codex on PATH
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override
 ```
@@ -707,6 +708,12 @@ editor-plugin agent GitHub's Copilot API expects.
 `openai-oauth` uses `auth login openai-oauth` and stores the ChatGPT/Codex
 refresh token in `<data_dir>/auth.json`; it is separate from MCP/server bearer
 auth and from OpenAI Platform API keys.
+
+`codex` reads only the access token and account id from the Codex CLI-owned
+`auth.json`, resolved from `CODEX_HOME` or the platform home. It never persists
+Codex credentials. A single 401 recovery is serialized and delegated to
+`codex app-server --stdio`, with bounded JSONL/stdout/stderr and a 30-second
+maximum recovery timeout.
 
 `copilot` uses `auth login copilot` or `COPILOT_GITHUB_TOKEN`, exchanges the
 GitHub token through `/copilot_internal/v2/token`, and calls Copilot Chat with

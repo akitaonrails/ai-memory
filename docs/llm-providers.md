@@ -46,6 +46,7 @@ Recommended defaults:
 | `anthropic-oauth` | `claude-sonnet-4-6` | Use a Claude Pro/Max subscription via `claude setup-token`, no API key. |
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
+| `codex` | `gpt-5.6-luna` | Reuse the Codex CLI-owned `auth.json`; access-token refresh remains owned by `codex app-server`. |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
 | `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
@@ -54,6 +55,30 @@ Recommended defaults:
 the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
 starts, run `ai-memory auth login openai-oauth` with the wrapper so the token
 lands in the same `ai-memory-data` volume as the server.
+
+`codex` is independent from `openai-oauth`: it never copies credentials into
+ai-memory's data directory and never reads a refresh token or ID token. It
+reads only `tokens.access_token` and `tokens.account_id` from
+`$CODEX_HOME/auth.json`, or from the platform home's `.codex/auth.json` when
+`CODEX_HOME` is unset or empty. Each request reloads the file. A first 401 may
+trigger one serialized `codex app-server --stdio` recovery followed by one
+retry; further 401 responses fail with a reauthentication hint. Override the
+binary with `AI_MEMORY_CODEX_EXECUTABLE` when `codex` is not on `PATH`.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=codex
+export AI_MEMORY_LLM_MODEL=gpt-5.6-luna
+export AI_MEMORY_LLM_REASONING_EFFORT=medium
+ai-memory llm-test --provider codex --model gpt-5.6-luna --prompt "Reply with OK"
+ai-memory llm-test --provider codex --model gpt-5.6-luna --structured --prompt "Return a short answer"
+```
+
+Codex credential storage mode `file` is supported. `auto` works only when its
+effective credential is present in `auth.json`; keyring-only and ephemeral
+credentials are not read and produce an actionable missing-auth-file error.
+Docker is not configured automatically: the Codex executable, `CODEX_HOME`,
+and its credential file must all exist in the same container/environment as
+ai-memory.
 
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run
@@ -80,7 +105,7 @@ uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
 also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 
 > [!TIP]
-> **For the OAuth/subscription backends (`anthropic-oauth`, `openai-oauth`,
+> **For the OAuth/subscription backends (`anthropic-oauth`, `openai-oauth`, `codex`,
 > `copilot`), pick a small, fast model** via `AI_MEMORY_LLM_MODEL` — e.g.
 > `claude-haiku-4-5` or `gpt-5-mini`. ai-memory's LLM work (consolidation,
 > lint, explore) is summarisation, not hard reasoning, so a Haiku/mini-class

@@ -36,10 +36,24 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         model = client.model(),
         "sending prompt",
     );
-    let resp = client
-        .complete(representative_request(args.prompt))
-        .await
-        .context("calling provider")?;
+    let request = representative_request(args.prompt);
+    if args.structured {
+        let value = client
+            .complete_structured_raw(
+                request,
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"]
+                }),
+            )
+            .await
+            .context("calling provider for structured output")?;
+        println!("--- model: {} ---", client.model());
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    let resp = client.complete(request).await.context("calling provider")?;
 
     println!("--- model: {} ---", resp.model);
     if let Some(u) = resp.usage {
@@ -69,6 +83,7 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::Gemini => Self::Gemini,
             LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
             LlmProviderChoice::OpenaiOauth => Self::OpenAiOAuth,
+            LlmProviderChoice::Codex => Self::Codex,
             LlmProviderChoice::Copilot => Self::Copilot,
             LlmProviderChoice::Opencode => Self::OpenCode,
         }
@@ -84,6 +99,14 @@ mod tests {
         assert_eq!(
             ProviderChoice::from(LlmProviderChoice::AnthropicOauth),
             ProviderChoice::AnthropicOAuth
+        );
+    }
+
+    #[test]
+    fn codex_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::Codex),
+            ProviderChoice::Codex
         );
     }
 

@@ -42,6 +42,8 @@ pub enum AuthRequirement {
     },
     /// Provider requires a ChatGPT/Codex OAuth token file.
     OpenAiOAuthToken,
+    /// Provider reuses the Codex CLI auth file and delegates refresh to Codex.
+    CodexAuthFile,
     /// Provider requires a GitHub token or stored auth for Copilot.
     CopilotToken,
     /// Provider requires an Anthropic OAuth subscription token
@@ -62,6 +64,15 @@ pub struct CopilotAuth {
     pub api_base_url: Option<String>,
 }
 
+/// Resolved, non-secret inputs for the Codex-backed provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexAuth {
+    /// Codex CLI-owned authentication file.
+    pub auth_file: PathBuf,
+    /// Codex executable used only for delegated refresh.
+    pub executable: PathBuf,
+}
+
 /// Materialized provider credential.
 #[derive(Debug, Clone)]
 pub enum Credential {
@@ -69,6 +80,8 @@ pub enum Credential {
     ApiKey(SecretString),
     /// Path to the OpenAI OAuth token file.
     OpenAiOAuthTokenFile(PathBuf),
+    /// Paths needed to reuse Codex CLI authentication.
+    Codex(CodexAuth),
     /// GitHub Copilot auth inputs.
     Copilot(CopilotAuth),
     /// Anthropic OAuth subscription token from `claude setup-token`.
@@ -110,6 +123,19 @@ impl ProviderAuth {
         Self {
             requirement: AuthRequirement::OpenAiOAuthToken,
             credential: Some(Credential::OpenAiOAuthTokenFile(path.into())),
+            source: CredentialSource::TokenFile,
+        }
+    }
+
+    /// Resolve Codex auth from already-resolved auth-file and executable paths.
+    #[must_use]
+    pub fn codex(auth_file: impl Into<PathBuf>, executable: impl Into<PathBuf>) -> Self {
+        Self {
+            requirement: AuthRequirement::CodexAuthFile,
+            credential: Some(Credential::Codex(CodexAuth {
+                auth_file: auth_file.into(),
+                executable: executable.into(),
+            })),
             source: CredentialSource::TokenFile,
         }
     }
@@ -201,6 +227,9 @@ impl ProviderAuth {
             (_, Some(Credential::OpenAiOAuthTokenFile(_))) => Err(LlmError::NotConfigured(
                 "API key credential expected, got openai-oauth token file".into(),
             )),
+            (_, Some(Credential::Codex(_))) => Err(LlmError::NotConfigured(
+                "API key credential expected, got codex auth file".into(),
+            )),
             (_, Some(Credential::Copilot(_))) => Err(LlmError::NotConfigured(
                 "API key credential expected, got copilot auth".into(),
             )),
@@ -215,6 +244,10 @@ impl ProviderAuth {
             }
             (AuthRequirement::OpenAiOAuthToken, None) => Err(LlmError::NotConfigured(
                 "openai-oauth token file missing; run `ai-memory auth login openai-oauth`".into(),
+            )),
+            (AuthRequirement::CodexAuthFile, None) => Err(LlmError::NotConfigured(
+                "codex auth file missing; run `codex login status` and authenticate Codex again"
+                    .into(),
             )),
             (AuthRequirement::CopilotToken, None) => Err(LlmError::NotConfigured(
                 "copilot auth missing; run `ai-memory auth login copilot` or set COPILOT_GITHUB_TOKEN"
@@ -235,6 +268,7 @@ impl ProviderAuth {
             Some(Credential::ApiKey(key)) => Some(key.clone()),
             Some(
                 Credential::OpenAiOAuthTokenFile(_)
+                | Credential::Codex(_)
                 | Credential::Copilot(_)
                 | Credential::AnthropicOAuthToken(_),
             )
@@ -278,6 +312,23 @@ impl ProviderAuth {
             )),
             _ => Err(LlmError::NotConfigured(
                 "openai-oauth token file credential required".into(),
+            )),
+        }
+    }
+
+    /// Extract the resolved Codex auth inputs.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] if this is not Codex auth.
+    pub fn require_codex_auth(&self) -> LlmResult<CodexAuth> {
+        match (&self.requirement, &self.credential) {
+            (AuthRequirement::CodexAuthFile, Some(Credential::Codex(auth))) => Ok(auth.clone()),
+            (AuthRequirement::CodexAuthFile, None) => Err(LlmError::NotConfigured(
+                "codex auth file missing; run `codex login status` and authenticate Codex again"
+                    .into(),
+            )),
+            _ => Err(LlmError::NotConfigured(
+                "codex auth-file credential required".into(),
             )),
         }
     }
@@ -419,5 +470,17 @@ mod tests {
     fn optional_api_key_returns_none_for_anthropic_oauth_credential() {
         let auth = ProviderAuth::anthropic_oauth_token(Some(SecretString::from("tok")));
         assert!(auth.optional_api_key().is_none());
+    }
+
+    #[test]
+    fn codex_auth_round_trips_only_resolved_paths() {
+        let auth = ProviderAuth::codex("/tmp/.codex/auth.json", "/opt/codex/bin/codex");
+        let codex = auth.require_codex_auth().unwrap();
+
+        assert_eq!(auth.requirement(), AuthRequirement::CodexAuthFile);
+        assert_eq!(auth.source(), CredentialSource::TokenFile);
+        assert_eq!(codex.auth_file, Path::new("/tmp/.codex/auth.json"));
+        assert_eq!(codex.executable, Path::new("/opt/codex/bin/codex"));
+        assert!(!format!("{codex:?}").contains("token"));
     }
 }

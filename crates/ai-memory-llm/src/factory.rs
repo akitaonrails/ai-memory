@@ -8,6 +8,7 @@ use std::sync::Arc;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::AnthropicProvider;
+use crate::CodexProvider;
 use crate::CopilotProvider;
 use crate::GeminiProvider;
 use crate::OpenAiCompatProvider;
@@ -33,6 +34,8 @@ pub enum ProviderChoice {
     OpenAiCompat,
     /// OpenAI ChatGPT/Codex OAuth backend.
     OpenAiOAuth,
+    /// Codex CLI-owned auth with refresh delegated to `codex app-server`.
+    Codex,
     /// GitHub Copilot Chat backend.
     Copilot,
     /// Anthropic Messages API via a Claude-subscription OAuth token.
@@ -52,6 +55,7 @@ impl ProviderChoice {
             Self::Gemini => "gemini",
             Self::OpenAiCompat => "openai-compat",
             Self::OpenAiOAuth => "openai-oauth",
+            Self::Codex => "codex",
             Self::Copilot => "copilot",
             Self::AnthropicOAuth => "anthropic-oauth",
             Self::OpenCode => "opencode",
@@ -75,6 +79,7 @@ impl ProviderChoice {
                 env_var: "LLM_API_KEY",
             },
             Self::OpenAiOAuth => AuthRequirement::OpenAiOAuthToken,
+            Self::Codex => AuthRequirement::CodexAuthFile,
             Self::Copilot => AuthRequirement::CopilotToken,
             Self::AnthropicOAuth => AuthRequirement::AnthropicOAuthToken,
             Self::OpenCode => AuthRequirement::RequiredApiKey {
@@ -384,6 +389,15 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                     .with_extra_headers(extra_headers),
             ))
         }
+        ProviderChoice::Codex => {
+            let auth = config.auth.require_codex_auth()?;
+            Ok(Arc::new(
+                CodexProvider::new(auth, config.model)?
+                    .with_timeout_secs(timeout)
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
+            ))
+        }
         ProviderChoice::Copilot => {
             let auth = config.auth.require_copilot_auth()?;
             Ok(Arc::new(
@@ -485,6 +499,11 @@ mod tests {
         assert_eq!(
             ProviderChoice::OpenAiOAuth.auth_requirement(),
             AuthRequirement::OpenAiOAuthToken
+        );
+        assert_eq!(ProviderChoice::Codex.name(), "codex");
+        assert_eq!(
+            ProviderChoice::Codex.auth_requirement(),
+            AuthRequirement::CodexAuthFile
         );
         assert_eq!(
             ProviderChoice::Copilot.auth_requirement(),

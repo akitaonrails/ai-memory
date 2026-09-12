@@ -175,7 +175,8 @@ pub struct Config {
     pub home_dir: Option<String>,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
     pub log_level: String,
-    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `copilot`).
+    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`,
+    /// `openai-oauth`, `codex`, `copilot`).
     pub llm_provider: Option<String>,
     /// Optional LLM model override.
     pub llm_model: Option<String>,
@@ -400,6 +401,9 @@ pub struct Config {
 pub struct RuntimeEnv {
     data_dir: Option<PathBuf>,
     home_dir: Option<String>,
+    platform_home: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    codex_executable: Option<PathBuf>,
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
@@ -427,6 +431,9 @@ impl RuntimeEnv {
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
             home_dir: env_string("AI_MEMORY_HOME").or_else(|| env_string("HOME")),
+            platform_home: dirs::home_dir(),
+            codex_home: env_path("CODEX_HOME"),
+            codex_executable: env_path("AI_MEMORY_CODEX_EXECUTABLE"),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
@@ -1223,7 +1230,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "AI_MEMORY_LLM_PROVIDER={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
             ))
         })?;
         let model = match non_empty(self.llm_model.as_deref()) {
@@ -1234,6 +1241,7 @@ impl Config {
                 ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
+                ProviderChoice::Codex => "gpt-5.6-luna".to_string(),
                 ProviderChoice::Copilot => "gpt-5.5".to_string(),
                 ProviderChoice::OpenAiCompat => {
                     return Err(LlmError::NotConfigured(
@@ -1282,7 +1290,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "llm_fallbacks[{index}].provider={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
             ))
         })?;
         let model = non_empty(Some(profile.model.as_str()))
@@ -1337,6 +1345,16 @@ impl Config {
             AuthRequirement::OpenAiOAuthToken => {
                 ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
             }
+            AuthRequirement::CodexAuthFile => ProviderAuth::codex(
+                resolve_codex_auth_file(
+                    self.runtime_env.codex_home.as_deref(),
+                    self.runtime_env.platform_home.as_deref(),
+                ),
+                self.runtime_env
+                    .codex_executable
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("codex")),
+            ),
             AuthRequirement::CopilotToken => ProviderAuth::copilot(
                 self.copilot_token_path(),
                 self.runtime_env.copilot_github_token.clone(),
@@ -1541,6 +1559,7 @@ impl Config {
             ProviderChoice::Gemini => self.runtime_env.gemini_api_key.clone(),
             ProviderChoice::OpenAiCompat => self.runtime_env.llm_api_key.clone(),
             ProviderChoice::OpenAiOAuth => None,
+            ProviderChoice::Codex => None,
             ProviderChoice::Copilot => None,
             ProviderChoice::AnthropicOAuth => None,
             ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
@@ -1557,6 +1576,17 @@ impl Config {
     #[must_use]
     pub fn openai_oauth_token_path(&self) -> PathBuf {
         self.auth_token_path()
+    }
+
+    /// Codex CLI-owned auth file resolved from the Codex or platform home.
+    #[must_use]
+    pub fn codex_auth_file_path(&self) -> PathBuf {
+        let platform_home = self
+            .runtime_env
+            .platform_home
+            .as_deref()
+            .or_else(|| self.runtime_env.home_dir.as_deref().map(Path::new));
+        resolve_codex_auth_file(self.runtime_env.codex_home.as_deref(), platform_home)
     }
 
     /// Shared Copilot auth token file path.
@@ -1605,6 +1635,13 @@ impl Config {
             AuthRequirement::OpenAiOAuthToken => {
                 ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
             }
+            AuthRequirement::CodexAuthFile => ProviderAuth::codex(
+                self.codex_auth_file_path(),
+                self.runtime_env
+                    .codex_executable
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("codex")),
+            ),
             AuthRequirement::CopilotToken => ProviderAuth::copilot(
                 self.copilot_token_path(),
                 self.runtime_env.copilot_github_token.clone(),
@@ -1669,6 +1706,7 @@ fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
         "gemini" | "google" => ProviderChoice::Gemini,
         "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
         "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+        "codex" => ProviderChoice::Codex,
         "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
         "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
         "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
@@ -1689,6 +1727,16 @@ fn env_string(name: &str) -> Option<String> {
 
 fn env_path(name: &str) -> Option<PathBuf> {
     env_string(name).map(PathBuf::from)
+}
+
+fn resolve_codex_auth_file(codex_home: Option<&Path>, platform_home: Option<&Path>) -> PathBuf {
+    if let Some(home) = codex_home.filter(|path| !path.as_os_str().is_empty()) {
+        return home.join("auth.json");
+    }
+    platform_home
+        .unwrap_or_else(|| Path::new("."))
+        .join(".codex")
+        .join("auth.json")
 }
 
 fn env_secret(name: &str) -> Option<SecretString> {
@@ -2860,6 +2908,48 @@ mod tests {
     }
 
     #[test]
+    fn codex_provider_uses_codex_home_auth_and_default_model() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("custom-codex-home");
+        let cfg = Config {
+            llm_provider: Some("codex".into()),
+            runtime_env: RuntimeEnv {
+                codex_home: Some(codex_home.clone()),
+                codex_executable: Some(PathBuf::from("codex-custom")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_codex_auth().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::Codex);
+        assert_eq!(provider.model, "gpt-5.6-luna");
+        assert_eq!(auth.auth_file, codex_home.join("auth.json"));
+        assert_eq!(auth.executable, Path::new("codex-custom"));
+    }
+
+    #[test]
+    fn codex_provider_falls_back_to_platform_home() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            llm_provider: Some("codex".into()),
+            runtime_env: RuntimeEnv {
+                platform_home: Some(tmp.path().to_path_buf()),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_codex_auth().unwrap();
+
+        assert_eq!(auth.auth_file, tmp.path().join(".codex").join("auth.json"));
+        assert_eq!(auth.executable, Path::new("codex"));
+    }
+
+    #[test]
     fn provider_config_forwards_the_operator_headers() {
         let tmp = TempDir::new().unwrap();
         let cfg = Config {
@@ -2873,6 +2963,24 @@ mod tests {
         assert_eq!(
             provider.extra_headers,
             ExtraHeaders::parse(["x-opencode-session=ses-1"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_auth_resolution_treats_empty_codex_home_as_unset() {
+        let platform_home = Path::new("/platform/home");
+
+        assert_eq!(
+            resolve_codex_auth_file(None, Some(platform_home)),
+            platform_home.join(".codex").join("auth.json")
+        );
+        assert_eq!(
+            resolve_codex_auth_file(Some(Path::new("")), Some(platform_home)),
+            platform_home.join(".codex").join("auth.json")
+        );
+        assert_eq!(
+            resolve_codex_auth_file(Some(Path::new("/custom/codex")), Some(platform_home)),
+            Path::new("/custom/codex").join("auth.json")
         );
     }
 

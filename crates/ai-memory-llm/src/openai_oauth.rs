@@ -13,13 +13,13 @@ use base64::Engine as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::auth_file::now_ms;
+use crate::codex_responses::{CodexResponsesAuth, post_codex_responses};
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited, response_text_limited};
 use crate::stored_token::{StoredOAuthToken, refresh_grant};
 use crate::text::truncate_with_ellipsis;
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
@@ -33,8 +33,7 @@ pub const OPENAI_OAUTH_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize
 /// OpenAI OAuth token endpoint.
 pub const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-/// ChatGPT/Codex Responses backend.
-pub const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub use crate::codex_responses::CODEX_RESPONSES_URL;
 
 /// Public Codex/OpenCode OAuth client id.
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -204,46 +203,18 @@ impl OpenAiOAuthProvider {
 
     async fn post(&self, body: &CodexResponsesRequest<'_>) -> LlmResult<CodexResponsesResponse> {
         let token = self.current_token().await?;
-        debug!(
-            url = CODEX_RESPONSES_URL,
-            "POST openai-oauth codex responses"
-        );
-        let mut request = self
-            .client
-            .post(CODEX_RESPONSES_URL)
-            .timeout(self.timeout)
-            .bearer_auth(token.access.expose_secret())
-            .header("content-type", "application/json")
-            .header(
-                "accept",
-                if body.stream {
-                    "text/event-stream"
-                } else {
-                    "application/json"
-                },
-            )
-            .header("openai-beta", "responses=experimental")
-            .header("originator", "codex_cli_rs")
-            .header("session_id", uuid::Uuid::new_v4().to_string())
-            .json(body);
-        request = self.extra_headers.apply(request);
-        if let Some(account_id) = token.extra.account_id.as_deref() {
-            request = request.header("chatgpt-account-id", account_id);
-        }
-        let resp = request.send().await.map_err(LlmError::from)?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
-        }
-        if body.stream {
-            parse_sse_response(&response_text_limited(resp).await?)
-        } else {
-            response_json_limited::<CodexResponsesResponse>(resp).await
-        }
+        post_codex_responses(
+            &self.client,
+            CODEX_RESPONSES_URL,
+            self.timeout,
+            &CodexResponsesAuth {
+                access_token: &token.access,
+                account_id: token.extra.account_id.as_deref(),
+            },
+            &self.extra_headers,
+            body,
+        )
+        .await
     }
 }
 
@@ -319,7 +290,7 @@ async fn refresh_access_token(
     ))
 }
 
-fn build_request<'a>(
+pub(crate) fn build_request<'a>(
     model: &'a str,
     request: &'a ChatRequest,
     text: Option<CodexText>,
@@ -357,7 +328,7 @@ fn build_request<'a>(
     }
 }
 
-fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse> {
+pub(crate) fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse> {
     let mut current_event: Option<String> = None;
     let mut data_lines: Vec<&str> = Vec::new();
     let mut output_text = String::new();
@@ -463,7 +434,7 @@ fn model_uses_default_temperature(model: &str) -> bool {
 }
 
 #[derive(Debug, Serialize)]
-struct CodexResponsesRequest<'a> {
+pub(crate) struct CodexResponsesRequest<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<&'a str>,
@@ -473,7 +444,7 @@ struct CodexResponsesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     store: bool,
-    stream: bool,
+    pub(crate) stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<CodexText>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -499,13 +470,13 @@ struct CodexInputContent<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct CodexText {
-    format: CodexTextFormat,
+pub(crate) struct CodexText {
+    pub(crate) format: CodexTextFormat,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum CodexTextFormat {
+pub(crate) enum CodexTextFormat {
     JsonSchema {
         name: String,
         schema: serde_json::Value,
@@ -514,7 +485,7 @@ enum CodexTextFormat {
 }
 
 #[derive(Debug, Deserialize)]
-struct CodexResponsesResponse {
+pub(crate) struct CodexResponsesResponse {
     #[serde(default)]
     output_text: Option<String>,
     #[serde(default)]
@@ -545,7 +516,7 @@ struct CodexUsage {
     output_tokens: u32,
 }
 
-fn into_chat_response(response: CodexResponsesResponse) -> ChatResponse {
+pub(crate) fn into_chat_response(response: CodexResponsesResponse) -> ChatResponse {
     let model = response
         .model
         .clone()
@@ -560,7 +531,7 @@ fn into_chat_response(response: CodexResponsesResponse) -> ChatResponse {
     }
 }
 
-fn extract_output_text(response: &CodexResponsesResponse) -> Option<String> {
+pub(crate) fn extract_output_text(response: &CodexResponsesResponse) -> Option<String> {
     if let Some(text) = response
         .output_text
         .as_deref()

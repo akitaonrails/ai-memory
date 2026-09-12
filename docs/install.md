@@ -1567,6 +1567,7 @@ ai-memory works in three intensity tiers:
 | **+ LLM consolidation** | LLM rewrites session pages as coherent narratives; PreCompact checkpoints; LLM-driven contradiction lint | `AI_MEMORY_LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | ~$0.01–0.05 / session |
 | **+ Anthropic via subscription** | Same LLM features using a Claude Pro/Max subscription instead of an API key | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` + `ANTHROPIC_OAUTH_TOKEN` | Uses your Claude subscription |
 | **+ ChatGPT/Codex OAuth** | Same LLM features using a ChatGPT Pro/Plus login instead of an OpenAI Platform key | `AI_MEMORY_LLM_PROVIDER=openai-oauth` + `ai-memory auth login openai-oauth` | Uses your ChatGPT subscription |
+| **+ Codex credential reuse** | Same LLM features using the Codex CLI-owned login without copying or owning its refresh token | `AI_MEMORY_LLM_PROVIDER=codex` + an authenticated Codex CLI | Uses your ChatGPT subscription |
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider | One LLM call per eligible query, at most four concurrently |
 | **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` (or `EMBEDDING_API_KEY`) | ~$0.0001 / page on backfill |
@@ -1581,6 +1582,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` | `claude-sonnet-4-6` | Anthropic via Claude subscription. Run `claude setup-token` once; set `ANTHROPIC_OAUTH_TOKEN` (or `CLAUDE_CODE_OAUTH_TOKEN`). No `ANTHROPIC_API_KEY` needed. Same `/v1/messages` endpoint, Bearer token auth. |
 | `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-5.4-mini` | Cheaper + faster alternative. Same parse reliability; mild over-classification on thin sessions. |
 | `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. Optional `AI_MEMORY_LLM_REASONING_EFFORT` (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`/`persistent`) is mapped to each provider's native reasoning field; omit it to keep the model default. |
+| `AI_MEMORY_LLM_PROVIDER=codex` | `gpt-5.6-luna` | Reuses only `access_token` and `account_id` from Codex's `auth.json`; token renewal is delegated to `codex app-server --stdio`. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1` — a cost-optimised model subset. GPT-5.6 Luna uses Go's Responses endpoint; other models use Chat Completions. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` — historical, and it selects Go like the others; the endpoint is chosen by the base URL, not the alias. |
@@ -1726,6 +1728,29 @@ Use `ai-memory auth status` to check whether a token is present and
 > `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` so hidden thought tokens
 > do not eat the JSON budget. Reserve high-effort reasoning for your
 > coding agent.
+
+### Codex credential reuse
+
+The independent `codex` provider reads `$CODEX_HOME/auth.json`, falling back to
+the platform home's `.codex/auth.json`. It materializes only
+`tokens.access_token` and `tokens.account_id`, reloads them before every call,
+and never copies or writes the file. On the first 401, it asks
+`codex app-server --stdio` to refresh the Codex-owned credential and retries
+the Responses request once.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=codex
+export AI_MEMORY_LLM_MODEL=gpt-5.6-luna
+export AI_MEMORY_LLM_REASONING_EFFORT=medium
+ai-memory llm-test --provider codex --model gpt-5.6-luna --prompt "Reply with OK"
+ai-memory llm-test --provider codex --model gpt-5.6-luna --structured --prompt "Return a short answer"
+```
+
+`AI_MEMORY_CODEX_EXECUTABLE` optionally selects another Codex binary. File
+storage is supported; `auto` is supported when it resolves to the same
+`auth.json`. Keyring-only and ephemeral storage are not supported. Docker is
+outside the automatic setup path: both the executable and credentials must be
+available inside the same container/environment.
 
 ### GitHub Copilot
 
