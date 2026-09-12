@@ -239,6 +239,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn sha256_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -249,6 +250,7 @@ mod tests {
     /// Whether the `tar` on PATH is GNU tar with sparse support, so the
     /// real-fixture test below can be skipped everywhere else (musl/BSD
     /// `tar`, or no `tar` at all) without breaking those environments.
+    #[cfg(target_os = "linux")]
     fn gnu_tar_with_sparse_available() -> bool {
         std::process::Command::new("tar")
             .arg("--version")
