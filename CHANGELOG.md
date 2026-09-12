@@ -17,7 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind the next delivery that succeeds, detached from the hook so the agent
   never waits. A 4xx stays a permanent rejection and is not retried. This is
   the durability the generated TypeScript integrations got in #580, for the
-  path the docker deploy installs. The PowerShell bundle is unchanged (#NNN).
+  path the docker deploy installs. The PowerShell bundle is unchanged (#719).
+- The POSIX shell hook bundle's `POST /hook` now hard-timeouts at 200 ms
+  rather than 500 ms, which is the budget invariant 5 documents for a script
+  hook. A real loopback round trip runs about 0.3 ms, so a local install is
+  unaffected; against a remote server the tighter ceiling is safe only because
+  a missed window now spools instead of dropping (above). The handoff GET keeps
+  its 1 s: it is fed synchronously to the agent's context, and truncating an
+  almost-ready handoff costs more than it saves (#719).
 
 ## [2.2.0] - 2026-09-12
 

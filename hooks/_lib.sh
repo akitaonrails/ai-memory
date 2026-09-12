@@ -446,7 +446,7 @@ ai_memory_clear_session_id() {
 
 # POST stdin to "$1" as JSON. Adds an
 # `Authorization: Bearer` header when `AI_MEMORY_AUTH_TOKEN` is set.
-# The 0.5s timeout matches the project-wide hook latency budget
+# The 0.2s timeout is invariant 5's budget for a script hook
 # (never block the agent), and the trailing `|| true` makes the
 # function safe to call from `set -e` scripts. An undelivered event
 # (unreachable server or 5xx) is spooled for a later drain instead of
@@ -465,7 +465,7 @@ ai_memory_post_hook() {
     _ambody=$(cat)
     _amhdr=$(ai_memory_auth_header_file || printf '')
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.5 -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
             -w '%{http_code}' -X POST "$1" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN" \
@@ -473,13 +473,13 @@ ai_memory_post_hook() {
     elif [ -n "$_amhdr" ]; then
         # `-H @file`: curl reads the header from disk, so the bearer never
         # appears in curl's argv the way an inline `-H` would (#552).
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.5 -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
             -w '%{http_code}' -X POST "$1" \
             -H "Content-Type: application/json" \
             -H @"$_amhdr" \
             --data-binary @- 2>/dev/null) || _amcode=000
     else
-        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.5 -o /dev/null \
+        _amcode=$(printf '%s' "$_ambody" | curl -s --max-time 0.2 -o /dev/null \
             -w '%{http_code}' -X POST "$1" \
             -H "Content-Type: application/json" \
             --data-binary @- 2>/dev/null) || _amcode=000
