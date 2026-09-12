@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The POSIX shell hook bundle no longer drops a lifecycle event when the
+  server is unreachable or answers 5xx. A failed delivery is written to
+  `<data_dir>/hook-spool/` in the same on-disk contract `ai-memory hook-drain`
+  reads (same filename shape, same `SpoolEntry` JSON, same 0600/0700 modes,
+  tmp+rename), with an `ingest_key` minted once at spool time so a shell drain
+  and a concurrent `hook-drain` cannot double-ingest; the backlog is flushed
+  behind the next delivery that succeeds, detached from the hook so the agent
+  never waits. A 4xx stays a permanent rejection and is not retried. This is
+  the durability the generated TypeScript integrations got in #580, for the
+  path the docker deploy installs. The PowerShell bundle is unchanged (#719).
+- The POSIX shell hook bundle's `POST /hook` now hard-timeouts at 200 ms
+  rather than 500 ms, which is the budget invariant 5 documents for a script
+  hook. A real loopback round trip runs about 0.3 ms, so a local install is
+  unaffected; against a remote server the tighter ceiling is safe only because
+  a missed window now spools instead of dropping (above). The handoff GET keeps
+  its 1 s: it is fed synchronously to the agent's context, and truncating an
+  almost-ready handoff costs more than it saves (#719).
+
 ## [2.2.0] - 2026-09-12
 
 ### Added

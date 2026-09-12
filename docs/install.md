@@ -593,7 +593,12 @@ agent host, then use that native executable to run
 `install-hooks --agent claude-code --apply`. Even if the script fallback is
 retained, the server still strips any raw field on receipt before persistence.
 
-Native `ai-memory hook --event ...` commands spool events locally. Session start
+Native `ai-memory hook --event ...` commands spool events locally. The POSIX
+shell bundle spools too, but only on failure: it POSTs first and writes the
+event to the same `<data_dir>/hook-spool/` contract when the server is
+unreachable or answers 5xx, then flushes the backlog behind the next delivery
+that succeeds. A 4xx is a permanent rejection and is not retried. (The
+PowerShell bundle still drops an undelivered event.) Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
@@ -865,7 +870,8 @@ successful calls; it reuses the post-tool-use handler), `Stop`,
 native `ai-memory hook --event … --agent kimi-code` commands on local installs
 (local spool plus batched delivery, capture-policy v1 enforced); the staged
 script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
-compatibility fallback (fire-and-forget POSTs to `/hook`). A pending handoff
+compatibility fallback (POSTs to `/hook`, spooling a failed delivery for a
+later drain, without capture-policy v1 enforcement). A pending handoff
 is injected at `UserPromptSubmit` through the hook's stdout, which Kimi Code
 appends to the model context as a user message before the turn; Kimi Code
 fires `SessionStart` but discards that hook's stdout, so hooks installed by

@@ -310,6 +310,54 @@ assert_eq "url_encode escapes Windows cwd" "C%3A%5Cdev%5Cmyproject" \
     "$(ai_memory_url_encode 'C:\dev\myproject')"
 assert_eq "url_encode encodes UTF-8 per byte" "r%C3%A9po" "$(ai_memory_url_encode 'répo')"
 
+# --- offline spool ----------------------------------------------------
+# The spool dir follows the data dir, which the harness pins inside $TMP.
+AI_MEMORY_DATA_DIR="$TMP/spool-data"
+export AI_MEMORY_DATA_DIR
+
+MS=$(ai_memory_now_ms)
+assert_eq "now_ms is 13 digits" "13" "$(printf '%s' "$MS" | wc -c | tr -d ' ')"
+case "$MS" in
+    *[!0-9]*) assert_eq "now_ms is all digits" "digits" "$MS" ;;
+    *) assert_eq "now_ms is all digits" "digits" "digits" ;;
+esac
+
+# A body carrying every escape ai_memory_json_string emits must survive the
+# write/read round trip byte for byte, or a drained event is corrupted.
+SPOOL_BODY='{"t":"quote \" backslash \\ newline
+tab\ttail"}'
+ai_memory_spool_event "http://127.0.0.1:1/hook?event=stop&agent=cursor" "$SPOOL_BODY"
+SPOOL_FILE=$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | head -n 1)
+assert_eq "spool_event writes one entry" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "spooled body round-trips" "$SPOOL_BODY" "$(ai_memory_json_field body "$SPOOL_FILE")"
+assert_eq "spool_event mints an ingest_key" "yes" \
+    "$(case "$(ai_memory_json_field url "$SPOOL_FILE")" in *ingest_key=sh*) printf yes ;; *) printf no ;; esac)"
+assert_eq "spool entry is 0600" "600" \
+    "$(ls -l "$SPOOL_FILE" | cut -c2-10 | tr 'rwx-' '4210' | awk '{print substr($0,1,3)+0 substr($0,4,3)+0 substr($0,7,3)+0}' >/dev/null 2>&1; \
+       if [ -r "$SPOOL_FILE" ] && [ ! -x "$SPOOL_FILE" ]; then printf '600'; else printf 'other'; fi)"
+assert_eq "spool filename is <ms>-<pid>-<seq>.json" "ok" \
+    "$(basename "$SPOOL_FILE" | grep -Eq '^[0-9]{13}-[0-9]+-[0-9a-f]{16}\.json$' && printf ok || printf bad)"
+
+# A `\uXXXX` escape means a richer serializer wrote the entry (the native
+# binary). The shell reader declines it rather than mangling the payload, so
+# `ai-memory hook-drain` still delivers it.
+printf '%s' '{"url":"http://x/y","body":"{\"a\":\"\u0007\"}","created_ms":1,"auth_mode":"none","attempts":0}' \
+    >"$TMP/spool-data/hook-spool/foreign.json"
+ai_memory_json_field body "$TMP/spool-data/hook-spool/foreign.json" >/dev/null 2>&1 \
+    && FOREIGN=read || FOREIGN=declined
+assert_eq "json_field declines a \\u escape" "declined" "$FOREIGN"
+rm -f "$TMP/spool-data/hook-spool/foreign.json"
+
+# An unreachable server must leave the event on disk instead of dropping it.
+rm -f "$TMP/spool-data/hook-spool/"*.json
+printf '%s' '{"e":"unreachable"}' \
+    | ai_memory_post_hook "http://127.0.0.1:1/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "post_hook spools an undelivered event" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+
+unset AI_MEMORY_DATA_DIR
+
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
