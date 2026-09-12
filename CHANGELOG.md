@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-09-12
+
 ### Fixed
 - The POSIX shell hook bundle no longer drops a lifecycle event when the
   server is unreachable or answers 5xx. A failed delivery is written to
@@ -5611,7 +5613,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.1
 [2.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.0
 [2.1.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.1.2
 [2.1.1]: https://github.com/akitaonrails/ai-memory/compare/v2.1.0...v2.1.1
