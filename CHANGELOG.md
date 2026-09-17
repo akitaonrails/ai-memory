@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `export-okf` no longer refuses to export a project because of its own raw
+  hook event ledger (`log-YYYY-MM.md`). The ledger is frontmatter-less by
+  design (same shape #660/#669 already exempt for the watcher and the OKF
+  migration), so it previously failed every export for a project with any
+  real usage history with `page log-YYYY-MM.md is not OKF-conformant`. It
+  is now excluded from the exported bundle the same way `log.md` already
+  was, and the exclusion is content-gated: a page merely named like a
+  ledger but holding prose still exports normally (#748).
+
 ## [2.3.0] - 2026-09-16
 
 ### Added

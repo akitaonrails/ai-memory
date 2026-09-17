@@ -937,8 +937,13 @@ async fn build_okf_bundle_file(
                 stack.push(path);
             } else if ft.is_file() && path.extension().is_some_and(|e| e == "md") {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name == "index.md" || name == "log.md" {
-                    continue; // regenerated / not adopted
+                if name == "index.md" || is_ledger_page(&path) {
+                    // index.md is regenerated below; the raw hook event
+                    // ledger (log.md / log-YYYY-MM.md) is never a concept
+                    // file and, being frontmatter-less by design, would
+                    // otherwise fail every export as non-conformant (#748,
+                    // same ledger shape #660/#669 already exempt elsewhere).
+                    continue;
                 }
                 let raw = std::fs::read_to_string(&path)?;
                 let fm = ai_memory_wiki::parse(&raw)
@@ -986,6 +991,23 @@ async fn build_okf_bundle_file(
     tar_file.sync_data()?;
     tar_file.rewind()?;
     Ok(tokio::fs::File::from_std(tar_file))
+}
+
+/// The raw hook event ledger (`log.md` / `log-YYYY-MM.md`) is written with
+/// no OKF frontmatter by design (see `ai-memory-wiki::ledger`) and is not a
+/// concept file: skip it from the export the same way the watcher (#660)
+/// and the OKF migration (#669) skip it, instead of failing the whole
+/// export as non-conformant (#748). Content-gated, not filename-only: a
+/// page merely *named* like a ledger but holding prose still exports.
+fn is_ledger_page(abs: &std::path::Path) -> bool {
+    let Some(name) = abs.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Ok(page_path) = ai_memory_core::PagePath::new(name) else {
+        return false;
+    };
+    ai_memory_wiki::ledger::is_log_ledger_filename(&page_path)
+        && ai_memory_wiki::ledger::opens_with_log_ledger(abs)
 }
 
 // ---------------------------------------------------------------------
@@ -8603,6 +8625,106 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// #748: the raw hook event ledger (`log-YYYY-MM.md`) every actively
+    /// used project accumulates has no OKF frontmatter by design (same
+    /// shape #660 and #669 already exempt elsewhere) and must not fail the
+    /// export — it is excluded from the bundle instead, the same way
+    /// `log.md` already was.
+    #[tokio::test]
+    async fn export_okf_skips_the_raw_ledger_by_content() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        let uuid_dir = |parent: &std::path::Path| {
+            std::fs::read_dir(parent)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.is_dir() && p.file_name().is_none_or(|n| n != ".git"))
+                .expect("scope dir")
+        };
+        let ws_dir = uuid_dir(&tmp.path().join("wiki"));
+        let proj_dir = uuid_dir(&ws_dir);
+        std::fs::write(
+            proj_dir.join("log-2026-08.md"),
+            "## [2026-08-25T19:49:36Z] session-start | claude-sonnet-5\n\
+             ## [2026-08-25T19:50:28Z] user-prompt | do the thing\n",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the ledger must not fail the export"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "notes/a.md"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("log-")),
+            "the ledger must not ship in the bundle: {names:?}"
+        );
+    }
+
+    /// Content-gating, not filename-only (matches #660/#669): a page that
+    /// merely happens to be named like a ledger but holds prose must still
+    /// be validated and exported like any other concept file.
+    #[tokio::test]
+    async fn export_okf_still_validates_a_prose_page_named_like_a_ledger() {
+        let (tmp, router) = read_page_test_router();
+        let uuid_dir = |parent: &std::path::Path| {
+            std::fs::read_dir(parent)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.is_dir() && p.file_name().is_none_or(|n| n != ".git"))
+                .expect("scope dir")
+        };
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        let ws_dir = uuid_dir(&tmp.path().join("wiki"));
+        let proj_dir = uuid_dir(&ws_dir);
+        std::fs::write(
+            proj_dir.join("log-2026-08.md"),
+            "# August retro\n\nJust an ordinary page someone named this way.\n",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a real pre-OKF page named like a ledger must still be caught"
+        );
     }
 
     fn admin_state_for_store(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {

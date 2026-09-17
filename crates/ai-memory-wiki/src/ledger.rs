@@ -13,7 +13,13 @@ use ai_memory_core::PagePath;
 /// `log.md` / `log-YYYY-MM.md` are the raw per-project event ledger the hooks
 /// append to (see `ai-memory-hooks::log::log_filename_for`): `## [ts] ...`
 /// entries, never YAML frontmatter.
-pub(crate) fn is_log_ledger_filename(page_path: &PagePath) -> bool {
+///
+/// `pub`, not `pub(crate)`: `ai-memory-mcp`'s `export-okf` handler composes
+/// this with [`opens_with_log_ledger`] the same way the watcher (#660) and
+/// the OKF migration (#669) do, so a project's ledger is excluded from the
+/// exported bundle instead of failing the whole export as non-conformant
+/// (#748).
+pub fn is_log_ledger_filename(page_path: &PagePath) -> bool {
     let s = page_path.as_str();
     s == "log.md" || is_rotated_log_filename(s)
 }
@@ -38,7 +44,9 @@ pub(crate) fn is_rotated_log_filename(s: &str) -> bool {
 /// has `type: Note` stamped on top of each `log-YYYY-MM.md`. Stopping at the
 /// fence would classify those ledgers as ordinary pages, and each hook
 /// `append_event` would then supersede a multi-megabyte page row.
-pub(crate) fn opens_with_log_ledger(abs: &Path) -> bool {
+///
+/// `pub` for the same cross-crate reason as [`is_log_ledger_filename`].
+pub fn opens_with_log_ledger(abs: &Path) -> bool {
     use std::io::{BufRead, BufReader};
     let Ok(file) = std::fs::File::open(abs) else {
         return false;

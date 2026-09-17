@@ -10,7 +10,7 @@ mod atomic;
 pub mod backup;
 mod error;
 mod git;
-mod ledger;
+pub mod ledger;
 mod markdown;
 pub mod migrations;
 mod watcher;
