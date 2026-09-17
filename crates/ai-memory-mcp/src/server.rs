@@ -940,8 +940,11 @@ struct LintArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct ConsolidateArgs {
-    /// UUID of the session to consolidate.
-    session_id: String,
+    /// UUID of the session to consolidate. Omit to consolidate the latest
+    /// completed session in the resolved project; pass it to target a
+    /// specific session.
+    #[serde(default)]
+    session_id: Option<String>,
     /// If true, preview without writing. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
@@ -2716,7 +2719,9 @@ impl AiMemoryServer {
         (single-page) rewrites sessions/<id>.md from the observation \
         log. multi_page=true fans out into a batch of concept/decision/\
         gotcha pages plus the session page, all written in one atomic \
-        SQL transaction. Off by default; requires AI_MEMORY_LLM_PROVIDER \
+        SQL transaction. Omit `session_id` to consolidate the latest \
+        completed session in the resolved project; pass it to target a \
+        specific session. Off by default; requires AI_MEMORY_LLM_PROVIDER \
         plus that provider's credentials. AI_MEMORY_LLM_MODEL is optional \
         for providers with a built-in default. \
         The target project's `_prompts/consolidation.md` page supplies \
@@ -2743,8 +2748,33 @@ impl AiMemoryServer {
                 None,
             ));
         };
-        let session_id = SessionId::from_str(&args.session_id)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let session_id = match args.session_id.as_deref() {
+            Some(raw) => SessionId::from_str(raw)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            _ => {
+                let aps_actor = Self::actor_key_from_parts(Some(&parts));
+                let (ws, proj) = self
+                    .effective_ids_for_read_args_with_actor(None, None, &aps_actor)
+                    .await?;
+                let latest = self
+                    .reader
+                    .latest_completed_session_for_project(ws, proj)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                match latest {
+                    Some(session_id) => session_id,
+                    None => {
+                        let scope = self.scope_label(ws, proj).await;
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "no completed session in {scope}; pass session_id to consolidate a specific session"
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+        };
         let dry = args.dry_run.unwrap_or(false);
         // Carry the request's authenticated identity into the write so the
         // consolidated page is attributed to the real operator and any
@@ -11675,7 +11705,7 @@ mod tests {
         let err = server
             .memory_consolidate(
                 Parameters(ConsolidateArgs {
-                    session_id: "00000000-0000-0000-0000-000000000000".into(),
+                    session_id: Some("00000000-0000-0000-0000-000000000000".into()),
                     dry_run: Some(true),
                     multi_page: Some(false),
                     instructions: None,
@@ -11696,6 +11726,106 @@ mod tests {
         assert!(
             msg.contains("without a built-in model"),
             "error should not imply every provider needs an explicit model: {msg}",
+        );
+    }
+
+    /// An omitted `session_id` must not fail at the tool boundary: the call
+    /// reaches the consolidator and resolves the latest COMPLETED session of
+    /// the resolved project, skipping an open one — the same default the
+    /// read-only tools use.
+    #[tokio::test]
+    async fn memory_consolidate_defaults_to_latest_completed_session() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let completed = seed_session_observations(
+            &store,
+            ws,
+            proj,
+            true,
+            &[(ObservationKind::UserPrompt, "done", "completed work")],
+        )
+        .await;
+        let _open = seed_session_observations(
+            &store,
+            ws,
+            proj,
+            false,
+            &[(ObservationKind::UserPrompt, "live", "still running")],
+        )
+        .await;
+
+        let outcome = call_tool_json(
+            server
+                .memory_consolidate(
+                    Parameters(ConsolidateArgs {
+                        session_id: None,
+                        dry_run: Some(true),
+                        multi_page: Some(false),
+                        instructions: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            outcome["path"],
+            format!("sessions/{completed}.md"),
+            "the omitted session_id must resolve the latest completed session",
+        );
+    }
+
+    /// A project with no completed session has no implicit default: the
+    /// omission must fail with the same actionable error the read tools use.
+    #[tokio::test]
+    async fn memory_consolidate_without_completed_session_errors_cleanly() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let err = server
+            .memory_consolidate(
+                Parameters(ConsolidateArgs {
+                    session_id: None,
+                    dry_run: Some(true),
+                    multi_page: Some(false),
+                    instructions: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("an empty project has no completed session");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.to_string()
+                .contains("no completed session in default/scratch"),
+            "got {err}"
         );
     }
 

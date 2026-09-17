@@ -10,7 +10,7 @@ Use this skill for compilation, learning review, wiki linting, and cleanup of ai
 
 ## Tools in this cluster
 
-- `memory_consolidate` compiles raw session observations into topical wiki pages on demand. The target project's `_prompts/consolidation.md` page supplies standing advisory preferences; `instructions` overrides it for one call.
+- `memory_consolidate` compiles raw session observations into topical wiki pages on demand. Omit `session_id` to consolidate the latest completed session in the resolved project. The target project's `_prompts/consolidation.md` page supplies standing advisory preferences; `instructions` overrides it for one call.
 - `memory_auto_improve` reviews a completed session for durable lessons and project-rule proposals.
 - `memory_lint` audits the wiki for contradictions, stale guidance, and candidate rule placement.
 - `memory_forget_sweep` prunes cold pages and deletes TTL-expired pages when the user asks for memory cleanup.
