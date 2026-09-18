@@ -3183,9 +3183,16 @@ const AiMemoryOpencode2: Plugin = {
             ?? event?.location?.directory ?? directory;
           if (type === "session.created") {
             const id = data?.sessionID ?? data?.id ?? info?.id;
+            const parentID = info?.parentID ?? data?.parentID;
             startSession(id, data?.location?.directory ?? loc, {
               title: data?.title ?? info?.title,
               projectID: data?.projectID ?? info?.projectID,
+              // Subagent sessions carry a parentID; forward it as the `agent_id`
+              // marker so drop_subagent_captures works on OpenCode 2 too (#755).
+              // Root sessions have no parentID and must stay unmarked.
+              ...(typeof parentID === "string" && parentID
+                ? { agent_id: parentID }
+                : {}),
             });
           }
           if (type === "session.idle") {
@@ -3845,6 +3852,13 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
         startSession(id, cwd, {{
           title: info.title,
           projectID: info.projectID,
+          // A subagent session carries a parentID; forward it as the `agent_id`
+          // subagent marker so `drop_subagent_captures` can recognize (and drop)
+          // OpenCode subagent sessions too (#755). A root session has no
+          // parentID — never mark it, or every session looks like a subagent.
+          ...(typeof info.parentID === "string" && info.parentID
+            ? {{ agent_id: info.parentID }}
+            : {{}}),
         }});
       }}
       if (event?.type === "session.idle") {{
@@ -8347,6 +8361,11 @@ model = "gpt-5"
         assert!(!plugin.contains("handoffChecked"));
         assert!(plugin.contains("function startSession"));
         assert!(plugin.contains("function endSession"));
+        // #755: a subagent session must forward its parentID as the `agent_id`
+        // marker (so drop_subagent_captures recognizes it), and only when the
+        // parentID is a real string (a root session stays unmarked).
+        assert!(plugin.contains("agent_id: info.parentID"));
+        assert!(plugin.contains("typeof info.parentID === \"string\""));
         assert!(plugin.contains("fetchHandoff"));
         assert!(plugin.contains("function applyMarkerParams"));
         assert!(plugin.contains("readFileSync(marker, \"utf8\")"));
@@ -8438,6 +8457,11 @@ model = "gpt-5"
         assert!(!plugin.contains("Plugin.define({"));
         assert!(plugin.contains("const AiMemoryOpencode2: Plugin = {"));
         assert!(plugin.contains("export default AiMemoryOpencode2;"));
+        // #755: subagent sessions forward parentID as the `agent_id` marker,
+        // only when it is a real string (root sessions stay unmarked).
+        assert!(plugin.contains("const parentID = info?.parentID ?? data?.parentID"));
+        assert!(plugin.contains("agent_id: parentID"));
+        assert!(plugin.contains("typeof parentID === \"string\""));
         // Beta hooks, verified against `@opencode-ai/plugin@beta`.
         assert!(plugin.contains("ctx.event.subscribe"));
         assert!(plugin.contains("ctx.session.hook(\"prompt\""));

@@ -70,6 +70,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const HTTP_READY: &str = "MCP HTTP server ready";
 const STDIO_READY: &str = "MCP server ready on stdio";
+/// Logged by `start_watcher` when `serve --no-watcher` is honoured.
+const WATCHER_DISABLED: &str = "watcher disabled by --no-watcher";
+/// Logged by `start_watcher` when it actually installs an FSEvents/inotify
+/// instance. Must not appear in these children: they do not exercise watching.
+const WATCHER_STARTED: &str = "starting wiki watcher";
 /// The stdio arm's post-handshake shutdown log — the branch only
 /// [`stdio_server_exits_on_sigterm_after_initialize`] reaches.
 const STDIO_STOP_AFTER_HANDSHAKE: &str = "stopping the stdio transport";
@@ -139,6 +144,10 @@ impl Server {
             // to exist so the server reaches its ready line.
             cmd.args(["--bind", "127.0.0.1:0"]);
         }
+        // None of these tests watch the wiki. The watcher is a machine-global
+        // FSEvents/inotify instance; concurrent serve children can exhaust it
+        // (#745). Opt out so the child never takes one.
+        cmd.arg("--no-watcher");
         cmd.arg("--data-dir")
             .arg(data_dir.path())
             .env("AI_MEMORY_DATA_DIR", data_dir.path())
@@ -209,6 +218,22 @@ impl Server {
                 self.stderr()
             ),
         }
+    }
+
+    /// Pin that the spawned binary opted out of the wiki watcher. Ready
+    /// lines are logged after the watcher decision, so `seen` already
+    /// contains that decision once [`Self::wait_for`] has matched one.
+    fn assert_watcher_opted_out(&self) {
+        assert!(
+            self.seen.contains(WATCHER_DISABLED),
+            "spawned serve must log that the watcher was opted out.\nstderr:\n{}",
+            self.seen
+        );
+        assert!(
+            !self.seen.contains(WATCHER_STARTED),
+            "spawned serve must not install a wiki watcher.\nstderr:\n{}",
+            self.seen
+        );
     }
 
     /// Block until a stderr line contains `needle`, or the timeout expires.
@@ -298,6 +323,7 @@ fn http_server_exits_on_sigterm() {
             server.stderr()
         );
     }
+    server.assert_watcher_opted_out();
 
     server.signal("TERM");
 
@@ -326,6 +352,7 @@ fn stdio_server_exits_on_sigint() {
             server.stderr()
         );
     }
+    server.assert_watcher_opted_out();
     // Precondition for a non-vacuous result: stdin is still open, so the
     // transport has no reason of its own to stop.
     assert!(
@@ -364,6 +391,7 @@ fn stdio_server_exits_on_sigterm_after_initialize() {
             server.stderr()
         );
     }
+    server.assert_watcher_opted_out();
 
     // Precondition for a non-vacuous result: until the handshake completes,
     // the signal lands in the pre-handshake select the other tests cover.

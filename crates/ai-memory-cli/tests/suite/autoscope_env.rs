@@ -22,6 +22,26 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ai-memory")
 }
 
+/// Logged by `start_watcher` when `serve --no-watcher` is honoured.
+const WATCHER_DISABLED: &str = "watcher disabled by --no-watcher";
+/// Logged by `start_watcher` when it actually installs an FSEvents/inotify
+/// instance. Must not appear in these children: they do not exercise watching.
+const WATCHER_STARTED: &str = "starting wiki watcher";
+
+/// Pin that the spawned binary opted out of the wiki watcher. The disable
+/// line is logged before the `[auto_scope]` mode needle these tests wait on,
+/// so a successful match without it would mean the flag was ignored.
+fn assert_watcher_opted_out(stderr: &str) {
+    assert!(
+        stderr.contains(WATCHER_DISABLED),
+        "spawned serve must log that the watcher was opted out.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(WATCHER_STARTED),
+        "spawned serve must not install a wiki watcher.\nstderr:\n{stderr}"
+    );
+}
+
 /// Spawn the binary with the given env vars and stream stderr until either
 /// `needle` appears in a line or `timeout` elapses. Always kills the child
 /// before returning. Returns `(matched_line_or_none, all_stderr_captured)`.
@@ -41,6 +61,11 @@ fn spawn_and_wait_for_log(
         "http",
         "--bind",
         "127.0.0.1:0",
+        // None of these tests watch the wiki. The watcher is a
+        // machine-global FSEvents/inotify instance; concurrent serve
+        // children can exhaust it (#745). Opt out so the child never
+        // takes one.
+        "--no-watcher",
         "--data-dir",
     ])
     .arg(tmp.path())
@@ -96,6 +121,9 @@ fn spawn_and_wait_for_log(
     // Pump thread terminates once stderr closes (post-kill); collect what
     // it captured.
     let all_stderr = pump.join().unwrap_or_default();
+    if matched.is_some() {
+        assert_watcher_opted_out(&all_stderr);
+    }
     (matched, all_stderr)
 }
 
@@ -111,6 +139,10 @@ fn spawn_and_wait_for_exit(envs: &[(&str, &str)], timeout: Duration) -> (bool, S
         "http",
         "--bind",
         "127.0.0.1:0",
+        // Same opt-out as [`spawn_and_wait_for_log`]: invalid config
+        // fails before the watcher is installed, but keeping the flag
+        // here means every serve spawn in this file is hermetic.
+        "--no-watcher",
         "--data-dir",
     ])
     .arg(tmp.path())

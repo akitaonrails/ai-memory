@@ -11,6 +11,11 @@ mod slow {
     use std::time::{Duration, Instant};
 
     const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
+    /// Logged by `start_watcher` when `serve --no-watcher` is honoured.
+    const WATCHER_DISABLED: &str = "watcher disabled by --no-watcher";
+    /// Logged by `start_watcher` when it actually installs an FSEvents/inotify
+    /// instance. Must not appear here: this test does not exercise watching.
+    const WATCHER_STARTED: &str = "starting wiki watcher";
 
     fn wait_for_exit(child: &mut Child, budget: Duration) -> Option<std::process::ExitStatus> {
         let deadline = Instant::now() + budget;
@@ -48,8 +53,10 @@ mod slow {
             .arg("-c")
             // Explicit transport: the default is stdio today, and a test that
             // rides that default would quietly start testing something else if
-            // it ever changed.
-            .arg(r#"trap "" INT; exec "$1" serve --transport stdio"#)
+            // it ever changed. `--no-watcher`: this test does not watch the
+            // wiki; concurrent serve children can exhaust the machine-global
+            // FSEvents/inotify instance (#745).
+            .arg(r#"trap "" INT; exec "$1" serve --transport stdio --no-watcher"#)
             .arg("sh")
             .arg(BIN)
             .env("AI_MEMORY_DATA_DIR", data_dir.path())
@@ -83,18 +90,34 @@ mod slow {
 
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut ready = false;
+        let mut startup = String::new();
         while Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(line) if line.contains("ready on stdio") => {
-                    ready = true;
-                    break;
+                Ok(line) => {
+                    startup.push_str(&line);
+                    startup.push('\n');
+                    if line.contains("ready on stdio") {
+                        ready = true;
+                        break;
+                    }
                 }
-                Ok(_) => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         assert!(ready, "server never reported it was ready on stdio");
+        // Ready is logged after the watcher decision, so this buffer
+        // includes that decision. None of this test watches the wiki;
+        // the watcher is a machine-global FSEvents/inotify instance
+        // concurrent children can exhaust (#745).
+        assert!(
+            startup.contains(WATCHER_DISABLED),
+            "spawned serve must log that the watcher was opted out.\nstderr:\n{startup}"
+        );
+        assert!(
+            !startup.contains(WATCHER_STARTED),
+            "spawned serve must not install a wiki watcher.\nstderr:\n{startup}"
+        );
 
         let killed = Command::new("kill")
             .args(["-INT", &child.id().to_string()])

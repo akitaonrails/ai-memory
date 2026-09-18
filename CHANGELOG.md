@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target a specific session, and `dry_run=true` for the cheap admission
   preflight. A project with no completed session now fails as
   `no completed session in <scope>` instead of a deserialization error.
+### Fixed
+- The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
+  `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
+  recognize and drop OpenCode subagent sessions. Previously both plugins emitted
+  only `title`/`projectID` on `session.created`, so the marker never reached the
+  server and the opt-in was a silent no-op for OpenCode. Root sessions (no
+  `parentID`) stay unmarked (#755).
 
 ## [2.3.1] - 2026-09-17
 
