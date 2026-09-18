@@ -84,6 +84,30 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
 /// Run one native harness from an explicit checkout without changing the
 /// parent process's working directory.
 pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
+    run_from_with_wiring(
+        config,
+        args,
+        cwd,
+        &super::run_autowire::WireOverrides::default(),
+    )
+    .await
+}
+
+/// [`run_from`] with the autowire path injections supplied explicitly.
+///
+/// Production callers use [`run_from`], which passes
+/// [`WireOverrides::default()`](super::run_autowire::WireOverrides) so the
+/// installers resolve their real per-agent paths — behavior is byte-identical to
+/// the inlined call this replaced. The overrides exist only so the `run` →
+/// autowire → child-spawn seam can be exercised without writing to the
+/// developer's real `$HOME`, mirroring the `ensure_wired` / `ensure_wired_with`
+/// split.
+pub(super) async fn run_from_with_wiring(
+    config: &Config,
+    args: RunArgs,
+    cwd: &Path,
+    wire_overrides: &super::run_autowire::WireOverrides,
+) -> Result<i32> {
     let repository = inspect_repository(cwd)?;
     let home = native_home(config).context("locating native harness session storage")?;
     let automatic_harness = args.harness.is_none();
@@ -222,7 +246,7 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
     // fails the launch); opt out with `--no-autowire` or AI_MEMORY_RUN_AUTOWIRE=false.
     // Runs before the child spawns so the harness picks up the fresh hooks.
     if config.run_autowire && !no_autowire {
-        super::run_autowire::ensure_wired(config, harness);
+        super::run_autowire::ensure_wired_with(config, harness, wire_overrides);
     }
     let native_grok_rules = user_supplied_grok_rules(&native_args);
     let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
@@ -2217,5 +2241,152 @@ mod tests {
         assert_eq!(paths[0], "/existing.md");
         let packet = paths[1].as_str().unwrap();
         assert_eq!(std::fs::read_to_string(packet).unwrap(), "managed packet");
+    }
+
+    /// The `ai-memory run` -> autowire -> child-spawn seam: driving the launcher
+    /// entry point (`run_from_with_wiring`) must run auto-wire *before* the child
+    /// starts, so the harness's ai-memory hooks + MCP are installed and the
+    /// per-(agent, version) sentinel is written as a side effect of `run` itself.
+    /// The autowire path injections keep it off the developer's real `$HOME`, the
+    /// child is a harmless `exit 0` script launched in passthrough mode
+    /// (`--version`), and a mock server stands in for the workstream endpoints, so
+    /// nothing here needs a real editor, network, or LLM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_entry_point_autowires_the_harness_before_spawning_the_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::commands::run_autowire::WireOverrides;
+        use crate::config::Config;
+
+        // Mock workstream server: prepare a run, accept the finish. Passthrough
+        // launches never link a session, so these two routes are all `run_from`
+        // touches over the wire.
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post(|| async {
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: None,
+                        native_session_id: None,
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+
+        // A harmless child the launcher can actually spawn: exits 0 immediately,
+        // so the run completes without a real harness.
+        let script = repo.path().join("harmless-harness");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Injected autowire targets — the whole point of the override seam is that
+        // wiring never resolves (and writes to) the developer's real `$HOME`.
+        let settings = data.path().join("claude-settings.json");
+        std::fs::write(&settings, r#"{"existingUserKey":"keep me"}"#).unwrap();
+        let mcp = data.path().join("claude.json");
+        std::fs::write(&mcp, r#"{"existingMcpKey":"keep me too"}"#).unwrap();
+
+        let mut config = Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data.path().to_path_buf();
+        config.home_dir = Some(home.path().to_string_lossy().into_owned());
+        config.server_url = format!("http://{address}");
+        config.run_autowire = true;
+
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+        };
+        let args = || RunArgs {
+            workspace: Some("ws".into()),
+            project: Some("proj".into()),
+            workstream: None,
+            new_workstream: None,
+            executable: Some(script.clone()),
+            yolo: false,
+            fresh: false,
+            no_autowire: false,
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: vec![OsString::from("--version")],
+        };
+
+        let exit = run_from_with_wiring(&config, args(), repo.path(), &overrides)
+            .await
+            .expect("managed passthrough run completes");
+        assert_eq!(exit, 0, "the harmless child exits 0");
+
+        // Auto-wire ran through the `run` entry point: hooks + MCP were installed
+        // into the injected targets, and the sentinel recording the attempt exists.
+        let hooks_json = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            hooks_json.contains("existingUserKey"),
+            "unrelated user settings must be preserved: {hooks_json}"
+        );
+        assert!(
+            hooks_json.contains("ai-memory") || hooks_json.contains("ai_memory"),
+            "run must auto-install the ai-memory hook before spawning: {hooks_json}"
+        );
+        let mcp_json = std::fs::read_to_string(&mcp).unwrap();
+        assert!(
+            mcp_json.contains("existingMcpKey"),
+            "unrelated MCP config must be preserved: {mcp_json}"
+        );
+        assert!(
+            mcp_json.contains("ai-memory"),
+            "run must auto-install the ai-memory MCP server before spawning: {mcp_json}"
+        );
+        let sentinels = std::fs::read_dir(data.path().join("autowire-state"))
+            .expect("autowire-state dir created by the run")
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            sentinels
+                .iter()
+                .any(|name| name.starts_with("claude-code-")),
+            "run must record the per-agent autowire sentinel: {sentinels:?}"
+        );
+
+        // A second launch is gated by that sentinel: the seam is idempotent, so
+        // neither config file is rewritten.
+        let before_hooks = std::fs::read(&settings).unwrap();
+        let before_mcp = std::fs::read(&mcp).unwrap();
+        run_from_with_wiring(&config, args(), repo.path(), &overrides)
+            .await
+            .expect("second managed passthrough run completes");
+        assert_eq!(
+            std::fs::read(&settings).unwrap(),
+            before_hooks,
+            "a gated re-launch must not rewrite hook config"
+        );
+        assert_eq!(
+            std::fs::read(&mcp).unwrap(),
+            before_mcp,
+            "a gated re-launch must not rewrite MCP config"
+        );
+
+        server.abort();
     }
 }

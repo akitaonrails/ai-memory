@@ -104,6 +104,7 @@ async fn session_recall_routing_flips_session_page_ranking() {
             0,
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -123,6 +124,7 @@ async fn session_recall_routing_flips_session_page_ranking() {
             0,
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -145,6 +147,7 @@ async fn session_recall_routing_flips_session_page_ranking() {
             0,
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -233,6 +236,7 @@ async fn abstract_vector_stream_is_opt_in() {
             dim,
             10,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -254,6 +258,7 @@ async fn abstract_vector_stream_is_opt_in() {
             dim,
             10,
             None,
+            false,
         )
         .await
         .unwrap();

@@ -75,7 +75,9 @@ The market has consolidated into recognizable camps:
 |---|---|---|
 | Temporal knowledge graphs | **Zep/Graphiti** (20K+ stars, 25K weekly PyPI installs), Cognee | Facts as bi-temporal graph edges: *when true in the world* vs *when observed*, superseded rather than deleted |
 | Memory OS / self-editing | **Letta**, MemOS, EverMemOS, MIRIX | The agent edits its own tiered memory via tools; "sleep-time compute" does consolidation off the hot path |
-| Fact extractors | **Mem0**, LangMem, Supermemory | LLM extracts atomic facts per turn; lightweight personalization |
+| Fact extractors | **Mem0**, LangMem | LLM extracts atomic facts per turn; lightweight personalization |
+| Hosted memory API (hybrid) | **Supermemory**, **LiquidLM** | Chunk-RAG + LLM temporal fact-graph + per-user profiles, answered in one query; managed connectors + multimodal; cloud-first (see below) |
+| User-modeling / theory-of-mind | **Honcho** (Plastic Labs) | Memory as a *reasoning* problem: derive what each "peer" knows/believes about another over time; model the human, not the project (see below) |
 | **File-first wiki memory** | **us**, basic-memory, OKF, Letta's filesystem result, mempalace (nominally) | Markdown source of truth, derived indexes, human-editable |
 | Code intelligence | **DeusData/codebase-memory-mcp** (~42K stars) | Index the *codebase* (162 languages, tree-sitter → SQLite graph, static C binary) rather than the *session* - adjacent, not competing: it remembers what the code is, not what you did (see `research-codebase-memory-mcp.md`) |
 | Agent-harness OS | **ECC** (~247K stars), plus the skills/agents-pack ecosystem | Install a whole plan→test→implement→review→**remember**→improve loop into the agent; memory is one thin pillar ("optimize the context window, persist everything else"), deliberately kept as *context, not policy* - adjacent, not competing (see `research-ecc.md`) |
@@ -169,6 +171,159 @@ SaaS/enterprise-licensing weight that pulls against a single self-contained
 binary. Per the research-doc convention, OpenViking has no standalone
 deep-dive; this section is its record.
 
+**Well-funded generalist: `supermemoryai/supermemory`** (~30K stars, MIT
+repo, ~$2.6-3M seed from Susa/Browder/SF1.vc plus angels incl. Jeff Dean,
+Cloudflare's CTO, and Logan Kilpatrick; founder Dhravya Shah). Positioned as
+"context infrastructure for AI agents": a **hosted memory API** (the paid
+`api.supermemory.ai`) with an MIT self-hostable local binary as the on-ramp.
+This is the entrant our own docs most **mislabeled** - it is *not* a Mem0-style
+atomic fact extractor. It is a **hybrid**: every ingested item is
+chunked+embedded for RAG **and** run through an LLM "dreaming" pass that
+extracts atomic facts into a **temporal vector-graph** (Updates / Extends /
+Derives edges, `isLatest` supersession, decay + forgetting) **and** rolled into
+a standing per-user **profile**, with RAG and memory answered in one query. Its
+default "Dynamic" mode batches *related* documents rather than extracting per
+turn, so even the "LLM-per-turn" half of the old label is wrong (that mode is
+opt-in). Like the others it validates our bets from the opposite corner: the
+batch "dream" pass is our consolidation ("compile, not retrieve") under another
+name, and supersede-don't-delete is our page-supersession chain. Where it
+genuinely leads is **ingestion breadth** - managed connectors (Drive, Gmail,
+Notion, OneDrive, S3, GitHub, web crawler), multimodal PDF/image/audio, and
+metadata + `containerTag` query filters, plus a first-class user profile - but
+every one of those is **cloud-only and LLM-required**; the self-hosted binary
+(embedded graph store, local `bge-base` embeddings, offline) explicitly "lacks
+connectors and the proprietary extraction models." It sits opposite us on every
+axis we chose: an **opaque graph is the source of truth** (no git, no markdown,
+nothing to `grep` or diff), the quality path is **LLM-required** (no zero-LLM
+default), and the best features **pull toward the paid Cloudflare cloud**. It is
+also not really in our lane: it is a general **memory-API for apps and user
+personalization** whose coding-agent plugins (Claude Code, Cursor, Codex,
+OpenCode) capture by **turn-batch polling**, not OS lifecycle hooks, with no
+cross-harness handoff, multi-user page-sharing, or per-project 3-tuple isolation
+model - the coding-agent-continuity primitives are exactly what we build and it
+does not. Read the numbers with the standard skepticism: "95% LongMemEval_s at
+Recall@15 with aggregation, ~720 tokens, sub-300ms p50, first on LoCoMo" are all
+**vendor self-reported** - though their **MemoryBench** harness and the
+accuracy / latency / context-tokens "MemScore" triple are open and worth
+borrowing (see R8). Per the research-doc convention, Supermemory has no
+standalone deep-dive; this section is its record.
+
+**Solo-built Supermemory-style hosted API: `liquidlm.com`** (**LiquidLM**,
+closed-source cloud SaaS, no funding — a single independent maker, Carlos Souza).
+Its own tagline is "persistent AI agent memory and RAG as a service." It is the
+same *camp* as Supermemory — a proprietary hosted memory API with entity/
+relationship extraction, temporal metadata, and an MCP surface on top — but a
+smaller, indie, individual-priced take on it (Free / $20 Pro / $200 Ultra,
+usage-based by ingestion volume). You ingest files/notes/links/media into cloud
+**"Vaults"**; it extracts entities, relationships, timestamps, and **staleness/
+`supersedes` signals**, then serves hybrid semantic+FTS retrieval with rerank and
+grounded, cited chat. It is on **every axis we deliberately chose against**: the
+**vault is an opaque hosted store** (no git, no markdown, no self-host, nothing to
+`grep`/diff), **LLM is intrinsic and not optional** (Gemini-class extraction/
+embeddings — no zero-LLM mode), and the memory engine is **closed-source** (the
+only open artifact is the MIT npm client `@liquidlm/cli`, v0.1.5 published
+2026-09-17; the GitHub `cli` repo is archived and empty). Where it is genuinely
+interesting is **breadth of ingestion and a clean MCP tool surface**: heavy
+multimodal capture (video/audio/image/PDF/Office, auto-transcription, a
+`yt-dlp`-fetch-locally pattern), a GitHub repo-sync connector, and eight native
+MCP tools worth studying by name — `put/get/list/search_knowledge`,
+`list_entities`, `get_related`, **`follow_references`** (walk the citation graph),
+**`pin_knowledge`** (standing context surfaced *before* search), and
+`forget_knowledge`. Tested harnesses: Claude Code, ChatGPT, Codex CLI, OpenCode
+over a hosted MCP endpoint (OAuth or scoped PAT). **No retrieval benchmarks** are
+published (only ROI marketing). It is **not in our lane and a weak migration
+target either way**: it captures by *explicit upload/sync* into a general "second
+brain," where we capture *automatically via lifecycle hooks* compiled into
+per-project coding pages you own — different job, different buyer. Two ideas are
+worth borrowing conceptually (never the substrate): the explicit **`pin_knowledge`
+= "seen before they search"** contract over our existing `pinned` pages, and
+**`follow_references`/`get_related` as first-class graph-walk MCP tools** over the
+link-neighbor RRF we already compute internally. Per the research-doc convention,
+LiquidLM has no standalone deep-dive; this section is its record.
+
+**Adjacent, not head-to-head: `plastic-labs/honcho`** (~7K stars, AGPL-3.0
+core + managed cloud, **$5.35M pre-seed** led by Variant/White Star/Betaworks).
+Honcho is the archetype of a **new camp** this report had no bucket for:
+**user-modeling / theory-of-mind memory**. Its unit of memory is a **"peer"**
+(any entity that "persists but changes over time — users, agents, objects") and
+its differentiator is treating memory as **"a reasoning problem, not a retrieval
+problem"** — it models *what one peer knows and believes about another* over
+time. The substrate is the opposite of ours on every axis we chose:
+**PostgreSQL is the source of truth** (Postgres FTS/GIN + HNSW vectors, Redis
+cache, pluggable LanceDB/Turbopuffer — **no git, no markdown, nothing to `grep`
+or diff**), it is **LLM-required** (a **Deriver** does one structured-output LLM
+call per message batch; a scheduled **Dreamer** runs surprisal-prioritized
+"dream-time" consolidation into premise→conclusion reasoning trees — no zero-LLM
+path), and it runs as a **multi-service stack** (FastAPI API + async worker +
+Postgres + Redis), cloud-leaning with a self-hostable core. Its flagship is the
+**Dialectic endpoint** (`peer.chat()`): a natural-language *oracle* — you ask a
+question about a peer and a synchronous tool-using agent (`search_memory`,
+`grep_messages`, `get_reasoning_chain`, temporal search, five reasoning tiers)
+synthesizes an answer rather than returning raw hits. Benchmarks are strong but
+**vendor self-reported** (blog dated Dec 19 2025): LongMemEval-S 90.4% (Haiku
+4.5) / 92.6% (Gemini 3 Pro), LoCoMo 89.9%, "median 5% of context tokens used."
+It now ships coding-agent front-ends too (Claude Code/Codex/Cursor/OpenCode
+plugins + an **MCP server** with exactly three tools: `honcho_search`,
+`honcho_chat`, `honcho_remember`), so it **collides with us on the shelf** — but
+the thing remembered is fundamentally different: **Honcho remembers the *user*;
+ai-memory remembers the *project*.** A coding team wanting cross-harness project
+continuity would not switch to it (opaque DB, LLM-mandatory, user-centric,
+multi-service), and an app builder wanting end-user personalization would not use
+us — **adjacent, not a migration target either way**. Two ideas are worth
+carrying forward as *optional LLM layers over* our zero-LLM core, never
+requirements: the **dialectic/oracle query** (ask-a-question → synthesized
+answer, which maps onto our retrieval as an opt-in LLM step) and the
+**reasoning-tier ladder** (minimal→max reasoning per query as a clean
+cost/quality knob). Deliberately **reject** the rest as off-mission: LLM-mandatory
+ingestion, opaque-Postgres-as-truth, the Postgres+Redis+worker operational
+weight, and the heavy theory-of-mind engine itself — a coding agent needs project
+facts, decisions, and conventions, not a psychological model of the developer
+(the lightweight "standing user preferences" slice we already have via global
+scope is enough). Positioning note: preempt the inevitable "but Honcho scores 90%
+on LongMemEval" by clarifying those are *user-recall* benchmarks on chat
+transcripts, not *coding-project* recall — a different task we are not competing
+on. Per the research-doc convention, Honcho has no standalone deep-dive; this
+section is its record.
+
+### Popularity and maintenance signal (as of 2026-09-18)
+
+None of the tracked competitors is stale or abandoned — every repo below had a
+commit within the last ~10 days and grades **ACTIVE**. Star counts are GitHub's
+raw figures (approximate; the biggest few were sanity-checked against prior
+research). This is a healthy, crowded, fast-moving field: "we picked a dead
+space" is not a claim we can make, and none of these can be dismissed as
+unmaintained.
+
+| Project | Stars (~) | Last commit | Latest release | Status |
+|---|---|---|---|---|
+| Mem0 | 65.6k | 2026-09-18 | openclaw-v1.2.0 (2026-09-18) | ACTIVE |
+| OpenViking | 38.0k | 2026-09-18 | v0.4.20 (2026-09-14) | ACTIVE |
+| Zep/Graphiti | 31.0k | 2026-09-17 | v0.30.2 (2026-09-08) | ACTIVE |
+| Cognee | 30.8k | 2026-09-18 | v1.5.4rc1 (2026-09-15) | ACTIVE |
+| Supermemory | 30.1k | 2026-09-18 | server-v0.0.8 (2026-08-17) | ACTIVE |
+| agentmemory | 28.6k | 2026-09-14 | v0.9.29 (2026-08-16) | ACTIVE |
+| Letta | 24.8k | 2026-09-10 | 0.16.8 (2026-05-14) | ACTIVE (releases lag code) |
+| Hindsight | 23.9k | 2026-09-18 | v0.10.0 (2026-09-14) | ACTIVE |
+| Honcho | 7.2k | 2026-09-18 | tag v3.2.0 (no GH release) | ACTIVE |
+| basic-memory | 4.0k | 2026-09-16 | v0.23.2 (2026-08-25) | ACTIVE |
+| mcp-memory-service | 2.0k | 2026-09-18 | v11.12.0 (2026-09-14) | ACTIVE |
+| LangMem | 1.7k | 2026-09-09 | none (PyPI-versioned) | ACTIVE |
+| LiquidLM | n/a (closed) | n/a (engine closed) | `@liquidlm/cli` 0.1.5 (2026-09-17) | ACTIVE (young, pre-1.0, solo) |
+
+Reading it honestly: raw stars track **funding and app-developer reach**, not
+coding-agent fitness — the leaders (Mem0, OpenViking, the KG/cloud entrants) are
+the app-personalization and hosted-context players, a different buyer from ours
+(see §5 and [`competitive-parity.md`](competitive-parity.md)). Our true
+architectural siblings sit lower on the star curve (basic-memory ~4.0k,
+mcp-memory-service ~2.0k) precisely because the self-hosted, file-first,
+coding-continuity niche is smaller and less VC-amplified — that is the segment we
+lead, not the whole chart. Two mild flags: Letta ships commits actively but its
+last *tagged* release is from May 2026 (formal releases lag the code), and
+LangMem/Honcho publish no GitHub *releases* (PyPI/tag-only versioning); and
+LiquidLM is **closed-source**, so it has no repo signal at all — its only public,
+open artifact is the MIT npm client `@liquidlm/cli` (v0.1.5, 2026-09-17), which is
+what dates it as active but young.
+
 ## 4. Research developments worth knowing
 
 - **"Rethinking How to Remember: Beyond Atomic Facts in Lifelong LLM
@@ -209,6 +364,12 @@ deep-dive; this section is its record.
   scheduled maintenance) without the branding.
 
 ## 5. What this means for ai-memory - analysis and recommendations
+
+> Companion audit: [`competitive-parity.md`](competitive-parity.md) turns this
+> "what to borrow" lens around and asks the harder one - in the goals where we
+> *overlap* a competitor, are we actually better or did we copy without
+> improving, and is ai-memory worth migrating *to*? It is the self-critical
+> record behind this section's recommendations.
 
 The May research led us to build: versioned supersession, retention
 formulas, hybrid RRF retrieval, opt-in LLM consolidation, handoffs as a
@@ -293,6 +454,40 @@ L1 summaries) rather than competing with it. Directory-scoped retrieval
 on `memory_query` within a project — worth noting but not scheduling
 until R7's tiering lands.
 
+**R8 - Queryable metadata/tag filters + a published eval triple (small-
+medium; from Supermemory).** Two borrowable ideas from the entrant that leads
+on ergonomics. First, **structured metadata/tag filtering on `memory_query`**:
+we already key every row by the `(workspace, project, path)` 3-tuple, but
+Supermemory's `containerTags` + arbitrary metadata filters let a caller narrow
+recall by attributes (kind, tier, author, tag) *before* ranking. A bounded,
+optional filter argument on `memory_query` - composing with FTS5/RRF, not
+replacing it - closes a real query-ergonomics gap at low cost; most of the
+plumbing (page frontmatter, kinds/tiers, `_slots`) already exists. Second,
+**publish an accuracy / latency / context-tokens triple** from the in-repo
+`recall_eval.rs`, mirroring Supermemory's open **MemScore / MemoryBench**
+philosophy: honest engineering discipline and the right answer to a field now
+competing on self-reported single numbers - it composes with R2 (the
+reproducible-harness recommendation) rather than competing. A per-project or
+per-user **"profile" page** auto-surfaced on start (Supermemory's standing
+profile) is a lighter third idea that maps onto our durable pages + the session
+brief - worth noting, below the two above. Deliberately *not* borrowed from this
+camp: managed cloud connectors and LLM-required extraction in the **core** - if
+connectors ever land they belong in the companion importer as opt-in, outside
+the trusted boundary, so the file-first / zero-LLM model is preserved (the same
+line drawn for multimodal/PDF import: OCR/transcribe to markdown pages, never an
+opaque store). On the other two axes the verdict is blunt: **security - nothing
+to borrow** (Supermemory is weaker on every axis we chose - opaque store,
+cloud-first, LLM-required, `containerTag` isolation vs our 3-tuple + invariant
+#16 - so this pass is confirmation of our posture, not a source of borrowings;
+the only security-relevant note is defensive: any future importer connector must
+cross the existing sanitizer boundary), and **performance - only f16/
+half-precision embedding storage is worth *evaluating*** (a stored-format change
+with a real recall-vs-size tradeoff, gated on `recall_eval.rs`), while their
+"sub-300ms p50" is a publish-a-number contract, not a change we need. Ranked, the
+only thing worth actually building is the metadata/tag filter; the eval triple is
+worth doing because it de-risks measuring anything else; f16 is evaluate-only;
+the rest is hold-or-reject. No implementation is scheduled here.
+
 **Deliberately not recommended:** joining the memory-OS camp (agent
 self-editing its memory - token-expensive, and Letta itself is hedging);
 adopting a graph database (bi-temporal-lite on SQLite covers the useful
@@ -326,6 +521,34 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
   in-house); arXiv:2605.29640 (VikingMem, VLDB 2026) plus Directory-Aware
   Query and VikingRAG papers (submitted/unreviewed). Analyzed inline in §3
   per the no-standalone-doc convention.
+- Supermemory: github.com/supermemoryai/supermemory (README, MIT, ~30K
+  stars); supermemory.ai/docs (how-it-works, graph-memory, self-hosting,
+  connectors, filtering); github.com/supermemoryai/{memorybench,
+  opencode-supermemory, supermemory-mcp}; supermemory.ai/blog (memory-engine,
+  supermemory-vs-mem0 - vendor self-reported benchmarks); DeepWiki
+  code-derived architecture; TechCrunch/Dataconomy 2025-10 (seed funding,
+  founder). Hosted backend is closed-source, so its storage internals,
+  latency, and benchmark numbers are vendor claims, not primary-verifiable.
+  Analyzed inline in §3 per the no-standalone-doc convention.
+- Honcho: github.com/plastic-labs/honcho (README, AGPL-3.0, ~7K stars,
+  coding-agent integrations + MCP tools) and its in-repo CLAUDE.md
+  (authoritative architecture: Postgres+pgvector/FTS, Redis, Deriver/
+  Dreamer/Dialectic, peer `(observer, observed)` collections, LanceDB/
+  Turbopuffer); honcho.dev/docs + docs.honcho.dev (peers, representations,
+  dialectic endpoint); plasticlabs.ai/blog/research/Benchmarking-Honcho +
+  evals.honcho.dev (vendor self-reported LongMemEval/LoCoMo/BEAM numbers,
+  2025-12-19); panews.io $5.35M pre-seed coverage (+ decentralized-identity
+  roadmap, absent from the repo); andrew.ooo independent review;
+  hermes-agent.nousresearch.com Honcho integration. Benchmarks are
+  vendor-reported and not independently reproduced. Analyzed inline in §3
+  per the no-standalone-doc convention.
+- LiquidLM: liquidlm.com (+ /about, /docs, /docs/assistants, /docs/mcp — Vaults,
+  MCP tool surface, per-harness support with test dates), github.com/liquidlm
+  (org: an archived empty `cli` repo + a homebrew tap, no engine source), and the
+  npm registry metadata for `@liquidlm/cli` (MIT, v0.1.5 published 2026-09-17).
+  Solo maker (Carlos Souza), closed-source cloud engine, no benchmarks; the
+  backend internals, model, and any numbers are undisclosed/vendor framing.
+  Analyzed inline in §3 per the no-standalone-doc convention.
 - Zep/Graphiti: arXiv:2501.13956; getzep.com temporal-KG explainer;
   Neo4j "Graphiti: Knowledge graph memory for an agentic world".
 - Letta: "Is a Filesystem All You Need?" (letta.com blog, Aug 2025).

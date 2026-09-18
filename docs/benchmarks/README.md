@@ -28,6 +28,13 @@ harness before the next change landed. For context, published
 embedding-based numbers on this dataset: agentmemory 0.967 R@5
 (hybrid + reranking), doobidoo/mcp-memory-service 0.804 R@5.
 
+## A/B comparisons (R2)
+
+The harness can also A/B two configs over the same question set and report
+an **accuracy + latency + context-tokens** triple with a baseline→candidate
+delta — see [retrieval-ab-r2.md](retrieval-ab-r2.md). Full-dataset A/B
+baselines are published there once run.
+
 ## Reading the numbers
 
 - **mode: local embeddings** is the 2.0 default: the in-process

@@ -153,6 +153,7 @@ async fn paraphrase_recall_fts_alone_cannot_do() {
             384,
             4,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -189,6 +190,7 @@ async fn paraphrase_recall_fts_alone_cannot_do() {
             384,
             4,
             None,
+            false,
         )
         .await
         .unwrap();

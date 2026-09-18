@@ -130,6 +130,7 @@ dependencies = [
  "clap",
  "jiff",
  "reqwest 0.12.28",
+ "schemars",
  "secrecy",
  "serde",
  "serde_json",

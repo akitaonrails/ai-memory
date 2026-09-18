@@ -487,6 +487,21 @@ Additional boundary rules:
   `Added`/`Changed`/`Fixed` heading, past-tense, trailing `(#NNN)`
   reference) and update the relevant README/docs references in the same
   commit. Internal refactors and test-only churn are exempt.
+- **Competitor research keeps the comparison docs in sync — never let them
+  go stale.** Any new competitor research pass, or a correction to an existing
+  one, must land its findings in the comparison docs in the *same* change, not
+  just in a research note: update `docs/comparison.md` (the public camp table +
+  positioning + "coming from …" migration notes), `docs/research-2026-landscape.md`
+  (the §3 camp entry + §6 sources, appending per the no-standalone-doc
+  convention), and `docs/competitive-parity.md` (the migration verdict + the
+  "did we copy without improving?" audit) wherever the finding applies. When a
+  competitor is reclassified or a claim is corrected, fix the camp table *and*
+  every per-tool claim that repeats it — a benchmark number, a "not file-first",
+  a camp label. This is a recurring failure: the Sept-2026 parity audit found
+  Supermemory mislabeled as a fact extractor, agentmemory's `0.967` attributed
+  to the wrong benchmark, and basic-memory's shipped reranking/Teams unrecorded.
+  Treat a stale claim in `comparison.md` (the doc that promises to be *fair*) as
+  a defect, not a nicety.
 - **CI pacing: fast per merge, full matrix before release.** Every
   implementation merge gates on the fast Linux jobs only. The slow
   macOS/Windows legs run on a `full-ci` PR label, nightly (windows), or
@@ -543,6 +558,10 @@ Additional boundary rules:
   against other memory tools (camps, migration notes, how the field validates
   the file-first/pages-over-facts approach). Analysis behind it:
   `research-2026-landscape.md`.
+- [`docs/competitive-parity.md`](docs/competitive-parity.md) — self-critical
+  internal audit: per-competitor migration-worthiness (do we do the basics +
+  add enough to justify switching?), the "did we copy without improving?"
+  borrowed-ideas verdicts, and documented gap-fill recommendations.
 - [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) — read before touching
   purge/rename/backup/restore/reset/reindex/restore-page.
 - [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) —

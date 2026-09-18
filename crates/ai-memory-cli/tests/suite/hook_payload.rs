@@ -17,12 +17,22 @@ fn run_hook_event(data_dir: &Path, event: &str, payload: &[u8]) -> Output {
 }
 
 fn run_hook_full(data_dir: &Path, event: &str, payload: &[u8], capture_assistant: bool) -> Output {
+    run_hook_full_agent(data_dir, "claude-code", event, payload, capture_assistant)
+}
+
+fn run_hook_full_agent(
+    data_dir: &Path,
+    agent: &str,
+    event: &str,
+    payload: &[u8],
+    capture_assistant: bool,
+) -> Output {
     let mut args = vec![
         "hook".to_string(),
         "--event".to_string(),
         event.to_string(),
         "--agent".to_string(),
-        "claude-code".to_string(),
+        agent.to_string(),
         "--server-url".to_string(),
         ai_memory_test_support::dead_http_endpoint(),
     ];
@@ -319,4 +329,127 @@ fn every_spooled_event_carries_a_persistent_ingest_key() {
         );
     }
     assert_ne!(keys[0], keys[1], "distinct events must mint distinct keys");
+}
+
+// --- Codex assistant-capture runtime (#196 / #743) -------------------------
+//
+// The INSTALLER baking `--capture-assistant` for Codex is unit-tested in
+// `install_hooks.rs`; the RUNTIME (a Codex `Stop` payload carrying
+// `last_assistant_message` flowing through the hook ingress, being captured and
+// sanitized) was covered only for `--agent claude-code` above. Codex's Stop hook
+// carries the assistant's final turn under the SAME top-level field spelling as
+// Claude Code — `last_assistant_message` (verified on codex-cli 0.154.0, #743) —
+// so the wire shape is identical and the ONLY runtime difference is `--agent
+// codex`. These cases prove the Codex path end-to-end at the client spool, the
+// same layer the Claude cases assert against (dead endpoint, zero-LLM, CI-safe).
+
+#[test]
+fn codex_opted_in_stop_captures_and_sanitizes_assistant_message() {
+    // With --capture-assistant, a Codex Stop event spools the sanitized protocol
+    // marker (NOT the raw field), carries capture_assistant=1 on a codex URL, and
+    // a planted secret in the assistant message is redacted before it is spooled.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // AWS access-key shape (AKIA + 16 chars) → redacted by the built-in sanitizer,
+    // mirroring `assistant_capture::client_transform_scrubs_before_truncating`.
+    let secret = format!("AKIA{}", "A".repeat(16));
+    // A unique, non-secret phrase proves the excerpt actually persisted, so the
+    // secret-absence below reflects redaction rather than an empty capture.
+    let survivor = "codex wrapped up the refactor";
+    let payload = serde_json::json!({
+        "session_id": "codex-capture",
+        "cwd": "/tmp/project",
+        "last_assistant_message": format!("{survivor} using key {secret}")
+    })
+    .to_string();
+
+    let output = run_hook_full_agent(tmp.path(), "codex", "stop", payload.as_bytes(), true);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"{}\n");
+
+    let entry = spooled_entry(tmp.path());
+    let body = entry["body"].as_str().expect("spooled body");
+    let url = entry["url"].as_str().expect("spooled url");
+
+    // 1. Captured: the sanitized protocol marker is spliced in, the raw field is
+    //    gone, and the server-gating flag rides the codex URL.
+    assert!(
+        !body.contains("last_assistant_message"),
+        "raw assistant field survived: {body}"
+    );
+    assert!(
+        body.contains("_ai_memory_assistant"),
+        "protocol marker missing from codex capture: {body}"
+    );
+    assert!(
+        body.contains(survivor),
+        "non-secret excerpt did not persist (capture may be empty): {body}"
+    );
+    assert!(
+        url.contains("capture_assistant=1"),
+        "capture flag missing from codex url: {url}"
+    );
+    assert!(
+        url.contains("agent=codex"),
+        "codex agent missing from url: {url}"
+    );
+
+    // 2. Sanitized: the planted secret must not survive anywhere in the spool
+    //    file bytes, and the sanitizer's redaction marker must be present.
+    let entries = spool_entries(tmp.path());
+    assert_eq!(entries.len(), 1);
+    let raw_bytes = std::fs::read(entries[0].path()).expect("read spool entry");
+    let raw_text = String::from_utf8_lossy(&raw_bytes);
+    assert!(
+        !raw_text.contains(&secret),
+        "planted secret leaked into the codex spool file bytes"
+    );
+    assert!(
+        body.contains("[REDACTED:aws_key]"),
+        "secret was not redacted in the captured excerpt: {body}"
+    );
+}
+
+#[test]
+fn codex_capture_off_does_not_capture_assistant_message() {
+    // Opt-in gating for Codex: WITHOUT --capture-assistant, the raw field is
+    // stripped defensively, no protocol marker is spliced, and the URL carries no
+    // capture flag — proving the flag actually gates Codex capture. Mirrors the
+    // claude-code `stop_hook_strips_last_assistant_message_from_spool_and_stderr`.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"codex-off","cwd":"/tmp/project","last_assistant_message":"SENTINEL_ASSISTANT_MESSAGE"}"#;
+
+    let output = run_hook_full_agent(tmp.path(), "codex", "stop", payload, false);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let entry = spooled_entry(tmp.path());
+    let body = entry["body"].as_str().expect("spooled body");
+    let url = entry["url"].as_str().expect("spooled url");
+    assert!(
+        !body.contains("SENTINEL_ASSISTANT_MESSAGE"),
+        "assistant message captured with capture OFF: {body}"
+    );
+    assert!(
+        !body.contains("last_assistant_message"),
+        "raw assistant field key survived: {body}"
+    );
+    assert!(
+        !body.contains("_ai_memory_assistant"),
+        "protocol marker spliced with capture OFF: {body}"
+    );
+    assert!(
+        !url.contains("capture_assistant=1"),
+        "capture flag present with capture OFF: {url}"
+    );
+    // Unrelated fields survive so the Codex Stop event is still ingested.
+    assert!(body.contains("codex-off"), "session_id was dropped: {body}");
 }

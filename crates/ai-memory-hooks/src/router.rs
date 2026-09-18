@@ -3487,6 +3487,156 @@ mod tests {
         assert!(many.contains('5') && many.contains("messages waiting"));
     }
 
+    /// Drop `count` pending messages into the state project's inbox, sent from a
+    /// sibling project in the same workspace (a message is addressed to a
+    /// project, so it needs a distinct sender coordinate). Returns nothing; the
+    /// point is only that the recipient now has pending mail.
+    async fn seed_inbox(state: &HookState, count: usize) {
+        let sender = state
+            .writer
+            .get_or_create_project(state.workspace_id, "sender-proj".to_string(), None)
+            .await
+            .unwrap();
+        for i in 0..count {
+            state
+                .writer
+                .insert_message(ai_memory_core::NewAgentMessage {
+                    from_workspace_id: state.workspace_id,
+                    from_project_id: sender,
+                    from_agent: AgentKind::ClaudeCode,
+                    from_session_id: None,
+                    from_owner_user: None,
+                    to_workspace_id: state.workspace_id,
+                    to_project_id: state.project_id,
+                    subject: Some(format!("subject {i}")),
+                    body: format!("please do task {i}"),
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    fn session_start_query(cwd: &str) -> HandoffQuery {
+        HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(cwd.to_string()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            project_strategy: None,
+            briefing: None,
+            briefing_budget: None,
+            managed_run: None,
+            session_id: None,
+        }
+    }
+
+    /// The on-start block appends the non-consuming inbox notice when the
+    /// project has pending cross-project mail (`docs/agent-messaging.md`). The
+    /// SessionStart delivery path (`GET /handoff` → `handle_handoff`) must
+    /// surface the count WITHOUT popping anything: the messages stay pending and
+    /// a later `memory_message_pop` still finds them, because message text may
+    /// only reach an agent through a deliberate pop, never the on-start context.
+    #[tokio::test]
+    async fn session_start_notice_surfaces_pending_mail_without_consuming_it() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        seed_inbox(&state, 2).await;
+        let state = Arc::new(state);
+
+        // The count is what the notice must report going in.
+        assert_eq!(
+            state
+                .reader
+                .pending_message_count(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            2,
+        );
+
+        let (status, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(session_start_query(&tmp.path().to_string_lossy())),
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // The notice is present and reports the real count, not message text.
+        assert!(
+            body.contains("📬"),
+            "the on-start block must carry the inbox notice: {body}",
+        );
+        assert!(
+            body.contains("2 cross-project messages waiting"),
+            "the notice must report the pending count: {body}",
+        );
+        assert!(
+            body.contains("memory_message_pop"),
+            "the notice must point at the deliberate pop tool: {body}",
+        );
+
+        // NON-CONSUMING: the mail is still pending after SessionStart — the
+        // notice looked, it did not claim.
+        assert_eq!(
+            state
+                .reader
+                .pending_message_count(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            2,
+            "the on-start notice must not consume any inbox message",
+        );
+        // And a deliberate pop still delivers one, proving the messages were
+        // left claimable rather than silently drained by the notice.
+        let popped = state
+            .writer
+            .pop_message(
+                ai_memory_core::MessageClaim {
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    claiming_agent: AgentKind::ClaudeCode,
+                    claiming_session: None,
+                    claiming_user: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            popped.is_some(),
+            "a message the notice reported must still be poppable afterwards",
+        );
+    }
+
+    /// With an empty inbox, the on-start block emits no inbox notice at all —
+    /// `render_inbox_notice(0)` returns `None`, so nothing is appended.
+    #[tokio::test]
+    async fn session_start_emits_no_inbox_notice_when_inbox_empty() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+
+        let (status, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(session_start_query(&tmp.path().to_string_lossy())),
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("📬"),
+            "an empty inbox must produce no inbox notice: {body:?}",
+        );
+    }
+
     struct RecordingLlm(Mutex<Option<ChatRequest>>);
 
     #[async_trait::async_trait]

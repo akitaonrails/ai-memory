@@ -49,6 +49,13 @@ Expired pages are excluded from project, sibling-scope, and global searches by
 default. Pass `include_expired: true` only when the user explicitly asks to
 inspect expired historical memory; do not broaden ordinary recall to stale data.
 
+Superseded (older) page versions are excluded by default; only the current
+version of each page is returned. Pass `include_superseded: true` when the user
+wants a page's history, or an answer that a later edit removed. Each older hit is
+labelled `superseded: true` so you can tell it from the live version; the current
+version is never marked. This applies to project and explicit-scope searches;
+`global=true` search and `as_of` time-travel are unaffected.
+
 Use `explain: true` only when the user asks why project or explicit-scope hits
 ranked as they did. It adds FTS, lexical entity, optional vector, and graph
 score provenance to compiled-page hits, including matched entity names.

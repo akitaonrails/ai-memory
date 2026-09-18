@@ -8627,6 +8627,87 @@ mod tests {
         );
     }
 
+    /// End-to-end companion to the hand-written ledger test above: the
+    /// export must drop the ledger the REAL capture path produces, not
+    /// merely a file whose bytes a test typed by hand. #748 was exactly a
+    /// disagreement between two subsystems — the hook that appends
+    /// `log-YYYY-MM.md` and the export that walked it — so the regression
+    /// is only truly guarded when the ledger under test is the one
+    /// `ai_memory_hooks::log::append_event` itself writes, named for the
+    /// event's own month.
+    #[tokio::test]
+    async fn export_okf_skips_the_ledger_real_capture_writes() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki.clone()));
+
+        // A real knowledge page, created through the normal write path.
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+
+        // The rotated ledger, created the way capture creates it: the exact
+        // `append_event` the hook router calls, which names the file for the
+        // event's own month (`log-YYYY-MM.md`) and writes a frontmatter-less
+        // `## [ts] ...` entry.
+        let scope = lookup_existing_scope(&store.reader, "default", "scratch")
+            .await
+            .unwrap();
+        ai_memory_hooks::log::append_event(
+            &wiki,
+            scope.workspace_id,
+            scope.project_id,
+            jiff::Timestamp::now(),
+            ai_memory_hooks::HookEvent::SessionStart,
+            "opened scratch",
+        )
+        .unwrap();
+
+        // Guard against a vacuous pass: capture must actually have written a
+        // rotated ledger into the project root the export walks.
+        let proj_root = wiki.project_root(scope.workspace_id, scope.project_id);
+        assert!(
+            std::fs::read_dir(&proj_root)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("log-")),
+            "capture must have written a rotated ledger for the test to be meaningful"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Export succeeds instead of aborting on the frontmatter-less ledger.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "notes/a.md"),
+            "the real knowledge page must ship: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("log-")),
+            "the ledger real capture wrote must not ship: {names:?}"
+        );
+    }
+
     /// Content gate control for #748: the ledger carve-out keys off the
     /// body, so an ordinary page named like a ledger is still a page —
     /// it ships in the bundle, and it still has to declare a `type`.

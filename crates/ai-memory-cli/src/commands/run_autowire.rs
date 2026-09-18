@@ -77,10 +77,10 @@ pub(crate) struct WireOverrides {
 
 /// Ensure the launched harness has ai-memory hooks + MCP installed. Best-effort
 /// and one-time; never blocks or fails the launch.
-pub(crate) fn ensure_wired(config: &Config, harness: ManagedHarness) {
-    ensure_wired_with(config, harness, &WireOverrides::default());
-}
-
+///
+/// Production launches pass [`WireOverrides::default()`] (via
+/// [`run_from`](super::run::run_from)); the overrides exist only so the seam can
+/// be exercised without writing to the developer's real `$HOME`.
 pub(crate) fn ensure_wired_with(
     config: &Config,
     harness: ManagedHarness,

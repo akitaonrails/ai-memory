@@ -93,6 +93,7 @@ async fn fts(
             0,
             10,
             None,
+            false,
         )
         .await
         .unwrap()

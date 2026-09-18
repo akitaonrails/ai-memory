@@ -52,6 +52,23 @@ fn not_expired(table: &str, now_param: &str) -> String {
     format!(" AND ({table}.expires_at IS NULL OR {table}.expires_at > {now_param})")
 }
 
+/// Latest-version guard for retrieval candidate queries (FTS / vector /
+/// entity / graph). When `include_superseded` is false — the default — this
+/// restricts a candidate query to the current version with
+/// `AND {table}.is_latest = 1`; when true it returns an empty fragment so
+/// superseded versions enter the candidate pool too. `table` is the pages
+/// alias in that query. One definition so the opt-in never drifts between
+/// streams, and the default fragment is byte-identical to the literal it
+/// replaces. The fragment carries no bound placeholder, so dropping it never
+/// disturbs positional parameter ordering.
+fn latest_only(table: &str, include_superseded: bool) -> String {
+    if include_superseded {
+        String::new()
+    } else {
+        format!(" AND {table}.is_latest = 1")
+    }
+}
+
 /// Current wall-clock in microseconds, for binding against
 /// [`not_expired`] fragments.
 fn now_us() -> i64 {
@@ -639,6 +656,12 @@ pub struct PageHit {
     pub snippet: String,
     /// Relevance rank after the bounded authority adjustment (lower is better).
     pub rank: f64,
+    /// True when this hit is a superseded (non-latest) page version, surfaced
+    /// only because the caller opted into `include_superseded`. False for the
+    /// current version — the default. Skipped in JSON when false so default
+    /// retrieval output is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
 }
 
 /// Completed session selected for scheduled auto-improvement.
@@ -1678,6 +1701,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        superseded: false,
                     },
                     authority,
                 ));
@@ -1811,6 +1835,7 @@ impl ReaderPool {
                 query,
                 authority_candidate_limit(limit),
                 expiry_cutoff_us,
+                false,
             )
             .await?;
         Ok(rerank_page_hits(candidates, limit))
@@ -1823,6 +1848,7 @@ impl ReaderPool {
         query: String,
         candidate_limit: usize,
         expiry_cutoff_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
         let fts_query = normalize_fts_query(&query);
         if fts_query.is_empty() || candidate_limit == 0 {
@@ -1840,10 +1866,10 @@ impl ReaderPool {
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  WHERE pages_fts MATCH ?1 \
                    AND pages.workspace_id = ?2 \
-                   AND pages.project_id = ?3 \
-                   AND pages.is_latest = 1{not_expired} \
+                   AND pages.project_id = ?3{latest}{not_expired} \
                  ORDER BY pages_fts.rank \
                  LIMIT ?4",
+                latest = latest_only("pages", include_superseded),
                 not_expired = not_expired("pages", "?5"),
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -1893,6 +1919,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        superseded: false,
                     },
                     authority,
                 ));
@@ -1989,6 +2016,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        superseded: false,
                     },
                     authority,
                 ));
@@ -2035,6 +2063,9 @@ impl ReaderPool {
                 candidate_limit,
                 None,
                 Some(as_of_us),
+                // The as_of branch resolves versions by ingestion window, so
+                // this flag is inert; false keeps the audit path unchanged.
+                false,
             )
             .await?;
         let fts_candidates = self
@@ -2120,6 +2151,7 @@ impl ReaderPool {
                         title: entry.title,
                         snippet: entry.snippet,
                         rank: -entry.score, // lower = better (matches FTS5 convention)
+                        superseded: false,
                     },
                     entry.explain,
                 )
@@ -2257,6 +2289,7 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    superseded: false,
                 });
             }
             Ok(hits)
@@ -2313,6 +2346,7 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    superseded: false,
                 });
             }
             Ok(hits)
@@ -3658,6 +3692,7 @@ impl ReaderPool {
         dim: u32,
         limit: usize,
         expiry_cutoff_us: i64,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         self.top_embedding_hits_in_table(
             EmbeddingTable::Body,
@@ -3669,6 +3704,7 @@ impl ReaderPool {
             dim,
             limit,
             expiry_cutoff_us,
+            include_superseded,
         )
         .await
     }
@@ -3688,6 +3724,7 @@ impl ReaderPool {
         dim: u32,
         limit: usize,
         expiry_cutoff_us: i64,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -3699,11 +3736,11 @@ impl ReaderPool {
                  FROM {table} \
                  JOIN pages ON pages.id = {table}.page_id \
                  WHERE pages.workspace_id = ?1 \
-                   AND pages.project_id = ?2 \
-                   AND pages.is_latest = 1{not_expired} \
+                   AND pages.project_id = ?2{latest}{not_expired} \
                    AND {table}.provider = ?3 \
                    AND {table}.model = ?4 \
                    AND {table}.dim = ?5",
+                latest = latest_only("pages", include_superseded),
                 not_expired = not_expired("pages", "?6"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -4016,6 +4053,7 @@ impl ReaderPool {
             limit,
             expiry_cutoff_us,
             None,
+            false,
         )
         .await
     }
@@ -4026,6 +4064,7 @@ impl ReaderPool {
     /// entity-link windows contain `T` — expiry is deliberately ignored
     /// there: a page valid at `T` that has since expired was still what
     /// we knew at `T`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn entity_hits_for_project_at(
         &self,
         workspace_id: WorkspaceId,
@@ -4034,6 +4073,7 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
         as_of_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<EntityHit>> {
         let tokens = entity_query_tokens(query);
         if tokens.is_empty() || limit == 0 {
@@ -4123,14 +4163,22 @@ impl ReaderPool {
                       AND (l.superseded_at IS NULL OR l.superseded_at > ?)"
                         .to_string()
                 } else {
-                    format!(" AND pg.is_latest = 1{}", not_expired("pg", "?"))
+                    format!(
+                        "{}{}",
+                        latest_only("pg", include_superseded),
+                        not_expired("pg", "?")
+                    )
                 },
                 freq_version_filter = if as_of_us.is_some() {
                     " AND l.valid_from <= ? \
                       AND (l.superseded_at IS NULL OR l.superseded_at > ?)"
                         .to_string()
                 } else {
-                    format!(" AND p.is_latest = 1{}", not_expired("p", "?"))
+                    format!(
+                        "{}{}",
+                        latest_only("p", include_superseded),
+                        not_expired("p", "?")
+                    )
                 },
             )
             .expect("writing SQL into String cannot fail");
@@ -4158,6 +4206,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank: 0.0,
+                        superseded: false,
                     },
                     weight,
                     matched,
@@ -4247,6 +4296,7 @@ impl ReaderPool {
                 seed_ids,
                 limit,
                 expiry_cutoff_us,
+                false,
             )
             .await?
             .into_iter()
@@ -4265,6 +4315,7 @@ impl ReaderPool {
         seed_ids: Vec<PageId>,
         limit: usize,
         expiry_cutoff_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<GraphNeighbor>> {
         if seed_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -4294,6 +4345,8 @@ impl ReaderPool {
 
             let out_descriptor = page_descriptor_expr("tp.body", "tp.frontmatter_json");
             let in_descriptor = page_descriptor_expr("fp.body", "fp.frontmatter_json");
+            let out_latest = latest_only("tp", include_superseded);
+            let in_latest = latest_only("fp", include_superseded);
             let out_not_expired = not_expired("tp", "?");
             let in_not_expired = not_expired("fp", "?");
             let mut sql = String::with_capacity(values_clause.len() + 1_500);
@@ -4308,7 +4361,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.from_page_id = seeds.seed_id \
                    JOIN pages tp ON tp.id = l.to_page_id \
-                   WHERE tp.workspace_id = ? AND tp.project_id = ? AND tp.is_latest = 1{out_not_expired} \
+                   WHERE tp.workspace_id = ? AND tp.project_id = ?{out_latest}{out_not_expired} \
                    UNION ALL \
                    SELECT fp.id AS id, fp.path AS path, fp.title AS title, \
                           {in_descriptor} AS snippet, \
@@ -4317,7 +4370,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.to_page_id = seeds.seed_id \
                    JOIN pages fp ON fp.id = l.from_page_id \
-                   WHERE fp.workspace_id = ? AND fp.project_id = ? AND fp.is_latest = 1{in_not_expired} \
+                   WHERE fp.workspace_id = ? AND fp.project_id = ?{in_latest}{in_not_expired} \
                  ) \
                  SELECT id, path, title, snippet, stream_ord, link_type \
                  FROM neighbors \
@@ -4352,6 +4405,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank: 0.0,
+                        superseded: false,
                     },
                     seed_ord,
                     incoming: stream_ord % 2 == 1,
@@ -4443,6 +4497,7 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         page_ids: Vec<PageId>,
+        include_superseded: bool,
     ) -> StoreResult<std::collections::HashMap<PageId, (String, String)>> {
         if page_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -4466,9 +4521,9 @@ impl ReaderPool {
                  FROM requested \
                  JOIN pages ON pages.id = requested.id \
                  WHERE pages.workspace_id = ? \
-                   AND pages.project_id = ? \
-                   AND pages.is_latest = 1",
+                   AND pages.project_id = ?{latest}",
                 descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
+                latest = latest_only("pages", include_superseded),
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
@@ -4590,6 +4645,13 @@ impl ReaderPool {
     /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`]. The
     /// cutoff resolves once here so all streams agree on it.
     ///
+    /// `include_superseded`: `false` — the default — restricts every stream
+    /// to the current page version (`is_latest = 1`), the exact hot-path
+    /// behaviour. `true` drops that predicate so superseded versions enter
+    /// the candidate pool too; each returned [`PageHit`] carries
+    /// `superseded` so the caller can tell historical versions from the
+    /// current one (invariant #16: the superseded loser stays reachable).
+    ///
     /// k=60 is the canonical RRF constant.
     ///
     /// # Errors
@@ -4606,6 +4668,7 @@ impl ReaderPool {
         dim: u32,
         limit: usize,
         expiry_cutoff_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<PageHit>> {
         Ok(self
             .hybrid_search_inner(
@@ -4619,6 +4682,7 @@ impl ReaderPool {
                 limit,
                 expiry_cutoff_us,
                 false,
+                include_superseded,
             )
             .await?
             .into_iter()
@@ -4645,6 +4709,7 @@ impl ReaderPool {
         dim: u32,
         limit: usize,
         expiry_cutoff_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageHit, SearchExplain)>> {
         let hits = self
             .hybrid_search_inner(
@@ -4658,6 +4723,7 @@ impl ReaderPool {
                 limit,
                 expiry_cutoff_us,
                 true,
+                include_superseded,
             )
             .await?;
         // Evidence counts (P2, docs/design-hindsight-borrowings.md §3) are
@@ -4688,6 +4754,7 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
         explain: bool,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // The routing decision is read off the query before the FTS call
@@ -4701,15 +4768,29 @@ impl ReaderPool {
         let candidate_limit = authority_candidate_limit(limit);
         // Tokenize the borrowed query before the FTS candidate call consumes
         // it. This avoids cloning a caller-controlled query on the hot path.
-        let entity_hits = self
-            .entity_hits_for_project(
+        // The default path uses the latest-only entry; the opt-in path reaches
+        // superseded versions through the `_at` entry with no `as_of` instant.
+        let entity_hits = if include_superseded {
+            self.entity_hits_for_project_at(
+                workspace_id,
+                project_id,
+                &query,
+                candidate_limit,
+                Some(cutoff),
+                None,
+                true,
+            )
+            .await?
+        } else {
+            self.entity_hits_for_project(
                 workspace_id,
                 project_id,
                 &query,
                 candidate_limit,
                 Some(cutoff),
             )
-            .await?;
+            .await?
+        };
         let fts_candidates = self
             .search_page_candidates_for_project(
                 workspace_id,
@@ -4717,6 +4798,7 @@ impl ReaderPool {
                 query,
                 candidate_limit,
                 Some(cutoff),
+                include_superseded,
             )
             .await?;
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
@@ -4742,6 +4824,7 @@ impl ReaderPool {
                         dim,
                         candidate_limit,
                         cutoff,
+                        include_superseded,
                     )
                     .await?;
             }
@@ -4755,6 +4838,7 @@ impl ReaderPool {
                     dim,
                     candidate_limit,
                     cutoff,
+                    include_superseded,
                 )
                 .await?;
         }
@@ -4793,6 +4877,7 @@ impl ReaderPool {
                 seed_ids,
                 candidate_limit,
                 Some(cutoff),
+                include_superseded,
             )
             .await?;
 
@@ -4912,6 +4997,7 @@ impl ReaderPool {
                         title: entry.title,
                         snippet: entry.snippet,
                         rank: -entry.score, // lower = better (matches FTS5 convention)
+                        superseded: false,
                     },
                     entry.explain,
                 )
@@ -4927,7 +5013,7 @@ impl ReaderPool {
             .collect();
         if !undescribed.is_empty() {
             let descriptors = self
-                .page_descriptors_for_ids(workspace_id, project_id, undescribed)
+                .page_descriptors_for_ids(workspace_id, project_id, undescribed, include_superseded)
                 .await?;
             for (hit, _) in &mut out {
                 if let Some((title, descriptor)) = descriptors.get(&hit.id) {
@@ -4941,10 +5027,18 @@ impl ReaderPool {
             .iter()
             .filter_map(|(hit, _)| (!authorities.contains_key(&hit.id)).then_some(hit.id))
             .collect();
-        authorities.extend(
+        // With `include_superseded`, some fused ids are non-latest versions
+        // reached by the vector/graph streams; their authority inputs must be
+        // read without the latest-only filter or they'd get the neutral
+        // default and misrank.
+        let extra_authorities = if include_superseded {
+            self.page_authorities_for_versions(workspace_id, project_id, missing_authorities)
+                .await?
+        } else {
             self.page_authorities_for_project(workspace_id, project_id, missing_authorities)
-                .await?,
-        );
+                .await?
+        };
+        authorities.extend(extra_authorities);
         for (hit, explain) in &mut out {
             if let Some(authority) = authorities.get(&hit.id) {
                 let factor = authority.factor_for(session_recall, tuning.session_recall_bonus);
@@ -4971,7 +5065,67 @@ impl ReaderPool {
                 .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
         });
         out.truncate(limit);
+        // Label the superseded versions among the final hits so the caller can
+        // tell historical versions from the current one. Only the opt-in path
+        // can surface a non-latest id, so the default path skips this lookup
+        // entirely and every hit keeps `superseded = false`.
+        if include_superseded {
+            let result_ids: Vec<PageId> = out.iter().map(|(hit, _)| hit.id).collect();
+            let superseded = self
+                .superseded_page_ids(workspace_id, project_id, result_ids)
+                .await?;
+            for (hit, _) in &mut out {
+                hit.superseded = superseded.contains(&hit.id);
+            }
+        }
         Ok(out)
+    }
+
+    /// The subset of `page_ids` that are superseded (non-latest) versions in
+    /// the given project. Used by [`Self::hybrid_search`] to label opt-in
+    /// `include_superseded` hits; the default path never calls it.
+    async fn superseded_page_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_ids: Vec<PageId>,
+    ) -> StoreResult<std::collections::HashSet<PageId>> {
+        if page_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        self.with_conn(move |conn| {
+            let mut values_clause = String::with_capacity(page_ids.len() * 5);
+            let mut sql_params = Vec::with_capacity(page_ids.len() + 2);
+            for (idx, page_id) in page_ids.iter().enumerate() {
+                if idx > 0 {
+                    values_clause.push_str(", ");
+                }
+                values_clause.push_str("(?)");
+                sql_params.push(Value::Blob(page_id.as_bytes().to_vec()));
+            }
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+
+            let sql = format!(
+                "WITH requested(id) AS (VALUES {values_clause}) \
+                 SELECT pages.id \
+                 FROM requested \
+                 JOIN pages ON pages.id = requested.id \
+                 WHERE pages.workspace_id = ? \
+                   AND pages.project_id = ? \
+                   AND pages.is_latest = 0"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?;
+            let mut out = std::collections::HashSet::new();
+            for row in rows {
+                out.insert(PageId::from_slice(&row?)?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// Return the open handoff the next session should pick up.

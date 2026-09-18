@@ -4,9 +4,11 @@
 //! the same binary a user runs, configured for deterministic zero-LLM
 //! operation (no consolidation LLM, no embedder, no reranker).
 
+use std::io::Read as _;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -20,17 +22,42 @@ pub struct EvalServer {
     /// Kept for the lifetime of the server unless --keep-data-dir moved it.
     _data_dir: Option<tempfile::TempDir>,
     pub data_dir_path: PathBuf,
+    /// Continuously drained child stderr. A piped stderr that nobody reads
+    /// deadlocks the server the moment its startup logging fills the OS
+    /// pipe buffer (~64 KiB) — and an A/B run launches two servers, so it
+    /// hits reliably. A background reader keeps the pipe empty and the
+    /// captured text is surfaced on a startup failure.
+    stderr: Arc<Mutex<String>>,
 }
 
 /// Which embedding configuration the eval server runs with.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum EvalEmbeddings {
-    /// Deterministic zero-LLM mode: no embedder at all.
+    /// Deterministic zero-LLM mode: no embedder at all (vectors OFF).
     None,
-    /// In-process local embeddings (all-MiniLM-L6-v2). The model files
-    /// must already sit in the given models root; the harness seeds the
-    /// server's data dir from there so the server never fetches.
+    /// In-process local embeddings (all-MiniLM-L6-v2), i.e. vectors ON.
+    /// The model files must already sit in the given models root; the
+    /// harness seeds the server's data dir from there so the server never
+    /// fetches.
     Local,
+}
+
+/// One server launch configuration — the knob matrix an A/B run varies
+/// between its baseline and candidate.
+pub struct LaunchConfig<'a> {
+    /// Embedding provider (`none` = zero-LLM/vectors off, `local` = vectors on).
+    pub embeddings: EvalEmbeddings,
+    /// When `embeddings == Local`, the models root to seed the server from.
+    pub models_root: Option<&'a std::path::Path>,
+    /// Turn the post-RRF reranker on (`AI_MEMORY_RERANKER=llm`). Requires
+    /// an LLM provider to be supplied through `env` — the harness does not
+    /// configure one, so a bare `reranker=true` with no provider is a no-op
+    /// the server logs and ignores.
+    pub reranker: bool,
+    /// Extra server env overrides, applied last so a config can set any
+    /// server knob (reranker provider, retrieval flags, future toggles)
+    /// without a new field here. These win over the harness defaults.
+    pub env: &'a [(String, String)],
 }
 
 impl EvalServer {
@@ -38,9 +65,10 @@ impl EvalServer {
     pub async fn launch(
         server_bin: &PathBuf,
         keep_data_dir: bool,
-        embeddings: EvalEmbeddings,
-        models_root: Option<&std::path::Path>,
+        config: &LaunchConfig<'_>,
     ) -> Result<Self> {
+        let embeddings = config.embeddings;
+        let models_root = config.models_root;
         let tmp = tempfile::Builder::new()
             .prefix("ai-memory-eval-")
             .tempdir()
@@ -78,8 +106,10 @@ impl EvalServer {
         .arg(&data_dir_path)
         .env("AI_MEMORY_AUTH_TOKEN", EVAL_AUTH_TOKEN)
         .env("AI_MEMORY_CAPTURE_ASSISTANT", "true")
-        // No chat LLM and no reranker in either mode; the embedding env
-        // selects the one nondefault stream under test.
+        // Start from a hermetic baseline: no chat LLM, no reranker, no
+        // inherited provider keys. The knob matrix below re-enables only
+        // what the config asks for, so a run never picks up the
+        // developer's ambient environment.
         .env_remove("AI_MEMORY_LLM_PROVIDER")
         .env_remove("AI_MEMORY_RERANKER")
         .env_remove("OPENAI_API_KEY")
@@ -96,11 +126,40 @@ impl EvalServer {
                 cmd.env("AI_MEMORY_EMBEDDING_PROVIDER", "local");
             }
         }
-        let child = cmd
+        if config.reranker {
+            // Only `llm` is a supported reranker; it needs a provider,
+            // which the config must supply via `env`.
+            cmd.env("AI_MEMORY_RERANKER", "llm");
+        }
+        // Config env overrides win over every default above.
+        for (key, value) in config.env {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawning {} serve", server_bin.display()))?;
+
+        // Drain stderr continuously so the server never blocks on a full
+        // pipe, keeping the captured text for failure diagnostics.
+        let stderr = Arc::new(Mutex::new(String::new()));
+        if let Some(mut pipe) = child.stderr.take() {
+            let sink = stderr.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut s) = sink.lock() {
+                                s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         let base_url = format!("http://{bind}");
         let (guard, data_dir_path) = if keep_data_dir {
@@ -114,9 +173,18 @@ impl EvalServer {
             base_url,
             _data_dir: guard,
             data_dir_path,
+            stderr,
         };
         server.wait_ready().await?;
         Ok(server)
+    }
+
+    /// Snapshot of the child's captured stderr so far.
+    fn stderr_snapshot(&self) -> String {
+        self.stderr
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| "(stderr capture poisoned)".into())
     }
 
     /// Poll until the HTTP surface answers (any status counts as up).
@@ -125,12 +193,10 @@ impl EvalServer {
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             if let Some(status) = self.child.try_wait()? {
-                let mut err = String::new();
-                if let Some(mut stderr) = self.child.stderr.take() {
-                    use std::io::Read as _;
-                    let _ = stderr.read_to_string(&mut err);
-                }
-                bail!("eval server exited during startup ({status}): {err}");
+                bail!(
+                    "eval server exited during startup ({status}): {}",
+                    self.stderr_snapshot()
+                );
             }
             if client
                 .get(format!("{}/", self.base_url))
@@ -143,8 +209,9 @@ impl EvalServer {
             }
             if Instant::now() > deadline {
                 bail!(
-                    "eval server did not answer on {} within 120s",
-                    self.base_url
+                    "eval server did not answer on {} within 120s: {}",
+                    self.base_url,
+                    self.stderr_snapshot()
                 );
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
