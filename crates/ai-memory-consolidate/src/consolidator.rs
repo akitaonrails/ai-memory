@@ -6,6 +6,7 @@
 //! kicks in automatically.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ai_memory_core::{AgentKind, Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
 use ai_memory_llm::{
@@ -62,6 +63,50 @@ impl From<serde_json::Error> for ConsolidatorError {
 
 /// Result alias used by the consolidator.
 pub type ConsolidatorResult<T> = Result<T, ConsolidatorError>;
+
+/// Maximum attempts (initial + retries) for one consolidation LLM call.
+const CONSOLIDATION_LLM_MAX_ATTEMPTS: u32 = 3;
+/// Fixed, short delay between consolidation retries. Deliberately not
+/// tenacity-style escalating backoff — see the cognee #2840 lesson in
+/// `ai-memory-llm`; the same policy `bootstrap.rs` applies to its chunks.
+const CONSOLIDATION_LLM_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Run one consolidation structured call with a short, bounded retry.
+///
+/// A provider answering `429`, any `5xx`, or dropping the connection used to
+/// end the consolidation after a single attempt: over MCP the operator saw an
+/// opaque internal error and had to re-issue the whole call by hand. A couple
+/// of seconds apart, one more identical request rides out those windows.
+/// Deterministic failures — auth, schema, a malformed-request `4xx`, an
+/// unparseable or truncated body — are not retried: the retry would burn
+/// another expensive call and hit the same wall.
+async fn complete_structured_with_retry<T>(
+    llm: &(dyn LlmProvider + 'static),
+    request: ChatRequest,
+    operation_id: ai_memory_llm::LlmOperationId,
+    retry_delay: Duration,
+) -> Result<T, LlmError>
+where
+    T: serde::de::DeserializeOwned + schemars::JsonSchema + Send + 'static,
+{
+    let mut attempt = 1;
+    loop {
+        match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
+            Ok(value) => return Ok(value),
+            Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
+                warn!(
+                    attempt,
+                    max = CONSOLIDATION_LLM_MAX_ATTEMPTS,
+                    error = %e,
+                    "consolidation hit a transient LLM error; retrying shortly",
+                );
+                tokio::time::sleep(retry_delay).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// Karpathy-style single-page consolidator. Holds handles to the
 /// store, wiki, and LLM provider so it can be reused across many
@@ -191,8 +236,13 @@ impl Consolidator {
             model = self.llm.model(),
             "consolidating session"
         );
-        let page: ConsolidatedPage =
-            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
+        let page: ConsolidatedPage = complete_structured_with_retry(
+            &*self.llm,
+            request,
+            session_id.into(),
+            CONSOLIDATION_LLM_RETRY_DELAY,
+        )
+        .await?;
 
         let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
@@ -490,8 +540,13 @@ impl Consolidator {
             provider = self.llm.name(),
             "consolidating session (multi-page)",
         );
-        let batch: ConsolidatedBatch =
-            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
+        let batch: ConsolidatedBatch = complete_structured_with_retry(
+            &*self.llm,
+            request,
+            session_id.into(),
+            CONSOLIDATION_LLM_RETRY_DELAY,
+        )
+        .await?;
 
         // `dry_run` is always false past the early return above, so every
         // update here is a real write.
@@ -1421,6 +1476,7 @@ mod tests {
     use super::*;
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Helper for prompt construction tests.
     fn obs_of_size(body_len: usize) -> Observation {
@@ -2414,6 +2470,163 @@ mod tests {
         ) -> ai_memory_llm::LlmResult<serde_json::Value> {
             Ok(self.0.clone())
         }
+    }
+
+    /// Which failure a [`FlakyLlm`] raises before it starts answering.
+    #[derive(Clone, Copy)]
+    enum ScriptedFailure {
+        /// A provider `503`: transient, so the retry must absorb it.
+        Transient,
+        /// An expired credential: deterministic, so a retry cannot help.
+        Deterministic,
+    }
+
+    /// Fails as scripted for its first `failures` structured calls, then
+    /// answers `response`, counting every attempt.
+    struct FlakyLlm {
+        calls: AtomicUsize,
+        failures: usize,
+        failure: ScriptedFailure,
+        response: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FlakyLlm {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+        fn model(&self) -> &str {
+            "flaky"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.failures {
+                return Err(match self.failure {
+                    ScriptedFailure::Transient => LlmError::Provider {
+                        status: 503,
+                        body: "This model is currently experiencing high demand.".into(),
+                    },
+                    ScriptedFailure::Deterministic => LlmError::Auth("expired".into()),
+                });
+            }
+            Ok(self.response.clone())
+        }
+    }
+
+    fn scripted_page() -> serde_json::Value {
+        serde_json::json!({
+            "title": "Queue decision",
+            "body_markdown": "The queue is bounded.",
+            "tags": [],
+        })
+    }
+
+    /// A briefly overloaded provider must not end the consolidation: the
+    /// retry absorbs it and the caller still gets the page.
+    #[tokio::test]
+    async fn a_transient_provider_failure_is_retried() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: 2, // fails twice, answers on the 3rd (= the budget)
+            failure: ScriptedFailure::Transient,
+            response: scripted_page(),
+        };
+
+        let page: ConsolidatedPage = complete_structured_with_retry(
+            &llm,
+            ChatRequest::user_prompt("consolidate"),
+            ai_memory_llm::LlmOperationId::default(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("a transient failure that clears within the budget must succeed");
+
+        assert_eq!(page.title, "Queue decision");
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            3,
+            "should have retried twice"
+        );
+    }
+
+    /// An outage that outlasts the budget gives up instead of retrying
+    /// forever, and reports the provider error it actually saw.
+    #[tokio::test]
+    async fn a_transient_provider_failure_gives_up_after_the_budget() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: usize::MAX, // never clears
+            failure: ScriptedFailure::Transient,
+            response: scripted_page(),
+        };
+
+        let err = complete_structured_with_retry::<ConsolidatedPage>(
+            &llm,
+            ChatRequest::user_prompt("consolidate"),
+            ai_memory_llm::LlmOperationId::default(),
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("a persistently transient failure must eventually give up");
+
+        assert!(err.is_transient());
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            CONSOLIDATION_LLM_MAX_ATTEMPTS as usize,
+            "must stop at the attempt budget, not retry forever"
+        );
+    }
+
+    /// A deterministic failure is not retried, and a consolidation whose
+    /// completion never arrives writes no page.
+    #[tokio::test]
+    async fn a_deterministic_provider_failure_is_not_retried_and_writes_no_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let llm = Arc::new(FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: usize::MAX,
+            failure: ScriptedFailure::Deterministic,
+            response: scripted_page(),
+        });
+
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        )
+        .consolidate_session(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("an auth error must fail the consolidation");
+
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            1,
+            "a deterministic error must fail on the first call, no retries"
+        );
+        assert!(
+            page_missing(&wiki, ws, proj, &format!("sessions/{session}.md")),
+            "a failed consolidation must not write a page"
+        );
     }
 
     async fn write_slot(wiki: &Wiki, ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) {

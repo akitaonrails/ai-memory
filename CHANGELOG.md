@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   target a specific session, and `dry_run=true` for the cheap admission
   preflight. A project with no completed session now fails as
   `no completed session in <scope>` instead of a deserialization error.
+- A consolidation LLM call that fails on a transient provider error (`429`, any
+  `5xx`, a transport timeout or connect failure) is retried twice, two seconds
+  apart, before the failure is reported — the same bounded policy `bootstrap`
+  already applies to its chunks. Deterministic failures (auth, schema, a
+  malformed-request `4xx`, unparseable or truncated output) are still reported
+  on the first attempt, since retrying them only burns another call.
 ### Fixed
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
@@ -23,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only `title`/`projectID` on `session.created`, so the marker never reached the
   server and the opt-in was a silent no-op for OpenCode. Root sessions (no
   `parentID`) stay unmarked (#755).
+- Scope-resolution failures over MCP now answer with `invalid params`
+  (`-32602`) instead of an opaque internal error (`-32603`), the same split the
+  web route applies with its 400/404: a malformed scope argument, or a
+  workspace/project name that does not resolve, is caller input, while a
+  missing writer handle or an underlying store failure stays internal. The
+  messages are unchanged.
+- `memory_consolidate` treats a blank `session_id` (`""` or whitespace) exactly
+  like an omitted one — the resolved project's latest completed session — and a
+  malformed id now fails as `invalid params`, the code `memory_auto_improve`
+  already uses for the same argument.
 
 ## [2.3.1] - 2026-09-17
 
