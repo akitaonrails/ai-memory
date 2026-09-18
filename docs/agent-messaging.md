@@ -83,6 +83,19 @@ ai-memory message cancel --all         # clear this project's outbox
 The CLI resolves the current project as the sender/reader scope, the same way
 `ai-memory handoffs` does.
 
+Both CLI and MCP sends run `message_send` admission against the **recipient**
+scope: deciding webhooks run before insertion, and observers run asynchronously
+only after a successful commit. With no matching webhook configured, send
+behavior is unchanged. A configured blocking reject policy can now refuse CLI
+sends too. See [admission webhooks](admission-webhooks.md).
+
+For event-driven inbox consumers, a nonblocking observer can use the notified
+workspace/project to trigger a scoped inbox read without periodic polling. The
+notification carries scope and actor metadata, not the message body or ID. It
+is a bounded, best-effort signal, not a durable queue, processing acknowledgment,
+or automatic agent wakeup. Consumers still need their own deduplication and
+recovery policy. This does not add a notification for raw Stop observations.
+
 ## Security — a popped message is untrusted input
 
 A popped message was composed by an agent in **another** project. Treat the body

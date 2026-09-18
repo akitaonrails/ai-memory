@@ -2755,6 +2755,8 @@ fn map_message_store_err(e: StoreError) -> (StatusCode, Json<serde_json::Value>)
 async fn handle_send_message(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
     Json(req): Json<SendMessageRequest>,
 ) -> impl IntoResponse {
     let (from_ws, from_proj) =
@@ -2810,11 +2812,35 @@ async fn handle_send_message(
         body,
     };
 
+    // Match MCP's crossing-point admission and post-commit observer ordering.
+    // CLI sends must not silently bypass a configured message_send subscriber.
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let admission = match state
+        .wiki
+        .authorize_operation(
+            to_ws,
+            to_proj,
+            AdmissionOp::MessageSend,
+            actor,
+            skip_webhooks_for_admin_request(level_ext, &headers),
+        )
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
     match state.writer.insert_message(message).await {
-        Ok(id) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "message_id": id.to_string() })),
-        ),
+        Ok(id) => {
+            if let Some(ctx) = admission.as_ref() {
+                state.wiki.notify_operation_observers(ctx);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "message_id": id.to_string() })),
+            )
+        }
         Err(e) => map_message_store_err(e),
     }
 }
@@ -7572,6 +7598,191 @@ mod tests {
     use axum::http::Request;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    async fn message_send_fixture(
+        reject: bool,
+    ) -> (
+        TempDir,
+        Store,
+        Router,
+        WorkspaceId,
+        ProjectId,
+        tokio::sync::mpsc::Receiver<(serde_json::Value, usize)>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use ai_memory_wiki::{AdmissionChain, FailurePolicy, WebhookConfig};
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        store
+            .writer
+            .get_or_create_project(ws, "sender", None)
+            .await
+            .unwrap();
+        let recipient = store
+            .writer
+            .get_or_create_project(ws, "recipient", None)
+            .await
+            .unwrap();
+        let reader = store.reader.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let wait = release.clone();
+        let app = Router::new().route(
+            "/observer",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let reader = reader.clone();
+                let tx = tx.clone();
+                let wait = wait.clone();
+                async move {
+                    let messages = reader
+                        .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 256)
+                        .await
+                        .unwrap();
+                    tx.send((body, messages.len())).await.unwrap();
+                    if reject {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        // A slow observer must not hold up the CLI send response.
+                        wait.notified().await;
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/observer", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "mail-observer".into(),
+            url,
+            timeout_ms: 2_000,
+            failure_policy: if reject {
+                FailurePolicy::Reject
+            } else {
+                FailurePolicy::Ignore
+            },
+            events: vec![AdmissionOp::MessageSend],
+            blocking: reject,
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone())
+            .with_admission_chain(chain);
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        (tmp, store, router, ws, recipient, rx, release, server)
+    }
+
+    fn message_send_request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/admin/messages/send")
+            .header("content-type", "application/json")
+            .extension(ActorContext {
+                user: Some("alice".into()),
+                ..Default::default()
+            })
+            .body(Body::from(
+                serde_json::json!({
+                    "from_workspace": "default", "from_project": "sender",
+                    "to_workspace": "default", "to_project": "recipient",
+                    "body": "Synthetic result"
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_message_send_observer_sees_commit_without_blocking_response() {
+        let (_tmp, _store, router, _ws, _recipient, mut rx, release, server) =
+            message_send_fixture(false).await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            router.oneshot(message_send_request()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (payload, committed_count) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(committed_count, 1, "observer must run after commit");
+        assert_eq!(payload["ctx"]["op"], "message_send");
+        assert_eq!(payload["ctx"]["workspace"], "default");
+        assert_eq!(payload["ctx"]["project"], "recipient");
+        assert_eq!(payload["ctx"]["actor"]["user"], "alice");
+        assert_eq!(
+            payload["page"]["body"], "",
+            "observer must not copy message text"
+        );
+        release.notify_one();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_message_send_reject_leaves_inbox_empty() {
+        let (_tmp, store, router, ws, recipient, mut rx, _release, server) =
+            message_send_fixture(true).await;
+        let response = router.oneshot(message_send_request()).await.unwrap();
+        assert!(!response.status().is_success());
+        let (_, committed_count) = rx.recv().await.unwrap();
+        assert_eq!(committed_count, 0);
+        assert!(
+            store
+                .reader
+                .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_message_send_full_inbox_does_not_notify_observer() {
+        let (_tmp, store, router, ws, recipient, mut rx, _release, server) =
+            message_send_fixture(false).await;
+        let sender = store
+            .writer
+            .get_or_create_project(ws, "sender", None)
+            .await
+            .unwrap();
+        for _ in 0..256 {
+            store
+                .writer
+                .insert_message(ai_memory_core::NewAgentMessage {
+                    from_workspace_id: ws,
+                    from_project_id: sender,
+                    from_agent: AgentKind::Other,
+                    from_session_id: None,
+                    from_owner_user: None,
+                    to_workspace_id: ws,
+                    to_project_id: recipient,
+                    subject: None,
+                    body: "fixture".into(),
+                })
+                .await
+                .unwrap();
+        }
+        let response = router.oneshot(message_send_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
 
     struct FakeAutoImproveLlm;
 

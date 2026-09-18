@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- CLI `message send` now applies `message_send` admission at the recipient
+  scope and dispatches observer webhooks after a successful commit, matching
+  the MCP send path. Previously `/admin/messages/send` inserted the message
+  without notifying subscribers or consulting their reject policies. Failed
+  inserts do not notify observers; nonblocking observers do not delay the send. (#756)
+
 ## [2.3.1] - 2026-09-17
 
 ### Added
