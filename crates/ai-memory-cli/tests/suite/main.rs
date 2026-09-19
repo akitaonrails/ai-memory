@@ -7,6 +7,7 @@
 
 mod autoscope_env;
 mod backfill_e2e;
+mod backfill_failures;
 mod completions;
 mod doctor_e2e;
 mod e2e_support;

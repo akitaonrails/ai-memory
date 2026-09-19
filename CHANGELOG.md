@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server and the opt-in was a silent no-op for OpenCode. Root sessions (no
   `parentID`) stay unmarked (#755).
 
+- `backfill` returned success even when imports failed, and `--quiet` hid
+  their diagnostics. It now reports errors on stderr, includes failure counts
+  in the human summary, and exits nonzero after emitting its report (#786).
+
 ## [2.3.1] - 2026-09-17
 
 ### Added

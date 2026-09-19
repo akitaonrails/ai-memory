@@ -149,7 +149,9 @@ fn write_sentinel(data_dir: &Path, cwd: &Path) {
 ///
 /// # Errors
 /// Returns an error when the scope cannot be resolved, the working directory
-/// cannot be read, or the server is unreachable for the emptiness check.
+/// cannot be read, the server is unreachable for the emptiness check, or any
+/// selected session fails to import. The report is emitted before import errors
+/// are returned, including in JSON mode.
 pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the current working directory")?;
 
@@ -209,19 +211,27 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
             }
             Err(error) => {
                 report.failed_sessions += 1;
-                if !args.quiet {
-                    eprintln!(
-                        "ai-memory: backfill of {} session {} failed: {error:#}",
-                        session.harness.as_str(),
-                        display_id(&session.native_session_id)
-                    );
-                }
+                // Quiet suppresses the success summary, not failures: the
+                // detached worker's stderr is the operator's diagnostic log.
+                eprintln!(
+                    "ai-memory: backfill of {} session {} failed: {error:#}",
+                    session.harness.as_str(),
+                    display_id(&session.native_session_id)
+                );
             }
         }
     }
 
     write_sentinel(&config.data_dir, &cwd);
-    finish(&args, &report)
+    finish(&args, &report)?;
+    if report.failed_sessions > 0 {
+        bail!(
+            "backfill failed to import {} of {} selected session(s)",
+            report.failed_sessions,
+            report.selected
+        );
+    }
+    Ok(())
 }
 
 /// Sum the server's per-agent session counts for this scope; zero means empty.
@@ -552,6 +562,9 @@ fn finish(args: &crate::cli::BackfillArgs, report: &BackfillReport) -> Result<()
         "📼 ai-memory imported {} prior local session(s) (~{} events) for {}/{}.",
         report.imported_sessions, report.imported_events, report.workspace, report.project
     );
+    if report.failed_sessions > 0 {
+        line.push_str(&format!(" {} session(s) failed.", report.failed_sessions));
+    }
     if report.skipped_for_cap > 0 {
         line.push_str(&format!(
             " {} older session(s) skipped (import cap).",
