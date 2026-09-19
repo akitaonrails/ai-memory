@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- CLI commands no longer fail at startup when an `[[llm_fallbacks]]` profile's
+  `api_key_env` variable is absent from the invoking shell. `Config::load`
+  validated every fallback credential eagerly, so read-only commands such as
+  `ai-memory status` exited with `llm_fallbacks[0].api_key_env=... is set but
+  the environment variable is missing or empty` even when the running server
+  had the key injected by its service wrapper, which pushed operators to export
+  provider keys in every shell. The missing credential is now enforced where it
+  is needed: `ai-memory serve` still refuses to start without it, and building
+  the LLM chain still fails rather than silently dropping the fallback. Every
+  other profile check (provider, model, base URL) still runs at load for every
+  command (#762).
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
   recognize and drop OpenCode subagent sessions. Previously both plugins emitted

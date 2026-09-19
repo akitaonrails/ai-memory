@@ -61,9 +61,13 @@ api_key_env = "GEMINI_API_KEY"
 
 `api_key_env` is optional when the provider already has a native credential
 source, such as OpenAI OAuth or Copilot. The loader validates every profile and
-resolves all credential material once. A missing credential, invalid provider,
-or malformed profile fails startup rather than leaving a latent fallback that
-only fails under an outage.
+resolves all credential material once. An invalid provider or malformed profile
+fails every command at load. A credential whose `api_key_env` variable is absent
+fails `ai-memory serve` at startup, rather than leaving a latent fallback that
+only fails under an outage, but does not stop other commands: `ai-memory
+status` and the other thin clients never build the chain, so the variable only
+has to be in the server's environment (for example a service wrapper's env
+block), not exported in every shell.
 
 The proposed initial semantics are append-only: the primary runs first, then
 the fallbacks in declaration order. No environment-variable shorthand is added
@@ -144,7 +148,9 @@ or trigger background recovery traffic.
 4. Verify an open circuit skips only its `(provider, model)` candidate and a
    success closes it.
 5. Test configuration validation, including missing/empty profiles and missing
-   credentials, through `Config::load()` without reading a real home directory.
+   credentials, through `Config::load()` without reading a real home directory;
+   a missing credential is checked by `require_llm_fallback_credentials()` and
+   `llm_provider_chain()`, not by `load`.
 6. Test health snapshots for candidate labels and redaction.
 7. Keep existing single-provider config tests byte-for-byte compatible.
 
