@@ -23,6 +23,9 @@ behavior and touches the trust boundary (retroactive untrusted text enters the s
    re-spawning. Live hook capture (install-time forward) and backfill (before-install
    history) do not overlap, so there is no double-capture to reconcile.
 
+`backfill --dry-run` only plans the import; it neither creates nor overwrites
+the local sentinel, so it does not suppress a later automatic attempt.
+
 The automatic path runs detached and silent (like Claude Code's own auto-memory); the
 `📼 imported N session(s)` summary is shown on a **manual** `ai-memory backfill` only.
 Surfacing the count in the next session's on-start context is a possible follow-up

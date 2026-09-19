@@ -157,7 +157,9 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
     // that it has been attempted for this checkout, so it runs at most once per
     // machine regardless of outcome. Manual runs ignore both.
     if args.auto && !config.backfill_on_start {
-        write_sentinel(&config.data_dir, &cwd);
+        if !args.dry_run {
+            write_sentinel(&config.data_dir, &cwd);
+        }
         return Ok(());
     }
 
@@ -180,7 +182,9 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
         if !empty {
             report.skipped_non_empty = true;
             // Mark attempted so the auto-trigger stops probing this checkout.
-            write_sentinel(&config.data_dir, &cwd);
+            if !args.dry_run {
+                write_sentinel(&config.data_dir, &cwd);
+            }
             return finish(&args, &report);
         }
     }
@@ -191,7 +195,6 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
     report.selected = selected.len();
 
     if args.dry_run {
-        write_sentinel(&config.data_dir, &cwd);
         return finish(&args, &report);
     }
 

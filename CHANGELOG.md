@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `backfill --dry-run` recorded a completed attempt and suppressed the next
+  automatic import. Planning now leaves the backfill sentinel untouched, even
+  for populated projects or an opted-out automatic invocation (#785).
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
   recognize and drop OpenCode subagent sessions. Previously both plugins emitted

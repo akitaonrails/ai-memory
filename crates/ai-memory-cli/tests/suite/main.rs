@@ -6,6 +6,7 @@
 //! so a new file must be declared here (`scripts/check-test-suites.*` enforces it).
 
 mod autoscope_env;
+mod backfill_dry_run;
 mod backfill_e2e;
 mod completions;
 mod doctor_e2e;
