@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--version` / force a re-download with `--force`. Optional
   `AI_MEMORY_RELEASE_BASE_URL` / `release_base_url` overrides the Releases
   base for mirrors and hermetic tests (loaded via `Config`, not ad-hoc env).
+  Downloads refuse bodies over 128 MiB (Content-Length and streamed cap).
   (#801)
 
 ## [2.3.2] - 2026-09-20

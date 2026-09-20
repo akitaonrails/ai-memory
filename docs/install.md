@@ -2398,7 +2398,9 @@ Homebrew/AUR/`/usr` installs (use the package manager), Windows self-replace
 wrapper/image instead). For mirrors or hermetic tests, set
 `AI_MEMORY_RELEASE_BASE_URL` (or `release_base_url` in config.toml) to a
 Releases-compatible base that serves `{base}/latest/tag` and
-`{base}/download/<tag>/<asset>` (+ `.sha256`).
+`{base}/download/<tag>/<asset>` (+ `.sha256`). That override is a trust
+boundary: archive and checksum are fetched from the same base, so point it
+only at origins you control. Each response body is capped at 128 MiB.
 
 ### Shared notes
 
