@@ -55,7 +55,7 @@ async fn run_unix(config: &Config, args: UpgradeArgs) -> Result<()> {
     }
 
     let fetcher = ReqwestFetcher::new()?;
-    let base = release_base_url();
+    let base = release_base_url(config);
     let tag = resolve_tag(&fetcher, &base, args.version.as_deref()).await?;
     let current = env!("CARGO_PKG_VERSION");
     if !args.force && versions_match(&tag, current) {
@@ -193,9 +193,14 @@ fn is_writable_file(path: &Path) -> bool {
     fs::OpenOptions::new().write(true).open(path).is_ok()
 }
 
-fn release_base_url() -> String {
-    std::env::var("AI_MEMORY_RELEASE_BASE_URL")
-        .unwrap_or_else(|_| format!("https://github.com/{RELEASE_OWNER_REPO}/releases"))
+fn release_base_url(config: &Config) -> String {
+    config
+        .release_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://github.com/{RELEASE_OWNER_REPO}/releases"))
 }
 
 fn release_asset_name() -> Option<&'static str> {
@@ -686,6 +691,69 @@ mod tests {
         replace_file_atomic(&src, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new");
         assert!(!dest.with_extension("new").exists());
+    }
+
+    #[test]
+    fn replace_dir_atomic_swaps_tree_and_cleans_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("hooks");
+        let src = dir.path().join("fresh-hooks");
+        fs::create_dir_all(dest.join("claude-code")).unwrap();
+        fs::write(dest.join("claude-code/old.sh"), b"old").unwrap();
+        fs::create_dir_all(src.join("claude-code")).unwrap();
+        fs::write(src.join("claude-code/new.sh"), b"new").unwrap();
+
+        replace_dir_atomic(&src, &dest).unwrap();
+
+        assert_eq!(fs::read(dest.join("claude-code/new.sh")).unwrap(), b"new");
+        assert!(!dest.join("claude-code/old.sh").exists());
+        assert!(!dir.path().join(".hooks.old").exists());
+        assert!(!dir.path().join(".hooks.new").exists());
+    }
+
+    #[test]
+    fn release_base_url_prefers_config_override() {
+        let mut config = Config::default();
+        assert!(
+            release_base_url(&config).contains("github.com/akitaonrails/ai-memory/releases")
+        );
+        config.release_base_url = Some(" http://127.0.0.1:9/releases ".into());
+        assert_eq!(release_base_url(&config), "http://127.0.0.1:9/releases");
+    }
+
+    #[tokio::test]
+    async fn resolve_tag_reads_latest_tag_from_non_github_base() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = "v9.9.9";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let fetcher = ReqwestFetcher::new().unwrap();
+        let base = format!("http://{addr}/releases");
+        let tag = resolve_tag(&fetcher, &base, None).await.unwrap();
+        assert_eq!(tag, "v9.9.9");
+    }
+
+    #[tokio::test]
+    async fn resolve_tag_honors_pinned_version_without_network() {
+        let fetcher = ReqwestFetcher::new().unwrap();
+        let tag = resolve_tag(&fetcher, "http://127.0.0.1:1/unused", Some("2.3.2"))
+            .await
+            .unwrap();
+        assert_eq!(tag, "v2.3.2");
     }
 
     #[test]

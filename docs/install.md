@@ -2395,7 +2395,10 @@ the on-disk binary (and a sibling `hooks/` directory when present), then
 re-stages hooks for agents already under the data-dir hooks tree. It refuses
 Homebrew/AUR/`/usr` installs (use the package manager), Windows self-replace
 (download the zip manually), and in-container binaries (upgrade the host
-wrapper/image instead).
+wrapper/image instead). For mirrors or hermetic tests, set
+`AI_MEMORY_RELEASE_BASE_URL` (or `release_base_url` in config.toml) to a
+Releases-compatible base that serves `{base}/latest/tag` and
+`{base}/download/<tag>/<asset>` (+ `.sha256`).
 
 ### Shared notes
 

@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   present), then re-runs `install-hooks --apply` for staged agents. Refuses
   package-managed paths (Homebrew/AUR/`/usr`), containers, and Windows
   self-replace; the Docker wrapper's `upgrade` path is unchanged. Pin with
-  `--version` / force a re-download with `--force`. (#801)
+  `--version` / force a re-download with `--force`. Optional
+  `AI_MEMORY_RELEASE_BASE_URL` / `release_base_url` overrides the Releases
+  base for mirrors and hermetic tests (loaded via `Config`, not ad-hoc env).
+  (#801)
 
 ## [2.3.2] - 2026-09-20
 
