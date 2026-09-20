@@ -55,6 +55,12 @@ regexes = [
     '''123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11''',
     '''ABC-DEF1234ghIkl-zyx57W2v1u123ew11''',
     '''Bearer abcdef0123456789ABCDEF0123456789''',
+    # Fixtures for the JSON-quoted value, scheme-prefixed header and
+    # unprefixed-assignment tests: a JSON `api_key`, a `client-token`, an
+    # `authorization: Token`, an Azure `AccountKey=` and an npm `_authToken=`.
+    # `generic-api-key` extracts the value alone, so the FAKE marker lives
+    # inside the value rather than in the key.
+    '''FAKEfake0123456789[A-Za-z0-9]*={0,2}''',
     '''xoxb-1234567890-abcdefghij''',
 
     # ---- Canary string used by the e2e test in tests/e2e/ ----

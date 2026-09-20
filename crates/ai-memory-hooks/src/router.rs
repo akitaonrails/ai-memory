@@ -1976,8 +1976,19 @@ fn cache_key_for(
 
 fn normalize_project_path_key(path: &str) -> String {
     let normalized = path.replace('\\', "/");
-    if normalized.len() > 1 {
+    let normalized = if normalized.len() > 1 {
         normalized.trim_end_matches('/').to_string()
+    } else {
+        normalized
+    };
+    // Same Windows-path folding as `ai_memory_store::normalize_cwd`: a Linux
+    // server comparing host cwds from Docker Desktop must treat `C:\Repo`
+    // and `c:\repo` as one tree, or session stickiness splits the project.
+    let bytes = normalized.as_bytes();
+    if (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || normalized.starts_with("//")
+    {
+        normalized.to_ascii_lowercase()
     } else {
         normalized
     }
@@ -4244,6 +4255,19 @@ mod tests {
             Some("/a/b"),
             None,
             Some("/home/user"),
+        ));
+
+        // Windows host cwd reaching a Linux server (Docker Desktop): drive
+        // letter and path case must not split one session into two projects.
+        assert!(sticky_within_session_tree(
+            Some(r"C:\Users\alice\repo"),
+            Some(r"c:\users\alice\repo\src"),
+            Some(r"C:\Users\alice"),
+        ));
+        assert!(!sticky_within_session_tree(
+            Some(r"C:\Users\alice"),
+            Some(r"c:\users\alice\repo"),
+            Some(r"C:\Users\alice"),
         ));
     }
 

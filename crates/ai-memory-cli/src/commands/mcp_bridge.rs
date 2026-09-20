@@ -198,7 +198,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::Router;
-    use rmcp::model::{Content, ServerCapabilities, Tool};
+    use rmcp::model::{ContentBlock as Content, ServerCapabilities, Tool};
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,

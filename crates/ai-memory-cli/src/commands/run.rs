@@ -4,8 +4,6 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use ai_memory_core::{
@@ -23,6 +21,7 @@ use ai_memory_workstream::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::cli::{RunArgs, RunHarnessChoice};
 use crate::commands::{path_util, resolve_scope};
@@ -165,8 +164,8 @@ pub(super) async fn run_from_with_wiring(
         new_workstream: args.new_workstream,
         lease_owner: lease_owner(),
     };
-    let interrupted_before_spawn = Arc::new(AtomicBool::new(false));
-    let interrupt_task = tokio::spawn(capture_interrupts(Arc::clone(&interrupted_before_spawn)));
+    let interrupted_before_spawn = CancellationToken::new();
+    let interrupt_task = tokio::spawn(capture_interrupts(interrupted_before_spawn.clone()));
     let prepared = prepare_managed_run(&endpoint, &prepare)
         .await
         .context("opening managed workstream; the agent was not started");
@@ -201,7 +200,7 @@ pub(super) async fn run_from_with_wiring(
             }
         };
     }
-    if interrupted_before_spawn.load(Ordering::SeqCst) {
+    if interrupted_before_spawn.is_cancelled() {
         acquired_try!(Err(anyhow!(
             "managed run interrupted before the agent started"
         )));
@@ -319,6 +318,7 @@ pub(super) async fn run_from_with_wiring(
                         candidates,
                         &endpoint,
                         &run_path,
+                        &interrupted_before_spawn,
                     )
                     .await
                 );
@@ -417,7 +417,7 @@ pub(super) async fn run_from_with_wiring(
         plan.args
             .extend([OsString::from("--rules"), OsString::from(context)]);
     }
-    if interrupted_before_spawn.load(Ordering::SeqCst) {
+    if interrupted_before_spawn.is_cancelled() {
         acquired_try!(Err(anyhow!(
             "managed run interrupted before the agent started"
         )));
@@ -578,9 +578,9 @@ pub(super) async fn run_from_with_wiring(
     Ok(exit_code)
 }
 
-async fn capture_interrupts(interrupted: Arc<AtomicBool>) {
+async fn capture_interrupts(interrupted: CancellationToken) {
     while tokio::signal::ctrl_c().await.is_ok() {
-        interrupted.store(true, Ordering::SeqCst);
+        interrupted.cancel();
     }
 }
 
@@ -1081,39 +1081,61 @@ async fn choose_native_session_interactive(
     candidates: Vec<NativeSessionCandidate>,
     endpoint: &ServerEndpoint,
     run_path: &str,
+    interrupted: &CancellationToken,
 ) -> Result<io::Result<Option<String>>> {
-    let mut chooser = tokio::task::spawn_blocking(move || {
+    let chooser = tokio::task::spawn_blocking(move || {
         let stdin = io::stdin();
-        let stderr = io::stderr();
+        let mut stderr = io::stderr();
         choose_native_session(
             harness,
             &workstream_name,
             &candidates,
             &mut stdin.lock(),
-            &mut stderr.lock(),
+            // Keep stderr available to report cancellation while stdin is blocked.
+            &mut stderr,
             SystemTime::now(),
         )
     });
-    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    heartbeat.tick().await;
-    let mut heartbeat_health = HeartbeatHealth::default();
-    let selection = loop {
-        tokio::select! {
-            result = &mut chooser => {
-                break result.context("waiting for the native session choice")?;
-            }
-            _ = heartbeat.tick() => {
-                let _ = send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health).await;
-            }
+    wait_for_native_session_choice(chooser, endpoint, run_path, interrupted).await
+}
+
+async fn wait_for_native_session_choice(
+    mut chooser: tokio::task::JoinHandle<io::Result<Option<String>>>,
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    interrupted: &CancellationToken,
+) -> Result<io::Result<Option<String>>> {
+    tokio::select! {
+        biased;
+        _ = interrupted.cancelled() => {
+            // A running stdin read cannot be aborted. The CLI runtime's bounded
+            // shutdown lets the process exit after the caller cancels the lease.
+            chooser.abort();
+            Err(anyhow!("managed run interrupted before the agent started"))
         }
-    };
-    send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health)
-        .await
-        .context(
-            "renewing the managed workstream after session selection; the agent was not started",
-        )?;
-    Ok(selection)
+        result = async {
+            let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            let mut heartbeat_health = HeartbeatHealth::default();
+            let selection = loop {
+                tokio::select! {
+                    result = &mut chooser => {
+                        break result.context("waiting for the native session choice")?;
+                    }
+                    _ = heartbeat.tick() => {
+                        let _ = send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health).await;
+                    }
+                }
+            };
+            send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health)
+                .await
+                .context(
+                    "renewing the managed workstream after session selection; the agent was not started",
+                )?;
+            Ok(selection)
+        } => result,
+    }
 }
 
 fn choose_native_session(
@@ -1423,7 +1445,8 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
 mod tests {
     use std::ffi::{OsStr, OsString};
     use std::io::Cursor;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ai_memory_core::{ManagedRunId, WorkstreamId};
     use axum::Router;
@@ -1434,6 +1457,121 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
+
+    #[tokio::test(start_paused = true)]
+    async fn native_session_choice_interrupt_does_not_wait_for_input() {
+        let interrupted = CancellationToken::new();
+        let signal = interrupted.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            signal.cancel();
+        });
+        let chooser = tokio::spawn(std::future::pending());
+        let abort = chooser.abort_handle();
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:1".into()), None);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_native_session_choice(chooser, &endpoint, "/unused", &interrupted),
+        )
+        .await;
+        abort.abort();
+
+        let error = result
+            .expect("Ctrl-C must not wait for a line of stdin")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted before the agent started")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_session_choice_preserves_an_earlier_interrupt() {
+        let interrupted = CancellationToken::new();
+        interrupted.cancel();
+        let chooser = tokio::spawn(std::future::pending());
+        let abort = chooser.abort_handle();
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:1".into()), None);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_native_session_choice(chooser, &endpoint, "/unused", &interrupted),
+        )
+        .await;
+        abort.abort();
+
+        assert!(
+            result
+                .expect("an earlier Ctrl-C must remain observable")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_session_choice_still_renews_before_returning_selection() {
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let observed = heartbeats.clone();
+        let app = Router::new().route(
+            "/run/heartbeat",
+            post(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::NO_CONTENT }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = ServerEndpoint::from_pair(
+            Some(format!("http://{}", listener.local_addr().unwrap())),
+            None,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let chooser = tokio::spawn(async { Ok(Some("selected-session".into())) });
+        let selected =
+            wait_for_native_session_choice(chooser, &endpoint, "/run", &CancellationToken::new())
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(selected.as_deref(), Some("selected-session"));
+        assert_eq!(heartbeats.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_session_choice_interrupt_cancels_a_stalled_heartbeat() {
+        let interrupted = CancellationToken::new();
+        let signal = interrupted.clone();
+        let app = Router::new().route(
+            "/run/heartbeat",
+            post(move || {
+                signal.cancel();
+                std::future::pending::<StatusCode>()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = ServerEndpoint::from_pair(
+            Some(format!("http://{}", listener.local_addr().unwrap())),
+            None,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let chooser = tokio::spawn(async { Ok(None) });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_native_session_choice(chooser, &endpoint, "/run", &interrupted),
+        )
+        .await;
+        server.abort();
+
+        let error = result
+            .expect("Ctrl-C must also cancel an in-flight heartbeat")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("interrupted before the agent started")
+        );
+    }
 
     /// `show` filters its harness menu with this, so a false positive would
     /// offer an agent that cannot start.

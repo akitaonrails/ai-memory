@@ -26,6 +26,10 @@
 //! `[sanitize].allowlist` — the allowlist is checked *per match*, so a
 //! pattern still runs but an allowlisted span survives unchanged.
 //!
+//! Terminal escape sequences, NUL and bidi overrides are stripped rather
+//! than redacted: they are not secrets, but stored text is replayed to a
+//! terminal by the CLI, and a NUL makes the markdown file binary.
+//!
 //! ## What we deliberately do not catch
 //!
 //! Standalone high-entropy strings (e.g. a 32-char random hex) cannot
@@ -44,6 +48,20 @@ use crate::NewObservation;
 /// may impose smaller limits, but no sanitized observation can cross the store
 /// boundary above 16 KiB.
 pub const OBSERVATION_BODY_MAX_BYTES: usize = 16 * 1024;
+
+/// ANSI/VT escape sequences: CSI (`ESC [ ... final`), OSC (`ESC ] ... BEL` or
+/// `ESC \\`), and the two-character forms. Removed whole, so a colour code
+/// does not leave `[31m` behind as text.
+const ESCAPE_SEQUENCES: &str =
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]";
+
+/// C0 and C1 controls except tab, newline and carriage return, DEL, and the
+/// bidi overrides that let stored text render as something else.
+const fn is_stripped_control(c: char) -> bool {
+    matches!(c,
+        '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}'
+        | '\u{7f}'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
 
 /// Compile-time list of redaction patterns. Order is intentional:
 /// more-specific patterns first. False positives are acceptable —
@@ -145,31 +163,47 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // protects an already-redacted value: `[REDACTED]` starts with `[`,
     // which the value character class excludes outright.
     (
-        r#"(?i)\b[A-Za-z0-9-]*(?:authentication|authorization|credentials?|password|passwd|apikey|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))\s*:\s*[A-Za-z0-9._~+/=-]{8,}"#,
+        r#"(?i)\b[A-Za-z0-9_-]*(?:authentication|authorization|credentials?|password|passwd|apikey|accountkey|authtoken|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))"?\s*[=:]\s*(?:(?:basic|bearer|digest|token|apikey)\s+)?"?[A-Za-z0-9._~+/=-]{8,}"#,
         "auth_header",
     ),
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
     // even without `sk-` shape).
     (
-        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)\s*[=:]\s*\S+"#,
+        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)"?\s*[=:]\s*\S+"#,
         "env_secret",
     ),
     // Generic env-var catch-all: any *_KEY / *_TOKEN / *_SECRET /
     // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
     (
-        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)\s*[=:]\s*\S+"#,
+        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)"?\s*[=:]\s*\S+"#,
         "env_secret",
     ),
-    // Filesystem paths that commonly contain credentials.
-    (r"(?:/[^/\s]+)*/\.ssh(?:/[^\s]+)?", "credential_path"),
-    (r"(?:/[^/\s]+)*/\.aws(?:/[^\s]+)?", "credential_path"),
-    (r"(?:/[^/\s]+)*/\.kube(?:/[^\s]+)?", "credential_path"),
+    // Filesystem paths that commonly contain credentials. The separator
+    // class is `[\\/]` and an optional `X:` drive prefix is accepted so a
+    // Windows agent echoing `C:\Users\alice\.ssh\id_rsa` is redacted the
+    // same way as `/home/user/.ssh/id_rsa`. Case-insensitive because NTFS
+    // is; Unix paths stay covered because they still start with `/`.
     (
-        r"(?:/[^/\s]+)*/\.config/gcloud(?:/[^\s]+)?",
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.ssh(?:[\\/][^\s]+)?",
         "credential_path",
     ),
-    (r"(?:/[^/\s]+)*/\.gnupg(?:/[^\s]+)?", "credential_path"),
+    (
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.aws(?:[\\/][^\s]+)?",
+        "credential_path",
+    ),
+    (
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.kube(?:[\\/][^\s]+)?",
+        "credential_path",
+    ),
+    (
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.config[\\/]gcloud(?:[\\/][^\s]+)?",
+        "credential_path",
+    ),
+    (
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.gnupg(?:[\\/][^\s]+)?",
+        "credential_path",
+    ),
 ];
 
 /// Stateful sanitizer. Cheap to clone — wraps an `Arc` of compiled
@@ -182,6 +216,7 @@ pub struct Sanitizer {
 struct SanitizerInner {
     patterns: Vec<(Regex, &'static str)>,
     allowlist: Vec<String>,
+    escapes: Regex,
 }
 
 impl std::fmt::Debug for Sanitizer {
@@ -227,6 +262,7 @@ impl Sanitizer {
             inner: Arc::new(SanitizerInner {
                 patterns,
                 allowlist: cfg.allowlist.clone(),
+                escapes: Regex::new(ESCAPE_SEQUENCES)?,
             }),
         })
     }
@@ -243,7 +279,9 @@ impl Sanitizer {
     /// allowlist entry, in which case it is left alone.
     #[must_use]
     pub fn scrub(&self, input: &str) -> String {
-        let mut out = input.to_string();
+        // Before the redaction passes: an escape inside a secret would
+        // otherwise split it out of reach of every pattern below.
+        let mut out = self.strip_control(input);
         for (re, label) in &self.inner.patterns {
             out = re
                 .replace_all(&out, |caps: &regex::Captures<'_>| {
@@ -258,6 +296,25 @@ impl Sanitizer {
                 .into_owned();
         }
         out
+    }
+
+    /// Drop terminal escape sequences and the control characters that have
+    /// no place in a page.
+    ///
+    /// Captured text is replayed to a terminal by `ai-memory read-page` and
+    /// `search`, where an escape rewrites the screen or the window title, and
+    /// a bidi override reverses what the reader sees. A NUL additionally
+    /// makes the markdown file binary, which costs it `grep` and git diffs.
+    fn strip_control(&self, input: &str) -> String {
+        let stripped = self.inner.escapes.replace_all(input, "");
+        if stripped.contains(is_stripped_control) {
+            stripped
+                .chars()
+                .filter(|c| !is_stripped_control(*c))
+                .collect()
+        } else {
+            stripped.into_owned()
+        }
     }
 }
 
@@ -676,6 +733,31 @@ mod tests {
         assert!(out2.contains("[REDACTED:"));
     }
 
+    /// Windows agent output uses backslashes. The Unix-only `/.ssh` rules left
+    /// `C:\Users\alice\.ssh\id_rsa` (and the same for `.aws` / `.kube` /
+    /// `.gnupg` / `.config\gcloud`) in the stored observation.
+    #[test]
+    fn scrubs_windows_credential_paths() {
+        for text in [
+            r"read C:\Users\alice\.ssh\id_rsa",
+            r"copy C:\Users\alice\.aws\credentials",
+            r"KUBECONFIG=C:\Users\alice\.kube\config",
+            r"GNUPGHOME=C:\Users\alice\.gnupg\private-keys-v1.d",
+            r"gcloud auth C:\Users\alice\.config\gcloud\credentials.db",
+        ] {
+            let out = s().scrub(text);
+            assert!(out.contains("[REDACTED:"), "not redacted: {text} -> {out}");
+            assert!(
+                !out.to_ascii_lowercase().contains(r"\users\alice\"),
+                "leaked profile path: {text} -> {out}"
+            );
+        }
+        // Unix paths still redact after the separator class is widened.
+        let unix = s().scrub("see /home/user/.ssh/id_ed25519");
+        assert!(unix.contains("[REDACTED:"));
+        assert!(!unix.contains("/home/user/.ssh"));
+    }
+
     /// Opaque auth headers reach capture via tool output echoing curl. The
     /// `bearer\s+` rule needs the literal keyword and the generic env rule
     /// needs `UPPER_SNAKE_TOKEN=`, so a kebab-case header matched neither.
@@ -879,5 +961,98 @@ mod tests {
             out.contains("PROJECT_TOKEN_PUBLIC"),
             "allowlist span should survive; got: {out}"
         );
+    }
+
+    /// JSON is the shape most captured tool payloads arrive in, and the
+    /// quote before the value used to put it outside the value class, so the
+    /// same secret was redacted in YAML and stored verbatim in JSON.
+    #[test]
+    fn scrubs_secret_values_in_json() {
+        for raw in [
+            r#"{"db_password":"correct-horse-battery"}"#,
+            r#"{"password": "hunter2hunter2"}"#,
+            r#""api_key": "FAKEfake0123456789abcdef""#,
+            r#"{"client-token":"FAKEfake0123456789"}"#,
+        ] {
+            let out = s().scrub(raw);
+            assert!(
+                out.contains("[REDACTED:"),
+                "JSON-quoted secret must be redacted: {raw} -> {out}"
+            );
+        }
+    }
+
+    /// `Authorization: Basic <base64>` carries `user:password`. The scheme
+    /// word sits where the value class expected the secret, so the rule that
+    /// names `authorization` never fired; only `Bearer` was caught, and only
+    /// because a separate pattern matches the scheme keyword itself.
+    #[test]
+    fn scrubs_scheme_prefixed_authorization_headers() {
+        for raw in [
+            "Authorization: Basic YWRtaW46c2VjcmV0cGFzc3dvcmQ=",
+            "authorization: Token FAKEfake0123456789",
+            "Proxy-Authorization: Digest cmVhbG09ZXhhbXBsZQ==",
+        ] {
+            let out = s().scrub(raw);
+            assert!(
+                out.contains("[REDACTED:"),
+                "scheme-prefixed credential must be redacted: {raw} -> {out}"
+            );
+        }
+    }
+
+    /// Azure storage connection strings and npm `_authToken` name the secret
+    /// without the underscore the generic env rule requires.
+    #[test]
+    fn scrubs_unprefixed_account_and_auth_token_assignments() {
+        for raw in [
+            "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=FAKEfake0123456789==;",
+            "//registry.npmjs.org/:_authToken=npm_FAKEfake0123456789abcdefghij",
+        ] {
+            let out = s().scrub(raw);
+            assert!(
+                out.contains("[REDACTED:"),
+                "assignment must be redacted: {raw} -> {out}"
+            );
+        }
+    }
+
+    /// Page bodies and observations are replayed to a terminal by
+    /// `ai-memory read-page` / `search`, and a NUL makes the markdown file
+    /// binary, so `grep` skips it and git stops diffing it.
+    #[test]
+    fn strips_terminal_control_sequences_and_nul() {
+        let out = s().scrub(
+            "red \u{1b}[31mtext\u{1b}[0m title \u{1b}]0;pwned\u{7}\
+             bidi \u{202e}reversed\u{202c} nul \u{0}end\n\ttabbed",
+        );
+        for bad in ['\u{1b}', '\u{7}', '\u{0}', '\u{202e}', '\u{202c}'] {
+            assert!(
+                !out.contains(bad),
+                "{bad:?} must not survive into a page or a terminal: {out:?}"
+            );
+        }
+        assert!(
+            !out.contains("[31m") && !out.contains("]0;"),
+            "the sequence bodies must go with their escapes: {out:?}"
+        );
+        assert!(
+            out.contains("red text title ") && out.ends_with("end\n\ttabbed"),
+            "text, newlines and tabs must survive: {out:?}"
+        );
+    }
+
+    /// The value floor is what keeps ordinary `key: value` prose intact; the
+    /// new quote and scheme allowances must not erode it.
+    #[test]
+    fn keeps_short_and_non_secret_values() {
+        for raw in [
+            "Access-Control-Allow-Credentials: true",
+            "Idempotency-Key: abc",
+            "note: the password is stored in 1Password",
+        ] {
+            let out = s().scrub(raw);
+            assert_eq!(out, raw, "must be left alone: {raw}");
+        }
     }
 }

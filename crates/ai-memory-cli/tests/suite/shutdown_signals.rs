@@ -82,6 +82,180 @@ const STDIO_STOP_AFTER_HANDSHAKE: &str = "stopping the stdio transport";
 /// connects. Distinguishing the two is what keeps that test honest.
 const STDIO_STOP_BEFORE_CLIENT: &str = "shutdown signal received before a client connected";
 
+// `script` supplies a real terminal for both stdin and stderr. Pipes skip the
+// native-session chooser entirely, and unit tests cannot catch its stderr lock.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod native_selector {
+    use super::*;
+    use axum::{Json, Router, http::StatusCode, routing::post};
+    use serde_json::json;
+    use std::io::Read;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    struct Terminal {
+        child: Child,
+        pid_file: PathBuf,
+        output: Receiver<String>,
+        seen: String,
+    }
+
+    impl Terminal {
+        fn wait_for(&mut self, needle: &str) {
+            let deadline = Instant::now() + READY_TIMEOUT;
+            while !self.seen.contains(needle) {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                match self.output.recv_timeout(timeout) {
+                    Ok(chunk) => self.seen.push_str(&chunk),
+                    Err(error) => panic!("missing {needle:?}: {error}; output:\n{}", self.seen),
+                }
+            }
+        }
+    }
+
+    impl Drop for Terminal {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                // Reap the launcher too if an assertion fails before it exits.
+                if let Ok(pid) = std::fs::read_to_string(&self.pid_file) {
+                    let _ = Command::new("kill").args(["-KILL", pid.trim()]).status();
+                }
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupt_releases_native_selector_without_enter() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let native = home.join(".claude/projects/fixture");
+        std::fs::create_dir_all(&native).unwrap();
+        crate::e2e_support::write_jsonl(
+            &native.join("session.jsonl"),
+            &[json!({"sessionId": "12345678-1234-4234-9234-123456789abc", "cwd": root})],
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let app = Router::new().fallback(post(move |uri: axum::http::Uri| {
+            let observed = observed.clone();
+            async move {
+                observed.lock().unwrap().push(uri.path().to_owned());
+                if uri.path() == "/workstream/runs" {
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "workstream_id": "12345678-1234-4234-9234-123456789abd",
+                            "workstream_name": "fixture",
+                            "run_id": "12345678-1234-4234-9234-123456789abe",
+                            "resolved_agent": "claude-code",
+                            "sync_after": 0, "sync_through": 0,
+                            "may_adopt_existing_session": true,
+                        })),
+                    )
+                } else {
+                    (StatusCode::NO_CONTENT, Json(json!(null)))
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let runner = root.join("runner.sh");
+        let pid_file = root.join("launcher.pid");
+        std::fs::write(
+            &runner,
+            concat!(
+                "printf '%s\\n' \"$$\" > \"$PICKER_PID_FILE\"\n",
+                "exec \"$PICKER_BINARY\" run --no-autowire --executable /usr/bin/true claude\n",
+            ),
+        )
+        .unwrap();
+        let mut command = crate::e2e_support::hermetic("script");
+        #[cfg(target_os = "macos")]
+        command.args(["-qe", "/dev/null", "/bin/sh"]).arg(&runner);
+        #[cfg(target_os = "linux")]
+        command.args(["-qec", "exec /bin/sh \"$PICKER_RUNNER\"", "/dev/null"]);
+        command
+            .current_dir(&root)
+            .env("PICKER_RUNNER", &runner)
+            .env("PICKER_PID_FILE", &pid_file)
+            .env("PICKER_BINARY", bin())
+            .env("AI_MEMORY_HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("AI_MEMORY_DATA_DIR", root.join("data"))
+            .env("AI_MEMORY_SERVER_URL", format!("http://{address}"))
+            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .expect("script must provide a pseudo-terminal");
+        let mut stdout = child.stdout.take().unwrap();
+        let (tx, output) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0; 1024];
+            while let Ok(count) = stdout.read(&mut buffer) {
+                if count == 0
+                    || tx
+                        .send(String::from_utf8_lossy(&buffer[..count]).into_owned())
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut terminal = Terminal {
+            child,
+            pid_file,
+            output,
+            seen: String::new(),
+        };
+        terminal.wait_for("Select [1]: ");
+        let pid = std::fs::read_to_string(&terminal.pid_file).unwrap();
+        assert!(
+            Command::new("kill")
+                .args(["-INT", pid.trim()])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // Keep stdin open and send no newline: only the interrupt may unblock it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = terminal.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "selector ignored SIGINT; output:\n{}",
+                terminal.seen
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        terminal.wait_for("managed run interrupted before the agent started");
+        assert_eq!(
+            status.code(),
+            Some(1),
+            "must report cancellation, not die from SIGINT"
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                "/workstream/runs",
+                "/workstream/runs/12345678-1234-4234-9234-123456789abe/cancel",
+            ],
+            "must cancel the acquired lease without linking or starting a session"
+        );
+        server.abort();
+    }
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ai-memory")
 }

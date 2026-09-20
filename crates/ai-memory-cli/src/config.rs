@@ -172,10 +172,11 @@ pub struct Config {
     #[serde(default)]
     pub base_path: String,
     /// Operator home directory, captured once here (the single config-read
-    /// path) from `AI_MEMORY_HOME` or `$HOME`. Used to keep the cwd->project resolver and the
-    /// startup heal from treating `$HOME` as a prefix-match catch-all
-    /// (issue #103) without env reads scattered through the runtime. Not a
-    /// config.toml key: always derived from the process environment at load.
+    /// path) from `AI_MEMORY_HOME`, `$HOME`, or Windows `%USERPROFILE%`. Used
+    /// to keep the cwd->project resolver and the startup heal from treating
+    /// the user profile as a prefix-match catch-all (issue #103) without env
+    /// reads scattered through the runtime. Not a config.toml key: always
+    /// derived from the process environment at load.
     #[serde(skip)]
     pub home_dir: Option<String>,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
@@ -458,10 +459,16 @@ pub struct RuntimeEnv {
 
 impl RuntimeEnv {
     fn from_process() -> Self {
+        let platform_home = dirs::home_dir();
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
-            home_dir: env_string("AI_MEMORY_HOME").or_else(|| env_string("HOME")),
-            platform_home: dirs::home_dir(),
+            home_dir: resolve_operator_home(
+                env_string("AI_MEMORY_HOME").as_deref(),
+                env_string("HOME").as_deref(),
+                env_string("USERPROFILE").as_deref(),
+                platform_home.as_deref(),
+            ),
+            platform_home,
             codex_home: env_path("CODEX_HOME"),
             codex_executable: env_path("AI_MEMORY_CODEX_EXECUTABLE"),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
@@ -1131,7 +1138,9 @@ impl Config {
         // Home is captured once in RuntimeEnv (config-read-path invariant);
         // threaded to the resolver guard and startup heal so neither reads the
         // env directly. AI_MEMORY_HOME is accepted for tests/wrappers that need
-        // to emulate a host home distinct from the process HOME.
+        // to emulate a host home distinct from the process HOME. Native Windows
+        // often has no HOME; USERPROFILE (then dirs::home_dir) fills that gap
+        // so the #103 catch-all guard is not inert there.
         config.home_dir = runtime_env.home_dir.as_deref().and_then(normalize_home_dir);
 
         // CLI override always wins (figment doesn't see it because clap has
@@ -1805,6 +1814,32 @@ fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
     })
 }
 
+/// Operator home used as the #103 catch-all prefix guard.
+///
+/// Precedence: `AI_MEMORY_HOME`, then `$HOME`, then Windows `%USERPROFILE%`,
+/// then the platform home from `dirs`. Empty strings are skipped so an
+/// exported-but-blank `HOME` cannot hide a real profile. Arguments are
+/// injected so tests do not mutate process env (`std::env::set_var` is
+/// `unsafe` under edition 2024).
+fn resolve_operator_home(
+    ai_memory_home: Option<&str>,
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    platform_home: Option<&Path>,
+) -> Option<String> {
+    [ai_memory_home, home, userprofile]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            platform_home
+                .and_then(Path::to_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        })
+}
+
 fn env_string(name: &str) -> Option<String> {
     std::env::var(name).ok().and_then(|s| {
         let trimmed = s.trim();
@@ -2458,17 +2493,57 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cli_dir = tmp.path().join("override");
         let cfg = Config::load(None, Some(cli_dir)).unwrap();
-        // `home_dir` is derived from AI_MEMORY_HOME or `$HOME` at load (the
-        // single config-read path), normalized so a trailing slash can't bypass
-        // the catch-all guards. Reading the env in a test is allowed; this
-        // fails if the load-time assignment is dropped while either env var is
-        // set.
+        // `home_dir` is derived from AI_MEMORY_HOME, `$HOME`, or Windows
+        // `%USERPROFILE%` at load (the single config-read path), normalized so
+        // a trailing slash can't bypass the catch-all guards. Reading the env
+        // in a test is allowed; this fails if the load-time assignment is
+        // dropped while any of those vars is set.
         assert_eq!(
             cfg.home_dir,
             std::env::var("AI_MEMORY_HOME")
                 .or_else(|_| std::env::var("HOME"))
+                .or_else(|_| std::env::var("USERPROFILE"))
                 .ok()
                 .and_then(|h| normalize_home_dir(&h))
+                .or_else(|| dirs::home_dir()
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+                    .and_then(normalize_home_dir))
+        );
+    }
+
+    /// Native Windows often has `%USERPROFILE%` and no `$HOME`. The #103
+    /// catch-all guard is inert when `home_dir` stays `None`, so a project
+    /// whose `repo_path` is the user profile would prefix-match every cwd
+    /// beneath it.
+    #[test]
+    fn operator_home_falls_back_to_userprofile_when_home_is_unset() {
+        assert_eq!(
+            resolve_operator_home(None, None, Some(r"C:\Users\tester"), None).as_deref(),
+            Some(r"C:\Users\tester")
+        );
+        assert_eq!(
+            resolve_operator_home(
+                Some("/tmp/override"),
+                Some("/home/u"),
+                Some(r"C:\Users\tester"),
+                None
+            )
+            .as_deref(),
+            Some("/tmp/override")
+        );
+        assert_eq!(
+            resolve_operator_home(None, Some("/home/u"), Some(r"C:\Users\tester"), None).as_deref(),
+            Some("/home/u")
+        );
+        assert_eq!(
+            resolve_operator_home(None, Some(""), Some(r"C:\Users\tester"), None).as_deref(),
+            Some(r"C:\Users\tester")
+        );
+        let platform = PathBuf::from(r"C:\Users\from-dirs");
+        assert_eq!(
+            resolve_operator_home(None, None, None, Some(platform.as_path())).as_deref(),
+            Some(r"C:\Users\from-dirs")
         );
     }
 
