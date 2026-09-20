@@ -1,0 +1,20 @@
+name: sync-upstream
+
+on:
+  schedule:
+    # Every 6 hours — keep fork main aligned with akitaonrails/ai-memory
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync fork main from upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main
