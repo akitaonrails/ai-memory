@@ -423,6 +423,37 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// List agent dirs under a staged hooks root, skipping shared helper dirs.
+///
+/// `lib` and `_*-prefixed` directories hold shared helpers, not agents (#38).
+/// Unknown directory names are omitted (callers may log them).
+fn list_staged_agents(hooks_root: &Path) -> Result<(Vec<(String, AgentChoice)>, Vec<String>)> {
+    let mut agents = Vec::new();
+    let mut unknown = Vec::new();
+    for entry in fs::read_dir(hooks_root)
+        .with_context(|| format!("reading staged hooks at {}", hooks_root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name == "lib" || name.starts_with('_') {
+            continue;
+        }
+        match AgentChoice::from_str(name, true) {
+            Ok(agent) => agents.push((name.to_string(), agent)),
+            Err(_) => unknown.push(name.to_string()),
+        }
+    }
+    agents.sort_by(|a, b| a.0.cmp(&b.0));
+    unknown.sort();
+    Ok((agents, unknown))
+}
+
 fn refresh_staged_hooks(config: &Config) -> Result<()> {
     let staging = install_hooks::hook_staging_root(
         &config.data_dir,
@@ -435,28 +466,9 @@ fn refresh_staged_hooks(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    let mut agents = Vec::new();
-    for entry in fs::read_dir(&hooks_root)
-        .with_context(|| format!("reading staged hooks at {}", hooks_root.display()))?
-    {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        // `lib` and `_*-prefixed` dirs hold shared helpers, not agents (#38).
-        if name == "lib" || name.starts_with('_') {
-            continue;
-        }
-        match AgentChoice::from_str(name, true) {
-            Ok(agent) => agents.push((name.to_string(), agent)),
-            Err(_) => {
-                println!("  (skipping unknown staged agent dir `{name}`)");
-            }
-        }
+    let (agents, unknown) = list_staged_agents(&hooks_root)?;
+    for name in &unknown {
+        println!("  (skipping unknown staged agent dir `{name}`)");
     }
 
     if agents.is_empty() {
@@ -906,5 +918,34 @@ mod tests {
         assert!(is_loopback_url("http://127.0.0.1:49374"));
         assert!(is_loopback_url("http://localhost:49374"));
         assert!(!is_loopback_url("http://192.168.1.10:49374"));
+    }
+
+    #[test]
+    fn list_staged_agents_keeps_known_and_skips_helpers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let hooks = dir.path();
+        for name in ["claude-code", "cursor", "lib", "_shared", "not-an-agent"] {
+            fs::create_dir(hooks.join(name))?;
+        }
+        fs::write(hooks.join("README.md"), b"ignore files")?;
+
+        let (agents, unknown) = list_staged_agents(hooks)?;
+        let names: Vec<_> = agents.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["claude-code", "cursor"]);
+        assert_eq!(unknown, ["not-an-agent"]);
+        assert!(agents.iter().all(|(_, a)| {
+            matches!(a, AgentChoice::ClaudeCode | AgentChoice::Cursor)
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn list_staged_agents_empty_root_returns_empty() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::create_dir(dir.path().join("lib"))?;
+        let (agents, unknown) = list_staged_agents(dir.path())?;
+        assert!(agents.is_empty());
+        assert!(unknown.is_empty());
+        Ok(())
     }
 }
