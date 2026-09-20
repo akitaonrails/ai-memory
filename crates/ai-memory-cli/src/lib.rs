@@ -24,6 +24,7 @@ mod cli;
 mod commands;
 mod config;
 mod http_client;
+mod install_layout;
 mod logging;
 mod marker;
 mod process_guard;

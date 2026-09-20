@@ -11,7 +11,7 @@ use std::ffi::OsStr;
 use sysinfo::System;
 
 /// Binary name to match against `/proc/*/comm` (or platform equivalent).
-pub const BIN_NAME: &str = "ai-memory";
+pub const BIN_NAME: &str = crate::install_layout::BINARY_NAME;
 
 /// Return PIDs of *other* `ai-memory` processes (excluding the current
 /// process and any threads of it).

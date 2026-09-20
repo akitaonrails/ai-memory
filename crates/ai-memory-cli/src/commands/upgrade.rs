@@ -8,9 +8,17 @@
 //! then re-run `install-hooks --apply` for every staged agent.
 //!
 //! Client-only: never claims to upgrade a remote/homelab server.
+//!
+//! Ownership (live CLI command — kept in one module by convention):
+//! - install classification (container / package-managed / writable)
+//! - release fetch + checksum
+//! - archive extract + path allowlist
+//! - atomic binary/dir replace
+//! - staged hook refresh
 
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -21,6 +29,7 @@ use tracing::info;
 use crate::cli::{AgentChoice, InstallHooksArgs, UpgradeArgs};
 use crate::commands::install_hooks;
 use crate::config::Config;
+use crate::install_layout::{BINARY_NAME, HOOKS_DIR_NAME};
 
 const RELEASE_OWNER_REPO: &str = "akitaonrails/ai-memory";
 const USER_AGENT: &str = concat!("ai-memory-cli/", env!("CARGO_PKG_VERSION"));
@@ -29,6 +38,12 @@ const USER_AGENT: &str = concat!("ai-memory-cli/", env!("CARGO_PKG_VERSION"));
 /// headroom while refusing multi-GB DoS if a mirror or compromised host
 /// advertises / streams an oversized payload.
 const MAX_RELEASE_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
+const HTTP_TIMEOUT_SECS: u64 = 120;
+#[cfg(unix)]
+const UNIX_EXECUTABLE_MODE: u32 = 0o755;
+
+/// Known agent dir + parsed choice pairs from a staged hooks root.
+type StagedAgentList = Vec<(String, AgentChoice)>;
 
 /// Run the `upgrade` subcommand.
 pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
@@ -51,27 +66,75 @@ pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
 
 #[cfg(not(windows))]
 async fn run_unix(config: &Config, args: UpgradeArgs) -> Result<()> {
-    let exe = std::env::current_exe().context("resolving current executable path")?;
-    let exe = fs::canonicalize(&exe).unwrap_or(exe);
-    let classification = classify_install(&exe)?;
-    match classification {
-        InstallClass::Supported => {}
-        InstallClass::Unsupported(reason) => bail!("{reason}"),
-    }
+    let exe = resolve_current_exe()?;
+    ensure_supported_install(&exe)?;
 
     let fetcher = ReqwestFetcher::new()?;
     let base = release_base_url(config);
     let tag = resolve_tag(&fetcher, &base, args.version.as_deref()).await?;
-    let current = env!("CARGO_PKG_VERSION");
-    if !args.force && versions_match(&tag, current) {
-        println!("already up to date ({current})");
+    if skip_when_current(&tag, args.force) {
         return Ok(());
     }
 
+    let extract_root = download_and_extract_release(&fetcher, &base, &tag).await?;
+    apply_extracted_release(extract_root.path(), &exe)?;
+
+    // Sync FS after await is intentional for this CLI one-shot path.
+    refresh_staged_hooks(config)?;
+    warn_remote_server(config);
+    println!("✓ upgraded to {tag}");
+    info!(%tag, path = %exe.display(), "native upgrade complete");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn resolve_current_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("resolving current executable path")?;
+    Ok(fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+#[cfg(not(windows))]
+fn ensure_supported_install(exe: &Path) -> Result<()> {
+    match classify_install(exe)? {
+        InstallClass::Supported => Ok(()),
+        InstallClass::Unsupported(reason) => bail!("{reason}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn skip_when_current(tag: &str, force: bool) -> bool {
+    let current = env!("CARGO_PKG_VERSION");
+    if !force && versions_match(tag, current) {
+        println!("already up to date ({current})");
+        return true;
+    }
+    false
+}
+
+#[cfg(not(windows))]
+async fn download_and_extract_release(
+    fetcher: &ReqwestFetcher,
+    base: &str,
+    tag: &str,
+) -> Result<tempfile::TempDir> {
     let asset = release_asset_name().context("no GitHub release asset for this OS/arch")?;
+    let archive_bytes = fetch_verified_archive(fetcher, base, tag, asset).await?;
+    let extract_root = tempfile::tempdir().context("creating extract temp dir")?;
+    extract_release_archive(&archive_bytes, extract_root.path())
+        .context("extracting release archive")?;
+    ensure_extracted_binary(extract_root.path())?;
+    Ok(extract_root)
+}
+
+#[cfg(not(windows))]
+async fn fetch_verified_archive(
+    fetcher: &ReqwestFetcher,
+    base: &str,
+    tag: &str,
+    asset: &str,
+) -> Result<Vec<u8>> {
     let archive_url = format!("{base}/download/{tag}/{asset}");
     let checksum_url = format!("{archive_url}.sha256");
-
     println!("→ downloading {asset} ({tag})");
     let archive_bytes = fetcher
         .get_bytes(&archive_url)
@@ -81,48 +144,61 @@ async fn run_unix(config: &Config, args: UpgradeArgs) -> Result<()> {
         .get_text(&checksum_url)
         .await
         .with_context(|| format!("downloading {checksum_url}"))?;
-    let expected = parse_sha256_sidecar(&checksum_text, asset)
+    verify_archive_checksum(&archive_bytes, &checksum_text, asset)?;
+    Ok(archive_bytes)
+}
+
+fn ensure_extracted_binary(extract_root: &Path) -> Result<()> {
+    if extract_root.join(BINARY_NAME).is_file() {
+        return Ok(());
+    }
+    bail!("release archive is missing the {BINARY_NAME} binary");
+}
+
+fn verify_archive_checksum(archive_bytes: &[u8], checksum_text: &str, asset: &str) -> Result<()> {
+    let expected = parse_sha256_sidecar(checksum_text, asset)
         .with_context(|| format!("parsing checksum sidecar for {asset}"))?;
-    let actual = sha256_hex(&archive_bytes);
+    let actual = sha256_hex(archive_bytes);
     if !actual.eq_ignore_ascii_case(&expected) {
         bail!("release archive checksum mismatch (expected {expected}, got {actual})");
     }
     println!("  ✓ checksum ok");
+    Ok(())
+}
 
-    let extract_root = tempfile::tempdir().context("creating extract temp dir")?;
-    extract_release_archive(&archive_bytes, extract_root.path())
-        .context("extracting release archive")?;
-    let new_binary = extract_root.path().join("ai-memory");
-    if !new_binary.is_file() {
-        bail!("release archive is missing the ai-memory binary");
-    }
-
+#[cfg(not(windows))]
+fn apply_extracted_release(extract_root: &Path, exe: &Path) -> Result<()> {
     let install_dir = exe
         .parent()
         .map(Path::to_path_buf)
         .context("executable has no parent directory")?;
+    replace_binary(extract_root, exe)?;
+    maybe_refresh_sibling_hooks(extract_root, &install_dir)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_binary(extract_root: &Path, exe: &Path) -> Result<()> {
+    let new_binary = extract_root.join(BINARY_NAME);
     println!("→ replacing {}", exe.display());
-    replace_file_atomic(&new_binary, &exe).with_context(|| {
+    replace_file_atomic(&new_binary, exe).with_context(|| {
         format!(
             "replacing {}; if this fails mid-way look for {}.new",
             exe.display(),
             exe.display()
         )
-    })?;
+    })
+}
 
-    let extracted_hooks = extract_root.path().join("hooks");
-    let sibling_hooks = install_dir.join("hooks");
-    if extracted_hooks.is_dir() && sibling_hooks.exists() {
-        println!("→ refreshing {}", sibling_hooks.display());
-        replace_dir_atomic(&extracted_hooks, &sibling_hooks)
-            .with_context(|| format!("replacing {}", sibling_hooks.display()))?;
+fn maybe_refresh_sibling_hooks(extract_root: &Path, install_dir: &Path) -> Result<()> {
+    let extracted_hooks = extract_root.join(HOOKS_DIR_NAME);
+    let sibling_hooks = install_dir.join(HOOKS_DIR_NAME);
+    if !(extracted_hooks.is_dir() && sibling_hooks.exists()) {
+        return Ok(());
     }
-
-    refresh_staged_hooks(config)?;
-    warn_remote_server(config);
-    println!("✓ upgraded to {tag}");
-    info!(%tag, path = %exe.display(), "native upgrade complete");
-    Ok(())
+    println!("→ refreshing {}", sibling_hooks.display());
+    replace_dir_atomic(&extracted_hooks, &sibling_hooks)
+        .with_context(|| format!("replacing {}", sibling_hooks.display()))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -132,39 +208,56 @@ enum InstallClass {
 }
 
 fn classify_install(exe: &Path) -> Result<InstallClass> {
+    if let Some(reason) = container_refusal() {
+        return Ok(InstallClass::Unsupported(reason));
+    }
+    if let Some(reason) = package_managed_refusal(exe) {
+        return Ok(InstallClass::Unsupported(reason));
+    }
+    if let Some(reason) = unwritable_refusal(exe)? {
+        return Ok(InstallClass::Unsupported(reason));
+    }
+    Ok(InstallClass::Supported)
+}
+
+fn container_refusal() -> Option<String> {
     if Path::new("/.dockerenv").exists() {
-        return Ok(InstallClass::Unsupported(
+        Some(
             "refusing to self-upgrade inside a container; run `ai-memory upgrade` on the \
              host Docker wrapper, or replace the image with `docker pull`"
                 .into(),
-        ));
+        )
+    } else {
+        None
     }
+}
 
+fn package_managed_refusal(exe: &Path) -> Option<String> {
     let path_str = exe.to_string_lossy();
     for prefix in package_managed_prefixes() {
         if path_str.starts_with(prefix) {
-            return Ok(InstallClass::Unsupported(format!(
+            return Some(format!(
                 "refusing to self-upgrade a package-managed install at {}; \
                  use your package manager (Homebrew, AUR, apt, …) instead",
                 exe.display()
-            )));
+            ));
         }
     }
+    None
+}
 
+fn unwritable_refusal(exe: &Path) -> Result<Option<String>> {
     let parent = exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("executable has no parent directory"))?;
-    let parent_writable = is_writable_dir(parent);
-    let exe_writable = is_writable_file(exe);
-    if !parent_writable || !exe_writable {
-        return Ok(InstallClass::Unsupported(format!(
-            "refusing to self-upgrade: {} is not writable by this user; \
-             install under ~/.local (or another user-owned prefix) and re-run",
-            exe.display()
-        )));
+    if is_writable_dir(parent) && is_writable_file(exe) {
+        return Ok(None);
     }
-
-    Ok(InstallClass::Supported)
+    Ok(Some(format!(
+        "refusing to self-upgrade: {} is not writable by this user; \
+         install under ~/.local (or another user-owned prefix) and re-run",
+        exe.display()
+    )))
 }
 
 fn package_managed_prefixes() -> &'static [&'static str] {
@@ -228,34 +321,44 @@ fn normalize_version(raw: &str) -> String {
 
 async fn resolve_tag(fetcher: &ReqwestFetcher, base: &str, pinned: Option<&str>) -> Result<String> {
     if let Some(pinned) = pinned {
-        let tag = pinned.trim();
-        if tag.is_empty() {
-            bail!("--version must be a non-empty release tag (e.g. v2.3.2)");
-        }
-        return Ok(if tag.starts_with('v') {
-            tag.to_string()
-        } else {
-            format!("v{tag}")
-        });
+        return normalize_pinned_tag(pinned);
     }
+    if base.contains("github.com") {
+        return fetch_github_latest_tag(fetcher).await;
+    }
+    fetch_text_latest_tag(fetcher, base).await
+}
 
+fn normalize_pinned_tag(pinned: &str) -> Result<String> {
+    let tag = pinned.trim();
+    if tag.is_empty() {
+        bail!("--version must be a non-empty release tag (e.g. v2.3.2)");
+    }
+    Ok(if tag.starts_with('v') {
+        tag.to_string()
+    } else {
+        format!("v{tag}")
+    })
+}
+
+async fn fetch_github_latest_tag(fetcher: &ReqwestFetcher) -> Result<String> {
+    let api = format!("https://api.github.com/repos/{RELEASE_OWNER_REPO}/releases/latest");
+    let body = fetcher
+        .get_text(&api)
+        .await
+        .context("fetching latest release")?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).context("parsing latest release JSON")?;
+    let tag = json
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .context("latest release JSON missing tag_name")?;
+    Ok(tag.to_string())
+}
+
+async fn fetch_text_latest_tag(fetcher: &ReqwestFetcher, base: &str) -> Result<String> {
     // Prefer the GitHub API when talking to github.com; for a test base URL
     // fall back to a `{base}/latest/tag` text endpoint.
-    if base.contains("github.com") {
-        let api = format!("https://api.github.com/repos/{RELEASE_OWNER_REPO}/releases/latest");
-        let body = fetcher
-            .get_text(&api)
-            .await
-            .context("fetching latest release")?;
-        let json: serde_json::Value =
-            serde_json::from_str(&body).context("parsing latest release JSON")?;
-        let tag = json
-            .get("tag_name")
-            .and_then(|v| v.as_str())
-            .context("latest release JSON missing tag_name")?;
-        return Ok(tag.to_string());
-    }
-
     let tag = fetcher
         .get_text(&format!("{base}/latest/tag"))
         .await
@@ -330,21 +433,26 @@ fn validate_release_entry(path: &Path, entry_type: tar::EntryType) -> Result<()>
             path.display()
         );
     }
-    let path_str = path.to_string_lossy();
-    let allowed = path_str == "ai-memory"
-        || path_str == "hooks"
-        || path_str.starts_with("hooks/")
-        || path_str == "README.md"
-        || path_str == "LICENSE"
-        || path_str.starts_with("docs/")
-        || path_str.starts_with("crates/");
-    if !allowed {
+    if !is_allowed_release_path(path) {
         bail!(
             "release archive contains unexpected path: {}",
             path.display()
         );
     }
     Ok(())
+}
+
+fn is_allowed_release_path(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    path_str == BINARY_NAME
+        || path_str == HOOKS_DIR_NAME
+        || path_str
+            .strip_prefix(HOOKS_DIR_NAME)
+            .is_some_and(|rest| rest.starts_with('/'))
+        || path_str == "README.md"
+        || path_str == "LICENSE"
+        || path_str.starts_with("docs/")
+        || path_str.starts_with("crates/")
 }
 
 fn replace_file_atomic(src: &Path, dest: &Path) -> Result<()> {
@@ -356,7 +464,7 @@ fn replace_file_atomic(src: &Path, dest: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(UNIX_EXECUTABLE_MODE))
             .with_context(|| format!("chmod +x {}", tmp.display()))?;
     }
     fs::rename(&tmp, dest).with_context(|| {
@@ -374,37 +482,52 @@ fn replace_dir_atomic(src: &Path, dest: &Path) -> Result<()> {
     let parent = dest
         .parent()
         .ok_or_else(|| anyhow::anyhow!("destination {} has no parent", dest.display()))?;
-    let tmp = parent.join(format!(
-        ".{}.new",
-        dest.file_name().and_then(|s| s.to_str()).unwrap_or("hooks")
-    ));
-    if tmp.exists() {
-        fs::remove_dir_all(&tmp).with_context(|| format!("removing stale {}", tmp.display()))?;
-    }
+    let tmp = prepare_dir_swap_staging(src, parent, dest)?;
+    let backup = move_aside_for_swap(parent, dest)?;
+    commit_dir_swap(&tmp, dest, &backup)
+}
+
+fn prepare_dir_swap_staging(src: &Path, parent: &Path, dest: &Path) -> Result<PathBuf> {
+    let tmp = sibling_swap_path(parent, dest, "new");
+    remove_dir_if_exists(&tmp)?;
     copy_dir_recursive(src, &tmp)?;
-    let backup = parent.join(format!(
-        ".{}.old",
-        dest.file_name().and_then(|s| s.to_str()).unwrap_or("hooks")
-    ));
-    if backup.exists() {
-        fs::remove_dir_all(&backup)
-            .with_context(|| format!("removing stale {}", backup.display()))?;
-    }
+    Ok(tmp)
+}
+
+fn move_aside_for_swap(parent: &Path, dest: &Path) -> Result<PathBuf> {
+    let backup = sibling_swap_path(parent, dest, "old");
+    remove_dir_if_exists(&backup)?;
     if dest.exists() {
         fs::rename(dest, &backup)
             .with_context(|| format!("moving {} aside to {}", dest.display(), backup.display()))?;
     }
-    if let Err(err) = fs::rename(&tmp, dest) {
+    Ok(backup)
+}
+
+fn commit_dir_swap(tmp: &Path, dest: &Path, backup: &Path) -> Result<()> {
+    if let Err(err) = fs::rename(tmp, dest) {
         if backup.exists() {
-            let _ = fs::rename(&backup, dest);
+            let _ = fs::rename(backup, dest);
         }
-        return Err(err)
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()));
+        return Err(err).with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()));
     }
-    if backup.exists() {
-        let _ = fs::remove_dir_all(&backup);
-    }
+    let _ = remove_dir_if_exists(backup);
     Ok(())
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(path).with_context(|| format!("removing stale {}", path.display()))
+}
+
+fn sibling_swap_path(parent: &Path, dest: &Path, suffix: &str) -> PathBuf {
+    let name = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(HOOKS_DIR_NAME);
+    parent.join(format!(".{name}.{suffix}"))
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
@@ -427,8 +550,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 ///
 /// `lib` and `_*-prefixed` directories hold shared helpers, not agents (#38).
 /// Unknown directory names are omitted (callers may log them).
-fn list_staged_agents(hooks_root: &Path) -> Result<(Vec<(String, AgentChoice)>, Vec<String>)> {
-    let mut agents = Vec::new();
+fn list_staged_agents(hooks_root: &Path) -> Result<(StagedAgentList, Vec<String>)> {
+    let mut agents = StagedAgentList::new();
     let mut unknown = Vec::new();
     for entry in fs::read_dir(hooks_root)
         .with_context(|| format!("reading staged hooks at {}", hooks_root.display()))?
@@ -455,22 +578,13 @@ fn list_staged_agents(hooks_root: &Path) -> Result<(Vec<(String, AgentChoice)>, 
 }
 
 fn refresh_staged_hooks(config: &Config) -> Result<()> {
-    let staging = install_hooks::hook_staging_root(
-        &config.data_dir,
-        ai_memory_wiki::backup::running_in_container(),
-    );
-    let hooks_root = staging.join("hooks");
+    let hooks_root = staged_hooks_root(config);
     if !hooks_root.is_dir() {
         println!("→ no staged hook scripts found at {}", hooks_root.display());
         println!("  (nothing to refresh — install-hooks hasn't been run with --apply yet)");
         return Ok(());
     }
-
-    let (agents, unknown) = list_staged_agents(&hooks_root)?;
-    for name in &unknown {
-        println!("  (skipping unknown staged agent dir `{name}`)");
-    }
-
+    let agents = collect_refreshable_agents(&hooks_root)?;
     if agents.is_empty() {
         println!(
             "→ no staged agent dirs found under {}",
@@ -478,33 +592,59 @@ fn refresh_staged_hooks(config: &Config) -> Result<()> {
         );
         return Ok(());
     }
+    refresh_agent_list(config, &agents);
+    Ok(())
+}
 
+fn staged_hooks_root(config: &Config) -> PathBuf {
+    install_hooks::hook_staging_root(
+        &config.data_dir,
+        ai_memory_wiki::backup::running_in_container(),
+    )
+    .join(HOOKS_DIR_NAME)
+}
+
+fn collect_refreshable_agents(hooks_root: &Path) -> Result<StagedAgentList> {
+    let (agents, unknown) = list_staged_agents(hooks_root)?;
+    for name in &unknown {
+        println!("  (skipping unknown staged agent dir `{name}`)");
+    }
+    Ok(agents)
+}
+
+fn refresh_agent_list(config: &Config, agents: &StagedAgentList) {
     let names: Vec<_> = agents.iter().map(|(n, _)| n.as_str()).collect();
     println!("→ refreshing staged hook scripts for: {}", names.join(" "));
     for (name, agent) in agents {
-        println!("    ai-memory install-hooks --agent {name} --apply");
-        let args = InstallHooksArgs {
-            agent,
-            hooks_dir: None,
-            server_url: None,
-            auth_token: None,
-            as_user: None,
-            apply: true,
-            config_file: None,
-            project_strategy: None,
-            capture_assistant: false,
-            capture_mode: None,
-            no_capture_prompts: false,
-            capture_prompts: false,
-            profile: None,
-        };
-        if let Err(err) = install_hooks::run(config, args) {
-            println!(
-                "      (skipped — {err:#}; re-run with the same --server-url / --auth-token used originally)"
-            );
-        }
+        apply_staged_agent_hooks(config, name, *agent);
     }
-    Ok(())
+}
+
+fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
+    println!("    ai-memory install-hooks --agent {name} --apply");
+    if let Err(err) = install_hooks::run(config, apply_hooks_args(agent)) {
+        println!(
+            "      (skipped — {err:#}; re-run with the same --server-url / --auth-token used originally)"
+        );
+    }
+}
+
+fn apply_hooks_args(agent: AgentChoice) -> InstallHooksArgs {
+    InstallHooksArgs {
+        agent,
+        hooks_dir: None,
+        server_url: None,
+        auth_token: None,
+        as_user: None,
+        apply: true,
+        config_file: None,
+        project_strategy: None,
+        capture_assistant: false,
+        capture_mode: None,
+        no_capture_prompts: false,
+        capture_prompts: false,
+        profile: None,
+    }
 }
 
 fn warn_remote_server(config: &Config) {
@@ -545,7 +685,7 @@ impl ReqwestFetcher {
         }
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .build()
             .context("building HTTP client")?;
         Ok(Self { client, max_bytes })
@@ -562,49 +702,70 @@ impl ReqwestFetcher {
         if !status.is_success() {
             bail!("GET {url} returned {status}");
         }
-
-        let content_len = response.content_length();
-        if let Some(len) = content_len
-            && content_length_exceeds_limit(len, self.max_bytes)
-        {
-            bail!(
-                "GET {url} Content-Length {len} exceeds upgrade download limit \
-                 of {} bytes",
-                self.max_bytes
-            );
-        }
-
-        // Stream with a hard cap — Content-Length can lie or be absent.
-        let mut out = Vec::new();
-        if let Some(len) = content_len
-            && let Ok(hint) = usize::try_from(len)
-        {
-            out.reserve(hint.min(self.max_bytes));
-        }
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .with_context(|| format!("reading body from {url}"))?
-        {
-            let over_limit = out
-                .len()
-                .checked_add(chunk.len())
-                .is_none_or(|next| next > self.max_bytes);
-            if over_limit {
-                bail!(
-                    "GET {url} body exceeded upgrade download limit of {} bytes",
-                    self.max_bytes
-                );
-            }
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out)
+        refuse_oversized_content_length(url, response.content_length(), self.max_bytes)?;
+        read_body_capped(&mut response, url, self.max_bytes).await
     }
 
     async fn get_text(&self, url: &str) -> Result<String> {
         let bytes = self.get_bytes(url).await?;
         String::from_utf8(bytes).context("response body is not UTF-8")
     }
+}
+
+fn refuse_oversized_content_length(url: &str, content_len: Option<u64>, max_bytes: usize) -> Result<()> {
+    if let Some(len) = content_len
+        && content_length_exceeds_limit(len, max_bytes)
+    {
+        bail!(
+            "GET {url} Content-Length {len} exceeds upgrade download limit \
+             of {max_bytes} bytes"
+        );
+    }
+    Ok(())
+}
+
+async fn read_body_capped(
+    response: &mut reqwest::Response,
+    url: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    // Stream with a hard cap — Content-Length can lie or be absent.
+    let mut out = reserve_body_buffer(response.content_length(), max_bytes);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading body from {url}"))?
+    {
+        append_chunk_within_limit(&mut out, &chunk, url, max_bytes)?;
+    }
+    Ok(out)
+}
+
+fn reserve_body_buffer(content_len: Option<u64>, max_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(len) = content_len
+        && let Ok(hint) = usize::try_from(len)
+    {
+        out.reserve(hint.min(max_bytes));
+    }
+    out
+}
+
+fn append_chunk_within_limit(
+    out: &mut Vec<u8>,
+    chunk: &[u8],
+    url: &str,
+    max_bytes: usize,
+) -> Result<()> {
+    let over_limit = out
+        .len()
+        .checked_add(chunk.len())
+        .is_none_or(|next| next > max_bytes);
+    if over_limit {
+        bail!("GET {url} body exceeded upgrade download limit of {max_bytes} bytes");
+    }
+    out.extend_from_slice(chunk);
+    Ok(())
 }
 
 /// `true` when `content_length` is strictly greater than `max_bytes`.
