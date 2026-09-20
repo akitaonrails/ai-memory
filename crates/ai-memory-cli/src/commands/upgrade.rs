@@ -24,6 +24,11 @@ use crate::config::Config;
 
 const RELEASE_OWNER_REPO: &str = "akitaonrails/ai-memory";
 const USER_AGENT: &str = concat!("ai-memory-cli/", env!("CARGO_PKG_VERSION"));
+/// Hard cap on any single upgrade HTTP body (release tarball, `.sha256`,
+/// or tag JSON). Current release archives are ~15–17 MiB; 128 MiB leaves
+/// headroom while refusing multi-GB DoS if a mirror or compromised host
+/// advertises / streams an oversized payload.
+const MAX_RELEASE_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 
 /// Run the `upgrade` subcommand.
 pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
@@ -514,20 +519,28 @@ fn is_loopback_url(url: &str) -> bool {
 
 struct ReqwestFetcher {
     client: reqwest::Client,
+    max_bytes: usize,
 }
 
 impl ReqwestFetcher {
     fn new() -> Result<Self> {
+        Self::with_max_bytes(MAX_RELEASE_DOWNLOAD_BYTES)
+    }
+
+    fn with_max_bytes(max_bytes: usize) -> Result<Self> {
+        if max_bytes == 0 {
+            bail!("upgrade download limit must be greater than zero");
+        }
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .context("building HTTP client")?;
-        Ok(Self { client })
+        Ok(Self { client, max_bytes })
     }
 
     async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let response = self
+        let mut response = self
             .client
             .get(url)
             .send()
@@ -537,16 +550,61 @@ impl ReqwestFetcher {
         if !status.is_success() {
             bail!("GET {url} returned {status}");
         }
-        Ok(response
-            .bytes()
+
+        let content_len = response.content_length();
+        if let Some(len) = content_len
+            && content_length_exceeds_limit(len, self.max_bytes)
+        {
+            bail!(
+                "GET {url} Content-Length {len} exceeds upgrade download limit \
+                 of {} bytes",
+                self.max_bytes
+            );
+        }
+
+        // Stream with a hard cap — Content-Length can lie or be absent.
+        let mut out = Vec::new();
+        if let Some(len) = content_len
+            && let Ok(hint) = usize::try_from(len)
+        {
+            out.reserve(hint.min(self.max_bytes));
+        }
+        while let Some(chunk) = response
+            .chunk()
             .await
             .with_context(|| format!("reading body from {url}"))?
-            .to_vec())
+        {
+            let over_limit = out
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|next| next > self.max_bytes);
+            if over_limit {
+                bail!(
+                    "GET {url} body exceeded upgrade download limit of {} bytes",
+                    self.max_bytes
+                );
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 
     async fn get_text(&self, url: &str) -> Result<String> {
         let bytes = self.get_bytes(url).await?;
         String::from_utf8(bytes).context("response body is not UTF-8")
+    }
+}
+
+/// `true` when `content_length` is strictly greater than `max_bytes`.
+///
+/// Compares in `u64` so a 32-bit `usize` limit never truncates via `as u64`
+/// in the wrong direction. If `max_bytes` somehow cannot fit in `u64`
+/// (theoretical >64-bit usize), every finite Content-Length is treated as
+/// under the limit and the streamed `checked_add` gate still enforces it.
+fn content_length_exceeds_limit(content_length: u64, max_bytes: usize) -> bool {
+    match u64::try_from(max_bytes) {
+        Ok(max) => content_length > max,
+        Err(_) => false,
     }
 }
 
@@ -570,27 +628,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_sha256_sidecar_accepts_sha256sum_format() {
+    fn parse_sha256_sidecar_accepts_sha256sum_format() -> Result<()> {
         let text = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  ai-memory-macos-aarch64.tar.gz\n";
-        let hash = parse_sha256_sidecar(text, "ai-memory-macos-aarch64.tar.gz").unwrap();
+        let hash = parse_sha256_sidecar(text, "ai-memory-macos-aarch64.tar.gz")?;
         assert_eq!(
             hash,
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_sha256_sidecar_rejects_wrong_filename() {
+    fn parse_sha256_sidecar_rejects_wrong_filename() -> Result<()> {
         let text =
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  other.tar.gz\n";
-        let err = parse_sha256_sidecar(text, "ai-memory-macos-aarch64.tar.gz").unwrap_err();
-        assert!(err.to_string().contains("expected"));
+        match parse_sha256_sidecar(text, "ai-memory-macos-aarch64.tar.gz") {
+            Ok(_) => bail!("wrong filename must fail"),
+            Err(err) => assert!(err.to_string().contains("expected")),
+        }
+        Ok(())
     }
 
     #[test]
-    fn parse_sha256_sidecar_rejects_bad_hash() {
-        let err = parse_sha256_sidecar("not-a-hash  file.tar.gz\n", "file.tar.gz").unwrap_err();
-        assert!(err.to_string().contains("invalid sha256"));
+    fn parse_sha256_sidecar_rejects_bad_hash() -> Result<()> {
+        match parse_sha256_sidecar("not-a-hash  file.tar.gz\n", "file.tar.gz") {
+            Ok(_) => bail!("bad hash must fail"),
+            Err(err) => assert!(err.to_string().contains("invalid sha256")),
+        }
+        Ok(())
     }
 
     #[test]
@@ -601,114 +666,121 @@ mod tests {
     }
 
     #[test]
-    fn classify_rejects_homebrew_prefix() {
-        let class = classify_install(Path::new("/opt/homebrew/bin/ai-memory")).unwrap();
+    fn classify_rejects_homebrew_prefix() -> Result<()> {
+        let class = classify_install(Path::new("/opt/homebrew/bin/ai-memory"))?;
         assert!(matches!(class, InstallClass::Unsupported(_)));
+        Ok(())
     }
 
     #[test]
-    fn classify_rejects_usr_bin() {
-        let class = classify_install(Path::new("/usr/bin/ai-memory")).unwrap();
+    fn classify_rejects_usr_bin() -> Result<()> {
+        let class = classify_install(Path::new("/usr/bin/ai-memory"))?;
         assert!(matches!(class, InstallClass::Unsupported(_)));
+        Ok(())
     }
 
     #[test]
-    fn classify_accepts_writable_user_prefix() {
-        let dir = tempfile::tempdir().unwrap();
+    fn classify_accepts_writable_user_prefix() -> Result<()> {
+        let dir = tempfile::tempdir()?;
         let exe = dir.path().join("ai-memory");
-        fs::write(&exe, b"fake").unwrap();
+        fs::write(&exe, b"fake")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755))?;
         }
-        let class = classify_install(&exe).unwrap();
+        let class = classify_install(&exe)?;
         // In CI containers /.dockerenv may exist — then Unsupported is correct.
         if Path::new("/.dockerenv").exists() {
             assert!(matches!(class, InstallClass::Unsupported(_)));
         } else {
             assert_eq!(class, InstallClass::Supported);
         }
+        Ok(())
     }
 
     #[test]
-    fn validate_rejects_path_traversal() {
-        let err =
-            validate_release_entry(Path::new("../evil"), tar::EntryType::Regular).unwrap_err();
-        assert!(err.to_string().contains("unsafe"), "{err}");
+    fn validate_rejects_path_traversal() -> Result<()> {
+        match validate_release_entry(Path::new("../evil"), tar::EntryType::Regular) {
+            Ok(()) => bail!("path traversal must fail"),
+            Err(err) => assert!(err.to_string().contains("unsafe"), "{err}"),
+        }
+        Ok(())
     }
 
     #[test]
-    fn validate_rejects_unexpected_paths() {
-        let err =
-            validate_release_entry(Path::new("etc/passwd"), tar::EntryType::Regular).unwrap_err();
-        assert!(err.to_string().contains("unexpected"), "{err}");
+    fn validate_rejects_unexpected_paths() -> Result<()> {
+        match validate_release_entry(Path::new("etc/passwd"), tar::EntryType::Regular) {
+            Ok(()) => bail!("unexpected path must fail"),
+            Err(err) => assert!(err.to_string().contains("unexpected"), "{err}"),
+        }
+        Ok(())
     }
 
     #[test]
-    fn extract_and_verify_round_trip() {
+    fn extract_and_verify_round_trip() -> Result<()> {
         let mut tar_bytes = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_bytes);
             let mut header = Header::new_gnu();
             header.set_entry_type(tar::EntryType::Regular);
-            header.set_path("ai-memory").unwrap();
+            header.set_path("ai-memory")?;
             header.set_size(11);
             header.set_mode(0o755);
             header.set_cksum();
-            builder.append(&header, &b"hello-world"[..]).unwrap();
-            builder.finish().unwrap();
+            builder.append(&header, &b"hello-world"[..])?;
+            builder.finish()?;
         }
         let mut gz_bytes = Vec::new();
         {
             use flate2::Compression;
             use flate2::write::GzEncoder;
             let mut enc = GzEncoder::new(&mut gz_bytes, Compression::fast());
-            std::io::Write::write_all(&mut enc, &tar_bytes).unwrap();
-            enc.finish().unwrap();
+            std::io::Write::write_all(&mut enc, &tar_bytes)?;
+            enc.finish()?;
         }
         let hash = sha256_hex(&gz_bytes);
         let sidecar = format!("{hash}  ai-memory-macos-aarch64.tar.gz\n");
         assert_eq!(
-            parse_sha256_sidecar(&sidecar, "ai-memory-macos-aarch64.tar.gz").unwrap(),
+            parse_sha256_sidecar(&sidecar, "ai-memory-macos-aarch64.tar.gz")?,
             hash
         );
-        let dest = tempfile::tempdir().unwrap();
-        extract_release_archive(&gz_bytes, dest.path()).unwrap();
-        assert_eq!(
-            fs::read(dest.path().join("ai-memory")).unwrap(),
-            b"hello-world"
-        );
+        let dest = tempfile::tempdir()?;
+        extract_release_archive(&gz_bytes, dest.path())?;
+        assert_eq!(fs::read(dest.path().join("ai-memory"))?, b"hello-world");
+        Ok(())
     }
 
     #[test]
-    fn replace_file_atomic_swaps_contents() {
-        let dir = tempfile::tempdir().unwrap();
+    fn replace_file_atomic_swaps_contents() -> Result<()> {
+        let dir = tempfile::tempdir()?;
         let dest = dir.path().join("ai-memory");
         let src = dir.path().join("fresh");
-        fs::write(&dest, b"old").unwrap();
-        fs::write(&src, b"new").unwrap();
-        replace_file_atomic(&src, &dest).unwrap();
-        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        fs::write(&dest, b"old")?;
+        fs::write(&src, b"new")?;
+        replace_file_atomic(&src, &dest)?;
+        assert_eq!(fs::read(&dest)?, b"new");
         assert!(!dest.with_extension("new").exists());
+        Ok(())
     }
 
     #[test]
-    fn replace_dir_atomic_swaps_tree_and_cleans_backup() {
-        let dir = tempfile::tempdir().unwrap();
+    fn replace_dir_atomic_swaps_tree_and_cleans_backup() -> Result<()> {
+        let dir = tempfile::tempdir()?;
         let dest = dir.path().join("hooks");
         let src = dir.path().join("fresh-hooks");
-        fs::create_dir_all(dest.join("claude-code")).unwrap();
-        fs::write(dest.join("claude-code/old.sh"), b"old").unwrap();
-        fs::create_dir_all(src.join("claude-code")).unwrap();
-        fs::write(src.join("claude-code/new.sh"), b"new").unwrap();
+        fs::create_dir_all(dest.join("claude-code"))?;
+        fs::write(dest.join("claude-code/old.sh"), b"old")?;
+        fs::create_dir_all(src.join("claude-code"))?;
+        fs::write(src.join("claude-code/new.sh"), b"new")?;
 
-        replace_dir_atomic(&src, &dest).unwrap();
+        replace_dir_atomic(&src, &dest)?;
 
-        assert_eq!(fs::read(dest.join("claude-code/new.sh")).unwrap(), b"new");
+        assert_eq!(fs::read(dest.join("claude-code/new.sh"))?, b"new");
         assert!(!dest.join("claude-code/old.sh").exists());
         assert!(!dir.path().join(".hooks.old").exists());
         assert!(!dir.path().join(".hooks.new").exists());
+        Ok(())
     }
 
     #[test]
@@ -722,11 +794,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_tag_reads_latest_tag_from_non_github_base() {
+    async fn resolve_tag_reads_latest_tag_from_non_github_base() -> Result<()> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         tokio::spawn(async move {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
@@ -741,19 +813,92 @@ mod tests {
             let _ = stream.write_all(response.as_bytes()).await;
         });
 
-        let fetcher = ReqwestFetcher::new().unwrap();
+        let fetcher = ReqwestFetcher::new()?;
         let base = format!("http://{addr}/releases");
-        let tag = resolve_tag(&fetcher, &base, None).await.unwrap();
+        let tag = resolve_tag(&fetcher, &base, None).await?;
         assert_eq!(tag, "v9.9.9");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resolve_tag_honors_pinned_version_without_network() {
-        let fetcher = ReqwestFetcher::new().unwrap();
-        let tag = resolve_tag(&fetcher, "http://127.0.0.1:1/unused", Some("2.3.2"))
-            .await
-            .unwrap();
+    async fn resolve_tag_honors_pinned_version_without_network() -> Result<()> {
+        let fetcher = ReqwestFetcher::new()?;
+        let tag = resolve_tag(&fetcher, "http://127.0.0.1:1/unused", Some("2.3.2")).await?;
         assert_eq!(tag, "v2.3.2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_bytes_rejects_oversized_content_length() -> Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 999\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let fetcher = ReqwestFetcher::with_max_bytes(64)?;
+        match fetcher.get_bytes(&format!("http://{addr}/big")).await {
+            Ok(_) => bail!("oversized Content-Length must fail"),
+            Err(err) => assert!(
+                err.to_string().contains("Content-Length"),
+                "unexpected error: {err:#}"
+            ),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_bytes_rejects_stream_past_limit_without_content_length() -> Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            // No Content-Length; body is 80 bytes against a 64-byte cap.
+            let body = vec![b'x'; 80];
+            let header = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+
+        let fetcher = ReqwestFetcher::with_max_bytes(64)?;
+        match fetcher.get_bytes(&format!("http://{addr}/stream")).await {
+            Ok(_) => bail!("stream past limit must fail"),
+            Err(err) => assert!(
+                err.to_string().contains("exceeded upgrade download limit"),
+                "unexpected error: {err:#}"
+            ),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn with_max_bytes_rejects_zero() -> Result<()> {
+        match ReqwestFetcher::with_max_bytes(0) {
+            Ok(_) => bail!("zero cap must fail"),
+            Err(err) => assert!(err.to_string().contains("greater than zero")),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn content_length_limit_compare_is_strict() {
+        assert!(!content_length_exceeds_limit(64, 64));
+        assert!(content_length_exceeds_limit(65, 64));
+        assert!(!content_length_exceeds_limit(0, 1));
     }
 
     #[test]
