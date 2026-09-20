@@ -260,7 +260,10 @@ On Linux/macOS, that's it. Start a Claude Code session as usual - every
 prompt and tool call now lands in ai-memory, and the next session you
 open in this project will see a handoff with where you left off.
 On macOS, the native release binary is also supported and recommended when you
-do not need Docker; see [`docs/macos.md`](docs/macos.md).
+do not need Docker; see [`docs/macos.md`](docs/macos.md). Later updates for that
+path use `ai-memory upgrade` (checksum-verified GitHub release replace + hook
+refresh) — see
+[`docs/install.md#keeping-ai-memory-up-to-date`](docs/install.md#keeping-ai-memory-up-to-date).
 
 Wiring another agent is the same two commands with a different name —
 `--client codex`, `--agent codex`, and so on for every row of the support

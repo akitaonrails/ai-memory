@@ -1,0 +1,697 @@
+//! `ai-memory upgrade` — refresh a GitHub-release native install.
+//!
+//! Docker-wrapper installs never reach this path: [`bin/ai-memory`] intercepts
+//! `upgrade` and pulls the container image. This command covers the release
+//! binary laid down under a writable user prefix (the macOS happy path in
+//! `docs/macos.md`): download the matching tarball + `.sha256`, verify,
+//! atomically replace the on-disk binary (and sibling `hooks/` when present),
+//! then re-run `install-hooks --apply` for every staged agent.
+//!
+//! Client-only: never claims to upgrade a remote/homelab server.
+
+use std::fs;
+use std::path::{Component, Path};
+
+use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
+use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
+use tracing::info;
+
+use crate::cli::{AgentChoice, InstallHooksArgs, UpgradeArgs};
+use crate::commands::install_hooks;
+use crate::config::Config;
+
+const RELEASE_OWNER_REPO: &str = "akitaonrails/ai-memory";
+const USER_AGENT: &str = concat!("ai-memory-cli/", env!("CARGO_PKG_VERSION"));
+
+/// Run the `upgrade` subcommand.
+pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = (config, args);
+        bail!(
+            "native `ai-memory upgrade` does not yet support Windows self-replace; \
+             download the release zip from \
+             https://github.com/{RELEASE_OWNER_REPO}/releases/latest \
+             and re-run `install-hooks --apply` for each agent"
+        );
+    }
+
+    #[cfg(not(windows))]
+    {
+        run_unix(config, args).await
+    }
+}
+
+#[cfg(not(windows))]
+async fn run_unix(config: &Config, args: UpgradeArgs) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving current executable path")?;
+    let exe = fs::canonicalize(&exe).unwrap_or(exe);
+    let classification = classify_install(&exe)?;
+    match classification {
+        InstallClass::Supported => {}
+        InstallClass::Unsupported(reason) => bail!("{reason}"),
+    }
+
+    let fetcher = ReqwestFetcher::new()?;
+    let base = release_base_url();
+    let tag = resolve_tag(&fetcher, &base, args.version.as_deref()).await?;
+    let current = env!("CARGO_PKG_VERSION");
+    if !args.force && versions_match(&tag, current) {
+        println!("already up to date ({current})");
+        return Ok(());
+    }
+
+    let asset = release_asset_name().context("no GitHub release asset for this OS/arch")?;
+    let archive_url = format!("{base}/download/{tag}/{asset}");
+    let checksum_url = format!("{archive_url}.sha256");
+
+    println!("→ downloading {asset} ({tag})");
+    let archive_bytes = fetcher
+        .get_bytes(&archive_url)
+        .await
+        .with_context(|| format!("downloading {archive_url}"))?;
+    let checksum_text = fetcher
+        .get_text(&checksum_url)
+        .await
+        .with_context(|| format!("downloading {checksum_url}"))?;
+    let expected = parse_sha256_sidecar(&checksum_text, asset)
+        .with_context(|| format!("parsing checksum sidecar for {asset}"))?;
+    let actual = sha256_hex(&archive_bytes);
+    if !actual.eq_ignore_ascii_case(&expected) {
+        bail!("release archive checksum mismatch (expected {expected}, got {actual})");
+    }
+    println!("  ✓ checksum ok");
+
+    let extract_root = tempfile::tempdir().context("creating extract temp dir")?;
+    extract_release_archive(&archive_bytes, extract_root.path())
+        .context("extracting release archive")?;
+    let new_binary = extract_root.path().join("ai-memory");
+    if !new_binary.is_file() {
+        bail!("release archive is missing the ai-memory binary");
+    }
+
+    let install_dir = exe
+        .parent()
+        .map(Path::to_path_buf)
+        .context("executable has no parent directory")?;
+    println!("→ replacing {}", exe.display());
+    replace_file_atomic(&new_binary, &exe).with_context(|| {
+        format!(
+            "replacing {}; if this fails mid-way look for {}.new",
+            exe.display(),
+            exe.display()
+        )
+    })?;
+
+    let extracted_hooks = extract_root.path().join("hooks");
+    let sibling_hooks = install_dir.join("hooks");
+    if extracted_hooks.is_dir() && sibling_hooks.exists() {
+        println!("→ refreshing {}", sibling_hooks.display());
+        replace_dir_atomic(&extracted_hooks, &sibling_hooks)
+            .with_context(|| format!("replacing {}", sibling_hooks.display()))?;
+    }
+
+    refresh_staged_hooks(config)?;
+    warn_remote_server(config);
+    println!("✓ upgraded to {tag}");
+    info!(%tag, path = %exe.display(), "native upgrade complete");
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InstallClass {
+    Supported,
+    Unsupported(String),
+}
+
+fn classify_install(exe: &Path) -> Result<InstallClass> {
+    if Path::new("/.dockerenv").exists() {
+        return Ok(InstallClass::Unsupported(
+            "refusing to self-upgrade inside a container; run `ai-memory upgrade` on the \
+             host Docker wrapper, or replace the image with `docker pull`"
+                .into(),
+        ));
+    }
+
+    let path_str = exe.to_string_lossy();
+    for prefix in package_managed_prefixes() {
+        if path_str.starts_with(prefix) {
+            return Ok(InstallClass::Unsupported(format!(
+                "refusing to self-upgrade a package-managed install at {}; \
+                 use your package manager (Homebrew, AUR, apt, …) instead",
+                exe.display()
+            )));
+        }
+    }
+
+    let parent = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("executable has no parent directory"))?;
+    let parent_writable = is_writable_dir(parent);
+    let exe_writable = is_writable_file(exe);
+    if !parent_writable || !exe_writable {
+        return Ok(InstallClass::Unsupported(format!(
+            "refusing to self-upgrade: {} is not writable by this user; \
+             install under ~/.local (or another user-owned prefix) and re-run",
+            exe.display()
+        )));
+    }
+
+    Ok(InstallClass::Supported)
+}
+
+fn package_managed_prefixes() -> &'static [&'static str] {
+    &[
+        "/opt/homebrew/",
+        "/usr/local/Cellar/",
+        "/usr/bin/",
+        "/bin/",
+        "/sbin/",
+        "/usr/sbin/",
+        "/nix/store/",
+    ]
+}
+
+fn is_writable_dir(path: &Path) -> bool {
+    let probe = path.join(".ai-memory-upgrade-write-probe");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn is_writable_file(path: &Path) -> bool {
+    fs::OpenOptions::new().write(true).open(path).is_ok()
+}
+
+fn release_base_url() -> String {
+    std::env::var("AI_MEMORY_RELEASE_BASE_URL")
+        .unwrap_or_else(|_| format!("https://github.com/{RELEASE_OWNER_REPO}/releases"))
+}
+
+fn release_asset_name() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("ai-memory-linux-x86_64.tar.gz"),
+        ("linux", "aarch64") => Some("ai-memory-linux-aarch64.tar.gz"),
+        ("macos", "aarch64") => Some("ai-memory-macos-aarch64.tar.gz"),
+        ("macos", "x86_64") => Some("ai-memory-macos-x86_64.tar.gz"),
+        _ => None,
+    }
+}
+
+fn versions_match(tag: &str, current: &str) -> bool {
+    normalize_version(tag) == normalize_version(current)
+}
+
+fn normalize_version(raw: &str) -> String {
+    raw.trim().trim_start_matches('v').to_string()
+}
+
+async fn resolve_tag(fetcher: &ReqwestFetcher, base: &str, pinned: Option<&str>) -> Result<String> {
+    if let Some(pinned) = pinned {
+        let tag = pinned.trim();
+        if tag.is_empty() {
+            bail!("--version must be a non-empty release tag (e.g. v2.3.2)");
+        }
+        return Ok(if tag.starts_with('v') {
+            tag.to_string()
+        } else {
+            format!("v{tag}")
+        });
+    }
+
+    // Prefer the GitHub API when talking to github.com; for a test base URL
+    // fall back to a `{base}/latest/tag` text endpoint.
+    if base.contains("github.com") {
+        let api = format!("https://api.github.com/repos/{RELEASE_OWNER_REPO}/releases/latest");
+        let body = fetcher
+            .get_text(&api)
+            .await
+            .context("fetching latest release")?;
+        let json: serde_json::Value =
+            serde_json::from_str(&body).context("parsing latest release JSON")?;
+        let tag = json
+            .get("tag_name")
+            .and_then(|v| v.as_str())
+            .context("latest release JSON missing tag_name")?;
+        return Ok(tag.to_string());
+    }
+
+    let tag = fetcher
+        .get_text(&format!("{base}/latest/tag"))
+        .await
+        .context("fetching latest tag")?
+        .trim()
+        .to_string();
+    if tag.is_empty() {
+        bail!("latest tag endpoint returned empty body");
+    }
+    Ok(tag)
+}
+
+fn parse_sha256_sidecar(text: &str, expected_filename: &str) -> Result<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let hash = parts.next().context("checksum line missing hash")?;
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("checksum line has invalid sha256 hash: {hash}");
+        }
+        if let Some(name) = parts.next() {
+            let name = name.trim_start_matches('*');
+            if name != expected_filename {
+                bail!("checksum sidecar names {name}, expected {expected_filename}");
+            }
+        }
+        return Ok(hash.to_ascii_lowercase());
+    }
+    bail!("checksum sidecar contained no hash line");
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn extract_release_archive(bytes: &[u8], dest: &Path) -> Result<()> {
+    let decoder = GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+    archive.set_preserve_permissions(false);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let entry_type = entry.header().entry_type();
+        validate_release_entry(&path, entry_type)?;
+        entry
+            .unpack_in(dest)
+            .with_context(|| format!("extracting {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn is_regular_file(entry_type: tar::EntryType) -> bool {
+    entry_type.is_file() || entry_type == tar::EntryType::GNUSparse
+}
+
+fn validate_release_entry(path: &Path, entry_type: tar::EntryType) -> Result<()> {
+    if !path.components().all(|c| matches!(c, Component::Normal(_))) {
+        bail!("release archive contains unsafe path: {}", path.display());
+    }
+    if entry_type.is_symlink() || entry_type.is_hard_link() {
+        bail!(
+            "release archive contains unsupported link entry: {}",
+            path.display()
+        );
+    }
+    if !(is_regular_file(entry_type) || entry_type.is_dir()) {
+        bail!(
+            "release archive contains unsupported entry type: {}",
+            path.display()
+        );
+    }
+    let path_str = path.to_string_lossy();
+    let allowed = path_str == "ai-memory"
+        || path_str == "hooks"
+        || path_str.starts_with("hooks/")
+        || path_str == "README.md"
+        || path_str == "LICENSE"
+        || path_str.starts_with("docs/")
+        || path_str.starts_with("crates/");
+    if !allowed {
+        bail!(
+            "release archive contains unexpected path: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn replace_file_atomic(src: &Path, dest: &Path) -> Result<()> {
+    let tmp = dest.with_extension("new");
+    if tmp.exists() {
+        fs::remove_file(&tmp).with_context(|| format!("removing stale {}", tmp.display()))?;
+    }
+    fs::copy(src, &tmp).with_context(|| format!("copying to {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("chmod +x {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, dest).with_context(|| {
+        format!(
+            "renaming {} -> {} (left {} in place on failure)",
+            tmp.display(),
+            dest.display(),
+            tmp.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn replace_dir_atomic(src: &Path, dest: &Path) -> Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("destination {} has no parent", dest.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.new",
+        dest.file_name().and_then(|s| s.to_str()).unwrap_or("hooks")
+    ));
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp).with_context(|| format!("removing stale {}", tmp.display()))?;
+    }
+    copy_dir_recursive(src, &tmp)?;
+    let backup = parent.join(format!(
+        ".{}.old",
+        dest.file_name().and_then(|s| s.to_str()).unwrap_or("hooks")
+    ));
+    if backup.exists() {
+        fs::remove_dir_all(&backup)
+            .with_context(|| format!("removing stale {}", backup.display()))?;
+    }
+    if dest.exists() {
+        fs::rename(dest, &backup)
+            .with_context(|| format!("moving {} aside to {}", dest.display(), backup.display()))?;
+    }
+    if let Err(err) = fs::rename(&tmp, dest) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, dest);
+        }
+        return Err(err)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()));
+    }
+    if backup.exists() {
+        let _ = fs::remove_dir_all(&backup);
+    }
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    for entry in fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else if ty.is_file() {
+            fs::copy(entry.path(), &to)
+                .with_context(|| format!("copying {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn refresh_staged_hooks(config: &Config) -> Result<()> {
+    let staging = install_hooks::hook_staging_root(
+        &config.data_dir,
+        ai_memory_wiki::backup::running_in_container(),
+    );
+    let hooks_root = staging.join("hooks");
+    if !hooks_root.is_dir() {
+        println!("→ no staged hook scripts found at {}", hooks_root.display());
+        println!("  (nothing to refresh — install-hooks hasn't been run with --apply yet)");
+        return Ok(());
+    }
+
+    let mut agents = Vec::new();
+    for entry in fs::read_dir(&hooks_root)
+        .with_context(|| format!("reading staged hooks at {}", hooks_root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // `lib` and `_*-prefixed` dirs hold shared helpers, not agents (#38).
+        if name == "lib" || name.starts_with('_') {
+            continue;
+        }
+        match AgentChoice::from_str(name, true) {
+            Ok(agent) => agents.push((name.to_string(), agent)),
+            Err(_) => {
+                println!("  (skipping unknown staged agent dir `{name}`)");
+            }
+        }
+    }
+
+    if agents.is_empty() {
+        println!(
+            "→ no staged agent dirs found under {}",
+            hooks_root.display()
+        );
+        return Ok(());
+    }
+
+    let names: Vec<_> = agents.iter().map(|(n, _)| n.as_str()).collect();
+    println!("→ refreshing staged hook scripts for: {}", names.join(" "));
+    for (name, agent) in agents {
+        println!("    ai-memory install-hooks --agent {name} --apply");
+        let args = InstallHooksArgs {
+            agent,
+            hooks_dir: None,
+            server_url: None,
+            auth_token: None,
+            as_user: None,
+            apply: true,
+            config_file: None,
+            project_strategy: None,
+            capture_assistant: false,
+            capture_mode: None,
+            no_capture_prompts: false,
+            capture_prompts: false,
+            profile: None,
+        };
+        if let Err(err) = install_hooks::run(config, args) {
+            println!(
+                "      (skipped — {err:#}; re-run with the same --server-url / --auth-token used originally)"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn warn_remote_server(config: &Config) {
+    if !config.server_url_configured() {
+        return;
+    }
+    if is_loopback_url(&config.server_url) {
+        return;
+    }
+    eprintln!(
+        "note: AI_MEMORY_SERVER_URL={} looks remote — this upgrade refreshed only the local \
+         binary and hooks; redeploy the remote server separately",
+        config.server_url
+    );
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("127.0.0.1")
+        || lower.contains("localhost")
+        || lower.contains("[::1]")
+        || lower.contains("0.0.0.0")
+}
+
+struct ReqwestFetcher {
+    client: reqwest::Client,
+}
+
+impl ReqwestFetcher {
+    fn new() -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("building HTTP client")?;
+        Ok(Self { client })
+    }
+
+    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("GET {url} returned {status}");
+        }
+        Ok(response
+            .bytes()
+            .await
+            .with_context(|| format!("reading body from {url}"))?
+            .to_vec())
+    }
+
+    async fn get_text(&self, url: &str) -> Result<String> {
+        let bytes = self.get_bytes(url).await?;
+        String::from_utf8(bytes).context("response body is not UTF-8")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tar::Header;
+
+    #[test]
+    fn asset_name_matches_release_matrix_for_this_host() {
+        // Compile-time host must map or explicitly fail — never invent a name.
+        let name = release_asset_name();
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => assert_eq!(name, Some("ai-memory-linux-x86_64.tar.gz")),
+            ("linux", "aarch64") => assert_eq!(name, Some("ai-memory-linux-aarch64.tar.gz")),
+            ("macos", "aarch64") => assert_eq!(name, Some("ai-memory-macos-aarch64.tar.gz")),
+            ("macos", "x86_64") => assert_eq!(name, Some("ai-memory-macos-x86_64.tar.gz")),
+            ("windows", _) => assert_eq!(name, None),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn parse_sha256_sidecar_accepts_sha256sum_format() {
+        let text = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  ai-memory-macos-aarch64.tar.gz\n";
+        let hash = parse_sha256_sidecar(text, "ai-memory-macos-aarch64.tar.gz").unwrap();
+        assert_eq!(
+            hash,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn parse_sha256_sidecar_rejects_wrong_filename() {
+        let text =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  other.tar.gz\n";
+        let err = parse_sha256_sidecar(text, "ai-memory-macos-aarch64.tar.gz").unwrap_err();
+        assert!(err.to_string().contains("expected"));
+    }
+
+    #[test]
+    fn parse_sha256_sidecar_rejects_bad_hash() {
+        let err = parse_sha256_sidecar("not-a-hash  file.tar.gz\n", "file.tar.gz").unwrap_err();
+        assert!(err.to_string().contains("invalid sha256"));
+    }
+
+    #[test]
+    fn versions_match_strips_v_prefix() {
+        assert!(versions_match("v2.3.2", "2.3.2"));
+        assert!(versions_match("2.3.2", "v2.3.2"));
+        assert!(!versions_match("v2.3.2", "2.3.1"));
+    }
+
+    #[test]
+    fn classify_rejects_homebrew_prefix() {
+        let class = classify_install(Path::new("/opt/homebrew/bin/ai-memory")).unwrap();
+        assert!(matches!(class, InstallClass::Unsupported(_)));
+    }
+
+    #[test]
+    fn classify_rejects_usr_bin() {
+        let class = classify_install(Path::new("/usr/bin/ai-memory")).unwrap();
+        assert!(matches!(class, InstallClass::Unsupported(_)));
+    }
+
+    #[test]
+    fn classify_accepts_writable_user_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("ai-memory");
+        fs::write(&exe, b"fake").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let class = classify_install(&exe).unwrap();
+        // In CI containers /.dockerenv may exist — then Unsupported is correct.
+        if Path::new("/.dockerenv").exists() {
+            assert!(matches!(class, InstallClass::Unsupported(_)));
+        } else {
+            assert_eq!(class, InstallClass::Supported);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal() {
+        let err =
+            validate_release_entry(Path::new("../evil"), tar::EntryType::Regular).unwrap_err();
+        assert!(err.to_string().contains("unsafe"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_unexpected_paths() {
+        let err =
+            validate_release_entry(Path::new("etc/passwd"), tar::EntryType::Regular).unwrap_err();
+        assert!(err.to_string().contains("unexpected"), "{err}");
+    }
+
+    #[test]
+    fn extract_and_verify_round_trip() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_path("ai-memory").unwrap();
+            header.set_size(11);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append(&header, &b"hello-world"[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz_bytes = Vec::new();
+        {
+            use flate2::Compression;
+            use flate2::write::GzEncoder;
+            let mut enc = GzEncoder::new(&mut gz_bytes, Compression::fast());
+            std::io::Write::write_all(&mut enc, &tar_bytes).unwrap();
+            enc.finish().unwrap();
+        }
+        let hash = sha256_hex(&gz_bytes);
+        let sidecar = format!("{hash}  ai-memory-macos-aarch64.tar.gz\n");
+        assert_eq!(
+            parse_sha256_sidecar(&sidecar, "ai-memory-macos-aarch64.tar.gz").unwrap(),
+            hash
+        );
+        let dest = tempfile::tempdir().unwrap();
+        extract_release_archive(&gz_bytes, dest.path()).unwrap();
+        assert_eq!(
+            fs::read(dest.path().join("ai-memory")).unwrap(),
+            b"hello-world"
+        );
+    }
+
+    #[test]
+    fn replace_file_atomic_swaps_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("ai-memory");
+        let src = dir.path().join("fresh");
+        fs::write(&dest, b"old").unwrap();
+        fs::write(&src, b"new").unwrap();
+        replace_file_atomic(&src, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert!(!dest.with_extension("new").exists());
+    }
+
+    #[test]
+    fn is_loopback_detects_common_forms() {
+        assert!(is_loopback_url("http://127.0.0.1:49374"));
+        assert!(is_loopback_url("http://localhost:49374"));
+        assert!(!is_loopback_url("http://192.168.1.10:49374"));
+    }
+}
