@@ -81,6 +81,12 @@ Bash on Windows). It appends or updates only ai-memory's managed block in
 `.git/hooks/pre-push`, preserving any existing hook body. Bypass it on a
 work-in-progress branch with `git push --no-verify`.
 
+The managed test block clears Git's repository environment and disables global
+and system Git configuration for Cargo and its children. Fixture commands can
+then use their own repositories without inheriting the checkout being pushed.
+The publishing Git process and other hook code retain their configuration.
+Run the installer again to update an existing installation.
+
 Integration tests live in `tests/suite/` per crate and compile into the
 crate's own test harness (declare a new file with `mod name;` in
 `tests/suite/mod.rs`); only the CLI keeps a separate test binary, because its

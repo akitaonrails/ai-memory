@@ -43,13 +43,30 @@ if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ] && [ -z "${SSL_CERT_FILE:-}"
     export SSL_CERT_FILE=/etc/ssl/cert.pem
 fi
 
-if command -v cargo-nextest >/dev/null 2>&1; then
-    echo "pre-push: cargo nextest run --workspace -P full"
-    cargo nextest run --workspace -P full
-else
-    echo "pre-push: cargo test --workspace --all-targets (nextest not installed)"
-    cargo test --workspace --all-targets
-fi
+# Git's hook environment would redirect fixture commands into this checkout.
+# Isolate Cargo and its children so other hook code keeps its Git context.
+(
+    # A plain assignment, so `set -e` still aborts if `git rev-parse` fails.
+    git_local_env_vars=$(git rev-parse --local-env-vars)
+    # A surrounding user hook may have narrowed IFS; the list below is split on
+    # newlines, so restore the default before splitting it.
+    IFS=$' \t\n'
+    # Unquoted on purpose: the output is one variable name per line.
+    for git_local_env_var in $git_local_env_vars; do
+        unset "$git_local_env_var"
+    done
+    # Fixture repositories must not inherit machine settings such as signing.
+    # Git for Windows maps /dev/null to nul.
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        echo "pre-push: cargo nextest run --workspace -P full"
+        cargo nextest run --workspace -P full
+    else
+        echo "pre-push: cargo test --workspace --all-targets (nextest not installed)"
+        cargo test --workspace --all-targets
+    fi
+)
 # <<< ai-memory pre-push <<<
 HOOK
 
