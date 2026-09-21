@@ -83,7 +83,7 @@
   that recovery for one harness. Managed mode currently covers Claude Code,
   Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP,
   Grok Build CLI, and Antigravity CLI; direct harness launches remain unchanged. See
-  [Managed cross-harness workstreams](docs/managed-workstreams.md).
+  [Managed cross-harness workstreams](managed-workstreams.md).
 - **"Just put me back where I was."** From any directory, with no name to
   type and no list to read:
 
@@ -188,7 +188,7 @@
   proposals are isolated by qualified operator identity, so one person's
   proposal for a page does not block another's; unattributed and single-user
   deployments retain the shared pending queue. See
-  [`docs/auto-improve-eval-gates.md`](docs/auto-improve-eval-gates.md) for
+  [`docs/auto-improve-eval-gates.md`](auto-improve-eval-gates.md) for
   example executable eval scorers.
 
   Existing installs do not need per-project migration. The scheduler initializes

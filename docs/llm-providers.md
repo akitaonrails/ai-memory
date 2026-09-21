@@ -49,6 +49,7 @@ Recommended defaults:
 | `codex` | `gpt-5.6-luna` | Reuse the Codex CLI-owned `auth.json`; access-token refresh remains owned by `codex app-server`. |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
+| `opencode` | `claude-sonnet-4-6` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
 | `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
@@ -80,6 +81,33 @@ Docker is not configured automatically: the Codex executable, `CODEX_HOME`,
 and its credential file must all exist in the same container/environment as
 ai-memory.
 
+`opencode` talks to OpenCode's gateway with the `sk-...` key from
+`opencode.ai/auth`, read from `OPENCODE_API_KEY` only; it does not fall back
+to `LLM_API_KEY`. It defaults to the **Go** endpoint,
+`https://opencode.ai/zen/go/v1`: a subscription with a per-model monthly
+allowance rather than per-token billing. Set
+`AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` (or `llm_base_url` in
+`config.toml`) for **Zen**'s pay-per-token catalogue. Model ids are per
+catalogue and written plainly (`mimo-v2.5`, `glm-5.3-flash`), not in the
+`opencode-go/<model>` form OpenCode's own client config uses. The built-in
+default is `claude-sonnet-4-6`; Go ids such as `mimo-v2.5` or `glm-5.3-flash`
+come from `AI_MEMORY_LLM_MODEL`, so set it to an id the endpoint you chose
+serves. `gpt-5.6-luna` is sent through the Responses endpoint;
+every other model uses Chat Completions. The provider sends the
+`x-opencode-session` correlation header OpenCode asks for, one id per logical
+operation, and its own `User-Agent`; `AI_MEMORY_LLM_HEADERS` overrides
+either. `AI_MEMORY_LLM_REASONING_EFFORT` and `AI_MEMORY_LLM_TIMEOUT_SECS`
+apply as for every other provider. `AI_MEMORY_LLM_PROVIDER` / `llm_provider`
+also accept the historical aliases `opencode-zen` and `opencode_zen` for the
+same provider (`llm-test --provider` takes only `opencode`); the endpoint is
+chosen by the base URL, not the alias.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=opencode
+export AI_MEMORY_LLM_MODEL=mimo-v2.5
+ai-memory llm-test --provider opencode --model mimo-v2.5 --prompt "Reply with OK"
+```
+
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run
 `claude setup-token` once, then set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` and
@@ -97,7 +125,7 @@ rule.
 
 **⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
 it may get your account rate-limited or banned. See
-[the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
+[the warning in `docs/install.md`](install.md#anthropic-via-claude-subscription-oauth).**
 
 `copilot` stores a GitHub user token in the same auth file, exchanges it for a
 short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
@@ -186,7 +214,7 @@ sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
 384-dim), with the model fetched once into `<data_dir>/models/` under
 pinned checksums — see [`docs/local-embeddings.md`](local-embeddings.md).
 
-See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
+See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter examples, and
-[`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md)
+[`docs/llm-provider-comparison.md`](llm-provider-comparison.md)
 for the empirical model comparison.

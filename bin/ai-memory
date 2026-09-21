@@ -604,6 +604,7 @@ for var in \
   VOYAGE_API_KEY \
   LLM_API_KEY \
   EMBEDDING_API_KEY \
+  OPENCODE_API_KEY \
   RUST_LOG
 do
   if [ -n "${!var:-}" ]; then

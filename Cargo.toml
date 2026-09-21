@@ -136,7 +136,7 @@ winapi-util = "0.1"
 # `aws_lc_rs`, which is exactly the C/JNI toolchain the bridge avoids by using
 # rmcp's `reqwest-tls-no-provider`. `ring` is already in the lockfile via reqwest 0.12.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+rmcp = { version = "2.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
 # Same `http` 1.x rmcp/axum use, so handlers can read the injected
@@ -152,6 +152,9 @@ flate2 = "1"
 
 # Text munging / hook payload sanitisation.
 regex = "1"
+# Unicode NFC for the portable page-path key. Already in the tree via
+# idna -> idna_adapter, so this adds no new code to the binary.
+icu_normalizer = "2"
 
 # Wiki git versioning.
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }

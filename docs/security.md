@@ -10,9 +10,9 @@ Unauthenticated non-loopback HTTP now fails closed. Set
 `AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an
 intentional, dangerous exception for plain HTTP only. Authentication does not
 encrypt bearer tokens: for LAN or remote access, use the ready
-[Caddy](docker/compose.tls.caddy.yml) or
-[Cloudflare Tunnel](docker/compose.tls.cloudflared.yml) templates described in
-the [HTTPS reverse-proxy guide](docs/https-via-proxy.md).
+[Caddy](../docker/compose.tls.caddy.yml) or
+[Cloudflare Tunnel](../docker/compose.tls.cloudflared.yml) templates described in
+the [HTTPS reverse-proxy guide](https-via-proxy.md).
 
 Enable bearer auth when the server is exposed beyond loopback, when
 untrusted local processes share the machine, or when the data dir holds
@@ -81,11 +81,11 @@ real lifecycle-hook session id on MCP requests.
 
 **Want HTTPS?** ai-memory deliberately does not terminate TLS itself —
 the right answer is a battle-tested reverse proxy in front of it.
-[`docs/https-via-proxy.md`](docs/https-via-proxy.md) is the deployment
+[`docs/https-via-proxy.md`](https-via-proxy.md) is the deployment
 guide, with copy-paste docker compose templates in
-[`docker/compose.tls.caddy.yml`](docker/compose.tls.caddy.yml) (Caddy
+[`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml) (Caddy
 with Let's Encrypt or internal CA) and
-[`docker/compose.tls.cloudflared.yml`](docker/compose.tls.cloudflared.yml)
+[`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml)
 (Cloudflare Tunnel — no open ports). Both are recommended once you
 turn on multi-user or bind beyond loopback. The Quick Start happy
 path of single-user on loopback doesn't need TLS — that case is
@@ -106,8 +106,8 @@ single-user behavior until a user is added. An SSO gateway can instead use a
 dedicated `[auth].actor_proxy_bearer_token` and trusted `X-Memory-Actor-*`
 headers; its credential is deliberately separate from the root bearer so a
 missing identity cannot become root. See
-[`docs/users.md`](docs/users.md) for the full walkthrough and the
+[`docs/users.md`](users.md) for the full walkthrough and the
 four-rung auth ladder.
 
-See [`docs/deploy.md`](docs/deploy.md) for the full homelab pattern
+See [`docs/deploy.md`](deploy.md) for the full homelab pattern
 with bearer auth, host allowlisting, and TLS/reverse-proxy options.

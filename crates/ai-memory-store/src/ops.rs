@@ -1070,6 +1070,12 @@ pub(crate) fn upsert_page_in_tx(
         )?;
         return Ok(new_id);
     }
+    if let Some(existing) = colliding_live_path(tx, page)? {
+        return Err(StoreError::PagePathCollides {
+            requested: page.path.as_str().to_owned(),
+            existing,
+        });
+    }
     let frontmatter_str = stamped_frontmatter(conformed, now)?;
     let new_id = PageId::new();
     tx.execute(
@@ -1110,6 +1116,36 @@ pub(crate) fn upsert_page_in_tx(
         now,
     )?;
     Ok(new_id)
+}
+
+/// The live page this create would share a file with on a case-folding or
+/// normalizing filesystem, if any.
+///
+/// Runs on creates only: a supersede targets a path that already has its own
+/// row, so it cannot introduce a pair that did not exist before. That keeps
+/// the scan off the rewrite-heavy path, where it would repeat for every
+/// consolidation pass over the same page.
+fn colliding_live_path(
+    tx: &rusqlite::Transaction<'_>,
+    page: &NewPage,
+) -> StoreResult<Option<String>> {
+    let key = ai_memory_core::portable_page_key(page.path.as_str());
+    let mut stmt = tx.prepare_cached(
+        "SELECT path FROM pages \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path <> ?3",
+    )?;
+    let mut rows = stmt.query(params![
+        page.workspace_id.as_bytes(),
+        page.project_id.as_bytes(),
+        page.path.as_str(),
+    ])?;
+    while let Some(row) = rows.next()? {
+        let candidate: String = row.get(0)?;
+        if ai_memory_core::portable_page_key(&candidate) == key {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 /// Attach the normalized entity set to a new page version (V38). Entity

@@ -8742,7 +8742,11 @@ fn telemetry_count_from_row(
 
 /// Normalize a cwd for comparison: treat Windows backslashes as path
 /// separators and trim trailing separators while keeping a bare root as `/`.
-/// Pure and string-only; it does not touch the filesystem.
+/// Drive-letter and UNC paths are ASCII-lowercased: the server often runs
+/// on Linux (Docker Desktop) while the hook cwd is a Windows host path,
+/// and Explorer/Git/PowerShell disagree on `C:` vs `c:`. Unix paths stay
+/// byte-exact (`/Repo` is not `/repo`). Pure and string-only; it does not
+/// touch the filesystem.
 pub(crate) fn normalize_cwd(p: &str) -> std::borrow::Cow<'_, str> {
     let replaced = if p.contains('\\') {
         std::borrow::Cow::Owned(p.replace('\\', "/"))
@@ -8750,13 +8754,24 @@ pub(crate) fn normalize_cwd(p: &str) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(p)
     };
     let trimmed = replaced.trim_end_matches('/');
-    if trimmed.is_empty() {
+    let core = if trimmed.is_empty() {
         std::borrow::Cow::Borrowed("/")
     } else if trimmed.len() == replaced.len() {
         replaced
     } else {
         std::borrow::Cow::Owned(trimmed.to_string())
+    };
+    if is_windows_style_path(&core) {
+        std::borrow::Cow::Owned(core.to_ascii_lowercase())
+    } else {
+        core
     }
+}
+
+fn is_windows_style_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || path.starts_with("//")
 }
 
 /// True when `descendant` is the same directory as `ancestor` or nested
@@ -9509,6 +9524,27 @@ mod tests {
         assert!(cwd_within(r"C:\repo", r"C:\repo\api"));
         assert!(cwd_within(r"C:\repo\", r"C:\repo\api"));
         assert!(!cwd_within(r"C:\repo", r"C:\repo-other"));
+    }
+
+    /// Docker Desktop runs the server on Linux while hook cwd is a Windows
+    /// host path. Explorer, Git, and PowerShell disagree on drive-letter
+    /// case, so a byte-exact compare misses the auto-handoff and the
+    /// repo_path prefix match for the same directory.
+    #[test]
+    fn cwd_within_windows_drive_letter_is_case_insensitive() {
+        use super::cwd_within;
+        assert!(cwd_within(r"C:\Users\alice\repo", r"c:\users\alice\repo"));
+        assert!(cwd_within(
+            r"C:\Users\alice\repo",
+            r"c:\Users\alice\repo\src"
+        ));
+        assert!(!cwd_within(
+            r"C:\Users\alice\repo",
+            r"c:\Users\alice\repo-other"
+        ));
+        // Unix paths stay case-sensitive: /Repo and /repo are different dirs.
+        assert!(!cwd_within("/Repo", "/repo"));
+        assert!(!cwd_within("/Repo", "/repo/src"));
     }
 
     // The realistic scenario matrix (see the cwd the SessionEnd hook injects):

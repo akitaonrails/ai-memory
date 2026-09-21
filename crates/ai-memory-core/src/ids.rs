@@ -203,6 +203,23 @@ impl fmt::Display for PagePath {
     }
 }
 
+/// The key a case-folding or Unicode-normalizing filesystem effectively
+/// stores a page path under: two paths with the same key are one file on
+/// macOS (APFS) and Windows (NTFS), whatever they look like here.
+///
+/// Lowercase first, then compose: `İ` lowercases to `i` + U+0307, which only
+/// composes back to a single scalar after the fold.
+#[must_use]
+pub fn portable_page_key(path: &str) -> String {
+    let lowered = path.to_lowercase();
+    let nfc = icu_normalizer::ComposingNormalizer::new_nfc();
+    if nfc.is_normalized(&lowered) {
+        lowered
+    } else {
+        nfc.normalize(&lowered).into_owned()
+    }
+}
+
 /// Discriminator for the agent CLI that captured an observation or handoff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -761,7 +778,7 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
 
 #[cfg(test)]
 mod portable_page_path_tests {
-    use super::PagePath;
+    use super::{PagePath, portable_page_key};
 
     /// Every shape #462 reproduced on native Windows. Each either fails late
     /// with a 500, or writes but cannot be checkpointed by libgit2 and cannot
@@ -889,6 +906,34 @@ mod portable_page_path_tests {
                 PagePath::new(raw).is_ok(),
                 "{raw:?} must still construct so persisted rows stay readable"
             );
+        }
+    }
+
+    #[test]
+    fn portable_key_collapses_case_and_normalization() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/Alpha.md"),
+            ("Concepts/alpha.md", "concepts/ALPHA.md"),
+            ("concepts/caf\u{00e9}.md", "concepts/cafe\u{0301}.md"),
+            ("concepts/CAF\u{00c9}.md", "concepts/cafe\u{0301}.md"),
+        ] {
+            assert_eq!(
+                portable_page_key(a),
+                portable_page_key(b),
+                "{a:?} and {b:?} are one file on macOS/Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_key_keeps_distinct_paths_distinct() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/alphabet.md"),
+            ("concepts/alpha.md", "decisions/alpha.md"),
+            ("concepts/nested/a.md", "concepts/a.md"),
+            ("concepts/cafe.md", "concepts/caf\u{00e9}.md"),
+        ] {
+            assert_ne!(portable_page_key(a), portable_page_key(b));
         }
     }
 }

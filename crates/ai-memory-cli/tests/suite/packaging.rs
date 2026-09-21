@@ -488,6 +488,21 @@ fn posix_wrapper_auto_selects_podman_when_docker_is_unavailable() {
     );
 }
 
+const WRAPPER_FORWARDED_PROVIDER_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_OAUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "VOYAGE_API_KEY",
+    "COPILOT_GITHUB_TOKEN",
+    "GITHUB_COPILOT_API_TOKEN",
+    "COPILOT_API_URL",
+    "LLM_API_KEY",
+    "EMBEDDING_API_KEY",
+    "OPENCODE_API_KEY",
+];
+
 #[test]
 fn wrapper_forwards_every_supported_provider_api_key() {
     // The wrapper runs the server in a container, so any provider credential
@@ -496,20 +511,46 @@ fn wrapper_forwards_every_supported_provider_api_key() {
     // Gemini/Google were missing while every other provider key was
     // forwarded (#698), so the guard names each key the config layer reads.
     let wrapper = read_repo("bin/ai-memory");
-    for key in [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_OAUTH_TOKEN",
-        "OPENAI_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "VOYAGE_API_KEY",
-        "COPILOT_GITHUB_TOKEN",
-        "LLM_API_KEY",
-        "EMBEDDING_API_KEY",
-    ] {
+    for key in WRAPPER_FORWARDED_PROVIDER_KEYS {
         assert!(
             wrapper.contains(&format!("  {key} \\")),
             "wrapper must forward {key} into the container"
+        );
+    }
+}
+
+#[test]
+fn powershell_wrapper_forwards_every_supported_provider_api_key() {
+    // Same contract as the POSIX wrapper: Docker Desktop on Windows still
+    // runs the CLI inside a Linux helper, so a host-exported Gemini /
+    // Copilot / OpenCode key that is not on this allowlist never reaches
+    // Config::load and the provider reports "not configured".
+    let wrapper = read_repo("bin/ai-memory.ps1");
+    let allowlist = wrapper
+        .split_once("foreach ($Name in @(")
+        .and_then(|(_, rest)| rest.split_once(")) {"))
+        .map(|(allowlist, _)| allowlist)
+        .expect("PowerShell wrapper env allowlist");
+    for key in WRAPPER_FORWARDED_PROVIDER_KEYS {
+        assert!(
+            allowlist
+                .lines()
+                .any(|line| line.trim() == format!("\"{key}\",")
+                    || line.trim() == format!("\"{key}\"")),
+            "PowerShell wrapper must list {key} in the helper env allowlist"
+        );
+    }
+    for key in [
+        "AI_MEMORY_COPILOT_CLIENT_ID",
+        "AI_MEMORY_WORKSTREAM_ID",
+        "CLAUDE_CONFIG_DIR",
+    ] {
+        assert!(
+            allowlist
+                .lines()
+                .any(|line| line.trim() == format!("\"{key}\",")
+                    || line.trim() == format!("\"{key}\"")),
+            "PowerShell wrapper must list {key} in the helper env allowlist"
         );
     }
 }

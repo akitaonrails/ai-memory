@@ -576,6 +576,13 @@ the conflict remains and concurrent writers are still rejected. Terminal
 interrupts continue to reach the child while the parent stays alive to finish
 or cancel the run.
 
+Before the child starts, `Ctrl+C` at the native-session chooser cancels the
+acquired run and exits without requiring Enter or adopting the selected session.
+The launcher waits for the server's cancellation response. A request error is
+reported and leaves the lease to expire within its normal 90-second window;
+a server that accepts the request but never responds can still keep the launcher
+waiting. Heartbeats have stopped, so the lease itself still expires.
+
 While the harness or native-session selector is open, a temporary server outage
 produces one short notice instead of printing every failed heartbeat. The
 launcher keeps probing every 30 seconds with a 10-second request timeout so the

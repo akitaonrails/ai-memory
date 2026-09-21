@@ -15,6 +15,7 @@ thiserror.workspace = true
 uuid.workspace = true
 jiff.workspace = true
 regex.workspace = true
+icu_normalizer.workspace = true
 tracing.workspace = true
 # JsonSchema on Tier/PageKind so the consolidation prompt's
 # structured-output schema enforces enum membership instead of
