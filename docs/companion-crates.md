@@ -63,6 +63,23 @@ mutation broker. Browsers should talk to the companion; the companion should tal
 to ai-memory with an operator token. That keeps CSRF, confirmation, audit, rate
 limits, and UI-specific policy outside the core server.
 
+## `ai-memory-relay`: external lifecycle delivery
+
+[`ai-memory-relay`](../companions/ai-memory-relay) delivers events collected by
+an external orchestrator through `/hook/batch`. Its own local queue records events
+before sending and retains unacknowledged entries for a later flush. It does not
+launch agents, claim handoffs, or open ai-memory's database or wiki.
+
+The orchestrator still maps its events to the native harness payloads and sets
+`AI_MEMORY_CAPTURE_OWNER` when launching that harness. The relay uses the native
+session identity and derives retry keys from the producer's stable event IDs.
+Only the first pending event for each session enters a batch; that session
+advances after acknowledgement, even when other sessions are rate-limited.
+
+The package has its own workspace, tests and CLI. Its README defines queue limits,
+local data handling and recovery, with an executable test against the real
+ai-memory server. Root workspace tests do not run the companion's unit tests.
+
 ## `ai-memory-importer`: migration and ingestion companion
 
 This is the companion shape for PR #118. The first implemented companion lives

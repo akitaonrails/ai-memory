@@ -1,0 +1,38 @@
+# Separate workspace, as described in docs/companion-crates.md.
+[workspace]
+
+[package]
+name = "ai-memory-relay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Persistent queue for external ai-memory lifecycle events"
+
+[[bin]]
+name = "ai-memory-relay"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+anyhow = "1"
+# Read the bearer token separately to keep it out of clap's Debug output.
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+# Native roots match the workspace (#492).
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls-native-roots",
+] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+# Default map ordering makes content comparisons independent of input key order.
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

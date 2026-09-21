@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added the optional `ai-memory-relay` companion for external lifecycle events.
+  It queues events locally and sends ordered batches through the public hook API,
+  using stable event identities for retries. The package has its own workspace
+  and does not change the server's capture or storage defaults. (#821)
 - Added per-execution `AI_MEMORY_CAPTURE_OWNER` context for external lifecycle
   producers. Updated native hooks, script bundles and generated integrations
   suppress capture while preserving supported handoff delivery and MCP recall.

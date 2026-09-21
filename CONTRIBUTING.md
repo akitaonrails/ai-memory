@@ -87,6 +87,11 @@ then use their own repositories without inheriting the checkout being pushed.
 The publishing Git process and other hook code retain their configuration.
 Run the installer again to update an existing installation.
 
+Companions have separate Cargo workspaces. Check each changed companion with
+`cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`, passing
+its `--manifest-path`. Changes to the lifecycle relay also need the real-server
+test documented in [its README](companions/ai-memory-relay/README.md#validation).
+
 Integration tests live in `tests/suite/` per crate and compile into the
 crate's own test harness (declare a new file with `mod name;` in
 `tests/suite/mod.rs`); only the CLI keeps a separate test binary, because its
