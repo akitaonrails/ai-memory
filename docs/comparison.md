@@ -59,6 +59,10 @@ not). See [where we're behind](#where-were-behind-or-different-by-choice).
 | Closest sibling (fact-row twin) | doobidoo/mcp-memory-service | SQLite(+vec), local ONNX, hook capture, typed edges, honest numbers | What ai-memory would be if it chose fact-rows over wiki **pages** |
 | Platform-native | Claude Code auto-memory | Zero setup, on by default | Machine-local, **no sync**, single-agent, repo-scoped, no tool-lifecycle capture, no team |
 | **File-first wiki (ai-memory)** | ai-memory, basic-memory, OKF | Human-editable markdown truth + derived index; cross-agent; zero-LLM default; multi-user | Below the reranking leaders on raw R@5; LLM-optional means no VLM fact-extraction sophistication |
+| Agent-memory / coding-agent memory | **Engram**, **memU** | Persistent, agent-oriented memory with MCP support and cross-session continuity | Different storage/runtime choices and product boundaries; evaluate integration and operational model separately |
+| Governed multi-agent memory | **Caura** | Shared memory for multi-agent fleets with scoped memory, trust/governance, and audit concepts | More governance/fleet-oriented; ai-memory emphasizes a local, git-backed project wiki |
+| Shared agent memory server | **TencentDB Agent Memory** | Shared memory across multiple coding/agent clients through a common memory/proxy layer | Server/proxy-oriented architecture rather than ai-memory's file-first wiki substrate |
+| Local-first memory runtime | **EverOS** | Markdown-centered memory with derived indexes and offline-oriented consolidation | Similar file-first direction, but different runtime and indexing architecture |
 
 ## Maturity and maintenance
 
