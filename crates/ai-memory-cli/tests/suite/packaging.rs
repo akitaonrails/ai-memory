@@ -1312,6 +1312,22 @@ fn log_field<'a>(log: &'a str, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no `{key}:` line in:\n{log}"))
 }
 
+/// Windows temp paths can use an 8.3 alias while Git reports the long name.
+/// Resolve both paths before comparing them; invalid paths still fail.
+#[cfg(any(unix, windows))]
+fn assert_same_directory(reported: &str, expected: &str, context: &str) {
+    let resolve = |label: &str, value: &str| {
+        std::fs::canonicalize(value).unwrap_or_else(|err| {
+            panic!("{context}\nthe {label} path `{value}` is not a directory: {err}")
+        })
+    };
+    assert_eq!(
+        resolve("reported", reported),
+        resolve("expected", expected),
+        "{context}"
+    );
+}
+
 #[cfg(any(unix, windows))]
 fn log_section<'a>(log: &'a str, name: &str) -> &'a str {
     let begin = format!("{name}-begin\n");
@@ -1451,7 +1467,7 @@ impl PrePushFixture {
     /// no path is ever interpolated into a shell literal.
     fn shell_env(&self, command: &mut Command) {
         command
-            .env("AI_MEMORY_FIXTURE_REPO", self.shell_arg(&self.fixture_repo))
+            .env("AI_MEMORY_FIXTURE_REPO", self.git_arg(&self.fixture_repo))
             .env(
                 "AI_MEMORY_FIXTURE_CARGO_LOG",
                 self.shell_arg(&self.cargo_log),
@@ -1463,16 +1479,25 @@ impl PrePushFixture {
             .env("AI_MEMORY_FIXTURE_HOOK", self.shell_arg(&self.hook));
     }
 
-    /// A path as the fixture's shell sees it: unchanged on Unix, MSYS-converted
-    /// by `cygpath` under Git Bash.
+    /// Bash needs MSYS paths for scripts and redirections on Windows.
     fn shell_arg(&self, path: &Path) -> String {
+        self.cygpath_arg("-u", path)
+    }
+
+    /// Native Git cannot resolve an MSYS `/tmp` mount. Use `C:/...` paths for
+    /// its arguments so correctness does not depend on MSYS argument conversion.
+    fn git_arg(&self, path: &Path) -> String {
+        self.cygpath_arg("-m", path)
+    }
+
+    fn cygpath_arg(&self, mode: &str, path: &Path) -> String {
         let Some(cygpath) = &self.cygpath else {
             return path.display().to_string();
         };
-        let output = Command::new(cygpath).arg("-u").arg(path).output().unwrap();
+        let output = Command::new(cygpath).arg(mode).arg(path).output().unwrap();
         assert!(
             output.status.success(),
-            "cygpath -u {} failed: {}",
+            "cygpath {mode} {} failed: {}",
             path.display(),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1654,10 +1679,10 @@ fn pre_push_hook_scrubs_the_repository_git_environment_before_cargo() {
 
     // The decisive check: a child `git` aimed at the fixture repository must
     // land there, not in the repository whose hook is running.
-    assert_eq!(
+    assert_same_directory(
         log_field(&log, "cargo-toplevel"),
-        fixture.fixture_toplevel,
-        "child git resolved the wrong repository:\n{log}"
+        &fixture.fixture_toplevel,
+        &format!("child git resolved the wrong repository:\n{log}"),
     );
     for (key, source) in [
         ("cargo-injected", "GIT_CONFIG_PARAMETERS"),
@@ -1715,10 +1740,10 @@ fn pre_push_hook_leaves_the_user_hook_environment_intact_around_the_block() {
         // The caller's Git still resolves through the inherited GIT_DIR, which
         // points at the hook's repository rather than the fixture repository
         // the command names.
-        assert_eq!(
+        assert_same_directory(
             log_field(&log, &format!("{stage}-toplevel")),
-            fixture.hook_toplevel,
-            "the {stage} content lost the repository Git gave it:\n{log}"
+            &fixture.hook_toplevel,
+            &format!("the {stage} content lost the repository Git gave it:\n{log}"),
         );
         for (key, expected, source) in [
             ("global", "from-global-config", "the global config"),
@@ -1778,10 +1803,11 @@ fn pre_push_hook_reinstall_keeps_user_content_and_one_managed_block() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        log_field(&fixture.cargo_log(), "cargo-toplevel"),
-        fixture.fixture_toplevel,
-        "the scrub did not survive a reinstall"
+    let log = fixture.cargo_log();
+    assert_same_directory(
+        log_field(&log, "cargo-toplevel"),
+        &fixture.fixture_toplevel,
+        "the scrub did not survive a reinstall",
     );
 }
 
@@ -1806,10 +1832,11 @@ fn pre_push_hook_splits_the_local_env_var_list_under_a_narrowed_ifs() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        log_field(&fixture.cargo_log(), "cargo-toplevel"),
-        fixture.fixture_toplevel,
-        "the scrub did not survive a narrowed IFS"
+    let log = fixture.cargo_log();
+    assert_same_directory(
+        log_field(&log, "cargo-toplevel"),
+        &fixture.fixture_toplevel,
+        "the scrub did not survive a narrowed IFS",
     );
 
     let caller = fixture.caller_log();
