@@ -283,7 +283,8 @@ jobs:
         with:
           log-level: warn
           command: check
-          arguments: --manifest-path companions/ai-memory-relay/Cargo.toml --all-features
+          manifest-path: companions/ai-memory-relay/Cargo.toml
+          arguments: --all-features
 
   audit:
     name: cargo-audit

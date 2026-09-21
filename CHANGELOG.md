@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added the optional `ai-memory-relay` companion for external lifecycle events.
   It queues events locally and sends ordered batches through the public hook API,
   using stable event identities for retries. The package has its own workspace
-  and does not change the server's capture or storage defaults. (#821)
+  and does not change the server's capture or storage defaults. (#823)
 - Added per-execution `AI_MEMORY_CAPTURE_OWNER` context for external lifecycle
   producers. Updated native hooks, script bundles and generated integrations
   suppress capture while preserving supported handoff delivery and MCP recall.
@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Isolated the pre-push test process from Git's repository environment and
   global/system configuration so fixture commands use their own repositories.
-  Existing installations need to run `scripts/install-git-hooks.sh` again. (#822)
+  Existing installations need to run `scripts/install-git-hooks.sh` again. (#823)
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
   provider credentials and host-config env vars as the POSIX wrapper into the
   helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
