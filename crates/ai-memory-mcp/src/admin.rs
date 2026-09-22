@@ -1981,6 +1981,7 @@ async fn handle_auto_improve(
         pending_path: req.pending_path.clone(),
         max_patchable_pages: req.max_patchable_pages,
         max_patchable_body_chars: req.max_patchable_body_chars,
+        patchable_prefixes: state.auto_improve_review_config.patchable_prefixes.clone(),
         max_edits_per_proposal: req.max_edits_per_proposal,
         max_edit_content_chars: req.max_edit_content_chars,
         max_changed_chars_per_proposal: req.max_changed_chars_per_proposal,

@@ -41,6 +41,9 @@ perf.data*
 .slim/deepwork/
 evals/runs/
 
+# FuXi session state (machine-local scheduler locks, session metrics).
+.fuxi/
+
 # ai-memory atomic-write backups (apply_atomic in apply_shared.rs)
 *.bak-*
 evals/datasets/

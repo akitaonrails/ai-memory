@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `[auto_improve] patchable_prefixes` configures which wiki folders the
+  auto-improvement reviewer reads as existing knowledge before proposing
+  edits. Previously `_rules/` and `procedures/` were the only folders whose
+  bodies reached the prompt, so durable invariants living under `decisions/`,
+  `gotchas/`, etc. were invisible and could be re-proposed verbatim as new
+  high-confidence proposals. Defaults to `["_rules/", "procedures/"]`;
+  widening it fixes the blind spot without changing existing behaviour. (#834)
+
 ### Security
 - Bumped `rmcp` to 2.x (2.2.0), resolving three MCP transport advisories:
   GHSA-9pj6-vhgr-3mwh (unauthenticated Streamable-HTTP session-table leak /

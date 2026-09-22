@@ -2041,6 +2041,7 @@ fn auto_improve_review_config_from_settings(
         proposal_actor: settings.proposal_actor.clone(),
         pending_path: settings.pending_path.clone(),
         max_patchable_pages: settings.max_patchable_pages,
+        patchable_prefixes: settings.patchable_prefixes.clone(),
         max_patchable_body_chars: settings.max_patchable_body_chars,
         max_edits_per_proposal: settings.max_edits_per_proposal,
         max_edit_content_chars: settings.max_edit_content_chars,

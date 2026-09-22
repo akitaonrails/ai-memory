@@ -838,6 +838,11 @@ pub struct AutoImproveSettings {
     pub max_proposals_per_run: usize,
     /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
     pub max_patchable_pages: usize,
+    /// Wiki-relative prefixes whose pages are eligible as patch targets.
+    /// Defaults to `_rules/` + `procedures/`; widen to make `decisions/`,
+    /// `gotchas/` etc. visible to the reviewer as existing knowledge.
+    #[serde(default = "ai_memory_consolidate::default_auto_improve_patchable_prefixes")]
+    pub patchable_prefixes: Vec<String>,
     /// Maximum body chars rendered per patchable target page.
     pub max_patchable_body_chars: usize,
     /// Maximum patch edits per proposal.
@@ -941,6 +946,7 @@ impl Default for AutoImproveSettings {
             max_input_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS,
             max_proposals_per_run: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
             max_patchable_pages: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_prefixes: ai_memory_consolidate::default_auto_improve_patchable_prefixes(),
             max_patchable_body_chars:
                 ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal:

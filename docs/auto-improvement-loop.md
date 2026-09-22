@@ -345,6 +345,11 @@ max_input_tokens = 24000
 max_proposals_per_run = 5
 max_patchable_pages = 8
 max_patchable_body_chars = 8000
+# Folders whose bodies the reviewer reads as existing knowledge before
+# proposing edits. Default `_rules/` + `procedures/`; widen to include
+# `decisions/`, `gotchas/`, etc. so durable pages there are not re-proposed
+# verbatim as new invariants (#834).
+patchable_prefixes = ["_rules/", "procedures/"]
 max_edits_per_proposal = 5
 max_edit_content_chars = 4000
 max_changed_chars_per_proposal = 12000
@@ -522,12 +527,12 @@ reviewer, so the same lesson can be proposed again. Reviewer duplicates are
 caught downstream (validation rejects a proposal whose path/title duplicates an
 existing page it *can* see, and staging enforces one pending proposal per
 target), but a proposal against a durable page the reviewer never saw is not
-prevented at review time.
+prevented at review time. The `[auto_improve] patchable_prefixes` setting
+widens the family list (`_rules/` + `procedures/` by default), so operators can
+bring `decisions/`/`gotchas/` bodies into the reviewer's view.
 
-Deferred improvements (future work, not in this line):
+Deferred improvement (future work, not in this line):
 
-- **Configurable patchable prefixes**, so `decisions/`/`gotchas/` bodies can
-  reach the reviewer without hard-coding the family list.
 - **Embedding-nearest dedup**, replacing the recency-ordered flat list with a
   retrieval of the pages semantically closest to the session under review, so
   relevant durable pages are surfaced regardless of recency.

@@ -30,6 +30,10 @@ const MAX_PROPOSAL_BODY_CHARS: usize = 32_000;
 pub const DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES: usize = 8;
 /// Default maximum body chars rendered for one patchable target page.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS: usize = 8_000;
+/// Default wiki-relative prefixes whose pages are loaded as patchable
+/// context. Only these folders' bodies reach the reviewer today, so durable
+/// knowledge under `decisions/`/`gotchas/` is invisible to it.
+pub const DEFAULT_AUTO_IMPROVE_PATCHABLE_PREFIXES: &[&str] = &["_rules/", "procedures/"];
 /// Default maximum patch edits per proposal.
 pub const DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL: usize = 5;
 /// Default maximum content chars in one patch edit.
@@ -87,6 +91,16 @@ pub fn default_auto_improve_eval_targets() -> Vec<String> {
     vec!["_rules".into(), "procedures".into()]
 }
 
+/// Default wiki-relative prefixes loaded as patchable context for the
+/// reviewer. Only these folders' bodies reach the prompt today, so durable
+/// knowledge under `decisions/`, `gotchas/` etc. is invisible unless widened.
+pub fn default_auto_improve_patchable_prefixes() -> Vec<String> {
+    DEFAULT_AUTO_IMPROVE_PATCHABLE_PREFIXES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 /// Optional executable gate for validated auto-improvement proposals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -136,6 +150,9 @@ pub struct AutoImproveReviewConfig {
     pub pending_path: String,
     /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
     pub max_patchable_pages: usize,
+    /// Wiki-relative prefixes whose pages are eligible as patch targets. Default
+    /// `_rules/` + `procedures/`; widen to cover `decisions/`, `gotchas/`, etc.
+    pub patchable_prefixes: Vec<String>,
     /// Maximum body chars rendered per patchable target page.
     pub max_patchable_body_chars: usize,
     /// Maximum patch edits per proposal.
@@ -173,6 +190,7 @@ impl Default for AutoImproveReviewConfig {
             pending_path: DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
             max_patchable_pages: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
             max_patchable_body_chars: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
+            patchable_prefixes: default_auto_improve_patchable_prefixes(),
             max_edits_per_proposal: DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
             max_edit_content_chars: DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
             max_changed_chars_per_proposal: DEFAULT_AUTO_IMPROVE_MAX_CHANGED_CHARS_PER_PROPOSAL,
@@ -961,7 +979,11 @@ pub(crate) async fn load_patchable_pages(
     let mut out = Vec::new();
     for page in recent_pages
         .iter()
-        .filter(|p| p.path.starts_with("_rules/") || p.path.starts_with("procedures/"))
+        .filter(|p| {
+            cfg.patchable_prefixes
+                .iter()
+                .any(|prefix| p.path.starts_with(prefix.as_str()))
+        })
         .take(cfg.max_patchable_pages)
     {
         if let Some(body) = reader
@@ -1997,6 +2019,7 @@ mod tests {
             max_final_body_chars: DEFAULT_AUTO_IMPROVE_MAX_FINAL_BODY_CHARS,
             max_rule_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
             max_procedure_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
+            patchable_prefixes: default_auto_improve_patchable_prefixes(),
             eval: AutoImproveEvalConfig::default(),
         }
     }
@@ -3312,6 +3335,108 @@ mod tests {
             rejected
                 .iter()
                 .all(|r| r.reason == "patch_target_not_in_context")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_patchable_pages_respects_configured_prefixes() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+
+        // Durable pages under several folders: only `_rules/` and
+        // `procedures/` are visible to the reviewer by default (#834).
+        for (path, body) in [
+            ("_rules/r.md", "# Rule\n\nbody of the rule"),
+            ("procedures/p.md", "# Proc\n\nbody of the procedure"),
+            ("decisions/d.md", "# Decision\n\nbody of the decision"),
+            ("notes/n.md", "# Note\n\nbody of the note"),
+        ] {
+            store
+                .writer
+                .upsert_page(ai_memory_core::NewPage {
+                    workspace_id: ws,
+                    project_id: proj,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: body.into(),
+                    tier: ai_memory_core::Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                    evidence: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let recent: Vec<BriefingPage> = [
+            "_rules/r.md",
+            "procedures/p.md",
+            "decisions/d.md",
+            "notes/n.md",
+        ]
+        .into_iter()
+        .map(|path| BriefingPage {
+            path: path.into(),
+            title: path.into(),
+            kind: "note".into(),
+            updated_at: "2026-06-15T00:00:00Z".into(),
+        })
+        .collect();
+
+        // Default prefixes: `_rules/` + `procedures/` only. A `decisions/`
+        // page's body must NOT reach the reviewer, so its invariant can be
+        // re-proposed verbatim without ever looking redundant (#834).
+        let patchable = load_patchable_pages(&store.reader, ws, proj, &recent, &cfg())
+            .await
+            .unwrap();
+        let paths: Vec<String> = patchable.iter().map(|p| p.path.clone()).collect();
+        assert!(
+            paths.contains(&"_rules/r.md".into()),
+            "default includes _rules/: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"procedures/p.md".into()),
+            "default includes procedures/: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"decisions/d.md".into()),
+            "default excludes decisions/: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"notes/n.md".into()),
+            "default excludes notes/: {paths:?}"
+        );
+
+        // Widen the prefixes: decisions/ now reaches the reviewer, so its
+        // durable knowledge can prevent a duplicate proposal.
+        let mut widened = cfg();
+        widened.patchable_prefixes =
+            vec!["_rules/".into(), "procedures/".into(), "decisions/".into()];
+        let patchable = load_patchable_pages(&store.reader, ws, proj, &recent, &widened)
+            .await
+            .unwrap();
+        let paths: Vec<String> = patchable.iter().map(|p| p.path.clone()).collect();
+        assert!(
+            paths.contains(&"decisions/d.md".into()),
+            "widened includes decisions/: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"notes/n.md".into()),
+            "widened still excludes notes/: {paths:?}"
         );
     }
 

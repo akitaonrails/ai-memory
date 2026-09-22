@@ -62,6 +62,7 @@ fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
         max_patchable_pages: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
         max_patchable_body_chars:
             ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
+        patchable_prefixes: ai_memory_consolidate::default_auto_improve_patchable_prefixes(),
         max_edits_per_proposal: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
         max_edit_content_chars: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
         max_changed_chars_per_proposal:
@@ -2896,6 +2897,7 @@ impl AiMemoryServer {
             proposal_actor: defaults.proposal_actor.clone(),
             pending_path: defaults.pending_path.clone(),
             max_patchable_pages: defaults.max_patchable_pages,
+            patchable_prefixes: defaults.patchable_prefixes.clone(),
             max_patchable_body_chars: defaults.max_patchable_body_chars,
             max_edits_per_proposal: defaults.max_edits_per_proposal,
             max_edit_content_chars: defaults.max_edit_content_chars,
