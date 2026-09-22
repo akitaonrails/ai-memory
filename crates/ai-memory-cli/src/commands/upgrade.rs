@@ -221,7 +221,7 @@ fn classify_install(exe: &Path) -> Result<InstallClass> {
 }
 
 fn container_refusal() -> Option<String> {
-    if Path::new("/.dockerenv").exists() {
+    if ai_memory_wiki::backup::running_in_container() {
         Some(
             "refusing to self-upgrade inside a container; run `ai-memory upgrade` on the \
              host Docker wrapper, or replace the image with `docker pull`"
@@ -250,7 +250,9 @@ fn unwritable_refusal(exe: &Path) -> Result<Option<String>> {
     let parent = exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("executable has no parent directory"))?;
-    if is_writable_dir(parent) && is_writable_file(exe) {
+    // Only the parent directory must be writable: atomic replace uses rename,
+    // and Linux returns ETXTBSY when opening a running executable for write.
+    if is_writable_dir(parent) {
         return Ok(None);
     }
     Ok(Some(format!(
@@ -264,6 +266,7 @@ fn package_managed_prefixes() -> &'static [&'static str] {
     &[
         "/opt/homebrew/",
         "/usr/local/Cellar/",
+        "/home/linuxbrew/.linuxbrew/",
         "/usr/bin/",
         "/bin/",
         "/sbin/",
@@ -285,10 +288,6 @@ fn is_writable_dir(path: &Path) -> bool {
         }
         Err(_) => false,
     }
-}
-
-fn is_writable_file(path: &Path) -> bool {
-    fs::OpenOptions::new().write(true).open(path).is_ok()
 }
 
 fn release_base_url(config: &Config) -> String {
@@ -418,9 +417,7 @@ fn is_regular_file(entry_type: tar::EntryType) -> bool {
 }
 
 fn validate_release_entry(path: &Path, entry_type: tar::EntryType) -> Result<()> {
-    if !path.components().all(|c| matches!(c, Component::Normal(_))) {
-        bail!("release archive contains unsafe path: {}", path.display());
-    }
+    let normalized = normalize_release_entry_path(path)?;
     if entry_type.is_symlink() || entry_type.is_hard_link() {
         bail!(
             "release archive contains unsupported link entry: {}",
@@ -433,13 +430,35 @@ fn validate_release_entry(path: &Path, entry_type: tar::EntryType) -> Result<()>
             path.display()
         );
     }
-    if !is_allowed_release_path(path) {
+    // `tar -C dist/$artifact -czf … .` (release.yml) emits `./` as the
+    // archive root — empty after stripping CurDir; allow that directory only.
+    if normalized.as_os_str().is_empty() {
+        if entry_type.is_dir() {
+            return Ok(());
+        }
+        bail!("release archive contains unsafe path: {}", path.display());
+    }
+    if !is_allowed_release_path(&normalized) {
         bail!(
             "release archive contains unexpected path: {}",
             path.display()
         );
     }
     Ok(())
+}
+
+/// Drop `Component::CurDir` (release tarballs use `./ai-memory`); reject
+/// anything that is not a normal component after that.
+fn normalize_release_entry_path(path: &Path) -> Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => out.push(part),
+            _ => bail!("release archive contains unsafe path: {}", path.display()),
+        }
+    }
+    Ok(out)
 }
 
 fn is_allowed_release_path(path: &Path) -> bool {
@@ -853,6 +872,19 @@ mod tests {
     }
 
     #[test]
+    fn homebrew_is_package_managed() {
+        let exe = Path::new("/opt/homebrew/bin/ai-memory");
+        assert!(package_managed_refusal(exe).is_some());
+    }
+
+    #[test]
+    fn linuxbrew_is_package_managed() {
+        let exe =
+            Path::new("/home/linuxbrew/.linuxbrew/Cellar/ai-memory/2.4.0/bin/ai-memory");
+        assert!(package_managed_refusal(exe).is_some());
+    }
+
+    #[test]
     fn classify_accepts_writable_user_prefix() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let exe = dir.path().join("ai-memory");
@@ -863,8 +895,9 @@ mod tests {
             fs::set_permissions(&exe, fs::Permissions::from_mode(0o755))?;
         }
         let class = classify_install(&exe)?;
-        // In CI containers /.dockerenv may exist — then Unsupported is correct.
-        if Path::new("/.dockerenv").exists() {
+        // In CI containers (or when AI_MEMORY_IN_CONTAINER is set) Unsupported
+        // is correct — do not depend on /.dockerenv alone.
+        if ai_memory_wiki::backup::running_in_container() {
             assert!(matches!(class, InstallClass::Unsupported(_)));
         } else {
             assert_eq!(class, InstallClass::Supported);
@@ -887,6 +920,39 @@ mod tests {
             Ok(()) => bail!("unexpected path must fail"),
             Err(err) => assert!(err.to_string().contains("unexpected"), "{err}"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_accepts_dot_slash_prefixed_binary() -> Result<()> {
+        validate_release_entry(Path::new("./ai-memory"), tar::EntryType::Regular)?;
+        validate_release_entry(Path::new("./"), tar::EntryType::Directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_archive_built_like_release_yml() -> Result<()> {
+        let src = tempfile::tempdir()?;
+        fs::write(src.path().join(BINARY_NAME), b"bin")?;
+        fs::create_dir_all(src.path().join("hooks/claude-code"))?;
+        fs::write(src.path().join("hooks/claude-code/x.sh"), b"#!/bin/sh")?;
+        let out = tempfile::tempdir()?;
+        let archive = out.path().join("a.tar.gz");
+        // Same invocation as .github/workflows/release.yml. COPYFILE_DISABLE
+        // keeps macOS tar from injecting AppleDouble `._*` sidecars that Linux
+        // release runners never produce.
+        let status = std::process::Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .arg("-C")
+            .arg(src.path())
+            .arg("-czf")
+            .arg(&archive)
+            .arg(".")
+            .status()?;
+        assert!(status.success());
+        let dest = tempfile::tempdir()?;
+        extract_release_archive(&fs::read(&archive)?, dest.path())?;
+        assert!(dest.path().join(BINARY_NAME).is_file());
         Ok(())
     }
 

@@ -38,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model ids, and which model goes through the Responses endpoint (#763).
 
 ### Fixed
+- Native `ai-memory upgrade` no longer refuses every Linux install by probing
+  the running executable for write (Linux `ETXTBSY`); it only requires the
+  parent directory to be writable for rename-based replace. (#802)
+- Native `ai-memory upgrade` accepts release archives whose entries are
+  `./`-prefixed (`tar -C … -czf … .` as in `release.yml`), instead of
+  rejecting `Component::CurDir` as an unsafe path. (#802)
+- Native `ai-memory upgrade` treats Linuxbrew (`/home/linuxbrew/.linuxbrew/`)
+  as package-managed and refuses self-replace there. (#802)
+- Native `ai-memory upgrade` container refusal now uses the shared
+  `running_in_container` helper (`AI_MEMORY_IN_CONTAINER`, `/.dockerenv`,
+  `/run/.containerenv` / Podman), matching staged-hooks detection. (#802)
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
   provider credentials and host-config env vars as the POSIX wrapper into the
   helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
