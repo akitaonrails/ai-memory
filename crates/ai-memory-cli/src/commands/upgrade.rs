@@ -301,7 +301,16 @@ fn release_base_url(config: &Config) -> String {
 }
 
 fn release_asset_name() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+    release_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Map an OS/arch pair to the GitHub release tarball name.
+///
+/// Pure so every CI host can assert the full Unix matrix (and Windows →
+/// `None`) without cross-compiling. Callers use [`release_asset_name`] for
+/// the running host.
+fn release_asset_name_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
         ("linux", "x86_64") => Some("ai-memory-linux-x86_64.tar.gz"),
         ("linux", "aarch64") => Some("ai-memory-linux-aarch64.tar.gz"),
         ("macos", "aarch64") => Some("ai-memory-macos-aarch64.tar.gz"),
@@ -806,17 +815,43 @@ mod tests {
     use tar::Header;
 
     #[test]
-    fn asset_name_matches_release_matrix_for_this_host() {
-        // Compile-time host must map or explicitly fail — never invent a name.
-        let name = release_asset_name();
-        match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => assert_eq!(name, Some("ai-memory-linux-x86_64.tar.gz")),
-            ("linux", "aarch64") => assert_eq!(name, Some("ai-memory-linux-aarch64.tar.gz")),
-            ("macos", "aarch64") => assert_eq!(name, Some("ai-memory-macos-aarch64.tar.gz")),
-            ("macos", "x86_64") => assert_eq!(name, Some("ai-memory-macos-x86_64.tar.gz")),
-            ("windows", _) => assert_eq!(name, None),
-            _ => {}
+    fn release_asset_name_for_covers_unix_matrix_and_refusals() {
+        // Table-driven so Linux CI still guards macos-* and windows → None.
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            (
+                "linux",
+                "x86_64",
+                Some("ai-memory-linux-x86_64.tar.gz"),
+            ),
+            (
+                "linux",
+                "aarch64",
+                Some("ai-memory-linux-aarch64.tar.gz"),
+            ),
+            (
+                "macos",
+                "aarch64",
+                Some("ai-memory-macos-aarch64.tar.gz"),
+            ),
+            ("macos", "x86_64", Some("ai-memory-macos-x86_64.tar.gz")),
+            ("windows", "x86_64", None),
+            ("windows", "aarch64", None),
+            ("linux", "arm", None),
+            ("freebsd", "x86_64", None),
+            ("unknown", "unknown", None),
+        ];
+        for &(os, arch, expected) in cases {
+            assert_eq!(
+                release_asset_name_for(os, arch),
+                expected,
+                "os={os} arch={arch}"
+            );
         }
+        // Host still maps through the same function (never invent a name).
+        assert_eq!(
+            release_asset_name(),
+            release_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
+        );
     }
 
     #[test]
