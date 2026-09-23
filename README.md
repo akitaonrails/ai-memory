@@ -470,6 +470,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for adding managed resume, transcript import, and startup context delivery to another harness. |
 | [`docs/companion-crates.md`](docs/companion-crates.md) | Boundary and plan for optional companion projects, including the standalone importer at [`companions/ai-memory-importer`](companions/ai-memory-importer). |
+| [`docs/external-lifecycle.md`](docs/external-lifecycle.md) | External lifecycle producers: per-execution native capture suppression, preserved handoffs, batch ingestion and stable retry identity. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 
 ## License

@@ -19,6 +19,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base for mirrors and hermetic tests (loaded via `Config`, not ad-hoc env).
   Downloads refuse bodies over 128 MiB (Content-Length and streamed cap).
   (#801)
+- `auto_improve.patchable_page_prefixes` makes the folders whose page bodies the
+  reviewer reads configurable, defaulting to the historical `_rules/` and
+  `procedures/`. Only those two folders' contents were ever sent; every other
+  page reached the model as a single title line, so a project keeping its
+  durable knowledge in `decisions/` or `gotchas/` — with no `_rules/` pages at
+  all — sent no page bodies, and the reviewer re-proposed invariants that were
+  already written down, at high confidence, indefinitely. Existing configs are
+  unchanged. (#834)
+- `ai-memory finalize-session --reopen --session-id <uuid>` re-finalizes a
+  session that already ended, for agents without a true session-end event
+  (Antigravity CLI, Kiro, ZCode, Pool) whose conversation continued after a
+  first manual finalize: the discovery step now accepts `include_ended=true`
+  on `GET /admin/open-sessions` for an exact session id (rejected without
+  one, so reopening stays exact-id-only and never a bulk operation), and the
+  server's normal session-end path re-runs over the new observations
+  (updated summary page via supersession, new handoff, opt-in
+  consolidation). Re-running with nothing new since the first end remains a
+  harmless no-op. The default finalize behavior is unchanged: ended sessions
+  stay invisible unless `--reopen` is passed. (#836)
+- Added per-execution `AI_MEMORY_CAPTURE_OWNER` context for external lifecycle
+  producers. Updated native hooks, script bundles and generated integrations
+  suppress capture while preserving supported handoff delivery and MCP recall.
+  Documented producer provenance and stable retries through the existing hook
+  ingestion API, without changing its schema or standalone defaults. (#821)
+- Builtin `/web` login and change-password pages for human password sessions:
+  unauthenticated browser GETs to the wiki redirect to `{web_slug}/login`
+  (not bare JSON 401), forms call existing `POST /auth/login` /
+  `/auth/password` / `/auth/logout`, and `--web-ui-dir` custom SPAs stay
+  unchanged. (#811)
+
+### Changed
+- Grok Build CLI shows a pending handoff, and an opted-in `[briefing]`, as
+  `PostToolUse` `additionalContext` on the first tool of a session.
+  `SessionStart` and `UserPromptSubmit` still do not accept the handoff (Grok
+  discards that stdout); a session that never calls a tool leaves the handoff
+  open for `memory_handoff_accept`. The note is clipped to 10,000 characters
+  (Grok's own cap). Because Grok reuses one session id across a
+  SessionEnd→restart, `memory_handoff_accept` now reopens an already-ended
+  receiver session (clears `ended_at`) instead of rejecting it — but only for
+  agents that reuse their session id across a restart (Grok); for every other
+  agent an ended session stays final, so a lifecycle-only receiver still cannot
+  reclaim after it released and ended. The reopen also only happens after the
+  exactly-once claim guard, so a session that already took a baton still cannot
+  take another (the multi-session claim-once invariant is preserved).
+  Delivery of this PostToolUse handoff is exempt from `AI_MEMORY_CAPTURE_OWNER`
+  capture suppression, like the other context-delivery events. (#840)
 
 ### Fixed
 - Native `ai-memory upgrade` no longer refuses every Linux install by probing

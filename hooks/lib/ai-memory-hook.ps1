@@ -288,6 +288,14 @@ function Test-AiMemoryAntigravityInitialInvocation {
     }
 }
 
+# Parity with `ai_memory_capture_owned_externally` in hooks/_lib.sh:
+# AI_MEMORY_CAPTURE_OWNER names an external producer of this session's capture
+# events. Non-blank claims ownership; unset, empty and whitespace-only keep
+# capture on. The value is only ever tested, never written to output.
+function Test-AiMemoryCaptureOwnedExternally {
+    return (-not [string]::IsNullOrWhiteSpace($env:AI_MEMORY_CAPTURE_OWNER))
+}
+
 function Invoke-AiMemoryHook {
     param(
         [Parameter(Mandatory = $true)] [string] $Event,
@@ -300,7 +308,10 @@ function Invoke-AiMemoryHook {
         # first prompt — parity with Claude's once-per-SessionStart brief).
         # Later fetches keep the handoff but drop the briefing params so the
         # server does not recompose the brief per prompt.
-        [switch] $BriefingOncePerSession
+        [switch] $BriefingOncePerSession,
+        # Grok PostToolUse: wrap a fetched handoff as additionalContext and
+        # only fetch once per session. Other events must not set this.
+        [switch] $GrokPostTool
     )
 
     $Server = if ($env:AI_MEMORY_HOOK_URL) { $env:AI_MEMORY_HOOK_URL } else { "http://127.0.0.1:49374" }
@@ -331,17 +342,22 @@ function Invoke-AiMemoryHook {
         $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
     }
 
-    $BodyBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
-    try {
-        Invoke-WebRequest `
-            -UseBasicParsing `
-            -TimeoutSec 3 `
-            -Method Post `
-            -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
-            -Headers $Headers `
-            -ContentType "application/json; charset=utf-8" `
-            -Body $BodyBytes | Out-Null
-    } catch {
+    # This POST is the only producer on this path (no spool, no drain here).
+    # Session identity and the handoff/briefing GET below are delivery, so an
+    # external owner leaves them, and the stdout contract, alone.
+    if (-not (Test-AiMemoryCaptureOwnedExternally)) {
+        $BodyBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
+        try {
+            Invoke-WebRequest `
+                -UseBasicParsing `
+                -TimeoutSec 3 `
+                -Method Post `
+                -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
+                -Headers $Headers `
+                -ContentType "application/json; charset=utf-8" `
+                -Body $BodyBytes | Out-Null
+        } catch {
+        }
     }
     if ($Agent -eq "devin" -and $Event -eq "session-end") {
         Clear-AiMemorySessionId -Agent $Agent
@@ -349,6 +365,7 @@ function Invoke-AiMemoryHook {
 
     if ($FetchHandoff) {
         $NativeSessionQS = ""
+        $NativeSessionId = $null
         try {
             $ParsedPayload = $Payload | ConvertFrom-Json
             $NativeSessionId = @(
@@ -362,6 +379,16 @@ function Invoke-AiMemoryHook {
                 $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"
             }
         } catch {
+        }
+        $Shown = $null
+        if ($GrokPostTool) {
+            $ShownKey = [string]$NativeSessionId
+            if (-not $ShownKey) { $ShownKey = "grok-post-$PID" }
+            $Shown = Get-AiMemoryBriefedFile -Key "post-$ShownKey"
+            if (Test-Path $Shown -PathType Leaf) {
+                [Console]::Out.Write("{}")
+                return
+            }
         }
         # Once-per-session briefing gate. Marker files are created only for
         # repositories that opt in. Prefer the native session id when Kimi
@@ -383,6 +410,9 @@ function Invoke-AiMemoryHook {
                 }
             }
         }
+        if ($GrokPostTool -and -not $BriefQS) {
+            $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
+        }
         try {
             $Response = Invoke-WebRequest `
                 -UseBasicParsing `
@@ -390,7 +420,15 @@ function Invoke-AiMemoryHook {
                 -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS" `
                 -Headers $Headers
             if ($null -ne $Response -and $Response.Content) {
-                if ($AntigravityPreInvocationOutput) {
+                if ($GrokPostTool) {
+                    $Wrapped = @{
+                        hookSpecificOutput = @{
+                            hookEventName = "PostToolUse"
+                            additionalContext = $Response.Content
+                        }
+                    }
+                    [Console]::Out.Write(($Wrapped | ConvertTo-Json -Depth 5 -Compress))
+                } elseif ($AntigravityPreInvocationOutput) {
                     $Payload = @{
                         injectSteps = @(@{ ephemeralMessage = $Response.Content })
                     }
@@ -398,13 +436,16 @@ function Invoke-AiMemoryHook {
                 } else {
                     [Console]::Out.Write($Response.Content)
                 }
-            } elseif ($AntigravityPreInvocationOutput) {
+            } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool) {
                 [Console]::Out.Write("{}")
             }
         } catch {
-            if ($AntigravityPreInvocationOutput) {
+            if ($AntigravityPreInvocationOutput -or $GrokPostTool) {
                 [Console]::Out.Write("{}")
             }
+        }
+        if ($Shown) {
+            Set-AiMemoryBriefed -Path $Shown
         }
         # Mark the session as briefed only AFTER the GET completed —
         # success or error (fail-open: with the server down, re-sending the

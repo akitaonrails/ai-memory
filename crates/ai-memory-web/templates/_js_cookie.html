@@ -1,0 +1,8 @@
+function cookie(name) {
+  var prefix = encodeURIComponent(name) + "=";
+  return document.cookie
+    .split(";")
+    .map(function (v) { return v.trim(); })
+    .find(function (v) { return v.indexOf(prefix) === 0; })
+    ?.slice(prefix.length);
+}

@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+
+{% block title %}Sign in — ai-memory{% endblock %}
+
+{% block header_actions %}{% endblock %}
+
+{% block content %}
+<div class="max-w-md">
+  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Sign in</h1>
+  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">Use your ai-memory username and password.</p>
+
+  <p id="auth-error" class="mt-4 hidden text-sm text-amber-800 dark:text-amber-300" role="alert"></p>
+
+  <form id="login-form" class="mt-4 space-y-3" autocomplete="on"
+        data-next="{{ next }}"
+        data-change-password="{{ change_password_href }}">
+    <div>
+      <label for="username" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Username</label>
+      <input
+        id="username"
+        name="username"
+        type="text"
+        autocomplete="username"
+        required
+        class="w-full rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+      >
+    </div>
+    <div>
+      <label for="password" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Password</label>
+      <input
+        id="password"
+        name="password"
+        type="password"
+        autocomplete="current-password"
+        required
+        class="w-full rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+      >
+    </div>
+    <button type="submit" class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
+      Sign in
+    </button>
+  </form>
+</div>
+<script>
+(function () {
+  var form = document.getElementById("login-form");
+  var err = document.getElementById("auth-error");
+  var next = form.getAttribute("data-next") || "/";
+  var changePassword = form.getAttribute("data-change-password") || "change-password";
+  var basePath = document
+    .querySelector('meta[name="ai-memory-base-path"]')
+    ?.getAttribute("content") || "";
+  function showError(msg) {
+    err.textContent = msg;
+    err.classList.remove("hidden");
+  }
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    err.classList.add("hidden");
+    var body = {
+      username: document.getElementById("username").value,
+      password: document.getElementById("password").value
+    };
+    fetch(basePath + "/auth/login", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (json) {
+        if (!resp.ok) {
+          showError((json && json.error) || ("Sign in failed (" + resp.status + ")"));
+          return;
+        }
+        if (json && json.must_change_password) {
+          location.assign(changePassword);
+          return;
+        }
+        location.assign(next);
+      });
+    }).catch(function () {
+      showError("Network error — try again.");
+    });
+  });
+})();
+</script>
+{% endblock %}

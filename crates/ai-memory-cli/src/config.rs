@@ -955,8 +955,15 @@ pub struct AutoImproveSettings {
     pub max_input_tokens: usize,
     /// Maximum validated proposals returned from one run.
     pub max_proposals_per_run: usize,
-    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    /// Maximum existing patchable pages included for patch proposals.
     pub max_patchable_pages: usize,
+    /// Wiki folder prefixes whose page bodies the reviewer may read.
+    ///
+    /// Defaults to `_rules/` and `procedures/`. A project that keeps durable
+    /// knowledge elsewhere — `decisions/`, `gotchas/` — can add those folders so
+    /// the reviewer stops proposing what is already written there (#834).
+    #[serde(default = "default_patchable_page_prefixes")]
+    pub patchable_page_prefixes: Vec<String>,
     /// Maximum body chars rendered per patchable target page.
     pub max_patchable_body_chars: usize,
     /// Maximum patch edits per proposal.
@@ -1066,6 +1073,7 @@ impl Default for AutoImproveSettings {
             max_input_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS,
             max_proposals_per_run: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
             max_patchable_pages: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_page_prefixes: default_patchable_page_prefixes(),
             max_patchable_body_chars:
                 ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal:
@@ -2251,6 +2259,15 @@ fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
         // Windows has no mode bits here; the data dir's own ACL is the boundary.
         std::fs::write(path, contents)
     }
+}
+
+/// The historical patchable folders, kept as the default so an existing config
+/// that omits the key behaves exactly as before (#834).
+fn default_patchable_page_prefixes() -> Vec<String> {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect()
 }
 
 fn default_data_dir() -> PathBuf {

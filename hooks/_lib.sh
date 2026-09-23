@@ -477,7 +477,25 @@ ai_memory_url_with_ingest_key() {
     esac
 }
 
+# AI_MEMORY_CAPTURE_OWNER names an external producer of this session's capture
+# events. Non-blank claims ownership; unset, empty and whitespace-only keep
+# capture on. The value is only ever tested, never printed or sent.
+ai_memory_capture_owned_externally() {
+    case "${AI_MEMORY_CAPTURE_OWNER:-}" in
+        *[![:space:]]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 ai_memory_post_hook() {
+    # Every shell hook produces its event here, and the spool and piggyback
+    # drain hang off the result below, so this one check suppresses all three.
+    # Delivery is untouched: an explicit ai_memory_drain_spool still ships the
+    # backlog. Stdin is drained so the caller's pipe does not take an EPIPE.
+    if ai_memory_capture_owned_externally; then
+        cat >/dev/null 2>&1 || true
+        return 0
+    fi
     _amurl=$(ai_memory_url_with_ingest_key "$1")
     _ambody=$(cat)
     _amhdr=$(ai_memory_auth_header_file || printf '')

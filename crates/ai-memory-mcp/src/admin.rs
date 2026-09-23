@@ -9,7 +9,8 @@
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
-//! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent.
+//! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent
+//!   (an exact `session_id` plus `include_ended=true` also matches an ended one).
 //! - `GET  /admin/sessions/by-agent` — session counts per agent CLI for one scope.
 //! - `GET  /admin/activity/by-client` — MCP tool-call counts per client (server-wide).
 //! - `GET  /admin/audit-log`      — paginated read of the append-only `audit_log`.
@@ -1241,7 +1242,9 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
 /// Query string for `GET /admin/open-sessions` — open (not yet ended)
 /// sessions for one scope + agent, newest first. Backs the thin
 /// `ai-memory finalize-session` command, which posts synthetic
-/// session-end hooks for whatever this returns.
+/// session-end hooks for whatever this returns. An exact `session_id` plus
+/// `include_ended=true` also matches an already-ended session, for the
+/// manual re-finalize path (`finalize-session --reopen`).
 #[derive(Debug, Deserialize)]
 struct OpenSessionsQuery {
     /// Workspace name (required).
@@ -1272,6 +1275,15 @@ struct OpenSessionsQuery {
     /// tabs each running Kiro CLI against one repo).
     #[serde(default)]
     session_id: Option<SessionId>,
+    /// Also match the exact `session_id` when it already ended, instead of
+    /// reporting "no open sessions". `finalize-session --reopen` passes
+    /// this when re-closing a session that received new observations after
+    /// its first end (e.g. an Antigravity conversation continued after a
+    /// manual finalize); the server's normal session-end path then re-runs
+    /// (page supersession, handoff, consolidation). Requires `session_id`:
+    /// reopening is exact-id-only, never a bulk operation.
+    #[serde(default)]
+    include_ended: bool,
 }
 
 /// Wire shape for one open session in the `GET /admin/open-sessions`
@@ -1405,6 +1417,14 @@ async fn handle_open_sessions(
             })),
         );
     }
+    if query.include_ended && query.session_id.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "include_ended requires session_id"
+            })),
+        );
+    }
     let Some(agent) = parse_agent_kind(&query.agent) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -1428,7 +1448,14 @@ async fn handle_open_sessions(
     let sessions = if let Some(session_id) = query.session_id {
         state
             .reader
-            .open_session_for_scope_agent_by_id(ws, proj, agent, owner_filter, session_id)
+            .open_session_for_scope_agent_by_id(
+                ws,
+                proj,
+                agent,
+                owner_filter,
+                session_id,
+                query.include_ended,
+            )
             .await
             .map(|session| session.into_iter().collect())
     } else {
@@ -1990,6 +2017,14 @@ async fn handle_auto_improve(
         proposal_actor: req.proposal_actor.clone(),
         pending_path: req.pending_path.clone(),
         max_patchable_pages: req.max_patchable_pages,
+        // The admin request body does not expose this, so the reviewer uses the
+        // server-configured `[auto_improve] patchable_page_prefixes` (which
+        // itself defaults to the historical `_rules/`/`procedures/`) rather than
+        // ignoring the operator's config on the admin-triggered path (#834).
+        patchable_page_prefixes: state
+            .auto_improve_review_config
+            .patchable_page_prefixes
+            .clone(),
         max_patchable_body_chars: req.max_patchable_body_chars,
         max_edits_per_proposal: req.max_edits_per_proposal,
         max_edit_content_chars: req.max_edit_content_chars,
@@ -8361,6 +8396,47 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+
+        // The same ended session id IS reachable with `include_ended=true`
+        // (the `finalize-session --reopen` path): the id still narrows the
+        // response to exactly that session.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={ended}&include_ended=true"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], ended.to_string());
+
+        // `include_ended=true` without an exact id is rejected: reopening
+        // must never become a bulk operation over every ended session.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&include_ended=true",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "include_ended requires session_id");
 
         // An exact id from another agent remains outside the requested
         // agent boundary even when its scope matches.

@@ -26,7 +26,10 @@ use ai_memory_mcp::{
 use ai_memory_store::{
     ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
 };
-use ai_memory_web::{WebMountSpec, normalize_prefix, split_web_routers, web_base_href};
+use ai_memory_web::{
+    HtmlAuthRedirectConfig, WebMountSpec, html_auth_redirect_mw, normalize_prefix,
+    split_web_routers, web_base_href,
+};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -1457,16 +1460,34 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_path: &base_path,
                 },
             )?;
+            // HTML navigational 401/403 → builtin login / change-password.
+            // Outer layer so it sees dual-auth responses; `/api/v1` stays JSON
+            // (`html_auth_redirect_mw` skips that prefix). Builtin wiki returns
+            // the cfg from split; custom SPA / web-off still builds one so the
+            // layer always has concrete login/change-password targets.
+            let html_auth = web.html_auth.unwrap_or_else(|| {
+                Arc::new(HtmlAuthRedirectConfig::from_mount(
+                    &base_path,
+                    &args.web_slug,
+                ))
+            });
             let router = machine
                 .merge(healthz_router())
                 .merge(admin)
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
                 .merge(internal_auth_router(auth_state.clone()))
-                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    require_dual_auth,
-                )))
+                .merge(
+                    web.protected
+                        .layer(axum::middleware::from_fn_with_state(
+                            auth_state.clone(),
+                            require_dual_auth,
+                        ))
+                        .layer(axum::middleware::from_fn_with_state(
+                            html_auth,
+                            html_auth_redirect_mw,
+                        )),
+                )
                 .merge(web.public.layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
@@ -2275,6 +2296,7 @@ fn auto_improve_review_config_from_settings(
         proposal_actor: settings.proposal_actor.clone(),
         pending_path: settings.pending_path.clone(),
         max_patchable_pages: settings.max_patchable_pages,
+        patchable_page_prefixes: settings.patchable_page_prefixes.clone(),
         max_patchable_body_chars: settings.max_patchable_body_chars,
         max_edits_per_proposal: settings.max_edits_per_proposal,
         max_edit_content_chars: settings.max_edit_content_chars,
@@ -4153,26 +4175,123 @@ mod tests {
         )
         .unwrap();
         let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let html_auth = web
+            .html_auth
+            .expect("builtin wiki mount must return html_auth");
         let router = apply_host_layer(
-            web.protected.layer(axum::middleware::from_fn_with_state(
-                auth,
-                require_dual_auth,
-            )),
+            web.public.merge(
+                web.protected
+                    .layer(axum::middleware::from_fn_with_state(
+                        auth,
+                        require_dual_auth,
+                    ))
+                    .layer(axum::middleware::from_fn_with_state(
+                        html_auth,
+                        html_auth_redirect_mw,
+                    )),
+            ),
             vec!["localhost".to_string()],
         );
 
-        let resp = router
+        // Non-HTML clients still see JSON 401.
+        let json_401 = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_401.status(), StatusCode::UNAUTHORIZED);
+
+        // Browser navigations redirect to the public login page.
+        let html_redir = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Accept", "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(html_redir.status(), StatusCode::SEE_OTHER);
+        let location = html_redir
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            location.starts_with("/web/login?next="),
+            "expected login redirect, got {location}"
+        );
+
+        // Login HTML is public (no auth).
+        let login = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/login")
                     .header("Host", "localhost")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(login.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Sign in"), "login page body: {html}");
+        assert!(
+            html.contains("ai-memory-base-path"),
+            "inject base-path meta"
+        );
 
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Change-password HTML is public (must_change_password flow).
+        let change = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/change-password")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(change.status(), StatusCode::OK);
+        let change_body = axum::body::to_bytes(change.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let change_html = std::str::from_utf8(&change_body).unwrap();
+        assert!(
+            change_html.contains("Change password"),
+            "change-password page body: {change_html}"
+        );
+
+        // `/api/v1` stays JSON even with an HTML Accept header.
+        let api = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .header("Accept", "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

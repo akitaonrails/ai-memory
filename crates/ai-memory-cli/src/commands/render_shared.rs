@@ -188,6 +188,21 @@ pub(crate) fn ts_string_literal(s: &str) -> String {
 /// repository with no `.ai-memory.toml` marker must emit nothing — mirroring
 /// the native admit gate in `commands/hook.rs` (`repository_admits_capture`)
 /// — so the check runs before any disposition logic, for every event kind.
+///
+/// Ahead of even that marker scan sits the external-ownership gate: when
+/// `AI_MEMORY_CAPTURE_OWNER` holds any value that is non-empty after trimming,
+/// `capturePolicy` returns `drop` immediately, so a generated consumer never
+/// queues, spools, or POSTs a *new* capture event. It mirrors the native gate
+/// in `commands/hook.rs` and leaves handoff fetching untouched, which is the
+/// whole point: an external producer replaces capture without losing native
+/// context delivery.
+///
+/// Two things it deliberately does not do. It does not suppress the consumer's
+/// routing work around the call (`applyMarkerParams` reads the marker before
+/// `capturePolicy` is even reached), and it does not erase an existing spool
+/// backlog: a consumer that reaches `drainHookQueue` — on dispose, for
+/// instance — still kicks off `requestSpoolDrain`, so events spooled before the
+/// handover can still be delivered.
 #[must_use]
 pub(crate) fn ts_capture_policy_v1(capture_mode: &str) -> String {
     const TEMPLATE: &str = r##"// capture-policy-v1 (generated; do not fork between adapters)
@@ -270,7 +285,15 @@ function captureConfig(cwd: string | undefined): CaptureConfig {
 }
 function captureGlob(pattern: string, candidate: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const p = [...pattern]; const c = [...candidate]; const eq = (a: string, b: string) => insensitive && a.charCodeAt(0) < 128 && b.charCodeAt(0) < 128 ? a.toLowerCase() === b.toLowerCase() : a === b; const previous = new Array<boolean>(p.length + 1).fill(false); previous[0] = true; for (let j = 1; j <= p.length; j++) previous[j] = p[j - 1] === "*" && p[j] !== "*" && previous[j - 1]; for (const ch of c) { const current = new Array<boolean>(p.length + 1).fill(false); for (let j = 1; j <= p.length; j++) { if (++budget.work > CAPTURE_MAX_WORK) return undefined; const x = p[j - 1]; current[j] = x === "*" && p[j] === "*" ? false : x === "*" && j >= 2 && p[j - 2] === "*" ? current[j - 2] || previous[j] : x === "*" ? current[j - 1] || (ch !== "/" && previous[j]) : x === "?" ? ch !== "/" && previous[j - 1] : eq(x, ch) && previous[j - 1]; } for (let j = 0; j <= p.length; j++) previous[j] = current[j]; } return previous[p.length]; }
 function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","execute","run_command","web_search"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && tool.family === "file") disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p))); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+// An external lifecycle owner (`AI_MEMORY_CAPTURE_OWNER`, any value that is
+// non-empty after trimming) takes over capture for this process: the gate runs
+// before the capture-policy marker scan, so no disposition work, no marker read
+// by this policy, and no queue write, spool write, or capture POST downstream.
+// It does not reach the consumer's own routing work (`applyMarkerParams` runs
+// earlier in postHook), and context delivery (`fetchHandoff`) is a separate
+// path that stays live.
+function captureOwnedExternally(): boolean { const owner = typeof process === "undefined" ? undefined : process.env?.AI_MEMORY_CAPTURE_OWNER; return typeof owner === "string" && owner.trim() !== ""; }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && tool.family === "file") disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p))); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
 "##;
     TEMPLATE.replace("__AI_MEMORY_CAPTURE_MODE__", capture_mode)
 }
@@ -2022,6 +2045,25 @@ mod tests {
         )
     }
 
+    /// `Some(())` when this machine can execute the emitted TypeScript.
+    /// Node is not a build dependency of this project, so a box without it
+    /// (or on a Node too old for type stripping) skips the runtime evidence
+    /// instead of failing.
+    fn node_strip_types_available() -> Option<()> {
+        let probe = Command::new("node")
+            .args(["--experimental-strip-types", "--version"])
+            .output();
+        match probe {
+            Ok(output) if output.status.success() => Some(()),
+            _ => {
+                eprintln!(
+                    "skipping Node-required runtime evidence: node lacks --experimental-strip-types"
+                );
+                None
+            }
+        }
+    }
+
     #[test]
     fn bearer_header_is_none_when_no_token() {
         assert!(bearer_header_value(None).is_none());
@@ -2039,21 +2081,9 @@ mod tests {
     #[test]
     #[ignore = "manual Node-required generated TypeScript runtime evidence"]
     fn generated_capture_policy_v1_node_runtime_evidence() {
-        let strip_types = Command::new("node")
-            .args(["--experimental-strip-types", "--version"])
-            .output();
-        let Ok(strip_types) = strip_types else {
-            eprintln!(
-                "skipping Node-required runtime evidence: node lacks --experimental-strip-types"
-            );
+        let Some(()) = node_strip_types_available() else {
             return;
         };
-        if !strip_types.status.success() {
-            eprintln!(
-                "skipping Node-required runtime evidence: node lacks --experimental-strip-types"
-            );
-            return;
-        }
 
         let temp = tempfile::tempdir().unwrap();
         let module = temp.path().join("capture-policy-runtime-evidence.ts");
@@ -2239,6 +2269,102 @@ check(markedButEmpty.disposition === "keep", "allowlist-marker-present-empty-cap
             String::from_utf8_lossy(&allowlist_output.stdout),
             String::from_utf8_lossy(&allowlist_output.stderr),
         );
+    }
+
+    /// `AI_MEMORY_CAPTURE_OWNER` hands capture to an external producer: the
+    /// generated `capturePolicy` must drop before it even looks for a marker.
+    /// Executed against the real emitted TypeScript rather than a hand-kept
+    /// copy, and cheap enough (three short Node runs, no fixtures) to stay in
+    /// the default tier instead of joining the manual evidence test above.
+    #[test]
+    fn generated_capture_policy_gates_on_external_capture_owner() {
+        let Some(()) = node_strip_types_available() else {
+            return;
+        };
+        // `keep()` cancels delete-on-drop: the emitted modules are the
+        // evidence, so they stay on disk for inspection after the run.
+        let temp = tempfile::tempdir().unwrap().keep();
+        eprintln!("capture-owner gate modules retained at {}", temp.display());
+        const HARNESS: &str = r#"import { closeSync, mkdirSync, openSync, readFileSync as readMarkerText, readSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
+
+const markerRoot = process.argv[2]!;
+const inheritOnly = process.argv[3] === "inherit";
+let markerScans = 0;
+const repo = join(markerRoot, "repo");
+mkdirSync(repo, { recursive: true });
+const markerFile = join(repo, ".ai-memory.toml");
+writeFileSync(markerFile, '[capture]\nignore_paths = ["secret/**"]\n');
+function findMarker(cwd: string | undefined): string | undefined { markerScans++; return cwd === repo ? markerFile : undefined; }
+__AI_MEMORY_POLICY__
+
+function fail(label: string): never { throw new Error(`external-owner gate failed: ${label}`); }
+function check(ok: unknown, label: string): asserts ok { if (!ok) fail(label); }
+
+function probe(label: string, owned: boolean): void {
+  markerScans = 0;
+  const payload = { tool: "edit", args: { path: "public/item" } };
+  const result = capturePolicy(payload, repo);
+  if (owned) {
+    check(result.disposition === "drop", `${label} disposition`);
+    // Before the capture-policy marker scan: no disk read by the policy, no
+    // disposition work, and the payload comes back untouched so nothing
+    // downstream can queue it.
+    check(markerScans === 0, `${label} marker scan`);
+    check(result.protocol === undefined, `${label} protocol`);
+    check(result.payload === payload, `${label} payload identity`);
+  } else {
+    check(result.disposition === "keep", `${label} disposition`);
+    check(markerScans > 0, `${label} marker scan`);
+    check(result.protocol?.policy_state === "active", `${label} protocol`);
+  }
+}
+
+if (inheritOnly) {
+  // The value really arrived through the process environment, not a mutation
+  // this harness made.
+  check((process.env.AI_MEMORY_CAPTURE_OWNER ?? "").trim() !== "", "inherited owner missing");
+  probe("inherited-owner", true);
+} else {
+  for (const [value, owned] of [[undefined, false], ["", false], [" \t\n", false], ["orchestrator-a", true], ["  orchestrator-a  ", true]] as [string | undefined, boolean][]) {
+    if (value === undefined) delete process.env.AI_MEMORY_CAPTURE_OWNER;
+    else process.env.AI_MEMORY_CAPTURE_OWNER = value;
+    probe(`owner=${JSON.stringify(value)}`, owned);
+  }
+}
+"#;
+
+        for (mode, inherit) in [("denylist", false), ("denylist", true), ("allowlist", true)] {
+            let module = temp.join(format!(
+                "capture-owner-{mode}-{}.ts",
+                if inherit { "inherit" } else { "matrix" }
+            ));
+            fs::write(
+                &module,
+                HARNESS.replace("__AI_MEMORY_POLICY__", &ts_capture_policy_v1(mode)),
+            )
+            .unwrap();
+            let mut command = Command::new("node");
+            command.args([
+                "--experimental-strip-types",
+                module.to_str().unwrap(),
+                temp.to_str().unwrap(),
+                if inherit { "inherit" } else { "matrix" },
+            ]);
+            if inherit {
+                command.env("AI_MEMORY_CAPTURE_OWNER", "orchestrator-a");
+            } else {
+                command.env_remove("AI_MEMORY_CAPTURE_OWNER");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "capture-owner gate evidence failed (mode={mode}, inherit={inherit})\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     #[test]

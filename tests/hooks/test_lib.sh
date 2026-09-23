@@ -413,6 +413,116 @@ assert_eq "post_hook spools an undelivered event" "1" \
 
 unset AI_MEMORY_DATA_DIR
 
+# --- external capture ownership (AI_MEMORY_CAPTURE_OWNER) -------------
+# A wrapper, extension or managed launcher that already produces this
+# session's capture events announces itself with AI_MEMORY_CAPTURE_OWNER.
+# The bundle must then stop PRODUCING events (no POST, no spool entry, no
+# piggyback drain) while still DELIVERING: the synchronous handoff GET keeps
+# working, a backlog already on disk stays put, and an explicit drain still
+# ships it. Every case below runs the real `ai_memory_post_hook` /
+# `ai_memory_get_handoff` / `ai_memory_drain_spool` path with curl stubbed,
+# so what is asserted is what the shipped functions do.
+
+# Stub curl: log method + URL, answer 200 to a POST and a body to a GET.
+# Only `--data-binary @-` reads the body from stdin. Consuming it for every
+# POST would block on an inherited terminal stdin the moment a caller passes
+# `@file` or an inline body, which the real curl never touches.
+curl() {
+    _tm=GET
+    _tu=""
+    _tdata=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -X) shift; [ "$#" -gt 0 ] || break; _tm="$1" ;;
+            --data-binary) shift; [ "$#" -gt 0 ] || break; _tdata="$1" ;;
+            --data-binary=*) _tdata="${1#--data-binary=}" ;;
+            http://* | https://*) _tu="$1" ;;
+        esac
+        shift
+    done
+    if [ "$_tdata" = "@-" ]; then
+        cat >/dev/null
+    fi
+    if [ "$_tm" = POST ]; then
+        printf 'POST %s\n' "$_tu" >>"$CURL_LOG"
+        printf '200'
+    else
+        printf 'GET %s\n' "$_tu" >>"$CURL_LOG"
+        printf 'HANDOFF BODY'
+    fi
+    return 0
+}
+
+# Each case gets its own data dir, so the spool and the curl log start empty
+# without anything having to be cleared between cases.
+owner_case() {
+    AI_MEMORY_DATA_DIR="$TMP/owner-$1"
+    export AI_MEMORY_DATA_DIR
+    mkdir -p "$AI_MEMORY_DATA_DIR"
+    CURL_LOG="$AI_MEMORY_DATA_DIR/curl.log"
+    touch "$CURL_LOG"
+}
+owner_requests() { awk 'END { print NR + 0 }' "$CURL_LOG"; }
+owner_posts()    { awk '/^POST /{ n++ } END { print n + 0 }' "$CURL_LOG"; }
+owner_spooled()  { ls "$AI_MEMORY_DATA_DIR/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' '; }
+
+# 1. Owner set: an event produced now is dropped whole, and the backlog that
+#    was already queued is neither extended nor drained behind it.
+owner_case suppressed
+ai_memory_spool_event "http://127.0.0.1:1/hook?event=stop&agent=cursor" '{"e":"backlog"}'
+BACKLOG=$(owner_spooled)
+assert_eq "owner: backlog is queued before the gate" "1" "$BACKLOG"
+AI_MEMORY_CAPTURE_OWNER="external-runner"
+export AI_MEMORY_CAPTURE_OWNER
+printf '%s' '{"e":"owned"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "owner: post_hook sends nothing" "0" "$(owner_requests)"
+assert_eq "owner: post_hook spools nothing and drains nothing" "$BACKLOG" "$(owner_spooled)"
+
+# 2. Delivery is untouched: the handoff GET still runs and still returns.
+HANDOFF=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor")
+assert_eq "owner: handoff GET still delivered" "HANDOFF BODY" "$HANDOFF"
+assert_eq "owner: the GET is the only request" "1" "$(owner_requests)"
+assert_eq "owner: still no POST"               "0" "$(owner_posts)"
+
+# 3. Standalone control: with no owner the same call POSTs as before.
+unset AI_MEMORY_CAPTURE_OWNER
+owner_case control
+printf '%s' '{"e":"control"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "no owner: post_hook POSTs" "1" "$(owner_posts)"
+
+# 4. An exported-but-blank variable must not disable capture: empty and
+#    whitespace-only keep the default behaviour.
+AI_MEMORY_CAPTURE_OWNER=""
+export AI_MEMORY_CAPTURE_OWNER
+owner_case empty
+printf '%s' '{"e":"empty"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "empty owner: post_hook POSTs" "1" "$(owner_posts)"
+
+AI_MEMORY_CAPTURE_OWNER=$(printf ' \t ')
+export AI_MEMORY_CAPTURE_OWNER
+owner_case whitespace
+printf '%s' '{"e":"blank"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "whitespace owner: post_hook POSTs" "1" "$(owner_posts)"
+
+# 5. An EXPLICIT drain is delivery, not production: it must still ship a
+#    queued event while the owner is set, and retire it on a 2xx.
+unset AI_MEMORY_CAPTURE_OWNER
+owner_case drain
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"pending"}'
+AI_MEMORY_CAPTURE_OWNER="external-runner"
+export AI_MEMORY_CAPTURE_OWNER
+ai_memory_drain_spool 64 >/dev/null 2>&1
+assert_eq "owner: explicit drain still delivers the backlog" "1" "$(owner_posts)"
+assert_eq "owner: delivered entry is retired"                "0" "$(owner_spooled)"
+
+unset -f curl
+unset AI_MEMORY_CAPTURE_OWNER
+unset AI_MEMORY_DATA_DIR
+
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

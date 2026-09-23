@@ -101,8 +101,11 @@ and actor-proxy bearer without logging the values. Operator runbook:
 
 `/admin/*` and `/api/v1/*` accept a machine Bearer **or** a web session.
 Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
-behind auth. Once human auth becomes active, the engine expires the deprecated
-`ai_memory_auth` compatibility cookie.
+behind auth. With human auth active and no session, a browser GET to the
+builtin wiki redirects to `{web_slug}/login` (HTML form → `POST /auth/login`);
+`must_change_password` redirects to `{web_slug}/change-password`. JSON clients
+and `/api/v1` still receive JSON 401/403. Once human auth becomes active, the
+engine expires the deprecated `ai_memory_auth` compatibility cookie.
 
 ## Trusted proxy identity
 

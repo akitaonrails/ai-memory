@@ -54,6 +54,7 @@ const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGE
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
 const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
+const CAPTURE_OWNER_ENV: &str = "AI_MEMORY_CAPTURE_OWNER";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
 const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
@@ -459,6 +460,55 @@ fn write_success_response<W: std::io::Write>(
     }
 }
 
+const GROK_ADDITIONAL_CONTEXT_CHARS: usize = 10_000;
+
+fn grok_post_tool_handoff_envelope(handoff: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": clip_chars(handoff, GROK_ADDITIONAL_CONTEXT_CHARS),
+        }
+    })
+}
+
+fn payload_is_subagent(raw: &serde_json::Value) -> bool {
+    [
+        "subagentType",
+        "subagent_type",
+        "agent_type",
+        "agent_id",
+        "parentSessionId",
+    ]
+    .iter()
+    .any(|key| {
+        raw.get(*key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(12);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("\n[truncated]");
+    out
+}
+
+fn handoff_shown_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    let key = briefed_marker_path(data_dir, agent, session_id, cwd);
+    data_dir
+        .join("handoff-shown")
+        .join(key.file_name().unwrap_or_default())
+}
+
 fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_json::Value {
     if agent == AgentKind::AntigravityCli {
         serde_json::json!({
@@ -508,6 +558,25 @@ where
 {
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
+    // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
+    // than server configuration. Hooks deliberately bypass Config::load.
+    let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
+    let delivers_context = (hook_event == HookEvent::SessionStart
+        && agent_kind.session_start_injects_handoff())
+        || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff())
+        // Grok delivers the handoff on the first PostToolUse (its SessionStart /
+        // UserPromptSubmit stdout is discarded); that path is context delivery
+        // too, so external capture must not suppress it.
+        || (hook_event == HookEvent::PostToolUse && agent_kind.post_tool_injects_handoff());
+    if external_capture && !args.check_capture && !delivers_context {
+        // Retiring the fallback session ID is lifecycle housekeeping, not
+        // capture. Preserve it even when no event is enqueued.
+        if agent_kind == AgentKind::Devin && hook_event == HookEvent::SessionEnd {
+            clear_session_id(&resolve_data_dir(data_dir.as_deref()), agent_kind);
+        }
+        write_success_response(stdout, agent_kind, hook_event)?;
+        return Ok(());
+    }
     let (mut payload, mut json) = match parse_hook_payload(payload) {
         Ok(parsed) => parsed,
         Err(_) => {
@@ -579,10 +648,10 @@ where
     let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "capture_mode": capture_mode,
             "marker_present": marker_present,
-            "admits_capture": admits_capture,
+            "admits_capture": admits_capture && !external_capture,
             "version": protocol.map_or(1, |protocol| protocol.version()),
             "policy_state": protocol.map_or(PolicyState::Inactive, |protocol| protocol.policy_state()),
             "tool_family": protocol.map_or(ai_memory_hooks::ToolFamily::Unknown, |protocol| protocol.tool_family()),
@@ -590,6 +659,9 @@ where
             "disposition": protocol.map_or(CaptureDisposition::Keep, |protocol| protocol.disposition()),
             "extraction_state": protocol.map_or(ai_memory_hooks::ExtractionState::NotApplicable, |protocol| protocol.extraction_state()),
         });
+        if external_capture {
+            output["external_capture"] = true.into();
+        }
         writeln!(stdout, "{output}")?;
         return Ok(());
     }
@@ -672,67 +744,72 @@ where
     // atomically with the observation row and skips replays whose previous
     // delivery succeeded but whose response was lost — closing the
     // conservative-retry duplication vector. Older servers ignore the param.
-    let ingest_key = uuid::Uuid::new_v4().simple().to_string();
-    let event_url = format!(
-        "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
-        args.event, args.agent, hook_qs, capture_qs
-    );
-    let entry = hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present);
-    if hook_spool::enqueue(&spool, &entry).is_err() {
-        eprintln!(
-            "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+    if !external_capture {
+        let ingest_key = uuid::Uuid::new_v4().simple().to_string();
+        let event_url = format!(
+            "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
+            args.event, args.agent, hook_qs, capture_qs
         );
-    }
-    // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
-    // per turn, so its stored id is cleared by `finalize-session` (or
-    // overwritten by the next session-start), never by a hook event.
-    if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
-        clear_session_id(&dd, AgentKind::Devin);
-    }
+        let entry =
+            hook_spool::entry_for(event_url, payload.clone(), effective_token, oidc_present);
+        if hook_spool::enqueue(&spool, &entry).is_err() {
+            eprintln!(
+                "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+            );
+        }
+        // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
+        // per turn, so its stored id is cleared by `finalize-session` (or
+        // overwritten by the next session-start), never by a hook event.
+        if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
+            clear_session_id(&dd, AgentKind::Devin);
+        }
 
-    // Mid-session catch-up: per-event hooks only enqueue, so a heavy session
-    // outpaces the boundary-only drain and the spool grows until the next
-    // boundary. On `post-tool-use`, once the backlog crosses the threshold, do a
-    // tightly time-boxed drain (budget == per-event timeout, sub-second) so the
-    // spool stays flat without ever stalling a tool call.
-    if should_incremental_drain(
-        &args.event,
-        hook_spool::spool_len(&spool),
-        incremental_drain_threshold(),
-    ) {
-        let _ = hook_spool::drain_exclusive(
-            &spool,
-            &dd,
-            INCREMENTAL_DRAIN_BUDGET,
-            INCREMENTAL_DRAIN_BUDGET,
-            hook_spool::DrainLockWait::NoWait,
-        )
-        .await;
-    }
+        // Mid-session catch-up: per-event hooks only enqueue, so a heavy session
+        // outpaces the boundary-only drain and the spool grows until the next
+        // boundary. On `post-tool-use`, once the backlog crosses the threshold, do a
+        // tightly time-boxed drain (budget == per-event timeout, sub-second) so the
+        // spool stays flat without ever stalling a tool call.
+        if should_incremental_drain(
+            &args.event,
+            hook_spool::spool_len(&spool),
+            incremental_drain_threshold(),
+        ) {
+            let _ = hook_spool::drain_exclusive(
+                &spool,
+                &dd,
+                INCREMENTAL_DRAIN_BUDGET,
+                INCREMENTAL_DRAIN_BUDGET,
+                hook_spool::DrainLockWait::NoWait,
+            )
+            .await;
+        }
 
-    // session-start: if this checkout has never had the one-time boot backfill
-    // attempted, spawn it detached. It self-gates (config opt-out, empty-store
-    // check) and records the attempt, so this is at most one extra process the
-    // first time a project is opened after installing hooks — never inline, so
-    // the SessionStart budget is untouched. Best-effort; a spawn failure must
-    // not affect session start.
-    if args.event == "session-start"
-        && let Ok(trigger_cwd) = std::env::current_dir()
-        && !super::backfill::sentinel_path(&dd, &trigger_cwd).exists()
-    {
-        let _ = hook_drain_process::spawn_backfill(&dd);
+        // session-start: if this checkout has never had the one-time boot backfill
+        // attempted, spawn it detached. It self-gates (config opt-out, empty-store
+        // check) and records the attempt, so this is at most one extra process the
+        // first time a project is opened after installing hooks — never inline, so
+        // the SessionStart budget is untouched. Best-effort; a spawn failure must
+        // not affect session start.
+        if args.event == "session-start"
+            && let Ok(trigger_cwd) = std::env::current_dir()
+            && !super::backfill::sentinel_path(&dd, &trigger_cwd).exists()
+        {
+            let _ = hook_drain_process::spawn_backfill(&dd);
+        }
     }
 
     // session-start: drain any backlog (e.g. from a previous session that ended
     // abruptly), then fetch + inject the pending handoff for the resuming agent.
     if args.event == "session-start" {
-        let _ = hook_spool::drain_exclusive_within_budget(
-            &spool,
-            &dd,
-            start_drain_budget(),
-            drain_event_timeout(),
-        )
-        .await;
+        if !external_capture {
+            let _ = hook_spool::drain_exclusive_within_budget(
+                &spool,
+                &dd,
+                start_drain_budget(),
+                drain_event_timeout(),
+            )
+            .await;
+        }
         // Only fetch the handoff for agents that inject the session-start
         // hook's stdout as context. Grok ignores it, so fetching here would
         // consume the handoff server-side (the GET is destructive) and then
@@ -765,12 +842,12 @@ where
         }
     }
 
-    // user-prompt: agents whose SessionStart stdout is discarded (Kimi Code)
-    // receive the handoff here instead — kimi injects UserPromptSubmit stdout
-    // into the turn verbatim as a `hook_result` user message. The payload
-    // carries the native session id when available, so the destructive GET
-    // can also link the managed run to the native session, same as
-    // session-start does.
+    // user-prompt: agents whose SessionStart stdout is discarded AND whose
+    // UserPromptSubmit stdout is injected (Kimi Code) receive the handoff
+    // here. Grok discards both, so it must not take this path: the GET
+    // accepts the handoff. The payload carries the native session id when
+    // available, so the destructive GET can also link the managed run to the
+    // native session, same as session-start does.
     // The installed kimi hook passes the script stem (`user-prompt-submit`)
     // while the legacy shell path posts `user-prompt`; HookEvent::parse
     // canonicalizes both (and the snake/native spellings) to UserPrompt.
@@ -840,11 +917,52 @@ where
         return Ok(());
     }
 
+    // post-tool-use: Grok shows hookSpecificOutput.additionalContext to the
+    // model after the tool result. SessionStart and UserPromptSubmit stdout
+    // are discarded, so this is the event that can carry a handoff without
+    // burning it. One fetch per session. A session that never calls a tool
+    // leaves the handoff open for memory_handoff_accept.
+    if HookEvent::parse(&args.event) == HookEvent::PostToolUse
+        && AgentKind::from_wire(&args.agent).post_tool_injects_handoff()
+    {
+        let shown = handoff_shown_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        );
+        if !shown.is_file() && !payload_is_subagent(&json) {
+            let client = build_client();
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+            let native_session_qs = canonical_session_id
+                .as_deref()
+                .map_or_else(String::new, |session_id| {
+                    format!("&session_id={}", url_encode(session_id))
+                });
+            let handoff_url = format!(
+                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                args.agent
+            );
+            let handoff =
+                get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await;
+            // Only a real body consumes this session's one chance. An empty
+            // or failed claim must retry on the next parent tool; a child
+            // session that errors must not burn the baton for the parent.
+            if let Some(handoff) = handoff {
+                mark_briefed(&shown);
+                let envelope = grok_post_tool_handoff_envelope(&handoff);
+                writeln!(stdout, "{envelope}")?;
+                return Ok(());
+            }
+        }
+    }
+
     // Boundary drain trigger: enqueue first, then ask a detached native drainer
     // to flush the shared spool. `session-end` remains the primary close path,
     // but `stop` and `pre-compact` also trigger the helper so delivery does not
     // rely on the single hook most likely to be cancelled during agent shutdown.
-    if should_spawn_background_drainer(&args.event)
+    if !external_capture
+        && should_spawn_background_drainer(&args.event)
         && let Err(err) = after_background_drain_event_enqueue(
             &dd,
             // The hook's own token, resolved the same way it authenticates
@@ -2427,6 +2545,19 @@ mod tests {
         }
     }
 
+    fn grok_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "grok".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        }
+    }
+
     fn kimi_hook_args(event: &str, server_url: &str) -> HookArgs {
         HookArgs {
             event: event.into(),
@@ -2903,6 +3034,243 @@ mod tests {
         assert!(request.starts_with("GET /handoff?"), "{request}");
         assert!(!request.contains("briefing"), "{request}");
         assert!(!data_dir.join("briefed").exists());
+    }
+
+    #[tokio::test]
+    async fn grok_session_start_never_fetches_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            grok_hook_args("session-start", &base),
+            serde_json::json!({"session_id": "grok-session", "cwd": tmp.path()}).to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_user_prompt_does_not_fetch_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            grok_hook_args("user-prompt", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": tmp.path(),
+                "prompt": "hello"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        // Grok discards allowing UserPromptSubmit stdout. Fetching would
+        // accept the handoff and then throw the body away.
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(
+                !request.starts_with("GET /handoff"),
+                "grok user-prompt must not accept the handoff: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_user_prompt_submit_stem_does_not_fetch_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        write_briefing_marker(&cwd);
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            grok_hook_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": cwd,
+                "prompt": "hi"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(
+                !request.starts_with("GET /handoff"),
+                "briefing opt-in must not make grok fetch /handoff: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_prints_additional_context_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let payload = serde_json::json!({
+            "session_id": "grok-session",
+            "cwd": tmp.path(),
+            "tool_name": "read_file"
+        })
+        .to_string();
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            grok_hook_args("post-tool-use", &base),
+            payload.clone(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["hookEventName"],
+            "PostToolUse"
+        );
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "AMWS-HANDOFF-DELTA"
+        );
+        let first = first_request(&mut requests).await.unwrap();
+        assert!(first.starts_with("GET /handoff?"), "{first}");
+        assert!(first.contains("agent=grok"), "{first}");
+        assert!(first.contains("session_id=grok-session"), "{first}");
+        assert!(
+            data_dir
+                .join("handoff-shown")
+                .join("grok-session")
+                .is_file(),
+            "shown marker missing"
+        );
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            grok_hook_args("post-tool-use", &base),
+            payload,
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        assert!(
+            first_request(&mut requests).await.is_none(),
+            "second post-tool must not fetch again"
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_includes_briefing_when_the_marker_opts_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        write_briefing_marker(&cwd);
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            grok_hook_args("post-tool-use", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": cwd,
+                "tool_name": "read_file"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.contains("&briefing=true"), "{request}");
+        assert!(request.contains("&briefing_budget=6000"), "{request}");
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "AMWS-HANDOFF-DELTA"
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_skips_a_subagent_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            grok_hook_args("post-tool-use", &base),
+            serde_json::json!({
+                "session_id": "child-session",
+                "cwd": tmp.path(),
+                "subagentType": "goal-plan-writer",
+                "tool_name": "read_file"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(
+                !request.starts_with("GET /handoff"),
+                "a child session must not accept the parent handoff: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_without_handoff_prints_empty_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            grok_hook_args("post-tool-use", &base),
+            serde_json::json!({"session_id": "grok-session", "cwd": tmp.path()}).to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+    }
+
+    #[test]
+    fn grok_additional_context_is_clipped_to_the_model_cap() {
+        let long = "x".repeat(GROK_ADDITIONAL_CONTEXT_CHARS + 50);
+        let envelope = grok_post_tool_handoff_envelope(&long);
+        let note = envelope["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(note.ends_with("\n[truncated]"));
+        assert!(note.chars().count() <= GROK_ADDITIONAL_CONTEXT_CHARS);
     }
 
     #[test]

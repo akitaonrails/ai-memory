@@ -847,6 +847,9 @@ explicitly:
 ai-memory finalize-session --agent antigravity-cli
 # add --all only to close every matching open Antigravity session in this scope
 # or add --session-id <uuid> to close one exact concurrent session
+# if the conversation continued after a first finalize, re-close it to cover
+# the new observations (a re-run with nothing new is a harmless no-op)
+ai-memory finalize-session --agent antigravity-cli --reopen --session-id <uuid>
 ```
 
 ### Devin CLI
@@ -1434,14 +1437,19 @@ Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`); its hooks live under
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
 captures lifecycle events.
-Grok ignores `SessionStart` stdout, so handoffs must be accepted through MCP with
-`memory_handoff_accept` when resuming. Claude Desktop, VS Code Copilot, Zed,
+Grok ignores `SessionStart` stdout and discards an allowing `UserPromptSubmit`,
+so those hooks do not accept the handoff. The first `PostToolUse` prints
+`hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
+`[briefing]`). The model sees it after that tool result, not before the
+first prompt. A session with no tool call leaves the handoff for
+`memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed,
 and ZCode
 are MCP-only here, so you'll need to nudge the model to call
 `memory_query` / `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
-for Grok's (and Zero's) no-stdout SessionStart behavior (Antigravity CLI uses `PreInvocation`).
+for Zero's no-stdout SessionStart behavior. Grok delivers on the first
+`PostToolUse` instead (Antigravity CLI uses `PreInvocation`).
 
 ---
 

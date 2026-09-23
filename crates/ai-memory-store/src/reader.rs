@@ -2987,6 +2987,7 @@ impl ReaderPool {
             owner_filter,
             limit,
             None,
+            false,
         )
         .await
     }
@@ -2998,6 +2999,12 @@ impl ReaderPool {
     /// colleague's session unless the caller explicitly uses
     /// [`OwnerFilter::Any`].
     ///
+    /// Pass `include_ended = true` to also match a session whose `ended_at`
+    /// is already set — the re-finalize path (`finalize-session --reopen`)
+    /// for agents without a native session-end, where new observations may
+    /// have landed after the first end. Reopening stays exact-id-only: the
+    /// bulk listing above always excludes ended sessions.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn open_session_for_scope_agent_by_id(
@@ -3007,6 +3014,7 @@ impl ReaderPool {
         agent_kind: AgentKind,
         owner_filter: OwnerFilter,
         session_id: SessionId,
+        include_ended: bool,
     ) -> StoreResult<Option<OpenSession>> {
         let mut sessions = self
             .open_sessions_for_scope_agent_filtered(
@@ -3016,11 +3024,16 @@ impl ReaderPool {
                 owner_filter,
                 Some(1),
                 Some(session_id),
+                include_ended,
             )
             .await?;
         Ok(sessions.pop())
     }
 
+    // Eight arguments is the full lookup key (scope + agent + owner +
+    // limit + exact id + ended-state); splitting it would just move the
+    // same parameters into a struct at both call sites.
+    #[allow(clippy::too_many_arguments)]
     async fn open_sessions_for_scope_agent_filtered(
         &self,
         workspace_id: WorkspaceId,
@@ -3029,6 +3042,7 @@ impl ReaderPool {
         owner_filter: OwnerFilter,
         limit: Option<usize>,
         exact_session_id: Option<SessionId>,
+        include_ended: bool,
     ) -> StoreResult<Vec<OpenSession>> {
         let agent = agent_kind.as_str().to_string();
         self.with_conn(move |conn| {
@@ -3040,6 +3054,15 @@ impl ReaderPool {
                 OwnerFilter::Any => "",
                 OwnerFilter::User(_) => " AND (actor_user IS NULL OR actor_user = ?4)",
                 OwnerFilter::Unattributed => " AND actor_user IS NULL",
+            };
+            // An exact-id lookup with `include_ended` reaches sessions that
+            // already closed (a manual finalizer's re-run after more work
+            // landed); the default and every bulk listing only see sessions
+            // whose `ended_at` is still NULL.
+            let ended_clause = if include_ended {
+                ""
+            } else {
+                " AND ended_at IS NULL"
             };
             let session_id_placeholder = if matches!(owner_filter, OwnerFilter::User(_)) {
                 "?5"
@@ -3054,7 +3077,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT id, cwd FROM sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
-                   AND agent_kind = ?3 AND ended_at IS NULL{owner_clause}{session_id_clause} \
+                   AND agent_kind = ?3{ended_clause}{owner_clause}{session_id_clause} \
                  ORDER BY started_at DESC, id DESC{limit_clause}"
             );
             let mut stmt = conn.prepare_cached(&sql)?;

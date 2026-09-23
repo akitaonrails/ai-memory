@@ -38,9 +38,11 @@ $ codex   # in the same directory, later
 
 If an agent has MCP but no lifecycle hook surface, ask it to call
 `memory_handoff_begin` before quitting. The next hooked agent can still
-consume that handoff automatically. No-stdout clients (Grok, Zero) should
-call `memory_handoff_list` on resume, then `memory_handoff_accept` with
-the listed `handoff_id`; listing does not claim the row.
+consume that handoff automatically. Grok shows it as `PostToolUse`
+`additionalContext` after the first tool. Until that tool runs, or if the
+session never calls one, call `memory_handoff_list` then
+`memory_handoff_accept` with the listed `handoff_id`. Zero should do that
+on resume. Listing does not claim the row.
 
 On a server that distinguishes operators, handoffs belong to their creator by
 default: the next session for that operator sees their own plus deliberately

@@ -35,7 +35,12 @@
   (DNS-rebinding guard).
 
 The custom SPA shell and its static assets are public so the login screen can
-load. Its data routes remain protected. Start with:
+load. Its data routes remain protected. When `--web-ui-dir` is **absent**, the
+builtin wiki exposes public `GET {web_slug}/login` and
+`GET {web_slug}/change-password` HTML pages that call the same `/auth/*`
+endpoints; navigational browser GETs to protected wiki routes redirect there
+instead of returning bare JSON 401/403. `/api/v1` stays JSON either way. Start
+with:
 
 ```http
 GET /auth/me

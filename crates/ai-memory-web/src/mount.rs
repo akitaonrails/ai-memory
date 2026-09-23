@@ -302,6 +302,9 @@ pub struct SplitWebRouters {
     pub public: axum::Router,
     /// `/api/v1` plus the builtin wiki when that is the chosen UI.
     pub protected: axum::Router,
+    /// Builtin login / change-password redirect targets. `None` when web is
+    /// disabled or a custom SPA is mounted (no builtin auth pages).
+    pub html_auth: Option<Arc<crate::HtmlAuthRedirectConfig>>,
 }
 
 /// Split the web surfaces so the host can attach different auth layers.
@@ -318,6 +321,7 @@ pub fn split_web_routers(
         return Ok(SplitWebRouters {
             public: axum::Router::new(),
             protected: axum::Router::new(),
+            html_auth: None,
         });
     }
     let api = build_api_router(&reader, &wiki, spec.cors_origins);
@@ -336,11 +340,28 @@ pub fn split_web_routers(
         return Ok(SplitWebRouters {
             public,
             protected: protected_api,
+            html_auth: None,
         });
     }
+    let auth_cfg = Arc::new(crate::HtmlAuthRedirectConfig::from_mount(
+        spec.base_path,
+        spec.web_slug,
+    ));
+    let browser_inject = Arc::new(WebInjectState {
+        base_href: spec.base_href.to_string(),
+        base_path: spec.base_path.to_string(),
+        login_path: auth_cfg.login_path.clone(),
+    });
     Ok(SplitWebRouters {
-        public: axum::Router::new(),
-        protected: mount_builtin_browser(protected_api, reader, wiki, &slug, spec.base_href, mount),
+        public: mount_builtin_public(
+            auth_cfg.clone(),
+            &slug,
+            spec.base_href,
+            spec.base_path,
+            mount,
+        ),
+        protected: mount_builtin_browser(protected_api, reader, wiki, &slug, mount, browser_inject),
+        html_auth: Some(auth_cfg),
     })
 }
 
@@ -430,6 +451,30 @@ fn mount_custom_spa(
     })
 }
 
+/// Mount public builtin auth pages + static assets at `slug`.
+fn mount_builtin_public(
+    auth_cfg: Arc<crate::HtmlAuthRedirectConfig>,
+    slug: &str,
+    base_href: &str,
+    base_path: &str,
+    mount: &str,
+) -> axum::Router {
+    let inject = Arc::new(WebInjectState {
+        base_href: base_href.to_string(),
+        base_path: base_path.to_string(),
+        login_path: auth_cfg.login_path.clone(),
+    });
+    let public = crate::routes::build_public_auth(auth_cfg).layer(
+        axum::middleware::from_fn_with_state(inject, inject_web_base_href),
+    );
+    info!(mount, base_href, "builtin public auth pages mounted");
+    if slug.is_empty() {
+        public
+    } else {
+        axum::Router::new().nest(slug, public)
+    }
+}
+
 /// Mount the built-in server-rendered wiki browser at `slug` with
 /// `<base href>` injection middleware. When `slug` is non-empty also
 /// register the trailing-slash → canonical redirect, preserving any
@@ -439,15 +484,16 @@ fn mount_builtin_browser(
     reader: ReaderPool,
     wiki: Wiki,
     slug: &str,
-    base_href: &str,
     mount: &str,
+    inject: Arc<WebInjectState>,
 ) -> axum::Router {
     // The built-in browser emits RELATIVE asset/link URLs (`static/…`,
     // `w/…`, `search`, `.`). Inject a `<base href>` into every HTML
     // response so they resolve under `{base_path}{web_slug}/` — the
     // same anchoring the custom SPA gets via its injected index.
+    let base_href = inject.base_href.clone();
     let web_router = crate::router(reader, wiki).layer(axum::middleware::from_fn_with_state(
-        Arc::new(base_href.to_string()),
+        inject,
         inject_web_base_href,
     ));
     info!(mount, base_href, "read-only wiki browser mounted");
@@ -518,12 +564,20 @@ fn custom_spa_router(dir: std::path::PathBuf, injected_index: String) -> axum::R
         .route_service("/{*path}", assets)
 }
 
-/// Response middleware: inject `<base href>` into `text/html` responses from
-/// the built-in server-rendered web browser, so its relative URLs resolve
-/// under the configured `{base_path}{web_slug}` prefix. Non-HTML responses
-/// (static assets, redirects) pass through untouched.
+/// Values injected into every builtin HTML response.
+struct WebInjectState {
+    base_href: String,
+    base_path: String,
+    login_path: String,
+}
+
+/// Response middleware: inject `<base href>` plus auth meta tags into
+/// `text/html` responses from the built-in browser / auth pages, so
+/// relative URLs and logout/login fetch paths resolve under the
+/// configured prefix. Non-HTML responses (static assets, redirects)
+/// pass through untouched.
 async fn inject_web_base_href(
-    State(base_href): State<Arc<String>>,
+    State(inject): State<Arc<WebInjectState>>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -554,7 +608,15 @@ async fn inject_web_base_href(
     };
     match std::str::from_utf8(&bytes) {
         Ok(html) => {
-            let injected = inject_base_href(html, &base_href);
+            let with_base = inject_base_href(html, &inject.base_href);
+            let with_path = inject_base_path_meta(&with_base, &inject.base_path);
+            let injected = inject_into_head(
+                &with_path,
+                &format!(
+                    "<meta name=\"ai-memory-login-path\" content=\"{}\">",
+                    escape_attr(&inject.login_path)
+                ),
+            );
             // Stale length from the pre-injection body; let hyper recompute.
             parts.headers.remove(header::CONTENT_LENGTH);
             Response::from_parts(parts, Body::from(injected))

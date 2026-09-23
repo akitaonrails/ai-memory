@@ -28,6 +28,20 @@ const PROMPT_RESERVE_TOKENS: usize = 1_000;
 const MAX_PROPOSAL_BODY_CHARS: usize = 32_000;
 /// Default number of existing pages included as patchable context.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES: usize = 8;
+
+/// Wiki folders whose page bodies the reviewer may read, by path prefix.
+///
+/// This list decides which of a project's durable knowledge the model can see
+/// before it proposes anything. `render_recent_pages` gives every other page as
+/// one line — path, title, kind, updated_at — so a page outside these folders
+/// reaches the reviewer as a title and nothing else, and the model cannot tell
+/// that what it is about to propose is already written down (#834).
+///
+/// The default is the historical pair. It is a default rather than a constant
+/// because folder choice should not silently decide model visibility: a project
+/// that keeps its invariants in `decisions/` or `gotchas/` — which the wiki's own
+/// conventions encourage — can add them instead of restructuring its wiki.
+pub const DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES: [&str; 2] = ["_rules/", "procedures/"];
 /// Default maximum body chars rendered for one patchable target page.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS: usize = 8_000;
 /// Default maximum patch edits per proposal.
@@ -134,8 +148,14 @@ pub struct AutoImproveReviewConfig {
     pub proposal_actor: String,
     /// Wiki-relative pending proposal sidecar folder.
     pub pending_path: String,
-    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    /// Maximum existing patchable pages included for patch proposals.
     pub max_patchable_pages: usize,
+    /// Wiki folder prefixes whose page bodies the reviewer may read.
+    ///
+    /// Defaults to [`DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES`]. Pages outside
+    /// these folders are still listed by title, but their content is never sent,
+    /// so the reviewer cannot notice that a proposal duplicates them (#834).
+    pub patchable_page_prefixes: Vec<String>,
     /// Maximum body chars rendered per patchable target page.
     pub max_patchable_body_chars: usize,
     /// Maximum patch edits per proposal.
@@ -172,6 +192,10 @@ impl Default for AutoImproveReviewConfig {
             proposal_actor: DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
             max_patchable_pages: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_page_prefixes: DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
             max_patchable_body_chars: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal: DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
             max_edit_content_chars: DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
@@ -951,6 +975,18 @@ fn normalize_title(title: &str) -> String {
         .to_lowercase()
 }
 
+/// Whether the reviewer may read this page's body, by folder prefix (#834).
+///
+/// An empty prefix list means no page body is sent, which is the honest reading
+/// of "no folders are patchable" — not "every folder is". An empty *prefix*
+/// would match every path, so it is ignored rather than silently opening the
+/// whole wiki.
+pub(crate) fn is_patchable_path(path: &str, prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| !prefix.is_empty() && path.starts_with(prefix.as_str()))
+}
+
 pub(crate) async fn load_patchable_pages(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
@@ -961,7 +997,7 @@ pub(crate) async fn load_patchable_pages(
     let mut out = Vec::new();
     for page in recent_pages
         .iter()
-        .filter(|p| p.path.starts_with("_rules/") || p.path.starts_with("procedures/"))
+        .filter(|p| is_patchable_path(&p.path, &cfg.patchable_page_prefixes))
         .take(cfg.max_patchable_pages)
     {
         if let Some(body) = reader
@@ -1987,6 +2023,10 @@ mod tests {
             proposal_actor: "auto_improve".into(),
             pending_path: "_pending/auto-improve".into(),
             max_patchable_pages: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_page_prefixes: DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect(),
             max_patchable_body_chars: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal: DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL,
             max_edit_content_chars: DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS,
@@ -2156,6 +2196,60 @@ mod tests {
             rejected[0].target_path.as_deref(),
             Some("procedures/test.md")
         );
+    }
+
+    // #834: the folder filter decides which of a project's durable knowledge the
+    // reviewer can read at all. Everything outside it arrives as a title, so the
+    // model cannot tell that a proposal duplicates a page that already exists.
+    #[test]
+    fn default_prefixes_match_the_historical_pair() {
+        let cfg = AutoImproveReviewConfig::default();
+        assert_eq!(cfg.patchable_page_prefixes, vec!["_rules/", "procedures/"]);
+    }
+
+    #[test]
+    fn the_default_still_hides_decisions_and_gotchas() {
+        // Pinning the reported blindness rather than only the fix: this is the
+        // behaviour a project with no `_rules/` pages actually gets today.
+        let prefixes = AutoImproveReviewConfig::default().patchable_page_prefixes;
+        assert!(is_patchable_path("_rules/testing.md", &prefixes));
+        assert!(is_patchable_path("procedures/release.md", &prefixes));
+        assert!(!is_patchable_path("decisions/0001-storage.md", &prefixes));
+        assert!(!is_patchable_path("gotchas/sqlite-wal.md", &prefixes));
+    }
+
+    #[test]
+    fn configuring_a_folder_makes_its_pages_readable() {
+        let prefixes = vec!["_rules/".to_string(), "decisions/".to_string()];
+        assert!(is_patchable_path("decisions/0001-storage.md", &prefixes));
+        assert!(is_patchable_path("_rules/testing.md", &prefixes));
+        // Not configured, so still title-only.
+        assert!(!is_patchable_path("procedures/release.md", &prefixes));
+    }
+
+    #[test]
+    fn an_empty_list_reads_no_page_bodies() {
+        // "No folders are patchable" must not mean "every folder is".
+        assert!(!is_patchable_path("_rules/testing.md", &[]));
+        assert!(!is_patchable_path("decisions/0001.md", &[]));
+    }
+
+    #[test]
+    fn an_empty_prefix_does_not_open_the_whole_wiki() {
+        // `"".starts_with` matches every path, so a stray empty entry would turn
+        // the filter off silently. It is ignored instead.
+        let prefixes = vec![String::new()];
+        assert!(!is_patchable_path("sessions/2026-09-21.md", &prefixes));
+        assert!(!is_patchable_path("anything.md", &prefixes));
+    }
+
+    #[test]
+    fn prefixes_match_folders_not_bare_name_prefixes() {
+        // `_rules/` carries its separator, so a sibling folder whose name merely
+        // starts with the same letters is not swept in.
+        let prefixes = vec!["decisions/".to_string()];
+        assert!(is_patchable_path("decisions/0001.md", &prefixes));
+        assert!(!is_patchable_path("decisions-archive/0001.md", &prefixes));
     }
 
     #[tokio::test]

@@ -23,6 +23,11 @@ the core workspace.
 
 ## Integration rules for companions
 
+Orchestrators that own their harness lifecycle can use the
+[external capture contract](external-lifecycle.md) to suppress native observation
+capture per execution while retaining handoff delivery and MCP retrieval.
+Producer provenance and retry identity use the existing hook ingestion fields.
+
 Companion projects may:
 
 - call the read-only `/api/v1` endpoints for workspaces, projects, pages,

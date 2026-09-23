@@ -47,7 +47,7 @@ endpoint. The trade-off:
 | | What you get | What you don't get |
 |---|---|---|
 | **MCP only** | LLM can query the wiki, accept handoffs, run memory_consolidate, and run `memory_auto_improve` learning reviews | No automatic session-end summaries; no auto-handoff at session boundaries |
-| **MCP + hooks** | All of the above *plus* bounded sanitized prompt/tool-lifecycle observations captured automatically; handoffs surface at SessionStart with no human prompting **only when the client consumes startup-hook output or an equivalent context-injection result** | Hook observations are not complete native transcripts. Grok and Zero discard SessionStart stdout; ask them to call `memory_handoff_accept` when resuming. |
+| **MCP + hooks** | All of the above *plus* bounded sanitized prompt/tool-lifecycle observations captured automatically; handoffs surface at SessionStart with no human prompting **only when the client consumes startup-hook output or an equivalent context-injection result** | Hook observations are not complete native transcripts. Grok delivers the handoff on the first `PostToolUse`. Zero discards SessionStart stdout; ask it to call `memory_handoff_accept`. |
 
 For MCP-only use, you can still cover the session-boundary gap by asking
 the LLM to call `memory_handoff_begin` manually before quitting.
@@ -618,7 +618,11 @@ The rendered hooks config looks like:
   the conversation. After the final turn, run
   `ai-memory finalize-session --agent antigravity-cli` to close the session and,
   when it contains substantive events, create the final summary and automatic
-  handoff and queue opt-in SessionEnd consolidation.
+  handoff and queue opt-in SessionEnd consolidation. If the conversation
+  continues after that first finalize, re-close it with
+  `ai-memory finalize-session --agent antigravity-cli --reopen --session-id <uuid>`
+  so the session-end path re-runs over the new observations (re-running with
+  nothing new is a harmless no-op).
 - `memory_handoff_begin` always creates an explicit manual handoff with no
   `from_session_id` and `from_agent = other`; it is project-wide for cwd
   matching but belongs to the creating operator by default. Pass `shared=true`
@@ -748,8 +752,10 @@ that file and preserves all unrelated MCP servers.
 ## Grok Build CLI
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
-`ai-memory install-hooks --agent grok --apply`. ❌ No automatic handoff
-injection (Grok ignores SessionStart stdout — same policy as Zero).
+`ai-memory install-hooks --agent grok --apply`. Handoff injection is the
+first `PostToolUse` (`additionalContext` after the tool result). Grok
+ignores `SessionStart` stdout and discards an allowing `UserPromptSubmit`,
+so those events do not accept the handoff.
 
 **Config file:** `install-mcp --client grok --apply` writes the user config at
 `$GROK_HOME/config.toml` (default `~/.grok/config.toml`). To use a project or
@@ -790,10 +796,11 @@ mirror Claude Code's vocabulary (`SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop`, `SessionEnd`,
 `SubagentStart`, `SubagentStop`) with a Grok-specific script bundle /
 native `ai-memory hook --event … --agent grok` commands. Session-end
-handoff *creation* works; handoff *injection* does not — ask Grok to
-call `memory_handoff_accept` (or install the managed routing skills under
-`.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`)) at the start
-of a resumed session.
+handoff *creation* works. Injection is the first `PostToolUse`: JSON
+`additionalContext` with the pending handoff and an opted-in `[briefing]`.
+`memory_handoff_accept` is still the path when the session has not called
+a tool yet (skills live under `.grok/skills` / `$GROK_HOME/skills`, default
+`~/.grok/skills`).
 
 Grok can also load MCP from Claude Code / Cursor compat sources when those
 compat flags are enabled, but first-party `install-mcp --client grok` is
@@ -1363,7 +1370,7 @@ that *starts* the next one - to play nicely with ai-memory:
 | Side | What's needed | Covered by |
 |---|---|---|
 | **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, OpenCode 2 beta, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero discard SessionStart stdout; Swival is MCP-only. Use (b) for those clients. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. The OpenCode 2 beta plugin subscribes to the same event name on the

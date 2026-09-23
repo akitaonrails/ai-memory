@@ -1816,6 +1816,19 @@ pub struct FinalizeSessionArgs {
     /// (still-active) session.
     #[arg(long, conflicts_with = "all")]
     pub session_id: Option<ai_memory_core::SessionId>,
+    /// Re-finalize a session that already ended (requires `--session-id`).
+    ///
+    /// Use this when the conversation continued after a first finalize and
+    /// landed new observations: agents without a true session-end event
+    /// (Antigravity CLI, Kiro, ZCode, Pool) keep capturing under the same
+    /// session id, but the plain discovery step only sees open sessions, so
+    /// a second finalize would silently find nothing. With `--reopen` the
+    /// lookup also matches the ended session and the normal session-end
+    /// path re-runs (updated summary page, handoff, opt-in consolidation).
+    /// When nothing new landed since the first end, the re-run is a
+    /// harmless no-op.
+    #[arg(long, requires = "session_id")]
+    pub reopen: bool,
     /// Emit a JSON summary.
     #[arg(long)]
     pub json: bool,
