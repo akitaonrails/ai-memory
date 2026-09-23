@@ -91,7 +91,10 @@ pub async fn run_embedding_backfill(
     options: EmbedBackfillOptions,
 ) -> Result<EmbedBackfillCounts, EmbedBackfillError> {
     let provider = embedder.provider().to_string();
-    let model = embedder.model().to_string();
+    // Not `.model()`: this identity drives both stale-row detection below
+    // (a document-prefix change must look "stale" like a model change
+    // would) and every write this pass makes. See `Embedder::model_identity`.
+    let model = embedder.model_identity();
     let dim = embedder.dim();
 
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;

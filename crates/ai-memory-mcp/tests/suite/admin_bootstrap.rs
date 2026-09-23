@@ -31,6 +31,8 @@ async fn make_admin_state(tmp: &TempDir) -> AdminState {
         embedder: None,
         provider_health: ai_memory_llm::ProviderHealth::default(),
         decay_params: DecayParams::default(),
+        contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         data_dir: tmp.path().to_path_buf(),
         db_path,
         bind: "127.0.0.1:0".to_string(),

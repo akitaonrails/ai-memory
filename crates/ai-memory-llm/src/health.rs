@@ -375,6 +375,17 @@ impl Embedder for HealthRecordingEmbedder {
         self.inner.model()
     }
 
+    fn model_identity(&self) -> String {
+        // Not the default (`self.model().to_string()`): every configured
+        // embedder is wrapped in this type before being handed to the rest
+        // of the server (`serve.rs`'s `wrap_embedder`), so without this
+        // override every caller of `model_identity` — the refuse-on-mismatch
+        // check, backfill, retrieval, cleanup — would silently see the
+        // wire model name instead of the inner embedder's actual document-
+        // prefix-aware identity.
+        self.inner.model_identity()
+    }
+
     fn dim(&self) -> u32 {
         self.inner.dim()
     }
@@ -557,6 +568,35 @@ mod tests {
         let after = health.snapshot().embedding;
         assert_eq!(after.status, ProviderHealthStatus::Ok);
         assert!(after.last_call_at.is_some());
+    }
+
+    /// Every configured embedder is wrapped in `HealthRecordingEmbedder`
+    /// before reaching the rest of the server (`serve.rs`'s
+    /// `wrap_embedder`), so a caller of `model_identity` — the
+    /// refuse-on-mismatch check, backfill, retrieval, cleanup — only ever
+    /// sees the wrapper, never the inner embedder directly. Without the
+    /// wrapper's own `model_identity` override, the default trait impl
+    /// (`self.model().to_string()`) would silently discard a document
+    /// prefix's identity fingerprint. `TaskAwareEmbedder` doesn't
+    /// distinguish this (it never overrides `model_identity` either, so a
+    /// missing wrapper override would coincidentally still pass against
+    /// it); a real `OpenAiCompatEmbedder` with a document prefix set does.
+    #[test]
+    fn embedder_wrapper_forwards_the_inner_model_identity_override() {
+        let inner =
+            crate::OpenAiCompatEmbedder::new("http://localhost:9/v1", None, "nomic-embed-text", 8)
+                .expect("embedder builds")
+                .with_prefixes("query: ", "passage: ");
+        let inner_identity = inner.model_identity();
+        assert_ne!(
+            inner_identity,
+            inner.model(),
+            "the fixture must actually have a distinct identity, or this test proves nothing"
+        );
+
+        let health = ProviderHealth::default();
+        let wrapped = health.wrap_embedder(Arc::new(inner), "openai-compat", "nomic-embed-text", 8);
+        assert_eq!(wrapped.model_identity(), inner_identity);
     }
 
     #[test]

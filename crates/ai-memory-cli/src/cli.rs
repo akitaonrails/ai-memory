@@ -268,6 +268,19 @@ pub struct RunArgs {
     /// `AI_MEMORY_RUN_AUTOWIRE=false`) to launch without touching harness config.
     #[arg(long)]
     pub no_autowire: bool,
+    /// Extra environment variable for the spawned harness, `KEY=VALUE`.
+    /// Repeatable; wrapper-owned like `--yolo`/`--executable`, so it must
+    /// precede `harness`. Reaches both the spawned process and ai-memory's own
+    /// native-session resolution (e.g. `CLAUDE_CONFIG_DIR`), so the two agree
+    /// on where the harness's session lives. A later `--env` wins over an
+    /// earlier one and over a same-key `--env-file` entry.
+    #[arg(long = "env", value_parser = parse_env_kv, value_name = "KEY=VALUE")]
+    pub env: Vec<(String, String)>,
+    /// Read `KEY=VALUE` lines from this file (blank lines and `#` comments
+    /// skipped) and merge them into the spawned harness's environment before
+    /// `--env` entries, which override a same-key line here.
+    #[arg(long = "env-file", value_name = "PATH")]
+    pub env_file: Option<PathBuf>,
     /// Agent harness to launch. When omitted, continue the newest managed or
     /// checkout-local session among the auto-detected harnesses. Any value
     /// starting with `claude` (e.g. `claude-corp`, `claude-personal`) also
@@ -356,6 +369,23 @@ fn parse_run_harness_choice(value: &str) -> Result<RunHarnessChoice, String> {
     Err(format!(
         "invalid value '{value}' for harness; expected one of: {known}, or any `claude*` spelling"
     ))
+}
+
+/// Parse one `KEY=VALUE` entry for `--env` (also reused for `--env-file`
+/// lines). The value is taken literally — no expansion, no interpretation —
+/// so a caller-supplied value reaches the harness exactly as written.
+pub(crate) fn parse_env_kv(value: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = value.split_once('=') else {
+        return Err(format!(
+            "invalid value '{value}' for --env; expected KEY=VALUE"
+        ));
+    };
+    if key.is_empty() {
+        return Err(format!(
+            "invalid value '{key}={value}' for --env; KEY must not be empty"
+        ));
+    }
+    Ok((key.to_string(), value.to_string()))
 }
 
 /// Arguments for `show`.
@@ -3230,6 +3260,88 @@ mod tests {
             error.to_string().contains("expected one of"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn run_env_flag_parses_repeatable_key_value_pairs() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--env",
+            "CLAUDE_CONFIG_DIR=/accounts/work",
+            "--env",
+            "FOO=bar=baz",
+            "claude",
+        ])
+        .expect("valid --env pairs parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            args.env,
+            vec![
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/accounts/work".to_string()
+                ),
+                ("FOO".to_string(), "bar=baz".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_env_flag_rejects_a_pair_without_equals() {
+        let error = Cli::try_parse_from(["ai-memory", "run", "--env", "NOEQUALS", "claude"])
+            .expect_err("a value without '=' must be rejected");
+        assert!(
+            error.to_string().contains("expected KEY=VALUE"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn run_env_flag_rejects_an_empty_key() {
+        let error = Cli::try_parse_from(["ai-memory", "run", "--env", "=value", "claude"])
+            .expect_err("an empty key must be rejected");
+        assert!(
+            error.to_string().contains("KEY must not be empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn run_env_file_flag_parses_as_a_path() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--env-file",
+            "/tmp/ai-memory-env-example.env",
+            "claude",
+        ])
+        .expect("--env-file parses");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            args.env_file,
+            Some(PathBuf::from("/tmp/ai-memory-env-example.env"))
+        );
+    }
+
+    #[test]
+    fn parse_env_kv_accepts_pairs_and_rejects_malformed_entries() {
+        assert_eq!(
+            parse_env_kv("KEY=VALUE"),
+            Ok(("KEY".to_string(), "VALUE".to_string()))
+        );
+        // The value is taken literally, including any further '=' signs.
+        assert_eq!(
+            parse_env_kv("KEY=a=b=c"),
+            Ok(("KEY".to_string(), "a=b=c".to_string()))
+        );
+        assert_eq!(parse_env_kv("KEY="), Ok(("KEY".to_string(), String::new())));
+        assert!(parse_env_kv("NOEQUALS").is_err());
+        assert!(parse_env_kv("=value").is_err());
     }
 
     #[test]

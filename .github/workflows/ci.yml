@@ -71,6 +71,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: echo "TAILWIND_BUILD=1" >> "$GITHUB_ENV"
       - run: cargo test --workspace --all-targets
+      # `--all-targets` deliberately excludes doctests, so a doc-comment code
+      # block that fails to compile (e.g. an indented shell example rustdoc
+      # reads as Rust) shipped unnoticed. Run them explicitly.
+      - run: cargo test --workspace --doc
       - name: Vendored tailwind.css is current
         if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- crates/ai-memory-web/static/tailwind.css
@@ -193,6 +197,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y rpm
       - run: scripts/check-native-packaging.sh
       - run: tests/wrapper_upgrade.sh
 

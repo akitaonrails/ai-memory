@@ -294,7 +294,7 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
     assert!(release.contains("artifact: ai-memory-linux-aarch64"));
     assert!(release.contains("artifact: ai-memory-macos-aarch64"));
     assert!(release.contains("artifact: ai-memory-macos-x86_64"));
-    assert!(release.contains("needs: [binary, macos, windows, validate-version]"));
+    assert!(release.contains("needs: [binary, macos, windows, rpm, validate-version]"));
     assert!(release.contains("target: runtime-prebuilt-amd64"));
     assert!(release.contains("target: runtime-prebuilt-arm64"));
 
@@ -1014,7 +1014,16 @@ fn run_wrapper_with_fake_docker_env(
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL")
-        .env_remove("CLAUDE_CONFIG_DIR");
+        .env_remove("CLAUDE_CONFIG_DIR")
+        // Guarantees the "unset" case in
+        // `posix_wrapper_forwards_embedding_prefixes_by_presence_not_non_emptiness`
+        // is actually unset rather than silently inheriting whatever the
+        // test-runner's own ambient environment happens to hold; every
+        // other case re-adds one of these via `forwarded_env` below, so
+        // removing them unconditionally here is a no-op for every other
+        // caller of this helper.
+        .env_remove("AI_MEMORY_EMBEDDING_QUERY_PREFIX")
+        .env_remove("AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX");
     if let Some(claude_config_dir) = claude_config_dir {
         command.env("CLAUDE_CONFIG_DIR", claude_config_dir);
     }
@@ -1831,6 +1840,83 @@ mod slow {
                 "wrapper must not put the value of {name} in Docker argv"
             );
         }
+    }
+
+    /// The two embedding-prefix env vars are forwarded on PRESENCE, not
+    /// non-emptiness, unlike every other var in the loop: an operator sets
+    /// one to the empty string to clear a `config.toml`-configured prefix
+    /// without editing the file (see `Config::load`'s figment overlay in
+    /// `ai-memory-cli/src/config.rs`), and that override only reaches the
+    /// server if the wrapper forwards the (empty) variable rather than
+    /// dropping it the way a plain `[ -n ]` check would.
+    #[cfg(unix)]
+    #[test]
+    fn posix_wrapper_forwards_embedding_prefixes_by_presence_not_non_emptiness() {
+        const QUERY: &str = "AI_MEMORY_EMBEDDING_QUERY_PREFIX";
+        const DOC: &str = "AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX";
+        let has_e = |args: &[&str], name: &str| args.windows(2).any(|pair| pair == ["-e", name]);
+
+        // Unset: neither var forwarded (the loop must not invent a value).
+        let args =
+            run_wrapper_with_fake_docker_and_forwarded_env(&["llm-test"], "[name=seccomp]", &[]);
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            !has_e(&lines, QUERY),
+            "unset must not be forwarded; got {lines:?}"
+        );
+        assert!(
+            !has_e(&lines, DOC),
+            "unset must not be forwarded; got {lines:?}"
+        );
+
+        // Empty: forwarded anyway — this is the override case.
+        let args = run_wrapper_with_fake_docker_and_forwarded_env(
+            &["llm-test"],
+            "[name=seccomp]",
+            &[(QUERY, ""), (DOC, "")],
+        );
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            has_e(&lines, QUERY),
+            "an empty (but present) value must still be forwarded; got {lines:?}"
+        );
+        assert!(
+            has_e(&lines, DOC),
+            "an empty (but present) value must still be forwarded; got {lines:?}"
+        );
+
+        // Whitespace-only: also present, also forwarded — this loop must
+        // not apply any trimming/emptiness judgement of its own.
+        let args = run_wrapper_with_fake_docker_and_forwarded_env(
+            &["llm-test"],
+            "[name=seccomp]",
+            &[(QUERY, "   "), (DOC, "   ")],
+        );
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            has_e(&lines, QUERY),
+            "whitespace-only must still be forwarded; got {lines:?}"
+        );
+        assert!(
+            has_e(&lines, DOC),
+            "whitespace-only must still be forwarded; got {lines:?}"
+        );
+
+        // Non-empty: forwarded, same as every other var.
+        let args = run_wrapper_with_fake_docker_and_forwarded_env(
+            &["llm-test"],
+            "[name=seccomp]",
+            &[(QUERY, "query: "), (DOC, "passage: ")],
+        );
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            has_e(&lines, QUERY),
+            "a non-empty value must be forwarded; got {lines:?}"
+        );
+        assert!(
+            has_e(&lines, DOC),
+            "a non-empty value must be forwarded; got {lines:?}"
+        );
     }
 
     // The Windows mirror of macos_wrapper_routes_urls_by_real_subcommand: Docker

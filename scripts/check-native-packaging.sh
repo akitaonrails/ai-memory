@@ -72,6 +72,13 @@ main() {
     log "Skipping makepkg .SRCINFO check (makepkg unavailable or running as root)"
   fi
 
+  if command -v rpmspec >/dev/null 2>&1; then
+    log "Checking RPM spec syntax"
+    rpmspec --parse --define '_arch x86_64' packaging/rpm/ai-memory.spec >/dev/null
+  else
+    log "Skipping RPM spec check (rpmspec unavailable)"
+  fi
+
   TMP_ROOT="$(mktemp -d /tmp/ai-memory-native-root.XXXXXX)"
   cleanup() {
     if [ -n "${TMP_ROOT}" ]; then

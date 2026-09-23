@@ -13,11 +13,11 @@ use ai_memory_core::{
 };
 use ai_memory_workstream::{
     ExportedTranscript, LaunchMode, LaunchPlan, ManagedHarness, NativeSessionCandidate,
-    allows_native_session_adoption, apply_yolo, build_launch_plan, discover_native_session,
-    export_transcript, has_native_session_selector, inspect_repository, kiro_explicit_session_id,
-    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
-    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
-    native_session_exists, wait_for_transcript_flush,
+    allows_native_session_adoption, apply_yolo, build_launch_plan, build_launch_plan_with_env,
+    discover_native_session, export_transcript, has_native_session_selector, inspect_repository,
+    kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
+    kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
+    list_native_sessions, native_session_exists, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -116,6 +116,8 @@ pub(super) async fn run_from_with_wiring(
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
     let force_fresh = args.fresh || trailing_fresh;
     let no_autowire = args.no_autowire || trailing_no_autowire;
+    let run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
+        .context("resolving --env/--env-file for the managed run")?;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
             "native harness arguments require an explicit harness; try `ai-memory run codex ...`"
@@ -256,6 +258,7 @@ pub(super) async fn run_from_with_wiring(
         force_fresh,
         &home,
         &repository.cwd,
+        &run_env,
     ));
     if let Some(orphaned_session) = orphaned_session {
         eprintln!(
@@ -282,11 +285,12 @@ pub(super) async fn run_from_with_wiring(
                 .find(|candidate| candidate.harness == harness)
                 .context("the selected automatic harness no longer has a checkout-local session")
         );
-        plan = acquired_try!(build_launch_plan(
+        plan = acquired_try!(build_launch_plan_with_env(
             harness,
             executable.clone(),
             native_args.clone(),
             Some(&candidate.session.native_session_id),
+            &run_env,
         ));
         eprintln!(
             "ai-memory: continuing newest checkout-local {} session {}",
@@ -324,11 +328,12 @@ pub(super) async fn run_from_with_wiring(
                 );
                 match selection {
                     Ok(Some(native_session_id)) => {
-                        plan = acquired_try!(build_launch_plan(
+                        plan = acquired_try!(build_launch_plan_with_env(
                             harness,
                             executable,
                             native_args,
                             Some(&native_session_id),
+                            &run_env,
                         ));
                     }
                     Ok(None) => {}
@@ -430,9 +435,13 @@ pub(super) async fn run_from_with_wiring(
     // unresolvable program reaching the spawn error below, which explains it.
     let program = resolve_program(&plan.program).unwrap_or_else(|| plan.program.clone().into());
     let mut command = Command::new(&program);
+    command.args(&plan.args).current_dir(&repository.cwd);
+    // Caller-supplied `--env`/`--env-file` entries go first so the fixed
+    // AI_MEMORY_* plumbing below always wins on a key collision.
+    for (key, value) in &run_env {
+        command.env(key, value);
+    }
     command
-        .args(&plan.args)
-        .current_dir(&repository.cwd)
         .env("AI_MEMORY_RUN_ID", prepared.run_id.to_string())
         .env(
             "AI_MEMORY_WORKSTREAM_ID",
@@ -817,6 +826,48 @@ fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
+/// Merge `--env-file` lines with `--env` entries into the final key/value
+/// list applied to the spawned harness, preserving file order but letting a
+/// `--env` entry override a same-key `--env-file` line. Values are taken
+/// literally; neither source is expanded or interpreted.
+fn resolve_run_env(
+    env_file: Option<&Path>,
+    env_args: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    if let Some(path) = env_file {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --env-file {}", path.display()))?;
+        for (line_number, line) in contents.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let (key, value) = crate::cli::parse_env_kv(trimmed)
+                .map_err(|error| anyhow!("{}:{}: {error}", path.display(), line_number + 1))?;
+            upsert_env(&mut merged, key, value);
+        }
+    }
+    for (key, value) in env_args {
+        upsert_env(&mut merged, key.clone(), value.clone());
+    }
+    Ok(merged)
+}
+
+/// Insert or replace one entry in an ordered env list, keeping the position
+/// of an existing key so `--env-file` order stays stable across overrides.
+fn upsert_env(entries: &mut Vec<(String, String)>, key: String, value: String) {
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|(existing_key, _)| *existing_key == key)
+    {
+        existing.1 = value;
+    } else {
+        entries.push((key, value));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_preflighted_launch_plan(
     harness: ManagedHarness,
     executable: Option<OsString>,
@@ -825,6 +876,7 @@ fn build_preflighted_launch_plan(
     force_fresh: bool,
     home: &Path,
     cwd: &Path,
+    env_overrides: &[(String, String)],
 ) -> Result<(LaunchPlan, Option<String>)> {
     let explicit_selector = has_native_session_selector(harness, &native_args);
     if force_fresh && explicit_selector {
@@ -833,11 +885,12 @@ fn build_preflighted_launch_plan(
         ));
     }
     let linked_session_id = if force_fresh { None } else { linked_session_id };
-    let plan = build_launch_plan(
+    let plan = build_launch_plan_with_env(
         harness,
         executable.clone(),
         native_args.clone(),
         linked_session_id,
+        env_overrides,
     )?;
     let Some(linked_session_id) = linked_session_id else {
         return Ok((plan, None));
@@ -854,7 +907,7 @@ fn build_preflighted_launch_plan(
     ) {
         Ok(true) => Ok((plan, None)),
         Ok(false) => Ok((
-            build_launch_plan(harness, executable, native_args, None)?,
+            build_launch_plan_with_env(harness, executable, native_args, None, env_overrides)?,
             Some(linked_session_id.to_string()),
         )),
         Err(error) => {
@@ -2130,6 +2183,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -2194,6 +2248,164 @@ mod tests {
     }
 
     #[test]
+    fn resolve_run_env_merges_file_then_overrides_with_cli_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.env");
+        std::fs::write(&path, "# a comment\n\n  \nFOO=from-file\nBAR=keep\n").unwrap();
+
+        let cli_pairs = vec![("FOO".to_string(), "from-cli".to_string())];
+        let merged = resolve_run_env(Some(&path), &cli_pairs).unwrap();
+
+        assert_eq!(
+            merged,
+            vec![
+                ("FOO".to_string(), "from-cli".to_string()),
+                ("BAR".to_string(), "keep".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_run_env_without_a_file_returns_only_cli_pairs() {
+        let cli_pairs = vec![("A".to_string(), "1".to_string())];
+        let merged = resolve_run_env(None, &cli_pairs).unwrap();
+        assert_eq!(merged, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn resolve_run_env_rejects_a_malformed_env_file_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.env");
+        std::fs::write(&path, "NOVALUE\n").unwrap();
+        let error = resolve_run_env(Some(&path), &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("expected KEY=VALUE"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn build_launch_plan_with_env_overrides_reach_native_session_resolution() {
+        // The same override list is what `run.rs` also applies to the spawned
+        // child's `Command`; proving it steers `session_dir` here proves
+        // ai-memory's own native-session resolution and the harness process
+        // agree on a caller-supplied `CLAUDE_CONFIG_DIR`, per the docs note
+        // this closes (#820).
+        let overrides = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/accounts/work".to_string(),
+        )];
+        let plan =
+            build_launch_plan_with_env(ManagedHarness::Claude, None, Vec::new(), None, &overrides)
+                .unwrap();
+        assert_eq!(
+            plan.session_dir.as_deref(),
+            Some(Path::new("/accounts/work/projects"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_env_reaches_the_spawned_child_and_overrides_env_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use crate::commands::run_autowire::WireOverrides;
+        use crate::config::Config;
+
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post(|| async {
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: None,
+                        native_session_id: None,
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+
+        let captured = repo.path().join("captured-env");
+        let script = repo.path().join("capture-env-harness");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'FOO=%s\\nCLAUDE_CONFIG_DIR=%s\\n' \"$FOO\" \"$CLAUDE_CONFIG_DIR\" > {}\nexit 0\n",
+                captured.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_file = repo.path().join("run.env");
+        std::fs::write(
+            &env_file,
+            "# comment\n\nFOO=from-file\nCLAUDE_CONFIG_DIR=/from/file\n",
+        )
+        .unwrap();
+
+        let mut config = Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        config.data_dir = data.path().to_path_buf();
+        config.home_dir = Some(home.path().to_string_lossy().into_owned());
+        config.server_url = format!("http://{address}");
+        config.run_autowire = false;
+
+        let args = RunArgs {
+            workspace: Some("ws".into()),
+            project: Some("proj".into()),
+            workstream: None,
+            new_workstream: None,
+            executable: Some(script.clone()),
+            yolo: false,
+            fresh: false,
+            no_autowire: true,
+            env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
+            env_file: Some(env_file.clone()),
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: vec![OsString::from("--version")],
+        };
+
+        let overrides = WireOverrides::default();
+        let exit = run_from_with_wiring(&config, args, repo.path(), &overrides)
+            .await
+            .expect("managed passthrough run completes");
+        assert_eq!(exit, 0, "the harmless child exits 0");
+
+        let captured_env = std::fs::read_to_string(&captured).unwrap();
+        assert!(
+            captured_env.contains("FOO=from-file"),
+            "an --env-file entry not overridden by --env must reach the spawned child: {captured_env}"
+        );
+        assert!(
+            captured_env.contains("CLAUDE_CONFIG_DIR=/from/cli"),
+            "--env must override a same-key --env-file entry for the spawned child: {captured_env}"
+        );
+
+        server.abort();
+    }
+
+    #[test]
     fn missing_linked_session_starts_fresh_but_explicit_selectors_win() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().join("repo");
@@ -2223,6 +2435,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert!(orphaned.is_none());
@@ -2238,6 +2451,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert_eq!(orphaned.as_deref(), Some("linked"));
@@ -2256,6 +2470,7 @@ mod tests {
             false,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert!(orphaned.is_none());
@@ -2275,6 +2490,7 @@ mod tests {
             true,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap();
         assert!(orphaned.is_none());
@@ -2289,6 +2505,7 @@ mod tests {
             true,
             temp.path(),
             &cwd,
+            &[],
         )
         .unwrap_err();
         assert!(error.to_string().contains("--fresh cannot be combined"));
@@ -2467,6 +2684,8 @@ mod tests {
             yolo: false,
             fresh: false,
             no_autowire: false,
+            env: Vec::new(),
+            env_file: None,
             harness: Some(RunHarnessChoice::Claude),
             native_args: vec![OsString::from("--version")],
         };

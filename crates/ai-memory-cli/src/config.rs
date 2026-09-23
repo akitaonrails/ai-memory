@@ -448,6 +448,48 @@ pub struct Config {
     pub embedding_dim: Option<u32>,
     /// Optional embedding base URL override.
     pub embedding_base_url: Option<String>,
+    /// Optional prefix prepended to every embedding **query** before it is
+    /// sent to the `openai` or `openai-compat` embedder, ahead of the
+    /// existing truncation. Unset (the default) is a no-op — no behaviour
+    /// change. Asymmetric self-hosted models need a query-side instruction
+    /// their publisher specifies; the OpenAI-compatible `/v1/embeddings`
+    /// wire format has no field for it, so the client prepends it instead.
+    /// `nvidia/Nemotron-3-Embed-1B-BF16` and base E5 models
+    /// (`intfloat/e5-base-v2`, multilingual E5, …) use a simple
+    /// `"query: "` / `"passage: "` pair (documents get
+    /// `embedding_document_prefix = "passage: "`). Instruction-tuned E5
+    /// variants and Qwen3-Embedding instead need a full task-instruction
+    /// string on the query side only, with **different exact spacing each**
+    /// — leave `embedding_document_prefix` unset for both (their documents
+    /// are plain text, no prefix):
+    /// `e5-mistral-7b-instruct` wants
+    /// `"Instruct: {task description}\nQuery: "` (a trailing space after
+    /// `Query:`); Qwen3-Embedding wants
+    /// `"Instruct: {task description}\nQuery:"` (no trailing space — the
+    /// query text follows the colon directly). Not trimmed: a publisher's
+    /// trailing space or embedded newline is significant and preserved
+    /// verbatim. Ignored by `google` (which has its own built-in
+    /// query/document asymmetry), `voyage`, `local`, and `copilot`.
+    /// Changing only this key never requires re-embedding existing pages —
+    /// the query side has no stored identity. See `docs/llm-providers.md`.
+    /// Settable via `AI_MEMORY_EMBEDDING_QUERY_PREFIX` (figment's `Env`
+    /// provider would otherwise trim a trailing space; `Config::load`
+    /// overlays the raw env bytes for this key specifically).
+    pub embedding_query_prefix: Option<String>,
+    /// Document-side counterpart of `embedding_query_prefix` (e.g.
+    /// `"passage: "` for Nemotron-3-Embed / base E5; see that field's doc
+    /// comment for which models this applies to). Unlike the query prefix,
+    /// this one IS folded into the stored embedding identity
+    /// (`Embedder::model_identity`): a non-empty value makes newly
+    /// embedded pages distinguishable from ones embedded before the
+    /// change (or under a different prefix), so `memory_query` and
+    /// `ai-memory embed`'s stale-row detection both treat a document-prefix
+    /// change like a model change — no manual `--force` needed, and an
+    /// empty value keeps the pre-existing (legacy) identity so upgrading
+    /// installs need no migration. Settable via
+    /// `AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX` (same raw-env overlay as
+    /// `embedding_query_prefix`).
+    pub embedding_document_prefix: Option<String>,
     /// M8 retention-sweep parameters. The defaults give an ~80-day
     /// "survival floor" for unused episodic content (above the cold
     /// threshold), followed by ~180 days of tombstone grace before permanent
@@ -456,6 +498,25 @@ pub struct Config {
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Lower edge (inclusive) of `memory_lint`'s A5 zero-LLM
+    /// contradiction-detection cosine-similarity band. Two cold pages whose
+    /// embeddings sit in `[contradiction_band_min, contradiction_band_max)`
+    /// are "same topic, not a duplicate" — flagged as a likely conflict.
+    ///
+    /// The band is a fixed absolute cosine value, but the background
+    /// similarity of unrelated pages is corpus-dependent: on a
+    /// single-language or single-domain store (or one written in a
+    /// non-English language), unrelated pages already sit well above the
+    /// general-purpose default floor, so the band ends up measuring domain
+    /// proximity rather than conflict and produces noisy findings. Raise
+    /// this floor for such a store. Default `0.4` preserves the historical
+    /// fixed band exactly. Settable via `AI_MEMORY_CONTRADICTION_BAND_MIN`.
+    pub contradiction_band_min: f32,
+    /// Upper edge (exclusive) of the band — see `contradiction_band_min`. At
+    /// or above this, two pages are treated as a near-duplicate (A3
+    /// cold-cluster dedup's territory) rather than a contradiction. Default
+    /// `0.75`. Settable via `AI_MEMORY_CONTRADICTION_BAND_MAX`.
+    pub contradiction_band_max: f32,
     /// Opt-in LLM "dream" pass (B2/B3/B4): rewrite/merge cold clusters with the
     /// configured provider, scheduled on idle and cancelled the moment the
     /// operator returns. OFF by default and gated on an R2 number before it may
@@ -883,8 +944,12 @@ impl Default for Config {
             embedding_model: None,
             embedding_dim: None,
             embedding_base_url: None,
+            embedding_query_prefix: None,
+            embedding_document_prefix: None,
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             dream: DreamSettings::default(),
             retrieval: RetrievalSettings::default(),
             slots: SlotSettings::default(),
@@ -1332,6 +1397,19 @@ impl Config {
             figment = figment.merge(Toml::file(&resolved_config_path));
         }
         figment = figment.merge(Env::prefixed("AI_MEMORY_").split("__"));
+        // The environment is read once, here, and passed down as data —
+        // never inside `overlay_embedding_prefixes` itself — so that
+        // function stays directly testable without mutating process env or
+        // cwd (see its doc comment).
+        figment = overlay_embedding_prefixes(
+            figment,
+            std::env::var("AI_MEMORY_EMBEDDING_QUERY_PREFIX")
+                .ok()
+                .as_deref(),
+            std::env::var("AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX")
+                .ok()
+                .as_deref(),
+        );
 
         let mut config: Config = figment.extract().with_context(|| {
             format!(
@@ -1420,6 +1498,26 @@ impl Config {
         }
         if config.decay.observation_prune_batch == 0 {
             anyhow::bail!("decay.observation_prune_batch must be greater than zero");
+        }
+        // A5 zero-LLM contradiction band (`memory_lint`): both edges must be
+        // finite and inside cosine similarity's own range, and the band must
+        // be non-empty. An inverted or out-of-range band would either
+        // silently disable A5 (no pair ever falls inside an empty range) or
+        // compare against a meaningless similarity value; reject it at load
+        // rather than inside the lint pass.
+        if !config.contradiction_band_min.is_finite()
+            || !config.contradiction_band_max.is_finite()
+            || config.contradiction_band_min < 0.0
+            || config.contradiction_band_max > 1.0
+            || config.contradiction_band_min >= config.contradiction_band_max
+        {
+            anyhow::bail!(
+                "contradiction_band_min/contradiction_band_max must satisfy \
+                 0.0 <= contradiction_band_min < contradiction_band_max <= 1.0 \
+                 (got min={}, max={})",
+                config.contradiction_band_min,
+                config.contradiction_band_max
+            );
         }
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
@@ -1897,6 +1995,14 @@ impl Config {
         } else {
             None
         };
+        // Not `non_empty`: that trims, and a publisher's trailing space
+        // (e.g. Nemotron-3-Embed's `"query: "`) is significant. By the time
+        // `Load` has run, `self.embedding_query_prefix` already holds the
+        // exact configured bytes regardless of source (TOML or env) — see
+        // `Config::load`'s env-prefix overlay, which corrects for
+        // figment's `Env` provider trimming unquoted values.
+        let query_prefix = self.embedding_query_prefix.clone().unwrap_or_default();
+        let document_prefix = self.embedding_document_prefix.clone().unwrap_or_default();
         Ok(Some(EmbedderConfig {
             provider,
             model,
@@ -1906,6 +2012,8 @@ impl Config {
             models_dir: Some(self.data_dir.join("models")),
             copilot_auth,
             defaulted,
+            query_prefix,
+            document_prefix,
         }))
     }
 
@@ -2108,6 +2216,51 @@ fn env_string(name: &str) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+/// Overlay the two embedding-prefix keys onto `figment` with their raw,
+/// untrimmed values, whenever the corresponding parameter is `Some` (even
+/// `Some("")` — an operator clearing a `config.toml`-set prefix back to
+/// none via an empty env var; only `None`, the variable genuinely absent,
+/// leaves a `config.toml` value or the default untouched).
+///
+/// figment's `Env` provider parses each var's string as a loose value
+/// (`figment::value::parse::value`), and its bare/unquoted branch calls
+/// `.trim()` — so `AI_MEMORY_EMBEDDING_QUERY_PREFIX="query: "` would
+/// otherwise reach `embedding_query_prefix` as `"query:"`, silently
+/// dropping the publisher-significant trailing space (verified against
+/// figment 0.10.19's vendored source, `src/value/parse.rs:78`).
+/// [`Serialized`] values are handed to figment as already-typed data (via
+/// `serde::Serialize`), so they never pass through that string parser and
+/// so are never trimmed. Callers merge this after `Env::prefixed` so it
+/// wins over the (possibly trimmed) value that provider already set.
+///
+/// The values come in as parameters, already read by the caller, rather
+/// than this function reading `std::env::var` itself — the same pattern
+/// `ai-memory-cli/src/commands/path_util.rs`'s `agent_config_home` and
+/// `ai-memory-hooks`'s `drain_with_live_token` use, and for the same
+/// reason: it keeps this function directly unit-testable without
+/// mutating process environment or the current directory. Both are
+/// unsafe or actively harmful to do from a `#[test]` in this crate's
+/// multi-threaded lib test binary — `std::env::set_var` is `unsafe` under
+/// edition 2024 and forbidden workspace-wide, and even a "safe" wrapper
+/// such as `figment::Jail` still calls `std::env::set_current_dir` on the
+/// real process (verified against its vendored source,
+/// `src/jail.rs:141`), racing every other test in the binary that reads
+/// env or relies on cwd — e.g. `tests/suite/backfill_e2e.rs`'s
+/// `Command::current_dir` calls.
+fn overlay_embedding_prefixes(
+    mut figment: Figment,
+    query_prefix_env: Option<&str>,
+    document_prefix_env: Option<&str>,
+) -> Figment {
+    if let Some(v) = query_prefix_env {
+        figment = figment.merge(Serialized::default("embedding_query_prefix", v));
+    }
+    if let Some(v) = document_prefix_env {
+        figment = figment.merge(Serialized::default("embedding_document_prefix", v));
+    }
+    figment
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -2535,6 +2688,48 @@ mod tests {
         );
     }
 
+    /// An install that never touched `contradiction_band_min`/`_max` sees no
+    /// change: the defaults are exactly the historical fixed band.
+    #[test]
+    fn contradiction_band_defaults_match_the_historical_fixed_band() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.contradiction_band_min,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW
+        );
+        assert_eq!(
+            cfg.contradiction_band_max,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH
+        );
+    }
+
+    #[test]
+    fn load_rejects_invalid_contradiction_band() {
+        for (min, max) in [
+            ("0.8", "0.4"),   // min >= max (inverted)
+            ("0.4", "0.4"),   // min >= max (equal)
+            ("-0.1", "0.75"), // min out of range
+            ("0.4", "1.5"),   // max out of range
+            ("nan", "0.75"),  // NaN
+            ("0.4", "nan"),   // NaN
+            ("0.4", "inf"),   // infinite (not finite)
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("contradiction_band_min = {min}\ncontradiction_band_max = {max}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err(&format!("min={min} max={max} must fail closed"));
+            assert!(
+                error.to_string().contains("contradiction_band"),
+                "unexpected error for min={min} max={max}: {error:#}"
+            );
+        }
+    }
+
     #[test]
     fn load_rejects_destructive_invalid_breadth_weights() {
         for value in ["-0.1", "nan", "inf"] {
@@ -2960,6 +3155,8 @@ mod tests {
             log_level = "debug"
             hook_rate_per_sec = 7.5
             hook_rate_burst = 12.0
+            contradiction_band_min = 0.5
+            contradiction_band_max = 0.8
 
             [auth]
             secure_cookie = true
@@ -3015,6 +3212,8 @@ mod tests {
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.hook_rate_per_sec, 7.5);
         assert_eq!(cfg.hook_rate_burst, 12.0);
+        assert_eq!(cfg.contradiction_band_min, 0.5);
+        assert_eq!(cfg.contradiction_band_max, 0.8);
         assert!(cfg.auth.secure_cookie);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
@@ -3242,6 +3441,168 @@ mod tests {
             missing_base.embedder_config().unwrap_err(),
             LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_BASE_URL")
         ));
+    }
+
+    #[test]
+    fn embedding_prefixes_default_empty_and_are_not_trimmed_when_set() {
+        // Unset: EmbedderConfig carries empty strings, so downstream
+        // embedders see byte-identical behaviour to before this feature.
+        let unset = Config {
+            embedding_provider: Some("openai-compat".into()),
+            embedding_model: Some("nvidia/Nemotron-3-Embed-1B-BF16".into()),
+            embedding_dim: Some(2048),
+            embedding_base_url: Some("http://localhost:8000/v1".into()),
+            ..Config::default()
+        };
+        let embedder = unset.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.query_prefix, "");
+        assert_eq!(embedder.document_prefix, "");
+
+        // Set: the publisher's exact strings pass through, including the
+        // significant trailing space — `non_empty`'s trim would corrupt it.
+        let set = Config {
+            embedding_query_prefix: Some("query: ".into()),
+            embedding_document_prefix: Some("passage: ".into()),
+            ..unset
+        };
+        let embedder = set.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.query_prefix, "query: ");
+        assert_eq!(embedder.document_prefix, "passage: ");
+    }
+
+    /// Pure unit tests for `overlay_embedding_prefixes`: no process env or
+    /// cwd mutation anywhere here (the workspace forbids `std::env::set_var`
+    /// as `unsafe` under edition 2024, and `figment::Jail` calls
+    /// `std::env::set_current_dir` on the real process internally, racing
+    /// every other test in this multi-threaded lib test binary that
+    /// relies on cwd, such as `tests/suite/backfill_e2e.rs`'s
+    /// `Command::current_dir` calls). Each test builds its own minimal
+    /// `Figment` in memory instead, exactly mirroring what `Config::load`
+    /// does (`Serialized::defaults` as the base, optionally a lower-priority
+    /// `Serialized` merge standing in for a `config.toml` value), and
+    /// extracts a `Config` to assert on — the identical merge machinery the
+    /// real loader uses, with the "env value" supplied as a parameter
+    /// instead of read from the process.
+    #[test]
+    fn overlay_embedding_prefixes_preserves_trailing_whitespace() {
+        // The regression this guards: figment's `Env` provider parses an
+        // unquoted value with its loose-value parser, whose bare-value
+        // branch calls `.trim()` — so without this overlay a real
+        // `AI_MEMORY_EMBEDDING_QUERY_PREFIX="query: "` would arrive as
+        // `"query:"`, silently dropping the space the model publisher
+        // requires. `Serialized` bypasses that parser entirely.
+        let base = Figment::from(Serialized::defaults(Config::default()));
+        let overlaid = overlay_embedding_prefixes(base, Some("query: "), Some("passage: "));
+        let cfg: Config = overlaid.extract().unwrap();
+        assert_eq!(cfg.embedding_query_prefix.as_deref(), Some("query: "));
+        assert_eq!(cfg.embedding_document_prefix.as_deref(), Some("passage: "));
+    }
+
+    #[test]
+    fn overlay_embedding_prefixes_none_leaves_a_lower_layer_untouched() {
+        // Simulates a `config.toml` value already merged in at lower
+        // priority; passing `None` (the env var genuinely absent) must not
+        // disturb it.
+        let base = Figment::from(Serialized::defaults(Config::default())).merge(
+            Serialized::default("embedding_query_prefix", "toml-query: "),
+        );
+        let overlaid = overlay_embedding_prefixes(base, None, None);
+        let cfg: Config = overlaid.extract().unwrap();
+        assert_eq!(cfg.embedding_query_prefix.as_deref(), Some("toml-query: "));
+    }
+
+    #[test]
+    fn overlay_embedding_prefixes_some_wins_over_a_lower_layer() {
+        let base = Figment::from(Serialized::defaults(Config::default())).merge(
+            Serialized::default("embedding_query_prefix", "toml-query: "),
+        );
+        let overlaid = overlay_embedding_prefixes(base, Some("env-query: "), None);
+        let cfg: Config = overlaid.extract().unwrap();
+        assert_eq!(cfg.embedding_query_prefix.as_deref(), Some("env-query: "));
+    }
+
+    #[test]
+    fn overlay_embedding_prefixes_empty_string_clears_a_lower_layer() {
+        // Present but empty (`Some("")`) is a deliberate override — an
+        // operator clearing a `config.toml` value via env without editing
+        // the file — distinct from `None` (the previous test), which must
+        // leave the lower layer untouched.
+        let base = Figment::from(Serialized::defaults(Config::default())).merge(
+            Serialized::default("embedding_query_prefix", "toml-query: "),
+        );
+        let overlaid = overlay_embedding_prefixes(base, Some(""), None);
+        let cfg: Config = overlaid.extract().unwrap();
+        assert_eq!(cfg.embedding_query_prefix.as_deref(), Some(""));
+    }
+
+    /// Exercises the real `Config::load` end to end, through an absolute
+    /// `config.toml` path and data dir from a `TempDir`. TOML strings were
+    /// never subject to figment's `Env`-provider trimming in the first
+    /// place, so this path already worked before the fix; this guards it
+    /// staying correct.
+    ///
+    /// This process's own environment is shared with every other test in
+    /// this binary and could already carry one of the two prefix vars from
+    /// the test runner's shell, which would make `Config::load` pick the
+    /// env value over the TOML one below and this test would silently stop
+    /// verifying the TOML-only path. Rather than assume the ambient
+    /// environment is clean, the actual `Config::load` call runs in a
+    /// separate child process with both vars explicitly removed via
+    /// `Command::env_remove` — real isolation instead of an in-process
+    /// assumption, and it does not touch this rule's target (mutating
+    /// *this* process's env), since a spawned child's environment is its
+    /// own.
+    #[test]
+    fn loader_toml_path_preserves_whitespace_with_no_env_var_set() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_LOADER_TOML_PATH_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            // Running as the child, with both prefix vars removed by the
+            // parent below: do the real work and print the result for the
+            // parent to assert on.
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                "embedding_query_prefix = \"query: \"\n\
+                 embedding_document_prefix = \"passage: \"\n",
+            )
+            .unwrap();
+            let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            println!(
+                "query={:?} document={:?}",
+                cfg.embedding_query_prefix, cfg.embedding_document_prefix
+            );
+            return;
+        }
+        // Running as the parent: re-exec this same test binary, filtered
+        // to just this one test, as a genuinely separate child process
+        // with both prefix env vars removed.
+        let exe = std::env::current_exe().expect("current test binary path");
+        let output = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("config::tests::loader_toml_path_preserves_whitespace_with_no_env_var_set")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env_remove("AI_MEMORY_EMBEDDING_QUERY_PREFIX")
+            .env_remove("AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX")
+            .output()
+            .expect("failed to spawn child test process");
+        assert!(
+            output.status.success(),
+            "child test process failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("query=Some(\"query: \")"),
+            "child stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("document=Some(\"passage: \")"),
+            "child stdout: {stdout}"
+        );
     }
 
     #[test]

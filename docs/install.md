@@ -1,12 +1,14 @@
 # Installation cookbook
 
 The [README quick-start](../README.md#quick-start) covers the happy
-paths (Docker + Claude Code, Arch AUR, macOS menu bar app). This page
-covers everything else:
+paths (Docker + Claude Code, Arch AUR, Fedora RPM, macOS menu bar app). This
+page covers everything else:
 
 - [Server on a different machine](#server-on-a-different-machine)
   (homelab, LAN box, remote server)
 - [Configuring the CLI URL and auth](#configuring-the-cli-url-and-auth)
+- [Fedora native package (RPM)](#fedora-rpm)
+  (systemd system service or user service)
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [macOS menu bar app](#macos-menu-bar-app)
@@ -197,6 +199,15 @@ take precedence — see
 [the marker-file reference](marker-file.md#install-wide-default-no-marker).
 
 ---
+
+## Fedora (RPM)
+
+Download the `x86_64` or `aarch64` RPM from the
+[latest GitHub release](https://github.com/akitaonrails/ai-memory/releases/latest)
+and install it with `sudo dnf install ./ai-memory-*.rpm`. The package includes
+the binary, hook sources, system and user systemd units, and system service
+configuration. Follow the [user-level service](#user-level-service) or
+[system service](#system-service) steps below to initialize and start it.
 
 ## Arch Linux native packages (AUR)
 
@@ -1649,7 +1660,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://api.orcarouter.ai/v1` | `openai/text-embedding-3-small` via [OrcaRouter](https://www.orcarouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY`, with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=voyage` | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=google` / `gemini` | `gemini-embedding-001` (768-dim) | Google-hosted embeddings via `embedContent`. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
-| `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `EMBEDDING_API_KEY`, else `LLM_API_KEY`, is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `EMBEDDING_API_KEY`, else `LLM_API_KEY`, is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. Asymmetric models need `AI_MEMORY_EMBEDDING_QUERY_PREFIX` / `AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX`, e.g. `nvidia/Nemotron-3-Embed-1B-BF16` wants `query: ` / `passage: ` — see [`docs/llm-providers.md`](llm-providers.md) for that and for Qwen3-Embedding/instruction-tuned E5, which need a different (query-only) format. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=copilot` | `text-embedding-3-small` (1536-dim) | Reuses the `copilot` LLM provider's OAuth login (`ai-memory auth login copilot`, `COPILOT_GITHUB_TOKEN`, or `GITHUB_COPILOT_API_TOKEN`) — no separate API key. Calls Copilot's `/embeddings` endpoint following the OpenAI-compatible contract Copilot documents for chat; that endpoint's exact shape is not covered by a live test against Copilot here, so treat it as needing a real-Copilot smoke test. |
 
 > **What we don't recommend:** reasoning-mode models (Claude with extended

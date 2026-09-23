@@ -2216,7 +2216,12 @@ impl Wiki {
                             page_id,
                             bytes,
                             embedder.provider().to_string(),
-                            embedder.model().to_string(),
+                            // Not `.model()`: a configured document prefix
+                            // must land under a distinct stored identity so
+                            // a prefix change is never silently mixed with
+                            // vectors embedded under a different (or no)
+                            // prefix. See `Embedder::model_identity`.
+                            embedder.model_identity(),
                             embedder.dim(),
                         )
                         .await?;
@@ -2250,7 +2255,8 @@ impl Wiki {
                                 page_id,
                                 vector_bytes: f32_vec_to_bytes(&vec),
                                 provider: embedder.provider().to_string(),
-                                model: embedder.model().to_string(),
+                                // See the body-embedding write above.
+                                model: embedder.model_identity(),
                                 dim: embedder.dim(),
                             }])
                             .await?;

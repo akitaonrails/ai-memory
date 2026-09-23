@@ -488,7 +488,7 @@ jobs:
 
   github-release:
     name: github release
-    needs: [binary, macos, windows, validate-version]
+    needs: [binary, macos, windows, rpm, validate-version]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -537,6 +537,8 @@ jobs:
           echo "# Arch Linux (AUR)" >> body.md
           echo "yay -S ai-memory-bin      # prebuilt Linux x86_64/aarch64 binary" >> body.md
           echo "yay -S ai-memory          # builds from source" >> body.md
+          echo "" >> body.md
+          echo "# Fedora: download the matching RPM below, then run sudo dnf install ./ai-memory-<version>-1.<arch>.rpm" >> body.md
           echo "" >> body.md
           echo "# Docker" >> body.md
           echo "docker pull akitaonrails/ai-memory:${{ needs.validate-version.outputs.version }}" >> body.md
@@ -666,3 +668,51 @@ jobs:
           publish_pkg ai-memory "$source_pkgbuild"
           publish_pkg ai-memory-bin "$bin_pkgbuild"
           EOF
+
+  rpm:
+    name: Fedora RPM (${{ matrix.arch }})
+    needs: [binary, validate-version]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ai-memory-linux-${{ matrix.arch }}
+          path: artifacts
+
+      - name: Build RPM
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cpio rpm
+          mkdir -p "$HOME/rpmbuild/SOURCES" "$HOME/rpmbuild/SPECS" "$HOME/rpmbuild/RPMS"
+          cp artifacts/ai-memory-linux-${ARCH}.tar.gz "$HOME/rpmbuild/SOURCES/"
+          cp packaging/rpm/ai-memory.spec "$HOME/rpmbuild/SPECS/"
+          sed -i "s/^Version:        .*/Version:        ${VERSION}/" "$HOME/rpmbuild/SPECS/ai-memory.spec"
+          rpmbuild -bb "$HOME/rpmbuild/SPECS/ai-memory.spec"
+          rpm_file="$(find "$HOME/rpmbuild/RPMS" -name '*.rpm' -print -quit)"
+          test -n "$rpm_file"
+          rpm -qp --queryformat '%{VERSION} %{ARCH}\n' "$rpm_file" | grep -Fx "$VERSION $ARCH"
+          rpm -ql "$rpm_file" | grep -Fx /usr/lib/systemd/system/ai-memory.service
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          rpm2cpio "$rpm_file" | (cd "$root" && cpio -idm --quiet)
+          "$root/usr/bin/ai-memory" --version | grep -Fx "ai-memory $VERSION"
+          rpm_name="ai-memory-$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}' "$rpm_file").rpm"
+          mv "$rpm_file" "artifacts/$rpm_name"
+          (cd artifacts && sha256sum "$rpm_name" > "$rpm_name.sha256")
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ai-memory-rpm-${{ matrix.arch }}
+          path: artifacts/*.rpm*

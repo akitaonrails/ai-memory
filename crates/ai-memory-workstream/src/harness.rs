@@ -203,6 +203,25 @@ pub fn build_launch_plan(
     native_args: Vec<OsString>,
     linked_session_id: Option<&str>,
 ) -> Result<LaunchPlan> {
+    build_launch_plan_with_env(harness, executable, native_args, linked_session_id, &[])
+}
+
+/// [`build_launch_plan`] with `--env`/`--env-file` overrides layered in front
+/// of the real process environment for native session-store resolution
+/// (e.g. `CLAUDE_CONFIG_DIR`).
+///
+/// A launch's own environment overrides must be visible here, not only to the
+/// spawned child: `ai-memory run` resolves the native transcript root from
+/// this same variable, so a caller-scoped override that only reached the
+/// child process would make the two disagree about where the session lives
+/// (see the `CLAUDE_CONFIG_DIR` note in `docs/managed-workstreams.md`).
+pub fn build_launch_plan_with_env(
+    harness: ManagedHarness,
+    executable: Option<OsString>,
+    native_args: Vec<OsString>,
+    linked_session_id: Option<&str>,
+    env_overrides: &[(String, String)],
+) -> Result<LaunchPlan> {
     let program = executable.unwrap_or_else(|| OsString::from(harness.executable()));
     let mut args = native_args;
     let session_dir = match harness {
@@ -210,7 +229,15 @@ pub fn build_launch_plan(
         ManagedHarness::Crush => flag_path(&args, &["--data-dir", "-D"]),
         _ => None,
     }
-    .or_else(|| environment_session_dir(harness));
+    .or_else(|| {
+        environment_session_dir_with(harness, |name| {
+            env_overrides
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| OsString::from(value))
+                .or_else(|| std::env::var_os(name))
+        })
+    });
     let mut expected = explicit_session_id(harness, &args);
     let mode = launch_mode(harness, &args);
     if mode == LaunchMode::Session
@@ -888,10 +915,6 @@ fn flag_path(args: &[OsString], names: &[&str]) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn environment_session_dir(harness: ManagedHarness) -> Option<PathBuf> {
-    environment_session_dir_with(harness, |name| std::env::var_os(name))
 }
 
 fn environment_session_dir_with(

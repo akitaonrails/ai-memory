@@ -731,6 +731,8 @@ async fn s1_contradiction_lint_flags_band_pair_without_deleting() {
                 model: MODEL.into(),
                 dim: 2,
             }),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         },
     )
     .await

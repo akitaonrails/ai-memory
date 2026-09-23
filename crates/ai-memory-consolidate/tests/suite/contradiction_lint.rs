@@ -120,6 +120,18 @@ fn latest_page_count(fx: &Fixture) -> i64 {
 }
 
 fn options(embedding: Option<EmbeddingCoord>) -> LintOptions {
+    options_with_band(
+        embedding,
+        ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+        ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+    )
+}
+
+fn options_with_band(
+    embedding: Option<EmbeddingCoord>,
+    band_min: f32,
+    band_max: f32,
+) -> LintOptions {
     LintOptions {
         // dry_run so the pass emits findings without writing a report page,
         // keeping the "nothing was mutated" assertion clean.
@@ -128,6 +140,8 @@ fn options(embedding: Option<EmbeddingCoord>) -> LintOptions {
         use_llm: false,
         decay_lambda: 0.02,
         embedding,
+        contradiction_band_min: band_min,
+        contradiction_band_max: band_max,
     }
 }
 
@@ -194,6 +208,39 @@ async fn band_pair_yields_advisory_contradiction() {
         latest_page_count(&fx),
         before,
         "the detector must not add, delete, or supersede any page"
+    );
+}
+
+/// A raised floor (as a same-domain / non-English store would configure)
+/// suppresses the same 0.6-similarity pair the default 0.4 floor admits.
+#[tokio::test]
+async fn raised_floor_suppresses_the_band_pair_end_to_end() {
+    let fx = seed_fixture().await;
+    let old = write_semantic(&fx, "concepts/old-claim.md", "The retry budget is 3.").await;
+    let new = write_semantic(&fx, "concepts/new-claim.md", "The retry budget is 5.").await;
+    // dot([1,0],[0.6,0.8]) = 0.6 — inside the default band, below a 0.7 floor.
+    seed_embedding(&fx, old, &[1.0, 0.0]);
+    seed_embedding(&fx, new, &[0.6, 0.8]);
+
+    let report = run_lint(
+        &fx.store.reader,
+        &fx.wiki,
+        None,
+        fx.ws,
+        fx.proj,
+        options_with_band(
+            coord(),
+            0.7,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !report.findings.iter().any(|f| f.kind == "contradiction"),
+        "a 0.7 floor must drop the 0.6-similarity pair the default 0.4 floor admits: {:?}",
+        report.findings
     );
 }
 

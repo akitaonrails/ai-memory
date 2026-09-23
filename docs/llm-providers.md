@@ -210,6 +210,59 @@ hybrid paths apply the same bounded page-authority adjustment after candidate
 generation; embeddings improve relevance recall but do not decide which source
 is canonical.
 
+Asymmetric embedding models — ones trained with a different instruction for
+queries than for the text being indexed — need that instruction added to the
+text itself; the OpenAI-compatible `/v1/embeddings` wire format has no field
+for it. `AI_MEMORY_EMBEDDING_QUERY_PREFIX` and
+`AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX` (only applied by the `openai` and
+`openai-compat` embedders) are prepended to query and document text
+respectively, before the existing truncation, so a long body is still
+truncated to the same overall input cap with the prefix included. Both are
+empty by default — no behaviour change when unset — and are not trimmed, so
+a publisher's trailing space is preserved exactly. For example, NVIDIA's
+[`nvidia/Nemotron-3-Embed-1B-BF16`](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16)
+(2048-dim, served locally through vLLM/`openai-compat`) specifies
+`"query: "` for queries and `"passage: "` for documents per its model card:
+
+```toml
+embedding_provider = "openai-compat"
+embedding_model = "nvidia/Nemotron-3-Embed-1B-BF16"
+embedding_base_url = "http://localhost:8000/v1"
+embedding_dim = 2048
+embedding_query_prefix = "query: "
+embedding_document_prefix = "passage: "
+```
+
+Base E5 models (`intfloat/e5-base-v2`, `e5-large-v2`, multilingual E5, …)
+use the same `"query: "` / `"passage: "` convention. Instruction-tuned E5
+variants and Qwen3-Embedding instead need a task-instruction string on the
+**query side only** — their documents are embedded plain, with no document
+prefix — but the two use **different exact spacing**, confirmed against
+each model card:
+
+- `intfloat/e5-mistral-7b-instruct`:
+  `embedding_query_prefix = "Instruct: {task description}\nQuery: "` — a
+  trailing space after `Query:`.
+- `Qwen/Qwen3-Embedding-0.6B` (and the other Qwen3-Embedding sizes):
+  `embedding_query_prefix = "Instruct: {task description}\nQuery:"` — **no**
+  trailing space; the query text follows the colon directly.
+
+Fill in your own task description for `{task description}`, leave
+`embedding_document_prefix` unset for both, and don't copy one model's
+exact string for the other — the trailing-space difference is
+publisher-specified, not a typo.
+
+Changing `embedding_query_prefix` alone never requires re-embedding: only
+`embedding_document_prefix` is folded into the stored embedding identity
+(a non-empty value changes what `ai-memory` treats as the current
+`{provider, model, dim}` triple for that page's vectors), so a document
+prefix change makes `memory_query` stop matching the old vectors and the
+next `ai-memory embed` (scheduled or manual) pass re-embed them
+automatically — no `--force` needed. `--force` remains useful to
+re-embed everything immediately rather than waiting for scheduled
+backfill, or to force a re-embed for a reason the triple alone doesn't
+capture (e.g. touching up the vLLM server's tokenizer or quantization).
+
 `AI_MEMORY_EMBEDDING_PROVIDER=copilot` reuses the same Copilot OAuth login as
 the `copilot` LLM provider (`ai-memory auth login copilot` or
 `COPILOT_GITHUB_TOKEN`/`GITHUB_COPILOT_API_TOKEN`) — no separate API key.

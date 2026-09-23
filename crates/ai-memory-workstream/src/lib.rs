@@ -6,8 +6,9 @@ mod transcript;
 
 pub use harness::{
     LaunchMode, LaunchPlan, ManagedHarness, allows_native_session_adoption, apply_yolo,
-    build_launch_plan, has_native_session_selector, kiro_explicit_session_id,
-    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
+    build_launch_plan, build_launch_plan_with_env, has_native_session_selector,
+    kiro_explicit_session_id, kiro_selects_non_default_engine, kiro_selects_v2_engine,
+    kiro_selects_v3_engine,
 };
 pub use repository::{RepositoryIdentity, inspect_repository};
 pub use transcript::{

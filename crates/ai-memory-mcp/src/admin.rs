@@ -126,6 +126,13 @@ pub struct AdminState {
     pub ingest_metrics: std::sync::Arc<ai_memory_core::IngestMetrics>,
     /// Retention-decay parameters forwarded from server config.
     pub decay_params: DecayParams,
+    /// Lower edge of `memory_lint`'s A5 zero-LLM contradiction-similarity
+    /// band, forwarded from `config.contradiction_band_min`. Defaults to
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW`].
+    pub contradiction_band_min: f32,
+    /// Upper edge of the A5 band — see `contradiction_band_min`. Defaults to
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH`].
+    pub contradiction_band_max: f32,
     /// Server's resolved data directory (e.g. `/data` in the docker
     /// image). Surfaced via `/admin/status` so the CLI can report
     /// "where the wiki + db actually live".
@@ -3484,9 +3491,11 @@ async fn handle_lint(
                 .as_ref()
                 .map(|e| ai_memory_consolidate::EmbeddingCoord {
                     provider: e.provider().to_string(),
-                    model: e.model().to_string(),
+                    model: e.model_identity(),
                     dim: e.dim(),
                 }),
+            contradiction_band_min: state.contradiction_band_min,
+            contradiction_band_max: state.contradiction_band_max,
         },
     )
     .await
@@ -3634,7 +3643,10 @@ async fn handle_embed(
     };
 
     let provider = embedder.provider().to_string();
-    let model = embedder.model().to_string();
+    // Not `.model()`: the purge below must match the identity rows were
+    // actually stored under (a document-prefix change), not the wire
+    // model name. See `Embedder::model_identity`.
+    let model = embedder.model_identity();
     let dim = embedder.dim();
 
     let mut totals = EmbedBackfillCounts::default();
@@ -6266,9 +6278,12 @@ async fn copy_purge_merge(
     let mut src_embeddings: std::collections::HashMap<String, Vec<u8>> =
         std::collections::HashMap::new();
     let embed_meta: Option<(String, String, u32)> = if let Some(embedder) = &state.embedder {
+        // Not `.model()`: only vectors stored under the current document
+        // identity are "current-model" for the carry-over below to load.
+        // See `Embedder::model_identity`.
         let (provider, model, dim) = (
             embedder.provider().to_string(),
-            embedder.model().to_string(),
+            embedder.model_identity(),
             embedder.dim(),
         );
         match state
@@ -7707,6 +7722,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -7774,6 +7791,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49376".to_string(),
@@ -7897,6 +7916,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49375".to_string(),
@@ -8131,6 +8152,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -8325,6 +8348,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -8546,6 +8571,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -8903,6 +8930,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -10391,6 +10420,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -10501,6 +10532,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -10604,6 +10637,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -10713,6 +10748,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -11261,6 +11298,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -11318,6 +11357,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -11754,6 +11795,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -11886,6 +11929,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
@@ -12317,6 +12362,8 @@ mod tests {
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             data_dir: tmp.path().to_path_buf(),
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),

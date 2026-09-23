@@ -80,7 +80,10 @@ pub use embed::{
 pub use entropy_filter::{EntropyFilterConfig, FilterVerdict, SkipReason, classify};
 pub use experience::{EXPERIENCE_SYSTEM_PROMPT, ExperienceConfig, run_experience_review};
 pub use keep_tokens::mine_keep_tokens;
-pub use lint::{LintError, LintFinding, LintOptions, LintReport, run_lint, stale_days_for};
+pub use lint::{
+    DEFAULT_CONTRADICTION_SIM_HIGH, DEFAULT_CONTRADICTION_SIM_LOW, LintError, LintFinding,
+    LintOptions, LintReport, run_lint, stale_days_for,
+};
 pub use sweep::{
     ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
     MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,

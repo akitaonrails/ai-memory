@@ -107,7 +107,11 @@ compacted or merged stays in git and the supersession chain, recoverable with
   CLI); with embeddings configured it flags pairs of same-topic pages that look
   like they conflict, advisory only. Similarity reads shared vocabulary as much
   as disagreement, so a single-domain or single-language store yields mostly
-  candidate pairs: read each finding as a pair to check, not as a defect.
+  candidate pairs: read each finding as a pair to check, not as a defect. If
+  that noise is too high, raise `contradiction_band_min` (`config.toml` or
+  `AI_MEMORY_CONTRADICTION_BAND_MIN`, default `0.4`) — on such a store the
+  band measures domain proximity more than conflict, so a higher floor trims
+  same-domain-but-unrelated pairs.
 - **Let an LLM consolidate on idle ("dream"):** with a provider *and* an embedder
   configured, `[dream] enabled` turns on a background pass that rewrites clusters
   of cold notes into single coherent pages while you're idle and cancels the

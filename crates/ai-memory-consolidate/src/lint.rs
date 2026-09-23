@@ -147,11 +147,20 @@ pub struct LintOptions {
     /// The running embedder's `(provider, model, dim)` triple, or `None` when
     /// no embedder is configured. It drives the zero-LLM contradiction
     /// detector (A5): the detector loads already-stored vectors under this
-    /// triple and flags pages in the 0.4–0.75 cosine-similarity band. `None`
-    /// makes that pass a clean no-op. User-invoked lint paths supply it; the
+    /// triple and flags pages in the `[contradiction_band_min,
+    /// contradiction_band_max)` cosine-similarity band. `None` makes that
+    /// pass a clean no-op. User-invoked lint paths supply it; the
     /// automatic scheduled lint passes `None` — detection is on for the
     /// user-invoked operation, not the background sweep.
     pub embedding: Option<EmbeddingCoord>,
+    /// Lower edge (inclusive) of the A5 contradiction-similarity band. See
+    /// [`DEFAULT_CONTRADICTION_SIM_LOW`] for the historical default and why
+    /// an operator might raise it (same-domain / non-English corpora, where
+    /// the background similarity floor sits well above 0.4).
+    pub contradiction_band_min: f32,
+    /// Upper edge (exclusive) of the A5 contradiction-similarity band. See
+    /// [`DEFAULT_CONTRADICTION_SIM_HIGH`].
+    pub contradiction_band_max: f32,
 }
 
 impl Default for LintOptions {
@@ -161,6 +170,8 @@ impl Default for LintOptions {
             use_llm: true,
             decay_lambda: 0.02,
             embedding: None,
+            contradiction_band_min: DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: DEFAULT_CONTRADICTION_SIM_HIGH,
         }
     }
 }
@@ -191,6 +202,8 @@ pub async fn run_lint(
         use_llm,
         decay_lambda,
         embedding,
+        contradiction_band_min,
+        contradiction_band_max,
     } = options;
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
     let mut findings = rule_based_findings(&candidates, stale_days_for(decay_lambda));
@@ -284,11 +297,18 @@ pub async fn run_lint(
     }
 
     // Zero-LLM detected contradictions (A5): pages whose embeddings sit in the
-    // 0.4–0.75 cosine-similarity band are "same topic, not a near-duplicate" —
-    // the shape of a likely conflict. This DETECTS contradictions beside the
-    // declared-`contradicts`-edge finding above, using only stored vectors and
-    // cosine (invariant #13 — no provider call). It emits advisory findings
-    // (invariant #16) and never persists an edge.
+    // (configurable, default 0.4–0.75) cosine-similarity band are "same topic,
+    // not a near-duplicate" — the shape of a likely conflict. This DETECTS
+    // contradictions beside the declared-`contradicts`-edge finding above,
+    // using only stored vectors and cosine (invariant #13 — no provider
+    // call). It emits advisory findings (invariant #16) and never persists an
+    // edge.
+    //
+    // The band is a FIXED absolute cosine value, but background similarity is
+    // corpus-dependent: on a single-language or single-domain store, unrelated
+    // pages already sit well above the general-purpose 0.4 floor, so the
+    // default band measures domain proximity more than conflict and produces
+    // noisy findings. Raise `contradiction_band_min` for such a store.
     //
     // Why no persistence / no migration: a `contradicts` edge would live in the
     // `links` table, but `links` rows are BODY-DERIVED — `replace_links_in_tx`
@@ -302,6 +322,8 @@ pub async fn run_lint(
         project_id,
         &candidates,
         embedding.as_ref(),
+        contradiction_band_min,
+        contradiction_band_max,
     )
     .await
     {
@@ -453,14 +475,24 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
 
 // ── A5: zero-LLM contradiction detection (cosine-similarity band) ──────────
 
-/// Lower edge (inclusive) of the likely-contradiction cosine-similarity band.
-/// Below this two pages are simply unrelated (different topics).
-const CONTRADICTION_SIM_LOW: f32 = 0.4;
-/// Upper edge (exclusive) of the band. At or above this two pages are a
+/// Default lower edge (inclusive) of the likely-contradiction cosine-similarity
+/// band. Below this two pages are simply unrelated (different topics).
+///
+/// Configurable (`contradiction_band_min` / `AI_MEMORY_CONTRADICTION_BAND_MIN`)
+/// because this floor is a fixed absolute cosine value, but the *background*
+/// similarity of unrelated pages is corpus-dependent: a single-language or
+/// single-domain store sits well above general-purpose background similarity,
+/// so the fixed 0.4 floor admits many same-domain-but-unrelated pairs as
+/// "likely contradictions". Raising the floor trims that noise; the default
+/// preserves the historical fixed band exactly.
+pub const DEFAULT_CONTRADICTION_SIM_LOW: f32 = 0.4;
+/// Default upper edge (exclusive) of the band. At or above this two pages are a
 /// near-duplicate — A3 cold-cluster dedup's territory, not a contradiction.
 /// The band (mcp-memory-service's heuristic) is "same topic, not a duplicate":
 /// the shape of two pages that discuss the same thing while likely disagreeing.
-const CONTRADICTION_SIM_HIGH: f32 = 0.75;
+/// Configurable via `contradiction_band_max` /
+/// `AI_MEMORY_CONTRADICTION_BAND_MAX` — see [`DEFAULT_CONTRADICTION_SIM_LOW`].
+pub const DEFAULT_CONTRADICTION_SIM_HIGH: f32 = 0.75;
 /// Cap on cold pages fed to the pairwise scan. The scan is O(N²) cosine ops, so
 /// this bounds it hard on the already-bounded cold set (invariant #2 — one
 /// embeddings load, no per-page N+1).
@@ -469,10 +501,13 @@ const CONTRADICTION_MAX_PAGES: usize = 60;
 /// many pairs in the band cannot flood the advisory report.
 const CONTRADICTION_MAX_FINDINGS: usize = 25;
 
-/// Whether a cosine similarity falls in the likely-contradiction band.
+/// Whether a cosine similarity falls in the likely-contradiction band
+/// `[low, high)`. `low`/`high` are normally
+/// [`DEFAULT_CONTRADICTION_SIM_LOW`]/[`DEFAULT_CONTRADICTION_SIM_HIGH`],
+/// overridden by `contradiction_band_min`/`contradiction_band_max`.
 #[must_use]
-fn in_contradiction_band(similarity: f32) -> bool {
-    (CONTRADICTION_SIM_LOW..CONTRADICTION_SIM_HIGH).contains(&similarity)
+fn in_contradiction_band(similarity: f32, low: f32, high: f32) -> bool {
+    (low..high).contains(&similarity)
 }
 
 /// One page eligible for the band scan: its path, last-updated microseconds
@@ -485,7 +520,7 @@ struct BandCandidate {
 
 /// Pure pairwise band scan over a bounded, deterministically-ordered set of
 /// pages. Emits an advisory `contradiction` finding for each pair whose cosine
-/// similarity is in `[0.4, 0.75)`, capped at `max_findings`.
+/// similarity is in `[band_min, band_max)`, capped at `max_findings`.
 ///
 /// Timestamp resolution is ADVISORY only: the message says the newer page
 /// supersedes on a timestamp basis, but the lint never deletes or edits
@@ -493,13 +528,15 @@ struct BandCandidate {
 /// input always yields the same capped subset.
 fn detected_contradiction_findings(
     pages: &[BandCandidate],
+    band_min: f32,
+    band_max: f32,
     max_findings: usize,
 ) -> Vec<LintFinding> {
     let mut findings = Vec::new();
     'outer: for i in 0..pages.len() {
         for j in (i + 1)..pages.len() {
             let similarity = 1.0 - cosine_distance(&pages[i].vector, &pages[j].vector);
-            if !in_contradiction_band(similarity) {
+            if !in_contradiction_band(similarity, band_min, band_max) {
                 continue;
             }
             let (a, b) = (&pages[i], &pages[j]);
@@ -546,6 +583,8 @@ async fn detected_contradiction_pass(
     project_id: ProjectId,
     candidates: &[DecayCandidate],
     embedding: Option<&EmbeddingCoord>,
+    band_min: f32,
+    band_max: f32,
 ) -> Result<Vec<LintFinding>, LintError> {
     let Some(coord) = embedding else {
         return Ok(Vec::new());
@@ -606,6 +645,8 @@ async fn detected_contradiction_pass(
 
     Ok(detected_contradiction_findings(
         &pages,
+        band_min,
+        band_max,
         CONTRADICTION_MAX_FINDINGS,
     ))
 }
@@ -1111,18 +1152,54 @@ mod tests {
     /// unrelated pair (<0.4) are not.
     #[test]
     fn contradiction_band_predicate() {
-        assert!(in_contradiction_band(0.6), "0.6 is the band's centre");
-        assert!(in_contradiction_band(0.4), "0.4 is the inclusive low edge");
+        let (low, high) = (
+            DEFAULT_CONTRADICTION_SIM_LOW,
+            DEFAULT_CONTRADICTION_SIM_HIGH,
+        );
         assert!(
-            !in_contradiction_band(0.75),
+            in_contradiction_band(0.6, low, high),
+            "0.6 is the band's centre"
+        );
+        assert!(
+            in_contradiction_band(0.4, low, high),
+            "0.4 is the inclusive low edge"
+        );
+        assert!(
+            !in_contradiction_band(0.75, low, high),
             "0.75 is a near-duplicate (A3 dedup), not a contradiction"
         );
         assert!(
-            !in_contradiction_band(0.85),
+            !in_contradiction_band(0.85, low, high),
             "0.85 is a near-duplicate, not a contradiction"
         );
-        assert!(!in_contradiction_band(0.2), "0.2 is unrelated");
-        assert!(!in_contradiction_band(1.0), "identical is a duplicate");
+        assert!(!in_contradiction_band(0.2, low, high), "0.2 is unrelated");
+        assert!(
+            !in_contradiction_band(1.0, low, high),
+            "identical is a duplicate"
+        );
+    }
+
+    /// Raising the floor (e.g. for a single-domain corpus) suppresses a pair
+    /// that the default 0.4 floor would admit: a 0.7 pair sits inside the
+    /// default band but outside a raised 0.8 floor.
+    #[test]
+    fn contradiction_band_predicate_with_custom_bounds() {
+        assert!(
+            in_contradiction_band(
+                0.7,
+                DEFAULT_CONTRADICTION_SIM_LOW,
+                DEFAULT_CONTRADICTION_SIM_HIGH
+            ),
+            "0.7 is inside the default 0.4-0.75 band"
+        );
+        assert!(
+            !in_contradiction_band(0.7, 0.8, DEFAULT_CONTRADICTION_SIM_HIGH),
+            "0.7 is below a raised 0.8 floor"
+        );
+        assert!(
+            in_contradiction_band(0.82, 0.8, 0.9),
+            "0.82 is inside a custom 0.8-0.9 band"
+        );
     }
 
     // Unit-length 2-D vectors: cosine similarity between them equals the dot
@@ -1144,7 +1221,12 @@ mod tests {
             // dot([1,0],[0.6,0.8]) = 0.6 — squarely in the band.
             band("concepts/new-claim.md", 9_000, vec![0.6, 0.8]),
         ];
-        let findings = detected_contradiction_findings(&pages, CONTRADICTION_MAX_FINDINGS);
+        let findings = detected_contradiction_findings(
+            &pages,
+            DEFAULT_CONTRADICTION_SIM_LOW,
+            DEFAULT_CONTRADICTION_SIM_HIGH,
+            CONTRADICTION_MAX_FINDINGS,
+        );
         assert_eq!(
             findings.len(),
             1,
@@ -1173,10 +1255,50 @@ mod tests {
             // dot ≈ 0.98 — a near-duplicate, above the band.
             band("concepts/b.md", 2, vec![0.98, 0.199]),
         ];
-        let findings = detected_contradiction_findings(&pages, CONTRADICTION_MAX_FINDINGS);
+        let findings = detected_contradiction_findings(
+            &pages,
+            DEFAULT_CONTRADICTION_SIM_LOW,
+            DEFAULT_CONTRADICTION_SIM_HIGH,
+            CONTRADICTION_MAX_FINDINGS,
+        );
         assert!(
             findings.is_empty(),
             "near-duplicate must not be flagged as a contradiction: {findings:?}"
+        );
+    }
+
+    /// A pair at cosine 0.7 sits inside the default 0.4-0.75 band (flagged),
+    /// but a raised 0.8 floor — the fix for a same-domain / non-English store
+    /// where 0.7 is just background domain proximity, not a likely conflict —
+    /// drops it.
+    #[test]
+    fn band_scan_raised_floor_drops_a_same_domain_pair() {
+        // dot([1,0],[0.7,x]) = 0.7 where x = sqrt(1 - 0.7^2).
+        let x = (1.0_f32 - 0.7 * 0.7).sqrt();
+        let pages = vec![
+            band("concepts/a.md", 1, vec![1.0, 0.0]),
+            band("concepts/b.md", 2, vec![0.7, x]),
+        ];
+        let default_findings = detected_contradiction_findings(
+            &pages,
+            DEFAULT_CONTRADICTION_SIM_LOW,
+            DEFAULT_CONTRADICTION_SIM_HIGH,
+            CONTRADICTION_MAX_FINDINGS,
+        );
+        assert_eq!(
+            default_findings.len(),
+            1,
+            "the default 0.4 floor admits a 0.7 same-domain pair: {default_findings:?}"
+        );
+        let raised_findings = detected_contradiction_findings(
+            &pages,
+            0.8,
+            DEFAULT_CONTRADICTION_SIM_HIGH,
+            CONTRADICTION_MAX_FINDINGS,
+        );
+        assert!(
+            raised_findings.is_empty(),
+            "a raised 0.8 floor must drop the 0.7 same-domain pair: {raised_findings:?}"
         );
     }
 
@@ -1187,7 +1309,12 @@ mod tests {
             band("concepts/a.md", 1, vec![1.0, 0.0]),
             band("concepts/b.md", 2, vec![0.2, 0.9798]),
         ];
-        let findings = detected_contradiction_findings(&pages, CONTRADICTION_MAX_FINDINGS);
+        let findings = detected_contradiction_findings(
+            &pages,
+            DEFAULT_CONTRADICTION_SIM_LOW,
+            DEFAULT_CONTRADICTION_SIM_HIGH,
+            CONTRADICTION_MAX_FINDINGS,
+        );
         assert!(
             findings.is_empty(),
             "unrelated pair not flagged: {findings:?}"
@@ -1197,9 +1324,25 @@ mod tests {
     /// Empty and single-page inputs produce nothing (no pair to compare).
     #[test]
     fn band_scan_handles_empty_and_single() {
-        assert!(detected_contradiction_findings(&[], CONTRADICTION_MAX_FINDINGS).is_empty());
+        assert!(
+            detected_contradiction_findings(
+                &[],
+                DEFAULT_CONTRADICTION_SIM_LOW,
+                DEFAULT_CONTRADICTION_SIM_HIGH,
+                CONTRADICTION_MAX_FINDINGS
+            )
+            .is_empty()
+        );
         let one = vec![band("concepts/a.md", 1, vec![1.0, 0.0])];
-        assert!(detected_contradiction_findings(&one, CONTRADICTION_MAX_FINDINGS).is_empty());
+        assert!(
+            detected_contradiction_findings(
+                &one,
+                DEFAULT_CONTRADICTION_SIM_LOW,
+                DEFAULT_CONTRADICTION_SIM_HIGH,
+                CONTRADICTION_MAX_FINDINGS
+            )
+            .is_empty()
+        );
     }
 
     /// The findings cap is honoured: two in-band pairs, cap of 1 ⇒ one finding.
@@ -1217,12 +1360,24 @@ mod tests {
             band("concepts/c.md", 3, vec![c.cos() as f32, c.sin() as f32]),
         ];
         assert_eq!(
-            detected_contradiction_findings(&pages, CONTRADICTION_MAX_FINDINGS).len(),
+            detected_contradiction_findings(
+                &pages,
+                DEFAULT_CONTRADICTION_SIM_LOW,
+                DEFAULT_CONTRADICTION_SIM_HIGH,
+                CONTRADICTION_MAX_FINDINGS
+            )
+            .len(),
             2,
             "two adjacent pairs are in band"
         );
         assert_eq!(
-            detected_contradiction_findings(&pages, 1).len(),
+            detected_contradiction_findings(
+                &pages,
+                DEFAULT_CONTRADICTION_SIM_LOW,
+                DEFAULT_CONTRADICTION_SIM_HIGH,
+                1
+            )
+            .len(),
             1,
             "a cap of 1 truncates the two candidate pairs"
         );

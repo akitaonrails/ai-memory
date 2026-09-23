@@ -455,7 +455,7 @@ long-lived entry appearing there is that policy working rather than a fault.
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | Retention pass: evict cold pages through the wiki layer, purge aged tombstone ancestry, and hard-delete TTL-expired pages. `dry_run=true` for preview. |
-| `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM contradiction detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the 0.4–0.75 cosine-similarity band ("same topic, not a near-duplicate" — ≥0.75 is A3 dedup, <0.4 unrelated) get an advisory `contradiction` finding with newer-wins timestamp advice. Bounded (one embeddings load over the capped cold set, capped findings, deterministic); a clean no-op with no embedder configured; advisory-only — never deletes/edits/supersedes a page and persists no edge (invariants #13, #16, #2), so no migration. |
+| `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM contradiction detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the `contradiction_band_min`–`contradiction_band_max` cosine-similarity band (default 0.4–0.75; "same topic, not a near-duplicate" — at/above the max is A3 dedup, below the min unrelated) get an advisory `contradiction` finding with newer-wins timestamp advice. Bounded (one embeddings load over the capped cold set, capped findings, deterministic); a clean no-op with no embedder configured; advisory-only — never deletes/edits/supersedes a page and persists no edge (invariants #13, #16, #2), so no migration. On a single-language or single-domain store, background similarity between unrelated pages already sits well above the default floor, so the band measures domain proximity more than conflict and produces noisy findings — raise `contradiction_band_min` (`config.toml` or `AI_MEMORY_CONTRADICTION_BAND_MIN`) for such a store. |
 | `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
 
 `memory_briefing`, `memory_explore`, `memory_write_page`,
@@ -612,6 +612,16 @@ tcp_keepalive_secs = 60            # idle time before TCP keepalive probes an ac
                                    # (laptop sleep, VPN flap) that would otherwise leak fds
                                    # until EMFILE (#792). 0 disables keepalive. Env:
                                    # AI_MEMORY_TCP_KEEPALIVE_SECS
+contradiction_band_min = 0.4       # `memory_lint`'s A5 zero-LLM contradiction band
+contradiction_band_max = 0.75      # (lower/upper cosine-similarity edge). The band is a
+                                   # fixed absolute cosine value, but a single-language or
+                                   # single-domain store's background similarity sits well
+                                   # above the general-purpose default, so the default band
+                                   # ends up measuring domain proximity rather than conflict
+                                   # and produces noisy findings — raise `contradiction_band_min`
+                                   # for such a store. Must satisfy 0.0 <= min < max <= 1.0.
+                                   # Env: AI_MEMORY_CONTRADICTION_BAND_MIN /
+                                   # AI_MEMORY_CONTRADICTION_BAND_MAX
 
 # Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
 # override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
@@ -872,6 +882,12 @@ AI_MEMORY_EMBEDDING_MODEL      e.g. text-embedding-3-small, gemini-embedding-001
 AI_MEMORY_EMBEDDING_BASE_URL   optional override; required for openai-compat
 AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI, Copilot), 1024 (Voyage), 768 (Google);
                                required explicitly for openai-compat
+AI_MEMORY_EMBEDDING_QUERY_PREFIX     optional; prepended to query text before
+                                     embedding (openai / openai-compat only)
+AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX  optional; prepended to document text
+                                     before embedding (openai / openai-compat
+                                     only); e.g. "query: " / "passage: " for
+                                     Nemotron-3-Embed / base E5
 OPENAI_API_KEY / VOYAGE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
 LLM_API_KEY                    accepted for openai with a custom base URL and as
                                optional bearer auth for openai-compat

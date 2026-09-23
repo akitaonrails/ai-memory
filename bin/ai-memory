@@ -612,6 +612,18 @@ do
   fi
 done
 
+# These two are presence-based, not non-empty-based like the loop above: an
+# operator sets one to the empty string to deliberately clear a
+# config.toml-configured prefix without editing the file (see
+# Config::load's figment overlay), and a present-but-empty value must reach
+# the container for that to work — `[ -n ]` above would drop it, making the
+# wrapper indistinguishable from the var never having been set at all.
+for var in AI_MEMORY_EMBEDDING_QUERY_PREFIX AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX; do
+  if [ -n "${!var+x}" ]; then
+    ENV_ARGS+=(-e "${var}")
+  fi
+done
+
 # The wrapper itself runs the CLI inside a short-lived helper container, while
 # the README server runs in the long-lived ai-memory container and publishes
 # 127.0.0.1:49374 on the host. Inside a normal bridge-network helper,

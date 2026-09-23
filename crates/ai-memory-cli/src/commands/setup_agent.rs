@@ -9,14 +9,16 @@
 //!
 //! `setup-agent` bundles the extract + render into one command:
 //!
-//!     docker run --rm \
-//!       -v "$HOME/.ai-memory:/host" \
-//!       akitaonrails/ai-memory:latest \
-//!       setup-agent \
-//!         --agent claude-code \
-//!         --to /host/hooks \
-//!         --host-prefix "$HOME/.ai-memory/hooks" \
-//!         --auth-token "$TOKEN"
+//! ```text
+//! docker run --rm \
+//!   -v "$HOME/.ai-memory:/host" \
+//!   akitaonrails/ai-memory:latest \
+//!   setup-agent \
+//!     --agent claude-code \
+//!     --to /host/hooks \
+//!     --host-prefix "$HOME/.ai-memory/hooks" \
+//!     --auth-token "$TOKEN"
+//! ```
 //!
 //! 1. Copies `/usr/local/share/ai-memory/hooks/claude-code/*.{sh,ps1}` into
 //!    `/host/hooks/claude-code/` (which on the host is

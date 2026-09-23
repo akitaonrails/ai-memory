@@ -460,6 +460,13 @@ pub struct AiMemoryServer {
     /// A2 opt-in: compact cold episodic pages (tier-down) instead of evicting
     /// them. Default `false`, so the sweep evicts exactly as before.
     compact_cold_episodic: bool,
+    /// Lower edge of `memory_lint`'s A5 zero-LLM contradiction-similarity
+    /// band, from `config.contradiction_band_min`. Defaults to
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW`].
+    contradiction_band_min: f32,
+    /// Upper edge of the A5 band — see `contradiction_band_min`. Defaults to
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH`].
+    contradiction_band_max: f32,
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
@@ -1640,6 +1647,8 @@ impl AiMemoryServer {
             decay_breadth_weight: 0.0,
             observation_retention: ObservationRetention::default(),
             compact_cold_episodic: false,
+            contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
@@ -2007,7 +2016,10 @@ impl AiMemoryServer {
         let Some(embedder) = &self.embedder else {
             return None;
         };
-        match embedder.embed(query).await {
+        // `embed_query`, not `embed`: an asymmetric embedder (configured
+        // query/document prefixes, or Google's RETRIEVAL_QUERY task type)
+        // must see this text on the query side, not the document side.
+        match embedder.embed_query(query).await {
             Ok(qv) => Some(qv),
             Err(e) => {
                 tracing::warn!(
@@ -2035,7 +2047,11 @@ impl AiMemoryServer {
         // eligible; with no query vector the vector stream never runs,
         // so the empty triple is inert rather than a fake identity.
         let (provider, model, dim) = match (&self.embedder, options.query_vec) {
-            (Some(e), Some(_)) => (e.provider().to_string(), e.model().to_string(), e.dim()),
+            // Not `.model()`: eligible stored vectors are keyed by the
+            // DOCUMENT identity they were embedded under, which a
+            // configured document prefix folds in. See
+            // `Embedder::model_identity`.
+            (Some(e), Some(_)) => (e.provider().to_string(), e.model_identity(), e.dim()),
             _ => (String::new(), String::new(), 0),
         };
         let fused: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = if options.explain {
@@ -2262,6 +2278,18 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_compact_cold_episodic(mut self, compact: bool) -> Self {
         self.compact_cold_episodic = compact;
+        self
+    }
+
+    /// Override the A5 zero-LLM contradiction-similarity band (typically
+    /// populated from `config.contradiction_band_min`/`_max`). Unset, it
+    /// defaults to the historical fixed band (see
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW`] /
+    /// [`ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH`]).
+    #[must_use]
+    pub fn with_contradiction_band(mut self, min: f32, max: f32) -> Self {
+        self.contradiction_band_min = min;
+        self.contradiction_band_max = max;
         self
     }
 
@@ -3124,9 +3152,11 @@ impl AiMemoryServer {
                     .as_ref()
                     .map(|e| ai_memory_consolidate::EmbeddingCoord {
                         provider: e.provider().to_string(),
-                        model: e.model().to_string(),
+                        model: e.model_identity(),
                         dim: e.dim(),
                     }),
+                contradiction_band_min: self.contradiction_band_min,
+                contradiction_band_max: self.contradiction_band_max,
             },
         )
         .await
@@ -5798,6 +5828,71 @@ mod tests {
 
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
         (tmp, store, server, ws, proj)
+    }
+
+    /// A test-only embedder whose three `Embedder` methods each return a
+    /// different, identifiable vector — mirroring `ai-memory-llm`'s own
+    /// `health::tests::TaskAwareEmbedder` fixture (same idea, duplicated
+    /// here because that one is private to its crate). `embed` deliberately
+    /// returns the SAME vector as `embed_document`: that is what the
+    /// pre-fix bug actually called (`AiMemoryServer::embed_query` invoked
+    /// the generic `Embedder::embed` instead of `Embedder::embed_query`),
+    /// so a regression back to that bug is what this fixture would surface.
+    struct TaskAwareEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for TaskAwareEmbedder {
+        fn provider(&self) -> &'static str {
+            "task-aware-test"
+        }
+
+        fn model(&self) -> &str {
+            "task-aware-test-model"
+        }
+
+        fn dim(&self) -> u32 {
+            2
+        }
+
+        async fn embed(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_document(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_query(&self, _text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+            Ok(vec![0.0, 1.0])
+        }
+    }
+
+    /// Regression test for the bug fixed alongside the embedding
+    /// query/document prefix feature: `AiMemoryServer::embed_query` (the
+    /// helper `memory_query` calls to vectorize the search query) called
+    /// `Embedder::embed` instead of `Embedder::embed_query`. For any
+    /// query/document-asymmetric embedder — Google's task-typed
+    /// `embedContent`, or the new `openai`/`openai-compat` query/document
+    /// prefixes — that silently embedded the search query as if it were a
+    /// document, corrupting vector-stream retrieval. `TaskAwareEmbedder`
+    /// makes the two paths return distinguishable vectors so the right one
+    /// being called is a direct, exact-equality assertion rather than an
+    /// inference from downstream ranking.
+    #[tokio::test]
+    async fn memory_query_embeds_the_query_with_embed_query_not_embed() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let server = server.with_embedder(Arc::new(TaskAwareEmbedder));
+
+        let query_vec = server.embed_query("anything").await;
+
+        assert_eq!(
+            query_vec.as_deref(),
+            Some([0.0_f32, 1.0].as_slice()),
+            "memory_query's embed_query helper must call Embedder::embed_query \
+             (query-side vector [0.0, 1.0]), not the generic Embedder::embed \
+             (which this fixture deliberately aliases to the document-side \
+             vector [1.0, 0.0] to make a regression to the old bug fail loudly)"
+        );
     }
 
     fn installed_ai_memory_prompt_surface() -> String {

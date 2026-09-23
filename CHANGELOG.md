@@ -19,6 +19,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base for mirrors and hermetic tests (loaded via `Config`, not ad-hoc env).
   Downloads refuse bodies over 128 MiB (Content-Length and streamed cap).
   (#801)
+- `ai-memory run` accepts a repeatable `--env KEY=VALUE` and an `--env-file
+  <path>` (blank lines and `#` comments skipped) to pass extra environment
+  into the spawned harness — e.g. a per-account `CLAUDE_CONFIG_DIR` for
+  callers who previously had to wrap the launch in `env KEY=VAL harness`.
+  Both flags are wrapper-owned like `--yolo`/`--executable` and must precede
+  the harness name; a `--env` entry overrides a same-key `--env-file` line.
+  The resolved environment reaches both the spawned process and ai-memory's
+  own native-session resolution, so the two agree on where a
+  `CLAUDE_CONFIG_DIR`-style override points the session store. See
+  `docs/managed-workstreams.md`. (#820)
+- `contradiction_band_min` / `contradiction_band_max` config keys (env:
+  `AI_MEMORY_CONTRADICTION_BAND_MIN` / `AI_MEMORY_CONTRADICTION_BAND_MAX`)
+  make `memory_lint`'s A5 zero-LLM contradiction-detection cosine-similarity
+  band configurable, defaulting to the historical fixed `0.4`–`0.75`. The
+  band is a fixed absolute cosine value, but background similarity is
+  corpus-dependent: on a single-language or single-domain store, unrelated
+  pages already sit above the general-purpose floor, so the default band
+  measures domain proximity more than conflict and produces noisy findings.
+  Raising `contradiction_band_min` trims that noise. Rejected at config load
+  unless `0.0 <= contradiction_band_min < contradiction_band_max <= 1.0` and
+  both are finite. (#853)
+- Fedora users can install prebuilt x86_64 and aarch64 RPMs from GitHub
+  Releases, with the existing native systemd service assets. (#858)
+- `embedding_query_prefix` / `embedding_document_prefix` config keys (env:
+  `AI_MEMORY_EMBEDDING_QUERY_PREFIX` / `AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX`)
+  for the `openai` and `openai-compat` embedders: an optional string
+  prepended to query / document text before the existing truncation, so
+  truncation still bounds the whole input. Asymmetric embedding models need
+  a query-side instruction their publisher specifies; the OpenAI-compatible
+  `/v1/embeddings` wire format has no field for it.
+  `nvidia/Nemotron-3-Embed-1B-BF16` and base E5 models use a simple
+  `"query: "` / `"passage: "` pair; instruction-tuned E5 variants and
+  Qwen3-Embedding instead need a task-instruction string on the query side
+  only (documents stay plain). Empty by default — no behaviour change when
+  unset, and not trimmed (nor is a present-but-empty env-var override, which
+  now clears a `config.toml` value), so a publisher's trailing space is
+  preserved. A non-empty `embedding_document_prefix` is folded into the
+  stored embedding identity (`Embedder::model_identity`), so a document
+  prefix change makes retrieval, backfill, and cleanup treat existing pages
+  as stale and re-embed them automatically — an empty prefix keeps the
+  pre-existing identity, so upgrading installs need no migration, and a
+  query-only prefix change never needs a rebuild. See
+  `docs/llm-providers.md`. (#859)
 - `auto_improve.patchable_page_prefixes` makes the folders whose page bodies the
   reviewer reads configurable, defaulting to the historical `_rules/` and
   `procedures/`. Only those two folders' contents were ever sent; every other
@@ -78,6 +121,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Native `ai-memory upgrade` container refusal now uses the shared
   `running_in_container` helper (`AI_MEMORY_IN_CONTAINER`, `/.dockerenv`,
   `/run/.containerenv` / Podman), matching staged-hooks detection. (#802)
+- `memory_query`'s vector stream called the generic `Embedder::embed`
+  instead of `embed_query` on the configured embedder, so a
+  query/document-asymmetric embedder (Google's task-typed embeddings, or
+  the new query/document prefixes above) embedded the search query on the
+  document side instead of the query side. (#859)
 - Auto-improve review no longer stages a proposal whose LLM-produced page
   path contains a Windows-illegal character (e.g. a `:` copied from a
   conventional-commit subject). That path passed the deliberately tolerant

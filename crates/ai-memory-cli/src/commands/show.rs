@@ -227,6 +227,8 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             yolo: args.yolo,
             fresh: args.fresh,
             no_autowire: false,
+            env: Vec::new(),
+            env_file: None,
             harness: Some(harness),
             native_args: args.native_args,
         },

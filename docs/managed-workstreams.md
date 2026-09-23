@@ -84,7 +84,7 @@ file, and the current checkout remain authoritative.
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
-              [--yolo] [--fresh]
+              [--yolo] [--fresh] [--env KEY=VALUE]... [--env-file PATH]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
@@ -407,6 +407,17 @@ the two disagree and the native transcript import fails. When you use per-accoun
 config directories, set the variable before invoking `ai-memory run` (or in the
 same wrapper that also runs it), so hook installation and native-session
 resolution agree.
+
+A repeatable `ai-memory run --env KEY=VALUE <harness>` (and `--env-file
+<path>`, one `KEY=VALUE` per line, blank lines and `#` comments skipped) is
+the first-class alternative to the `env KEY=VAL harness` wrapper-alias
+pattern above: it is a wrapper-owned flag, so it must precede the harness
+name, and the resolved environment reaches both the spawned harness process
+*and* `ai-memory run`'s own native-session resolution — the same
+`CLAUDE_CONFIG_DIR`-agreement requirement described above, satisfied without
+having to export the variable into the invoking shell first. A later `--env`
+overrides a same-key `--env-file` entry; neither expands nor interprets the
+value.
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never

@@ -194,6 +194,18 @@ yay -S ai-memory-bin    # prebuilt Linux x86_64/aarch64 binary
 yay -S ai-memory        # builds from source
 ```
 
+### Fedora (RPM)
+
+Download the `x86_64` or `aarch64` RPM from the
+[latest release](https://github.com/akitaonrails/ai-memory/releases/latest),
+then install it:
+
+```bash
+sudo dnf install ./ai-memory-*.rpm
+```
+
+Then follow the native Linux service instructions in [`docs/install.md`](docs/install.md).
+
 Single-user workstation:
 
 ```bash
