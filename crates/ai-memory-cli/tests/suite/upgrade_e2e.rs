@@ -61,12 +61,7 @@ mod slow {
         {
             let mut builder = tar::Builder::new(&mut tar_bytes);
             append_regular(&mut builder, "ai-memory", NEW_BINARY, 0o755);
-            append_regular(
-                &mut builder,
-                "hooks/claude-code/new.sh",
-                NEW_HOOK,
-                0o755,
-            );
+            append_regular(&mut builder, "hooks/claude-code/new.sh", NEW_HOOK, 0o755);
             builder.finish().expect("finish tar");
         }
         let mut gz_bytes = Vec::new();

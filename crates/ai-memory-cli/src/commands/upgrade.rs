@@ -537,7 +537,8 @@ fn commit_dir_swap(tmp: &Path, dest: &Path, backup: &Path) -> Result<()> {
         if backup.exists() {
             let _ = fs::rename(backup, dest);
         }
-        return Err(err).with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()));
+        return Err(err)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()));
     }
     let _ = remove_dir_if_exists(backup);
     Ok(())
@@ -740,7 +741,11 @@ impl ReqwestFetcher {
     }
 }
 
-fn refuse_oversized_content_length(url: &str, content_len: Option<u64>, max_bytes: usize) -> Result<()> {
+fn refuse_oversized_content_length(
+    url: &str,
+    content_len: Option<u64>,
+    max_bytes: usize,
+) -> Result<()> {
     if let Some(len) = content_len
         && content_length_exceeds_limit(len, max_bytes)
     {
@@ -818,21 +823,9 @@ mod tests {
     fn release_asset_name_for_covers_unix_matrix_and_refusals() {
         // Table-driven so Linux CI still guards macos-* and windows → None.
         let cases: &[(&str, &str, Option<&str>)] = &[
-            (
-                "linux",
-                "x86_64",
-                Some("ai-memory-linux-x86_64.tar.gz"),
-            ),
-            (
-                "linux",
-                "aarch64",
-                Some("ai-memory-linux-aarch64.tar.gz"),
-            ),
-            (
-                "macos",
-                "aarch64",
-                Some("ai-memory-macos-aarch64.tar.gz"),
-            ),
+            ("linux", "x86_64", Some("ai-memory-linux-x86_64.tar.gz")),
+            ("linux", "aarch64", Some("ai-memory-linux-aarch64.tar.gz")),
+            ("macos", "aarch64", Some("ai-memory-macos-aarch64.tar.gz")),
             ("macos", "x86_64", Some("ai-memory-macos-x86_64.tar.gz")),
             ("windows", "x86_64", None),
             ("windows", "aarch64", None),
@@ -914,8 +907,7 @@ mod tests {
 
     #[test]
     fn linuxbrew_is_package_managed() {
-        let exe =
-            Path::new("/home/linuxbrew/.linuxbrew/Cellar/ai-memory/2.4.0/bin/ai-memory");
+        let exe = Path::new("/home/linuxbrew/.linuxbrew/Cellar/ai-memory/2.4.0/bin/ai-memory");
         assert!(package_managed_refusal(exe).is_some());
     }
 
@@ -1060,9 +1052,7 @@ mod tests {
     #[test]
     fn release_base_url_prefers_config_override() {
         let mut config = Config::default();
-        assert!(
-            release_base_url(&config).contains("github.com/akitaonrails/ai-memory/releases")
-        );
+        assert!(release_base_url(&config).contains("github.com/akitaonrails/ai-memory/releases"));
         config.release_base_url = Some(" http://127.0.0.1:9/releases ".into());
         assert_eq!(release_base_url(&config), "http://127.0.0.1:9/releases");
     }
@@ -1195,9 +1185,11 @@ mod tests {
         let names: Vec<_> = agents.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["claude-code", "cursor"]);
         assert_eq!(unknown, ["not-an-agent"]);
-        assert!(agents.iter().all(|(_, a)| {
-            matches!(a, AgentChoice::ClaudeCode | AgentChoice::Cursor)
-        }));
+        assert!(
+            agents
+                .iter()
+                .all(|(_, a)| { matches!(a, AgentChoice::ClaudeCode | AgentChoice::Cursor) })
+        );
         Ok(())
     }
 
