@@ -6,7 +6,7 @@
 //! that produced them were all lost. It fires with a single operator, through
 //! the path the prompt itself recommends.
 
-use ai_memory_core::{ActorContext, IdentityKey, PagePath, ProjectId, WorkspaceId};
+use ai_memory_core::{ActorContext, IdentityKey, NewPage, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_store::{
     AutoImproveProposalOperation, NewAutoImproveProposal, StageAutoImproveRun, Store,
 };
@@ -26,6 +26,35 @@ fn proposal(path: &str, title: &str) -> NewAutoImproveProposal {
         patch_json: None,
         expected_base_body_sha256: None,
     }
+}
+
+fn update_proposal(path: &str, title: &str) -> NewAutoImproveProposal {
+    NewAutoImproveProposal {
+        operation: AutoImproveProposalOperation::Update,
+        ..proposal(path, title)
+    }
+}
+
+async fn seed_page(store: &Store, ws: WorkspaceId, proj: ProjectId, path: &str) {
+    store
+        .writer
+        .upsert_page(NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: path.to_string(),
+            body: format!("# {path}\n\nexisting body"),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
 }
 
 fn run(
@@ -377,4 +406,111 @@ async fn an_unrelated_unique_failure_is_not_reported_as_a_pending_collision() {
         error.to_string().contains("UNIQUE constraint failed"),
         "the real constraint must reach the caller: {error}"
     );
+}
+
+/// A create/update misclassification is ordinary LLM error, not corrupt state.
+///
+/// A `Create` proposal whose target already exists (or an `Update` whose target
+/// is missing) used to `return Err` inside the staging transaction, discarding
+/// the whole run — every sibling proposal and the run row — over one probabilistic
+/// mislabel. Skip just the misclassified proposal, keep the rest, and report it,
+/// exactly like a pending-target collision. Never coerce Create->Update: the
+/// existing page can be pinned, and auto-applying would rewrite it.
+#[tokio::test]
+async fn a_create_on_an_existing_page_is_skipped_not_fatal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    // A real, published page — not a pending proposal — at the collided path.
+    seed_page(&store, ws, proj, "_rules/existing.md").await;
+
+    let report = store
+        .writer
+        .stage_auto_improve_run_for_owner(
+            run(
+                ws,
+                proj,
+                vec![
+                    proposal("_rules/existing.md", "Collides with a live page"),
+                    proposal("_rules/fresh.md", "Perfectly fine"),
+                ],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.proposal_ids.len(),
+        1,
+        "the non-colliding proposal must still be staged (a run row exists)"
+    );
+    assert_eq!(
+        report.skipped.len(),
+        1,
+        "the misclassified create is reported"
+    );
+    assert_eq!(report.skipped[0].target_path, "_rules/existing.md");
+    assert_eq!(
+        report.skipped[0].reason,
+        "create proposal target already exists"
+    );
+
+    let staged = store
+        .reader
+        .list_auto_improve_proposals(ws, proj, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(staged.len(), 1, "only the fresh proposal is persisted");
+    assert_eq!(staged[0].target_path.as_str(), "_rules/fresh.md");
+}
+
+/// The symmetric misclassification: an `Update` aimed at a page that does not
+/// exist must skip that proposal and keep the run and its siblings.
+#[tokio::test]
+async fn an_update_on_a_missing_page_is_skipped_not_fatal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let report = store
+        .writer
+        .stage_auto_improve_run_for_owner(
+            run(
+                ws,
+                proj,
+                vec![
+                    update_proposal("_rules/nonexistent.md", "Update of nothing"),
+                    proposal("_rules/fresh.md", "Perfectly fine"),
+                ],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.proposal_ids.len(),
+        1,
+        "the non-colliding proposal must still be staged (a run row exists)"
+    );
+    assert_eq!(
+        report.skipped.len(),
+        1,
+        "the misclassified update is reported"
+    );
+    assert_eq!(report.skipped[0].target_path, "_rules/nonexistent.md");
+    assert_eq!(
+        report.skipped[0].reason,
+        "update proposal target does not exist"
+    );
+
+    let staged = store
+        .reader
+        .list_auto_improve_proposals(ws, proj, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(staged.len(), 1, "only the fresh proposal is persisted");
+    assert_eq!(staged[0].target_path.as_str(), "_rules/fresh.md");
 }

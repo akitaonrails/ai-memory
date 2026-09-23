@@ -358,3 +358,94 @@ async fn an_owned_handoff_stays_with_its_owner_while_pages_stay_shared() {
         operator("alice")
     );
 }
+
+/// Grok reuses one session id across a SessionEnd→restart, so
+/// `accept_handoff` must reopen an already-ended receiver session instead of
+/// rejecting it (#840) — but only *after* the exactly-once claim guard, so the
+/// resurrection can never become a way to steal an already-taken baton.
+#[tokio::test]
+async fn accept_reopens_an_ended_receiver_session_but_keeps_claim_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let id = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_agent: AgentKind::Grok,
+            to_agent: None,
+            from_session_id: None,
+            summary: "resume after restart".into(),
+            next_steps: Vec::new(),
+            open_questions: Vec::new(),
+            files_touched: Vec::new(),
+            cwd: None,
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let accept = |session: SessionId| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::Grok,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    // The same Grok session id: opened, then ended (SessionEnd), then reused
+    // when the conversation restarts and calls its first tool.
+    let grok = open_session(&store, ws, proj, AgentKind::Grok).await;
+    store.writer.end_session(grok, None).await.unwrap();
+
+    let claimed = store.writer.accept_handoff(accept(grok)).await.unwrap();
+    assert!(
+        claimed,
+        "an ended session that reuses its id must be able to accept the handoff"
+    );
+
+    // The receiver row was reopened (ended_at cleared), not left a corpse.
+    let grok_bytes = grok.as_bytes().to_vec();
+    let ended_at: Option<i64> = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                rusqlite::params![grok_bytes],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(
+        ended_at.is_none(),
+        "accepting a handoff must reopen the ended receiver session"
+    );
+
+    // Claim-once still holds: a *different* session cannot steal the baton the
+    // reopened session already took, even though the loser is wide open.
+    let loser = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let stolen = store
+        .writer
+        .accept_handoff(HandoffAcceptance {
+            handoff_id: id,
+            workspace_id: ws,
+            project_id: proj,
+            accepting_agent: AgentKind::Codex,
+            accepting_session: Some(loser),
+            accepting_user: None,
+            owner_filter: OwnerFilter::Any,
+            receiving_cwd: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !stolen,
+        "the resurrection path must not let a second session steal an accepted baton"
+    );
+}

@@ -87,7 +87,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- crates/ai-memory-web/static/tailwind.css
 
-  # Native Windows coverage lives in `.github/workflows/windows.yml`: it
+  # Native Windows *test* coverage lives in `.github/workflows/windows.yml`: it
   # runs nightly, on demand, and on any pull request carrying the `windows`
   # label. It was ~1000s here against ~250s for the
   # same tests on Linux, which meant every pull request waited roughly
@@ -95,6 +95,43 @@ jobs:
   # and it was `continue-on-error`, so those extra minutes gated nothing.
   # Add the `windows` label to a pull request that touches path handling,
   # file locking, or git plumbing.
+  #
+  # `windows-cross` below is the cheap per-merge complement: it cross-*builds*
+  # the Windows target from Linux, so a `#[cfg(windows)]` compile or link break
+  # is caught in this ~8-minute gate instead of at release time. It does NOT run
+  # tests — cross-compiling proves the code builds and links for Windows, not
+  # that it behaves correctly there. Wine is deliberately not used to fake a
+  # runtime: it cannot faithfully reproduce native PowerShell, NTFS
+  # case-folding, Win32 file-locking/sharing-violation semantics, or verbatim
+  # (`\\?\`) path handling — exactly the surface windows.yml (and the local
+  # dockur VM loop, see docs/design-windows-ci.md) exist to validate.
+  windows-cross:
+    name: windows cross-build (msvc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pin to 1.95 to match rust-toolchain.toml: that file overrides the
+      # active toolchain inside the repo, so the MSVC target's std must be added
+      # to 1.95 (not `stable`) or the cross-build fails with "can't find crate
+      # for `core`".
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.95
+        with:
+          toolchain: "1.95"
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: windows-cross
+      # cargo-xwin drives clang-cl / lld-link against an auto-downloaded MSVC
+      # CRT + Windows SDK, so bundled SQLite and vendored libgit2 (both C) build
+      # for the target without a Windows host.
+      - name: Install clang/lld toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang llvm lld
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin --locked
+      # --all-targets so the `#[cfg(windows)]` test binaries compile too — that
+      # is the class of break (a test that only compiles on Windows) this gate
+      # is here to catch before it reaches windows.yml or a release.
+      - run: cargo xwin build --workspace --all-targets --target x86_64-pc-windows-msvc
 
   # Companions have their own workspaces and need separate checks.
   companions:

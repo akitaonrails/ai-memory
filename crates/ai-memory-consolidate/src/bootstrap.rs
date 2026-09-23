@@ -44,6 +44,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::path_sanitize::slugify_page_path;
+
 /// Rough characters-per-token estimate used for budget enforcement.
 /// 4 is the standard heuristic for English prose (cl100k, gpt-4
 /// tokenizer family). Don't rely on it for billing math — it's
@@ -559,14 +561,27 @@ impl Bootstrap {
         let mut requests = Vec::with_capacity(merged_pages.len() + 1);
         let mut written_paths = Vec::with_capacity(merged_pages.len() + 1);
         for page in &merged_pages {
-            let path = match PagePath::new(&page.path) {
+            // Sanitize before validating: a model-produced path with a
+            // Windows-illegal character (e.g. `:`) is otherwise valid per
+            // `PagePath::new`, so it would enter the batch and only fail
+            // later at `ensure_portable` inside `apply_batch` — which is
+            // atomic and would then lose every other page in the run (#847).
+            let cleaned = slugify_page_path(&page.path);
+            let path = match PagePath::new(&cleaned) {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(path = %page.path, error = %e, "skipping bootstrap page with invalid path");
                     continue;
                 }
             };
-            written_paths.push(page.path.clone());
+            // Final guard for whatever slugify can't fix (dot-segments,
+            // reserved DOS device names, `.git`, ...); skip rather than
+            // abort the whole batch.
+            if let Err(e) = path.ensure_portable() {
+                warn!(path = %page.path, error = %e, "skipping bootstrap page with invalid path");
+                continue;
+            }
+            written_paths.push(path.as_str().to_string());
             requests.push(WritePageRequest {
                 workspace_id: cfg.workspace_id,
                 project_id: cfg.project_id,
@@ -2310,5 +2325,81 @@ mod tests {
                 .contains(&"concepts/stale.md".to_string()),
             "the stale chunk-2 page across the gap must not be adopted"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Windows-illegal path sanitization (#847)
+    // ----------------------------------------------------------------
+
+    // `slugify_page_path` itself is unit-tested alongside its definition in
+    // `crate::path_sanitize`; this remaining test exercises the bootstrap
+    // write loop's use of it end to end.
+
+    /// A batch with one page whose path contains a Windows-illegal `:`
+    /// (copied verbatim from a conventional-commit subject, e.g.
+    /// `build(sandbox): orchestrate`) must not abort the whole run: the bad
+    /// path is sanitized in place, and the sibling valid page in the same
+    /// batch survives. Before the fix, the bad path passed `PagePath::new`
+    /// (deliberately tolerant) and only failed later at `ensure_portable`
+    /// inside `Wiki::apply_batch`, which is atomic — one bad page there
+    /// lost every page in the batch, surfacing as a 500 from `bootstrap`.
+    #[tokio::test]
+    async fn bad_windows_path_is_sanitized_not_aborted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sources = vec![BootstrapSource {
+            kind: SourceKind::Readme,
+            label: "readme".into(),
+            text: "hello".into(),
+        }];
+
+        let response = serde_json::json!({
+            "pages": [
+                {
+                    "path": "concepts/build(sandbox): orchestrate the run.md",
+                    "title": "bad",
+                    "body_markdown": "body for bad",
+                    "tags": [],
+                },
+                {
+                    "path": "concepts/good.md",
+                    "title": "good",
+                    "body_markdown": "body for good",
+                    "tags": [],
+                },
+            ],
+            "rationale": "one bad path, one good",
+        });
+        let llm = Arc::new(SequencedLlm {
+            calls: AtomicUsize::new(0),
+            responses: vec![response],
+            fail_at: None,
+        });
+        let (_store, bootstrap, ws, proj) = bootstrap_fixture(tmp.path(), llm.clone()).await;
+
+        let cfg = resume_test_config(ws, proj, false);
+        let outcome = bootstrap
+            .process_sources(&cfg, sources)
+            .await
+            .expect("a sanitizable bad path must not fail (or abort) the whole run");
+
+        assert!(
+            outcome
+                .pages_written
+                .contains(&"concepts/good.md".to_string()),
+            "the sibling valid page in the same batch must survive"
+        );
+
+        let sanitized = outcome
+            .pages_written
+            .iter()
+            .find(|p| p.starts_with("concepts/build"))
+            .expect("the bad page must still be written, under a sanitized path");
+        assert!(
+            !sanitized.contains(':'),
+            "the written path must not contain the illegal ':'"
+        );
+        let path = PagePath::new(sanitized.as_str()).unwrap();
+        path.ensure_portable()
+            .expect("the sanitized path must pass the portability guard");
     }
 }

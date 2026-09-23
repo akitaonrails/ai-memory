@@ -9,7 +9,7 @@ use std::time::Duration;
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
     ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
-    run_lint, run_sweep_with_options,
+    run_lint,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -26,7 +26,10 @@ use ai_memory_mcp::{
 use ai_memory_store::{
     ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
 };
-use ai_memory_web::{WebMountSpec, normalize_prefix, split_web_routers, web_base_href};
+use ai_memory_web::{
+    HtmlAuthRedirectConfig, WebMountSpec, html_auth_redirect_mw, normalize_prefix,
+    split_web_routers, web_base_href,
+};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -846,6 +849,59 @@ async fn run_session_consolidation_worker(
     }
 }
 
+/// Wraps [`tokio::net::TcpListener`] to enable TCP keepalive on every
+/// accepted connection.
+///
+/// Without this, a hook client whose peer dies without sending FIN (laptop
+/// sleep, a VPN/Tailscale flap, an abrupt kill) leaves its socket
+/// `ESTABLISHED` forever: the OS default is keepalive off, so the fd is
+/// never reclaimed. Over days that leaks one fd per dead peer until
+/// `accept()` starts failing with `EMFILE` and the healthcheck breaks (#792).
+/// Keepalive makes the kernel probe idle connections and close ones whose
+/// peer no longer answers.
+///
+/// This is built on axum's own [`axum::serve::ListenerExt::tap_io`] rather
+/// than a hand-rolled `impl axum::serve::Listener`. A hand-rolled newtype
+/// was tried first: it compiles as a `Listener`, but
+/// `into_make_service_with_connect_info::<SocketAddr>()` additionally needs
+/// `SocketAddr: Connected<IncomingStream<'_, L>>`, and axum only ships that
+/// impl for its own `TcpListener` and for `TapIo<L, F>` (generically, for any
+/// `L: Listener`) — never for an arbitrary third-party `L`. Implementing
+/// `Connected` ourselves is blocked by the orphan rule: neither `Connected`,
+/// `SocketAddr`, nor `IncomingStream` (a plain, non-fundamental axum type) is
+/// local to this crate. `tap_io` is the extension point axum actually
+/// provides for exactly this "touch every accepted `Io`" case, and it keeps
+/// `ConnectInfo` (real peer `SocketAddr`) working for free.
+fn keepalive_listener(
+    listener: tokio::net::TcpListener,
+    keepalive_secs: u64,
+) -> axum::serve::TapIo<
+    tokio::net::TcpListener,
+    impl FnMut(&mut tokio::net::TcpStream) + Send + 'static,
+> {
+    // `None` when `tcp_keepalive_secs = 0` (keepalive disabled) — pass
+    // accepted sockets through unmodified.
+    let keepalive = (keepalive_secs > 0).then(|| {
+        let idle = Duration::from_secs(keepalive_secs);
+        socket2::TcpKeepalive::new()
+            .with_time(idle)
+            .with_interval(idle)
+    });
+    axum::serve::ListenerExt::tap_io(listener, move |stream: &mut tokio::net::TcpStream| {
+        let Some(keepalive) = keepalive.as_ref() else {
+            return;
+        };
+        let sock_ref = socket2::SockRef::from(&*stream);
+        if let Err(error) = sock_ref.set_tcp_keepalive(keepalive) {
+            // Guard, don't panic (runtime paths never unwrap/expect): a
+            // platform or socket-state quirk here should not take down the
+            // connection, just leave it without the reaping this wrapper
+            // exists to provide.
+            tracing::warn!(%error, "failed to set TCP keepalive on accepted connection");
+        }
+    })
+}
+
 /// Run the `serve` subcommand.
 ///
 /// # Errors
@@ -1027,6 +1083,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
+        .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
@@ -1045,6 +1102,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
     let admin_llm = consolidator_setup.admin_llm;
+    // Share the tool router's last-activity clock with the B3 dream scheduler so
+    // it can tell an idle box from a busy one and cancel a run on the operator's
+    // return.
+    let activity_clock = server.activity_clock();
     let _maintenance_tasks = start_maintenance_scheduler(
         config.maintenance.clone(),
         config.auto_improve.clone(),
@@ -1054,6 +1115,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         embedder.clone(),
         admin_llm.clone(),
         config.decay,
+        config.dream,
+        activity_clock,
     )
     .await;
 
@@ -1263,6 +1326,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
                 config.decay.breadth_weight,
                 config.decay.observation_retention(),
+                config.decay.compact_cold_episodic,
             );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -1396,15 +1460,34 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_path: &base_path,
                 },
             )?;
+            // HTML navigational 401/403 → builtin login / change-password.
+            // Outer layer so it sees dual-auth responses; `/api/v1` stays JSON
+            // (`html_auth_redirect_mw` skips that prefix). Builtin wiki returns
+            // the cfg from split; custom SPA / web-off still builds one so the
+            // layer always has concrete login/change-password targets.
+            let html_auth = web.html_auth.unwrap_or_else(|| {
+                Arc::new(HtmlAuthRedirectConfig::from_mount(
+                    &base_path,
+                    &args.web_slug,
+                ))
+            });
             let router = machine
+                .merge(healthz_router())
                 .merge(admin)
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
                 .merge(internal_auth_router(auth_state.clone()))
-                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    require_dual_auth,
-                )))
+                .merge(
+                    web.protected
+                        .layer(axum::middleware::from_fn_with_state(
+                            auth_state.clone(),
+                            require_dual_auth,
+                        ))
+                        .layer(axum::middleware::from_fn_with_state(
+                            html_auth,
+                            html_auth_redirect_mw,
+                        )),
+                )
                 .merge(web.public.layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
@@ -1483,6 +1566,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                      docs/https-via-proxy.md for copy-paste templates."
                 );
             }
+            let listener = keepalive_listener(listener, config.tcp_keepalive_secs);
             let shutdown_cancel = cancel.clone();
             let serve_result = {
                 let serve = axum::serve(
@@ -1551,6 +1635,8 @@ async fn start_maintenance_scheduler(
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
     decay: crate::config::DecaySettings,
+    dream: crate::config::DreamSettings,
+    activity_clock: ai_memory_consolidate::ActivityClock,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -1561,11 +1647,23 @@ async fn start_maintenance_scheduler(
     let lint_interval_secs = settings.lint_interval_secs;
     let embedding_backfill_interval_secs = settings.embedding_backfill_interval_secs;
 
+    // A3 cold-cluster dedup targets the running server's configured embedder
+    // coordinate; with no embedder it is `None`, making A3 a clean no-op even
+    // when the flag is set (there are no stored vectors to cluster).
+    let dedup_embedding = embedder
+        .as_ref()
+        .map(|e| ai_memory_consolidate::EmbeddingCoord {
+            provider: e.provider().to_string(),
+            model: e.model().to_string(),
+            dim: e.dim(),
+        });
+
     let mut tasks = Vec::new();
     if maintenance_enabled && forget_sweep_interval_secs > 0 {
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
+        let dedup_embedding = dedup_embedding.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
             run_persisted_maintenance_job(
@@ -1591,6 +1689,7 @@ async fn start_maintenance_scheduler(
                     let writer = writer.clone();
                     let wiki = wiki.clone();
                     let decay = decay;
+                    let dedup_embedding = dedup_embedding.clone();
                     async move {
                         let started = std::time::Instant::now();
                         let outcome = run_scheduled_sweep_tick(
@@ -1600,6 +1699,8 @@ async fn start_maintenance_scheduler(
                             &decay.decay_params(),
                             decay.breadth_weight,
                             decay.observation_retention(),
+                            decay.compact_cold_episodic,
+                            decay.cold_cluster_dedup(dedup_embedding),
                         )
                         .await?;
                         if outcome.errors > 0 {
@@ -1612,6 +1713,7 @@ async fn start_maintenance_scheduler(
                             scopes = outcome.scopes,
                             candidates_evaluated = outcome.candidates_evaluated,
                             evicted = outcome.evicted,
+                            compacted = outcome.compacted,
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
@@ -1800,6 +1902,7 @@ async fn start_maintenance_scheduler(
                 ai_memory_consolidate::ExperienceConfig {
                     sessions: scheduler.experience_sessions.max(1),
                     min_new_sessions: scheduler.experience_every_sessions,
+                    entropy_filter: scheduler.experience_entropy_filter,
                     ..ai_memory_consolidate::ExperienceConfig::default()
                 }
             }),
@@ -1853,6 +1956,41 @@ async fn start_maintenance_scheduler(
         info!("auto-improve scheduler enabled but no LLM provider is configured; job not started");
     }
 
+    // B2/B3/B4 — the opt-in LLM dream pass. OFF by default; it starts only when
+    // `[dream] enabled` is set AND a provider AND an embedder are configured (a
+    // provider-less store keeps the zero-LLM A3 path, invariant #13). It never
+    // contends with live work: it runs only after `idle_window_secs` of quiet and
+    // cancels the moment activity resumes (invariant #5, cancellable + bounded).
+    if dream.enabled {
+        match (llm.clone(), dedup_embedding.clone()) {
+            (Some(llm), Some(embedding)) => {
+                let reader = reader.clone();
+                let wiki = wiki.clone();
+                let activity_clock = activity_clock.clone();
+                let interval = std::time::Duration::from_secs(dream.effective_interval_secs());
+                tasks.push(tokio::spawn(async move {
+                    run_dream_scheduler_loop(
+                        reader,
+                        wiki,
+                        llm,
+                        decay,
+                        dream,
+                        embedding,
+                        activity_clock,
+                        interval,
+                    )
+                    .await;
+                }));
+            }
+            (None, _) => info!(
+                "dream pass enabled but no LLM provider is configured; job not started (the zero-LLM A3 path is unaffected)"
+            ),
+            (_, None) => info!(
+                "dream pass enabled but no embedder is configured; job not started (nothing to cluster)"
+            ),
+        }
+    }
+
     if tasks.is_empty() {
         info!("scheduled maintenance enabled but all intervals are disabled");
     } else {
@@ -1861,17 +1999,121 @@ async fn start_maintenance_scheduler(
     tasks
 }
 
+/// The B3 dream scheduler loop: on its interval, run the dream pass across every
+/// scope ONLY when the operator has been idle for the configured window, and
+/// cancel the in-flight run the moment activity resumes. A cheap watcher task
+/// flips the shared [`ai_memory_consolidate::DreamCancel`] when the activity
+/// clock advances past the run's start; `run_dream_pass` polls it between
+/// clusters.
+#[allow(clippy::too_many_arguments)]
+async fn run_dream_scheduler_loop(
+    reader: ReaderPool,
+    wiki: Wiki,
+    llm: Arc<dyn LlmProvider>,
+    decay: crate::config::DecaySettings,
+    dream: crate::config::DreamSettings,
+    embedding: ai_memory_consolidate::EmbeddingCoord,
+    activity_clock: ai_memory_consolidate::ActivityClock,
+    interval: std::time::Duration,
+) {
+    /// How often the cancel watcher samples the activity clock during a run.
+    const DREAM_ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    let cfg = dream.dream_config(Some(embedding));
+    let decay_params = decay.decay_params();
+    loop {
+        tokio::time::sleep(interval).await;
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        if !ai_memory_consolidate::dream_idle_ready(&cfg, activity_clock.last_activity_us(), now_us)
+        {
+            continue;
+        }
+
+        // Cancel-on-activity: snapshot the last activity, then spawn a watcher
+        // that flips the cancel as soon as the clock moves past that snapshot.
+        let cancel = ai_memory_consolidate::DreamCancel::new();
+        let run_start_activity = activity_clock.last_activity_us();
+        let watcher = {
+            let cancel = cancel.clone();
+            let activity_clock = activity_clock.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(DREAM_ACTIVITY_POLL).await;
+                    if activity_clock.last_activity_us() > run_start_activity {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let scopes = match reader.list_all_scopes().await {
+            Ok(scopes) => scopes,
+            Err(error) => {
+                tracing::warn!(%error, "dream scheduler: could not list scopes; skipping tick");
+                watcher.abort();
+                continue;
+            }
+        };
+        let mut merged = 0usize;
+        let mut superseded = 0usize;
+        let mut cancelled = false;
+        for scope in scopes {
+            if cancel.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            match ai_memory_consolidate::run_dream_pass(
+                &reader,
+                &wiki,
+                Some(llm.as_ref()),
+                scope.workspace_id,
+                scope.project_id,
+                &decay_params,
+                decay.breadth_weight,
+                &cfg,
+                &cancel,
+                false,
+            )
+            .await
+            {
+                Ok(report) => {
+                    merged += report.clusters_merged;
+                    superseded += report.pages_superseded;
+                    cancelled |= report.cancelled;
+                }
+                Err(error) => tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    %error,
+                    "dream pass failed for scope"
+                ),
+            }
+        }
+        watcher.abort();
+        info!(
+            merged,
+            superseded,
+            cancelled,
+            elapsed_ms = started.elapsed().as_millis(),
+            "dream pass tick completed"
+        );
+    }
+}
+
 #[derive(Debug, Default)]
 struct ScheduledSweepTickOutcome {
     scopes: usize,
     candidates_evaluated: usize,
     evicted: usize,
+    compacted: usize,
     expired: usize,
     hard_deleted: usize,
     observations_pruned: usize,
     errors: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_scheduled_sweep_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
@@ -1879,6 +2121,8 @@ async fn run_scheduled_sweep_tick(
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
     retention: ObservationRetention,
+    compact_cold_episodic: bool,
+    dedup: ai_memory_consolidate::ColdClusterDedup,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1887,7 +2131,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep_with_options(
+        match ai_memory_consolidate::run_sweep_with_hygiene(
             reader,
             writer,
             Some(wiki),
@@ -1896,6 +2140,8 @@ async fn run_scheduled_sweep_tick(
             decay,
             breadth_weight,
             retention,
+            compact_cold_episodic,
+            dedup.clone(),
             false,
         )
         .await
@@ -1903,6 +2149,11 @@ async fn run_scheduled_sweep_tick(
             Ok(report) => {
                 outcome.candidates_evaluated += report.candidates_evaluated;
                 outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
+                outcome.compacted += report
+                    .compacted
+                    .iter()
+                    .filter(|page| page.compacted)
+                    .count();
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
                 outcome.observations_pruned += report.observations_pruned;
@@ -1952,6 +2203,10 @@ async fn run_scheduled_lint_tick(
                 dry_run: false,
                 use_llm: false,
                 decay_lambda,
+                // The automatic scheduled lint stays rule-based: the A5
+                // contradiction detector is on for the user-invoked
+                // `memory_lint` / admin lint, not the background sweep.
+                embedding: None,
             },
         )
         .await
@@ -2041,6 +2296,7 @@ fn auto_improve_review_config_from_settings(
         proposal_actor: settings.proposal_actor.clone(),
         pending_path: settings.pending_path.clone(),
         max_patchable_pages: settings.max_patchable_pages,
+        patchable_page_prefixes: settings.patchable_page_prefixes.clone(),
         max_patchable_body_chars: settings.max_patchable_body_chars,
         max_edits_per_proposal: settings.max_edits_per_proposal,
         max_edit_content_chars: settings.max_edit_content_chars,
@@ -2337,6 +2593,22 @@ fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String
     }
     command.push_str(" --prompt ping");
     command
+}
+
+/// Liveness probe for process supervisors.
+///
+/// Unauthenticated on purpose: launchd, systemd and `HEALTHCHECK` have no
+/// bearer token, and the answer ("this process is listening") is already
+/// observable by connecting to the port. It reads nothing and reports no
+/// store, provider or auth state.
+///
+/// Without it the only live signal is `GET /mcp` answering 405, which is an
+/// accident of method routing rather than a contract a supervisor can rely on.
+fn healthz_router() -> axum::Router {
+    axum::Router::new().route(
+        "/healthz",
+        axum::routing::get(|| async { axum::Json(serde_json::json!({ "status": "ok" })) }),
+    )
 }
 
 fn apply_host_layer(router: axum::Router, allowed_hosts: Vec<String>) -> axum::Router {
@@ -3147,6 +3419,8 @@ mod tests {
             None,
             None,
             crate::config::DecaySettings::default(),
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
         )
         .await;
         assert!(tasks.is_empty());
@@ -3191,6 +3465,8 @@ mod tests {
                 None,
                 None,
                 crate::config::DecaySettings::default(),
+                crate::config::DreamSettings::default(),
+                ai_memory_consolidate::ActivityClock::default(),
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -3635,6 +3911,8 @@ mod tests {
             &decay,
             0.0,
             ObservationRetention::default(),
+            false,
+            ai_memory_consolidate::ColdClusterDedup::default(),
         )
         .await
         .unwrap();
@@ -3897,26 +4175,123 @@ mod tests {
         )
         .unwrap();
         let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let html_auth = web
+            .html_auth
+            .expect("builtin wiki mount must return html_auth");
         let router = apply_host_layer(
-            web.protected.layer(axum::middleware::from_fn_with_state(
-                auth,
-                require_dual_auth,
-            )),
+            web.public.merge(
+                web.protected
+                    .layer(axum::middleware::from_fn_with_state(
+                        auth,
+                        require_dual_auth,
+                    ))
+                    .layer(axum::middleware::from_fn_with_state(
+                        html_auth,
+                        html_auth_redirect_mw,
+                    )),
+            ),
             vec!["localhost".to_string()],
         );
 
-        let resp = router
+        // Non-HTML clients still see JSON 401.
+        let json_401 = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_401.status(), StatusCode::UNAUTHORIZED);
+
+        // Browser navigations redirect to the public login page.
+        let html_redir = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Accept", "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(html_redir.status(), StatusCode::SEE_OTHER);
+        let location = html_redir
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            location.starts_with("/web/login?next="),
+            "expected login redirect, got {location}"
+        );
+
+        // Login HTML is public (no auth).
+        let login = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/login")
                     .header("Host", "localhost")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(login.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Sign in"), "login page body: {html}");
+        assert!(
+            html.contains("ai-memory-base-path"),
+            "inject base-path meta"
+        );
 
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Change-password HTML is public (must_change_password flow).
+        let change = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/change-password")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(change.status(), StatusCode::OK);
+        let change_body = axum::body::to_bytes(change.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let change_html = std::str::from_utf8(&change_body).unwrap();
+        assert!(
+            change_html.contains("Change password"),
+            "change-password page body: {change_html}"
+        );
+
+        // `/api/v1` stays JSON even with an HTML Accept header.
+        let api = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .header("Accept", "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -4029,7 +4404,8 @@ mod tests {
                 require_dual_auth,
             )))
             .merge(web.public)
-            .merge(ai_memory_web::favicon_router());
+            .merge(ai_memory_web::favicon_router())
+            .merge(healthz_router());
 
         // Mutation captured: dropping any host-owned route merge lets the root SPA
         // wildcard return its HTML shell instead of the reserved route response.
@@ -4057,6 +4433,21 @@ mod tests {
                 "{path} must reach its authenticated host route"
             );
         }
+
+        // A supervisor probing liveness sends no bearer token, so /healthz has to
+        // answer 200 with auth configured — and it is a host-owned route like the
+        // ones above, so the SPA wildcard must not serve its shell here either.
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
 
         let api = router
             .clone()
@@ -4573,6 +4964,44 @@ mod tests {
                 "https://b.example.com",
                 "https://c.example.com"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_listener_enables_socket_keepalive_when_configured() {
+        use axum::serve::Listener as _;
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = keepalive_listener(raw, 60);
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await;
+        let _client = client.await.unwrap().unwrap();
+
+        let sock_ref = socket2::SockRef::from(&accepted);
+        assert!(
+            sock_ref.keepalive().unwrap(),
+            "SO_KEEPALIVE must be enabled when tcp_keepalive_secs > 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_listener_disables_socket_keepalive_when_idle_is_zero() {
+        use axum::serve::Listener as _;
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = keepalive_listener(raw, 0);
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await;
+        let _client = client.await.unwrap().unwrap();
+
+        let sock_ref = socket2::SockRef::from(&accepted);
+        assert!(
+            !sock_ref.keepalive().unwrap(),
+            "SO_KEEPALIVE must stay off when tcp_keepalive_secs = 0"
         );
     }
 }

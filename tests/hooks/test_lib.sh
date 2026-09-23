@@ -31,6 +31,18 @@ assert_eq() {
     fi
 }
 
+# Git Bash reports $PWD and mktemp's directory as MSYS paths (/h/..., /tmp/...).
+# powershell.exe resolves neither, so a path handed to it has to be converted
+# first. cygpath ships with Git for Windows and exists nowhere else, where the
+# path is already native.
+host_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # --- parse_toml_key ---------------------------------------------------
 cat >"$TMP/sample.toml" <<EOF
 # Comment line
@@ -299,8 +311,10 @@ if command -v git >/dev/null 2>&1; then
         PSH=$(command -v powershell)
     fi
     if [ -n "$PSH" ]; then
-        PS_REPO=$($PSH -NoProfile -ExecutionPolicy Bypass -Command \
-            ". '$PWD/hooks/lib/ai-memory-hook.ps1'; Get-AiMemoryRepoRootProject -Cwd '$REPO/crates/cli'")
+        PS_LIB=$(host_path "$PWD/hooks/lib/ai-memory-hook.ps1")
+        PS_CWD=$(host_path "$REPO/crates/cli")
+        PS_REPO=$("$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+            ". '$PS_LIB'; Get-AiMemoryRepoRootProject -Cwd '$PS_CWD'")
         assert_eq "powershell repo-root helper resolves repo basename" "acme-api" "$PS_REPO"
     else
         PS_STATIC=$(grep -q 'function Get-AiMemoryRepoRootProject' hooks/lib/ai-memory-hook.ps1 \

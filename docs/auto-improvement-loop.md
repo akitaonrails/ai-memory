@@ -344,6 +344,7 @@ min_confidence = 0.75
 max_input_tokens = 24000
 max_proposals_per_run = 5
 max_patchable_pages = 8
+patchable_page_prefixes = ["_rules/", "procedures/"]
 max_patchable_body_chars = 8000
 max_edits_per_proposal = 5
 max_edit_content_chars = 4000
@@ -364,6 +365,35 @@ interval_secs = 3600          # 0 disables background review only
 max_sessions_per_tick = 1       # per project; ticks process projects sequentially
 min_session_age_secs = 600
 ```
+
+### Which pages the reviewer can actually read
+
+`patchable_page_prefixes` decides which folders' **page bodies** are sent to the
+reviewer. Everything else in the project reaches it through the recent-page list
+as a single line — path, title, kind, updated_at — with no content.
+
+That matters because the reviewer cannot avoid duplicating what it cannot read.
+A project that keeps its invariants in `decisions/` or `gotchas/`, with no
+`_rules/` pages at all, sends **no page bodies**, and the model will keep
+proposing rules that are already written down — often with high confidence,
+because the claim really is well evidenced by the session.
+
+The default is the historical pair, so existing installations are unchanged. Add
+the folders where your durable knowledge actually lives:
+
+```toml
+patchable_page_prefixes = ["_rules/", "procedures/", "decisions/", "gotchas/"]
+```
+
+Prefixes are matched against the start of the page path and should end with `/`,
+so `decisions/` does not also match `decisions-archive/`. An empty list disables
+page-body context entirely; an empty string in the list is ignored rather than
+matching every page.
+
+Note that `max_patchable_pages` still bounds how many of the matching pages are
+sent, and the recent-page list they are drawn from is ordered by recency, so a
+project with heavy `sessions/` churn may still crowd out durable pages.
+
 
 `[auto_improve.scheduler]` controls whether and how often the server launches
 background review. `[auto_improve] require_approval` controls whether validated
@@ -497,6 +527,40 @@ keywords, and evenly spaced checkpoints. Validation rejects missing evidence,
 unsupported paths, low confidence, oversized bodies, duplicate existing paths or
 titles, and normalizes a missing H1 by prepending the proposal title before final
 validation.
+
+#### Reviewer context is bounded (and how it can miss existing durable pages)
+
+The reviewer does not see every page. Two limits shape what durable knowledge it
+can notice already exists, and therefore what it may redundantly re-propose:
+
+- **Only `_rules/` and `procedures/` page *bodies* are loaded** for patch
+  context (`load_patchable_pages`). Durable pages in other families
+  (`decisions/`, `gotchas/`, `concepts/`, `notes/`) are not sent to the reviewer
+  in full.
+- **The "recent pages" list is recency-ordered, one line per page** (path,
+  title, kind, updated_at), drawn from the project briefing. Because it is a flat
+  bounded list, a project with many pages only shows the reviewer the most
+  recently updated ones. To keep those slots for durable knowledge, the
+  auto-improve reviewer excludes `sessions/` pages from *its* recent-page context
+  (session pages are never valid proposal targets and would otherwise dominate
+  the list). This exclusion is scoped to the reviewer only — the SessionStart
+  briefing and `memory_briefing` still include session pages, where they belong.
+
+The practical consequence: a durable page that lives outside `_rules/` /
+`procedures/` and is not among the most-recent pages may be invisible to the
+reviewer, so the same lesson can be proposed again. Reviewer duplicates are
+caught downstream (validation rejects a proposal whose path/title duplicates an
+existing page it *can* see, and staging enforces one pending proposal per
+target), but a proposal against a durable page the reviewer never saw is not
+prevented at review time.
+
+Deferred improvements (future work, not in this line):
+
+- **Configurable patchable prefixes**, so `decisions/`/`gotchas/` bodies can
+  reach the reviewer without hard-coding the family list.
+- **Embedding-nearest dedup**, replacing the recency-ordered flat list with a
+  retrieval of the pages semantically closest to the session under review, so
+  relevant durable pages are surfaced regardless of recency.
 
 Tests:
 

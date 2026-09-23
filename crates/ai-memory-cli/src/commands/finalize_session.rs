@@ -64,6 +64,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
         args.all,
         args.all_owners,
         args.session_id,
+        args.reopen,
     )
     .await?;
     if sessions.is_empty() {
@@ -101,6 +102,9 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
 /// workspace/project fails closed server-side with a 404; that maps to
 /// "nothing to finalize" here, matching the previous direct-DB behavior
 /// for a missing scope.
+// Eight arguments is the full request shape (scope + agent + the four
+// selection flags + exact id); cf. `post_session_end_batch` below.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_open_sessions(
     endpoint: &ServerEndpoint,
     workspace: &str,
@@ -109,15 +113,18 @@ async fn fetch_open_sessions(
     all: bool,
     all_owners: bool,
     session_id: Option<SessionId>,
+    include_ended: bool,
 ) -> Result<Vec<OpenSessionEntry>> {
     let all = if all { "true" } else { "false" };
     let all_owners = if all_owners { "true" } else { "false" };
+    let include_ended = if include_ended { "true" } else { "false" };
     let mut query = vec![
         ("workspace", workspace),
         ("project", project),
         ("agent", agent.as_str()),
         ("all", all),
         ("all_owners", all_owners),
+        ("include_ended", include_ended),
     ];
     let session_id = session_id.map(|sid| sid.to_string());
     if let Some(sid) = session_id.as_deref() {
@@ -363,6 +370,7 @@ mod tests {
                 AgentKind::KiroCli,
                 ai_memory_core::OwnerFilter::Any,
                 older,
+                false,
             )
             .await
             .unwrap();
@@ -384,10 +392,84 @@ mod tests {
                 AgentKind::KiroCli,
                 ai_memory_core::OwnerFilter::Any,
                 latest,
+                false,
             )
             .await
             .unwrap();
         assert_eq!(still_open.map(|session| session.session_id), Some(latest));
+    }
+
+    /// Regression for the Antigravity manual-finalize gap: after a first
+    /// `finalize-session` closes the session, the conversation may continue
+    /// and land new observations under the same id. The default discovery
+    /// must keep excluding the ended session (closing something already
+    /// closed stays a silent no-op), while the `--reopen` lookup
+    /// (`include_ended = true`) must find it so a second finalize re-runs
+    /// the session-end path.
+    #[tokio::test]
+    async fn ended_session_matches_only_with_include_ended() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let ended = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: ended,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::AntigravityCli,
+                cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(ended, None).await.unwrap();
+
+        let default_lookup = store
+            .reader
+            .open_session_for_scope_agent_by_id(
+                ws,
+                proj,
+                AgentKind::AntigravityCli,
+                ai_memory_core::OwnerFilter::Any,
+                ended,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            default_lookup.map(|session| session.session_id),
+            None,
+            "an ended session must stay invisible to the default finalize discovery"
+        );
+
+        let reopen_lookup = store
+            .reader
+            .open_session_for_scope_agent_by_id(
+                ws,
+                proj,
+                AgentKind::AntigravityCli,
+                ai_memory_core::OwnerFilter::Any,
+                ended,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reopen_lookup.map(|session| session.session_id),
+            Some(ended),
+            "--reopen must reach the ended session for a second finalize"
+        );
     }
 
     #[test]

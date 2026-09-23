@@ -32,7 +32,8 @@ pub struct Question {
     pub question_id: String,
     pub question_type: String,
     pub question: String,
-    #[allow(dead_code)]
+    /// Gold answer. Usually a JSON string; occasionally a richer value.
+    /// Read via [`Question::gold_answer_text`] for the QA judge (R2b).
     pub answer: serde_json::Value,
     #[allow(dead_code)]
     pub question_date: String,
@@ -49,6 +50,16 @@ impl Question {
     /// metrics and reported separately.
     pub fn is_abstention(&self) -> bool {
         self.question_id.ends_with("_abs")
+    }
+
+    /// The gold answer as text for the LLM-as-judge (R2b QA mode). A JSON
+    /// string is unwrapped to its contents; any other shape is rendered as
+    /// compact JSON so the judge still sees the reference value.
+    pub fn gold_answer_text(&self) -> String {
+        match &self.answer {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
     }
 }
 
@@ -142,6 +153,14 @@ mod tests {
         assert_eq!(qs.len(), 1);
         assert_eq!(qs[0].haystack_sessions[0][0].role, "user");
         assert!(!qs[0].is_abstention());
+    }
+
+    #[test]
+    fn gold_answer_unwraps_a_json_string_and_renders_other_shapes() {
+        let mut qs: Vec<Question> = serde_json::from_value(sample_json()).unwrap();
+        assert_eq!(qs[0].gold_answer_text(), "Business");
+        qs[0].answer = serde_json::json!(["a", "b"]);
+        assert_eq!(qs[0].gold_answer_text(), "[\"a\",\"b\"]");
     }
 
     #[test]

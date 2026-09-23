@@ -137,7 +137,12 @@ from hook paths.
    `[decay] breadth_weight` can reward pages reinforced by several distinct
    operators. That bump is throttled to at most once per page per minute, so a
    burst of overlapping searches does not flood the writer actor with
-   redundant reinforcement writes.
+   redundant reinforcement writes. The same reinforcement fires from every
+   read path that surfaces a page, not just search: `memory_read_page` (and its
+   `include_related` walk, which reinforces the walked neighbours too) and
+   `memory_explore` (the pages it surfaces) bump the same counters through the
+   same throttled, FTS-exempt path, so a page a human opens directly or the
+   graph surfaces resists decay like a query hit (design-memory-aging.md C1).
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);
@@ -293,8 +298,9 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
 | `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
-| `page_evidence` | V63 append-only record of what produced or reaffirmed each page version — consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Surfaced as `evidence_count` in `memory_query(explain=true)` and used to order the opt-in `settled_first` briefing. Ranking-inert: the confidence→authority factor is deferred behind the eval harness (`docs/design-hindsight-borrowings.md` P2). |
+| `page_evidence` | V63 append-only record of what produced or reaffirmed each page version — consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Feeds a read-time, zero-LLM **belief-strength `confidence`** (`ai_memory_store::belief`, B1 / `docs/design-hindsight-borrowings.md` P2): a bounded `[0.0, 0.95]` function of distinct supporting sessions (breadth, not raw count), recency of the newest sighting, and live `contradicts` count. Exposed as `confidence` + `evidence_count` in `memory_query(explain=true)`, as `evidence_rows` in `memory_status`, and used to order the opt-in `settled_first` briefing — all **ranking-inert**. It folds into `PageAuthority` only behind `[retrieval] belief_authority_weight` (**default `0.0`/OFF, R2-gated**), as one bounded factor inside the `[0.55, 1.50]` clamp; a supersession always wins regardless of evidence (a superseded version is never boosted). |
 | `agent_messages` | V64 cross-project message inbox/queue (`docs/agent-messaging.md`). Directed, claim-once mail from a sender coordinate to a recipient coordinate; `pending`→`claimed` (popped exactly once, the handoff compare-and-set) or `pending`→`cancelled` (sender retracts). The one table that crosses per-project isolation, so reads are keyed by the recipient coordinate (inbox) or sender coordinate (outbox); `from_owner_user`/`claimed_by_user` are attribution only, never a read filter. Recipient inbox depth is capped. `ON DELETE CASCADE` on both coordinate pairs. |
+| `pages.compacted_at` | V65 nullable A2 tier-down marker (`docs/design-memory-aging.md` §A2). Set when the forget-sweep extractively compacts a cold episodic page (opt-in `[decay] compact_cold_episodic`) instead of evicting it; derived at the single page-upsert choke point from a `compacted: true` frontmatter mirror, so the marker and compacted body land in one transaction. Additive `ADD COLUMN`, no backfill — populated lazily by the sweep. The sweep and curator skip a marked page so it is never re-compacted, re-evicted, or re-reported as cold. Reversible: the full pre-compaction body stays in git + the supersession chain. |
 | `client_activity` | Server-wide MCP tool-call counters split into reads/writes and bucketed by UTC day. The MCP request choke point flushes buffered calls on a one-minute background interval; failed batches retry from bounded memory. Each day stores at most 128 sanitized client labels plus `other`, so an untrusted `clientInfo.name` cannot create traffic-proportional rows. |
 | `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
@@ -305,9 +311,54 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | Tier | Lifetime | Decay |
 |---|---|---|
 | Working | Current session only | Hard-drop on session end (kept in `observations` for forensics) |
-| Episodic | 30d hot → 180d cold → evict | `salience · exp(−λΔt) + σ · log(1+access_count) · exp(−μ · days_since_access) · (1 + breadth_weight · ln(1 + max(distinct_actors−1, 0)))` |
+| Episodic | 30d hot → 180d cold → evict (or tier-down, opt-in A2) | `salience · exp(−λΔt) + σ · log(1+access_count) · exp(−μ · days_since_access) · (1 + breadth_weight · ln(1 + max(distinct_actors−1, 0)))` |
 | Semantic | Indefinite | None - only supersedeable via M7 LLM rewrite |
 | Procedural | Indefinite | Frequency-decay if not re-observed |
+
+`λ` is the scalar `[decay] lambda` by default, but can be set per tier via
+`[decay.half_life_days]` (a half-life in days per tier, converted to
+`λ = ln(2)/days`); an unset tier uses the scalar, so the default reproduces
+today's single-λ scores exactly.
+
+**Extractive tier-down (A2, opt-in).** With `[decay] compact_cold_episodic =
+true`, the sweep runs a compaction pass *before* the decay-eviction pass: a cold
+episodic page that is not already compacted is rewritten through the wiki layer
+to keep its L0 `abstract:`, an L1 first-paragraph summary, and an L2 regex-mined
+keep-token set (paths, URLs, code spans, error codes, identifiers), dropping the
+prose — instead of being tombstoned. The rewrite supersedes the prior version,
+so the full body stays reachable (git + supersession chain; `restore-page`
+recovers it). The `V65` `pages.compacted_at` marker makes a compacted page
+terminal for the decay pass (never re-compacted, never re-evicted, never
+re-reported as cold). Zero-LLM, off by default; the R2 recall no-regression
+proof gates any future default-on.
+
+**LLM "dream" pass (B2/B3/B4, opt-in LLM, OFF by default, R2-gated before
+default-on).** Where A3 collapses near-duplicate cold clusters *extractively*
+(zero-LLM, keep-token union), the dream pass
+(`ai-memory-consolidate::dream::run_dream_pass`) hands each cold cluster to the
+configured provider to be rewritten into ONE coherent page — the prose-coherent
+merge extraction cannot do. It reuses A3's clustering math (`adaptive_eps` /
+`dbscan`) over the *same* bounded cold set the forget sweep materialises
+(`sweep::materialize_cold_set`, invariant #2). It runs only when `[dream]
+enabled` is set AND a provider AND an embedder are configured; a provider-less
+store keeps the zero-LLM A3 path (invariant #13). It **never deletes a source**
+(invariant #16): the highest-retention member is rewritten and every merged-away
+member is *superseded* with a merge-note stub, so the full pre-merge body stays
+reachable (git + supersession chain; `restore-page` recovers it), and
+`page_evidence` (`reconsolidation` + `b2_dream:<id>`) records which members fed
+each merge (the hallucinated-merge guard). The rewrite routes through the gated
+apply path — `preflight_admission(Consolidate)` before the LLM, then
+`Wiki::apply_batch` (single-writer actor, invariant #2) — with **`dry_run`
+first** (returns the plan, calls neither the LLM nor the writer) and
+**JSON-schema structured output only** (invariant #7). Scheduling (B3, in
+`serve.rs`) starts a run only after `[dream] idle_window_secs` of no client
+activity (read from the tool router's shared `ActivityClock`) and **cancels it
+the moment activity resumes** — a cheap `DreamCancel` flag polled between
+clusters — bounded to `max_clusters_per_run` clusters per run (invariant #5).
+Work is ordered **surprisal-first** (B4): the most-novel clusters, farthest in
+embedding space from the nearest existing (non-cold) page, first. Every run
+returns an observable `DreamReport` so a bad run is never silent. No new
+migration (reuses `page_evidence` + supersession); no new MCP tool.
 
 Pinned pages (`pinned: true` in frontmatter) are exempt from all
 decay paths. Pages under `_slots/` are pinned automatically and surfaced
@@ -376,13 +427,13 @@ invariants below.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine/entity inverse-frequency scores, RRF contributions, graph provenance including the typed edge kind (`causes`/`fixes`/`contradicts`) a neighbour was reached by, the page's evidence count, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. |
+| `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine/entity inverse-frequency scores, RRF contributions, graph provenance including the typed edge kind (`causes`/`fixes`/`contradicts`) a neighbour was reached by, the page's evidence count, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. `include_superseded=true` also returns superseded (non-latest) page versions across the FTS/entity/vector/graph streams, each hit labelled `superseded: true` (the current version is never marked); default-off is byte-identical to the latest-only behaviour, and `global=true` / `as_of` are unaffected. `pin_first=true` prepends the project's bounded pinned latest pages (`ReaderPool::list_pinned_pages`, cap 10) ahead of the fused hits, deduped by page id (a pinned page that also matches appears once, marked `pinned: true`) and re-truncated to the requested limit; it applies to single-project searches (default or `workspace`+`project`), is ignored on `scopes`/`global`/`as_of`, and default-off is byte-identical. `answer=true` (opt-in, off by default) additionally synthesizes a cited natural-language answer over the top hits via the configured LLM provider (`complete_structured`, JSON-schema `{ answer, citations }`), attached as `answer: { text, citations }`; with no provider configured it returns the hits plus an `answer_unavailable` note instead of erroring, and with `answer` unset/`false` no provider is accessed and the response is byte-identical (invariant #13). It applies to the normal single-project/`scopes` path; `global`/`as_of` ignore it. Answer quality is not yet eval-validated. An optional `reasoning` tier (`minimal` (default) / `low` / `medium` / `high` / `max`) tunes the synthesis effort: `ChatRequest` carries no per-request reasoning field (the provider-level `reasoning_effort` is fixed at construction from config), so the tier maps to a per-tier max-token budget scaled off the path's base (answer base 2 000; `minimal` = 1x = byte-identical, `low` 1.5x, `medium` 2x, `high` 3x, `max` 4x). The tier is inert unless the `answer` LLM path runs (invariant #13); an unknown value is rejected by the schema (invariant #7). |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
-| `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
+| `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. `include_related=true` also walks the link graph outward from the page (bounded BFS reusing the `page_links` primitive per node: default 1 hop, hard cap 3, global visited set for dedup/cycle-safety, total-node cap 50, cross-project aware) and returns a `related` array of reachable pages, each labelled with its `depth` (hop distance) and `direction` (`link`/`backlink`); default-off is byte-identical (no `related` field). |
 | `memory_read_session_observations` | read-only | Page through ONE session's raw hook observations (`ObservationRecord` with full sanitized body, capped per row by `body_max_chars`), restricted to the rows that landed in the resolved scope and to sessions the caller may see; `total` and `elided_other_scope` report the in-scope count and the rows the session left in another project. `session_id` omitted reads the latest completed visible session. |
-| `memory_status` | read-only | Counts, paths, version. |
-| `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. Opt-in `settled_first: true` leads with up to 8 of the project's highest-standing `rule`/`decision` pages, ordered by evidence count then recency; off by default. |
-| `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
+| `memory_status` | read-only | Counts, paths, version, plus the `scope` that answered: `workspace`, `project`, and `resolved_by` (`explicit`, `session`, `shared_slot`, `startup_seed`, `default`, `default_after_mismatch`). Unscoped reads resolved by `startup_seed` or `default_after_mismatch` also log a server warning. |
+| `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. Project-scoped snapshots also carry a bounded `pinned` list (up to 10) of the project's pinned latest pages (`pinned = 1`, newest first) as standing SessionStart hot-context — distinct from `slots`, which is keyed by the `_slots/` path prefix; empty and omitted from JSON when the project has no pins, so the default shape is unchanged. Opt-in `settled_first: true` leads with up to 8 of the project's highest-standing `rule`/`decision` pages, ordered by evidence count then recency; off by default. |
+| `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. An optional `reasoning` tier (`minimal` (default) / `low` / `medium` / `high` / `max`) scales the digest's max-token budget off its base (16 000; same 1x/1.5x/2x/3x/4x mapping as `memory_query`); inert on the no-provider briefing-only path, and `minimal` is byte-identical. |
 | `memory_handoff_begin` | destructive | Open an owner-scoped handoff for the next agent; `shared=true` deliberately publishes it to the project. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_list` | read-only | List open own/shared handoffs with inspectable body and identity fields; does not claim or expire. Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_accept` | destructive | Fetch + ack an open own/shared handoff. Pass `handoff_id` from `memory_handoff_list` to claim that exact row; omitting it still claims the latest eligible open handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
@@ -404,7 +455,7 @@ long-lived entry appearing there is that policy working rather than a fault.
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | Retention pass: evict cold pages through the wiki layer, purge aged tombstone ancestry, and hard-delete TTL-expired pages. `dry_run=true` for preview. |
-| `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |
+| `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. Also runs a **zero-LLM contradiction detector** (design-memory-aging.md A5): cold semantic/procedural pages whose already-stored embeddings sit in the 0.4–0.75 cosine-similarity band ("same topic, not a near-duplicate" — ≥0.75 is A3 dedup, <0.4 unrelated) get an advisory `contradiction` finding with newer-wins timestamp advice. Bounded (one embeddings load over the capped cold set, capped findings, deterministic); a clean no-op with no embedder configured; advisory-only — never deletes/edits/supersedes a page and persists no edge (invariants #13, #16, #2), so no migration. |
 | `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
 
 `memory_briefing`, `memory_explore`, `memory_write_page`,
@@ -433,7 +484,7 @@ for mistaken handoff creation. `memory_feedback` implements the
 without conflating read and write semantics, and the access counter it
 supplements cannot tell "this page answered the question" from "this page
 wasted a read". The narrow-surface discipline still holds —
-every new tool has to earn its slot — but the count is 17, not 10.
+every new tool has to earn its slot — but the count is now 23, not 10.
 
 The managed Agent Skills are a narrow prompt-packaging exception to the
 otherwise wiki-centered architecture. They are static `SKILL.md` files that
@@ -556,6 +607,11 @@ prefixed `AI_MEMORY_*`.
 ```toml
 bind = "127.0.0.1:49374"
 log_level = "info"
+tcp_keepalive_secs = 60            # idle time before TCP keepalive probes an accepted `serve`
+                                   # connection; reaps sockets left half-open by a dead peer
+                                   # (laptop sleep, VPN flap) that would otherwise leak fds
+                                   # until EMFILE (#792). 0 disables keepalive. Env:
+                                   # AI_MEMORY_TCP_KEEPALIVE_SECS
 
 # Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
 # override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
@@ -574,7 +630,7 @@ run_autowire = true                # `ai-memory run <harness>` auto-installs tha
                                    # one-time per harness+version). Also `--no-autowire`.
 
 [decay]                            # M8 retention params
-lambda = 0.02                      # ↓ to forget less aggressively
+lambda = 0.02                      # ↓ to forget less aggressively (fallback λ)
 sigma = 0.6                        # ↑ to reward query-hits more
 mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → remove file + retain tombstone
@@ -582,6 +638,33 @@ hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
 observation_retention_days = 0     # 0 = never prune raw observations
 observation_prune_batch = 5000     # rows per prune transaction
+compact_cold_episodic = false      # A2 opt-in: tier-down (compact) a cold
+                                   # episodic page instead of evicting it —
+                                   # keep abstract+summary+keep-tokens, drop
+                                   # prose. Reversible (git + supersession),
+                                   # zero-LLM. false = today's evict behaviour.
+dedup_cold_clusters = false        # A3 opt-in: cluster near-duplicate cold
+                                   # episodic pages by embedding (cosine DBSCAN,
+                                   # adaptive eps) and collapse each cluster to
+                                   # one survivor (union of keep-tokens), others
+                                   # superseded with a merge note. Reversible
+                                   # (git + supersession), zero generative LLM,
+                                   # no-op with no embedder. Merge provenance in
+                                   # page_evidence. false = no clustering.
+# dedup_min_pts = 2                # DBSCAN density floor (0 ⇒ default 2)
+# dedup_max_eps = 0.15             # conservative eps ceiling (cosine distance;
+                                   # 0 ⇒ default). Lower = merges less.
+
+[decay.half_life_days]             # opt-in per-tier retention curves (all keys
+                                   # optional). Half-life in DAYS; converted to
+                                   # λ = ln(2)/days. An omitted key falls back to
+                                   # the scalar `lambda` above, so the default
+                                   # (no keys) is byte-identical to today — no
+                                   # score change or mass-eviction on upgrade.
+# working = 7                      # e.g. keep scratch short…
+# episodic = 365                   # …and session history long
+# semantic = 180
+# procedural = 90
 
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context
@@ -600,6 +683,7 @@ min_confidence = 0.75
 max_input_tokens = 24000
 max_proposals_per_run = 5
 max_patchable_pages = 8
+patchable_page_prefixes = ["_rules/", "procedures/"]
 max_patchable_body_chars = 8000
 max_edits_per_proposal = 5
 max_edit_content_chars = 4000
@@ -619,6 +703,18 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1        # per project; scheduler ticks do not overlap
 min_session_age_secs = 600
+experience_every_sessions = 0    # 0 disables the cross-session experience pass
+experience_sessions = 10         # session summaries one experience pass reads
+
+[auto_improve.scheduler.experience_entropy_filter]  # A4 opt-in; off by default
+enabled = false                  # true: skip low-information session pages from
+                                 # the experience consolidation pass BEFORE the
+                                 # prompt/eval-gate/apply_batch. Advisory (skip,
+                                 # never delete); zero-LLM. false = no filtering.
+# min_chars = 16                 # near-empty floor (non-whitespace chars)
+# min_entropy_bits_per_char = 2.0
+# max_repetition_ratio = 0.7     # 1 - distinct/total tokens above this ⇒ skip
+# repetition_min_tokens = 6      # repetition check applies only above this
 
 [retrieval]                       # opt-in ranking signals; all off by default
 query_intent = false              # lexical session-recall routing: queries phrased as
@@ -630,6 +726,26 @@ session_recall_bonus = 0.25       # extra authority on top of the cancelled pena
 abstract_vectors = false          # fifth RRF stream over page_abstract_embeddings
                                   # (L0: each page's frontmatter `abstract:` line, embedded
                                   # by the same backfill as the body)
+belief_authority_weight = 0.0     # fold read-time belief-strength confidence (P2) into page
+                                  # authority as ONE bounded factor inside the [0.55, 1.50]
+                                  # clamp. 0.0 = OFF (default): ranking is byte-identical and
+                                  # no belief query runs. confidence/evidence_count are still
+                                  # exposed in explain regardless (inert). DEFAULT OFF,
+                                  # R2-gated: do not default on without a positive R2 delta.
+
+[dream]                           # B2/B3/B4 opt-in LLM "dream" pass. OFF by default,
+                                  # R2-gated before it may default on. Never deletes a source.
+enabled = false                   # true starts the scheduled pass — but ONLY if a provider AND
+                                  # an embedder are also configured. A provider-less store keeps
+                                  # the zero-LLM A3 path untouched (invariant #13).
+interval_secs = 3600              # how often the scheduler CONSIDERS a run (0 ⇒ 3600)
+idle_window_secs = 300            # operator must be quiet this long before a run starts; returning
+                                  # activity CANCELS an in-flight run at the next cluster boundary
+                                  # (B3). 0 ⇒ default 300.
+# min_pts = 2                     # DBSCAN density floor (0 ⇒ default 2)
+# max_eps = 0.15                  # conservative eps ceiling (cosine distance; 0 ⇒ default)
+# max_clusters_per_run = 8        # bounded fan-out per run (invariant #5; 0 ⇒ default 8)
+# min_cold_pages = 2             # events-accrued gate: skip a run below this many cold pages
 ```
 
 **LLM provider env** (opt-in):

@@ -17,6 +17,7 @@ use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, project_observations};
 use crate::types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome, Relations, SlotKind,
@@ -621,6 +622,19 @@ impl Consolidator {
                 );
                 continue;
             }
+            // Final guard for whatever `slugify_page_path` in `build_update`
+            // can't fix (dot-segments, reserved DOS device names, `.git`,
+            // ...), mirroring bootstrap's #847 fix: skip this one page
+            // rather than let `Wiki::apply_batch`'s atomic `ensure_portable`
+            // check abort every other page in the batch (#848).
+            if let Err(e) = req.path.ensure_portable() {
+                warn!(
+                    path = %req.path.as_str(),
+                    error = %e,
+                    "skipped consolidation page update: path is not portable",
+                );
+                continue;
+            }
             requests.push(req);
             outcomes_preview.push(outcome);
         }
@@ -689,7 +703,17 @@ fn build_update(
         let slug = slugify_for_rule(&effective_title);
         format!("_rules/{slug}.md")
     } else {
-        upd.path.clone()
+        // The LLM sometimes echoes free text straight into a page path (a
+        // conventional-commit subject like `build(sandbox): orchestrate`).
+        // That passes `PagePath::new` (deliberately tolerant) but fails
+        // `ensure_portable`, which `Wiki::apply_batch` enforces atomically —
+        // one bad path there would abort every page in this batch, not just
+        // its own (#848, same class as bootstrap's #847). Sanitize before
+        // `PagePath::new` so every downstream use of `path` (rule routing
+        // already produces a safe slug above, slot placement, and the
+        // `req.path == anchor` comparison in `consolidate_session_multi`)
+        // sees this one, consistent, sanitized value.
+        slugify_page_path(&upd.path)
     };
     let path = PagePath::new(final_path)?;
     let tier = upd.tier;
@@ -2859,6 +2883,90 @@ mod tests {
                 outcome.path.as_str()
             );
         }
+    }
+
+    /// A batch with one page whose LLM-produced path contains a
+    /// Windows-illegal `:` (copied verbatim from a conventional-commit
+    /// subject, e.g. `build(sandbox): orchestrate`) must not abort the whole
+    /// run: `build_update` sanitizes the path in place (same class of fix as
+    /// bootstrap's #847) and the batch's sibling valid page survives. Before
+    /// the fix, the bad path passed `PagePath::new` (deliberately tolerant)
+    /// and only failed later at `ensure_portable` inside `Wiki::apply_batch`,
+    /// which is atomic — one bad page there lost every page in the batch
+    /// (#848).
+    #[tokio::test]
+    async fn batch_with_illegal_char_path_is_sanitized_not_aborted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+        let response = serde_json::json!({
+            "rationale": "one bad path, one good",
+            "updates": [
+                {
+                    "path": "concepts/build(sandbox): orchestrate the run.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Bad path page",
+                    "body_markdown": "Bad path body.",
+                    "tags": []
+                },
+                {
+                    "path": "concepts/good.md",
+                    "tier": "semantic",
+                    "kind": "fact",
+                    "title": "Good path page",
+                    "body_markdown": "Good path body.",
+                    "tags": []
+                }
+            ]
+        });
+
+        let outcomes = Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(ScriptedLlm(response)),
+            ws,
+            proj,
+        )
+        .consolidate_session_multi(
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("a sanitizable bad path must not fail (or abort) the whole batch");
+
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "both pages, including the sanitized one, must be written"
+        );
+
+        let sanitized_path = outcomes
+            .iter()
+            .find(|o| o.path.as_str().starts_with("concepts/build"))
+            .expect("the offending page must still be written, under a sanitized path")
+            .path
+            .clone();
+        assert!(
+            !sanitized_path.as_str().contains(':'),
+            "the sanitized path must not contain the Windows-illegal `:`: {}",
+            sanitized_path.as_str()
+        );
+        assert!(
+            sanitized_path.ensure_portable().is_ok(),
+            "the sanitized path must pass the portability check"
+        );
+
+        let good = wiki
+            .read_page(ws, proj, &PagePath::new("concepts/good.md").unwrap())
+            .unwrap();
+        assert_eq!(good.frontmatter["title"], "Good path page");
+
+        let bad = wiki.read_page(ws, proj, &sanitized_path).unwrap();
+        assert_eq!(bad.frontmatter["title"], "Bad path page");
     }
 
     /// A batch whose single update targets `path` — the model chooses this

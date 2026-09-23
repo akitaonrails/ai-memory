@@ -406,7 +406,11 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
 - **`unhealthy`** status: the container is running but its embedded
   `ai-memory status` healthcheck is failing. Most likely the data
   dir's permissions don't match the container's user (uid 1000). Fix
-  with `sudo chown -R 1000:1000 $DEPLOY_DIR/data` on the host.
+  with `sudo chown -R 1000:1000 $DEPLOY_DIR/data` on the host. A slower-onset
+  cause (days, not minutes) is fd exhaustion from dead-peer connections
+  (laptop sleep, a VPN flap) accumulating without TCP keepalive; `serve`
+  enables it by default (`tcp_keepalive_secs = 60`, `AI_MEMORY_TCP_KEEPALIVE_SECS`
+  to tune or `=0` to disable) (#792).
 - **Embedding mismatch after a model change**: startup logs a warning
   when stored `(provider, model, dim)` triples differ from config.
   Hybrid search ignores stale rows until they are re-embedded. Start

@@ -31,7 +31,7 @@ enum Command {
     /// consolidation prompt.
     Ab(Box<ab::AbArgs>),
     /// LongMemEval retrieval benchmark through the real server stack.
-    Retrieval(retrieval::RetrievalArgs),
+    Retrieval(Box<retrieval::RetrievalArgs>),
 }
 
 #[tokio::main]
@@ -45,6 +45,6 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Ab(args) => ab::run(*args).await,
-        Command::Retrieval(args) => retrieval::run(args).await,
+        Command::Retrieval(args) => retrieval::run(*args).await,
     }
 }

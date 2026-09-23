@@ -1,7 +1,8 @@
 # ai-memory cookbook
 
 A task-oriented cheat sheet: "I want to do X" → how. For the full reference see
-[`ARCHITECTURE.md`](ARCHITECTURE.md); for install see [`install.md`](install.md);
+[`ARCHITECTURE.md`](ARCHITECTURE.md); for install see [`install.md`](install.md)
+(including the [macOS menu bar app](install.md#macos-menu-bar-app));
 for the tool-routing table see [`usage.md`](usage.md).
 
 ## What ai-memory is, in one paragraph
@@ -77,6 +78,40 @@ Once the material is saved as pages in the right scope, any project can search
 it (`memory_query`) and read a specific document in full (`memory_read_page`)
 before implementing against it.
 
+## Recipe: control what gets kept, aged, or consolidated
+
+By default nothing you have to think about: memory decays on a single gentle
+curve, and an upgrade to 2.4 changes no scores and evicts nothing. When you *do*
+want to tune aging, it is all opt-in and reversible — the original of anything
+compacted or merged stays in git and the supersession chain, recoverable with
+`ai-memory restore-page`.
+
+- **Keep something forever:** pin it. A pinned page is exempt from the
+  forget-sweep regardless of tier or age. Semantic and procedural pages never
+  decay either — only working/episodic memory ages.
+- **Make a note expire on a deadline:** ask your agent to remember it "until
+  <date>" (an `expires_at`); the forget-sweep deletes it when the time passes,
+  no matter how often it was read. A TTL outranks pinning.
+- **Tune how long each tier lasts:** set per-tier half-lives in the project's
+  `.ai-memory.toml` `[decay.half_life_days]` (e.g. keep episodic history longer,
+  working-tier scratch shorter). Omit it for the default single curve.
+- **Compact instead of evict, and de-duplicate:** `[decay] compact_cold_episodic`
+  keeps a cold page's durable facts (paths, error codes, decisions) and drops the
+  prose; `[decay] dedup_cold_clusters` collapses near-duplicate cold pages into
+  one survivor. Both are zero-LLM, off by default, and supersede rather than
+  delete.
+- **Keep used memory longer:** nothing to configure — a page you open, search,
+  or reach through a related-pages walk is reinforced automatically and resists
+  decay.
+- **Surface likely contradictions:** run `memory_lint` (through your agent or the
+  CLI); with embeddings configured it flags pairs of same-topic pages that look
+  like they conflict, advisory only.
+- **Let an LLM consolidate on idle ("dream"):** with a provider *and* an embedder
+  configured, `[dream] enabled` turns on a background pass that rewrites clusters
+  of cold notes into single coherent pages while you're idle and cancels the
+  moment you return. It is off by default, never deletes a source, and is gated on
+  an internal recall eval before it could ever become default behavior.
+
 ## Recipe: two agents / two repos working together
 
 - **Continuity across agents in the same project** (quit Claude Code, open Codex
@@ -86,6 +121,30 @@ before implementing against it.
   project's context here: cross-project messaging — "send project-b a request to
   add the export endpoint" (`memory_message_send`), and over there "check my
   inbox" (`memory_message_pop`). See [`agent-messaging.md`](agent-messaging.md).
+
+## Recipe: run the server on a Mac
+
+Use the menu bar app when you want one `.app` that starts the server and
+opens the existing tools (web UI, `ai-memory status`, config, logs). It does
+not replace those tools with a second dashboard.
+
+```bash
+./companions/ai-memory-macos/build.sh
+open "companions/ai-memory-macos/dist/AI Memory.app"
+```
+
+Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
+from the menu extra. Wire an agent with the bundled binary:
+
+```bash
+BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
+"$BIN" install-mcp --client claude-code --apply
+"$BIN" install-hooks --agent claude-code --apply
+```
+
+Memory stays in `~/Library/Application Support/ai-memory`. Replacing the
+`.app` does not rewrite it. Full paths (tarball, source, Docker, launchd):
+[`macos.md`](macos.md).
 
 ## From the terminal (CLI)
 

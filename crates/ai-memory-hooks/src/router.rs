@@ -11992,7 +11992,8 @@ mod tests {
                         proj,
                         AgentKind::Codex,
                         ai_memory_core::OwnerFilter::Any,
-                        sid
+                        sid,
+                        false
                     )
                     .await
                     .unwrap()

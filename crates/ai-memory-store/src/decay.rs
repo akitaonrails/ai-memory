@@ -10,13 +10,65 @@
 //! The forget-sweep job computes it from store rows; the property tests
 //! pin the math without touching the database.
 
+use ai_memory_core::Tier;
 use serde::{Deserialize, Serialize};
+
+/// Convert a half-life expressed in **days** to the per-day exponential decay
+/// rate λ the retention formula uses: `λ = ln(2) / half_life_days`.
+///
+/// The config surface talks in half-lives ("episodic pages: 180-day
+/// half-life") because that is the intuitive knob; the math needs λ. This is
+/// the single conversion both live and reused by the config layer. Callers are
+/// responsible for rejecting a non-positive `half_life_days` (config validation
+/// does): passing `0.0` yields `+inf` and a negative value a negative λ, either
+/// of which would be a nonsensical curve rather than a silent fallback.
+#[must_use]
+pub fn lambda_from_half_life_days(half_life_days: f64) -> f64 {
+    std::f64::consts::LN_2 / half_life_days
+}
+
+/// Per-`Tier` decay-rate (λ) overrides.
+///
+/// A closed, `Copy` struct — one `Option<f64>` per tier — rather than a
+/// `HashMap<Tier, f64>`: the four tiers are a closed enum, so a fixed struct
+/// keeps [`DecayParams`] `Copy` (a map would not) and needs no allocation on
+/// the sweep's hot batch path. `None` for a tier means "fall back to the scalar
+/// [`DecayParams::lambda`]", so the default (every tier `None`) reproduces the
+/// single-λ behaviour byte-for-byte — there is no eviction cliff to migrate
+/// around. Each `Some` value is a λ (already converted from the operator's
+/// half-life-in-days via [`lambda_from_half_life_days`]).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TierLambdas {
+    /// λ override for [`Tier::Working`]; `None` uses the scalar λ.
+    pub working: Option<f64>,
+    /// λ override for [`Tier::Episodic`]; `None` uses the scalar λ.
+    pub episodic: Option<f64>,
+    /// λ override for [`Tier::Semantic`]; `None` uses the scalar λ.
+    pub semantic: Option<f64>,
+    /// λ override for [`Tier::Procedural`]; `None` uses the scalar λ.
+    pub procedural: Option<f64>,
+}
+
+impl TierLambdas {
+    /// The λ override recorded for `tier`, if any.
+    #[must_use]
+    pub fn get(&self, tier: Tier) -> Option<f64> {
+        match tier {
+            Tier::Working => self.working,
+            Tier::Episodic => self.episodic,
+            Tier::Semantic => self.semantic,
+            Tier::Procedural => self.procedural,
+        }
+    }
+}
 
 /// Tunable retention coefficients.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DecayParams {
     /// Per-day exponential decay rate applied to "age since updated_at".
-    /// `0.02` ≈ 35-day half-life.
+    /// `0.02` ≈ 35-day half-life. Used for any tier without a
+    /// [`DecayParams::tier_lambda`] override, so it stays the single knob a
+    /// zero-config store decays by.
     pub lambda: f64,
     /// Magnitude of the access-reinforcement boost.
     pub sigma: f64,
@@ -30,6 +82,11 @@ pub struct DecayParams {
     /// Days an evicted page's tombstone and version ancestry survive before
     /// permanent deletion.
     pub hard_delete_after_days: i64,
+    /// Optional per-tier λ overrides. Default (all `None`) falls back to the
+    /// scalar [`DecayParams::lambda`] for every tier — byte-identical to the
+    /// pre-per-tier behaviour. An operator sets these to keep, e.g., episodic
+    /// history longer and working-tier scratch shorter.
+    pub tier_lambda: TierLambdas,
 }
 
 impl Default for DecayParams {
@@ -41,7 +98,21 @@ impl Default for DecayParams {
             salience_default: 1.0,
             cold_threshold: 0.20,
             hard_delete_after_days: 180,
+            tier_lambda: TierLambdas::default(),
         }
+    }
+}
+
+impl DecayParams {
+    /// The decay rate λ for a page in `tier`: its per-tier override when one is
+    /// set, otherwise the scalar [`DecayParams::lambda`].
+    ///
+    /// The fallback returns `self.lambda` *unchanged* (not a days↔λ round-trip
+    /// of it), so a store with no per-tier config scores exactly as it did
+    /// before this existed.
+    #[must_use]
+    pub fn lambda_for(&self, tier: Tier) -> f64 {
+        self.tier_lambda.get(tier).unwrap_or(self.lambda)
     }
 }
 
@@ -58,6 +129,7 @@ impl Default for DecayParams {
 #[must_use]
 pub fn retention_score(
     params: &DecayParams,
+    tier: Tier,
     age_days: f64,
     access_count: u32,
     days_since_access: Option<f64>,
@@ -65,6 +137,7 @@ pub fn retention_score(
 ) -> f64 {
     retention_score_with_breadth(
         params,
+        tier,
         age_days,
         access_count,
         days_since_access,
@@ -90,9 +163,19 @@ pub fn retention_score(
 ///
 /// `salience` is the page's own feedback-moved salience; it scales the time
 /// term independently of breadth, which scales the access term.
+///
+/// `tier` selects the decay rate λ via [`DecayParams::lambda_for`]: with the
+/// default (empty) per-tier map every tier resolves to the scalar
+/// [`DecayParams::lambda`], so the score is identical for every tier until an
+/// operator configures a per-tier curve.
+// Each argument is an independent, orthogonal input to the pure formula
+// (page state and tuning coefficients); bundling them into a struct would only
+// move the same fields behind a name and obscure the call sites in the sweep.
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn retention_score_with_breadth(
     params: &DecayParams,
+    tier: Tier,
     age_days: f64,
     access_count: u32,
     days_since_access: Option<f64>,
@@ -110,7 +193,7 @@ pub fn retention_score_with_breadth(
     } else {
         0.0
     };
-    let time_term = salience * (-params.lambda * age_days).exp();
+    let time_term = salience * (-params.lambda_for(tier) * age_days).exp();
     // g(0) = g(1) = 1, monotonically non-decreasing afterwards.
     let breadth = 1.0 + breadth_weight * (f64::from(distinct_actors.max(1)) - 1.0).ln_1p();
     let access_term = days_since_access.map_or(0.0, |d| {
@@ -156,27 +239,27 @@ pub fn salience_after_feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::FeedbackKind;
+    use ai_memory_core::{FeedbackKind, Tier};
 
     #[test]
     fn fresh_unused_page_starts_near_salience() {
         let p = DecayParams::default();
-        let score = retention_score(&p, 0.0, 0, None, None);
+        let score = retention_score(&p, Tier::Episodic, 0.0, 0, None, None);
         assert!((score - p.salience_default).abs() < 1e-9);
     }
 
     #[test]
     fn ancient_page_with_no_access_decays_below_threshold() {
         let p = DecayParams::default();
-        let score = retention_score(&p, 365.0, 0, None, None);
+        let score = retention_score(&p, Tier::Episodic, 365.0, 0, None, None);
         assert!(score < p.cold_threshold, "got {score}");
     }
 
     #[test]
     fn frequently_accessed_page_stays_above_threshold_even_old() {
         let p = DecayParams::default();
-        let aged_unused = retention_score(&p, 200.0, 0, None, None);
-        let aged_hot = retention_score(&p, 200.0, 50, Some(2.0), None);
+        let aged_unused = retention_score(&p, Tier::Episodic, 200.0, 0, None, None);
+        let aged_hot = retention_score(&p, Tier::Episodic, 200.0, 50, Some(2.0), None);
         assert!(aged_unused < p.cold_threshold);
         assert!(
             aged_hot > p.cold_threshold,
@@ -187,24 +270,24 @@ mod tests {
     #[test]
     fn recent_access_boosts_more_than_old_access() {
         let p = DecayParams::default();
-        let recent = retention_score(&p, 100.0, 10, Some(2.0), None);
-        let stale = retention_score(&p, 100.0, 10, Some(120.0), None);
+        let recent = retention_score(&p, Tier::Episodic, 100.0, 10, Some(2.0), None);
+        let stale = retention_score(&p, Tier::Episodic, 100.0, 10, Some(120.0), None);
         assert!(recent > stale, "recent {recent} vs stale {stale}");
     }
 
     #[test]
     fn score_decreases_as_age_increases_without_access() {
         let p = DecayParams::default();
-        let young = retention_score(&p, 10.0, 0, None, None);
-        let old = retention_score(&p, 20.0, 0, None, None);
+        let young = retention_score(&p, Tier::Episodic, 10.0, 0, None, None);
+        let old = retention_score(&p, Tier::Episodic, 20.0, 0, None, None);
         assert!(young > old, "young {young} vs old {old}");
     }
 
     #[test]
     fn score_increases_with_access_count_when_access_age_matches() {
         let p = DecayParams::default();
-        let low = retention_score(&p, 100.0, 1, Some(5.0), None);
-        let high = retention_score(&p, 100.0, 20, Some(5.0), None);
+        let low = retention_score(&p, Tier::Episodic, 100.0, 1, Some(5.0), None);
+        let high = retention_score(&p, Tier::Episodic, 100.0, 20, Some(5.0), None);
         assert!(high > low, "high {high} vs low {low}");
     }
 
@@ -212,15 +295,16 @@ mod tests {
     fn explicit_salience_scales_the_time_term_only() {
         let p = DecayParams::default();
         // No access term: the score is purely salience · exp(−λt).
-        let default = retention_score(&p, 30.0, 0, None, None);
-        let boosted = retention_score(&p, 30.0, 0, None, Some(2.0));
-        let dropped = retention_score(&p, 30.0, 0, None, Some(SALIENCE_MIN));
+        let default = retention_score(&p, Tier::Episodic, 30.0, 0, None, None);
+        let boosted = retention_score(&p, Tier::Episodic, 30.0, 0, None, Some(2.0));
+        let dropped = retention_score(&p, Tier::Episodic, 30.0, 0, None, Some(SALIENCE_MIN));
         assert!((boosted - 2.0 * default).abs() < 1e-9);
         assert!(dropped < default, "floor salience must score below default");
 
         // With an access term, only the time half scales.
-        let with_access_default = retention_score(&p, 30.0, 10, Some(1.0), None);
-        let with_access_boosted = retention_score(&p, 30.0, 10, Some(1.0), Some(2.0));
+        let with_access_default = retention_score(&p, Tier::Episodic, 30.0, 10, Some(1.0), None);
+        let with_access_boosted =
+            retention_score(&p, Tier::Episodic, 30.0, 10, Some(1.0), Some(2.0));
         assert!((with_access_boosted - with_access_default - default).abs() < 1e-9);
     }
 
@@ -228,8 +312,15 @@ mod tests {
     fn salience_none_matches_explicit_default() {
         let p = DecayParams::default();
         assert!(
-            (retention_score(&p, 42.0, 3, Some(7.0), None)
-                - retention_score(&p, 42.0, 3, Some(7.0), Some(p.salience_default)))
+            (retention_score(&p, Tier::Episodic, 42.0, 3, Some(7.0), None)
+                - retention_score(
+                    &p,
+                    Tier::Episodic,
+                    42.0,
+                    3,
+                    Some(7.0),
+                    Some(p.salience_default)
+                ))
             .abs()
                 < 1e-12,
             "NULL salience must read exactly as salience_default",
@@ -267,10 +358,88 @@ mod tests {
         // The floor must not make an actively-used page sweep-eligible:
         // feedback lowers confidence, the sweep decides eviction.
         let p = DecayParams::default();
-        let fresh_floored = retention_score(&p, 0.0, 0, None, Some(SALIENCE_MIN));
+        let fresh_floored = retention_score(&p, Tier::Episodic, 0.0, 0, None, Some(SALIENCE_MIN));
         assert!(
             fresh_floored > p.cold_threshold,
             "fresh floored page should survive: {fresh_floored}",
+        );
+    }
+
+    /// Load-bearing upgrade guarantee: with the DEFAULT (empty) per-tier map,
+    /// every tier scores byte-for-byte identically to the historical scalar-λ
+    /// formula. This is what proves an upgrade never changes a score or
+    /// mass-evicts on the first post-upgrade forget-sweep.
+    #[test]
+    fn default_params_are_byte_identical_to_the_scalar_lambda_formula_for_every_tier() {
+        let p = DecayParams::default();
+        // The pre-per-tier formula, written out against the scalar lambda.
+        let reference =
+            |age_days: f64, access_count: u32, since: Option<f64>, salience: Option<f64>| {
+                let salience = salience.unwrap_or(p.salience_default);
+                let time_term = salience * (-p.lambda * age_days).exp();
+                let access_term = since.map_or(0.0, |d| {
+                    p.sigma * (1.0 + f64::from(access_count)).ln() * (-p.mu * d).exp()
+                });
+                time_term + access_term
+            };
+        for tier in [
+            Tier::Working,
+            Tier::Episodic,
+            Tier::Semantic,
+            Tier::Procedural,
+        ] {
+            for age in [0.0, 1.0, 35.0, 200.0, 365.0, 1000.0] {
+                for count in [0u32, 1, 7, 50] {
+                    for since in [None, Some(0.0), Some(3.0), Some(90.0)] {
+                        for salience in [None, Some(SALIENCE_MIN), Some(1.0), Some(2.0)] {
+                            let got = retention_score(&p, tier, age, count, since, salience);
+                            let want = reference(age, count, since, salience);
+                            assert_eq!(
+                                got.to_bits(),
+                                want.to_bits(),
+                                "tier {tier:?} age {age} count {count} since {since:?} \
+                                 salience {salience:?} must match the scalar-λ formula exactly",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A non-default map lets tiers age at different rates: an old episodic page
+    /// on a long half-life survives while an equally-old working page on a short
+    /// one falls below the cold threshold. Tiers left unset still decay at the
+    /// scalar rate (identity).
+    #[test]
+    fn per_tier_half_lives_evict_by_tier() {
+        let p = DecayParams {
+            tier_lambda: TierLambdas {
+                working: Some(lambda_from_half_life_days(7.0)),
+                episodic: Some(lambda_from_half_life_days(365.0)),
+                ..TierLambdas::default()
+            },
+            ..DecayParams::default()
+        };
+        // 90 days: many working half-lives, a fraction of an episodic one.
+        let age = 90.0;
+        // Unused, feedback-free pages: only the time term (per-tier λ) matters.
+        let working = retention_score(&p, Tier::Working, age, 0, None, None);
+        let episodic = retention_score(&p, Tier::Episodic, age, 0, None, None);
+        assert!(
+            working < p.cold_threshold,
+            "short-half-life working page should be cold: {working}",
+        );
+        assert!(
+            episodic > p.cold_threshold,
+            "long-half-life episodic page should survive: {episodic}",
+        );
+        // A tier with no override is byte-identical to the default params.
+        let semantic = retention_score(&p, Tier::Semantic, age, 0, None, None);
+        assert_eq!(
+            semantic.to_bits(),
+            retention_score(&DecayParams::default(), Tier::Semantic, age, 0, None, None).to_bits(),
+            "an un-overridden tier must be unchanged from the default",
         );
     }
 }

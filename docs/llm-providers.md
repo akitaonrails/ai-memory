@@ -133,12 +133,19 @@ uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
 also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 
 > [!TIP]
-> **For the OAuth/subscription backends (`anthropic-oauth`, `openai-oauth`, `codex`,
-> `copilot`), pick a small, fast model** via `AI_MEMORY_LLM_MODEL` — e.g.
-> `claude-haiku-4-5` or `gpt-5-mini`. ai-memory's LLM work (consolidation,
-> lint, explore) is summarisation, not hard reasoning, so a Haiku/mini-class
-> model is plenty and is much easier on subscription rate limits. Save the
-> high-effort thinking models for your coding agent.
+> **For the OAuth/subscription backends, prefer a small, fast model** via
+> `AI_MEMORY_LLM_MODEL` where the backend lets you choose one. ai-memory's LLM
+> work (consolidation, lint, explore) is summarisation, not hard reasoning, so a
+> Haiku/mini-class model is plenty and is much easier on subscription rate
+> limits. Save the high-effort thinking models for your coding agent. Per backend:
+> - `anthropic-oauth`: set `claude-haiku-4-5`.
+> - `openai-oauth` / `codex`: leave the provider default (`gpt-5.5`). The
+>   Codex/ChatGPT backend only accepts a small server-defined set of model ids
+>   and rejects others (e.g. `gpt-5-mini`) with a deterministic 400, so do not
+>   override the model here.
+> - `copilot`: a mini-class id such as `gpt-5-mini` may work, but Copilot's
+>   accepted model set is unverified — check before relying on it, and fall back
+>   to the default if the endpoint rejects your choice.
 
 > [!TIP]
 > **OpenAI-compatible structured output is schema-constrained by default.**
@@ -195,7 +202,10 @@ engines (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
 `AI_MEMORY_EMBEDDING_DIM`. The optional `EMBEDDING_API_KEY` credentials the
 embedder alone and is checked before `OPENAI_API_KEY` and `LLM_API_KEY`, so
-embeddings can run on a different provider than the LLM. Both the FTS-only and
+embeddings can run on a different provider than the LLM. Because the two
+endpoints are independent, `AI_MEMORY_LLM_BASE_URL` redirects only the LLM;
+set `AI_MEMORY_EMBEDDING_BASE_URL` as well or embedding traffic still goes to
+the embedding provider's default endpoint. Both the FTS-only and
 hybrid paths apply the same bounded page-authority adjustment after candidate
 generation; embeddings improve relevance recall but do not decide which source
 is canonical.

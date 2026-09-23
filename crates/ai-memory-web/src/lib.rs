@@ -12,7 +12,8 @@
 //! - `GET /w/:workspace/:project`         → page tree + recent activity
 //! - `GET /w/:workspace/:project/p/*path` → rendered markdown + metadata
 //! - `GET /search?q=…`                    → FTS5 hit list
-//! - `GET /static/*`                      → embedded CSS + logo
+//! - `GET /login` / `GET /change-password` → public human-auth HTML forms
+//! - `GET /static/*`                      → embedded CSS + logo (public)
 //!
 //! The companion `api_router` exposes the same read-only data as JSON
 //! for custom frontends. It intentionally does not expose write/admin
@@ -27,12 +28,14 @@ use ai_memory_store::ReaderPool;
 use ai_memory_wiki::Wiki;
 use axum::Router;
 
+mod html_auth;
 mod markdown;
 pub mod mount;
 mod routes;
 mod state;
 mod templates;
 
+pub use html_auth::{HtmlAuthRedirectConfig, html_auth_redirect_mw, sanitize_next};
 pub use mount::{
     SplitWebRouters, WebMountSpec, inject_base_href, inject_base_path_meta, normalize_prefix,
     split_web_routers, web_base_href,

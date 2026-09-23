@@ -1,0 +1,31 @@
+{
+  "version": "2.3.2",
+  "data_dir": "/Users/test/Library/Application Support/ai-memory",
+  "bind": "127.0.0.1:49374",
+  "db_path": "/Users/test/Library/Application Support/ai-memory/db/memory.sqlite",
+  "counts": {
+    "pages_latest": 138,
+    "pages_all": 162,
+    "sessions": 27,
+    "observations": 4198
+  },
+  "write_queue": [0, 128],
+  "providers": {
+    "llm": {
+      "status": "ok",
+      "provider": "openai",
+      "model": "gpt-4.1"
+    },
+    "embedding": {
+      "status": "disabled"
+    },
+    "llm_candidates": []
+  },
+  "ingest": {
+    "accepted": 4198,
+    "dropped_by_policy": 12,
+    "shed_saturated": 0,
+    "shed_rate_limited": 0,
+    "last_persisted_ms": 1700000000000
+  }
+}

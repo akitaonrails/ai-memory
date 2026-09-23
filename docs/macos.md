@@ -4,12 +4,23 @@ macOS is a supported platform: the workspace test suite runs on macOS CI and
 tagged releases publish native `ai-memory-macos-aarch64.tar.gz` (Apple Silicon)
 and `ai-memory-macos-x86_64.tar.gz` (Intel) binaries.
 
-On macOS the **native binary** (a prebuilt release or a source build) is the
-recommended way to run ai-memory. It binds the server on `127.0.0.1:49374`, and
-both the MCP endpoint and the lifecycle hooks talk to that loopback address —
-which the native agent can reach and which is already in the default Host-header
-allowlist. The Docker wrapper is also supported when you prefer a containerised
-server.
+On macOS the **native binary** is the recommended way to run ai-memory. Three
+native installs exist:
+
+- **[Scenario D — menu bar app](#scenario-d-menu-bar-app)** — self-contained
+  `.app` that bundles the binary, starts the LaunchAgent, and opens `/web`,
+  status, and config. The GUI path if you are building from source.
+- **[Scenario A — prebuilt tarball](#scenario-a-prebuilt-release-binary-recommended-no-toolchain)** —
+  no Rust toolchain; run `serve` in a terminal or install the LaunchAgent by
+  hand.
+- **[Scenario B — source build](#scenario-b-source-build)** — developing
+  ai-memory itself.
+
+It binds the server on `127.0.0.1:49374`, and both the MCP endpoint and the
+lifecycle hooks talk to that loopback address — which the native agent can
+reach and which is already in the default Host-header allowlist. The Docker
+wrapper ([Scenario C](#scenario-c-docker-wrapper)) is also supported when you
+prefer a containerised server.
 
 Unlike Windows there is only one "path world" on macOS: POSIX paths and POSIX
 `.sh` hooks throughout. There is no WSL-vs-native split to get wrong.
@@ -31,6 +42,10 @@ normal Terminal.
   - `posix` — `sh` runs the bundled `.sh` script. The Docker wrapper's default.
 
   Set `AI_MEMORY_HOOK_PLATFORM` before wiring hooks to override the default.
+
+- The [menu bar app](#scenario-d-menu-bar-app) still needs `install-mcp` /
+  `install-hooks` from a shell; use the bundled binary inside the `.app` so
+  hook discovery sees the sibling `hooks/` tree.
 
 ## Scenario A: Prebuilt Release Binary (Recommended, No Toolchain)
 
@@ -174,10 +189,56 @@ symlink caution above (#546) does not apply here.
 The published Docker image includes both `linux/amd64` and `linux/arm64`, so
 Apple Silicon pulls the native arm64 image without `--platform linux/amd64`.
 
+## Scenario D: Menu bar app
+
+Use this when you want a self-contained macOS install: one `.app` that contains
+the `ai-memory` binary and `hooks/`, starts the existing LaunchAgent, and opens
+the surfaces the tool already has (`/web`, `ai-memory status`, `config.toml`,
+logs). It does not replace those tools with a second dashboard.
+
+From a source checkout (Rust 1.95 + Xcode / Swift 6):
+
+```bash
+./companions/ai-memory-macos/build.sh
+open "companions/ai-memory-macos/dist/AI Memory.app"
+```
+
+Drag `AI Memory.app` to `/Applications` so the LaunchAgent path stays stable
+across rebuilds. The menu extra has no Dock icon.
+
+1. **Install & Start Server** — runs bundled `ai-memory init` if
+   `~/Library/Application Support/ai-memory/config.toml` is missing, renders
+   `packaging/launchd/com.github.akitaonrails.ai-memory.plist`, and bootstraps
+   the same `com.github.akitaonrails.ai-memory` label as the hand-installed
+   LaunchAgent below. Do not skip this click; the app does not start the
+   server on first launch by itself.
+2. The status item is green when `GET /admin/status` succeeds, yellow when the
+   server is up but the LLM/embedding role is in error or the write queue is
+   non-empty, red when the server is unreachable.
+3. **Open Web UI**, **Show Status…**, **Open Config**, **Open Data Directory**,
+   and **Open Logs** call the existing browser UI, the bundled CLI, and Finder.
+
+Wire an agent with the **bundled** binary so `install-hooks` finds the sibling
+`hooks/` tree (#546):
+
+```bash
+BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
+"$BIN" install-mcp --client claude-code --apply
+"$BIN" install-hooks --agent claude-code --apply
+```
+
+Memory, config, models, and logs stay outside the bundle
+(`~/Library/Application Support/ai-memory` and `~/Library/Logs/ai-memory`).
+Replacing the `.app` is an update; it does not rewrite that tree. Details:
+[`companions/ai-memory-macos/README.md`](../companions/ai-memory-macos/README.md).
+
+Notarization and a Homebrew cask are not part of this companion yet.
+
 ## Run as a Login Service (launchd)
 
-Every scenario above leaves the server in the foreground: close that terminal
-and capture stops. The macOS counterpart of a systemd user unit is a
+Scenarios A–C leave the server in the foreground: close that terminal and
+capture stops. Scenario D already installs this LaunchAgent from **Install &
+Start Server**. The macOS counterpart of a systemd user unit is a
 **LaunchAgent** — a plist in `~/Library/LaunchAgents/` that the per-user
 launchd domain starts at login and restarts on failure. The repo ships one at
 `packaging/launchd/com.github.akitaonrails.ai-memory.plist`, and the macOS
@@ -329,6 +390,16 @@ wrapper's `posix` shell-script path does not. Re-run `install-hooks --agent
   reuse that stale copy instead and report success. Run `install-hooks` via
   the real extracted/built path instead of the symlink
   until that's fixed.
+- **No Dock icon after opening AI Memory.app:** that is the menu extra. Look
+  in the menu bar (brain / status symbol), not the Dock.
+- **Menu extra says "Runtime not bundled":** `swift run` from the package
+  does not stage `ai-memory` + `hooks/`. Use
+  `./companions/ai-memory-macos/build.sh`.
+- **Install & Start does not turn the item green:** check
+  `~/Library/Logs/ai-memory/stderr.log` and
+  `launchctl print gui/$(id -u)/com.github.akitaonrails.ai-memory`. The app
+  never writes into its own bundle; a missing `config.toml` is created under
+  `~/Library/Application Support/ai-memory` by bundled `ai-memory init`.
 
 ## Suggested Test Checklist
 
@@ -343,6 +414,11 @@ wrapper's `posix` shell-script path does not. Re-run `install-hooks --agent
 5. Launch the agent, call `memory_status`, send a prompt, then confirm capture
    (`ai-memory status` shows non-zero observations, or query the SQLite
    `observations` table).
+6. **Scenario D:** after **Install & Start Server**, the menu extra is green;
+   **Open Web UI** loads `http://127.0.0.1:49374/web`;
+   `launchctl print gui/$(id -u)/com.github.akitaonrails.ai-memory` shows
+   `state = running`; replacing the `.app` leaves
+   `~/Library/Application Support/ai-memory` untouched.
 
 Report which scenario you used, your chip (Apple Silicon / Intel), the agent and
 version, and whether hooks executed or failed with a connect/resolve error.

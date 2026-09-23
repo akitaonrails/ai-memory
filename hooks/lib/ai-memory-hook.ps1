@@ -308,7 +308,10 @@ function Invoke-AiMemoryHook {
         # first prompt — parity with Claude's once-per-SessionStart brief).
         # Later fetches keep the handoff but drop the briefing params so the
         # server does not recompose the brief per prompt.
-        [switch] $BriefingOncePerSession
+        [switch] $BriefingOncePerSession,
+        # Grok PostToolUse: wrap a fetched handoff as additionalContext and
+        # only fetch once per session. Other events must not set this.
+        [switch] $GrokPostTool
     )
 
     $Server = if ($env:AI_MEMORY_HOOK_URL) { $env:AI_MEMORY_HOOK_URL } else { "http://127.0.0.1:49374" }
@@ -362,6 +365,7 @@ function Invoke-AiMemoryHook {
 
     if ($FetchHandoff) {
         $NativeSessionQS = ""
+        $NativeSessionId = $null
         try {
             $ParsedPayload = $Payload | ConvertFrom-Json
             $NativeSessionId = @(
@@ -375,6 +379,16 @@ function Invoke-AiMemoryHook {
                 $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"
             }
         } catch {
+        }
+        $Shown = $null
+        if ($GrokPostTool) {
+            $ShownKey = [string]$NativeSessionId
+            if (-not $ShownKey) { $ShownKey = "grok-post-$PID" }
+            $Shown = Get-AiMemoryBriefedFile -Key "post-$ShownKey"
+            if (Test-Path $Shown -PathType Leaf) {
+                [Console]::Out.Write("{}")
+                return
+            }
         }
         # Once-per-session briefing gate. Marker files are created only for
         # repositories that opt in. Prefer the native session id when Kimi
@@ -396,6 +410,9 @@ function Invoke-AiMemoryHook {
                 }
             }
         }
+        if ($GrokPostTool -and -not $BriefQS) {
+            $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
+        }
         try {
             $Response = Invoke-WebRequest `
                 -UseBasicParsing `
@@ -403,7 +420,15 @@ function Invoke-AiMemoryHook {
                 -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS" `
                 -Headers $Headers
             if ($null -ne $Response -and $Response.Content) {
-                if ($AntigravityPreInvocationOutput) {
+                if ($GrokPostTool) {
+                    $Wrapped = @{
+                        hookSpecificOutput = @{
+                            hookEventName = "PostToolUse"
+                            additionalContext = $Response.Content
+                        }
+                    }
+                    [Console]::Out.Write(($Wrapped | ConvertTo-Json -Depth 5 -Compress))
+                } elseif ($AntigravityPreInvocationOutput) {
                     $Payload = @{
                         injectSteps = @(@{ ephemeralMessage = $Response.Content })
                     }
@@ -411,13 +436,16 @@ function Invoke-AiMemoryHook {
                 } else {
                     [Console]::Out.Write($Response.Content)
                 }
-            } elseif ($AntigravityPreInvocationOutput) {
+            } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool) {
                 [Console]::Out.Write("{}")
             }
         } catch {
-            if ($AntigravityPreInvocationOutput) {
+            if ($AntigravityPreInvocationOutput -or $GrokPostTool) {
                 [Console]::Out.Write("{}")
             }
+        }
+        if ($Shown) {
+            Set-AiMemoryBriefed -Path $Shown
         }
         # Mark the session as briefed only AFTER the GET completed —
         # success or error (fail-open: with the server down, re-sending the

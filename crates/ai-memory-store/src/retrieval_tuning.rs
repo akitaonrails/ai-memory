@@ -36,6 +36,19 @@ pub struct RetrievalTuning {
     /// Add the L0 abstract-embedding stream to the RRF fusion. Reads
     /// `page_abstract_embeddings`; contributes nothing while it is empty.
     pub abstract_vectors: bool,
+    /// Weight of the belief-strength confidence factor folded into
+    /// [`crate::belief`] page authority (P2,
+    /// `docs/design-hindsight-borrowings.md` §3). `0.0` (the default) leaves
+    /// ranking byte-identical to a store that never heard of belief strength:
+    /// no belief query runs and the authority factor is untouched. When
+    /// positive, a page's derived `confidence` adds up to `weight * confidence`
+    /// to its authority factor, still clamped inside the existing `[0.55,
+    /// 1.50]` bounds — one more bounded factor, never a new multiplier tower.
+    ///
+    /// Ships OFF: this changes retrieval ranking, so per the design it must not
+    /// default on without a positive R2 delta (retrieval-triple / QA), not yet
+    /// performed.
+    pub belief_authority_weight: f64,
 }
 
 impl Default for RetrievalTuning {
@@ -50,6 +63,9 @@ impl Default for RetrievalTuning {
             // matters more than session recall.
             session_recall_bonus: 0.25,
             abstract_vectors: false,
+            // OFF by default: folding belief confidence into ranking is
+            // R2-gated (see the field doc).
+            belief_authority_weight: 0.0,
         }
     }
 }
@@ -140,6 +156,7 @@ mod tests {
         let t = RetrievalTuning::default();
         assert!(!t.session_recall_routing);
         assert!(!t.abstract_vectors);
+        assert_eq!(t.belief_authority_weight, 0.0);
     }
 
     #[test]

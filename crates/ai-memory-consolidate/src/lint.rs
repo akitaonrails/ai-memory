@@ -17,7 +17,9 @@
 /// at compile time from `prompts/lint_system.md`.
 const LINT_SYSTEM_PROMPT: &str = include_str!("../prompts/lint_system.md");
 
-use ai_memory_core::{PagePath, ProjectId, Tier, WorkspaceId};
+use crate::EmbeddingCoord;
+use crate::cold_cluster::cosine_distance;
+use ai_memory_core::{PageId, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, Role, complete_structured};
 use ai_memory_store::{DecayCandidate, ReaderPool};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
@@ -129,7 +131,9 @@ pub fn stale_days_for(lambda: f64) -> f64 {
 /// A struct rather than three positional parameters: `false, false` at a
 /// call site said nothing about which switch was which, and the threshold
 /// input has to travel alongside them.
-#[derive(Debug, Clone, Copy)]
+///
+/// Not `Copy`: the optional embedding coordinate carries owned strings.
+#[derive(Debug, Clone)]
 pub struct LintOptions {
     /// When `true`, no `_lint/report.md` page is written (and no legacy
     /// dated reports are pruned).
@@ -140,6 +144,14 @@ pub struct LintOptions {
     /// The operator's `[decay] lambda`. The stale threshold is derived from
     /// it — see [`stale_days_for`].
     pub decay_lambda: f64,
+    /// The running embedder's `(provider, model, dim)` triple, or `None` when
+    /// no embedder is configured. It drives the zero-LLM contradiction
+    /// detector (A5): the detector loads already-stored vectors under this
+    /// triple and flags pages in the 0.4–0.75 cosine-similarity band. `None`
+    /// makes that pass a clean no-op. User-invoked lint paths supply it; the
+    /// automatic scheduled lint passes `None` — detection is on for the
+    /// user-invoked operation, not the background sweep.
+    pub embedding: Option<EmbeddingCoord>,
 }
 
 impl Default for LintOptions {
@@ -148,6 +160,7 @@ impl Default for LintOptions {
             dry_run: false,
             use_llm: true,
             decay_lambda: 0.02,
+            embedding: None,
         }
     }
 }
@@ -177,6 +190,7 @@ pub async fn run_lint(
         dry_run,
         use_llm,
         decay_lambda,
+        embedding,
     } = options;
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
     let mut findings = rule_based_findings(&candidates, stale_days_for(decay_lambda));
@@ -267,6 +281,32 @@ pub async fn run_lint(
             pages: vec![flagged.path.clone()],
             detail: None,
         });
+    }
+
+    // Zero-LLM detected contradictions (A5): pages whose embeddings sit in the
+    // 0.4–0.75 cosine-similarity band are "same topic, not a near-duplicate" —
+    // the shape of a likely conflict. This DETECTS contradictions beside the
+    // declared-`contradicts`-edge finding above, using only stored vectors and
+    // cosine (invariant #13 — no provider call). It emits advisory findings
+    // (invariant #16) and never persists an edge.
+    //
+    // Why no persistence / no migration: a `contradicts` edge would live in the
+    // `links` table, but `links` rows are BODY-DERIVED — `replace_links_in_tx`
+    // deletes and re-inserts every page's links from its `[[...]]` body on each
+    // write. A programmatically inserted edge would be silently wiped on the
+    // next rewrite of that page, a fragile, misleading persistence path. So A5
+    // is a lint-time detector: no links writer, no schema change.
+    match detected_contradiction_pass(
+        reader,
+        workspace_id,
+        project_id,
+        &candidates,
+        embedding.as_ref(),
+    )
+    .await
+    {
+        Ok(mut extra) => findings.append(&mut extra),
+        Err(e) => warn!(error = %e, "lint detected-contradiction pass failed"),
     }
 
     if use_llm && let Some(provider) = llm {
@@ -409,6 +449,165 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
     }
 
     out
+}
+
+// ── A5: zero-LLM contradiction detection (cosine-similarity band) ──────────
+
+/// Lower edge (inclusive) of the likely-contradiction cosine-similarity band.
+/// Below this two pages are simply unrelated (different topics).
+const CONTRADICTION_SIM_LOW: f32 = 0.4;
+/// Upper edge (exclusive) of the band. At or above this two pages are a
+/// near-duplicate — A3 cold-cluster dedup's territory, not a contradiction.
+/// The band (mcp-memory-service's heuristic) is "same topic, not a duplicate":
+/// the shape of two pages that discuss the same thing while likely disagreeing.
+const CONTRADICTION_SIM_HIGH: f32 = 0.75;
+/// Cap on cold pages fed to the pairwise scan. The scan is O(N²) cosine ops, so
+/// this bounds it hard on the already-bounded cold set (invariant #2 — one
+/// embeddings load, no per-page N+1).
+const CONTRADICTION_MAX_PAGES: usize = 60;
+/// Cap on contradiction findings emitted, so a pathological corpus that lands
+/// many pairs in the band cannot flood the advisory report.
+const CONTRADICTION_MAX_FINDINGS: usize = 25;
+
+/// Whether a cosine similarity falls in the likely-contradiction band.
+#[must_use]
+fn in_contradiction_band(similarity: f32) -> bool {
+    (CONTRADICTION_SIM_LOW..CONTRADICTION_SIM_HIGH).contains(&similarity)
+}
+
+/// One page eligible for the band scan: its path, last-updated microseconds
+/// (for the newer-wins advisory), and its stored embedding.
+struct BandCandidate {
+    path: String,
+    updated_at_us: i64,
+    vector: Vec<f32>,
+}
+
+/// Pure pairwise band scan over a bounded, deterministically-ordered set of
+/// pages. Emits an advisory `contradiction` finding for each pair whose cosine
+/// similarity is in `[0.4, 0.75)`, capped at `max_findings`.
+///
+/// Timestamp resolution is ADVISORY only: the message says the newer page
+/// supersedes on a timestamp basis, but the lint never deletes or edits
+/// anything (invariant #16). Pairs are visited in `(i, j)` order so the same
+/// input always yields the same capped subset.
+fn detected_contradiction_findings(
+    pages: &[BandCandidate],
+    max_findings: usize,
+) -> Vec<LintFinding> {
+    let mut findings = Vec::new();
+    'outer: for i in 0..pages.len() {
+        for j in (i + 1)..pages.len() {
+            let similarity = 1.0 - cosine_distance(&pages[i].vector, &pages[j].vector);
+            if !in_contradiction_band(similarity) {
+                continue;
+            }
+            let (a, b) = (&pages[i], &pages[j]);
+            // Newer = larger updated_at_us. Ties resolve to `a` (the lexically
+            // earlier path, since the caller sorts by path) for determinism.
+            let (newer, older) = if a.updated_at_us >= b.updated_at_us {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let newer_ts = Timestamp::from_microsecond(newer.updated_at_us)
+                .map(|t| t.to_zoned(TimeZone::UTC).strftime("%Y-%m-%d").to_string())
+                .unwrap_or_else(|_| "unknown".into());
+            findings.push(LintFinding {
+                kind: "contradiction".into(),
+                severity: "info".into(),
+                message: format!(
+                    "Pages {} and {} are similar (cosine {similarity:.2}) but not a \
+                     duplicate — likely conflicting. The newer page ({}, updated \
+                     {newer_ts}) supersedes {} on a timestamp basis; reconcile them.",
+                    a.path, b.path, newer.path, older.path,
+                ),
+                pages: vec![a.path.clone(), b.path.clone()],
+                detail: None,
+            });
+            if findings.len() >= max_findings {
+                break 'outer;
+            }
+        }
+    }
+    findings
+}
+
+/// Load stored embeddings for the bounded cold knowledge-page set and flag
+/// pairs in the contradiction band.
+///
+/// A clean no-op (empty, never an error) when no embedder is configured
+/// (`embedding` is `None`) or no stored vectors match the cold set — the
+/// detector reads only already-stored embeddings and never calls a provider
+/// (invariant #13).
+async fn detected_contradiction_pass(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    candidates: &[DecayCandidate],
+    embedding: Option<&EmbeddingCoord>,
+) -> Result<Vec<LintFinding>, LintError> {
+    let Some(coord) = embedding else {
+        return Ok(Vec::new());
+    };
+
+    // Bound the set BEFORE loading vectors. Contradictions matter on the
+    // knowledge pages a user compounds (semantic / procedural), not session
+    // logs or the lint report itself. "Coldest first" = fewest accesses, then
+    // oldest update, so a large corpus is trimmed to its most-stale knowledge.
+    let mut eligible: Vec<&DecayCandidate> = candidates
+        .iter()
+        .filter(|c| matches!(c.tier, Tier::Semantic | Tier::Procedural))
+        .filter(|c| !c.path.as_str().starts_with("_lint/"))
+        .collect();
+    eligible.sort_by(|a, b| {
+        a.access_count
+            .cmp(&b.access_count)
+            .then(a.updated_at_us.cmp(&b.updated_at_us))
+            .then_with(|| a.path.as_str().cmp(b.path.as_str()))
+    });
+    eligible.truncate(CONTRADICTION_MAX_PAGES);
+    if eligible.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let by_id: std::collections::HashMap<PageId, &DecayCandidate> =
+        eligible.iter().map(|c| (c.id, *c)).collect();
+
+    // One bounded embeddings load (invariant #2). Mismatched-triple rows are
+    // skipped inside the store; a missing embedder yields no rows.
+    let embeddings = reader
+        .load_embeddings(
+            workspace_id,
+            project_id,
+            coord.provider.clone(),
+            coord.model.clone(),
+            coord.dim,
+        )
+        .await?;
+
+    let mut pages: Vec<BandCandidate> = Vec::new();
+    for e in &embeddings {
+        if let Some(c) = by_id.get(&e.id) {
+            pages.push(BandCandidate {
+                path: c.path.as_str().to_string(),
+                updated_at_us: c.updated_at_us,
+                vector: e.vector.clone(),
+            });
+        }
+    }
+    // No stored vectors for the cold set ⇒ clean no-op.
+    if pages.len() < 2 {
+        return Ok(Vec::new());
+    }
+    // Deterministic input order regardless of the DB row order load_embeddings
+    // returned, so findings and the cap are reproducible.
+    pages.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(detected_contradiction_findings(
+        &pages,
+        CONTRADICTION_MAX_FINDINGS,
+    ))
 }
 
 async fn contradiction_pass(
@@ -670,6 +869,7 @@ mod tests {
             frontmatter_json: r#"{"title": "A session nobody reopened"}"#.into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
 
         let default_lambda =
@@ -707,6 +907,7 @@ mod tests {
             frontmatter_json: "{}".into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         }];
         let findings = rule_based_findings(&candidates, STALE_DAYS);
         assert_eq!(findings.len(), 1);
@@ -726,6 +927,7 @@ mod tests {
             frontmatter_json: r#"{"title": "Karpathy Wiki"}"#.into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let b = DecayCandidate {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
@@ -752,6 +954,7 @@ mod tests {
             frontmatter_json: r#"{"title": ""}"#.into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let blank = DecayCandidate {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
@@ -781,6 +984,7 @@ mod tests {
                 .into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let findings = rule_based_findings(&[candidate], STALE_DAYS);
         let rules: Vec<_> = findings
@@ -807,6 +1011,7 @@ mod tests {
             frontmatter_json: "{}".into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let findings = rule_based_findings(&[candidate], STALE_DAYS);
         assert!(
@@ -831,6 +1036,7 @@ mod tests {
             frontmatter_json: r#"{"title": "Karpathy Wiki", "kind": "fact"}"#.into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let findings = rule_based_findings(&[candidate], STALE_DAYS);
         assert!(
@@ -887,6 +1093,7 @@ mod tests {
             frontmatter_json: "{}".into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         }];
         // rule_based_findings is the exact code path that `use_llm=false`
         // keeps active. Confirm it still fires.
@@ -894,6 +1101,130 @@ mod tests {
         assert!(
             findings.iter().any(|f| f.kind == "stale"),
             "rule-based stale finding must be present regardless of use_llm flag",
+        );
+    }
+
+    // ── A5 zero-LLM detected contradictions (cosine-similarity band) ──────
+
+    /// A pair whose similarity sits in the 0.4–0.75 band is a likely
+    /// contradiction; a near-duplicate (≥0.75, A3's territory) and an
+    /// unrelated pair (<0.4) are not.
+    #[test]
+    fn contradiction_band_predicate() {
+        assert!(in_contradiction_band(0.6), "0.6 is the band's centre");
+        assert!(in_contradiction_band(0.4), "0.4 is the inclusive low edge");
+        assert!(
+            !in_contradiction_band(0.75),
+            "0.75 is a near-duplicate (A3 dedup), not a contradiction"
+        );
+        assert!(
+            !in_contradiction_band(0.85),
+            "0.85 is a near-duplicate, not a contradiction"
+        );
+        assert!(!in_contradiction_band(0.2), "0.2 is unrelated");
+        assert!(!in_contradiction_band(1.0), "identical is a duplicate");
+    }
+
+    // Unit-length 2-D vectors: cosine similarity between them equals the dot
+    // product, so a chosen second component pins the similarity exactly.
+    fn band(path: &str, updated_at_us: i64, vector: Vec<f32>) -> BandCandidate {
+        BandCandidate {
+            path: path.to_string(),
+            updated_at_us,
+            vector,
+        }
+    }
+
+    /// Two pages at cosine 0.6 ⇒ exactly one contradiction finding naming both,
+    /// with newer-wins advice pointing at the more recently updated page.
+    #[test]
+    fn band_scan_flags_a_mid_band_pair_newer_wins() {
+        let pages = vec![
+            band("concepts/old-claim.md", 1_000, vec![1.0, 0.0]),
+            // dot([1,0],[0.6,0.8]) = 0.6 — squarely in the band.
+            band("concepts/new-claim.md", 9_000, vec![0.6, 0.8]),
+        ];
+        let findings = detected_contradiction_findings(&pages, CONTRADICTION_MAX_FINDINGS);
+        assert_eq!(
+            findings.len(),
+            1,
+            "one band pair ⇒ one finding: {findings:?}"
+        );
+        let f = &findings[0];
+        assert_eq!(f.kind, "contradiction");
+        assert_eq!(f.severity, "info");
+        assert_eq!(f.pages.len(), 2);
+        assert!(f.pages.contains(&"concepts/old-claim.md".to_string()));
+        assert!(f.pages.contains(&"concepts/new-claim.md".to_string()));
+        // Newer (larger updated_at_us) supersedes on a timestamp basis.
+        assert!(
+            f.message.contains("concepts/new-claim.md") && f.message.contains("supersedes"),
+            "newer page wins advisory: {}",
+            f.message
+        );
+    }
+
+    /// A near-duplicate pair (cosine ≈ 0.98) is A3 dedup territory, never a
+    /// contradiction finding.
+    #[test]
+    fn band_scan_ignores_near_duplicates() {
+        let pages = vec![
+            band("concepts/a.md", 1, vec![1.0, 0.0]),
+            // dot ≈ 0.98 — a near-duplicate, above the band.
+            band("concepts/b.md", 2, vec![0.98, 0.199]),
+        ];
+        let findings = detected_contradiction_findings(&pages, CONTRADICTION_MAX_FINDINGS);
+        assert!(
+            findings.is_empty(),
+            "near-duplicate must not be flagged as a contradiction: {findings:?}"
+        );
+    }
+
+    /// An unrelated pair (cosine ≈ 0.2) is below the band, never flagged.
+    #[test]
+    fn band_scan_ignores_unrelated_pairs() {
+        let pages = vec![
+            band("concepts/a.md", 1, vec![1.0, 0.0]),
+            band("concepts/b.md", 2, vec![0.2, 0.9798]),
+        ];
+        let findings = detected_contradiction_findings(&pages, CONTRADICTION_MAX_FINDINGS);
+        assert!(
+            findings.is_empty(),
+            "unrelated pair not flagged: {findings:?}"
+        );
+    }
+
+    /// Empty and single-page inputs produce nothing (no pair to compare).
+    #[test]
+    fn band_scan_handles_empty_and_single() {
+        assert!(detected_contradiction_findings(&[], CONTRADICTION_MAX_FINDINGS).is_empty());
+        let one = vec![band("concepts/a.md", 1, vec![1.0, 0.0])];
+        assert!(detected_contradiction_findings(&one, CONTRADICTION_MAX_FINDINGS).is_empty());
+    }
+
+    /// The findings cap is honoured: two in-band pairs, cap of 1 ⇒ one finding.
+    #[test]
+    fn band_scan_respects_the_findings_cap() {
+        // Three unit vectors at 0°, 55°, 110°. Adjacent pairs differ by 55°
+        // (cos 55° ≈ 0.57 — in band); the 0°/110° pair differs by 110°
+        // (cos ≈ -0.34 — out of band). So exactly two candidate findings.
+        let a = (0.0_f64).to_radians();
+        let b = (55.0_f64).to_radians();
+        let c = (110.0_f64).to_radians();
+        let pages = vec![
+            band("concepts/a.md", 1, vec![a.cos() as f32, a.sin() as f32]),
+            band("concepts/b.md", 2, vec![b.cos() as f32, b.sin() as f32]),
+            band("concepts/c.md", 3, vec![c.cos() as f32, c.sin() as f32]),
+        ];
+        assert_eq!(
+            detected_contradiction_findings(&pages, CONTRADICTION_MAX_FINDINGS).len(),
+            2,
+            "two adjacent pairs are in band"
+        );
+        assert_eq!(
+            detected_contradiction_findings(&pages, 1).len(),
+            1,
+            "a cap of 1 truncates the two candidate pairs"
         );
     }
 }

@@ -36,6 +36,12 @@ pub struct ExperienceConfig {
     pub min_new_sessions: u64,
     /// Per-session-page character cap in the prompt.
     pub max_session_page_chars: usize,
+    /// A4 entropy / boilerplate pre-filter (docs/design-memory-aging.md §A4).
+    /// Off by default: a low-information session page is only skipped from the
+    /// prompt when an operator turns it on, so consolidation output is otherwise
+    /// unchanged. Advisory (invariant #16): a skipped page is not consolidated,
+    /// never deleted.
+    pub entropy_filter: crate::entropy_filter::EntropyFilterConfig,
 }
 
 impl Default for ExperienceConfig {
@@ -44,6 +50,7 @@ impl Default for ExperienceConfig {
             sessions: 10,
             min_new_sessions: 5,
             max_session_page_chars: 6_000,
+            entropy_filter: crate::entropy_filter::EntropyFilterConfig::default(),
         }
     }
 }
@@ -91,6 +98,28 @@ pub async fn run_experience_review(
         }
     }
 
+    // A4 entropy / boilerplate pre-filter: drop low-information session pages
+    // BEFORE they reach the consolidation prompt (and thus the eval gate and
+    // `apply_batch`). Skipped pages are simply not consolidated — never deleted
+    // (invariant #16). Off by default, so this changes nothing unless enabled.
+    let mut entropy_skipped = 0usize;
+    if experience.entropy_filter.enabled {
+        session_pages.retain(|(_, path, page)| {
+            match crate::entropy_filter::classify(&page.body, &experience.entropy_filter) {
+                crate::entropy_filter::FilterVerdict::Keep => true,
+                crate::entropy_filter::FilterVerdict::Skip(reason) => {
+                    entropy_skipped += 1;
+                    tracing::debug!(
+                        %path,
+                        reason = reason.as_str(),
+                        "experience pass: skipping low-information session page from consolidation"
+                    );
+                    false
+                }
+            }
+        });
+    }
+
     let label = format!("experience:{}-sessions", session_pages.len());
     if (session_pages.len() as u64) < experience.min_new_sessions {
         return Ok(AutoImproveReport {
@@ -134,6 +163,11 @@ pub async fn run_experience_review(
     let rejection_context = load_rejection_context(reader, workspace_id, project_id, &cfg).await?;
 
     let mut warnings = Vec::new();
+    if entropy_skipped > 0 {
+        warnings.push(format!(
+            "entropy filter skipped {entropy_skipped} low-information session page(s) from consolidation"
+        ));
+    }
     let mut prompt = String::new();
     prompt.push_str(
         "You are reviewing MULTIPLE session summaries of one project side \

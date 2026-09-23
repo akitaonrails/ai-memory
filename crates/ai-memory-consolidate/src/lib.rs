@@ -12,11 +12,17 @@ pub mod auto_improve;
 pub mod auto_improve_schedule;
 pub mod auto_improve_telemetry;
 pub mod bootstrap;
+pub mod cold_cluster;
+pub mod compaction;
 pub mod consolidator;
 pub mod curator;
+pub mod dream;
 pub mod embed;
+pub mod entropy_filter;
 pub mod experience;
+pub mod keep_tokens;
 pub mod lint;
+mod path_sanitize;
 pub mod projection;
 pub mod sweep;
 pub mod types;
@@ -32,9 +38,9 @@ pub use auto_improve::{
     DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS, DEFAULT_AUTO_IMPROVE_MAX_REJECTION_CONTEXT,
     DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS, DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE,
     DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS, DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS,
-    DEFAULT_AUTO_IMPROVE_PENDING_PATH, DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR,
-    DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS, default_auto_improve_eval_targets,
-    run_auto_improve_review,
+    DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES, DEFAULT_AUTO_IMPROVE_PENDING_PATH,
+    DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR, DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS,
+    default_auto_improve_eval_targets, run_auto_improve_review,
 };
 pub use auto_improve_schedule::{
     ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome,
@@ -52,6 +58,8 @@ pub use bootstrap::{
     derive_project_name, discover_main_repo_root, discover_repo_root, effective_chunk_budget,
     plan_bootstrap_chunks, prune_sources_to_budget,
 };
+pub use cold_cluster::{adaptive_eps, cosine_distance, dbscan};
+pub use compaction::build_compacted_markdown;
 pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult,
     DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS, DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
@@ -61,14 +69,23 @@ pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
     run_curator_report, run_curator_report_with_breadth,
 };
+pub use dream::{
+    ActivityClock, DEFAULT_DREAM_IDLE_WINDOW_SECS, DEFAULT_DREAM_MAX_CLUSTERS_PER_RUN,
+    DEFAULT_DREAM_MIN_COLD_PAGES, DreamCancel, DreamConfig, DreamError, DreamMerge,
+    DreamMergedPage, DreamReport, dream_idle_ready, run_dream_pass,
+};
 pub use embed::{
     EmbedBackfillCounts, EmbedBackfillError, EmbedBackfillOptions, run_embedding_backfill,
 };
+pub use entropy_filter::{EntropyFilterConfig, FilterVerdict, SkipReason, classify};
 pub use experience::{EXPERIENCE_SYSTEM_PROMPT, ExperienceConfig, run_experience_review};
+pub use keep_tokens::mine_keep_tokens;
 pub use lint::{LintError, LintFinding, LintOptions, LintReport, run_lint, stale_days_for};
 pub use sweep::{
-    DEFAULT_OBSERVATION_PRUNE_BATCH, EvictedPage, ObservationRetention, SweepError, SweepReport,
-    run_sweep, run_sweep_with_breadth, run_sweep_with_options,
+    ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
+    MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,
+    run_sweep_with_breadth, run_sweep_with_compaction, run_sweep_with_hygiene,
+    run_sweep_with_options,
 };
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,

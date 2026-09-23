@@ -22,6 +22,9 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
+# A2 keep-token miner: file paths / URLs / code spans / error codes, compiled
+# once via `LazyLock`. Same crate + version the core sanitizer already uses.
+regex.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true

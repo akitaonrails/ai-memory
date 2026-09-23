@@ -9,7 +9,9 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use ai_memory_core::{ActiveProject, ActiveProjectLookup, ActorKey, ProjectId, WorkspaceId};
+use ai_memory_core::{
+    ActiveProject, ActiveProjectLookup, ActorKey, ProjectId, ReadPointer, WorkspaceId,
+};
 
 use crate::error::StoreError;
 use crate::{ReaderPool, WriterHandle};
@@ -57,6 +59,65 @@ impl ResolvedScope {
     #[must_use]
     pub fn as_tuple(self) -> (WorkspaceId, ProjectId) {
         (self.workspace_id, self.project_id)
+    }
+}
+
+/// Where a resolved read scope came from.
+///
+/// An unscoped read never fails: it degrades through the pointer, the startup
+/// seed and the server default. That keeps reads working, and it also means a
+/// caller cannot tell a correct answer from one about a different project
+/// (#757). Surfaces report this next to the scope they answered from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScopeSource {
+    /// The caller named the project (with or without its workspace).
+    Explicit,
+    /// The caller's own keyed active-project entry — its hook session.
+    Session,
+    /// The process-wide slot: whichever project published last. The answer
+    /// for a caller with no coordinate, and for every caller in `single` mode.
+    SharedSlot,
+    /// The startup seed (#678): the most recently active project on disk,
+    /// standing in until the first hook event after a restart.
+    StartupSeed,
+    /// The server default, because no pointer information exists at all.
+    Default,
+    /// The server default, because the caller's coordinate matched no hook
+    /// session — a static MCP client whose transport session id is not a
+    /// lifecycle-hook session id.
+    DefaultAfterMismatch,
+}
+
+impl ScopeSource {
+    /// Stable snake_case label for responses and logs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeSource::Explicit => "explicit",
+            ScopeSource::Session => "session",
+            ScopeSource::SharedSlot => "shared_slot",
+            ScopeSource::StartupSeed => "startup_seed",
+            ScopeSource::Default => "default",
+            ScopeSource::DefaultAfterMismatch => "default_after_mismatch",
+        }
+    }
+
+    /// True when the scope is a guess standing in for a caller the server
+    /// could not identify, rather than information about that caller. The
+    /// shared slot and the plain default are how pointer-less installs have
+    /// always worked, so they do not count.
+    #[must_use]
+    pub fn is_fallback(self) -> bool {
+        matches!(
+            self,
+            ScopeSource::StartupSeed | ScopeSource::DefaultAfterMismatch
+        )
+    }
+}
+
+impl fmt::Display for ScopeSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -371,13 +432,28 @@ impl<'a> ScopeResolver<'a> {
         explicit_project: Option<&str>,
         actor: &ActorKey,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
+        self.resolve_read_args_traced(explicit_workspace, explicit_project, actor)
+            .await
+            .map(|(scope, _)| scope)
+    }
+
+    /// [`Self::resolve_read_args`], plus where the scope came from.
+    pub async fn resolve_read_args_traced(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ActorKey,
+    ) -> Result<(ResolvedScope, ScopeSource), ScopeResolutionError> {
         match (
             trimmed_opt(explicit_workspace),
             trimmed_opt(explicit_project),
         ) {
-            (Some(workspace), Some(project)) => self.lookup_existing(workspace, project).await,
+            (Some(workspace), Some(project)) => self
+                .lookup_existing(workspace, project)
+                .await
+                .map(|scope| (scope, ScopeSource::Explicit)),
             (Some(_), None) => Err(ScopeResolutionError::WorkspaceProjectPairRequired),
-            (None, project) => self.resolve_current_or_project(project, actor).await,
+            (None, project) => self.resolve_current_or_project_traced(project, actor).await,
         }
     }
 
@@ -388,13 +464,33 @@ impl<'a> ScopeResolver<'a> {
         explicit_project: Option<&str>,
         actor: &ActorKey,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
-        // Read path, so `get_for_read`: it adds the startup seed for a caller
+        self.resolve_current_or_project_traced(explicit_project, actor)
+            .await
+            .map(|(scope, _)| scope)
+    }
+
+    async fn resolve_current_or_project_traced(
+        &self,
+        explicit_project: Option<&str>,
+        actor: &ActorKey,
+    ) -> Result<(ResolvedScope, ScopeSource), ScopeResolutionError> {
+        // Read path, so `read_pointer`: it adds the startup seed for a caller
         // the pointer knows nothing about, which is every caller in the window
         // between a restart and the first hook event (#678). `resolve_write_args`
         // below deliberately stays on `get_for` / `lookup_for` — a write must
         // not be attributed to a project reconstructed from history the caller
         // never named.
-        let active = self.active_project.and_then(|a| a.get_for_read(actor));
+        let pointer = self
+            .active_project
+            .map_or(ReadPointer::Unset, |a| a.read_pointer(actor));
+        let source = match pointer {
+            ReadPointer::Session(..) => ScopeSource::Session,
+            ReadPointer::SharedSlot(..) => ScopeSource::SharedSlot,
+            ReadPointer::StartupSeed(..) => ScopeSource::StartupSeed,
+            ReadPointer::Mismatch => ScopeSource::DefaultAfterMismatch,
+            ReadPointer::Unset => ScopeSource::Default,
+        };
+        let active = pointer.ids();
         if let Some(project) = trimmed_opt(explicit_project) {
             if let Some((active_ws, _)) = active
                 && let Some(project_id) = self
@@ -402,10 +498,11 @@ impl<'a> ScopeResolver<'a> {
                     .find_project(active_ws, project.to_owned())
                     .await?
             {
-                return Ok(ResolvedScope {
+                let scope = ResolvedScope {
                     workspace_id: active_ws,
                     project_id,
-                });
+                };
+                return Ok((scope, ScopeSource::Explicit));
             }
             if active.map(|(ws, _)| ws) != Some(self.default_workspace_id)
                 && let Some(project_id) = self
@@ -413,10 +510,11 @@ impl<'a> ScopeResolver<'a> {
                     .find_project(self.default_workspace_id, project.to_owned())
                     .await?
             {
-                return Ok(ResolvedScope {
+                let scope = ResolvedScope {
                     workspace_id: self.default_workspace_id,
                     project_id,
-                });
+                };
+                return Ok((scope, ScopeSource::Explicit));
             }
             return Err(ScopeResolutionError::ProjectNotFoundInActiveOrDefault {
                 project: project.to_owned(),
@@ -424,10 +522,11 @@ impl<'a> ScopeResolver<'a> {
         }
         let (workspace_id, project_id) =
             active.unwrap_or((self.default_workspace_id, self.default_project_id));
-        Ok(ResolvedScope {
+        let scope = ResolvedScope {
             workspace_id,
             project_id,
-        })
+        };
+        Ok((scope, source))
     }
 
     /// Resolve a write target. Explicit names may create the workspace/project;
@@ -1206,5 +1305,145 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(named.as_tuple(), (team_ws, team_proj));
+    }
+
+    #[tokio::test]
+    async fn traced_read_resolution_reports_where_the_scope_came_from() {
+        // #757: every row is a read that succeeds, so the source is the only
+        // way a caller can tell an answer about its own project from one about
+        // somebody else's.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, default_ws, default_proj, team_ws, team_proj) = scoped_fixture(&tmp).await;
+        let hook_session = ActorKey {
+            user: None,
+            session_id: Some("hook-session".into()),
+        };
+        let static_client = ActorKey {
+            user: None,
+            session_id: Some("mcp-transport-session".into()),
+        };
+
+        let unset = ActiveProject::new();
+        let seeded = ActiveProject::new();
+        seeded.seed_read_fallback(team_ws, team_proj);
+        let live = ActiveProject::new();
+        live.set_for(&hook_session, team_ws, team_proj, false);
+
+        struct Case<'a> {
+            name: &'static str,
+            pointer: Option<&'a ActiveProject>,
+            workspace: Option<&'static str>,
+            project: Option<&'static str>,
+            actor: &'a ActorKey,
+            expected: (WorkspaceId, ProjectId),
+            source: ScopeSource,
+        }
+        let cases = [
+            Case {
+                name: "explicit pair",
+                pointer: Some(&live),
+                workspace: Some("default"),
+                project: Some("scratch"),
+                actor: &static_client,
+                expected: (default_ws, default_proj),
+                source: ScopeSource::Explicit,
+            },
+            Case {
+                name: "project only",
+                pointer: Some(&live),
+                workspace: None,
+                project: Some("real-work"),
+                actor: &hook_session,
+                expected: (team_ws, team_proj),
+                source: ScopeSource::Explicit,
+            },
+            Case {
+                name: "caller's own hook session",
+                pointer: Some(&live),
+                workspace: None,
+                project: None,
+                actor: &hook_session,
+                expected: (team_ws, team_proj),
+                source: ScopeSource::Session,
+            },
+            Case {
+                name: "static client on a live install",
+                pointer: Some(&live),
+                workspace: None,
+                project: None,
+                actor: &static_client,
+                expected: (default_ws, default_proj),
+                source: ScopeSource::DefaultAfterMismatch,
+            },
+            Case {
+                name: "caller with no coordinate",
+                pointer: Some(&live),
+                workspace: None,
+                project: None,
+                actor: &ActorKey::default(),
+                expected: (team_ws, team_proj),
+                source: ScopeSource::SharedSlot,
+            },
+            Case {
+                name: "restart window",
+                pointer: Some(&seeded),
+                workspace: None,
+                project: None,
+                actor: &static_client,
+                expected: (team_ws, team_proj),
+                source: ScopeSource::StartupSeed,
+            },
+            Case {
+                name: "no pointer information",
+                pointer: Some(&unset),
+                workspace: None,
+                project: None,
+                actor: &static_client,
+                expected: (default_ws, default_proj),
+                source: ScopeSource::Default,
+            },
+            Case {
+                name: "no pointer attached",
+                pointer: None,
+                workspace: None,
+                project: None,
+                actor: &hook_session,
+                expected: (default_ws, default_proj),
+                source: ScopeSource::Default,
+            },
+        ];
+
+        for case in cases {
+            let mut resolver = ScopeResolver::new(&store.reader, default_ws, default_proj);
+            if let Some(pointer) = case.pointer {
+                resolver = resolver.with_active_project(pointer);
+            }
+            let (scope, source) = resolver
+                .resolve_read_args_traced(case.workspace, case.project, case.actor)
+                .await
+                .unwrap();
+            assert_eq!(scope.as_tuple(), case.expected, "{}", case.name);
+            assert_eq!(source, case.source, "{}", case.name);
+            let untraced = resolver
+                .resolve_read_args(case.workspace, case.project, case.actor)
+                .await
+                .unwrap();
+            assert_eq!(
+                untraced, scope,
+                "{}: tracing must not change the answer",
+                case.name
+            );
+        }
+
+        assert!(ScopeSource::DefaultAfterMismatch.is_fallback());
+        assert!(ScopeSource::StartupSeed.is_fallback());
+        for honest in [
+            ScopeSource::Explicit,
+            ScopeSource::Session,
+            ScopeSource::SharedSlot,
+            ScopeSource::Default,
+        ] {
+            assert!(!honest.is_fallback(), "{honest}");
+        }
     }
 }

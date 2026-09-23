@@ -25,6 +25,12 @@ use serde::{Deserialize, Serialize};
 /// Default HTTP bind address for the local single-user server.
 pub const DEFAULT_BIND: &str = "127.0.0.1:49374";
 
+/// Default idle time (seconds) before TCP keepalive probes start on an
+/// accepted `serve` connection. Conservative: long enough to never fire on a
+/// live, merely-quiet MCP/hook connection, short enough that a dead peer's
+/// fd is reclaimed in minutes rather than the OS default of ~2 hours (#792).
+pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 60;
+
 /// Default base URL used by thin-client CLI subcommands.
 pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:49374";
 
@@ -45,6 +51,27 @@ pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT: &str = ai_memory_core::DEFAULT_PROJECT_NAME;
+
+/// Optional per-tier retention half-lives, expressed in **days**.
+///
+/// This is the operator-facing `[decay.half_life_days]` sub-table. Half-life in
+/// days is the intuitive knob ("episodic pages: a 180-day half-life"); it is
+/// converted to the internal per-day decay rate λ (`λ = ln(2) / days`) in
+/// [`DecaySettings::decay_params`]. Every key is optional: an omitted key falls
+/// back to the scalar `lambda`, so the default (all keys unset) reproduces
+/// today's single-λ behaviour byte-for-byte and no upgrade changes a score.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecayHalfLifeDays {
+    /// Half-life in days for `working`-tier pages; unset uses the scalar λ.
+    pub working: Option<f64>,
+    /// Half-life in days for `episodic`-tier pages; unset uses the scalar λ.
+    pub episodic: Option<f64>,
+    /// Half-life in days for `semantic`-tier pages; unset uses the scalar λ.
+    pub semantic: Option<f64>,
+    /// Half-life in days for `procedural`-tier pages; unset uses the scalar λ.
+    pub procedural: Option<f64>,
+}
 
 /// Config-file representation of retention settings.
 ///
@@ -73,6 +100,30 @@ pub struct DecaySettings {
     pub observation_retention_days: i64,
     /// Observation rows deleted per prune transaction.
     pub observation_prune_batch: usize,
+    /// A2 extractive tier-down (`[decay] compact_cold_episodic`). When `true`,
+    /// the forget sweep COMPACTS a cold episodic page — keeping its L0 abstract,
+    /// an L1 summary and the L2 keep-token set, dropping the prose — instead of
+    /// evicting it. Reversible (the full body stays in git + the supersession
+    /// chain) and non-destructive. Defaults to `false`, so an upgrade changes
+    /// nothing until an operator opts in.
+    pub compact_cold_episodic: bool,
+    /// A3 cold-cluster dedup (`[decay] dedup_cold_clusters`). When `true` AND an
+    /// embedder is configured, the forget sweep clusters near-duplicate cold
+    /// episodic pages by embedding (cosine DBSCAN, adaptive eps) and collapses
+    /// each cluster to one survivor via supersession + a merge note.
+    /// Non-destructive (merged-away members stay reachable) and zero generative
+    /// LLM. Defaults to `false`, and is a clean no-op with no embedder, so an
+    /// upgrade changes nothing until an operator opts in.
+    pub dedup_cold_clusters: bool,
+    /// DBSCAN density floor for A3. `0` ⇒ the conservative default (2).
+    pub dedup_min_pts: usize,
+    /// Conservative ceiling on the adaptive eps (cosine distance) for A3.
+    /// `0.0` ⇒ the conservative default. Lower errs harder toward NOT merging.
+    pub dedup_max_eps: f32,
+    /// Optional per-tier half-life overrides (`[decay.half_life_days]`). All
+    /// keys default to unset ⇒ the scalar `lambda` applies to every tier, which
+    /// is byte-identical to the historical single-λ behaviour.
+    pub half_life_days: DecayHalfLifeDays,
 }
 
 impl Default for DecaySettings {
@@ -88,6 +139,11 @@ impl Default for DecaySettings {
             breadth_weight: 0.0,
             observation_retention_days: 0,
             observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
+            compact_cold_episodic: false,
+            dedup_cold_clusters: false,
+            dedup_min_pts: 0,
+            dedup_max_eps: 0.0,
+            half_life_days: DecayHalfLifeDays::default(),
         }
     }
 }
@@ -103,6 +159,28 @@ impl DecaySettings {
             salience_default: self.salience_default,
             cold_threshold: self.cold_threshold,
             hard_delete_after_days: self.hard_delete_after_days,
+            // Half-life-in-days is the user surface; λ is the math. Convert here
+            // once. An unset key stays `None`, so `lambda_for` falls back to the
+            // scalar `lambda` unchanged — the identity default, no days↔λ
+            // round-trip that could perturb an unconfigured store's scores.
+            tier_lambda: ai_memory_store::TierLambdas {
+                working: self
+                    .half_life_days
+                    .working
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                episodic: self
+                    .half_life_days
+                    .episodic
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                semantic: self
+                    .half_life_days
+                    .semantic
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                procedural: self
+                    .half_life_days
+                    .procedural
+                    .map(ai_memory_store::lambda_from_half_life_days),
+            },
         }
     }
 
@@ -116,6 +194,24 @@ impl DecaySettings {
         ai_memory_consolidate::ObservationRetention {
             days: self.observation_retention_days,
             batch: self.observation_prune_batch,
+        }
+    }
+
+    /// A3 cold-cluster dedup options for the M8 sweep.
+    ///
+    /// `embedding` is the running server's configured embedder coordinate, or
+    /// `None` when no embedder is configured — in which case A3 is a clean no-op
+    /// even with the flag on (there are no stored vectors to cluster).
+    #[must_use]
+    pub fn cold_cluster_dedup(
+        self,
+        embedding: Option<ai_memory_consolidate::EmbeddingCoord>,
+    ) -> ai_memory_consolidate::ColdClusterDedup {
+        ai_memory_consolidate::ColdClusterDedup {
+            enabled: self.dedup_cold_clusters,
+            embedding,
+            min_pts: self.dedup_min_pts,
+            max_eps: self.dedup_max_eps,
         }
     }
 }
@@ -159,6 +255,14 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// HTTP bind address used by `ai-memory serve`.
     pub bind: String,
+    /// Idle-time (seconds) before the OS starts probing an accepted `serve`
+    /// connection with TCP keepalive. `0` disables keepalive entirely. A
+    /// hook client's peer can die without sending FIN (laptop sleep, a
+    /// VPN/Tailscale flap, an abrupt kill); without keepalive the socket
+    /// stays `ESTABLISHED` forever and leaks one fd per dead peer until
+    /// `accept()` fails with `EMFILE` and the healthcheck breaks (#792). Set
+    /// with `AI_MEMORY_TCP_KEEPALIVE_SECS`.
+    pub tcp_keepalive_secs: u64,
     /// Base URL used by thin-client CLI commands to contact the running server.
     pub server_url: String,
     /// URL subpath the server is mounted under (e.g. `/wiki`). Thin-client
@@ -345,6 +449,11 @@ pub struct Config {
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Opt-in LLM "dream" pass (B2/B3/B4): rewrite/merge cold clusters with the
+    /// configured provider, scheduled on idle and cancelled the moment the
+    /// operator returns. OFF by default and gated on an R2 number before it may
+    /// default on; never deletes a source.
+    pub dream: DreamSettings,
     /// Opt-in post-fusion ranking signals for `memory_query` (hotness boost,
     /// lexical query-intent routing). All off by default.
     pub retrieval: RetrievalSettings,
@@ -740,6 +849,7 @@ impl Default for Config {
         Self {
             data_dir: default_data_dir(),
             bind: DEFAULT_BIND.into(),
+            tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
             base_path: String::new(),
             home_dir: None,
@@ -767,6 +877,7 @@ impl Default for Config {
             embedding_base_url: None,
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            dream: DreamSettings::default(),
             retrieval: RetrievalSettings::default(),
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
@@ -836,8 +947,15 @@ pub struct AutoImproveSettings {
     pub max_input_tokens: usize,
     /// Maximum validated proposals returned from one run.
     pub max_proposals_per_run: usize,
-    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    /// Maximum existing patchable pages included for patch proposals.
     pub max_patchable_pages: usize,
+    /// Wiki folder prefixes whose page bodies the reviewer may read.
+    ///
+    /// Defaults to `_rules/` and `procedures/`. A project that keeps durable
+    /// knowledge elsewhere — `decisions/`, `gotchas/` — can add those folders so
+    /// the reviewer stops proposing what is already written there (#834).
+    #[serde(default = "default_patchable_page_prefixes")]
+    pub patchable_page_prefixes: Vec<String>,
     /// Maximum body chars rendered per patchable target page.
     pub max_patchable_body_chars: usize,
     /// Maximum patch edits per proposal.
@@ -912,6 +1030,11 @@ pub struct AutoImproveSchedulerSettings {
     pub experience_every_sessions: u64,
     /// How many recent session summary pages one experience pass reads.
     pub experience_sessions: usize,
+    /// A4 entropy / boilerplate pre-filter for the experience pass
+    /// (`[auto_improve.scheduler.experience_entropy_filter]`). Off by default:
+    /// low-information session pages are skipped from consolidation only when an
+    /// operator enables it. Advisory (skip, never delete).
+    pub experience_entropy_filter: ai_memory_consolidate::EntropyFilterConfig,
 }
 
 impl Default for AutoImproveSchedulerSettings {
@@ -923,6 +1046,7 @@ impl Default for AutoImproveSchedulerSettings {
             min_session_age_secs: 600,
             experience_every_sessions: 0,
             experience_sessions: 10,
+            experience_entropy_filter: ai_memory_consolidate::EntropyFilterConfig::default(),
         }
     }
 }
@@ -941,6 +1065,7 @@ impl Default for AutoImproveSettings {
             max_input_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS,
             max_proposals_per_run: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
             max_patchable_pages: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
+            patchable_page_prefixes: default_patchable_page_prefixes(),
             max_patchable_body_chars:
                 ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS,
             max_edits_per_proposal:
@@ -1034,6 +1159,90 @@ impl Default for MaintenanceSettings {
     }
 }
 
+/// `[dream]` — the opt-in LLM dream pass (docs/design-memory-aging.md §B2–B4).
+///
+/// OFF by default (`enabled = false`): the scheduled job is not started, and even
+/// a direct call is a clean no-op. It runs only when this flag is set AND a
+/// provider AND an embedder are configured; a provider-less store keeps the
+/// zero-LLM A3 path (invariant #13). Gated on an R2 number before default-on.
+///
+/// Env form: `AI_MEMORY_DREAM__ENABLED=true`,
+/// `AI_MEMORY_DREAM__IDLE_WINDOW_SECS=600`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DreamSettings {
+    /// Master switch. `false` (the default) means the job never starts.
+    pub enabled: bool,
+    /// How often the scheduler CONSIDERS a run (seconds). It still only runs when
+    /// the operator has been idle for `idle_window_secs`. `0` ⇒ a conservative
+    /// default cadence.
+    pub interval_secs: u64,
+    /// Idle window (seconds) the operator must be quiet for before a run starts,
+    /// and past which returning activity cancels an in-flight run (B3). `0` ⇒
+    /// [`ai_memory_consolidate::DEFAULT_DREAM_IDLE_WINDOW_SECS`].
+    pub idle_window_secs: u64,
+    /// DBSCAN density floor. `0` ⇒ the conservative default (2).
+    pub min_pts: usize,
+    /// Conservative eps ceiling (cosine distance). `0.0` ⇒ the conservative
+    /// default; lower errs harder toward NOT merging.
+    pub max_eps: f32,
+    /// Hard cap on clusters rewritten per run (bounded fan-out, invariant #5).
+    /// `0` ⇒ [`ai_memory_consolidate::DEFAULT_DREAM_MAX_CLUSTERS_PER_RUN`].
+    pub max_clusters_per_run: usize,
+    /// Minimum cold pages before a run does work (the events-accrued gate). `0` ⇒
+    /// [`ai_memory_consolidate::DEFAULT_DREAM_MIN_COLD_PAGES`].
+    pub min_cold_pages: usize,
+}
+
+impl Default for DreamSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // A conservative default cadence: the job wakes hourly to check
+            // whether the box has been idle long enough to run.
+            interval_secs: 3_600,
+            idle_window_secs: 0,
+            min_pts: 0,
+            max_eps: 0.0,
+            max_clusters_per_run: 0,
+            min_cold_pages: 0,
+        }
+    }
+}
+
+impl DreamSettings {
+    /// The effective scheduler interval in seconds (never zero).
+    #[must_use]
+    pub fn effective_interval_secs(self) -> u64 {
+        if self.interval_secs == 0 {
+            3_600
+        } else {
+            self.interval_secs
+        }
+    }
+
+    /// Build the [`ai_memory_consolidate::DreamConfig`] for the pass.
+    ///
+    /// `embedding` is the running server's configured embedder coordinate, or
+    /// `None` when no embedder is configured — in which case the dream pass is a
+    /// clean no-op even with the flag on (there are no stored vectors).
+    #[must_use]
+    pub fn dream_config(
+        self,
+        embedding: Option<ai_memory_consolidate::EmbeddingCoord>,
+    ) -> ai_memory_consolidate::DreamConfig {
+        ai_memory_consolidate::DreamConfig {
+            enabled: self.enabled,
+            embedding,
+            min_pts: self.min_pts,
+            max_eps: self.max_eps,
+            max_clusters_per_run: self.max_clusters_per_run,
+            min_cold_pages: self.min_cold_pages,
+            idle_window_secs: self.idle_window_secs,
+        }
+    }
+}
+
 /// `[retrieval]` opt-in ranking signals layered on the RRF fusion in
 /// `memory_query`. Every default leaves ranking byte-identical to a store
 /// that never heard of this section.
@@ -1055,6 +1264,12 @@ pub struct RetrievalSettings {
     /// the RRF fusion. Pages gain an abstract vector when their frontmatter
     /// carries `abstract:` and the embedding backfill runs.
     pub abstract_vectors: bool,
+    /// Weight of the belief-strength confidence factor folded into page
+    /// authority (P2). `0.0` (the default) is inert — ranking is byte-identical
+    /// and no belief query runs. Positive folds a page's evidence-derived
+    /// `confidence` into its authority factor, inside the existing bounds.
+    /// OFF by default: enabling it is gated on a positive R2 delta.
+    pub belief_authority_weight: f64,
 }
 
 impl Default for RetrievalSettings {
@@ -1064,6 +1279,7 @@ impl Default for RetrievalSettings {
             query_intent: base.session_recall_routing,
             session_recall_bonus: base.session_recall_bonus,
             abstract_vectors: base.abstract_vectors,
+            belief_authority_weight: base.belief_authority_weight,
         }
     }
 }
@@ -1076,6 +1292,10 @@ impl RetrievalSettings {
             session_recall_routing: self.query_intent,
             session_recall_bonus: self.session_recall_bonus.max(0.0),
             abstract_vectors: self.abstract_vectors,
+            // A negative weight would flip the boost into a penalty on
+            // supported pages; clamp it out so misconfiguration is inert, not
+            // inverted.
+            belief_authority_weight: self.belief_authority_weight.max(0.0),
         }
     }
 }
@@ -1160,6 +1380,27 @@ impl Config {
             );
         }
 
+        // A per-tier half-life must be a real, positive number of days: `0` (or
+        // negative/NaN) would convert to a nonsensical λ (+inf / negative /
+        // NaN) and silently mass-evict or never decay that tier. Reject it at
+        // load rather than at 3am inside the sweep. An unset key is fine — it
+        // falls back to the scalar `lambda`.
+        for (tier, value) in [
+            ("working", config.decay.half_life_days.working),
+            ("episodic", config.decay.half_life_days.episodic),
+            ("semantic", config.decay.half_life_days.semantic),
+            ("procedural", config.decay.half_life_days.procedural),
+        ] {
+            if let Some(days) = value
+                && (!days.is_finite() || days <= 0.0)
+            {
+                anyhow::bail!(
+                    "decay.half_life_days.{tier} must be a finite number greater than zero \
+                     (got {days}); omit the key to use the default decay rate"
+                );
+            }
+        }
+
         // Fail closed at load rather than at 3am inside a destructive pass: a
         // negative age would be a nonsensical cutoff, and a zero batch would
         // spin the prune loop forever without deleting anything.
@@ -1171,6 +1412,16 @@ impl Config {
         }
         if config.decay.observation_prune_batch == 0 {
             anyhow::bail!("decay.observation_prune_batch must be greater than zero");
+        }
+        // A4 entropy filter thresholds: reject an unusable threshold at startup
+        // rather than silently ignoring it on the first experience pass.
+        if let Err(message) = config
+            .auto_improve
+            .scheduler
+            .experience_entropy_filter
+            .validate()
+        {
+            anyhow::bail!("auto_improve.scheduler.experience_{message}");
         }
 
         // Fail at startup rather than shipping a prompt that is all scaffolding
@@ -2002,6 +2253,15 @@ fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
     }
 }
 
+/// The historical patchable folders, kept as the default so an existing config
+/// that omits the key behaves exactly as before (#834).
+fn default_patchable_page_prefixes() -> Vec<String> {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect()
+}
+
 fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -2196,6 +2456,7 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.data_dir.ends_with("ai-memory"));
         assert_eq!(cfg.bind, DEFAULT_BIND);
+        assert_eq!(cfg.tcp_keepalive_secs, DEFAULT_TCP_KEEPALIVE_SECS);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.log_level, "info");
         assert_eq!(
@@ -2277,6 +2538,97 @@ mod tests {
             assert!(
                 error.to_string().contains("breadth_weight"),
                 "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// `[decay.half_life_days]` parses per-tier half-lives (in days) and
+    /// converts each to the internal λ; an omitted key falls back to the scalar
+    /// `lambda`, so the resulting `DecayParams` is a pure identity for every
+    /// unset tier.
+    #[test]
+    fn load_parses_per_tier_half_lives_and_falls_back_for_omitted_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[decay.half_life_days]\nepisodic = 365.0\nworking = 7.0\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        let params = cfg.decay.decay_params();
+
+        // Configured tiers convert days -> λ = ln(2) / days.
+        let expect = |days: f64| std::f64::consts::LN_2 / days;
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Episodic).to_bits(),
+            expect(365.0).to_bits(),
+        );
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Working).to_bits(),
+            expect(7.0).to_bits(),
+        );
+        // Omitted tiers fall back to the scalar λ, byte-for-byte.
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Semantic).to_bits(),
+            params.lambda.to_bits(),
+        );
+        assert_eq!(
+            params
+                .lambda_for(ai_memory_core::Tier::Procedural)
+                .to_bits(),
+            params.lambda.to_bits(),
+        );
+    }
+
+    /// With no `[decay.half_life_days]` table the resolved `DecayParams` is the
+    /// store default: every tier's λ is the scalar `lambda` (the identity
+    /// upgrade guarantee at the config layer).
+    #[test]
+    fn load_without_half_lives_is_identity_to_the_default_params() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        let params = cfg.decay.decay_params();
+        let default = ai_memory_store::DecayParams::default();
+        for tier in [
+            ai_memory_core::Tier::Working,
+            ai_memory_core::Tier::Episodic,
+            ai_memory_core::Tier::Semantic,
+            ai_memory_core::Tier::Procedural,
+        ] {
+            assert_eq!(
+                params.lambda_for(tier).to_bits(),
+                default.lambda_for(tier).to_bits(),
+                "tier {tier:?} must decay at the default scalar λ",
+            );
+        }
+    }
+
+    /// A zero, negative, or non-finite half-life converts to a nonsensical λ,
+    /// so it is rejected at load rather than silently mass-evicting (or never
+    /// decaying) that tier.
+    #[test]
+    fn load_rejects_invalid_per_tier_half_lives() {
+        for (tier, value) in [
+            ("episodic", "0.0"),
+            ("working", "-5.0"),
+            ("semantic", "nan"),
+            ("procedural", "inf"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[decay.half_life_days]\n{tier} = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an invalid per-tier half-life must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("decay.half_life_days.{tier}")),
+                "unexpected error for {tier} = {value}: {error:#}"
             );
         }
     }

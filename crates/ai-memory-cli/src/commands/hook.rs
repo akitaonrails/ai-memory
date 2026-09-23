@@ -460,6 +460,55 @@ fn write_success_response<W: std::io::Write>(
     }
 }
 
+const GROK_ADDITIONAL_CONTEXT_CHARS: usize = 10_000;
+
+fn grok_post_tool_handoff_envelope(handoff: &str) -> serde_json::Value {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": clip_chars(handoff, GROK_ADDITIONAL_CONTEXT_CHARS),
+        }
+    })
+}
+
+fn payload_is_subagent(raw: &serde_json::Value) -> bool {
+    [
+        "subagentType",
+        "subagent_type",
+        "agent_type",
+        "agent_id",
+        "parentSessionId",
+    ]
+    .iter()
+    .any(|key| {
+        raw.get(*key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| !text.trim().is_empty())
+    })
+}
+
+fn clip_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(12);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("\n[truncated]");
+    out
+}
+
+fn handoff_shown_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    let key = briefed_marker_path(data_dir, agent, session_id, cwd);
+    data_dir
+        .join("handoff-shown")
+        .join(key.file_name().unwrap_or_default())
+}
+
 fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_json::Value {
     if agent == AgentKind::AntigravityCli {
         serde_json::json!({
@@ -514,7 +563,11 @@ where
     let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
     let delivers_context = (hook_event == HookEvent::SessionStart
         && agent_kind.session_start_injects_handoff())
-        || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff());
+        || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff())
+        // Grok delivers the handoff on the first PostToolUse (its SessionStart /
+        // UserPromptSubmit stdout is discarded); that path is context delivery
+        // too, so external capture must not suppress it.
+        || (hook_event == HookEvent::PostToolUse && agent_kind.post_tool_injects_handoff());
     if external_capture && !args.check_capture && !delivers_context {
         // Retiring the fallback session ID is lifecycle housekeeping, not
         // capture. Preserve it even when no event is enqueued.
@@ -789,12 +842,12 @@ where
         }
     }
 
-    // user-prompt: agents whose SessionStart stdout is discarded (Kimi Code)
-    // receive the handoff here instead — kimi injects UserPromptSubmit stdout
-    // into the turn verbatim as a `hook_result` user message. The payload
-    // carries the native session id when available, so the destructive GET
-    // can also link the managed run to the native session, same as
-    // session-start does.
+    // user-prompt: agents whose SessionStart stdout is discarded AND whose
+    // UserPromptSubmit stdout is injected (Kimi Code) receive the handoff
+    // here. Grok discards both, so it must not take this path: the GET
+    // accepts the handoff. The payload carries the native session id when
+    // available, so the destructive GET can also link the managed run to the
+    // native session, same as session-start does.
     // The installed kimi hook passes the script stem (`user-prompt-submit`)
     // while the legacy shell path posts `user-prompt`; HookEvent::parse
     // canonicalizes both (and the snake/native spellings) to UserPrompt.
@@ -862,6 +915,46 @@ where
         // text. Empty handoff or any fetch error means print nothing at all
         // (kimi ignores empty stdout; warnings go to stderr).
         return Ok(());
+    }
+
+    // post-tool-use: Grok shows hookSpecificOutput.additionalContext to the
+    // model after the tool result. SessionStart and UserPromptSubmit stdout
+    // are discarded, so this is the event that can carry a handoff without
+    // burning it. One fetch per session. A session that never calls a tool
+    // leaves the handoff open for memory_handoff_accept.
+    if HookEvent::parse(&args.event) == HookEvent::PostToolUse
+        && AgentKind::from_wire(&args.agent).post_tool_injects_handoff()
+    {
+        let shown = handoff_shown_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        );
+        if !shown.is_file() && !payload_is_subagent(&json) {
+            let client = build_client();
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+            let native_session_qs = canonical_session_id
+                .as_deref()
+                .map_or_else(String::new, |session_id| {
+                    format!("&session_id={}", url_encode(session_id))
+                });
+            let handoff_url = format!(
+                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                args.agent
+            );
+            let handoff =
+                get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await;
+            // Only a real body consumes this session's one chance. An empty
+            // or failed claim must retry on the next parent tool; a child
+            // session that errors must not burn the baton for the parent.
+            if let Some(handoff) = handoff {
+                mark_briefed(&shown);
+                let envelope = grok_post_tool_handoff_envelope(&handoff);
+                writeln!(stdout, "{envelope}")?;
+                return Ok(());
+            }
+        }
     }
 
     // Boundary drain trigger: enqueue first, then ask a detached native drainer
@@ -2452,6 +2545,19 @@ mod tests {
         }
     }
 
+    fn grok_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "grok".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        }
+    }
+
     fn kimi_hook_args(event: &str, server_url: &str) -> HookArgs {
         HookArgs {
             event: event.into(),
@@ -2928,6 +3034,243 @@ mod tests {
         assert!(request.starts_with("GET /handoff?"), "{request}");
         assert!(!request.contains("briefing"), "{request}");
         assert!(!data_dir.join("briefed").exists());
+    }
+
+    #[tokio::test]
+    async fn grok_session_start_never_fetches_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            grok_hook_args("session-start", &base),
+            serde_json::json!({"session_id": "grok-session", "cwd": tmp.path()}).to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(!request.starts_with("GET /handoff"), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_user_prompt_does_not_fetch_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            grok_hook_args("user-prompt", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": tmp.path(),
+                "prompt": "hello"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        // Grok discards allowing UserPromptSubmit stdout. Fetching would
+        // accept the handoff and then throw the body away.
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(
+                !request.starts_with("GET /handoff"),
+                "grok user-prompt must not accept the handoff: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_user_prompt_submit_stem_does_not_fetch_the_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        write_briefing_marker(&cwd);
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            grok_hook_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": cwd,
+                "prompt": "hi"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(
+                !request.starts_with("GET /handoff"),
+                "briefing opt-in must not make grok fetch /handoff: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_prints_additional_context_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let payload = serde_json::json!({
+            "session_id": "grok-session",
+            "cwd": tmp.path(),
+            "tool_name": "read_file"
+        })
+        .to_string();
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            grok_hook_args("post-tool-use", &base),
+            payload.clone(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["hookEventName"],
+            "PostToolUse"
+        );
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "AMWS-HANDOFF-DELTA"
+        );
+        let first = first_request(&mut requests).await.unwrap();
+        assert!(first.starts_with("GET /handoff?"), "{first}");
+        assert!(first.contains("agent=grok"), "{first}");
+        assert!(first.contains("session_id=grok-session"), "{first}");
+        assert!(
+            data_dir
+                .join("handoff-shown")
+                .join("grok-session")
+                .is_file(),
+            "shown marker missing"
+        );
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            grok_hook_args("post-tool-use", &base),
+            payload,
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        assert!(
+            first_request(&mut requests).await.is_none(),
+            "second post-tool must not fetch again"
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_includes_briefing_when_the_marker_opts_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        write_briefing_marker(&cwd);
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir),
+            grok_hook_args("post-tool-use", &base),
+            serde_json::json!({
+                "session_id": "grok-session",
+                "cwd": cwd,
+                "tool_name": "read_file"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.contains("&briefing=true"), "{request}");
+        assert!(request.contains("&briefing_budget=6000"), "{request}");
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"],
+            "AMWS-HANDOFF-DELTA"
+        );
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_skips_a_subagent_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AMWS-HANDOFF-DELTA").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            grok_hook_args("post-tool-use", &base),
+            serde_json::json!({
+                "session_id": "child-session",
+                "cwd": tmp.path(),
+                "subagentType": "goal-plan-writer",
+                "tool_name": "read_file"
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        while let Some(request) = first_request(&mut requests).await {
+            assert!(
+                !request.starts_with("GET /handoff"),
+                "a child session must not accept the parent handoff: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn grok_post_tool_without_handoff_prints_empty_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            grok_hook_args("post-tool-use", &base),
+            serde_json::json!({"session_id": "grok-session", "cwd": tmp.path()}).to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"{}\n");
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+    }
+
+    #[test]
+    fn grok_additional_context_is_clipped_to_the_model_cap() {
+        let long = "x".repeat(GROK_ADDITIONAL_CONTEXT_CHARS + 50);
+        let envelope = grok_post_tool_handoff_envelope(&long);
+        let note = envelope["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(note.ends_with("\n[truncated]"));
+        assert!(note.chars().count() <= GROK_ADDITIONAL_CONTEXT_CHARS);
     }
 
     #[test]

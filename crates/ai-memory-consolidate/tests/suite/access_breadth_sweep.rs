@@ -125,7 +125,14 @@ async fn default_weight_scores_identically_however_many_operators_read_the_page(
         assert_eq!(e.access_count, ACCESS_COUNT);
         assert_eq!(
             e.retention,
-            retention_score(&params, e.age_days, e.access_count, Some(e.age_days), None),
+            retention_score(
+                &params,
+                Tier::Episodic,
+                e.age_days,
+                e.access_count,
+                Some(e.age_days),
+                None,
+            ),
             "{} scored differently from the pre-breadth formula",
             e.path,
         );
@@ -281,7 +288,14 @@ async fn curator_scores_match_the_pre_breadth_formula_at_the_default_weight() {
     for (path, score, age_days) in &cold {
         assert_eq!(
             *score,
-            retention_score(&params, *age_days, ACCESS_COUNT, Some(*age_days), None),
+            retention_score(
+                &params,
+                Tier::Episodic,
+                *age_days,
+                ACCESS_COUNT,
+                Some(*age_days),
+                None,
+            ),
             "{path} scored differently from the pre-breadth formula",
         );
     }

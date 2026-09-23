@@ -288,6 +288,27 @@ pub(crate) struct SearchView {
 #[template(path = "not_found.html")]
 pub(crate) struct NotFoundView {}
 
+// ---------------------------------------------------------------------------
+// login.html / change_password.html
+// ---------------------------------------------------------------------------
+
+/// View-model for `GET /login` (public builtin auth page).
+#[derive(Template)]
+#[template(path = "login.html")]
+pub(crate) struct LoginView {
+    /// Sanitised post-login redirect target (absolute path under the wiki root).
+    pub next: String,
+    /// Absolute path to the change-password page (for `must_change_password`).
+    pub change_password_href: String,
+}
+
+/// View-model for `GET /change-password` (public builtin auth page).
+#[derive(Template)]
+#[template(path = "change_password.html")]
+pub(crate) struct ChangePasswordView {
+    /// Sanitised post-change redirect target (absolute path under the wiki root).
+    pub next: String,
+}
 #[cfg(test)]
 mod tests {
     use super::*;

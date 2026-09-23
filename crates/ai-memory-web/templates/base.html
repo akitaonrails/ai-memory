@@ -15,7 +15,8 @@
         <span class="font-semibold text-slate-800 dark:text-slate-100 text-sm hidden sm:inline">ai-memory</span>
       </a>
       <div class="flex-1"></div>
-      <form action="search" method="get" class="flex items-center">
+      {% block header_actions %}
+      <form action="search" method="get" class="flex items-center gap-2">
         <input
           name="q"
           type="search"
@@ -23,6 +24,37 @@
           class="w-40 sm:w-64 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
         >
       </form>
+      <button
+        type="button"
+        id="ai-memory-logout"
+        class="text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400"
+      >Log out</button>
+      <script>
+      (function () {
+        var btn = document.getElementById("ai-memory-logout");
+        if (!btn) return;
+        {% include "_js_cookie.html" %}
+        btn.addEventListener("click", function () {
+          var basePath = document
+            .querySelector('meta[name="ai-memory-base-path"]')
+            ?.getAttribute("content") || "";
+          var loginHref = document
+            .querySelector('meta[name="ai-memory-login-path"]')
+            ?.getAttribute("content") || (basePath + "/web/login");
+          fetch(basePath + "/auth/logout", {
+            method: "POST",
+            credentials: "include",
+            headers: {
+              "Accept": "application/json",
+              "X-CSRF-Token": decodeURIComponent(cookie("ai_memory_csrf") || "")
+            }
+          }).finally(function () {
+            location.assign(loginHref);
+          });
+        });
+      })();
+      </script>
+      {% endblock %}
     </div>
   </header>
 
