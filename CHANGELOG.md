@@ -60,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture suppression, like the other context-delivery events. (#840)
 
 ### Fixed
+- Isolated the pre-push test process from Git's repository environment and
+  global/system configuration so fixture commands use their own repositories.
+  Existing installations need to run `scripts/install-git-hooks.sh` again. (#823)
 - `companions/ai-memory-macos/build.sh` no longer fails on machines whose
   active developer directory is Command Line Tools only: SwiftUI `@State`
   needs the `SwiftUIMacros` plugin shipped with full Xcode, so the script
@@ -360,9 +363,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vs 2.3.x (the 2.4 features are opt-in / off by default).
 
 ### Fixed
-- Isolated the pre-push test process from Git's repository environment and
-  global/system configuration so fixture commands use their own repositories.
-  Existing installations need to run `scripts/install-git-hooks.sh` again. (#823)
 - A failed scheduled `auto_improve` review no longer removes its session from
   the queue permanently. The scheduler claims a session before reviewing it,
   and the candidate query excludes any session that holds a claim — but nothing
