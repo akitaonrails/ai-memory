@@ -1883,6 +1883,25 @@ function resolveToken(): string | null {
 "#
 }
 
+/// `timeoutSignal`, shared by every generated TypeScript integration: a
+/// request deadline composed with `hookAbort`. A host that tears its capture
+/// state down aborts `hookAbort` once its final deliveries had their drain
+/// budget (OpenCode 2 on each location's unload), so whatever is still in
+/// flight fails over to the spool at once instead of each waiting out its own
+/// timeout. The module-level integrations never abort it.
+pub(crate) fn ts_timeout_signal() -> &'static str {
+    r#"const hookAbort = new AbortController();
+
+function timeoutSignal(ms: number): AbortSignal | undefined {
+  if (typeof AbortSignal === "undefined") return undefined;
+  const factory = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout;
+  const anyFactory = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (!factory) return hookAbort.signal;
+  return anyFactory ? anyFactory([hookAbort.signal, factory(ms)]) : factory(ms);
+}
+"#
+}
+
 pub(crate) fn ts_spool_runtime() -> &'static str {
     r#"
 // ---- offline spool (#580): the same on-disk contract as `ai-memory hook` ----
@@ -1902,6 +1921,11 @@ function hookSpoolDir(): string {
   return join(base, "hook-spool");
 }
 
+// A random prefix per copy of this state keeps two copies in one process
+// (OpenCode 2 location instances, OMP and Pi loading each other's extension)
+// from renaming onto each other's same-millisecond entry; the counter keeps
+// one copy's entries in order.
+const spoolSeqPrefix = Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, "0");
 let spoolSeq = 0;
 
 function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): void {
@@ -1924,7 +1948,7 @@ function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): v
       ...(token ? { token } : {}),
       attempts: 0,
     };
-    const seq = (spoolSeq++ & 0xffffffff).toString(16).padStart(16, "0");
+    const seq = spoolSeqPrefix + (spoolSeq++ & 0xffffffff).toString(16).padStart(8, "0");
     const name = `${String(createdMs).padStart(13, "0")}-${process.pid}-${seq}.json`;
     const tmp = join(dir, `${name}.tmp`);
     writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
@@ -1986,6 +2010,60 @@ async function drainHookSpool(): Promise<void> {
 "#
 }
 
+/// `Some(())` when this machine can execute the emitted TypeScript.
+/// Node is not a build dependency of this project, so a box without it
+/// (or on a Node too old for type stripping) skips the runtime evidence
+/// instead of failing.
+#[cfg(test)]
+pub(crate) fn node_strip_types_available() -> Option<()> {
+    let probe = std::process::Command::new("node")
+        .args(["--experimental-strip-types", "--version"])
+        .output();
+    match probe {
+        Ok(output) if output.status.success() => Some(()),
+        _ => {
+            eprintln!(
+                "skipping Node-required runtime evidence: node lacks --experimental-strip-types"
+            );
+            None
+        }
+    }
+}
+
+/// Two copies of the spool state in one process (OpenCode 2 location
+/// instances, OMP and Pi sharing an extensions dir) must not write the
+/// same file name in the same millisecond, and every request deadline
+/// must compose with the state's abort signal.
+#[cfg(test)]
+pub(crate) fn assert_shared_ts_delivery_runtime(name: &str, source: &str) {
+    assert!(
+        source.contains("const spoolSeqPrefix = Math.floor(Math.random() * 0x100000000)"),
+        "{name}: spool names need a per-state random prefix"
+    );
+    assert!(
+        source.contains(
+            "const seq = spoolSeqPrefix + (spoolSeq++ & 0xffffffff).toString(16).padStart(8, \"0\");"
+        ),
+        "{name}: spool seq must stay 16 hex digits"
+    );
+    assert_eq!(
+        source
+            .matches("const hookAbort = new AbortController();")
+            .count(),
+        1,
+        "{name}"
+    );
+    assert_eq!(
+        source.matches("function timeoutSignal(").count(),
+        1,
+        "{name}"
+    );
+    assert!(
+        source.contains("anyFactory([hookAbort.signal, factory(ms)])"),
+        "{name}: request deadlines must also honour hookAbort"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2043,25 +2121,6 @@ mod tests {
             shape,
             HookCommandContext::new(HookCommandPlatform::Posix, "claude-code", None, None),
         )
-    }
-
-    /// `Some(())` when this machine can execute the emitted TypeScript.
-    /// Node is not a build dependency of this project, so a box without it
-    /// (or on a Node too old for type stripping) skips the runtime evidence
-    /// instead of failing.
-    fn node_strip_types_available() -> Option<()> {
-        let probe = Command::new("node")
-            .args(["--experimental-strip-types", "--version"])
-            .output();
-        match probe {
-            Ok(output) if output.status.success() => Some(()),
-            _ => {
-                eprintln!(
-                    "skipping Node-required runtime evidence: node lacks --experimental-strip-types"
-                );
-                None
-            }
-        }
     }
 
     #[test]

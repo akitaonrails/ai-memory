@@ -52,7 +52,8 @@ and each requires a deliberate config change to turn on.
    opt-in and sanitized"). Persisting the coding assistant's final-turn text
    requires a double opt-in: `capture_assistant` on the server *and*
    `install-hooks --capture-assistant` on the client. Once enabled, captured
-   text flows into consolidation/reviewer prompts and — only if you have
+   text rides in the session's automatic handoff to the next session and
+   flows into consolidation/reviewer prompts and — only if you have
    separately configured a cloud LLM provider — is sent to that provider. The
    flag is global to the install; there is no per-project exclusion once it's
    on.

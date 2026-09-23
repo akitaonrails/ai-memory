@@ -101,6 +101,9 @@ what the project is and is not designed to defend against.
     `[REDACTED]`.
   - Captured assistant text flows into the consolidation and reviewer prompts,
     and — if you configure a cloud LLM provider — is sent to that provider.
+    The latest excerpt of a session also rides in its automatic handoff, so
+    the next session that claims the baton receives it as startup context. It
+    is not rendered into the git-tracked session page.
   - The opt-in is **global** to the install: there is no per-project marker to
     exclude a sensitive repository once the flag is on (assistant text is not
     path-attributable). Turn the server flag off to disable it everywhere.

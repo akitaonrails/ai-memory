@@ -844,6 +844,7 @@ async fn handle_hook_batch(
         }
         let _permit = permit;
         state.ingest_metrics.record_accepted();
+        let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
         if let Err(e) = process_authorized(
             &state,
             env,
@@ -857,7 +858,13 @@ async fn handle_hook_batch(
                 e.downcast_ref::<StoreError>(),
                 Some(StoreError::SessionCollision)
             ) {
-                warn!("hook batch session collision/recovery rejection dropped");
+                warn!(
+                    session = ?session,
+                    agent = %agent.as_str(),
+                    event = ?event,
+                    reason = SESSION_COLLISION_REASON,
+                    "hook batch session collision/recovery rejection dropped"
+                );
                 accepted_indices.push(idx);
                 continue;
             }
@@ -2383,6 +2390,13 @@ fn sticky_cwd_admits(
             && meaningful_session_anchor(session_cwd, home_dir).is_some())
 }
 
+/// Why a `SessionCollision` is refused. The store error deliberately carries
+/// no row details, so the log names the rule instead: scope is not identity,
+/// only the owner and agent of an existing session id are (plus the
+/// all-owners recovery authorization checked in `process_authorized`).
+const SESSION_COLLISION_REASON: &str =
+    "session id belongs to another owner or agent, or all-owners recovery was refused";
+
 /// Returns `true` when the event cleared the writer, so the caller can stamp
 /// the ingest "last write" metric. A rejected or failed event returns `false`:
 /// nothing was persisted, and pretending otherwise hides exactly the outage
@@ -2394,12 +2408,19 @@ async fn process_envelope(
     level: ai_memory_core::AuthLevel,
     skip_webhooks: Vec<String>,
 ) -> bool {
+    let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
     if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks).await {
         if matches!(
             e.downcast_ref::<StoreError>(),
             Some(StoreError::SessionCollision)
         ) {
-            warn!("hook session collision dropped");
+            warn!(
+                session = ?session,
+                agent = %agent.as_str(),
+                event = ?event,
+                reason = SESSION_COLLISION_REASON,
+                "hook session collision dropped"
+            );
         } else {
             warn!(error = %e, "hook processing failed");
         }
@@ -2507,6 +2528,27 @@ async fn process_authorized(
     skip_webhooks: Vec<String>,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(&env)?;
+    // An OpenCode `session.moved` relocation, forwarded by the plugin as a
+    // SessionStart naming the directory the session left. Admission rebinds
+    // the live session row to where it now runs, so its later SessionEnd and
+    // sticky routing follow it; a child session moves like its root. Managed
+    // runs are pinned to their own scope and never move.
+    let moved_from_cwd = (env.agent == AgentKind::OpenCode
+        && env.event == HookEvent::SessionStart
+        && env.managed_run.is_none()
+        && env
+            .raw
+            .get("session_moved")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true))
+    .then(|| {
+        env.raw
+            .get("session_moved_from_cwd")
+            .and_then(serde_json::Value::as_str)
+            .filter(|cwd| !cwd.is_empty())
+            .map(str::to_owned)
+    })
+    .flatten();
     // Build the actor key used to scope the in-process `ActiveProject`
     // pointer. `user` is the qualified storage key of whatever identity the
     // auth middleware extracted from this request; `session_id` is the RAW
@@ -2544,12 +2586,13 @@ async fn process_authorized(
     // - Under `[routing] mid_session = "sticky"` the session also overrules a
     //   host-derived `repo-root` override, closing the cross-repo `cd` case;
     //   marker-declared scopes still win. See `overrides_permit_sticky`.
-    let sticky_scope = if overrides_permit_sticky(
-        env.workspace_override.as_deref(),
-        env.project_override.as_deref(),
-        env.project_source,
-        state.mid_session_routing,
-    ) {
+    let sticky_scope = if moved_from_cwd.is_none()
+        && overrides_permit_sticky(
+            env.workspace_override.as_deref(),
+            env.project_override.as_deref(),
+            env.project_source,
+            state.mid_session_routing,
+        ) {
         state
             .reader
             .find_session_scope(session_id)
@@ -2675,6 +2718,7 @@ async fn process_authorized(
                 sanitized,
                 owner_filter.clone(),
                 ingest_key.clone(),
+                moved_from_cwd.clone(),
             )
             .await;
         match result {
@@ -2840,8 +2884,34 @@ async fn process_authorized(
 
     // On SessionEnd, close boundary-only sessions without generated artifacts.
     // Substantive sessions synthesize the summary page and auto-handoff below.
-    if matches!(env.event, HookEvent::SessionEnd) {
+    // OpenCode's service outlives its CLI: a completed root turn publishes a
+    // continuation checkpoint without claiming the native session has ended.
+    let turn_checkpoint = env.agent == AgentKind::OpenCode
+        && env.event == HookEvent::Stop
+        && env
+            .raw
+            .get("turn_checkpoint")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && !managed
+        && !body_is_subagent(&env.raw);
+    if matches!(env.event, HookEvent::SessionEnd) || turn_checkpoint {
         let mut observations = state.reader.observations_for_session(session_id).await?;
+        // A checkpoint writes where the session's end will: the session row's
+        // scope, not wherever this Stop resolved (a marker may have appeared
+        // mid-session). One that lost the race with the end writes nothing.
+        let checkpoint_scope = if turn_checkpoint && !is_ephemeral_session(&observations) {
+            state.reader.open_session_scope(session_id).await?
+        } else {
+            None
+        };
+        if turn_checkpoint && checkpoint_scope.is_none() {
+            if let Some(key) = ingest_key {
+                state.writer.complete_observation_ingest(proj, key).await?;
+            }
+            return Ok(());
+        }
+        let (page_ws, page_proj) = checkpoint_scope.unwrap_or((ws, proj));
         if is_ephemeral_session(&observations) {
             let outcome = state
                 .writer
@@ -2880,8 +2950,13 @@ async fn process_authorized(
                 }
             }
         }
-        let new_page =
-            synthesize_session_page(ws, proj, session_id, admitted.agent_kind(), &observations);
+        let new_page = synthesize_session_page(
+            page_ws,
+            page_proj,
+            session_id,
+            admitted.agent_kind(),
+            &observations,
+        );
         let page_id = state
             .wiki
             .write_page(ai_memory_wiki::WritePageRequest {
@@ -2912,15 +2987,21 @@ async fn process_authorized(
         // baton lands in a bucket the operator's actorless transport cannot
         // read.
         let handoff_owner = owner_stamp_for_event(state, session_owner.as_ref()).await;
-        let handoff = (!managed).then(|| {
+        // An OpenCode child session has its own id and forwards its parent as
+        // `agent_id`; its end must not hand the next session a sub-task baton.
+        // Other harnesses are not gated: Claude Code also sets `agent_type` on
+        // a top-level `--agent` session, which still owns its baton.
+        let child_session = env.agent == AgentKind::OpenCode && body_is_subagent(&env.raw);
+        let handoff = (!managed && !child_session).then(|| {
             build_auto_handoff(
-                ws,
-                proj,
+                page_ws,
+                page_proj,
                 env.agent,
                 session_id,
                 env.cwd.clone(),
                 &observations,
                 handoff_owner,
+                turn_checkpoint,
             )
         });
         // Automatic SessionEnd handoffs are the bulk of handoff traffic;
@@ -2945,8 +3026,8 @@ async fn process_authorized(
                 match state
                     .wiki
                     .authorize_operation(
-                        ws,
-                        proj,
+                        page_ws,
+                        page_proj,
                         ai_memory_wiki::AdmissionOp::HandoffBegin,
                         session_actor.clone(),
                         skip_webhooks,
@@ -2958,7 +3039,7 @@ async fn process_authorized(
                         warn!(
                             session = %session_id,
                             error = %e,
-                            "auto handoff refused by admission chain; session ends without a baton",
+                            "auto handoff refused by admission chain; continuing without a baton",
                         );
                         (None, None)
                     }
@@ -2970,19 +3051,26 @@ async fn process_authorized(
         // between them would leave an ended session whose successor has
         // nothing to pick up. A managed run and an admission refusal both take
         // the second arm, ending the session with no handoff at all.
-        let handoff_id = match handoff {
-            Some(handoff) => Some(
-                state
-                    .writer
-                    .end_admitted_session_with_handoff(admitted.clone(), Some(page_id), handoff)
-                    .await?,
-            ),
-            None => {
-                state
-                    .writer
-                    .end_admitted_session(admitted.clone(), Some(page_id))
-                    .await?;
-                None
+        let handoff_id = if turn_checkpoint {
+            match handoff {
+                Some(handoff) => state.writer.checkpoint_session_handoff(handoff).await?,
+                None => None,
+            }
+        } else {
+            match handoff {
+                Some(handoff) => Some(
+                    state
+                        .writer
+                        .end_admitted_session_with_handoff(admitted.clone(), Some(page_id), handoff)
+                        .await?,
+                ),
+                None => {
+                    state
+                        .writer
+                        .end_admitted_session(admitted.clone(), Some(page_id))
+                        .await?;
+                    None
+                }
             }
         };
         if handoff_id.is_some()
@@ -3006,30 +3094,35 @@ async fn process_authorized(
         // deterministic wiki writes are committed so the worker cannot race
         // their git snapshot. Stale redelivery above repairs cancellation in
         // the narrow window after `end_session`.
-        enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
-        if let Some(handoff_id) = handoff_id {
-            info!(
-                session = %session_id,
-                page = %new_page.path,
-                handoff = %handoff_id,
-                "session ended; summary page + open handoff created",
-            );
-        } else if managed {
-            info!(
-                session = %session_id,
-                page = %new_page.path,
-                managed_run = ?managed_run,
-                "managed session ended; summary page written without duplicate legacy handoff",
-            );
+        if turn_checkpoint {
+            info!(session = %session_id, page = %new_page.path, "turn checkpoint written; native session remains open");
         } else {
-            // Only reachable through the admission refusal above, which already
-            // warned with the reason; without this arm the refusal would be
-            // logged as a managed session end and hide why the baton is gone.
-            info!(
-                session = %session_id,
-                page = %new_page.path,
-                "session ended; summary page written without a handoff (admission refused)",
-            );
+            enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
+            if let Some(handoff_id) = handoff_id {
+                info!(
+                    session = %session_id,
+                    page = %new_page.path,
+                    handoff = %handoff_id,
+                    "session ended; summary page + open handoff created",
+                );
+            } else if managed || child_session {
+                info!(
+                    session = %session_id,
+                    page = %new_page.path,
+                    managed_run = ?managed_run,
+                    "managed or child session ended; summary page written without legacy handoff",
+                );
+            } else {
+                // Only reachable through the admission refusal above, which
+                // already warned with the reason; without this arm the refusal
+                // would be logged as a managed session end and hide why the
+                // baton is gone.
+                info!(
+                    session = %session_id,
+                    page = %new_page.path,
+                    "session ended; summary page written without a handoff (admission refused)",
+                );
+            }
         }
     }
 
@@ -3087,6 +3180,7 @@ fn is_ephemeral_session(observations: &[ai_memory_core::Observation]) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_auto_handoff(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
@@ -3095,6 +3189,7 @@ fn build_auto_handoff(
     cwd: Option<String>,
     observations: &[ai_memory_core::Observation],
     owner_user: Option<String>,
+    turn_checkpoint: bool,
 ) -> NewHandoff {
     // Prefer obs.body (the full prompt) over obs.title (first-line +
     // truncated to 80 chars for log/list display). When body is
@@ -3136,16 +3231,42 @@ fn build_auto_handoff(
     }
     let first_prompt = prompts.first().cloned();
     let last_prompt = prompts.last().cloned();
-    let summary = match (&first_prompt, &last_prompt) {
+    let mut summary = match (&first_prompt, &last_prompt) {
         (Some(first), Some(last)) if first == last => format!("Session focused on: {}", cap(first)),
         (Some(first), Some(last)) => format!("Started: {}\n\nLast: {}", cap(first), cap(last),),
         (Some(first), None) => format!("Started: {}", cap(first)),
         _ => format!(
-            "Session ended; {} observations recorded.",
+            "{}; {} observations recorded.",
+            if turn_checkpoint {
+                "Turn checkpoint"
+            } else {
+                "Session ended"
+            },
             observations.len()
         ),
     };
-    let open_questions = derive_open_questions(observations, &last_prompt);
+    // Stop bodies exist only after the assistant-capture double opt-in. The
+    // excerpt continues the work in the next session's baton and stays out of
+    // the git-tracked session page.
+    if let Some(assistant) = observations.iter().rev().find(|observation| {
+        observation.kind == ObservationKind::Stop && !observation.body.trim().is_empty()
+    }) {
+        summary.push_str("\n\nLatest assistant response: ");
+        summary.push_str(&assistant.body);
+    }
+    let open_questions = if turn_checkpoint {
+        // A completed turn is neither a native-session exit nor evidence that
+        // the user's last question remains unanswered.
+        last_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty() && !is_acknowledgment(prompt))
+            .map(|prompt| format!("Continue from last request: {}", cap_handoff_text(prompt)))
+            .into_iter()
+            .collect()
+    } else {
+        derive_open_questions(observations, &last_prompt)
+    };
     let next_steps = if tools.is_empty() {
         Vec::new()
     } else {
@@ -8347,6 +8468,598 @@ mod tests {
         );
     }
 
+    fn opencode_turn_event(session: &str, event: &str, text: &str) -> HookEnvelope {
+        HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: event.into(),
+                agent: Some("opencode2".into()),
+                capture_assistant: Some("1".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session,
+                "prompt": text,
+                "turn_checkpoint": true,
+                "_ai_memory_assistant": { "version": 1, "excerpt": text },
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn opencode_turn_checkpoints_refresh_page_and_baton_without_ending_session() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.consolidate_on_session_end = true;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm.clone(),
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+        let session = SessionId::new();
+        let mut previous_page = None;
+        let mut previous_handoff = None;
+        for text in ["Implemented the first turn", "Verified the second turn"] {
+            process(
+                &state,
+                opencode_turn_event(&session.to_string(), "user-prompt", text),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let mut stop = opencode_turn_event(&session.to_string(), "stop", text);
+            crate::assistant_capture::apply_assistant_backstop(&mut stop, true);
+            process(&state, stop, None, Vec::new()).await.unwrap();
+            let pages = state
+                .reader
+                .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+                .await
+                .unwrap();
+            let page = pages
+                .iter()
+                .find(|page| page.path.as_str().starts_with("sessions/"))
+                .unwrap();
+            let body = state
+                .wiki
+                .read_page(state.workspace_id, state.project_id, &page.path)
+                .unwrap()
+                .body;
+            assert!(body.contains(text));
+            assert_ne!(previous_page, Some(page.id));
+            previous_page = Some(page.id);
+            let handoff = state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                handoff
+                    .content
+                    .summary
+                    .contains(&format!("Latest assistant response: {text}"))
+            );
+            if let Some(previous) = previous_handoff {
+                assert_eq!(
+                    previous, handoff.scope.id,
+                    "a live session keeps one baton, refreshed in place"
+                );
+            }
+            assert!(
+                handoff
+                    .content
+                    .open_questions
+                    .iter()
+                    .all(|question| !question.contains("exit"))
+            );
+            previous_handoff = Some(handoff.scope.id);
+            assert!(
+                state
+                    .reader
+                    .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                state
+                    .reader
+                    .session_end_disposition(
+                        session,
+                        state.workspace_id,
+                        state.project_id,
+                        AgentKind::OpenCode
+                    )
+                    .await
+                    .unwrap(),
+                ai_memory_store::SessionEndDisposition::Open
+            );
+        }
+        let now = Timestamp::now().as_microsecond();
+        assert!(
+            state
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(llm.0.lock().unwrap().is_none());
+        // Each turn replaces the session's own unclaimed baton rather than
+        // leaving an expired row behind per turn.
+        let batons = state
+            .reader
+            .list_handoffs(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batons.len(), 1, "one baton row per live session");
+
+        // A real end still closes the same resumable native session.
+        process(
+            &state,
+            opencode_turn_event(&session.to_string(), "session-end", ""),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            Some(session)
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_turn_checkpoint_requires_root_substantive_unmanaged_marked_stop() {
+        for case in [
+            "noop",
+            "subagent",
+            "managed",
+            "unmarked",
+            "wrong-agent",
+            "wrong-type",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let state = make_state(&tmp).await;
+            let session = SessionId::new().to_string();
+            if case != "noop" {
+                let mut prompt = opencode_turn_event(&session, "user-prompt", "Real work");
+                if case == "wrong-agent" {
+                    prompt.agent = AgentKind::Codex;
+                }
+                process(&state, prompt, None, Vec::new()).await.unwrap();
+            }
+            let mut stop = opencode_turn_event(&session, "stop", "Completed work");
+            match case {
+                "subagent" => stop.raw["agent_id"] = serde_json::json!("child"),
+                "managed" => stop.managed_run = Some(ManagedRunId::new().to_string()),
+                "unmarked" => stop.raw["turn_checkpoint"] = serde_json::json!(false),
+                "wrong-type" => stop.raw["turn_checkpoint"] = serde_json::json!("true"),
+                "wrong-agent" => stop.agent = AgentKind::Codex,
+                _ => {}
+            }
+            process(&state, stop, None, Vec::new()).await.unwrap();
+            assert!(session_pages(&state).await.is_empty(), "{case}");
+            assert!(!open_handoff_exists(&state).await, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_turn_checkpoint_admission_refusal_keeps_page_and_live_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state_with_admission(
+            &tmp,
+            refusing_admission_chain("guard", vec![ai_memory_wiki::AdmissionOp::HandoffBegin]),
+        )
+        .await;
+        let session = SessionId::new().to_string();
+        for event in ["user-prompt", "stop"] {
+            process(
+                &state,
+                opencode_turn_event(&session, event, "Real work"),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(!session_pages(&state).await.is_empty());
+        assert!(!open_handoff_exists(&state).await);
+        assert!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_child_session_end_closes_and_summarizes_without_baton() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = SessionId::new();
+        for event in ["user-prompt", "stop", "session-end"] {
+            let mut env = opencode_turn_event(&session.to_string(), event, "Child captured work");
+            env.raw["agent_id"] = serde_json::json!("child");
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+        assert!(!session_pages(&state).await.is_empty());
+        assert!(!open_handoff_exists(&state).await);
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            Some(session)
+        );
+    }
+
+    // Claude Code stamps `agent_type` on a top-level `--agent` session, so
+    // that marker must not cost it its baton; and a captured Stop body is
+    // surfaced for any agent in the capture table, not only OpenCode.
+    #[tokio::test]
+    async fn claude_code_agent_session_end_keeps_baton_and_latest_response() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = SessionId::new().to_string();
+        for event in ["user-prompt", "stop", "session-end"] {
+            let mut env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    capture_assistant: Some("1".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session,
+                    "agent_type": "reviewer",
+                    "prompt": "Review the patch",
+                    "_ai_memory_assistant": { "version": 1, "excerpt": "Found two bugs" },
+                }),
+            );
+            crate::assistant_capture::apply_assistant_backstop(&mut env, true);
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+        let handoff = state
+            .reader
+            .latest_open_handoff(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .expect("a top-level --agent session keeps its baton");
+        assert!(
+            handoff
+                .content
+                .summary
+                .contains("Latest assistant response: Found two bugs")
+        );
+        let pages = session_pages(&state).await;
+        let body = state
+            .wiki
+            .read_page(
+                state.workspace_id,
+                state.project_id,
+                &ai_memory_core::PagePath::new(pages[0].clone()).unwrap(),
+            )
+            .unwrap()
+            .body;
+        assert!(
+            !body.contains("Found two bugs"),
+            "the assistant excerpt stays out of the git-tracked session page"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_turn_checkpoint_assistant_capture_requires_both_opt_ins() {
+        for (server, client) in [(false, false), (false, true), (true, false), (true, true)] {
+            let tmp = TempDir::new().unwrap();
+            let state = make_state(&tmp).await;
+            let session = SessionId::new().to_string();
+            process(
+                &state,
+                opencode_turn_event(&session, "user-prompt", "Fix the bug"),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let secret = "AKIA".to_string() + &"A".repeat(16);
+            let mut stop =
+                opencode_turn_event(&session, "stop", &format!("Assistant-only result {secret}"));
+            stop.capture_assistant_requested = client;
+            crate::assistant_capture::apply_assistant_backstop(&mut stop, server);
+            process(&state, stop, None, Vec::new()).await.unwrap();
+            let handoff = state
+                .reader
+                .latest_open_handoff(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                handoff.content.summary.contains("Assistant-only result"),
+                server && client
+            );
+            assert!(!handoff.content.summary.contains(&secret));
+            let pages = state
+                .reader
+                .recent_pages_for_project(state.workspace_id, state.project_id, 20)
+                .await
+                .unwrap();
+            let page = pages
+                .iter()
+                .find(|page| page.path.as_str().starts_with("sessions/"))
+                .unwrap();
+            let body = state
+                .wiki
+                .read_page(state.workspace_id, state.project_id, &page.path)
+                .unwrap()
+                .body;
+            assert!(!body.contains("Assistant-only result"));
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_turn_checkpoint_handoffs_are_project_scoped_and_claimed_once() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        for project in ["alpha", "beta"] {
+            let session = SessionId::new().to_string();
+            for turn in ["first", "latest"] {
+                for event in ["user-prompt", "stop"] {
+                    let mut env =
+                        opencode_turn_event(&session, event, &format!("{project}-{turn}"));
+                    env.workspace_override = Some("checkpoint-workspace".into());
+                    env.project_override = Some(project.into());
+                    crate::assistant_capture::apply_assistant_backstop(&mut env, true);
+                    process(&state, env, None, Vec::new()).await.unwrap();
+                }
+            }
+        }
+        for (project, other) in [("alpha", "beta"), ("beta", "alpha")] {
+            let query = HandoffQuery {
+                workspace: Some("checkpoint-workspace".into()),
+                project: Some(project.into()),
+                agent: Some("codex".into()),
+                session_id: Some(SessionId::new().to_string()),
+                ..Default::default()
+            };
+            let first = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(first.contains(&format!("Latest assistant response: {project}-latest")));
+            assert!(!first.contains(&format!("{other}-")));
+            let second = fetch_and_accept_handoff(&state, query, None, Vec::new())
+                .await
+                .unwrap();
+            assert!(
+                second.is_none(),
+                "a consumed or superseded baton must not reappear"
+            );
+        }
+    }
+
+    // Live incident: a `.ai-memory.toml` naming a workspace appeared under
+    // running OpenCode sessions, so their later events (same cwd) resolved to
+    // a new `(workspace, project)`. Scope is not identity: those events are
+    // recorded in the scope they name instead of being dropped as a session
+    // collision, the session row keeps the scope it began in, and the
+    // drifted SessionEnd still ends it.
+    #[tokio::test]
+    async fn marker_added_mid_session_records_later_events_and_still_ends() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = SessionId::new();
+        let event = |name: &str, workspace: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: name.into(),
+                    agent: Some("opencode2".into()),
+                    cwd: Some("/work/projects".into()),
+                    workspace: workspace.map(str::to_owned),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session.to_string(),
+                    "prompt": "keep working",
+                    "tool_name": "bash",
+                    "turn_checkpoint": name == "stop",
+                }),
+            )
+        };
+        let admit = |env| {
+            process_authorized(
+                &state,
+                env,
+                None,
+                ai_memory_core::AuthLevel::Anonymous,
+                Vec::new(),
+            )
+        };
+        for name in ["session-start", "user-prompt"] {
+            admit(event(name, None)).await.unwrap();
+        }
+        let (began_ws, began_proj, _) = state
+            .reader
+            .find_session_scope(session)
+            .await
+            .unwrap()
+            .unwrap();
+        for name in ["user-prompt", "pre-tool-use", "stop"] {
+            admit(event(name, Some("windows"))).await.unwrap();
+        }
+
+        let observations = state
+            .reader
+            .observations_for_session(session)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 5, "no event may be dropped");
+        let marker_scoped = observations
+            .iter()
+            .filter(|obs| obs.workspace_id != began_ws && obs.project_id != began_proj)
+            .count();
+        assert_eq!(
+            marker_scoped, 3,
+            "post-marker events land where they resolve"
+        );
+        let (row_ws, row_proj, _) = state
+            .reader
+            .find_session_scope(session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((row_ws, row_proj), (began_ws, began_proj));
+
+        // The drifted Stop was a turn checkpoint. Its page and baton belong to
+        // the session, so they land where its end will write them, and a purge
+        // of the session's scope can find them.
+        let marker = observations.last().unwrap();
+        let (marker_ws, marker_proj) = (marker.workspace_id, marker.project_id);
+        let session_page = |ws, proj| {
+            let reader = state.reader.clone();
+            async move {
+                reader
+                    .recent_pages_for_project(ws, proj, 20)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .any(|page| page.path.as_str().starts_with("sessions/"))
+            }
+        };
+        let open_baton = |ws, proj| {
+            let reader = state.reader.clone();
+            async move {
+                reader
+                    .latest_open_handoff(ws, proj, None, ai_memory_core::OwnerFilter::Any)
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        };
+        assert!(session_page(began_ws, began_proj).await);
+        assert!(open_baton(began_ws, began_proj).await);
+        assert!(!session_page(marker_ws, marker_proj).await);
+        assert!(!open_baton(marker_ws, marker_proj).await);
+
+        // The plugin's end also resolves to the marker scope. It comes from
+        // the session's own cwd, so it ends the session where it began
+        // instead of stranding it open.
+        admit(event("session-end", Some("windows"))).await.unwrap();
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(began_ws, began_proj)
+                .await
+                .unwrap(),
+            Some(session)
+        );
+    }
+
+    // OpenCode `session.moved`: the plugin forwards the relocation as a keyed
+    // SessionStart naming the directory the session left. The live row
+    // follows it, so the SessionEnd sent from the new directory ends the
+    // session there instead of being ignored as a foreign-scope end. A child
+    // session (it carries its parent as `agent_id`) moves the same way.
+    #[tokio::test]
+    async fn opencode_native_move_lets_the_session_end_where_it_now_runs() {
+        for child in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let state = make_state(&tmp).await;
+            let session = SessionId::new();
+            let event = |project: &str, name: &str| {
+                let mut body = serde_json::json!({
+                    "session_id": session.to_string(),
+                    "prompt": format!("{project} work"),
+                });
+                if child {
+                    body["agent_id"] = serde_json::json!("parent");
+                }
+                HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: name.into(),
+                        agent: Some("opencode2".into()),
+                        cwd: Some(format!("/repo/{project}")),
+                        workspace: Some("move-workspace".into()),
+                        project: Some(project.into()),
+                        ..Default::default()
+                    },
+                    body,
+                )
+            };
+            for name in ["session-start", "user-prompt"] {
+                process(&state, event("alpha", name), None, Vec::new())
+                    .await
+                    .unwrap();
+            }
+            let mut moved = event("beta", "session-start");
+            moved.raw["session_moved"] = serde_json::json!(true);
+            moved.raw["session_moved_from_cwd"] = serde_json::json!("/repo/alpha");
+            moved.ingest_key = Some("alpha-to-beta".into());
+            process(&state, moved, None, Vec::new()).await.unwrap();
+            for name in ["user-prompt", "session-end"] {
+                process(&state, event("beta", name), None, Vec::new())
+                    .await
+                    .unwrap();
+            }
+
+            let (ws, project, cwd) = state
+                .reader
+                .find_session_scope(session)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cwd.as_deref(), Some("/repo/beta"), "child: {child}");
+            let beta = state
+                .writer
+                .get_or_create_project(ws, "beta", None)
+                .await
+                .unwrap();
+            assert_eq!(project, beta, "child: {child}");
+            assert_eq!(
+                state
+                    .reader
+                    .latest_completed_session_for_project(ws, beta)
+                    .await
+                    .unwrap(),
+                Some(session),
+                "child: {child}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn session_end_closes_only_matching_scoped_session() {
         let tmp = TempDir::new().unwrap();
@@ -9816,6 +10529,7 @@ mod tests {
             None,
             &observations,
             None,
+            false,
         );
         state
             .writer

@@ -86,6 +86,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session in a directory. Concurrent OpenCode sessions in different projects
   no longer read each other's active project; explicit `workspace`/`project`
   arguments still win and `X-Memory-Actor-Session-Id` keeps precedence. (#864)
+- OpenCode 2 turn checkpoints: every completed root turn
+  (`session.execution.succeeded`, `.failed` or `.interrupted`, OpenCode
+  2.0.10+) now refreshes `sessions/<id>.md` and the session's automatic
+  handoff without ending the native session, because OpenCode 2's shared
+  service outlives the CLI and closing a terminal is not a session end. The
+  checkpoint is deterministic (no LLM call), is written in the session's own
+  scope, keeps one open baton per live session (refreshed in place, audited as
+  `refresh_handoff`), and never touches a session that already ended. Child
+  sessions neither claim startup context nor publish batons. (#865)
+- `install-hooks --agent opencode2 --capture-assistant` extends the
+  assistant/Stop capture double opt-in to OpenCode 2: the plugin forwards the
+  last completed assistant text through the native hook's sanitizer before it
+  reaches the spool or the wire. The captured excerpt continues the work in
+  the next session's automatic handoff; it is not rendered into the
+  git-tracked session page. (#865)
 
 ### Changed
 - Grok Build CLI shows a pending handoff, and an opted-in `[briefing]`, as
@@ -103,6 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   take another (the multi-session claim-once invariant is preserved).
   Delivery of this PostToolUse handoff is exempt from `AI_MEMORY_CAPTURE_OWNER`
   capture suppression, like the other context-delivery events. (#840)
+- The generated OpenCode 2 plugin binds to the OpenCode 2.0.10+ event and hook
+  API (`session.execution.*`, `session.text.ended`, `session.moved`, the
+  `context` hook). Startup context is claimed once per root session and
+  retained on every later model request; content-only tool results are
+  captured; each location instance owns its own queue, spool state and
+  cleanup; an explicit `session.moved` rebinds the live session to its new
+  directory so its later end lands there. Checked against OpenCode 2.0.14. (#865)
 
 ### Fixed
 - `memory_query`'s vector stream called the generic `Embedder::embed`
@@ -187,6 +209,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event: their `git` lookups set `windowsHide`. The repo-root project lookup
   behind those spawns is memoized per cwd instead of running two synchronous
   `git` processes on every event. (#863)
+- A `SessionEnd` whose resolved scope drifted from its session (a
+  `.ai-memory.toml` appeared under the running session) was refused as a
+  foreign-scope end and stranded the session open forever. It now ends the
+  session when owner and agent match and the event comes from the session's
+  own (normalized) cwd; a different cwd, operator or agent is still refused. (#865)
+- Generated TypeScript integrations no longer overwrite each other's spooled
+  events written in the same millisecond, and a host that tears its capture
+  state down cancels still-pending deliveries after the drain budget instead
+  of waiting out each request's timeout. (#865)
 
 ## [2.4.0] - 2026-09-21
 

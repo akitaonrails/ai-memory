@@ -2313,7 +2313,7 @@ pub struct HookArgs {
     /// the local spool or the wire.
     #[arg(long, value_enum)]
     pub capture_mode: Option<CaptureModeArg>,
-    /// Opt in to assistant/Stop capture: on a Claude Code `stop` event, attach a
+    /// Opt in to assistant/Stop capture: on a supported agent's `stop` event, attach a
     /// sanitized, capped excerpt of the assistant's final turn as the Stop body.
     /// Baked onto the native `stop` command by
     /// `install-hooks --capture-assistant`; the server must also enable
@@ -2391,11 +2391,10 @@ pub struct InstallHooksArgs {
     /// silently revert `repo-root` back to `basename`.
     #[arg(long, value_enum)]
     pub project_strategy: Option<ProjectStrategyArg>,
-    /// Bake `--capture-assistant` onto the installed native `stop` command so a
-    /// Claude Code `stop` event carries a sanitized excerpt of the assistant's
-    /// final turn (#196). Only valid for `--agent claude-code` on a native
-    /// platform; the server must also set `capture_assistant = true`. Re-running
-    /// without this flag removes it (idempotent). Default off.
+    /// Capture a sanitized excerpt of the assistant's final turn through the
+    /// native Stop hook. Supported for Claude Code, Codex and OpenCode 2 on a
+    /// native platform; the server must also set `capture_assistant = true`.
+    /// A bare re-apply preserves an existing opt-in. Default off.
     #[arg(long)]
     pub capture_assistant: bool,
     /// Persist the capture failure mode for this install (#446). Under
