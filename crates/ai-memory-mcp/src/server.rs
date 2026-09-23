@@ -1768,8 +1768,12 @@ impl AiMemoryServer {
     ///   raw client-supplied headers.
     /// - `session_id` comes from the same `ActorContext` when the auth
     ///   middleware filled it; if not, falls back to the rung-4
-    ///   `X-Memory-Actor-Session-Id` request header, then to the standard
-    ///   MCP `Mcp-Session-Id` header. The session id is just a cache key
+    ///   `X-Memory-Actor-Session-Id` request header, then native request
+    ///   `_meta["ai.opencode/sessionID"]`, then the transport's
+    ///   `Mcp-Session-Id` header. The native id matches lifecycle hooks; a
+    ///   transport id does not, and only `--http-stateful` issues one (the
+    ///   default stateless transport never does, so clients send none).
+    ///   The session id is just a cache key
     ///   for the active-project map — getting it wrong only routes the
     ///   lookup to a different (or absent) slot, with no auth-bypass risk,
     ///   so trusting the header here is safe.
@@ -1804,6 +1808,12 @@ impl AiMemoryServer {
         let session_id = ctx
             .and_then(|c| c.session_id.clone())
             .or_else(|| header_session("x-memory-actor-session-id"))
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<NativeSessionId>()
+                    .map(|id| id.0.clone())
+            })
             .or_else(|| header_session("mcp-session-id"));
         ai_memory_core::ActorKey { user, session_id }
     }
@@ -5087,8 +5097,10 @@ impl ServerHandler for AiMemoryServer {
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
-        context: rmcp::service::RequestContext<RoleServer>,
+        mut context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, McpError> {
+        // rmcp moves params._meta into RequestContext before dispatch.
+        attach_native_session(&mut context.extensions, &context.meta);
         self.record_client_activity(&request.name, &context);
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
@@ -5662,6 +5674,29 @@ fn default_parts() -> axum::http::request::Parts {
     *request.method_mut() = axum::http::Method::POST;
     *request.uri_mut() = axum::http::Uri::from_static("/mcp");
     request.into_parts().0
+}
+
+/// Routing-only native identity; never populate authenticated actor extensions
+/// from client metadata. Keep it request-local even on shared MCP transports.
+#[derive(Clone)]
+struct NativeSessionId(String);
+
+fn attach_native_session(extensions: &mut rmcp::model::Extensions, meta: &rmcp::model::Meta) {
+    // OpenCode 2 (2.0.4+) sends this on every tools/call, never on
+    // initialize. Its transport session is shared per (server, directory).
+    let Some(session_id) = meta
+        .get("ai.opencode/sessionID")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let OptionalParts(mut parts) = OptionalParts::from_extensions(extensions);
+    parts
+        .extensions
+        .insert(NativeSessionId(session_id.to_owned()));
+    extensions.insert(parts);
 }
 
 /// Tool-handler extractor for the request `Parts`. Unlike rmcp's
@@ -6368,6 +6403,86 @@ mod tests {
 
         assert_eq!(actor.user, None);
         assert_eq!(actor.session_id.as_deref(), Some("hook-session"));
+    }
+
+    #[test]
+    fn native_session_metadata_is_routing_only_and_preserves_precedence() {
+        let native = serde_json::json!({"ai.opencode/sessionID": "  native-session  "});
+        let other_native = serde_json::json!({"ai.opencode/sessionID": "other-native"});
+        // `sessionID` is not an OpenCode key, so the transport id wins.
+        let alias = serde_json::json!({"sessionID": "alias-session"});
+        let none = serde_json::json!({});
+        for (context_session, header_session, meta, expected) in [
+            (None, None, &native, "native-session"),
+            // Same shared transport, another native session: another slot.
+            (None, None, &other_native, "other-native"),
+            (None, None, &alias, "transport-session"),
+            (None, None, &none, "transport-session"),
+            (None, Some("header-session"), &native, "header-session"),
+            (
+                Some("context-session"),
+                Some("header-session"),
+                &native,
+                "context-session",
+            ),
+        ] {
+            let mut parts = test_parts_default();
+            parts
+                .headers
+                .insert("mcp-session-id", "transport-session".parse().unwrap());
+            if let Some(session) = header_session {
+                parts
+                    .headers
+                    .insert("x-memory-actor-session-id", session.parse().unwrap());
+            }
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(ActorContext {
+                user: Some("alice".into()),
+                session_id: context_session.map(str::to_owned),
+                ..ActorContext::default()
+            });
+            let mut extensions = rmcp::model::Extensions::new();
+            extensions.insert(parts);
+            let mut meta = meta.clone();
+            meta["user"] = "root".into();
+            meta["auth"] = "root".into();
+            let meta = serde_json::from_value(meta).unwrap();
+            attach_native_session(&mut extensions, &meta);
+            let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+            let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+            assert_eq!(actor.user.as_deref(), Some("user:alice"));
+            assert_eq!(actor.session_id.as_deref(), Some(expected));
+            assert_eq!(parts.extensions.get::<AuthLevel>(), Some(&AuthLevel::User));
+        }
+    }
+
+    #[test]
+    fn native_session_metadata_validates_strings_without_granting_identity() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!(true),
+            serde_json::json!(" \t "),
+            serde_json::json!(" ses_native "),
+        ] {
+            let mut extensions = rmcp::model::Extensions::new();
+            let meta = serde_json::from_value(
+                serde_json::json!({"ai.opencode/sessionID": value, "user": "root"}),
+            )
+            .unwrap();
+            attach_native_session(&mut extensions, &meta);
+            let OptionalParts(parts) = OptionalParts::from_extensions(&extensions);
+            let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+            assert_eq!(actor.user, None);
+            assert_eq!(
+                actor.session_id.as_deref(),
+                value.as_str().map(str::trim).filter(|id| !id.is_empty())
+            );
+            assert!(parts.extensions.get::<ActorContext>().is_none());
+            assert!(parts.extensions.get::<AuthLevel>().is_none());
+        }
     }
 
     #[test]

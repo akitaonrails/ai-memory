@@ -80,6 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (not bare JSON 401), forms call existing `POST /auth/login` /
   `/auth/password` / `/auth/logout`, and `--web-ui-dir` custom SPAs stay
   unchanged. (#811)
+- MCP tool calls from OpenCode 2 (2.0.4+) are routed by the native session id
+  the client sends in `params._meta["ai.opencode/sessionID"]`, ahead of the
+  `Mcp-Session-Id` transport header, which OpenCode shares across every
+  session in a directory. Concurrent OpenCode sessions in different projects
+  no longer read each other's active project; explicit `workspace`/`project`
+  arguments still win and `X-Memory-Actor-Session-Id` keeps precedence. (#864)
 
 ### Changed
 - Grok Build CLI shows a pending handoff, and an opted-in `[briefing]`, as

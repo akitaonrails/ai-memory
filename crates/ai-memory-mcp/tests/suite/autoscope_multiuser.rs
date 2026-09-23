@@ -354,6 +354,163 @@ async fn fire_hook_and_settle(h: &MultiUserHarness, token: &str, session_id: &st
     .expect("hook processing must release its harness permit");
 }
 
+async fn native_call(
+    router: &Router,
+    token: &str,
+    session: Option<&str>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> String {
+    // The wire shape OpenCode 2 (2.0.4+) sends on every tools/call, Code
+    // Mode included. Every native session in one directory shares a single
+    // transport session, so the header below is the same for all of them.
+    let mut params = json!({"name": name, "arguments": arguments});
+    if let Some(session) = session {
+        params["_meta"] = json!({"ai.opencode/sessionID": session});
+    }
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("authorization", format!("Bearer {token}"))
+        // A transport session must not mask the native lifecycle coordinate.
+        .header("mcp-session-id", "shared-transport")
+        .body(Body::from(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params})
+                .to_string(),
+        ))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response_text(response).await
+}
+
+async fn native_tool(
+    router: &Router,
+    token: &str,
+    session: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> String {
+    let body = native_call(router, token, Some(session), name, arguments).await;
+    let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_ne!(
+        envelope.pointer("/result/isError"),
+        Some(&json!(true)),
+        "{body}"
+    );
+    tool_text(&body)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_metadata_routes_concurrent_reads_and_writes_to_hook_workspaces() {
+    let h = MultiUserHarness::build(2).await;
+    // One authenticated operator, two native sessions: user identity alone
+    // cannot isolate their current projects (invariant #16).
+    let token = &h.users[0].token;
+    let sessions = ["ses_native_alpha", "ses_native_beta"];
+    let workspaces = ["native-alpha", "native-beta"];
+    for (session, workspace) in sessions.iter().zip(workspaces) {
+        let mut request = hook_request(token, session, "shared");
+        *request.uri_mut() = format!(
+            "/hook?event=session-start&agent=opencode2&workspace={workspace}&project=shared"
+        )
+        .parse()
+        .unwrap();
+        let response = h.router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.ingest_semaphore.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let write = |session, marker| {
+        native_tool(
+            &h.router,
+            token,
+            session,
+            "memory_write_page",
+            json!({
+                "path": "native.md", "title": "Native routing", "body": marker
+            }),
+        )
+    };
+    tokio::join!(
+        write(sessions[0], "native alpha evidence"),
+        write(sessions[1], "native beta evidence")
+    );
+    let read = |session| {
+        native_tool(
+            &h.router,
+            token,
+            session,
+            "memory_read_page",
+            json!({"path": "native.md"}),
+        )
+    };
+    let (alpha, beta) = tokio::join!(read(sessions[0]), read(sessions[1]));
+    assert!(alpha.contains("native alpha evidence"), "{alpha}");
+    assert!(!alpha.contains("native beta evidence"), "{alpha}");
+    assert!(beta.contains("native beta evidence"), "{beta}");
+    assert!(!beta.contains("native alpha evidence"), "{beta}");
+
+    // Explicit scope remains authoritative, and pages remain shared with
+    // another operator rather than being filtered by their author's identity.
+    let shared = native_tool(
+        &h.router,
+        &h.users[1].token,
+        sessions[1],
+        "memory_read_page",
+        json!({
+            "workspace": workspaces[0], "project": "shared", "path": "native.md"
+        }),
+    )
+    .await;
+    assert!(shared.contains("native alpha evidence"), "{shared}");
+    native_tool(
+        &h.router,
+        token,
+        sessions[1],
+        "memory_write_page",
+        json!({
+            "workspace": workspaces[0], "project": "shared", "path": "override.md",
+            "title": "Explicit override", "body": "written into alpha"
+        }),
+    )
+    .await;
+    let overridden = native_tool(
+        &h.router,
+        token,
+        sessions[0],
+        "memory_read_page",
+        json!({"path": "override.md"}),
+    )
+    .await;
+    assert!(overridden.contains("written into alpha"), "{overridden}");
+    // The override must not mutate beta's active pointer.
+    assert!(read(sessions[1]).await.contains("native beta evidence"));
+
+    // Without `_meta` the shared transport id is the only coordinate and it
+    // names no hook session, so the call must not follow the last hook.
+    let unrouted = native_call(
+        &h.router,
+        token,
+        None,
+        "memory_write_page",
+        json!({"path": "unrouted.md", "title": "Unrouted", "body": "no native id"}),
+    )
+    .await;
+    assert!(
+        unrouted.contains("active-project pointer does not match this caller"),
+        "{unrouted}"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Each user, authenticated by their real Bearer token, hooks their own
 // project; concurrent reads must resolve into their OWN slot, never any
