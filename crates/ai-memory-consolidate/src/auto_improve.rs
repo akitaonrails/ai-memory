@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, cap_text_with_marker, project_observations};
 
 const CHARS_PER_TOKEN: usize = 4;
@@ -1626,7 +1627,18 @@ fn validate_proposal(
     {
         return Err("missing_evidence".into());
     }
-    let path = PagePath::new(proposal.path.clone()).map_err(|_| "invalid_path".to_string())?;
+    // Same class as bootstrap #847 / consolidation #848: a model-produced
+    // path with a Windows-illegal character (e.g. `:`) passes `PagePath::new`
+    // and would be staged, then fail `ensure_portable` at approve time.
+    // Sanitize before constructing the path so the staged proposal is
+    // applyable; a path that is still unportable after slugify is rejected
+    // rather than queued.
+    let cleaned = slugify_page_path(&proposal.path);
+    let path = PagePath::new(&cleaned).map_err(|_| "invalid_path".to_string())?;
+    if path.ensure_portable().is_err() {
+        return Err("invalid_path".into());
+    }
+    proposal.path = path.as_str().to_string();
     match proposal.edit_mode.as_str() {
         "" | "full_page" => {
             validate_full_page_proposal(proposal, cfg, existing_index, path.as_str())
@@ -2696,6 +2708,53 @@ mod tests {
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].reason, "invalid_path");
         assert!(warnings.is_empty());
+    }
+
+    /// Same class as bootstrap #847 / consolidation #848: the reviewer LLM
+    /// echoes a conventional-commit subject into the page path. That passes
+    /// `PagePath::new` (deliberately tolerant) but fails `ensure_portable`,
+    /// so the proposal is staged and then cannot be applied.
+    #[test]
+    fn windows_illegal_model_path_is_sanitized_before_staging() {
+        let raw_path = "concepts/build(sandbox): orchestrate.md";
+        assert!(
+            PagePath::new(raw_path).is_ok(),
+            "precondition: PagePath::new is deliberately tolerant of ':'"
+        );
+        assert!(
+            PagePath::new(raw_path).unwrap().ensure_portable().is_err(),
+            "precondition: the raw model path is not portable"
+        );
+
+        let raw: AutoImproveLlmResponse = serde_json::from_value(serde_json::json!({
+            "summary": "ok",
+            "proposals": [{
+                "path": raw_path,
+                "title": "Orchestrate the run",
+                "kind": "concept",
+                "confidence": 0.91,
+                "rationale": "The session recorded a durable conventional-commit workflow.",
+                "evidence": [{"quote": "build(sandbox): orchestrate the run"}],
+                "body_markdown": "# Orchestrate the run\n\nKeep the sandbox build orchestrated."
+            }],
+            "rejected_candidates": []
+        }))
+        .unwrap();
+
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(
+            rejected.is_empty(),
+            "sanitized path should be accepted: {rejected:?}"
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path, "concepts/build(sandbox)- orchestrate.md");
+        let path = PagePath::new(&accepted[0].path).unwrap();
+        assert!(
+            path.ensure_portable().is_ok(),
+            "staged path must be applyable"
+        );
     }
 
     #[test]

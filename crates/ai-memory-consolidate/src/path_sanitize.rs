@@ -1,12 +1,14 @@
 //! Shared model-path sanitization for LLM-produced wiki paths.
 //!
-//! Both bootstrap (#847) and per-session consolidation (#848) accept a
-//! page path straight from LLM structured output and hand it to
-//! `Wiki::apply_batch`, which is atomic: a single path that fails
-//! `PagePath::ensure_portable` at write time aborts every page in that
-//! batch, not just its own. `PagePath::new` is deliberately tolerant (see
-//! its doc comment) and does not catch this, so callers must sanitize the
-//! raw model path themselves before constructing a `PagePath`.
+//! Bootstrap (#847), per-session consolidation (#848), and auto-improve
+//! review all accept a page path straight from LLM structured output.
+//! Bootstrap and consolidation hand it to `Wiki::apply_batch`, which is
+//! atomic: a single path that fails `PagePath::ensure_portable` at write
+//! time aborts every page in that batch, not just its own. Auto-improve
+//! stages the path and only hits `ensure_portable` on approve, so a bad
+//! path becomes an unapplyable proposal. `PagePath::new` is deliberately
+//! tolerant (see its doc comment) and does not catch this, so callers must
+//! sanitize the raw model path themselves before constructing a `PagePath`.
 
 /// Filename characters Windows refuses, mirroring
 /// `ai_memory_core::ids`'s reserved-char set, plus `\` — `PagePath::new`
@@ -23,6 +25,7 @@ pub(crate) const PATH_ILLEGAL_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '
 /// `PagePath::new` (deliberately tolerant; see its doc comment) but fails
 /// `ensure_portable`, which `Wiki::apply_batch` enforces atomically: one bad
 /// path there aborts every page in the batch, not just its own (#847, #848).
+/// Auto-improve review stages the path and hits the same check on approve.
 /// Replace every Windows-illegal character and ASCII control byte in each
 /// `/`-separated component with `-`, keeping the `dir/subdir/name.md` shape
 /// intact so the model's intended layout survives.

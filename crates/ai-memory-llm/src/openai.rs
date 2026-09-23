@@ -65,7 +65,7 @@ fn last_segment_is_version(url: &str) -> bool {
 ///
 /// `Official` targets `api.openai.com` and honours the model-family
 /// rules that the real OpenAI Chat Completions endpoint enforces:
-/// `max_completion_tokens` for gpt-5 / o-series, model-family output
+/// `max_completion_tokens` for gpt-5 / gpt-6 / o-series, model-family output
 /// caps, omitted `temperature` for reasoning models, strict-mode JSON
 /// schema normalisation.
 ///
@@ -388,7 +388,7 @@ impl OpenAiProvider {
                 } else {
                     (Some(capped), None)
                 };
-                // gpt-5 and o-series reject any non-default temperature
+                // gpt-5, gpt-6 and o-series reject any non-default temperature
                 // with `Unsupported value: temperature does not support
                 // 0.2 with this model. Only the default (1) is
                 // supported.` The lint / consolidate / bootstrap call
@@ -576,17 +576,21 @@ pub(crate) fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
 
 /// Models that require `max_completion_tokens` instead of `max_tokens`.
 /// OpenAI introduced this rename starting with the reasoning-capable o1
-/// family and made it mandatory across the gpt-5 line. Sending the legacy
+/// family and made it mandatory across the gpt-5 and gpt-6 lines. Sending the legacy
 /// `max_tokens` to these models returns a 400 with
 /// `Unsupported parameter: 'max_tokens'`.
 fn model_requires_max_completion_tokens(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+    m.starts_with("gpt-5")
+        || m.starts_with("gpt-6")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
 }
 
 /// Models that reject any non-default `temperature` value.
 ///
-/// gpt-5 and the o-series reasoning models accept only the model
+/// gpt-5, gpt-6 and the o-series reasoning models accept only the model
 /// default (1.0). Any caller-supplied value — including the 0.1-0.2
 /// passed by lint / bootstrap / consolidation — returns a 400:
 /// `Unsupported value: 'temperature' does not support 0.2 with this
@@ -653,12 +657,12 @@ impl ReasoningHost {
 /// model-specific message — at which point the operator can lower
 /// `max_tokens` or switch model. The cap exists to unblock the
 /// common case (gpt-4o family at 16384), not to paper over every
-/// model. Reasoning models in the gpt-5 / o-series have much larger
+/// model. Reasoning models in the gpt-5 / gpt-6 / o-series have much larger
 /// caps (128K+), so we leave their requests untouched.
 fn max_output_tokens_for(model: &str) -> u32 {
     if model_requires_max_completion_tokens(model) {
-        // gpt-5 / o-series: documented at 128K output. Leave the
-        // caller's value alone — they know what they're asking for.
+        // gpt-5 / o-series: documented at 128K output; gpt-6 gets the
+        // same handling. Leave the caller's value alone — they know what they're asking for.
         u32::MAX
     } else {
         // gpt-4o family published cap. gpt-4-turbo / gpt-3.5 have a
@@ -1043,6 +1047,7 @@ mod tests {
         assert!(model_requires_max_completion_tokens("o1-mini"));
         assert!(model_requires_max_completion_tokens("o3"));
         assert!(model_requires_max_completion_tokens("o4-mini"));
+        assert!(model_requires_max_completion_tokens("gpt-6-luna"));
     }
 
     #[test]
@@ -1115,6 +1120,25 @@ mod tests {
             json.get("temperature").is_none(),
             "temperature must be omitted for gpt-5/o-series under the Official dialect"
         );
+    }
+
+    #[test]
+    fn build_request_omits_temperature_for_gpt6() {
+        let p = provider_for("gpt-6-luna");
+        let req_input = ChatRequest {
+            system: None,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "x".into(),
+            }],
+            max_tokens: 64_000,
+            temperature: Some(0.2),
+        };
+        let json = serde_json::to_value(p.build_request(&req_input, None)).unwrap();
+        assert!(json.get("temperature").is_none());
+        assert!(json.get("max_tokens").is_none());
+        // Above the 16,384 cap applied to non-reasoning models.
+        assert_eq!(json["max_completion_tokens"], 64_000);
     }
 
     #[test]

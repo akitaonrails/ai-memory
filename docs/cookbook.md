@@ -105,7 +105,9 @@ compacted or merged stays in git and the supersession chain, recoverable with
   decay.
 - **Surface likely contradictions:** run `memory_lint` (through your agent or the
   CLI); with embeddings configured it flags pairs of same-topic pages that look
-  like they conflict, advisory only.
+  like they conflict, advisory only. Similarity reads shared vocabulary as much
+  as disagreement, so a single-domain or single-language store yields mostly
+  candidate pairs: read each finding as a pair to check, not as a defect.
 - **Let an LLM consolidate on idle ("dream"):** with a provider *and* an embedder
   configured, `[dream] enabled` turns on a background pass that rewrites clusters
   of cold notes into single coherent pages while you're idle and cancels the

@@ -78,6 +78,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Native `ai-memory upgrade` container refusal now uses the shared
   `running_in_container` helper (`AI_MEMORY_IN_CONTAINER`, `/.dockerenv`,
   `/run/.containerenv` / Podman), matching staged-hooks detection. (#802)
+- Auto-improve review no longer stages a proposal whose LLM-produced page
+  path contains a Windows-illegal character (e.g. a `:` copied from a
+  conventional-commit subject). That path passed the deliberately tolerant
+  `PagePath::new` and only failed later at `ensure_portable` when the
+  proposal was approved, so the learning loop queued work that could not
+  be applied. Paths are now sanitized the same way bootstrap (#847) and
+  per-session consolidation (#848) already sanitize theirs, before
+  validation; a path that is still unportable after sanitizing is rejected
+  instead of staged. (#850)
+- Omitted `temperature` for `gpt-6-*` models in the `codex`,
+  `openai-oauth`, `copilot` and `openai` providers. Codex answered GPT-6
+  requests that carried `temperature` with `400 Unsupported parameter:
+  temperature`, which broke consolidation, lint and bootstrap on a
+  provider or fallback configured with `gpt-6-luna`, `gpt-6-sol` or
+  `gpt-6-astra`. The `openai` provider now also sends
+  `max_completion_tokens` for GPT-6 and no longer applies its local
+  16,384-token cap to it, matching `gpt-5*`. (#851)
 - `memory_message_pop` and `memory_message_list` no longer return a silent
   empty result when the inbox scope was *inferred* rather than named. A caller
   with no explicit `workspace`/`project` and no forwarded hook-session id

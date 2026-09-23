@@ -21,6 +21,7 @@ use crate::embedding::{
 };
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
+use crate::openai_oauth::model_uses_default_temperature;
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited, response_text_limited};
 use crate::text::truncate_for_embedding;
@@ -695,11 +696,6 @@ fn build_chat_request<'a>(
     }
 }
 
-fn model_uses_default_temperature(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    m.starts_with("gpt-5") || m.starts_with('o')
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CopilotEndpoint {
     ChatCompletions,
@@ -1314,6 +1310,31 @@ mod tests {
         assert_eq!(value["max_tokens"], 123);
         assert!(value.get("temperature").is_none());
         assert_eq!(value["stream"], false);
+    }
+
+    #[test]
+    fn chat_request_omits_gpt6_temperature() {
+        let request = ChatRequest {
+            system: None,
+            messages: vec![crate::types::ChatMessage::user("hello")],
+            temperature: Some(0.2),
+            max_tokens: 123,
+        };
+        let value = serde_json::to_value(build_chat_request("gpt-6-sol", &request, None)).unwrap();
+        assert!(value.get("temperature").is_none());
+    }
+
+    #[test]
+    fn responses_request_omits_gpt6_temperature() {
+        let request = ChatRequest {
+            system: None,
+            messages: vec![crate::types::ChatMessage::user("hello")],
+            temperature: Some(0.2),
+            max_tokens: 123,
+        };
+        let value =
+            serde_json::to_value(build_responses_request("gpt-6-sol", &request, None)).unwrap();
+        assert!(value.get("temperature").is_none());
     }
 
     #[test]
