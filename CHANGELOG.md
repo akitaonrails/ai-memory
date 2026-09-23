@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Pre-push hook (`scripts/install-git-hooks.sh`) clears git's
+  `rev-parse --local-env-vars` (`GIT_DIR`, `GIT_WORK_TREE`, …) before
+  running the test suite. Without that, fixture `git` / libgit2 calls
+  inherited the hook environment and operated on the real checkout —
+  failing repo-root collapse tests and writing empty fixture commits onto
+  the branch under push (especially from linked worktrees). The installer
+  also resolves the hook path via `git rev-parse --git-path hooks` so
+  worktrees refresh the shared hooks dir. Re-run
+  `scripts/install-git-hooks.sh` to refresh an already-installed hook.
 - Auto-improve review no longer stages a proposal whose LLM-produced page
   path contains a Windows-illegal character (e.g. a `:` copied from a
   conventional-commit subject). That path passed the deliberately tolerant
