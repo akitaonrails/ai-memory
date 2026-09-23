@@ -11,8 +11,11 @@
 
 set -euo pipefail
 
-repo_root=$(git rev-parse --show-toplevel)
-hook="$repo_root/.git/hooks/pre-push"
+# Prefer --git-path so worktrees (where .git is a file) and linked checkouts
+# resolve to the shared common-dir hooks/, not $toplevel/.git/hooks.
+hooks_dir=$(git rev-parse --git-path hooks)
+hook="$hooks_dir/pre-push"
+mkdir -p "$hooks_dir"
 begin="# >>> ai-memory pre-push >>>"
 end="# <<< ai-memory pre-push <<<"
 tmp=$(mktemp "${hook}.XXXXXX")
@@ -37,6 +40,14 @@ cat >> "$tmp" <<'HOOK'
 # >>> ai-memory pre-push >>>
 # Runs the full test tier before a push. See scripts/install-git-hooks.sh.
 set -euo pipefail
+
+# Git exports GIT_DIR / GIT_WORK_TREE / … into hook environments. The test
+# suite creates throwaway repos via `git` and libgit2; those calls inherit
+# the hook env and then operate on *this* checkout (empty fixture commits
+# have landed on the branch under push). Clear git's own local-env list
+# before spawning cargo so fixtures stay inside their tempdirs.
+# shellcheck disable=SC2046
+unset $(git rev-parse --local-env-vars)
 
 # macOS: stop reqwest re-reading the Keychain in every test process.
 if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ] && [ -z "${SSL_CERT_FILE:-}" ] && [ -f /etc/ssl/cert.pem ]; then
