@@ -4575,8 +4575,8 @@ impl AiMemoryServer {
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+        let ((ws, proj), source) = self
+            .traced_ids_for_read_args(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -4610,7 +4610,8 @@ impl AiMemoryServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match popped {
-            None => ok_json(&serde_json::json!({ "message": null })),
+            None => ok_json(&serde_json::json!({ "message": null,
+                "scope": self.scope_label(ws, proj).await, "resolved_by": source.as_str() })),
             Some(message) => {
                 self.notify_operation_observers(admission.as_ref());
                 // Fence the body as untrusted cross-project input, and surface

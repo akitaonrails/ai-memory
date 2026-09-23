@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `memory_message_pop` no longer answers an empty pop with a bare `{"message": null}`: it names the `scope` (workspace/project) it resolved and the `resolved_by` source behind that choice, so a no-scope pop that resolved a different project (`shared_slot`) is diagnosable instead of indistinguishable from an empty inbox. (#854)
 - `companions/ai-memory-macos/build.sh` no longer fails on machines whose
   active developer directory is Command Line Tools only: SwiftUI `@State`
   needs the `SwiftUIMacros` plugin shipped with full Xcode, so the script
