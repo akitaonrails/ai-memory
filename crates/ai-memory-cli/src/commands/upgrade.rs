@@ -434,8 +434,7 @@ fn extract_release_zip(bytes: &[u8], dest: &Path) -> Result<()> {
             continue;
         }
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let mut out = fs::File::create(&out_path)
             .with_context(|| format!("creating {}", out_path.display()))?;

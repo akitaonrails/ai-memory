@@ -150,10 +150,10 @@ tower-http = { version = "0.6", features = ["fs", "cors"] }
 tar = "0.4"
 flate2 = "1"
 # Native Windows release zip extract/write for `ai-memory upgrade` (#801).
-# Already in the lockfile via candle-core; pin the same major here so the CLI
-# can enable default deflate (PowerShell Compress-Archive) without relying on
-# candle's feature set.
-zip = "8.6"
+# Already in the lockfile via candle-core. Keep default-features off so we
+# do not pull bzip2/`libbz2-rs-sys` (license not in deny allowlist); Deflate
+# covers PowerShell Compress-Archive release zips and Stored test fixtures.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # Text munging / hook payload sanitisation.
 regex = "1"

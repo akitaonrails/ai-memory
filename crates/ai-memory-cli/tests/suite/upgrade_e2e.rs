@@ -95,8 +95,7 @@ mod slow {
             let mut zip = ZipWriter::new(&mut cursor);
             let options =
                 SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-            zip.start_file("ai-memory.exe", options)
-                .expect("start exe");
+            zip.start_file("ai-memory.exe", options).expect("start exe");
             zip.write_all(NEW_BINARY).expect("write exe");
             zip.add_directory("hooks/", options).expect("hooks dir");
             zip.start_file("hooks/claude-code/new.sh", options)
