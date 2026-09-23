@@ -182,6 +182,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checksum block, which concatenates every platform's file. The zip's smoke
   test now requires LF rather than tolerating either, so the format the
   release claims is the format it ships. (#838)
+- The generated TypeScript integrations (OpenCode 1 and 2, OMP, Pi,
+  OpenClaw) no longer flash a console window on Windows for every captured
+  event: their `git` lookups set `windowsHide`. The repo-root project lookup
+  behind those spawns is memoized per cwd instead of running two synchronous
+  `git` processes on every event. (#863)
 
 ## [2.4.0] - 2026-09-21
 

@@ -388,26 +388,7 @@ function tomlKey(text: string, key: string): string | undefined {{
 }}
 
 
-function repoRootProject(cwd: string | undefined): string | undefined {{
-  if (!cwd) return undefined;
-  try {{
-    const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (inside !== "true") return undefined;
-    const common = execFileSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (!common) return undefined;
-    const root = dirname(common);
-    if (!root || root === dirname(root)) return undefined;
-    return basename(root);
-  }} catch (_e) {{
-    return undefined;
-  }}
-}}
+{repo_root_project}
 {apply_marker_params}
 
 function textFrom(value: unknown): string {{
@@ -603,6 +584,7 @@ export default definePluginEntry({{
 "#,
         server_literal = ts_string_literal(server_url),
         token_line = token_line,
+        repo_root_project = super::install_hooks::TS_REPO_ROOT_PROJECT,
         spool_runtime = ts_spool_runtime(),
     )
 }
@@ -698,6 +680,8 @@ mod tests {
         assert!(plugin.contains("if (existsSync(join(probe, \".git\")))"));
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
+        assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
+        assert_eq!(plugin.matches("windowsHide: true").count(), 2);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
