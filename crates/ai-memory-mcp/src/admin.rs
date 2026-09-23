@@ -54,7 +54,7 @@ use ai_memory_consolidate::{
     EmbedBackfillCounts, EmbedBackfillOptions, ObservationRetention, SourceCounts,
     prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
     render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
-    run_curator_report_with_breadth, run_embedding_backfill, run_lint, run_sweep_with_options,
+    run_curator_report_with_breadth, run_embedding_backfill, run_lint, run_sweep_with_compaction,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
@@ -93,6 +93,8 @@ const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 struct SweepTuning {
     breadth_weight: f64,
     retention: ObservationRetention,
+    /// A2 opt-in: compact cold episodic pages instead of evicting them.
+    compact_cold_episodic: bool,
 }
 
 /// Shared state for the admin router.
@@ -596,15 +598,22 @@ pub fn admin_router(state: AdminState) -> Router {
 
 /// Build the admin router with the optional distinct-reader retention weight.
 pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -> Router {
-    admin_router_with_sweep_tuning(state, breadth_weight, ObservationRetention::default())
+    admin_router_with_sweep_tuning(
+        state,
+        breadth_weight,
+        ObservationRetention::default(),
+        false,
+    )
 }
 
 /// Build the admin router with every sweep knob that lives outside
-/// `DecayParams`, including the opt-in observation prune (disabled by default).
+/// `DecayParams`, including the opt-in observation prune (disabled by default)
+/// and A2 extractive tier-down (`compact_cold_episodic`, off by default).
 pub fn admin_router_with_sweep_tuning(
     state: AdminState,
     breadth_weight: f64,
     retention: ObservationRetention,
+    compact_cold_episodic: bool,
 ) -> Router {
     let state = Arc::new(state);
     let operational = Router::new()
@@ -711,6 +720,7 @@ pub fn admin_router_with_sweep_tuning(
         .layer(axum::Extension(SweepTuning {
             breadth_weight,
             retention,
+            compact_cold_episodic,
         }))
 }
 
@@ -3432,6 +3442,16 @@ async fn handle_lint(
             dry_run: req.dry_run,
             use_llm: !req.no_llm,
             decay_lambda: state.decay_params.lambda,
+            // Zero-LLM contradiction detection (A5) off the configured
+            // embedder's triple; `None` ⇒ clean no-op.
+            embedding: state
+                .embedder
+                .as_ref()
+                .map(|e| ai_memory_consolidate::EmbeddingCoord {
+                    provider: e.provider().to_string(),
+                    model: e.model().to_string(),
+                    dim: e.dim(),
+                }),
         },
     )
     .await
@@ -3469,7 +3489,7 @@ async fn handle_forget_sweep(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
-    run_sweep_with_options(
+    run_sweep_with_compaction(
         &state.reader,
         &state.writer,
         Some(&state.wiki),
@@ -3478,6 +3498,7 @@ async fn handle_forget_sweep(
         &state.decay_params,
         tuning.breadth_weight,
         tuning.retention,
+        tuning.compact_cold_episodic,
         req.dry_run,
     )
     .await

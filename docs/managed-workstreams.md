@@ -399,6 +399,14 @@ environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
 `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`,
 `KIRO_HOME`, and `GROK_HOME`.
+Export these in the environment `ai-memory run` itself sees — not only inside a
+harness wrapper script. `ai-memory run` resolves the native session directory
+(and installs hooks) from its own environment; if the harness writes its
+transcript under a custom `CLAUDE_CONFIG_DIR` that `ai-memory run` cannot see,
+the two disagree and the native transcript import fails. When you use per-account
+config directories, set the variable before invoking `ai-memory run` (or in the
+same wrapper that also runs it), so hook installation and native-session
+resolution agree.
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never

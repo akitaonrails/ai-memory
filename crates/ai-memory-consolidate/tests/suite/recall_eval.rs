@@ -243,6 +243,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
             0,
             5,
             None,
+            false,
         )
         .await
         .expect("hybrid search");
@@ -318,6 +319,7 @@ async fn entity_stream_recovers_a_probe_fts_and_graph_both_miss() {
             0,
             5,
             None,
+            false,
         )
         .await
         .expect("hybrid search");
@@ -419,6 +421,7 @@ async fn measure_recall(
                     emb.dim(),
                     5,
                     None,
+                    false,
                 )
                 .await
                 .expect("hybrid search")

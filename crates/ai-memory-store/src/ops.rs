@@ -973,6 +973,17 @@ pub(crate) fn upsert_page_in_tx(
     let mut conformed = page.frontmatter_json.clone();
     ai_memory_core::okf::conform_frontmatter(page.path.as_str(), &mut conformed);
     let tier_str = page.tier.as_str();
+    // A2 tier-down marker (V65). The `compacted: true` frontmatter mirror is
+    // the single source of truth an A2 compaction rewrite carries in through
+    // the wiki layer; the `compacted_at` column is derived from it here, at the
+    // one write choke point, so the marker and the compacted body always land
+    // in the same transaction (invariant: indexes commit with the data). A
+    // normal write has no `compacted` key, so the column stays NULL and every
+    // pre-A2 code path behaves exactly as before.
+    let compacted_at: Option<i64> = conformed
+        .get("compacted")
+        .and_then(serde_json::Value::as_bool)
+        .and_then(|flag| flag.then_some(now));
 
     let existing: Option<ExistingPageVersion> = tx
         .query_row(
@@ -1033,8 +1044,8 @@ pub(crate) fn upsert_page_in_tx(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
               frontmatter_json, is_latest, supersedes, pinned, author_id, \
-              created_at, updated_at, expires_at, valid_from) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14)",
+              created_at, updated_at, expires_at, valid_from, compacted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -1051,6 +1062,7 @@ pub(crate) fn upsert_page_in_tx(
                 page.author_id.map(|id| id.as_bytes().to_vec()),
                 now,
                 page.expires_at.map(|ts| ts.as_microsecond()),
+                compacted_at,
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
@@ -1081,8 +1093,8 @@ pub(crate) fn upsert_page_in_tx(
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at, valid_from) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14, ?13)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at, valid_from, compacted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14, ?13, ?15)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -1098,6 +1110,7 @@ pub(crate) fn upsert_page_in_tx(
             page.author_id.map(|id| id.as_bytes().to_vec()),
             now,
             page.expires_at.map(|ts| ts.as_microsecond()),
+            compacted_at,
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
@@ -6764,6 +6777,38 @@ pub(crate) mod tests {
             entities: Vec::new(),
             evidence: Vec::new(),
         }
+    }
+
+    /// The V65 A2 marker is derived from the `compacted: true` frontmatter
+    /// mirror at the single write choke point, in the same transaction as the
+    /// body — a normal write leaves it NULL, so every pre-A2 path is unchanged.
+    #[test]
+    fn upsert_derives_compacted_at_from_frontmatter_mirror() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        // A normal write has no `compacted` key → marker stays NULL.
+        let plain = upsert_page(&mut conn, &page(ws, proj, "notes/plain.md", "body")).unwrap();
+        let plain_marker: Option<i64> = conn
+            .query_row(
+                "SELECT compacted_at FROM pages WHERE id = ?1",
+                rusqlite::params![plain.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(plain_marker, None, "an ordinary write is never marked");
+
+        // A write carrying the frontmatter mirror sets the marker.
+        let mut compacted = page(ws, proj, "notes/compacted.md", "residue");
+        compacted.frontmatter_json = serde_json::json!({"compacted": true});
+        let compacted_id = upsert_page(&mut conn, &compacted).unwrap();
+        let marker: Option<i64> = conn
+            .query_row(
+                "SELECT compacted_at FROM pages WHERE id = ?1",
+                rusqlite::params![compacted_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker.is_some(), "the frontmatter mirror sets compacted_at");
     }
 
     /// A page written before entity extraction — tags in frontmatter but

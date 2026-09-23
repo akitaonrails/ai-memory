@@ -20,23 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Downloads refuse bodies over 128 MiB (Content-Length and streamed cap).
   (#801)
 
-### Security
-- Bumped `rmcp` to 2.x (2.2.0), resolving three MCP transport advisories:
-  GHSA-9pj6-vhgr-3mwh (unauthenticated Streamable-HTTP session-table leak /
-  DoS), GHSA-33f5-2c5q-wgwj (missing OAuth resource-field validation), and
-  GHSA-9g45-5xwm-f3wc (custom headers leaking to cross-origin redirect
-  targets). Behavior-preserving: the only source change is the
-  `rmcp::model::Content` → `ContentBlock` rename (imported under the prior
-  name), the feature set is unchanged, and the 23-tool MCP surface is
-  unaffected. (#794)
-
-### Docs
-- `docs/llm-providers.md` now covers the `opencode` LLM provider, which has
-  shipped since 1.x but was missing from the recommended-defaults table:
-  `OPENCODE_API_KEY` as the only credential, Go as the default endpoint, Zen
-  via `AI_MEMORY_LLM_BASE_URL`, the built-in default model, per-catalogue
-  model ids, and which model goes through the Responses endpoint (#763).
-
 ### Fixed
 - Native `ai-memory upgrade` no longer refuses every Linux install by probing
   the running executable for write (Linux `ETXTBSY`); it only requires the
@@ -49,6 +32,347 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Native `ai-memory upgrade` container refusal now uses the shared
   `running_in_container` helper (`AI_MEMORY_IN_CONTAINER`, `/.dockerenv`,
   `/run/.containerenv` / Podman), matching staged-hooks detection. (#802)
+- `memory_message_pop` and `memory_message_list` no longer return a silent
+  empty result when the inbox scope was *inferred* rather than named. A caller
+  with no explicit `workspace`/`project` and no forwarded hook-session id
+  resolves the shared active-project slot (whichever project published last),
+  so two same-operator agents can have a no-scope pop land on a different inbox
+  than the on-start notice / `memory_briefing` counted — "you have mail"
+  followed by an empty fetch, with no way to tell it was the wrong inbox. An
+  empty read from an inferred scope now reports the `resolved_scope`
+  (workspace + project), the `scope_source`, and a hint to re-run with explicit
+  scope; an explicitly-scoped or session-bound empty read is unchanged. No
+  message is lost — the mis-scoped pop consumes nothing. (#854)
+- `companions/ai-memory-macos/build.sh` no longer fails on machines whose
+  active developer directory is Command Line Tools only: SwiftUI `@State`
+  needs the `SwiftUIMacros` plugin shipped with full Xcode, so the script
+  now exports `DEVELOPER_DIR` to Xcode (or a caller-set path) before
+  `swift build`, with a clear error when no macOS platform is present. (#849)
+- `ai-memory serve` no longer leaked file descriptors from half-open HTTP
+  connections until `EMFILE`, breaking the healthcheck (an unauthenticated
+  availability/DoS). A hook or MCP client whose peer died without sending FIN
+  (laptop sleep, a VPN/Tailscale flap, an abrupt kill) left its accepted
+  socket `ESTABLISHED` forever, since the OS default has TCP keepalive off —
+  each dead peer leaked one fd, exhausting the 1024-fd default in roughly 2-3
+  days of normal churn. Accepted connections now get TCP keepalive via
+  `socket2`, tunable with the new `tcp_keepalive_secs` config key (default
+  60s; `AI_MEMORY_TCP_KEEPALIVE_SECS=0` disables keepalive). This closes the
+  half-open-socket half of the fd leak; the rmcp session-table half was
+  already fixed in 2.4.0 by the rmcp 2.x bump. (#792)
+- `ai-memory bootstrap` no longer returns a 500 when the LLM emits a page
+  path containing a Windows-illegal character (e.g. a `:` copied verbatim
+  from a conventional-commit subject like `build(sandbox): orchestrate`).
+  Such a path passed the deliberately tolerant `PagePath::new` and only
+  failed later at `ensure_portable` inside the atomic wiki write batch,
+  which aborted every page in the run, not just the offending one. Bad
+  paths are now sanitized (illegal characters replaced with `-`, directory
+  shape preserved) before validation, so the run and its other pages
+  survive; a path `ensure_portable` still rejects after sanitizing is
+  skipped with a warning instead of failing the batch. (#847)
+- Per-session consolidation (`consolidate_session_multi`) had the same
+  Windows-illegal-path defect as `ai-memory bootstrap` (#847): an
+  LLM-produced page path containing a character like `:` passed the
+  deliberately tolerant `PagePath::new` and only failed later at
+  `ensure_portable` inside the atomic wiki write batch, losing every other
+  page from that session's consolidation run. The path is now sanitized
+  the same way bootstrap's is, consistently across rule-routing, per-user
+  slot placement, and the session-anchor comparison, before validation;
+  a path `ensure_portable` still rejects after sanitizing is skipped with
+  a warning instead of failing the batch. (#848)
+- The Windows release checksum (`ai-memory-windows-x86_64.zip.sha256`) is now
+  written with a LF terminator instead of CRLF. `Out-File`'s Windows line
+  ending made `sha256sum -c` fail with `No such file or directory` — the CR
+  is read as part of the filename — on the WSL2 and Git Bash paths where that
+  is the natural command, and placed a stray byte in the release body's
+  checksum block, which concatenates every platform's file. The zip's smoke
+  test now requires LF rather than tolerating either, so the format the
+  release claims is the format it ships. (#838)
+
+## [2.4.0] - 2026-09-21
+
+### Security
+- Bumped `rmcp` to 2.x (2.2.0), resolving three MCP transport advisories:
+  GHSA-9pj6-vhgr-3mwh (unauthenticated Streamable-HTTP session-table leak /
+  DoS), GHSA-33f5-2c5q-wgwj (missing OAuth resource-field validation), and
+  GHSA-9g45-5xwm-f3wc (custom headers leaking to cross-origin redirect
+  targets). Behavior-preserving: the only source change is the
+  `rmcp::model::Content` → `ContentBlock` rename (imported under the prior
+  name), the feature set is unchanged, and the 23-tool MCP surface is
+  unaffected. (#794)
+
+### Added
+- macOS menu bar companion (`companions/ai-memory-macos`) that bundles the
+  `ai-memory` binary and `hooks/` tree, governs the existing LaunchAgent, and
+  opens the built-in web UI, `ai-memory status`, `config.toml`, the data
+  directory, and logs. Durable memory stays in
+  `~/Library/Application Support/ai-memory`; replacing the `.app` does not
+  rewrite it. Documented as a README quick-start, an
+  [`install.md`](docs/install.md#macos-menu-bar-app) path, a cookbook
+  recipe, and [`docs/macos.md`](docs/macos.md) Scenario D. (#809)
+- LLM "dream" pass — cross-session rewrite/merge of cold clusters, scheduled on
+  idle (design-memory-aging.md buckets B2/B3/B4). Where A3 collapses
+  near-duplicate cold clusters *extractively* (zero-LLM, keep-token union), the
+  dream pass hands each cold cluster to the configured provider to be rewritten
+  into ONE coherent page. It is **opt-in LLM, OFF by default, and gated on an R2
+  number before it may default on**: it runs only when the new `[dream] enabled`
+  flag is set AND a provider AND an embedder are configured — a provider-less
+  store keeps the zero-LLM A3 path untouched (invariant #13). **It never deletes
+  a source** (invariant #16): the highest-retention member is rewritten and every
+  merged-away member is *superseded* with a merge-note stub pointing at it, so the
+  full pre-merge body stays reachable via the supersession chain + git and
+  `restore-page` recovers it; `page_evidence` (`reconsolidation` +
+  `b2_dream:<id>`) records which members fed each merge (the hallucinated-merge
+  guard). The rewrite routes through the existing gated apply path
+  (`preflight_admission(Consolidate)` → `Wiki::apply_batch`, single-writer actor,
+  invariant #2) with **`dry_run` first** (a dry run returns the plan and calls
+  neither the LLM nor the writer), and uses **JSON-schema structured output only**
+  (invariant #7). Scheduling (B3) runs the pass only after a configurable idle
+  window with no client activity and **cancels it the moment the operator
+  returns** (a cheap cancellation flag polled between clusters), bounded to a
+  capped number of clusters per run (invariant #5). Work is ordered
+  **surprisal-first** (B4): most-novel clusters — those farthest from the nearest
+  existing page — first. Every run returns an observable `DreamReport` (clusters
+  considered, merged, pages rewritten/superseded, skipped, cancelled) so a bad
+  run is never silent. New `[dream]` config section; no new migration (reuses
+  `page_evidence` + supersession); no new MCP tool (still 23) (#816).
+- Belief-strength confidence over the `page_evidence` substrate
+  (design-memory-aging.md bucket B1 / design-hindsight-borrowings.md §3): a
+  read-time, **zero-LLM** `confidence` derived per page version from its
+  evidence — distinct supporting sessions (breadth, not raw count), recency of
+  the newest sighting, and live `contradicts` count — bounded to
+  `[0.0, 0.95]`. It is **exposed inertly** everywhere it helps diagnosis:
+  `memory_query(explain=true)` now reports `confidence` and `evidence_count`
+  per hit (and `belief_factor` when folding is on), and `memory_status` reports
+  the project's `evidence_rows` count — none of which changes ranking. It can
+  optionally be **folded into ranking authority** as one more bounded factor
+  inside the existing `[0.55, 1.50]` clamp (never a new multiplier tower) via
+  the new `[retrieval] belief_authority_weight` config key, which **defaults to
+  `0.0` (OFF)** so upgrades rank byte-identically. The anti-entrenchment guards
+  are baked in: breadth weighting by distinct sessions, recency shading, a
+  hard confidence cap, and — the caller-side guard for invariant #16 — **a
+  supersession always wins regardless of evidence** (a superseded version's
+  stale evidence never boosts it, and confidence never gates whether a write or
+  correction takes). Turning the authority factor on is **gated on a positive
+  R2 delta** (retrieval-triple / QA), not yet performed (#815).
+- Zero-LLM contradiction detection surfaced through `memory_lint`
+  (design-memory-aging.md bucket A5): the lint pass now flags likely-conflicting
+  pages by cosine-similarity band. Cold knowledge pages (semantic / procedural)
+  whose already-stored embeddings sit in the **0.4–0.75 cosine-similarity band** —
+  "same topic, but not a near-duplicate", the shape of a likely contradiction
+  (a pair ≥ 0.75 is A3 dedup territory; < 0.4 is unrelated) — get an advisory
+  `contradiction` lint finding naming both pages, with timestamp-based
+  resolution advice (the newer page supersedes on a timestamp basis; reconcile).
+  It is fully **zero generative LLM**: it reads only existing embeddings and
+  cosine (invariant #13), so with no embedder configured — or no embeddings for
+  the configured `(provider, model, dim)` triple — it is a clean no-op, not an
+  error, and never a provider call. It runs on the user-invoked `memory_lint`
+  (MCP and admin) and is **advisory-only and non-destructive**: it emits a
+  finding and never deletes, edits, or supersedes a page (invariant #16), and
+  never persists an edge (the `links` table's `contradicts` edges are
+  body-derived and rewritten on every page write, so a programmatic edge would
+  be silently wiped) — hence **no new migration**, and no new MCP tool (still
+  23). The scan is bounded: one embeddings load over the already-bounded cold
+  set, capped page and finding counts, deterministic ordering (invariant #2)
+  (#814).
+- Cold-cluster dedup of near-duplicate episodic pages (design-memory-aging.md
+  bucket A3): the forget-sweep can now cluster near-duplicate cold episodic
+  pages by embedding (cosine-distance DBSCAN with an adaptive k-distance eps,
+  `minPts = 2`) and collapse each cluster to one survivor — the highest-retention
+  member, its body the *extractive union* of the cluster's keep-tokens, so every
+  member's durable facts survive — superseding the other members with a merge
+  note that points at the survivor. It runs only over the bounded cold-episodic
+  candidate set the sweep already materialises (never O(N²) over the whole
+  corpus), is **opt-in and off by default** via `[decay] dedup_cold_clusters`
+  (a `false` default), and fully **zero generative LLM**: it reads only
+  already-stored embeddings, so with no embedder configured — or no embeddings
+  for the configured `(provider, model, dim)` triple — it is a clean no-op, not
+  an error. The eps is clamped to a conservative ceiling (`[decay] dedup_max_eps`,
+  default cosine distance ≈ 0.15) so it errs toward NOT merging. **Non-destructive
+  and reversible**: no source is ever hard-deleted — every merged-away member
+  stays reachable via the supersession chain and git history and is recoverable
+  with `restore-page` (invariant #16) — and the merge provenance is recorded in
+  `page_evidence`. Every run reports its collapses in the `SweepReport`. Reuses
+  existing tables: **no new migration**, and no new MCP tool (still 23). Ships
+  opt-in/off; the R2 recall no-regression proof is the gate before any future
+  default-on (#812).
+- Entropy / boilerplate pre-filter before consolidation (design-memory-aging.md
+  bucket A4): a pure, zero-LLM Shannon-entropy + boilerplate gate that skips
+  low-information session pages (near-empty, whitespace, single-character, or
+  highly-repetitive boilerplate) from the cross-session experience consolidation
+  pass *before* they reach the LLM prompt, the eval gate, or `apply_batch`.
+  It is **advisory and non-destructive** — a skipped page is not consolidated,
+  never deleted (invariant #16) — and **opt-in / off by default** via
+  `[auto_improve.scheduler.experience_entropy_filter]` (a `false` default with
+  conservative, validated thresholds tuned so a terse-but-informative note with
+  a file path and an error code is KEPT), so an upgrade changes no consolidation
+  output until an operator opts in. Every run surfaces the skip count in the
+  experience report warnings. No schema change and no new MCP tool (still 23)
+  (#812).
+- Extractive tier-down of cold episodic pages (design-memory-aging.md bucket
+  A2): instead of evicting a cold episodic page, the forget-sweep can now
+  *compact* it — keeping the L0 frontmatter `abstract:`, an L1 first-paragraph
+  summary, and an L2 regex-mined keep-token set (file paths, URLs, inline-code
+  spans, error codes, `UPPER_SNAKE` constants and long identifiers), and
+  dropping the prose body. Tier-down beats eviction because the durable facts
+  survive while the expensive, low-signal prose does not. It is **opt-in and
+  off by default** via `[decay] compact_cold_episodic` (a `false` default, so an
+  upgrade changes nothing until an operator opts in), fully zero-LLM (regex
+  only), and **reversible and non-destructive**: the rewrite goes through the
+  wiki layer, so the full pre-compaction body stays reachable in git history and
+  the supersession chain and is recoverable with `restore-page`. A new `V65`
+  migration adds a nullable `pages.compacted_at` marker (additive `ADD COLUMN`,
+  no backfill; populated lazily by the sweep from a `compacted: true` frontmatter
+  mirror) so the sweep and the curator tell a deliberately-short compacted page
+  from a cold one — a compacted page is never re-compacted, re-evicted, or
+  re-reported as cold. Only unpinned episodic pages compact; pinned/semantic/
+  procedural pages are never touched. Every run reports what it compacted in the
+  `SweepReport`. Ships opt-in/off; the R2 recall no-regression proof is the gate
+  before any future default-on. No new MCP tool (still 23) (#808).
+- Per-tier retention half-life curves (design-memory-aging.md bucket A1): the
+  forget-sweep's decay rate can now be tuned per memory tier via an opt-in
+  `[decay.half_life_days]` config table, replacing the single global λ. Each
+  key (`working` / `episodic` / `semantic` / `procedural`) is a half-life in
+  *days*, converted internally to `λ = ln(2) / days`, so an operator can keep
+  episodic session history longer and working-tier scratch shorter (the
+  mcp-memory-service 365/180/90/30 shape). An omitted key falls back to the
+  scalar `[decay] lambda`, so the default (no table) is byte-identical to the
+  previous single-λ behaviour — an upgrade changes no score and mass-evicts
+  nothing on the first post-upgrade sweep. Pure math + config: no new column,
+  no migration, and no new MCP tool (still 23) (#807).
+- Access reinforcement on the remaining read paths (design-memory-aging.md
+  bucket C1): `memory_read_page` (a direct by-path/by-query read), its
+  `include_related` link-graph walk (the walked neighbours, not just the seed),
+  and `memory_explore` (the pages it surfaces — rules, slots, recent, pinned,
+  settled) now bump `access_count` + `last_accessed_at` exactly as
+  `memory_query` and `memory_recent` already do. A page a human opens directly,
+  or one the graph surfaces, is *used* and now resists decay like a search hit.
+  Reuses the sanctioned reinforcement path: fire-and-forget on the single-writer
+  actor, throttled to ≤1 per (page, operator) per minute, and FTS-exempt. It is
+  strictly additive — reinforcement only raises retention scores, never blocks,
+  never touches the response payloads, and adds no new MCP tool (still 23)
+  (#798).
+- Reasoning tier on the LLM synthesis paths: an opt-in `reasoning` argument on
+  `memory_query` (its `answer` path) and `memory_explore` (borrowed from
+  Honcho's reasoning-effort ladder; targets the 2.4 line). The knob is a schema
+  enum `minimal` (default) / `low` / `medium` / `high` / `max`; an unknown value
+  is rejected. Because the provider-neutral `ChatRequest` carries no per-request
+  reasoning/effort field (the provider-level `reasoning_effort` is fixed at
+  construction from config), the tier maps honestly to a per-tier max-token
+  budget scaled off each path's base budget (answer 2 000, explore 16 000):
+  `minimal` = 1x, `low` = 1.5x, `medium` = 2x, `high` = 3x, `max` = 4x — a
+  higher tier gives the model more room to reason before its output is
+  truncated. It only tunes the answer path: `reasoning` is inert unless the LLM
+  path actually runs (`answer: true` with a provider, or `memory_explore` with a
+  provider), so the zero-LLM default path is untouched. Omitting `reasoning`, or
+  passing `minimal`, is byte-identical to before. No new MCP tool (still 23)
+  (#783).
+- Dialectic answer on `memory_query`: an opt-in, off-by-default `answer`
+  argument (borrowed from Honcho's dialectic endpoint; targets the 2.4 line).
+  When `answer: true` AND the server has an LLM provider configured, the query
+  synthesizes a concise, cited natural-language answer over the top retrieved
+  hits and attaches it as `answer: { text, citations }`, where `citations` are
+  the page paths the answer drew from (JSON-schema structured output, grounded
+  strictly in the retrieved snippets). When `answer: true` but no provider is
+  configured, the normal hits are returned plus a short `answer_unavailable`
+  note rather than an error. With `answer` omitted/`false` (the default), no LLM
+  provider is accessed and the response is byte-identical to before, so the
+  zero-LLM default path is untouched. Applies to the normal single-project /
+  `scopes` search; `global` and `as_of` queries ignore it. Honest caveat: the
+  feature is new and its answer quality is not yet eval-validated — treat the
+  synthesized answer as a convenience over the same hits and still open the
+  cited pages before acting (#782).
+- "Pin before search": `memory_query` gained an opt-in `pin_first` argument and
+  `memory_briefing` now carries a bounded `pinned` list (default off/absent;
+  targets the 2.4 line). Pinned pages previously earned only a small post-RRF
+  authority bump; they were never surfaced *ahead of* the search, and the
+  briefing never listed them by the `pinned` column. With `pin_first: true`, a
+  single-project `memory_query` prepends the project's bounded pinned latest
+  pages (newest first, cap 10) ahead of the fused hits, deduped by page id so a
+  pinned page that also matches the query appears once (marked `pinned: true`),
+  and re-truncates to the requested limit; `scopes`, `global`, and `as_of`
+  queries ignore it. A project-scoped `memory_briefing` snapshot now includes a
+  bounded `pinned` list of pinned latest pages (distinct from the `_slots/`
+  path-prefixed `slots`) so SessionStart hot-context can show standing context.
+  Both are backed by the new `ReaderPool::list_pinned_pages`; default off/empty
+  is byte-identical to the previous query ordering and briefing shape (#780).
+- `memory_read_page` gained an opt-in related-pages graph walk (default false;
+  targets the 2.4 line). Passing `include_related: true` adds a `related` array
+  of the pages reachable from the read page through the link graph — a bounded
+  breadth-first walk that reuses the single-hop link primitive per node,
+  following both outgoing links and incoming back-links out to `related_depth`
+  hops (default 1, hard-capped at 3). Each entry carries its
+  path/title/kind/workspace/project plus the hop `depth` and edge `direction`
+  (`link`/`backlink`) it was reached by; the walk is cross-project aware,
+  dedup- and cycle-safe via a global visited set, and bounded by a total-node
+  cap. Default-off behaviour is byte-identical to the previous single-page
+  response (no `related` field) (#775).
+- `memory_query` gained an opt-in `include_superseded` argument (default false;
+  targets the 2.4 line). When set, project and explicit-scope searches also
+  return superseded (older) page versions across the FTS/entity/vector/graph
+  streams, each hit labelled `superseded: true` so callers can tell historical
+  versions from the current one; the current version is never marked. Default-off
+  behaviour is byte-identical to the previous latest-only retrieval, and
+  `global=true` and `as_of` time-travel are unaffected (#773).
+- `memory_status` now reports which project answered: a `scope` object with
+  `workspace`, `project`, and `resolved_by` (`explicit`, `session`,
+  `shared_slot`, `startup_seed`, `default`, or `default_after_mismatch`). An
+  unscoped call from a static MCP client, whose transport session id is not a
+  lifecycle-hook session id, returned plausible counts for a project it never
+  named, with nothing in the response to question them; `resolved_by` now makes
+  that visible. The server also logs a warning whenever an unscoped MCP read is
+  resolved by the startup seed or by the default after a session mismatch,
+  rather than by the caller's own hook session (#757, #774).
+
+### Docs
+- Stopped recommending `AI_MEMORY_LLM_MODEL=gpt-5-mini` for the `openai-oauth`
+  provider in `docs/llm-providers.md` and `docs/install.md`. The Codex/ChatGPT
+  backend only accepts a small server-defined set of model ids and rejects
+  others (including `gpt-5-mini`) with a deterministic 400; the docs now advise
+  leaving the provider default (`gpt-5.5`) for `openai-oauth`/`codex`, keep
+  `claude-haiku-4-5` for `anthropic-oauth`, and qualify `gpt-5-mini` for
+  `copilot` as unverified. (#831)
+- `docs/llm-providers.md` now covers the `opencode` LLM provider, which has
+  shipped since 1.x but was missing from the recommended-defaults table:
+  `OPENCODE_API_KEY` as the only credential, Go as the default endpoint, Zen
+  via `AI_MEMORY_LLM_BASE_URL`, the built-in default model, per-catalogue
+  model ids, and which model goes through the Responses endpoint (#763).
+- Refreshed the LongMemEval-S retrieval benchmarks on the 2.4 tree and
+  populated the full-dataset R2 A/B (`docs/benchmarks/`): local embeddings add
+  +0.149 hit@5 / +0.254 recall@10 over zero-LLM FTS, with a clean
+  baseline-vs-baseline determinism check and **no default-ranking regression**
+  vs 2.3.x (the 2.4 features are opt-in / off by default).
+
+### Fixed
+- A failed scheduled `auto_improve` review no longer removes its session from
+  the queue permanently. The scheduler claims a session before reviewing it,
+  and the candidate query excludes any session that holds a claim — but nothing
+  ever released one, so a review that failed (a hung provider call, or a
+  proposal the reviewer could not stage) left a claim with no run row and that
+  session was skipped by every later tick. The state was silent: the tick
+  reported `errors=1` once and clean runs from then on, and the only exit was a
+  hand-written `DELETE`. A claim now records the failure and releases, so the
+  next tick retries it, and parks after 3 attempts with the last error kept so a
+  deterministic failure stops costing a review every tick instead of vanishing.
+  The tick summary counts `parked` separately from `errors`. (#833)
+- The auto-improve reviewer now excludes `sessions/` pages from its own
+  recent-page context so those slots go to durable pages (`decisions/`,
+  `gotchas/`, `_rules/`, …) it might otherwise re-propose. Session pages are
+  never valid proposal targets and previously dominated the recency-ordered
+  list, crowding durable knowledge out of the reviewer's view. The exclusion is
+  scoped to the reviewer only — the SessionStart briefing and `memory_briefing`
+  still include session pages. `docs/auto-improvement-loop.md` now documents
+  that only `_rules/`/`procedures/` page bodies reach the reviewer and that the
+  recent-page list is recency-ordered, with configurable patchable prefixes and
+  embedding-nearest dedup noted as deferred future work. (#834)
+- Auto-improve proposal staging no longer discards an entire run when one
+  proposal is a create/update misclassification. A `Create` whose target page
+  already exists, or an `Update`/patch whose target is missing, previously
+  aborted the staging transaction, dropping every sibling proposal and the run
+  row over one probabilistic LLM mislabel. Those two cases now skip just the
+  offending proposal (reported as `skipped`, like a pending-target collision)
+  and keep the rest of the run. Two proposals in one run targeting the same
+  path remain a hard error, and a create-on-existing is never coerced to an
+  update (the page could be pinned). (#832)
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
   provider credentials and host-config env vars as the POSIX wrapper into the
   helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
@@ -6007,7 +6331,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.4.0...HEAD
+[2.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.4.0
 [2.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.2
 [2.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.1
 [2.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.0

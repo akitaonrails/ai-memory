@@ -204,3 +204,132 @@ async fn briefing_pending_message_count_tracks_the_recipient_inbox() {
         "popping one message must drop the briefed pending_message_count to 2",
     );
 }
+
+/// Regression for the field-reported dead-end (cross-project mail on the
+/// homeserver): the on-start notice / `memory_briefing` counts one project's
+/// inbox, but a *no-scope* `memory_message_pop` resolves the shared
+/// active-project slot to a DIFFERENT project whose inbox is empty, and used to
+/// return a bare `{"message": null}` — "you have mail" followed by an empty
+/// fetch, with no way to tell they were looking at the wrong inbox.
+///
+/// The mail must stay put (the mis-scoped pop consumes nothing), the empty
+/// result must NAME the inbox it actually resolved and how it was inferred, and
+/// an explicit-scope pop must still deliver.
+#[tokio::test]
+async fn no_scope_pop_that_misses_the_mail_is_diagnosed_not_a_silent_null() {
+    let h = harness().await;
+
+    // Mail lands in project-b's inbox; the notice/briefing for B reports it.
+    send_to_b(&h.router, "export", "please add the /v1/export endpoint").await;
+    assert_eq!(pending_count(&h.router, B).await, 1);
+
+    // A no-scope pop resolves the baked "current project" (project-a), whose
+    // inbox is empty. It must not be a bare null: it names the resolved scope
+    // and flags that the scope was inferred, not stated.
+    let missed = call(&h.router, "memory_message_pop", json!({})).await;
+    assert!(
+        missed["message"].is_null(),
+        "the wrong (inferred) inbox has no mail: {missed}",
+    );
+    assert_eq!(
+        missed["resolved_scope"]["project"].as_str(),
+        Some(A),
+        "an empty inferred-scope pop must name the inbox it resolved: {missed}",
+    );
+    let src = missed["scope_source"].as_str().unwrap_or_default();
+    assert!(
+        !src.is_empty() && src != "explicit" && src != "session",
+        "the miss must report an inferred (non-explicit, non-session) scope source, got {src:?}: {missed}",
+    );
+    assert!(
+        missed["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("explicit"),
+        "the hint must steer the caller to re-run with explicit scope: {missed}",
+    );
+
+    // The mis-scoped pop consumed nothing: B still has its message.
+    assert_eq!(
+        pending_count(&h.router, B).await,
+        1,
+        "a pop that resolved the wrong inbox must not consume B's mail",
+    );
+
+    // Popping with explicit scope delivers it.
+    let got = call(
+        &h.router,
+        "memory_message_pop",
+        json!({ "workspace": WS, "project": B }),
+    )
+    .await;
+    assert_eq!(
+        got["message"]["body"], "please add the /v1/export endpoint",
+        "an explicit-scope pop of B delivers the message: {got}",
+    );
+    assert!(
+        got.get("hint").is_none(),
+        "a successful pop carries no scope hint: {got}",
+    );
+    assert_eq!(pending_count(&h.router, B).await, 0);
+
+    // An EXPLICIT pop of an empty inbox is unambiguous — no hint.
+    let empty_explicit = call(
+        &h.router,
+        "memory_message_pop",
+        json!({ "workspace": WS, "project": C }),
+    )
+    .await;
+    assert!(empty_explicit["message"].is_null());
+    assert!(
+        empty_explicit.get("hint").is_none(),
+        "an explicitly-scoped empty pop is not ambiguous and must not add a hint: {empty_explicit}",
+    );
+}
+
+/// The same divergence via `memory_message_list`: a no-scope inbox listing that
+/// resolves the wrong (empty) project names the inferred scope instead of
+/// silently returning `{"messages": []}`, while an explicit listing of B shows
+/// the mail with no hint.
+#[tokio::test]
+async fn no_scope_inbox_list_that_misses_the_mail_names_the_inferred_scope() {
+    let h = harness().await;
+    send_to_b(&h.router, "export", "please add the /v1/export endpoint").await;
+
+    // No-scope inbox list resolves project-a (empty) -> hint, not a silent [].
+    let missed = call(&h.router, "memory_message_list", json!({ "box": "inbox" })).await;
+    assert_eq!(
+        missed["messages"].as_array().map(Vec::len),
+        Some(0),
+        "the inferred (wrong) inbox is empty: {missed}",
+    );
+    assert_eq!(
+        missed["resolved_scope"]["project"].as_str(),
+        Some(A),
+        "an empty inferred-scope list must name the inbox it resolved: {missed}",
+    );
+    assert!(
+        missed["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("explicit"),
+        "the list hint must steer the caller to explicit scope: {missed}",
+    );
+
+    // Explicit inbox list of B shows the mail and carries no hint.
+    let seen = call(
+        &h.router,
+        "memory_message_list",
+        json!({ "box": "inbox", "workspace": WS, "project": B }),
+    )
+    .await;
+    assert_eq!(
+        seen["messages"].as_array().map(Vec::len),
+        Some(1),
+        "explicit list of B shows its mail: {seen}",
+    );
+    assert!(
+        seen.get("hint").is_none(),
+        "a non-empty explicit list carries no scope hint: {seen}",
+    );
+}

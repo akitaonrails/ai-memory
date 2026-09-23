@@ -34,6 +34,7 @@ fn breadth_is_identity_at_the_default_weight() {
             assert_eq!(
                 retention_score_with_breadth(
                     &params,
+                    Tier::Episodic,
                     age,
                     count,
                     since,
@@ -41,7 +42,7 @@ fn breadth_is_identity_at_the_default_weight() {
                     actors,
                     breadth_weight,
                 ),
-                retention_score(&params, age, count, since, None),
+                retention_score(&params, Tier::Episodic, age, count, since, None),
                 "default weight must be identity (actors={actors})"
             );
         }
@@ -56,17 +57,44 @@ fn breadth_is_identity_at_the_default_weight() {
 fn zero_and_one_actor_score_identically_even_when_weighted() {
     let params = DecayParams::default();
     let breadth_weight = 1.5;
-    let baseline = retention_score(&params, 30.0, 5, Some(3.0), None);
+    let baseline = retention_score(&params, Tier::Episodic, 30.0, 5, Some(3.0), None);
     for actors in [0, 1] {
         assert_eq!(
-            retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, actors, breadth_weight,),
+            retention_score_with_breadth(
+                &params,
+                Tier::Episodic,
+                30.0,
+                5,
+                Some(3.0),
+                None,
+                actors,
+                breadth_weight,
+            ),
             baseline,
             "actors={actors} must not change the score"
         );
     }
     // More readers is worth strictly more, and monotonically so.
-    let two = retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, 2, breadth_weight);
-    let ten = retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, 10, breadth_weight);
+    let two = retention_score_with_breadth(
+        &params,
+        Tier::Episodic,
+        30.0,
+        5,
+        Some(3.0),
+        None,
+        2,
+        breadth_weight,
+    );
+    let ten = retention_score_with_breadth(
+        &params,
+        Tier::Episodic,
+        30.0,
+        5,
+        Some(3.0),
+        None,
+        10,
+        breadth_weight,
+    );
     assert!(two > baseline);
     assert!(ten > two);
 }
@@ -77,18 +105,27 @@ fn zero_and_one_actor_score_identically_even_when_weighted() {
 fn never_accessed_pages_are_unaffected_by_breadth() {
     let params = DecayParams::default();
     assert_eq!(
-        retention_score_with_breadth(&params, 10.0, 0, None, None, 9, 2.0),
-        retention_score(&params, 10.0, 0, None, None)
+        retention_score_with_breadth(&params, Tier::Episodic, 10.0, 0, None, None, 9, 2.0),
+        retention_score(&params, Tier::Episodic, 10.0, 0, None, None)
     );
 }
 
 #[test]
 fn invalid_breadth_weights_fail_closed_to_the_historical_score() {
     let params = DecayParams::default();
-    let baseline = retention_score(&params, 30.0, 5, Some(3.0), None);
+    let baseline = retention_score(&params, Tier::Episodic, 30.0, 5, Some(3.0), None);
     for weight in [-1.0, f64::NAN, f64::INFINITY] {
         assert_eq!(
-            retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, 50, weight),
+            retention_score_with_breadth(
+                &params,
+                Tier::Episodic,
+                30.0,
+                5,
+                Some(3.0),
+                None,
+                50,
+                weight
+            ),
             baseline,
         );
     }

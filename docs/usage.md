@@ -385,6 +385,9 @@ Start the server with `--enable-web` and open
 ai-memory serve --transport http --bind 127.0.0.1:49374 --enable-web
 ```
 
+On macOS the [menu bar app](macos.md#scenario-d-menu-bar-app) already starts
+the LaunchAgent with `--enable-web`; **Open Web UI** opens that same URL.
+
 Docker compose users can add the flag to the service command:
 
 ```yaml

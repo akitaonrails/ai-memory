@@ -4,8 +4,14 @@
 
 mod abstract_backfill;
 mod access_breadth_sweep;
+mod aging_lifecycle;
+mod cold_cluster_sweep;
+mod compaction_sweep;
+mod contradiction_lint;
+mod dream_pass;
 mod embed_backfill;
 mod embeddings;
+mod entropy_experience;
 mod lifecycle;
 mod local_embeddings;
 mod multi_machine;

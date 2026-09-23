@@ -131,10 +131,18 @@ pub async fn run_curator_report_with_breadth(
         if c.tier != Tier::Episodic || c.pinned || frontmatter_pinned(&c.frontmatter_json) {
             continue;
         }
+        // A2: a page already tiered down (its V65 marker set) is a deliberately
+        // short compacted residue, not a fresh cold candidate. The sweep will
+        // never touch it again, so the curator must not report it as cold —
+        // `cold_episodic` is a prediction of what the sweep would evict.
+        if c.compacted_at_us.is_some() {
+            continue;
+        }
         let page_age_days = age_days(now_us, c.updated_at_us);
         let days_since_access = c.last_accessed_at_us.map(|us| age_days(now_us, us));
         let score = retention_score_with_breadth(
             &params.decay_params,
+            c.tier,
             page_age_days,
             c.access_count,
             days_since_access,

@@ -107,6 +107,10 @@ pub struct ScheduledAutoImproveTickOutcome {
     pub skipped: usize,
     /// Per-scope/per-session failures, logged and counted, not fatal.
     pub errors: usize,
+    /// Sessions whose claim spent its last attempt this tick and is now parked.
+    /// Counted separately from `errors` because it is the terminal state an
+    /// operator has to act on, not just another retryable failure (#833).
+    pub parked: usize,
     /// Cross-session ("experience") passes that ran this tick.
     pub experience_runs: usize,
 }
@@ -325,11 +329,48 @@ pub async fn run_auto_improve_scheduler_tick(
                 }
                 Err(e) => {
                     outcome.errors += 1;
+                    // #833: the claim is this session's only in-flight marker and the
+                    // candidate query excludes on it, so leaving it behind dropped the
+                    // session from every future tick — silently, because the tick
+                    // reports `errors=1` once and clean runs forever after. Release it
+                    // so the next tick retries, and let the attempt counter park it
+                    // once a deterministic failure has proved it will not recover.
+                    let attempts = match ctx
+                        .writer
+                        .record_auto_improve_claim_failure(
+                            ctx.workspace_id,
+                            ctx.project_id,
+                            candidate.session_id,
+                            &e.to_string(),
+                        )
+                        .await
+                    {
+                        Ok(attempts) => Some(attempts),
+                        Err(release_err) => {
+                            // The review already failed; a failed release is a second,
+                            // separate fault and must not mask the first.
+                            tracing::warn!(
+                                workspace = %scope.workspace_name,
+                                project = %scope.project_name,
+                                session_id = %candidate.session_id,
+                                error = %release_err,
+                                "scheduled auto-improve claim release failed"
+                            );
+                            None
+                        }
+                    };
+                    let parked = attempts
+                        .is_some_and(|n| n >= ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+                    if parked {
+                        outcome.parked += 1;
+                    }
                     tracing::warn!(
                         workspace = %scope.workspace_name,
                         project = %scope.project_name,
                         session_id = %candidate.session_id,
                         error = %e,
+                        attempts = attempts.unwrap_or(0),
+                        parked,
                         "scheduled auto-improve failed"
                     );
                 }

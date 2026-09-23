@@ -23,7 +23,14 @@ fn header_end(bytes: &[u8]) -> Option<usize> {
 
 fn receive_one_request(listener: TcpListener) -> (String, Vec<u8>) {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // A cold PowerShell start on a loaded windows-latest runner (process spawn +
+    // JIT + dot-sourcing the hook lib) can take well over ten seconds before the
+    // hook opens its connection; the 10s deadline was marginal and flaked. This
+    // window only bounds *failure detection* — a working hook connects in a few
+    // seconds regardless, and a genuinely broken hook is caught earlier by the
+    // `output.status.success()` assertion — so a generous deadline removes the
+    // false negative without masking a real break.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let (mut stream, _) = loop {
         match listener.accept() {
             Ok(connection) => break connection,

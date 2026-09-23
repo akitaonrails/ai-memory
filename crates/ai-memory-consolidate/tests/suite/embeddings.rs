@@ -142,6 +142,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
             64,
             5,
             None,
+            false,
         )
         .await
         .expect("hybrid search");
@@ -169,6 +170,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
             64,
             5,
             None,
+            false,
         )
         .await
         .expect("hybrid (no query vec)");

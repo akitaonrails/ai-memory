@@ -48,6 +48,7 @@ ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true
 async-trait.workspace = true
 flate2.workspace = true
+secrecy.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 tower.workspace = true

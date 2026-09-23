@@ -602,6 +602,13 @@ pub(crate) enum WriteCmd {
         ended_at: i64,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    RecordAutoImproveClaimFailure {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: String,
+        reply: oneshot::Sender<StoreResult<u32>>,
+    },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -2503,6 +2510,31 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record a failed scheduled review, releasing the session's claim for
+    /// another attempt and returning the new attempt count. Returns `0` when the
+    /// session holds no claim, which is the manual path.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the statement fails.
+    pub async fn record_auto_improve_claim_failure(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        error: &str,
+    ) -> StoreResult<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordAutoImproveClaimFailure {
+            workspace_id,
+            project_id,
+            session_id,
+            error: error.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -3538,6 +3570,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     ended_at,
                 );
                 send_or_warn(reply, result, "claim_auto_improve_scheduler_session");
+            }
+            WriteCmd::RecordAutoImproveClaimFailure {
+                workspace_id,
+                project_id,
+                session_id,
+                error,
+                reply,
+            } => {
+                let result = crate::auto_improve::record_claim_failure(
+                    &conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    &error,
+                );
+                send_or_warn(reply, result, "record_auto_improve_claim_failure");
             }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);

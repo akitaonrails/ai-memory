@@ -178,6 +178,56 @@ Re-home by kind:
 6. Only after repeated usage, consider whether ai-memory core lacks a small,
    generic API seam; do not start by patching core endpoints.
 
+## `ai-memory-macos`: menu bar wrapper
+
+Self-contained macOS accessory app at
+[`companions/ai-memory-macos`](../companions/ai-memory-macos). It is a
+**wrapper**, not a data-seam dashboard: it ships the `ai-memory` binary and
+`hooks/` tree inside an `.app`, governs the existing LaunchAgent, and opens
+`/web`, `ai-memory status`, `config.toml`, the data directory, and logs.
+
+It is not a root workspace member. Build and test it separately:
+
+```bash
+./companions/ai-memory-macos/build.sh
+swift test --package-path companions/ai-memory-macos
+```
+
+### Goal
+
+Give macOS a first-class install that does not require a prior tarball, without
+reimplementing status, search, wiki browsing, or config editing in SwiftUI.
+
+### How it talks to ai-memory
+
+- `GET /admin/status` for the menu-bar traffic light and two headline lines
+  (version, page/session counts, LLM role).
+- Bundled `ai-memory status` / `ai-memory init` via `Process` (the real CLI).
+- `launchctl` against `com.github.akitaonrails.ai-memory` and the checked-in
+  plist template in `packaging/launchd/`.
+- `NSWorkspace` to open `/web`, `config.toml`, the data dir, and logs.
+
+It does not open SQLite or the wiki, does not call writable `/admin` routes, and
+does not add MCP tools.
+
+### Data vs bundle
+
+Durable state stays in `~/Library/Application Support/ai-memory` (the binary’s
+existing macOS default) and logs under `~/Library/Logs/ai-memory`. Replacing
+`/Applications/AI Memory.app` does not rewrite that tree. An optional data-dir
+override is written only into the rendered LaunchAgent plist
+(`AI_MEMORY_DATA_DIR`), never into the bundle.
+
+### Safety requirements
+
+- Do not silently start the LaunchAgent on first launch; **Install & Start**
+  is an explicit click.
+- Do not write `AI_MEMORY_AUTH_TOKEN` into the plist. The menu bar’s own HTTP
+  client may keep a bearer in the Keychain.
+- Do not sandbox the app in a way that blocks `launchctl` or LaunchAgents.
+
+See [`docs/macos.md`](macos.md#scenario-d-menu-bar-app).
+
 ## `ai-memory-web-editor`: browser chat/editor companion
 
 This is the companion shape for PR #123.

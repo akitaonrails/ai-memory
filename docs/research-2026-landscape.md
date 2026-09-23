@@ -79,6 +79,10 @@ The market has consolidated into recognizable camps:
 | Hosted memory API (hybrid) | **Supermemory**, **LiquidLM** | Chunk-RAG + LLM temporal fact-graph + per-user profiles, answered in one query; managed connectors + multimodal; cloud-first (see below) |
 | User-modeling / theory-of-mind | **Honcho** (Plastic Labs) | Memory as a *reasoning* problem: derive what each "peer" knows/believes about another over time; model the human, not the project (see below) |
 | **File-first wiki memory** | **us**, basic-memory, OKF, Letta's filesystem result, mempalace (nominally) | Markdown source of truth, derived indexes, human-editable |
+| File-first wiki (LLM-leaning) | **memU**, **EverOS** | Markdown source of truth + derived vector/SQLite(+LanceDB) indexes, but LLM-required for the capture/distill flow; skill-distillation and offline consolidation (see below) |
+| Self-hosted coding-agent store | **Engram** | Single Go binary, SQLite+FTS5, MCP, project scope, session-summary handoffs — a structured-row sibling captured via agent MCP calls, not lifecycle hooks (see below) |
+| Governed multi-agent / fleet memory | **Caura** | Shared fleet memory with visibility scopes, trust tiers, audit, governance on Postgres+pgvector — org-scale, not project-scale (see below) |
+| Shared memory server (proxy fan-in) | **TencentDB Agent Memory** | One proxy in front of many harnesses distilling Chat Memory / Skill / Wiki / CodeGraph; proxy interception, not MCP/hooks (see below) |
 | Code intelligence | **DeusData/codebase-memory-mcp** (~42K stars) | Index the *codebase* (162 languages, tree-sitter → SQLite graph, static C binary) rather than the *session* - adjacent, not competing: it remembers what the code is, not what you did (see `research-codebase-memory-mcp.md`) |
 | Agent-harness OS | **ECC** (~247K stars), plus the skills/agents-pack ecosystem | Install a whole plan→test→implement→review→**remember**→improve loop into the agent; memory is one thin pillar ("optimize the context window, persist everything else"), deliberately kept as *context, not policy* - adjacent, not competing (see `research-ecc.md`) |
 
@@ -96,7 +100,18 @@ tracker repeats patterns from our own history - v11.10.0 fixed
 consolidation time horizons that *silently ignored their configured
 window*, the same class of quiet-lifecycle bug our `#526`/`#528` work
 addressed with observable outcomes. Published honest numbers: 80.4% R@5
-on LongMemEval turn-level, 86.0% session-level.
+on LongMemEval turn-level, 86.0% session-level. **Where we now stand
+(2.4):** its consolidation set — type-dependent TTL (365/180/90/30),
+extractive compression, DBSCAN adaptive-eps clustering, access/connection
+boosts, and 0.4–0.75-band contradiction detection — is the direct
+grounding for the 2.4 memory-aging program
+([`design-memory-aging.md`](design-memory-aging.md)), which now ships each
+at parity but **zero-LLM by default, reversible** (supersede-not-delete +
+`restore-page`), and **off by default** (per-tier `[decay.half_life_days]`,
+extractive tier-down, cold-cluster dedup, access reinforcement on all read
+paths, and a `memory_lint` contradiction finding). The difference is
+posture, not mechanism: theirs runs autonomously; ours preserves the
+zero-LLM default path and evicts nothing on upgrade.
 
 **Platform development: Claude Code native "auto memory"** shipped
 default-on (v2.1.59): the agent keeps its own `MEMORY.md` plus topic
@@ -137,8 +152,23 @@ are Virginia Tech Sanghani faculty; the Post is a named collaborator), it
 is a preprint, and it reports accuracy rather than the R@5 others quote -
 still the most credible benchmark claim here (a paper with per-category
 sub-scores, gains concentrated where structured temporal memory should
-help), and a reminder the serious players now publish numbers. Full
-analysis in [`research-hindsight.md`](research-hindsight.md).
+help), and a reminder the serious players now publish numbers. **Where we
+now stand (2.4):** the two ideas flagged to carry forward — belief-strength
+over binary supersession, and the background rewrite loop — now ship, as
+opt-in layers over the zero-LLM core, per
+[`design-hindsight-borrowings.md`](design-hindsight-borrowings.md) §3 and
+[`design-memory-aging.md`](design-memory-aging.md) B1–B4. Belief-strength is
+a read-time, zero-LLM `confidence` (distinct-session breadth + recency +
+live `contradicts`, capped) exposed inertly in `explain`/`status` and
+foldable into ranking behind a **default-0.0, R2-gated** weight; the
+"dream" pass is an idle-scheduled, cancel-on-activity, surprisal-first LLM
+rewrite of cold clusters that is **off by default and never deletes a
+source**. We designed *against* Hindsight's own documented failure —
+belief *entrenchment* (raw proof-count pins a wrong page) — with
+breadth-not-count weighting, a confidence cap, and supersession always
+winning over evidence. Honest caveat: no R2 delta has been run, so this is
+parity of *mechanism*, not a measured accuracy win. Full analysis in
+[`research-hindsight.md`](research-hindsight.md).
 
 **Biggest-backed new entrant: `volcengine/OpenViking`** (~37.5K stars,
 ByteDance/Volcano-Engine, AGPLv3 core + Apache-2.0 CLI/examples, three
@@ -157,7 +187,11 @@ at **L0 (one-sentence abstract, for relevance checks)**, **L1 (overview, for
 planning)**, or **L2 (full original, read only when needed)** — the reported
 34-91% input-token reduction (LoCoMo) is almost entirely this deferral, and
 it maps directly onto work we already have (V61 abstract embeddings, the
-session brief) rather than a new architecture. Second, **directory-scoped
+session brief) rather than a new architecture — and 2.4's **extractive
+tier-down** (A2, [`design-memory-aging.md`](design-memory-aging.md)) now
+persists exactly this shape for cold episodic pages: an L0 abstract, an L1
+summary, and an L2 keep-token set, with the full prose one supersession-
+restore away. Second, **directory-scoped
 retrieval** (a "TrieHI" prefix-tree vector index that narrows a query to a
 path subtree before ranking) — a cheaper cousin of our per-project scoping,
 one level down at the `_rules/` / `norms/` path prefix. Read the numbers
@@ -241,6 +275,109 @@ worth borrowing conceptually (never the substrate): the explicit **`pin_knowledg
 link-neighbor RRF we already compute internally. Per the research-doc convention,
 LiquidLM has no standalone deep-dive; this section is its record.
 
+### New entrants raised in issue #810 (verified 2026-09-22)
+
+Five projects flagged in issue #810, each researched from its own repo/README
+(and, where the name could mislead, the LICENSE and the metadata endpoint) rather
+than from a name search — the failure mode this series has been burned by before.
+None displaces the camp taxonomy; they slot into it, and two are close enough to
+be honest migration conversations.
+
+**Closest new sibling: `Gentleman-Programming/engram`** (~6.8K stars, MIT, single
+Go binary, commit 2026-09-22, release v2.0.0). Engram is the newcomer nearest our
+own lane: persistent memory for AI coding agents over **SQLite + FTS5** in a
+zero-dependency stateless Go executable (`~/.engram/engram.db`), an MCP **stdio**
+server confirmed against Claude Code, Codex, OpenCode, Gemini CLI, Cursor,
+Windsurf and more, project-scoped, with **session-summary handoffs**
+(a `mem_session_summary` carrying goal/instructions/discoveries/next-steps/files),
+**git-sync** of portable compressed chunks across machines, and an optional
+Engram Cloud for project-scoped replication. Where it differs from us is the two
+choices that define our substrate: capture is **agent-driven** (the agent calls
+`mem_*` MCP tools under an "operating contract," not OS lifecycle hooks that
+capture automatically), and **SQLite is the source of truth** (git-syncs
+compressed chunks, not a hand-editable git-markdown wiki you can `grep`/diff).
+It is a fact-row/structured-store sibling in the mold of mcp-memory-service, but
+Go and MCP-capture rather than hook-capture — the honest "closest self-hosted
+coding-agent store" newcomer. **No retrieval benchmark is published.** Per the
+research-doc convention, Engram has no standalone deep-dive; this section is its
+record.
+
+**Local-first file-first sibling: `EverMind-AI/EverOS`** (~13.1K stars,
+Apache-2.0, Python 3.12+, commit 2026-09-09, release v1.3.1). Architecturally the
+closest of the five to our bet: a **local-first memory runtime** with **canonical
+Markdown as the source of truth** ("readable, editable, diffable, and
+Git-versioned") over derived **SQLite + LanceDB** indexes, direct file edits
+cascading through watchers — the same files-as-truth + derived-index split we
+chose. It adds dual first-class tracks (a user `episodes/profile` and an agent
+`cases/skills`), an editable **Knowledge Wiki** with taxonomy + CRUD APIs, and
+**offline memory evolution** that merges episode clusters and refines profiles —
+our consolidation/auto-improve loop under other names. It validates the substrate,
+but from the LLM-leaning corner: the minimal tier still **requires an LLM for the
+core flow** (embedding/reranking optional, OpenRouter the default; a zero-LLM
+demo exists but is not the operating default), it is a Python stack rather than a
+single binary, and MCP support is not stated in the README. **No retrieval
+benchmark is published.** Per the research-doc convention, EverOS has no
+standalone deep-dive; this section is its record.
+
+**LLM-wiki with skill distillation: `NevaMind-AI/memU`** (~14.4K stars,
+Apache-2.0, Python, commit 2026-09-21; last tagged release v1.5.1 from 2026-03-23,
+so releases lag active code). Positioned as a **shared LLM wiki across sessions,
+agents and devices** whose signature is **automatic skill distillation** —
+converting agent session history into reusable **Markdown** workflows — plus
+scheduled memorization and standing retrieval-instruction injection into host
+instruction files. Storage is SQLite (default) or Postgres+pgvector with
+brute-force-cosine or pgvector search and pluggable embedding providers
+(OpenAI/Jina/Voyage/Doubao/OpenRouter); the core logic is advertised at ~500 LOC.
+It is **file-first-adjacent** (Markdown output) but **LLM-leaning**: the host
+agent does the judgment/synthesis (the MemoryService itself makes no LLM calls, so
+the *product* still depends on a provider), there is **no MCP** — it ships as
+sidecar binaries that patch host instruction files, with adapters for
+Cursor/Claude Code/Codex/OpenClaw/Hermes/WorkBuddy — and a managed cloud exists at
+memu.so. **No named benchmark** (no LoCoMo/LongMemEval figure) is in the README.
+Its skill-distillation-into-Markdown is the idea worth noting against our
+experience pass. Per the research-doc convention, memU has no standalone
+deep-dive; this section is its record.
+
+**Governed fleet memory (different buyer): `caura-ai/caura`** (~0.5K stars,
+Apache-2.0 core + managed platform at caura.ai, Python/FastAPI, commit
+2026-09-22, release backend-v3.17.2). Caura is a genuinely new camp for this
+report: **governed shared memory for multi-agent fleets**. On **PostgreSQL 16 +
+pgvector** (Redis optional) it layers row-level multi-tenant isolation, three
+visibility scopes (`scope_agent`/`scope_team`/`scope_org`), **four trust tiers**
+governing cross-fleet read/write/delete, a full **audit trail** ("every write,
+delete, and transition logged"), automatic PII flagging, an auto-extracted
+knowledge graph, and contradiction detection with supersession — a native MCP
+surface at `/mcp` (12 tools) for Claude Desktop/Code, Cursor, Windsurf. Its
+benchmark claims are **self-reported** and, per its own README, single-agent
+proxies for a fleet product it says those benchmarks "can't measure": **LoCoMo
+77.6% accuracy / 96.6% token savings** and **LongMemEval 92.2% accuracy / 79.2%
+token savings** (with a "23 ms p50 · 27 ms p95" latency figure and a stated
+production deployment of "300+ AI agents" at eToro — vendor-reported, not
+independently verified). It sits opposite us on substrate (opaque Postgres, LLM
+extraction, hosted-leaning) and orthogonal on goal: **org-scale fleet governance**
+rather than one project's git-backed wiki. Its **trust-tier governance is a real
+capability we do not have** (noted honestly in `competitive-parity.md`), but it is
+a different buyer, not a coding-continuity migration target. Per the research-doc
+convention, Caura has no standalone deep-dive; this section is its record.
+
+**Proxy fan-in memory server (misleading name): `TencentCloud/TencentDB-Agent-
+Memory`** (~27.2K stars, MIT, Node/TypeScript, commit 2026-09-22, release
+v2.0.1). Despite the "TencentDB" name it **requires no Tencent database product**
+— storage is **SQLite by default** (an experimental, off-by-default MongoDB
+backend exists) — so the name-search trap here would be to file it as a managed
+cloud DB feature; it is not. It is a **team-level memory hub** that distills
+conversations, documents and code into four reusable assets — **Chat Memory,
+Skill, Wiki, CodeGraph** — and its distinctive mechanism is a **proxy fan-in**: a
+three-service deployment (Memory Core + Memory Hub + Proxy) where agents point
+their API **base URL** at the proxy ("One Proxy, unchanged protocol, zero-code
+integration"), so capture is **proxy interception, not MCP or OS lifecycle
+hooks**. Documented harness support spans Claude Code, Codex, DeepSeek Harness,
+CodeBuddy, WorkBuddy, Hermes and OpenClaw. Its benchmark claim is **self-reported
+PersonaMem** (48% without memory → 76% with it, "+59% relative"). Its **CodeGraph**
+is a codebase-intelligence feature adjacent to, not overlapping, our session
+memory. Per the research-doc convention, TencentDB Agent Memory has no standalone
+deep-dive; this section is its record.
+
 **Adjacent, not head-to-head: `plastic-labs/honcho`** (~7K stars, AGPL-3.0
 core + managed cloud, **$5.35M pre-seed** led by Variant/White Star/Betaworks).
 Honcho is the archetype of a **new camp** this report had no bucket for:
@@ -274,7 +411,13 @@ carrying forward as *optional LLM layers over* our zero-LLM core, never
 requirements: the **dialectic/oracle query** (ask-a-question → synthesized
 answer, which maps onto our retrieval as an opt-in LLM step) and the
 **reasoning-tier ladder** (minimal→max reasoning per query as a clean
-cost/quality knob). Deliberately **reject** the rest as off-mission: LLM-mandatory
+cost/quality knob). **Both now ship on 2.4** as opt-in, off-by-default LLM
+layers (`memory_query answer=true` #782; `reasoning: {minimal..max}` #783),
+and the Dreamer's *scheduling shape* — surprisal-first ordering, idle
+trigger, cancel-on-activity — is the grounding for 2.4's opt-in "dream"
+consolidation pass (#816, [`design-memory-aging.md`](design-memory-aging.md)
+B3/B4), which stays off by default and never deletes a source. Deliberately
+**reject** the rest as off-mission: LLM-mandatory
 ingestion, opaque-Postgres-as-truth, the Postgres+Redis+worker operational
 weight, and the heavy theory-of-mind engine itself — a coding agent needs project
 facts, decisions, and conventions, not a psychological model of the developer
@@ -292,7 +435,9 @@ commit within the last ~10 days and grades **ACTIVE**. Star counts are GitHub's
 raw figures (approximate; the biggest few were sanity-checked against prior
 research). This is a healthy, crowded, fast-moving field: "we picked a dead
 space" is not a claim we can make, and none of these can be dismissed as
-unmaintained.
+unmaintained. (The five issue-#810 new-entrant rows — TencentDB Agent Memory,
+memU, EverOS, Engram, Caura — were verified against the GitHub metadata endpoint
+on 2026-09-22.)
 
 | Project | Stars (~) | Last commit | Latest release | Status |
 |---|---|---|---|---|
@@ -302,12 +447,17 @@ unmaintained.
 | Cognee | 30.8k | 2026-09-18 | v1.5.4rc1 (2026-09-15) | ACTIVE |
 | Supermemory | 30.1k | 2026-09-18 | server-v0.0.8 (2026-08-17) | ACTIVE |
 | agentmemory | 28.6k | 2026-09-14 | v0.9.29 (2026-08-16) | ACTIVE |
+| TencentDB Agent Memory | 27.2k | 2026-09-22 | v2.0.1 (2026-08-25) | ACTIVE |
 | Letta | 24.8k | 2026-09-10 | 0.16.8 (2026-05-14) | ACTIVE (releases lag code) |
 | Hindsight | 23.9k | 2026-09-18 | v0.10.0 (2026-09-14) | ACTIVE |
+| memU | 14.4k | 2026-09-21 | v1.5.1 (2026-03-23) | ACTIVE (releases lag code) |
+| EverOS | 13.1k | 2026-09-09 | v1.3.1 (2026-09-08) | ACTIVE |
 | Honcho | 7.2k | 2026-09-18 | tag v3.2.0 (no GH release) | ACTIVE |
+| Engram | 6.8k | 2026-09-22 | v2.0.0 (2026-09-18) | ACTIVE |
 | basic-memory | 4.0k | 2026-09-16 | v0.23.2 (2026-08-25) | ACTIVE |
 | mcp-memory-service | 2.0k | 2026-09-18 | v11.12.0 (2026-09-14) | ACTIVE |
 | LangMem | 1.7k | 2026-09-09 | none (PyPI-versioned) | ACTIVE |
+| Caura | 0.5k | 2026-09-22 | backend-v3.17.2 (2026-09-19) | ACTIVE |
 | LiquidLM | n/a (closed) | n/a (engine closed) | `@liquidlm/cli` 0.1.5 (2026-09-17) | ACTIVE (young, pre-1.0, solo) |
 
 Reading it honestly: raw stars track **funding and app-developer reach**, not
@@ -401,7 +551,12 @@ ships a *paper* with per-category LongMemEval sub-scores (91.4%), so the
 bar is no longer "publish a number" but "publish a harness and a metric
 someone else can re-run" - fix the split and the metric (theirs is
 accuracy, agentmemory/mcp-memory-service quote R@5; pick one and state
-it) so our result is comparable, not just present.
+it) so our result is comparable, not just present. **Now load-bearing on
+2.4:** the two aging features that can move quality — belief-strength folded
+into ranking (#815) and the LLM "dream" pass (#816) — ship **off by default
+and gated on this harness before they may default on**; no R2 delta has been
+run yet, so both remain opt-in and unproven (see
+[`design-memory-aging.md`](design-memory-aging.md) R2 acceptance).
 
 **R3 - Typed relation edges (small-medium).** `causes` / `fixes` /
 `contradicts` on our existing `links`/`entities` model, from the
@@ -449,7 +604,12 @@ storage: reuse the abstract already embedded at V61. Worth a design doc
 that decides where the L1 overview comes from (frontmatter summary,
 first-paragraph extraction, or the existing abstract) before any code;
 it composes with R5 (the cross-session abstraction pass produces good
-L1 summaries) rather than competing with it. Directory-scoped retrieval
+L1 summaries) rather than competing with it. **Partly realized on 2.4:**
+extractive tier-down (A2, #808) already persists the L0 abstract + L1
+summary + L2 keep-token shape for cold episodic pages
+([`design-memory-aging.md`](design-memory-aging.md)); the remaining R7 work
+is the *tiered on-start brief* that leads with abstracts, still a design
+doc before code. Directory-scoped retrieval
 (OpenViking's TrieHI) is the lower-priority half — a path-prefix filter
 on `memory_query` within a project — worth noting but not scheduling
 until R7's tiering lands.
@@ -549,6 +709,37 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
   Solo maker (Carlos Souza), closed-source cloud engine, no benchmarks; the
   backend internals, model, and any numbers are undisclosed/vendor framing.
   Analyzed inline in §3 per the no-standalone-doc convention.
+- Engram (issue #810): github.com/Gentleman-Programming/engram (README —
+  SQLite+FTS5, Go single binary, MCP stdio, operating contract /
+  `mem_session_summary`, git-sync, Engram Cloud; MIT) and the GitHub metadata
+  endpoint (~6.8K stars, commit 2026-09-22, release v2.0.0). No benchmark
+  published. Analyzed inline in §3 per the no-standalone-doc convention.
+- EverOS (issue #810): github.com/EverMind-AI/EverOS (README — Markdown source
+  of truth + SQLite/LanceDB indexes, user/agent tracks, Knowledge Wiki, offline
+  consolidation, minimal-tier LLM-required, OpenRouter default; Apache-2.0) and
+  the metadata endpoint (~13.1K stars, commit 2026-09-09, release v1.3.1). No
+  benchmark published. Analyzed inline in §3 per the no-standalone-doc convention.
+- memU (issue #810): github.com/NevaMind-AI/memU (README — shared LLM wiki,
+  Markdown skill distillation, SQLite/Postgres+pgvector, host-instruction-file
+  sidecars, no MCP; LICENSE.txt = Apache-2.0) and the metadata endpoint (~14.4K
+  stars, commit 2026-09-21, release v1.5.1 2026-03-23 so releases lag); managed
+  cloud at memu.so. No named benchmark. Analyzed inline in §3 per the
+  no-standalone-doc convention.
+- Caura (issue #810): github.com/caura-ai/caura (README — governed multi-agent
+  fleet memory on Postgres+pgvector, visibility scopes, four trust tiers, audit,
+  PII flagging, KG, MCP `/mcp`; Apache-2.0) + managed caura.ai, and the metadata
+  endpoint (~0.5K stars, commit 2026-09-22, release backend-v3.17.2). Benchmarks
+  (LoCoMo 77.6% / LongMemEval 92.2%, "23 ms p50," eToro "300+ agents") are
+  README-stated and vendor self-reported, not independently verified. Analyzed
+  inline in §3 per the no-standalone-doc convention.
+- TencentDB Agent Memory (issue #810): github.com/TencentCloud/TencentDB-Agent-
+  Memory (README — Chat Memory/Skill/Wiki/CodeGraph assets, proxy fan-in base-URL
+  interception, Node/TS, SQLite default + experimental MongoDB, harness list;
+  LICENSE = MIT despite the GitHub NOASSERTION detection) and the metadata
+  endpoint (~27.2K stars, commit 2026-09-22, release v2.0.1). PersonaMem
+  48%→76% is vendor self-reported. The name does **not** imply a Tencent DB
+  dependency (SQLite by default). Analyzed inline in §3 per the no-standalone-doc
+  convention.
 - Zep/Graphiti: arXiv:2501.13956; getzep.com temporal-KG explainer;
   Neo4j "Graphiti: Knowledge graph memory for an agentic world".
 - Letta: "Is a Filesystem All You Need?" (letta.com blog, Aug 2025).
@@ -561,3 +752,11 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
 - Landscape comparisons: cognee.ai, vectorize.io, atlan.com,
   particula.tech, mnemoverse.com 2026 roundups (read as marketing;
   cross-checked against the projects' own repos where load-bearing).
+- In-repo design of record for the 2.4 memory-aging borrowings (per-tier
+  decay, extractive tier-down, cold-cluster dedup, contradiction band,
+  belief-strength, the dream pass, access-weighting):
+  [`design-memory-aging.md`](design-memory-aging.md) (with a sourced
+  competitor-grounding table) and
+  [`design-hindsight-borrowings.md`](design-hindsight-borrowings.md) §3
+  (belief-strength). Migration verdicts:
+  [`competitive-parity.md`](competitive-parity.md).

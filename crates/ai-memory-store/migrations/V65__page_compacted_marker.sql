@@ -1,0 +1,23 @@
+-- A2 extractive tier-down marker (docs/design-memory-aging.md §A2).
+--
+-- When the forget sweep tiers a cold episodic page DOWN — keeping its L0
+-- abstract, an L1 summary, and an L2 regex-mined keep-token set, dropping the
+-- prose body — instead of evicting it, it stamps this column on the rewritten
+-- latest version. The marker lets the sweep and `curator.rs` tell a
+-- deliberately-short *compacted* page from a *cold* one, so a compacted page is
+-- never re-compacted and never re-reported as a fresh cold candidate.
+--
+-- Purely ADDITIVE DDL: a single nullable `ADD COLUMN` is instant on SQLite
+-- (no table rewrite, no lock on a large store). Existing rows read back NULL
+-- ("not compacted"), which is exactly today's behaviour, so an upgrade changes
+-- nothing until an operator opts in to `[decay] compact_cold_episodic`. There
+-- is NO body backfill: the marker is populated LAZILY by the sweep as it
+-- compacts, not in a boot migration (contrast the V62 window backfill).
+--
+-- The frontmatter carries a `compacted: true` mirror of this column; the column
+-- is derived from that mirror at the single store write choke point
+-- (`ops::upsert_page_in_tx`), so both land in the same transaction as the page
+-- body (invariant: indexes commit with the data). The full pre-compaction body
+-- stays reachable through the supersession chain and git history, so tier-down
+-- is reversible (invariant #16: the loser stays reachable).
+ALTER TABLE pages ADD COLUMN compacted_at INTEGER;

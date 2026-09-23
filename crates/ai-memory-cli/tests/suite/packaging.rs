@@ -625,7 +625,7 @@ fn github_actions_are_pinned_to_full_commits() {
 #[test]
 fn workflows_keep_fixed_rust_jobs_on_the_fixed_toolchain() {
     for (path, expected_fixed_jobs) in [
-        (".github/workflows/ci.yml", 1),
+        (".github/workflows/ci.yml", 2),
         (".github/workflows/release.yml", 3),
     ] {
         let workflow = read_repo(path);

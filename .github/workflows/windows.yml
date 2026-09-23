@@ -30,6 +30,10 @@ name: windows
 # to main: fast Linux CI gates each merge, and the full Windows suite runs
 # nightly, on demand, and MANDATORILY right before a release (dispatch it
 # on the release-candidate SHA and wait for green — see AGENTS.md).
+#
+# The `hooks` job is separate so a Rust failure cannot stop the hook suite from
+# reporting, but it follows the same `windows` label gate on pull requests.
+# Both jobs also run nightly and on manual dispatch.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -66,3 +70,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo test --workspace --all-targets
+
+  # `ci.yml`'s `hooks-shell` job covers the POSIX bundle across four awks, all
+  # on Linux. The suite also drives `hooks/lib/ai-memory-hook.ps1`, and that
+  # half only ever executes where PowerShell is native — so the one platform
+  # its PowerShell branch is written for was the one platform no job ran it on.
+  #
+  # Its own job so a Rust failure cannot stop the shell suite from reporting,
+  # but gated behind the `windows` label like `test` above. The project keeps
+  # Windows off per-PR feedback by default (see the header's cost argument), so
+  # a pull request touching `hooks/` opts in with the `windows` label, the same
+  # as any other platform-sensitive change; it also runs nightly and on manual
+  # dispatch. (The job is cheap — a checkout and a few seconds of `sh` — but
+  # consistency with the fast-CI-per-merge rule wins over an every-PR carve-out.)
+  hooks:
+    name: hook bundle (windows-latest)
+    # On a pull request, only when explicitly opted in (same as `test`).
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'windows')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: hook bundle (Git Bash)
+        shell: bash
+        run: sh tests/hooks/test_lib.sh

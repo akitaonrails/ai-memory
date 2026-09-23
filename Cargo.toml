@@ -35,7 +35,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "2.3.2"
+version = "2.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -44,16 +44,16 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "2.3.2" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "2.3.2" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "2.3.2" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "2.3.2" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "2.3.2" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "2.3.2" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "2.3.2" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "2.3.2" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "2.3.2" }
-ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "2.1.1" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "2.4.0" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "2.4.0" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "2.4.0" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "2.4.0" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "2.4.0" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "2.4.0" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "2.4.0" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "2.4.0" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "2.4.0" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "2.3.2" }
 
 # (Workspace shared deps follow below)
 
@@ -136,7 +136,7 @@ winapi-util = "0.1"
 # `aws_lc_rs`, which is exactly the C/JNI toolchain the bridge avoids by using
 # rmcp's `reqwest-tls-no-provider`. `ring` is already in the lockfile via reqwest 0.12.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rmcp = { version = "2.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
 # Same `http` 1.x rmcp/axum use, so handlers can read the injected

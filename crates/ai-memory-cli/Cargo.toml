@@ -38,6 +38,9 @@ sha2.workspace = true
 base64.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+# Sets SO_KEEPALIVE on accepted `serve` sockets (#792); not a workspace dep,
+# `ai-memory-cli` is the only crate that needs it.
+socket2 = "0.6.3"
 clap.workspace = true
 clap_complete.workspace = true
 crossterm.workspace = true

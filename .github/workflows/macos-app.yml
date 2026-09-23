@@ -1,0 +1,22 @@
+name: macos-app
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  swift-test:
+    name: swift test (ai-memory-macos)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'macos') ||
+      contains(github.event.pull_request.labels.*.name, 'full-ci')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Swift tests
+        run: swift test --package-path companions/ai-memory-macos

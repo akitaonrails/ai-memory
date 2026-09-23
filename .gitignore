@@ -1,6 +1,9 @@
 # Rust build artefacts.
 /target/
 /companions/*/target/
+/companions/*/.build/
+/companions/*/.swiftpm/
+/companions/*/dist/
 /dist/
 **/*.rs.bk
 **/*.rs.orig

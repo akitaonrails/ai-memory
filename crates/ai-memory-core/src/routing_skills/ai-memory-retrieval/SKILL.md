@@ -12,10 +12,10 @@ Use this skill for read-only ai-memory lookups, catch-up, and evaluating remembe
 
 - `memory_query` searches the current project's wiki for prior decisions, gotchas, procedures, rules, and session notes.
 - `memory_recent` lists the most recently updated pages when the user wants a light activity check.
-- `memory_read_page` fetches a full page body after a search hit or direct path lookup.
+- `memory_read_page` fetches a full page body after a search hit or direct path lookup. Pass `include_related: true` (optional `related_depth`, default 1, hard cap 3) to also walk the link graph outward and return a `related` array of reachable pages, each with its hop `depth` and edge `direction` (`link`/`backlink`); default off omits it.
 - `memory_read_session_observations` reads one session's raw hook observations (prompts, tool calls, stops) in capture order, paged and body-capped, when the user asks what actually happened in a session or wants to check a compiled page against its evidence.
 - `memory_status` reports whether ai-memory is healthy and how large the knowledge base is.
-- `memory_briefing` returns a structured read-only snapshot for agent consumption.
+- `memory_briefing` returns a structured read-only snapshot for agent consumption, including a bounded `pinned` list of the project's pinned standing-context pages (present only when the project has pins).
 - `memory_explore` returns a prose digest when the user asks for an open-ended catch-up.
 
 ## Project scope
@@ -49,11 +49,48 @@ Expired pages are excluded from project, sibling-scope, and global searches by
 default. Pass `include_expired: true` only when the user explicitly asks to
 inspect expired historical memory; do not broaden ordinary recall to stale data.
 
+Superseded (older) page versions are excluded by default; only the current
+version of each page is returned. Pass `include_superseded: true` when the user
+wants a page's history, or an answer that a later edit removed. Each older hit is
+labelled `superseded: true` so you can tell it from the live version; the current
+version is never marked. This applies to project and explicit-scope searches;
+`global=true` search and `as_of` time-travel are unaffected.
+
+Pass `pin_first: true` to prepend the project's bounded pinned latest pages
+ahead of the ranked search hits ("pin before search") when the user's task
+should be anchored in standing operator-curated context first. The pins are
+deduped against the search hits (a pinned page that also matches appears once,
+marked `pinned: true`), the combined result stays within the requested limit,
+and default `false` leaves the ordering unchanged. It applies to single-project
+searches (default or `workspace`+`project`); `scopes`, `global`, and `as_of`
+queries ignore it.
+
 Use `explain: true` only when the user asks why project or explicit-scope hits
 ranked as they did. It adds FTS, lexical entity, optional vector, and graph
 score provenance to compiled-page hits, including matched entity names.
 Cross-project `global: true` search has a distinct FTS-only ranker, so it reports
 the active stream without per-hit RRF details.
+
+Pass `answer: true` (opt-in, off by default) to also get a synthesized,
+natural-language answer over the top hits, attached as `answer: { text,
+citations }` where `citations` are the page paths the answer drew from. This
+requires the server to have an LLM provider configured: with no provider the
+call returns the normal hits plus a short `answer_unavailable` note and never
+errors, and the default path (`answer` omitted/`false`) makes no LLM call at
+all. The answer is grounded strictly in the retrieved snippets, so treat it as a
+convenience over the same hits, not a new source — still open the cited pages
+before acting. It applies to the normal single-project / `scopes` search;
+`global` and `as_of` queries ignore it. This is a new 2.4 feature and its answer
+quality is not yet eval-validated.
+
+Pair `answer: true` with a `reasoning` tier — `minimal` (default), `low`,
+`medium`, `high`, or `max` — to tune how hard the model works on the synthesis.
+Higher tiers hand the model a larger token budget so it can reason longer before
+its answer is truncated; `minimal` (and omitting `reasoning`) is byte-identical
+to today. `memory_explore` takes the same `reasoning` tier for its prose digest.
+The tier only matters when the LLM path actually runs: with `answer: false` (or
+no provider configured) it is inert and no LLM call is made. An unknown value is
+rejected by the schema.
 
 ## Snippets are not full pages
 

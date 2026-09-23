@@ -241,7 +241,12 @@ jobs:
           # etc. land at the zip root, mirroring the Linux tarball layout.
           Get-ChildItem $stage | Compress-Archive -DestinationPath $zip
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
+          # -NoNewline plus an explicit `n, because Out-File's own line
+          # terminator is CRLF on Windows. `sha256sum -c` treats the CR as part
+          # of the filename and fails with "No such file or directory", and the
+          # release body concatenates every platform's file into one block, so
+          # the stray byte shows up there too.
+          "$hash  $zip`n" | Out-File -Encoding ascii -NoNewline "$zip.sha256"
 
       - name: Smoke test release zip
         shell: pwsh
@@ -264,7 +269,7 @@ jobs:
             }
           }
           $checksum = Get-Content "$zip.sha256" -Raw
-          if ($checksum -notmatch '^[0-9a-f]{64}  ai-memory-windows-x86_64\.zip\r?\n?$') {
+          if ($checksum -cnotmatch '^[0-9a-f]{64}  ai-memory-windows-x86_64\.zip\n$') {
             throw "Windows release zip checksum is not sha256sum format"
           }
 
