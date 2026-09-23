@@ -8,17 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Native `ai-memory upgrade` for GitHub-release Unix installs (Linux/macOS):
-  downloads the matching release tarball, verifies the `.sha256` sidecar,
-  atomically replaces the on-disk binary (and a sibling `hooks/` tree when
-  present), then re-runs `install-hooks --apply` for staged agents. Refuses
-  package-managed paths (Homebrew/AUR/`/usr`), containers, and Windows
-  self-replace; the Docker wrapper's `upgrade` path is unchanged. Pin with
-  `--version` / force a re-download with `--force`. Optional
+- Native `ai-memory upgrade` for GitHub-release installs (Linux/macOS
+  tarballs and Windows x86_64 zip): downloads the matching release archive,
+  verifies the `.sha256` sidecar, replaces the on-disk binary (and a sibling
+  `hooks/` tree when present), then re-runs `install-hooks --apply` for staged
+  agents. Windows uses rename-aside self-replace (running `.exe` → `.old`,
+  promote `.new`) because the mapped image cannot be overwritten in place.
+  Refuses package-managed paths (Homebrew/AUR/`/usr`), containers, and
+  unwritable prefixes; the Docker wrapper's `upgrade` path is unchanged. Pin
+  with `--version` / force a re-download with `--force`. Optional
   `AI_MEMORY_RELEASE_BASE_URL` / `release_base_url` overrides the Releases
   base for mirrors and hermetic tests (loaded via `Config`, not ad-hoc env).
   Downloads refuse bodies over 128 MiB (Content-Length and streamed cap).
-  (#801)
+  (#801, #802)
 - `ai-memory run` accepts a repeatable `--env KEY=VALUE` and an `--env-file
   <path>` (blank lines and `#` comments skipped) to pass extra environment
   into the spawned harness — e.g. a per-account `CLAUDE_CONFIG_DIR` for

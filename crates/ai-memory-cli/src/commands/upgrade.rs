@@ -2,21 +2,23 @@
 //!
 //! Docker-wrapper installs never reach this path: [`bin/ai-memory`] intercepts
 //! `upgrade` and pulls the container image. This command covers the release
-//! binary laid down under a writable user prefix (the macOS happy path in
-//! `docs/macos.md`): download the matching tarball + `.sha256`, verify,
-//! atomically replace the on-disk binary (and sibling `hooks/` when present),
-//! then re-run `install-hooks --apply` for every staged agent.
+//! binary laid down under a writable user prefix (macOS/Linux tarball in
+//! `docs/macos.md`, Windows zip in `docs/windows.md` Scenario C): download the
+//! matching archive + `.sha256`, verify, replace the on-disk binary (and sibling
+//! `hooks/` when present), then re-run `install-hooks --apply` for every staged
+//! agent.
 //!
 //! Client-only: never claims to upgrade a remote/homelab server.
 //!
 //! Ownership (live CLI command — kept in one module by convention):
 //! - install classification (container / package-managed / writable)
 //! - release fetch + checksum
-//! - archive extract + path allowlist
-//! - atomic binary/dir replace
+//! - archive extract + path allowlist (`.tar.gz` or `.zip`)
+//! - atomic binary/dir replace (Unix rename-over; Windows rename-aside)
 //! - staged hook refresh
 
 use std::fs;
+use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -29,7 +31,7 @@ use tracing::info;
 use crate::cli::{AgentChoice, InstallHooksArgs, UpgradeArgs};
 use crate::commands::install_hooks;
 use crate::config::Config;
-use crate::install_layout::{BINARY_NAME, HOOKS_DIR_NAME};
+use crate::install_layout::{HOOKS_DIR_NAME, shipped_binary_name};
 
 const RELEASE_OWNER_REPO: &str = "akitaonrails/ai-memory";
 const USER_AGENT: &str = concat!("ai-memory-cli/", env!("CARGO_PKG_VERSION"));
@@ -47,25 +49,6 @@ type StagedAgentList = Vec<(String, AgentChoice)>;
 
 /// Run the `upgrade` subcommand.
 pub async fn run(config: &Config, args: UpgradeArgs) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = (config, args);
-        bail!(
-            "native `ai-memory upgrade` does not yet support Windows self-replace; \
-             download the release zip from \
-             https://github.com/{RELEASE_OWNER_REPO}/releases/latest \
-             and re-run `install-hooks --apply` for each agent"
-        );
-    }
-
-    #[cfg(not(windows))]
-    {
-        run_unix(config, args).await
-    }
-}
-
-#[cfg(not(windows))]
-async fn run_unix(config: &Config, args: UpgradeArgs) -> Result<()> {
     let exe = resolve_current_exe()?;
     ensure_supported_install(&exe)?;
 
@@ -87,13 +70,11 @@ async fn run_unix(config: &Config, args: UpgradeArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn resolve_current_exe() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("resolving current executable path")?;
     Ok(fs::canonicalize(&exe).unwrap_or(exe))
 }
 
-#[cfg(not(windows))]
 fn ensure_supported_install(exe: &Path) -> Result<()> {
     match classify_install(exe)? {
         InstallClass::Supported => Ok(()),
@@ -101,7 +82,6 @@ fn ensure_supported_install(exe: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
 fn skip_when_current(tag: &str, force: bool) -> bool {
     let current = env!("CARGO_PKG_VERSION");
     if !force && versions_match(tag, current) {
@@ -111,7 +91,6 @@ fn skip_when_current(tag: &str, force: bool) -> bool {
     false
 }
 
-#[cfg(not(windows))]
 async fn download_and_extract_release(
     fetcher: &ReqwestFetcher,
     base: &str,
@@ -120,13 +99,12 @@ async fn download_and_extract_release(
     let asset = release_asset_name().context("no GitHub release asset for this OS/arch")?;
     let archive_bytes = fetch_verified_archive(fetcher, base, tag, asset).await?;
     let extract_root = tempfile::tempdir().context("creating extract temp dir")?;
-    extract_release_archive(&archive_bytes, extract_root.path())
+    extract_release_archive(&archive_bytes, extract_root.path(), asset)
         .context("extracting release archive")?;
     ensure_extracted_binary(extract_root.path())?;
     Ok(extract_root)
 }
 
-#[cfg(not(windows))]
 async fn fetch_verified_archive(
     fetcher: &ReqwestFetcher,
     base: &str,
@@ -149,10 +127,11 @@ async fn fetch_verified_archive(
 }
 
 fn ensure_extracted_binary(extract_root: &Path) -> Result<()> {
-    if extract_root.join(BINARY_NAME).is_file() {
+    let name = shipped_binary_name();
+    if extract_root.join(name).is_file() {
         return Ok(());
     }
-    bail!("release archive is missing the {BINARY_NAME} binary");
+    bail!("release archive is missing the {name} binary");
 }
 
 fn verify_archive_checksum(archive_bytes: &[u8], checksum_text: &str, asset: &str) -> Result<()> {
@@ -166,7 +145,6 @@ fn verify_archive_checksum(archive_bytes: &[u8], checksum_text: &str, asset: &st
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn apply_extracted_release(extract_root: &Path, exe: &Path) -> Result<()> {
     let install_dir = exe
         .parent()
@@ -177,13 +155,13 @@ fn apply_extracted_release(extract_root: &Path, exe: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn replace_binary(extract_root: &Path, exe: &Path) -> Result<()> {
-    let new_binary = extract_root.join(BINARY_NAME);
+    let new_binary = extract_root.join(shipped_binary_name());
     println!("→ replacing {}", exe.display());
     replace_file_atomic(&new_binary, exe).with_context(|| {
         format!(
-            "replacing {}; if this fails mid-way look for {}.new",
+            "replacing {}; if this fails mid-way look for {}.new / {}.old",
+            exe.display(),
             exe.display(),
             exe.display()
         )
@@ -304,17 +282,18 @@ fn release_asset_name() -> Option<&'static str> {
     release_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Map an OS/arch pair to the GitHub release tarball name.
+/// Map an OS/arch pair to the GitHub release archive name.
 ///
-/// Pure so every CI host can assert the full Unix matrix (and Windows →
-/// `None`) without cross-compiling. Callers use [`release_asset_name`] for
-/// the running host.
+/// Pure so every CI host can assert the full matrix (Unix tarballs + Windows
+/// x86_64 zip; Windows aarch64 stays `None` — no release asset) without
+/// cross-compiling. Callers use [`release_asset_name`] for the running host.
 fn release_asset_name_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("linux", "x86_64") => Some("ai-memory-linux-x86_64.tar.gz"),
         ("linux", "aarch64") => Some("ai-memory-linux-aarch64.tar.gz"),
         ("macos", "aarch64") => Some("ai-memory-macos-aarch64.tar.gz"),
         ("macos", "x86_64") => Some("ai-memory-macos-x86_64.tar.gz"),
+        ("windows", "x86_64") => Some("ai-memory-windows-x86_64.zip"),
         _ => None,
     }
 }
@@ -405,7 +384,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn extract_release_archive(bytes: &[u8], dest: &Path) -> Result<()> {
+fn extract_release_archive(bytes: &[u8], dest: &Path, asset: &str) -> Result<()> {
+    if asset.ends_with(".zip") {
+        extract_release_zip(bytes, dest)
+    } else if asset.ends_with(".tar.gz") || asset.ends_with(".tgz") {
+        extract_release_tar_gz(bytes, dest)
+    } else {
+        bail!("unsupported release archive format for asset {asset}");
+    }
+}
+
+fn extract_release_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
     let decoder = GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
     archive.set_preserve_permissions(false);
@@ -413,10 +402,45 @@ fn extract_release_archive(bytes: &[u8], dest: &Path) -> Result<()> {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
         let entry_type = entry.header().entry_type();
-        validate_release_entry(&path, entry_type)?;
+        validate_release_tar_entry(&path, entry_type)?;
         entry
             .unpack_in(dest)
             .with_context(|| format!("extracting {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn extract_release_zip(bytes: &[u8], dest: &Path) -> Result<()> {
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).context("opening release zip")?;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .with_context(|| format!("reading zip entry {i}"))?;
+        let Some(enclosed) = file.enclosed_name() else {
+            bail!("release archive contains unsafe path: {}", file.name());
+        };
+        if file.is_symlink() {
+            bail!(
+                "release archive contains unsupported link entry: {}",
+                enclosed.display()
+            );
+        }
+        validate_release_path(&enclosed, file.is_dir())?;
+        let out_path = dest.join(&enclosed);
+        if file.is_dir() {
+            fs::create_dir_all(&out_path)
+                .with_context(|| format!("creating {}", out_path.display()))?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut out = fs::File::create(&out_path)
+            .with_context(|| format!("creating {}", out_path.display()))?;
+        std::io::copy(&mut file, &mut out)
+            .with_context(|| format!("extracting {}", enclosed.display()))?;
     }
     Ok(())
 }
@@ -425,8 +449,7 @@ fn is_regular_file(entry_type: tar::EntryType) -> bool {
     entry_type.is_file() || entry_type == tar::EntryType::GNUSparse
 }
 
-fn validate_release_entry(path: &Path, entry_type: tar::EntryType) -> Result<()> {
-    let normalized = normalize_release_entry_path(path)?;
+fn validate_release_tar_entry(path: &Path, entry_type: tar::EntryType) -> Result<()> {
     if entry_type.is_symlink() || entry_type.is_hard_link() {
         bail!(
             "release archive contains unsupported link entry: {}",
@@ -439,10 +462,16 @@ fn validate_release_entry(path: &Path, entry_type: tar::EntryType) -> Result<()>
             path.display()
         );
     }
+    validate_release_path(path, entry_type.is_dir())
+}
+
+/// Shared path gates for tar and zip entries (allowlist + traversal).
+fn validate_release_path(path: &Path, is_dir: bool) -> Result<()> {
+    let normalized = normalize_release_entry_path(path)?;
     // `tar -C dist/$artifact -czf … .` (release.yml) emits `./` as the
     // archive root — empty after stripping CurDir; allow that directory only.
     if normalized.as_os_str().is_empty() {
-        if entry_type.is_dir() {
+        if is_dir {
             return Ok(());
         }
         bail!("release archive contains unsafe path: {}", path.display());
@@ -470,9 +499,24 @@ fn normalize_release_entry_path(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Portable forward-slash key so Windows `Path` separators do not break
+/// the allowlist string checks.
+fn release_path_key(path: &Path) -> String {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn is_allowed_release_path(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-    path_str == BINARY_NAME
+    let path_str = release_path_key(path);
+    // Accept both release basenames so the zip extractor can be unit-tested
+    // on Unix CI (archive root is always `ai-memory.exe` per release.yml).
+    path_str == "ai-memory"
+        || path_str == "ai-memory.exe"
         || path_str == HOOKS_DIR_NAME
         || path_str
             .strip_prefix(HOOKS_DIR_NAME)
@@ -495,14 +539,57 @@ fn replace_file_atomic(src: &Path, dest: &Path) -> Result<()> {
         fs::set_permissions(&tmp, fs::Permissions::from_mode(UNIX_EXECUTABLE_MODE))
             .with_context(|| format!("chmod +x {}", tmp.display()))?;
     }
-    fs::rename(&tmp, dest).with_context(|| {
-        format!(
-            "renaming {} -> {} (left {} in place on failure)",
-            tmp.display(),
-            dest.display(),
-            tmp.display()
-        )
-    })?;
+    #[cfg(windows)]
+    {
+        replace_file_windows_rename_aside(&tmp, dest)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(&tmp, dest).with_context(|| {
+            format!(
+                "renaming {} -> {} (left {} in place on failure)",
+                tmp.display(),
+                dest.display(),
+                tmp.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+/// Windows allows renaming a running image aside, but not overwriting it.
+/// Stage to `.new`, move live `dest` → `.old`, promote `.new` → `dest`, then
+/// best-effort delete `.old` (often fails while this process still maps it).
+#[cfg(windows)]
+fn replace_file_windows_rename_aside(tmp: &Path, dest: &Path) -> Result<()> {
+    let old = dest.with_extension("old");
+    if old.exists() {
+        let _ = fs::remove_file(&old);
+    }
+    let had_dest = dest.exists();
+    if had_dest {
+        fs::rename(dest, &old).with_context(|| {
+            format!(
+                "moving running binary aside {} -> {}",
+                dest.display(),
+                old.display()
+            )
+        })?;
+    }
+    if let Err(err) = fs::rename(tmp, dest) {
+        if had_dest {
+            let _ = fs::rename(&old, dest);
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "renaming {} -> {} (attempted rollback of {})",
+                tmp.display(),
+                dest.display(),
+                old.display()
+            )
+        });
+    }
+    let _ = fs::remove_file(&old);
     Ok(())
 }
 
@@ -817,17 +904,20 @@ fn content_length_exceeds_limit(content_length: u64, max_bytes: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use tar::Header;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     #[test]
-    fn release_asset_name_for_covers_unix_matrix_and_refusals() {
-        // Table-driven so Linux CI still guards macos-* and windows → None.
+    fn release_asset_name_for_covers_unix_and_windows_matrix() {
+        // Table-driven so Linux CI still guards macos-* and windows mapping.
         let cases: &[(&str, &str, Option<&str>)] = &[
             ("linux", "x86_64", Some("ai-memory-linux-x86_64.tar.gz")),
             ("linux", "aarch64", Some("ai-memory-linux-aarch64.tar.gz")),
             ("macos", "aarch64", Some("ai-memory-macos-aarch64.tar.gz")),
             ("macos", "x86_64", Some("ai-memory-macos-x86_64.tar.gz")),
-            ("windows", "x86_64", None),
+            ("windows", "x86_64", Some("ai-memory-windows-x86_64.zip")),
             ("windows", "aarch64", None),
             ("linux", "arm", None),
             ("freebsd", "x86_64", None),
@@ -845,6 +935,20 @@ mod tests {
             release_asset_name(),
             release_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
         );
+    }
+
+    #[test]
+    fn shipped_binary_name_matches_host() {
+        #[cfg(windows)]
+        assert_eq!(shipped_binary_name(), "ai-memory.exe");
+        #[cfg(not(windows))]
+        assert_eq!(shipped_binary_name(), "ai-memory");
+    }
+
+    #[test]
+    fn allowlist_accepts_shipped_binary_basename() {
+        assert!(is_allowed_release_path(Path::new(shipped_binary_name())));
+        assert!(is_allowed_release_path(Path::new("hooks/claude-code/x.sh")));
     }
 
     #[test]
@@ -914,7 +1018,7 @@ mod tests {
     #[test]
     fn classify_accepts_writable_user_prefix() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let exe = dir.path().join("ai-memory");
+        let exe = dir.path().join(shipped_binary_name());
         fs::write(&exe, b"fake")?;
         #[cfg(unix)]
         {
@@ -934,7 +1038,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_path_traversal() -> Result<()> {
-        match validate_release_entry(Path::new("../evil"), tar::EntryType::Regular) {
+        match validate_release_tar_entry(Path::new("../evil"), tar::EntryType::Regular) {
             Ok(()) => bail!("path traversal must fail"),
             Err(err) => assert!(err.to_string().contains("unsafe"), "{err}"),
         }
@@ -943,7 +1047,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_unexpected_paths() -> Result<()> {
-        match validate_release_entry(Path::new("etc/passwd"), tar::EntryType::Regular) {
+        match validate_release_tar_entry(Path::new("etc/passwd"), tar::EntryType::Regular) {
             Ok(()) => bail!("unexpected path must fail"),
             Err(err) => assert!(err.to_string().contains("unexpected"), "{err}"),
         }
@@ -952,15 +1056,15 @@ mod tests {
 
     #[test]
     fn validate_accepts_dot_slash_prefixed_binary() -> Result<()> {
-        validate_release_entry(Path::new("./ai-memory"), tar::EntryType::Regular)?;
-        validate_release_entry(Path::new("./"), tar::EntryType::Directory)?;
+        validate_release_tar_entry(Path::new("./ai-memory"), tar::EntryType::Regular)?;
+        validate_release_tar_entry(Path::new("./"), tar::EntryType::Directory)?;
         Ok(())
     }
 
     #[test]
     fn extracts_archive_built_like_release_yml() -> Result<()> {
         let src = tempfile::tempdir()?;
-        fs::write(src.path().join(BINARY_NAME), b"bin")?;
+        fs::write(src.path().join(shipped_binary_name()), b"bin")?;
         fs::create_dir_all(src.path().join("hooks/claude-code"))?;
         fs::write(src.path().join("hooks/claude-code/x.sh"), b"#!/bin/sh")?;
         let out = tempfile::tempdir()?;
@@ -978,8 +1082,12 @@ mod tests {
             .status()?;
         assert!(status.success());
         let dest = tempfile::tempdir()?;
-        extract_release_archive(&fs::read(&archive)?, dest.path())?;
-        assert!(dest.path().join(BINARY_NAME).is_file());
+        extract_release_archive(
+            &fs::read(&archive)?,
+            dest.path(),
+            "ai-memory-macos-aarch64.tar.gz",
+        )?;
+        assert!(dest.path().join(shipped_binary_name()).is_file());
         Ok(())
     }
 
@@ -1012,21 +1120,102 @@ mod tests {
             hash
         );
         let dest = tempfile::tempdir()?;
-        extract_release_archive(&gz_bytes, dest.path())?;
+        extract_release_archive(&gz_bytes, dest.path(), "ai-memory-macos-aarch64.tar.gz")?;
         assert_eq!(fs::read(dest.path().join("ai-memory"))?, b"hello-world");
+        Ok(())
+    }
+
+    fn build_test_zip(entries: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for &(path, body) in entries {
+                if path.ends_with('/') {
+                    zip.add_directory(path, options)?;
+                } else {
+                    zip.start_file(path, options)?;
+                    zip.write_all(body)?;
+                }
+            }
+            zip.finish()?;
+        }
+        Ok(cursor.into_inner())
+    }
+
+    #[test]
+    fn extracts_zip_happy_path_with_hooks() -> Result<()> {
+        let bytes = build_test_zip(&[
+            ("ai-memory.exe", b"win-bin"),
+            ("hooks/", b""),
+            ("hooks/claude-code/x.ps1", b"hook"),
+        ])?;
+        let dest = tempfile::tempdir()?;
+        extract_release_archive(&bytes, dest.path(), "ai-memory-windows-x86_64.zip")?;
+        assert_eq!(fs::read(dest.path().join("ai-memory.exe"))?, b"win-bin");
+        assert_eq!(
+            fs::read(dest.path().join("hooks/claude-code/x.ps1"))?,
+            b"hook"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zip_extract_rejects_path_traversal() -> Result<()> {
+        let bytes = build_test_zip(&[("../evil.exe", b"nope")])?;
+        let dest = tempfile::tempdir()?;
+        match extract_release_archive(&bytes, dest.path(), "ai-memory-windows-x86_64.zip") {
+            Ok(()) => bail!("path traversal must fail"),
+            Err(err) => assert!(
+                err.to_string().contains("unsafe") || err.to_string().contains("unexpected"),
+                "{err}"
+            ),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn zip_extract_rejects_unexpected_paths() -> Result<()> {
+        let bytes = build_test_zip(&[("etc/passwd", b"nope")])?;
+        let dest = tempfile::tempdir()?;
+        match extract_release_archive(&bytes, dest.path(), "ai-memory-windows-x86_64.zip") {
+            Ok(()) => bail!("unexpected path must fail"),
+            Err(err) => assert!(err.to_string().contains("unexpected"), "{err}"),
+        }
         Ok(())
     }
 
     #[test]
     fn replace_file_atomic_swaps_contents() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let dest = dir.path().join("ai-memory");
+        let dest = dir.path().join(shipped_binary_name());
         let src = dir.path().join("fresh");
         fs::write(&dest, b"old")?;
         fs::write(&src, b"new")?;
         replace_file_atomic(&src, &dest)?;
         assert_eq!(fs::read(&dest)?, b"new");
         assert!(!dest.with_extension("new").exists());
+        // Windows may leave `.old` while a process still maps it; unit test
+        // has no live mapping so it should be gone, but tolerate leftovers.
+        let old = dest.with_extension("old");
+        if old.exists() {
+            assert_eq!(fs::read(&old)?, b"old");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replace_file_atomic_cleans_stale_old_before_swap() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join(shipped_binary_name());
+        let src = dir.path().join("fresh");
+        let old = dest.with_extension("old");
+        fs::write(&dest, b"current")?;
+        fs::write(&old, b"stale-old")?;
+        fs::write(&src, b"new")?;
+        replace_file_atomic(&src, &dest)?;
+        assert_eq!(fs::read(&dest)?, b"new");
         Ok(())
     }
 

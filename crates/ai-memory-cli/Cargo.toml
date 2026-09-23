@@ -76,6 +76,7 @@ serde_json.workspace = true
 toml_edit.workspace = true
 sysinfo.workspace = true
 tar.workspace = true
+zip.workspace = true
 jiff.workspace = true
 jsonc-parser.workspace = true
 tokio.workspace = true

@@ -331,6 +331,8 @@ Docker — either the [menu bar app](#macos-menu-bar-app) above or a
 path use `ai-memory upgrade` (checksum-verified GitHub release replace + hook
 refresh) — see
 [`docs/install.md#keeping-ai-memory-up-to-date`](docs/install.md#keeping-ai-memory-up-to-date).
+The same native upgrade path covers Windows x86_64 zip installs under a
+writable prefix (see [`docs/windows.md`](docs/windows.md) Scenario C).
 
 Wiring another agent is the same two commands with a different name —
 `--client codex`, `--agent codex`, and so on for every row of the support

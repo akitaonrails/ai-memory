@@ -2441,11 +2441,11 @@ self-upgrades to a fork or tagged release, set `AI_MEMORY_WRAPPER_URL=<url>`;
 the wrapper requires `<url>.sha256` unless
 `AI_MEMORY_WRAPPER_SHA256_URL=<checksum-url>` is also set.
 
-### Native release binary (Linux / macOS)
+### Native release binary (Linux / macOS / Windows x86_64)
 
 When `PATH` points at a GitHub-release `ai-memory` binary under a writable
-user prefix (for example `~/.local/bin`), the same command upgrades the
-binary itself:
+user prefix (for example `~/.local/bin`, or `%LOCALAPPDATA%\ai-memory` on
+Windows), the same command upgrades the binary itself:
 
 ```bash
 ai-memory upgrade
@@ -2454,18 +2454,22 @@ ai-memory upgrade --version v2.3.2
 ai-memory upgrade --force
 ```
 
-The native path downloads the matching `ai-memory-<os>-<arch>.tar.gz` and
-its `.sha256` sidecar from GitHub Releases, verifies the checksum, replaces
-the on-disk binary (and a sibling `hooks/` directory when present), then
-re-stages hooks for agents already under the data-dir hooks tree. It refuses
-Homebrew/AUR/`/usr` installs (use the package manager), Windows self-replace
-(download the zip manually), and in-container binaries (upgrade the host
-wrapper/image instead). For mirrors or hermetic tests, set
-`AI_MEMORY_RELEASE_BASE_URL` (or `release_base_url` in config.toml) to a
-Releases-compatible base that serves `{base}/latest/tag` and
-`{base}/download/<tag>/<asset>` (+ `.sha256`). That override is a trust
-boundary: archive and checksum are fetched from the same base, so point it
-only at origins you control. Each response body is capped at 128 MiB.
+The native path downloads the matching release archive
+(`ai-memory-<os>-<arch>.tar.gz` on Unix, `ai-memory-windows-x86_64.zip` on
+Windows) and its `.sha256` sidecar from GitHub Releases, verifies the
+checksum, replaces the on-disk binary (and a sibling `hooks/` directory when
+present), then re-stages hooks for agents already under the data-dir hooks
+tree. Windows uses rename-aside (`.exe` → `.old`, then promote `.new`) because
+a running image cannot be overwritten in place. It refuses Homebrew/AUR/`/usr`
+installs (use the package manager), unwritable prefixes (for example Program
+Files — download the zip manually), and in-container binaries (upgrade the
+host wrapper/image instead). Windows aarch64 has no release asset yet. For
+mirrors or hermetic tests, set `AI_MEMORY_RELEASE_BASE_URL` (or
+`release_base_url` in config.toml) to a Releases-compatible base that serves
+`{base}/latest/tag` and `{base}/download/<tag>/<asset>` (+ `.sha256`). That
+override is a trust boundary: archive and checksum are fetched from the same
+base, so point it only at origins you control. Each response body is capped
+at 128 MiB.
 
 ### Shared notes
 

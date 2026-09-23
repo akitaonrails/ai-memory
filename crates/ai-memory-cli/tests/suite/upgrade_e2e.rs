@@ -6,16 +6,13 @@
 //! replace the on-disk exe → refresh a sibling `hooks/` tree. No real
 //! GitHub, no Docker.
 //!
-//! Unix-only: Windows self-replace is refused by design.
-
-#![cfg(unix)]
+//! Covers Unix `.tar.gz` and Windows `.zip` release layouts.
 
 /// Spawns a loopback release fixture and a real CLI subprocess: seconds,
 /// not milliseconds — slow tier (`cargo tf` / CI), not the everyday loop.
 mod slow {
     use std::fs;
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::io::{Cursor, Write as _};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -29,6 +26,8 @@ mod slow {
     use flate2::write::GzEncoder;
     use sha2::{Digest as _, Sha256};
     use tar::Header;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     use crate::e2e_support::hermetic;
 
@@ -52,7 +51,24 @@ mod slow {
             ("linux", "aarch64") => "ai-memory-linux-aarch64.tar.gz",
             ("macos", "aarch64") => "ai-memory-macos-aarch64.tar.gz",
             ("macos", "x86_64") => "ai-memory-macos-x86_64.tar.gz",
+            ("windows", "x86_64") => "ai-memory-windows-x86_64.zip",
             other => panic!("native upgrade e2e unsupported on {other:?}"),
+        }
+    }
+
+    fn shipped_binary_name() -> &'static str {
+        if cfg!(windows) {
+            "ai-memory.exe"
+        } else {
+            "ai-memory"
+        }
+    }
+
+    fn build_release_archive() -> Vec<u8> {
+        if cfg!(windows) {
+            build_release_zip()
+        } else {
+            build_release_tarball()
         }
     }
 
@@ -71,6 +87,24 @@ mod slow {
             enc.finish().expect("gzip finish");
         }
         gz_bytes
+    }
+
+    fn build_release_zip() -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("ai-memory.exe", options)
+                .expect("start exe");
+            zip.write_all(NEW_BINARY).expect("write exe");
+            zip.add_directory("hooks/", options).expect("hooks dir");
+            zip.start_file("hooks/claude-code/new.sh", options)
+                .expect("start hook");
+            zip.write_all(NEW_HOOK).expect("write hook");
+            zip.finish().expect("finish zip");
+        }
+        cursor.into_inner()
     }
 
     fn append_regular(
@@ -109,9 +143,14 @@ mod slow {
                 .into_response();
         }
         if name == fx.asset {
+            let content_type = if fx.asset.ends_with(".zip") {
+                "application/zip"
+            } else {
+                "application/gzip"
+            };
             return Response::builder()
                 .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/gzip")
+                .header(header::CONTENT_TYPE, content_type)
                 .body(Body::from(fx.archive.as_ref().clone()))
                 .expect("build archive response");
         }
@@ -121,9 +160,13 @@ mod slow {
     fn install_writable_prefix(prefix: &Path) -> PathBuf {
         let bin_dir = prefix.join("bin");
         fs::create_dir_all(&bin_dir).expect("bin dir");
-        let exe = bin_dir.join("ai-memory");
+        let exe = bin_dir.join(shipped_binary_name());
         fs::copy(BIN, &exe).expect("copy built binary into writable prefix");
-        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod +x");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod +x");
+        }
 
         // Sibling hooks tree: upgrade refreshes it when the archive ships hooks/.
         let hooks = bin_dir.join("hooks/claude-code");
@@ -135,7 +178,7 @@ mod slow {
     #[tokio::test]
     async fn native_upgrade_replaces_binary_and_sibling_hooks_from_fixture() {
         let asset = host_asset_name().to_string();
-        let archive = Arc::new(build_release_tarball());
+        let archive = Arc::new(build_release_archive());
         let hash = format!("{:x}", Sha256::digest(archive.as_ref()));
         let checksum_body = format!("{hash}  {asset}\n");
         let fixture = ReleaseFixture {

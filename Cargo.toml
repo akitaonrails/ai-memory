@@ -149,6 +149,11 @@ tower-http = { version = "0.6", features = ["fs", "cors"] }
 # Backup / restore archive format.
 tar = "0.4"
 flate2 = "1"
+# Native Windows release zip extract/write for `ai-memory upgrade` (#801).
+# Already in the lockfile via candle-core; pin the same major here so the CLI
+# can enable default deflate (PowerShell Compress-Archive) without relying on
+# candle's feature set.
+zip = "8.6"
 
 # Text munging / hook payload sanitisation.
 regex = "1"
