@@ -10,6 +10,15 @@
 //!
 //! Client-only: never claims to upgrade a remote/homelab server.
 //!
+//! Egress decisions (AR004-style, cited): **timeout** — every request runs
+//! with a hard 120 s client timeout and non-2xx fail-fast
+//! ([`HTTP_TIMEOUT_SECS`]); **cache** — explicit none, this is a one-shot
+//! CLI fetch, the extract `TempDir` is discarded after the replace, and a
+//! cached archive would only add a stale-binary risk; **rate limit / load
+//! shedding** — n/a (single outbound GET from a user-invoked CLI command,
+//! no ingress). The 128 MiB body cap is a security limit, not a resilience
+//! decision (see [`MAX_RELEASE_DOWNLOAD_BYTES`]).
+//!
 //! Ownership (live CLI command — kept in one module by convention):
 //! - install classification (container / package-managed / writable)
 //! - release fetch + checksum
@@ -1012,6 +1021,40 @@ mod tests {
     fn linuxbrew_is_package_managed() {
         let exe = Path::new("/home/linuxbrew/.linuxbrew/Cellar/ai-memory/2.4.0/bin/ai-memory");
         assert!(package_managed_refusal(exe).is_some());
+    }
+
+    /// Focused predicate test for the writability refusal (the composite
+    /// `classify_install` cases above would all pass if the refusal branch
+    /// were deleted). Skipped when the effective uid ignores directory
+    /// permission bits (root CI runners).
+    #[cfg(unix)]
+    #[test]
+    fn classify_refuses_unwritable_parent_directory() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let parent = dir.path().join("ro");
+        fs::create_dir(&parent)?;
+        let exe = parent.join(shipped_binary_name());
+        fs::write(&exe, b"fake")?;
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555))?;
+        let probe = parent.join(".root-probe");
+        if fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .is_ok()
+        {
+            let _ = fs::remove_file(&probe);
+            eprintln!("skipping: uid ignores directory permissions (root runner)");
+            return Ok(());
+        }
+        let class = classify_install(&exe)?;
+        assert!(
+            matches!(class, InstallClass::Unsupported(ref reason) if reason.contains("writable")),
+            "expected a writability refusal, got {class:?}"
+        );
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755))?;
+        Ok(())
     }
 
     #[test]
