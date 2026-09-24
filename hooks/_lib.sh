@@ -148,10 +148,20 @@ ai_memory_json_unescape_path() {
     printf '%s' "$1" | sed 's/\\\\/\\/g; s/\\\//\//g'
 }
 
+# Print the payload text after the first `"$1"` (a JSON key, quotes added
+# here) and succeed, or fail when the key is absent. Same result as
+# `${payload#*"key"}`, which is quadratic in the payload size under dash and
+# bash and pinned a CPU for minutes on a large tool result (#870).
+ai_memory_after_key() {
+    LC_ALL=C awk -v k="\"$1\"" '
+        found { print; next }
+        { i = index($0, k); if (i) { found = 1; print substr($0, i + length(k)) } }
+        END { exit !found }'
+}
+
 ai_memory_extract_cwd() {
     payload="${1:-$(cat)}"
-    rest=${payload#*\"cwd\"}
-    if [ "$rest" != "$payload" ]; then
+    if rest=$(printf '%s' "$payload" | ai_memory_after_key cwd); then
         raw=$(printf '%s' "$rest" \
             | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
             | head -n 1)
@@ -165,8 +175,7 @@ ai_memory_extract_cwd() {
     # and its tool events send `cwd: ""`, so an empty match above must fall
     # through to here rather than returning the empty string.
     for key in workspacePaths workspace_roots; do
-        rest=${payload#*\"$key\"}
-        [ "$rest" = "$payload" ] && continue
+        rest=$(printf '%s' "$payload" | ai_memory_after_key "$key") || continue
         raw=$(printf '%s' "$rest" \
             | sed -n -E 's/^[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' \
             | head -n 1)
@@ -183,8 +192,7 @@ ai_memory_extract_cwd() {
 ai_memory_extract_session_id() {
     payload="${1:-$(cat)}"
     for key in session_id sessionId sessionID session conversationId; do
-        rest=${payload#*\"$key\"}
-        if [ "$rest" != "$payload" ]; then
+        if rest=$(printf '%s' "$payload" | ai_memory_after_key "$key"); then
             printf '%s' "$rest" \
                 | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
                 | head -n 1
@@ -199,8 +207,7 @@ ai_memory_extract_session_id() {
 # a repeated invocation cannot consume a next-session handoff.
 ai_memory_antigravity_is_initial_invocation() {
     payload="${1:-$(cat)}"
-    rest=${payload#*\"invocationNum\"}
-    [ "$rest" != "$payload" ] || return 1
+    rest=$(printf '%s' "$payload" | ai_memory_after_key invocationNum) || return 1
     value=$(printf '%s' "$rest" \
         | sed -n -E 's/^[[:space:]]*:[[:space:]]*([0-9]+)[[:space:]]*([,}]).*/\1/p' \
         | head -n 1)

@@ -3471,6 +3471,52 @@ pub(crate) const TS_TOML_FLAG: &str = r#"function tomlFlag(text: string, key: st
   return undefined;
 }"#;
 
+/// `repoRootProject`, shared by every generated TypeScript integration: the
+/// project is named after the git repository that owns `cwd` (the main
+/// checkout, so linked worktrees share it).
+///
+/// `applyMarkerParams` calls it on every captured event, and two synchronous
+/// git spawns cost tens of milliseconds of host event loop each time, so the
+/// answer is memoized per `cwd` for as long as the generated state lives: the
+/// host process for the module-level integrations, one `setup()` instance for
+/// OpenCode 2. A miss (not a repo, git absent) is cached too; a directory
+/// that becomes a repo later resolves after the plugin reloads.
+///
+/// `windowsHide` keeps each spawn from flashing a console window when the
+/// host has none (OpenCode 2 runs plugins in a console-less background
+/// service), the TS counterpart of the native drain's `CREATE_NO_WINDOW`.
+pub(crate) const TS_REPO_ROOT_PROJECT: &str = r#"const repoProjectCache = new Map<string, string | undefined>();
+
+function repoRootProject(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined;
+  if (repoProjectCache.has(cwd)) return repoProjectCache.get(cwd);
+  const project = gitRepoProject(cwd);
+  repoProjectCache.set(cwd, project);
+  return project;
+}
+
+function gitRepoProject(cwd: string): string | undefined {
+  try {
+    const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    }).trim();
+    if (inside !== "true") return undefined;
+    const common = execFileSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    }).trim();
+    if (!common) return undefined;
+    const root = dirname(common);
+    if (!root || root === dirname(root)) return undefined;
+    return basename(root);
+  } catch (_e) {
+    return undefined;
+  }
+}"#;
+
 /// Post-process a generated TypeScript integration so failed hook
 /// deliveries SPOOL instead of vanishing (#580). The shell hooks have
 /// spooled since day one; the TS plugins fire-and-forgot, so a laptop
@@ -3716,26 +3762,7 @@ function tomlKey(text: string, key: string): string | undefined {{
 }}
 
 
-function repoRootProject(cwd: string | undefined): string | undefined {{
-  if (!cwd) return undefined;
-  try {{
-    const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (inside !== "true") return undefined;
-    const common = execFileSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (!common) return undefined;
-    const root = dirname(common);
-    if (!root || root === dirname(root)) return undefined;
-    return basename(root);
-  }} catch (_e) {{
-    return undefined;
-  }}
-}}
+{TS_REPO_ROOT_PROJECT}
 {apply_marker_params}
 
 function sessionID(input: unknown): string | undefined {{
@@ -4461,26 +4488,7 @@ function tomlKey(text: string, key: string): string | undefined {{
 }}
 
 
-function repoRootProject(cwd: string | undefined): string | undefined {{
-  if (!cwd) return undefined;
-  try {{
-    const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (inside !== "true") return undefined;
-    const common = execFileSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (!common) return undefined;
-    const root = dirname(common);
-    if (!root || root === dirname(root)) return undefined;
-    return basename(root);
-  }} catch (_e) {{
-    return undefined;
-  }}
-}}
+{TS_REPO_ROOT_PROJECT}
 {apply_marker_params}
 
 function sessionID(ctx: any): string | undefined {{
@@ -8432,6 +8440,8 @@ model = "gpt-5"
         assert!(plugin.contains("if (existsSync(join(probe, \".git\")))"));
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
+        assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
+        assert_eq!(plugin.matches("windowsHide: true").count(), 2);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -8749,6 +8759,8 @@ model = "gpt-5"
         assert!(extension.contains("boundary ??= dir;"));
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(extension.contains("function repoRootProject"));
+        assert!(extension.contains("repoProjectCache.set(cwd, project);"));
+        assert_eq!(extension.matches("windowsHide: true").count(), 2);
         assert!(extension.contains("--git-common-dir"));
         assert!(
             extension
@@ -9200,6 +9212,8 @@ model = "gpt-5"
         assert!(extension.contains("tok"));
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(!extension.contains(".omp"));
+        assert!(extension.contains("repoProjectCache.set(cwd, project);"));
+        assert_eq!(extension.matches("windowsHide: true").count(), 2);
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
         // #676: the pi string-transform (api.on( -> pi.on() must still

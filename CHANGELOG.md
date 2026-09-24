@@ -231,6 +231,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sessions/<id>.md` (including versions written before OKF sources existed
   and summaries of sessions that never recorded a summary pointer), while a
   manual page at the same path survives. (#862)
+- Shell hooks no longer pin a CPU core for minutes on a large payload. The
+  `hooks/_lib.sh` extractors for `cwd`/`workspacePaths`/`workspace_roots`,
+  the session id, and Antigravity's `invocationNum` located each key with
+  `${payload#*"key"}`, which is quadratic in the payload size under dash and
+  bash: a 200 KB Cursor `postToolUse` event spent minutes in
+  `ai_memory_extract_cwd`, and concurrent hooks stayed at 100% CPU before
+  ever reaching the POST. A shared `ai_memory_after_key` helper now finds the
+  first occurrence with one linear `awk` pass (about 50 ms at 200 KB) and
+  feeds the unchanged `sed` parsing, so the extracted values are the same as
+  before. (#870)
+- The generated TypeScript integrations (OpenCode 1 and 2, OMP, Pi,
+  OpenClaw) no longer flash a console window on Windows for every captured
+  event: their `git` lookups set `windowsHide`. The repo-root project lookup
+  behind those spawns is memoized per cwd instead of running two synchronous
+  `git` processes on every event. (#863)
 
 ## [2.4.0] - 2026-09-21
 
