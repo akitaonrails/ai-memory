@@ -219,6 +219,77 @@ async fn recipient_cannot_cancel_the_senders_outbox() {
     );
 }
 
+/// The sibling of `recipient_cannot_cancel_the_senders_outbox` for the
+/// specific-id path: the existing test only exercises whole-outbox cancel
+/// (`specific_id: None`), which is scoped by `from_workspace_id`/
+/// `from_project_id` alone and would still refuse B even if the id-scoped
+/// branch dropped that guard. This targets B's exact knowledge of A's
+/// message id directly, so it can only pass if the id-scoped `UPDATE` also
+/// carries the sender-coordinate `AND from_workspace_id = ... AND
+/// from_project_id = ...` guard.
+#[tokio::test]
+async fn recipient_cannot_cancel_a_specific_message_by_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+
+    let a_msg_id = store
+        .writer
+        .insert_message(message(a, b, "A's own message"))
+        .await
+        .unwrap();
+
+    // B knows the exact id (e.g. from its own inbox listing) but must not be
+    // able to cancel A's outbound message by targeting it directly.
+    let cancelled = store
+        .writer
+        .cancel_messages(b.0, b.1, Some(a_msg_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled, 0,
+        "B cancelling A's message by exact id must not touch it"
+    );
+
+    let popped = store
+        .writer
+        .pop_message(claim(b), Some(a_msg_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        popped
+            .expect("A's message must still be pending and poppable by B")
+            .body,
+        "A's own message"
+    );
+
+    // Control: A cancelling its OWN message by the same exact id succeeds.
+    let a_msg_id_2 = store
+        .writer
+        .insert_message(message(a, b, "A's second message"))
+        .await
+        .unwrap();
+    let cancelled_by_owner = store
+        .writer
+        .cancel_messages(a.0, a.1, Some(a_msg_id_2))
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled_by_owner, 1,
+        "A cancelling its own message by exact id must succeed"
+    );
+    assert!(
+        store
+            .writer
+            .pop_message(claim(b), Some(a_msg_id_2))
+            .await
+            .unwrap()
+            .is_none(),
+        "a cancelled message must not be delivered"
+    );
+}
+
 /// Popping by an explicit id claims that specific message; FIFO otherwise.
 #[tokio::test]
 async fn pop_can_target_a_specific_message_id() {
@@ -255,6 +326,45 @@ async fn pop_can_target_a_specific_message_id() {
         .unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].body, "first");
+}
+
+/// Two racing pops of the SAME pending message must not both claim it: the
+/// baton claim-once discipline this module's own doc comment promises. Both
+/// calls are dispatched together via `tokio::join!` so their `WriteCmd`s land
+/// on the single-writer actor back-to-back, exercising the real
+/// `state = 'pending'` guards in `pop_message_in_transaction` rather than
+/// relying on test-side sequencing to keep them apart.
+#[tokio::test]
+async fn concurrent_pops_of_one_message_deliver_it_exactly_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+
+    let id = store
+        .writer
+        .insert_message(message(a, b, "only one winner"))
+        .await
+        .unwrap();
+
+    // Targeted by exact id (rather than `None`/FIFO) so the race exercises
+    // Guard 1 + Guard 2 in `pop_message_in_transaction` directly, instead of
+    // being pre-filtered by the FIFO candidate selection's own `state =
+    // 'pending'` clause before either guard runs.
+    let writer1 = store.writer.clone();
+    let writer2 = store.writer.clone();
+    let (r1, r2) = tokio::join!(
+        writer1.pop_message(claim(b), Some(id)),
+        writer2.pop_message(claim(b), Some(id)),
+    );
+    let r1 = r1.unwrap();
+    let r2 = r2.unwrap();
+
+    let winners = [&r1, &r2].into_iter().filter(|r| r.is_some()).count();
+    assert_eq!(
+        winners, 1,
+        "exactly one of two concurrent pops must claim the message: {r1:?} / {r2:?}",
+    );
 }
 
 /// A full recipient inbox rejects new sends so a flood cannot exhaust the

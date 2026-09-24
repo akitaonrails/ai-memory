@@ -943,9 +943,12 @@ fn uninstall_dry_run_previews_purge() {
     }
 }
 
-/// Best-effort, NOT in the default run (sysinfo reads the real process table;
-/// no injection seam). Spawns a real sibling `ai-memory` process and asserts
-/// `--purge-data` refuses up front, leaving the wiring intact. Run with:
+/// Best-effort, NOT in the default run (sysinfo reads the real process
+/// table). Spawns a REAL sibling `ai-memory` process — as opposed to the
+/// `AI_MEMORY_TEST_FORCE_SIBLING_PIDS` injection seam the tests below use —
+/// so the actual sysinfo scan itself stays covered, not just the refusal
+/// logic downstream of it. Asserts `--purge-data` refuses up front, leaving
+/// the wiring intact. Run with:
 /// `cargo test -p ai-memory-cli --test removal -- --ignored`.
 #[test]
 #[ignore]
@@ -986,6 +989,273 @@ fn purge_data_refuses_when_sibling_alive() {
         original,
         "no wiring should be removed when the purge is refused up front"
     );
+}
+
+// ----------------------------------------------------------------
+// Process-guard injection seam (`AI_MEMORY_TEST_FORCE_SIBLING_PIDS`).
+//
+// `process_guard::sibling_processes()` normally either does a real sysinfo
+// scan, or (only under `cfg!(test)` / `AI_MEMORY_TEST_NO_PROCESS_GUARD`)
+// short-circuits to "no siblings" — which made the guard's REFUSAL branch
+// untestable from an in-process test and left `purge_data_refuses_when_
+// sibling_alive` above `#[ignore]`d, needing a real spawned sibling. These
+// tests exercise the refusal deterministically via the injection seam,
+// against every direct-disk lifecycle command the guard protects: `reset`,
+// `restore`, `reindex`, and `uninstall --purge-data`.
+// ----------------------------------------------------------------
+
+/// `reset --confirm` refuses while a sibling is reported alive, and leaves
+/// the data dir completely untouched.
+#[test]
+fn reset_refuses_when_sibling_pid_is_injected() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+
+    let out = command_with_home(home.path())
+        .args(["reset", "--confirm"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "424242")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "should refuse while a sibling is alive"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to reset") && stderr.contains("424242"),
+        "stderr was: {stderr}"
+    );
+    for sub in ["wiki", "db", "raw"] {
+        assert!(
+            data.path().join(sub).join("f.txt").exists(),
+            "{sub}/f.txt must survive a refused reset"
+        );
+    }
+}
+
+/// The control: an explicitly EMPTY injected sibling list must not block a
+/// legitimate `reset --confirm`.
+#[test]
+fn reset_proceeds_when_injected_sibling_list_is_empty() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+
+    let out = command_with_home(home.path())
+        .args(["reset", "--confirm"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for sub in ["wiki", "db", "raw"] {
+        assert!(
+            !data.path().join(sub).join("f.txt").exists(),
+            "{sub} must be wiped once the guard reports no siblings"
+        );
+    }
+}
+
+/// `restore --from` refuses while a sibling is reported alive, before ever
+/// checking whether the source tarball exists.
+#[test]
+fn restore_refuses_when_sibling_pid_is_injected() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    let out = command_with_home(home.path())
+        .args(["restore", "--from", "/does/not/exist.tar.gz"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "424242")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "should refuse while a sibling is alive"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to restore") && stderr.contains("424242"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not found"),
+        "the guard must refuse BEFORE the missing-tarball check runs: {stderr}"
+    );
+}
+
+/// The control: an explicitly EMPTY injected sibling list lets `restore` past
+/// the guard — it then fails on the next check (missing tarball) instead of
+/// the busy message, proving the guard itself is not what stopped it.
+#[test]
+fn restore_proceeds_when_injected_sibling_list_is_empty() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+
+    let out = command_with_home(home.path())
+        .args(["restore", "--from", "/does/not/exist.tar.gz"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "")
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "still fails, but past the guard");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not found"),
+        "expected the missing-tarball error once no sibling is reported: {stderr}"
+    );
+    assert!(
+        !stderr.contains("refusing to restore"),
+        "stderr was: {stderr}"
+    );
+}
+
+/// `reindex` refuses while a sibling is reported alive, before ever opening
+/// the SQLite store.
+#[test]
+fn reindex_refuses_when_sibling_pid_is_injected() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("wiki")).unwrap();
+
+    let out = command_with_home(home.path())
+        .args(["reindex"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "424242")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "should refuse while a sibling is alive"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to reindex") && stderr.contains("424242"),
+        "stderr was: {stderr}"
+    );
+    // Nothing should have been created; the guard runs before `Store::open`.
+    assert!(
+        !data.path().join("db").join("memory.sqlite").exists(),
+        "the guard must refuse before the store is opened/created"
+    );
+}
+
+/// The control: an explicitly EMPTY injected sibling list lets `reindex`
+/// proceed and actually rebuild the (empty) index.
+#[test]
+fn reindex_proceeds_when_injected_sibling_list_is_empty() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("wiki")).unwrap();
+
+    let out = command_with_home(home.path())
+        .args(["reindex"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        data.path().join("db").join("memory.sqlite").exists(),
+        "reindex must have opened/created the store once no sibling is reported"
+    );
+}
+
+/// `uninstall --purge-data` refuses while a sibling is reported alive, and
+/// leaves the data dir untouched — the sibling of the ignored real-process
+/// test above, but deterministic and in the default run.
+#[test]
+fn uninstall_purge_data_refuses_when_sibling_pid_is_injected() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+
+    let out = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes", "--purge-data"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "424242")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "should refuse while a sibling is alive"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to purge data") && stderr.contains("424242"),
+        "stderr was: {stderr}"
+    );
+    for sub in ["wiki", "db", "raw"] {
+        assert!(
+            data.path().join(sub).join("f.txt").exists(),
+            "{sub}/f.txt must survive a refused purge"
+        );
+    }
+}
+
+/// The control: an explicitly EMPTY injected sibling list must not block a
+/// legitimate `uninstall --apply --yes --purge-data`.
+#[test]
+fn uninstall_purge_data_proceeds_when_injected_sibling_list_is_empty() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    for sub in ["wiki", "db", "raw"] {
+        std::fs::create_dir_all(data.path().join(sub)).unwrap();
+        std::fs::write(data.path().join(sub).join("f.txt"), b"x").unwrap();
+    }
+
+    let out = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--yes", "--purge-data"])
+        .env("AI_MEMORY_DATA_DIR", data.path())
+        .env("AI_MEMORY_TEST_FORCE_SIBLING_PIDS", "")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for sub in ["wiki", "db", "raw"] {
+        assert!(
+            !data.path().join(sub).join("f.txt").exists(),
+            "{sub} must be purged once the guard reports no siblings"
+        );
+    }
 }
 
 #[test]

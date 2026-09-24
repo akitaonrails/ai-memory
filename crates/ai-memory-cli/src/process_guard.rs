@@ -17,6 +17,24 @@ pub const BIN_NAME: &str = crate::install_layout::BINARY_NAME;
 /// process and any threads of it).
 #[must_use]
 pub fn sibling_processes() -> Vec<sysinfo::Pid> {
+    // Test injection: a comma-separated list of fake PIDs to report as alive
+    // siblings, bypassing both the real scan AND the `cfg!(test)` opt-out
+    // below. This is what lets the guard's REFUSAL path be exercised by an
+    // in-process test (reset / reindex / restore / uninstall --purge-data all
+    // call `sibling_processes()` directly, and `cfg!(test)` alone would
+    // otherwise force every in-process test onto the "no siblings" branch).
+    // Checked first, and not itself gated by `cfg!(test)`, matching the
+    // existing `AI_MEMORY_TEST_NO_PROCESS_GUARD` opt-out below: neither is
+    // reachable in a normal shipped run because neither is ever set outside
+    // a test harness's own env.
+    if let Ok(raw) = std::env::var("AI_MEMORY_TEST_FORCE_SIBLING_PIDS") {
+        return raw
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .map(sysinfo::Pid::from_u32)
+            .collect();
+    }
     // Test opt-out. The destructive-command tests would otherwise flake
     // non-deterministically: a dev box (and a parallel test run) almost always
     // has some *other* `ai-memory` process alive, which the real scan rightly

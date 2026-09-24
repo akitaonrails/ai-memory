@@ -449,16 +449,37 @@ Additional boundary rules:
   fails), and build `git2` signatures with a fixed `Signature::now(...)`,
   never `repo.signature()`. CI cannot catch either — its runners have no
   global gitconfig, so the breakage only ever shows up on a developer's box.
-- PRs touching scope resolution need table-driven tests for partial
-  scope, missing explicit scope, active-project precedence, and
-  cross-workspace isolation.
-- PRs touching permissions need tests for root, DB-user, and anonymous
-  behavior.
+- **Security-boundary tests are adversarial and mandatory.**
+  [`docs/security-boundaries.md`](docs/security-boundaries.md) is the inventory
+  of every isolation/security guard (per-project and workspace isolation, the
+  multi-user auth ladder, handoff single-claim + `any_owner` gate, pages-shared/
+  `author_id`-never-a-read-filter and supersession per invariant #16, the
+  active-project pointer, the sanitizer boundary, messaging scope, scope-
+  resolution fail-closed, destructive-op guards, hook backpressure, network
+  posture), each mapped to the test that would fail if the guard were removed.
+  Whenever you touch code in a boundary's "Enforcing code" column — or add a
+  new read/write/admin/hook/cross-scope entry point past one of these guards —
+  you MUST add or extend an **adversarial** test (attempt the violation, assert
+  refusal, include a legitimate control) and update that file's row in the same
+  change. Adding a new isolation dimension means a new row + its tests before
+  merge. A raw-id or unscoped/cross-project entry point (bare `session_id`/
+  `run_id`/`page_id`/message id, `global=true`, global `recent`, search) is
+  guilty until a test proves a foreign id/scope is refused. Prove the test
+  bites: it must fail with the guard removed and pass with it — a happy-path or
+  single-tenant test cannot see an isolation defect and does not count. These
+  guards live at integration level (`multi_session.rs`, `handoff_ownership.rs`,
+  `agent_messages.rs`, the active-project pointer tests, the MCP permission
+  suites); put boundary tests there. This subsumes the older "scope resolution"
+  and "permissions" test rules: PRs touching scope resolution still need
+  table-driven tests for partial scope, missing explicit scope, active-project
+  precedence, and cross-workspace isolation; PRs touching permissions still need
+  root, DB-user, and anonymous cases — now recorded against the inventory.
 - New disk+SQL mutations need recovery/rollback tests.
 - The recall-eval framework lives at
   `crates/ai-memory-consolidate/tests/recall_eval.rs`.
 - Tests run with `cargo t` locally and `cargo test --workspace --all-targets`
-  in CI.
+  in CI (plus `cargo test --workspace --doc`, which `--all-targets` excludes,
+  for doc-comment code blocks).
 
 ## Security considerations
 

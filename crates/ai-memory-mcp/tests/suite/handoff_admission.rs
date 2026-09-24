@@ -431,3 +431,126 @@ async fn unauthorised_any_owner_cancel_reaches_no_webhook() {
         "the refused cancel must not have discarded the baton",
     );
 }
+
+/// The sibling of `unauthorised_any_owner_cancel_reaches_no_webhook` for the
+/// accept path: a non-admin proxied caller ("alice") asking to accept a
+/// baton owned by "bob" via `any_owner: true` must be refused by
+/// `require_admin_capability`, must not reach the admission chain, and must
+/// NOT have claimed the handoff — accept is a compare-and-set consume, so a
+/// silently-successful bypass here would hand a stranger's session state to
+/// anyone who could reach the tool. An admin (root) doing the exact same
+/// call is the control: `any_owner` recovery must still work for the
+/// operator it exists for.
+#[tokio::test]
+async fn unauthorised_any_owner_accept_reaches_no_webhook_and_does_not_claim() {
+    let (addr, calls) = recording_webhook_host().await;
+    let h = proxied_harness(guarded_chain(addr)).await;
+
+    // Inserted directly, as the cancel test does: going through the tool
+    // would put a legitimate `handoff_begin` in the recording, and what is
+    // under test is that the refused accept adds nothing to it.
+    let id = h
+        .store
+        .writer
+        .insert_handoff(ai_memory_core::NewHandoff {
+            workspace_id: h.ws,
+            project_id: h.proj,
+            from_session_id: None,
+            from_agent: ai_memory_core::AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "bobs-baton".to_string(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: ai_memory_core::owner_stamp(
+                Some(&ai_memory_core::IdentityKey::User("bob".into())),
+                true,
+            ),
+        })
+        .await
+        .expect("insert handoff");
+
+    let response = call_tool_raw(
+        &h.router,
+        "memory_handoff_accept",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "handoff_id": id.to_string(),
+            "any_owner": true,
+        }),
+        &proxied_as("alice"),
+    )
+    .await;
+    // Asserted on the message, not merely the presence of an error: a
+    // rejection from the auth layer itself would also produce one, and would
+    // make this test pass without the capability gate ever running.
+    let message = response
+        .pointer("/error/message")
+        .and_then(|m| m.as_str())
+        .unwrap_or_else(|| panic!("a non-admin caller must be refused any_owner: {response}"));
+    assert!(
+        message.contains("admin"),
+        "expected the admin capability gate to refuse this, got: {message}",
+    );
+
+    settle().await;
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "an operation the caller was never permitted must reach no webhook: {:?}",
+        calls.lock().unwrap(),
+    );
+    assert_eq!(
+        h.store
+            .reader
+            .handoff_by_id(id)
+            .await
+            .expect("read back")
+            .expect("row still there")
+            .lifecycle
+            .state,
+        ai_memory_core::HandoffState::Open,
+        "the refused accept must not have claimed bob's baton",
+    );
+
+    // Control: an admin (root) CAN accept via `any_owner`, because the
+    // recovery path this gate exists for must still work for the operator it
+    // is meant for.
+    let accepted = call_tool_raw(
+        &h.router,
+        "memory_handoff_accept",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "handoff_id": id.to_string(),
+            "any_owner": true,
+        }),
+        &[("authorization", "Bearer the-root-token")],
+    )
+    .await;
+    assert!(
+        accepted.get("error").is_none(),
+        "root's any_owner accept must succeed: {accepted}",
+    );
+    let claimed_summary = accepted
+        .pointer("/result/content/0/text")
+        .and_then(|t| t.as_str())
+        .unwrap_or_else(|| panic!("missing tool text: {accepted}"));
+    assert!(
+        claimed_summary.contains("bobs-baton"),
+        "root's recovery accept must actually claim bob's baton: {claimed_summary}",
+    );
+    assert_eq!(
+        h.store
+            .reader
+            .handoff_by_id(id)
+            .await
+            .expect("read back")
+            .expect("row still there")
+            .lifecycle
+            .state,
+        ai_memory_core::HandoffState::Accepted,
+        "the admin's accept must have claimed the baton",
+    );
+}

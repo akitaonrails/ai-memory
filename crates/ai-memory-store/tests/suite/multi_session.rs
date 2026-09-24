@@ -18,7 +18,7 @@
 
 use ai_memory_core::{
     ActorContext, AgentKind, HandoffAcceptance, IdentityKey, NewHandoff, NewPage, NewSession,
-    OwnerFilter, PagePath, ProjectId, SessionId, Tier, WorkspaceId, owner_stamp,
+    NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::Store;
 
@@ -128,6 +128,74 @@ async fn one_operators_page_is_readable_by_another_in_the_same_project() {
         .unwrap()
         .expect("the page resolves by path for any reader");
     assert!(body.body.contains("We picked SQLite"));
+}
+
+/// The stronger form of the collaboration guarantee: the existing sibling
+/// test writes with `author_id: None`, so it cannot tell an "authored pages
+/// are private" regression from a genuine bug — a filter keyed on the
+/// caller's identity would happily let a NULL-authored page through. This
+/// stamps a real, non-null `author_id` (operator A) and asserts operator B —
+/// a *different* identity, reading with no owner coordinate at all, exactly
+/// as `search_pages_for_project` and `page_body_by_ids` are shaped — still
+/// sees the page in full, through both the search path and the direct-body
+/// path. `pages.author_id` is attribution, never a read filter.
+#[tokio::test]
+async fn an_authored_page_is_readable_by_a_different_operator_via_search_and_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let operator_a = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "operator-a".into(),
+                name: Some("Operator A".into()),
+                email: Some("operator-a@example.com".into()),
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .upsert_page(NewPage {
+            author_id: Some(operator_a),
+            ..page(
+                ws,
+                proj,
+                "decisions/0002.md",
+                "Chose SQLite Again",
+                "We picked SQLite for the derived index, authored by operator A.",
+            )
+        })
+        .await
+        .unwrap();
+
+    // Operator B's read: no owner coordinate passed anywhere, because none of
+    // these signatures accept one — that absence IS the invariant.
+    let hits = store
+        .reader
+        .search_pages_for_project(ws, proj, "SQLite Again".to_string(), 10, None)
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.path.as_str() == "decisions/0002.md"),
+        "an authored page must be visible to a different operator's search; \
+         got {:?}",
+        hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>()
+    );
+
+    let body = store
+        .reader
+        .page_body_by_ids(ws, proj, "decisions/0002.md")
+        .await
+        .unwrap()
+        .expect("a different operator can still resolve the page by path");
+    assert!(body.body.contains("authored by operator A"));
 }
 
 /// Two harnesses editing the same page keep both versions.
