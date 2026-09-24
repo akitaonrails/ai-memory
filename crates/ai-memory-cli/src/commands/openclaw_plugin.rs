@@ -10,6 +10,7 @@ use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::render_shared::{
     ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime, ts_string_literal,
+    ts_timeout_signal,
 };
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
@@ -340,12 +341,7 @@ const AGENT = "openclaw";
 {token_line}{resolve_fn}
 {capture_policy}
 
-function timeoutSignal(ms: number): AbortSignal | undefined {{
-  if (typeof AbortSignal === "undefined") return undefined;
-  const factory = (AbortSignal as unknown as {{ timeout?: (ms: number) => AbortSignal }}).timeout;
-  return factory ? factory(ms) : undefined;
-}}
-
+{timeout_signal}
 function authHeaders(): Record<string, string> {{
   const token = resolveToken();
   return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
@@ -585,6 +581,7 @@ export default definePluginEntry({{
         server_literal = ts_string_literal(server_url),
         token_line = token_line,
         repo_root_project = super::install_hooks::TS_REPO_ROOT_PROJECT,
+        timeout_signal = ts_timeout_signal(),
         spool_runtime = ts_spool_runtime(),
     )
 }
@@ -606,6 +603,7 @@ mod tests {
                 .contains("if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);")
         );
         assert!(plugin.contains("else requestSpoolDrain();"));
+        crate::commands::render_shared::assert_shared_ts_delivery_runtime("openclaw", &plugin);
         assert!(plugin.contains(r#"return join(env, "hook-spool");"#));
         for f in [
             "mkdirSync",

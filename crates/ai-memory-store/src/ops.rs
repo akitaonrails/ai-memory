@@ -99,9 +99,10 @@ pub enum HookSessionAdmission {
     },
     /// A terminal event named no persisted session and created nothing.
     InvalidMissingEnd,
-    /// A terminal event named a persisted session in a different scope, so it
-    /// is not that session's end. Mirrors the pre-guard
-    /// `SessionEndDisposition::DropInvalid` arm.
+    /// A terminal event named a persisted session in a different scope and
+    /// from a different or missing cwd, so it is not that session's end. A
+    /// same-cwd end is admitted in the session's own scope instead. Mirrors
+    /// the pre-guard `SessionEndDisposition::DropInvalid` arm.
     InvalidScopedEnd,
 }
 /// Result of conditionally ending a session whose persisted observations are
@@ -1658,12 +1659,17 @@ pub fn insert_observation_keyed(
 /// Find or create the hook session, validate its immutable tuple and owner,
 /// optionally claim an ingest key, and append the observation in one writer
 /// transaction. Validation always precedes key mutation.
+///
+/// `moved_from_cwd` marks an explicit native relocation (OpenCode
+/// `session.moved`): when the stored cwd still matches it, the live session
+/// row is rebound to this event's scope and cwd in the same transaction.
 pub fn admit_hook_session_event(
     conn: &mut Connection,
     session: &NewSession,
     obs: &NewObservation,
     owner_filter: &OwnerFilter,
     ingest_key: Option<&str>,
+    moved_from_cwd: Option<&str>,
 ) -> StoreResult<HookSessionAdmission> {
     if obs.session_id != session.id
         || obs.workspace_id != session.workspace_id
@@ -1676,14 +1682,22 @@ pub fn admit_hook_session_event(
     let session_end = obs.kind == ObservationKind::SessionEnd;
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    type Row = (Vec<u8>, Vec<u8>, String, Option<String>, Option<i64>, u64);
+    type Row = (
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Option<String>,
+        Option<i64>,
+        u64,
+        Option<String>,
+    );
     let existing: Option<Row> = tx.query_row(
-        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count FROM sessions WHERE id = ?1",
+        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count, cwd FROM sessions WHERE id = ?1",
         params![session.id.as_bytes()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
     ).optional()?;
-    let (owner, ended_at, ended_count) = match existing {
-        Some((ws, project, agent, owner, ended_at, ended_count)) => {
+    let (owner, ended_at, ended_count, stored_cwd, scope) = match existing {
+        Some((ws, project, agent, owner, ended_at, ended_count, cwd)) => {
             // Corrupt owners fail closed, including for Any recovery. Owner
             // and agent identify WHO the session belongs to, so a mismatch
             // there is a genuine UUID collision and is terminal.
@@ -1703,17 +1717,35 @@ pub fn admit_hook_session_event(
             // exists to opt out of. Treating the difference as a collision
             // silently DROPPED those events instead of recording them.
             //
-            // A terminal event is the one exception: an end naming a different
-            // scope is not this session's end, so it is dropped rather than
-            // ending someone else's session (the pre-guard
-            // `SessionEndDisposition::DropInvalid` arm).
+            // A terminal event is the exception: a session ends in the scope
+            // it was recorded in. An end naming a different scope still ends
+            // it when it comes from the session's own cwd — the scope drifted
+            // under the same directory, e.g. a `.ai-memory.toml` appeared
+            // mid-session. Otherwise it is not this session's end and is
+            // dropped (the pre-guard `SessionEndDisposition::DropInvalid`
+            // arm). Owner and agent were already checked above, so a foreign
+            // operator or agent never gets this far.
             let scoped_to_session = ws.as_slice() == session.workspace_id.as_bytes()
                 && project.as_slice() == session.project_id.as_bytes();
-            if session_end && !scoped_to_session {
+            let same_cwd = matches!(
+                (cwd.as_deref(), session.cwd.as_deref()),
+                (Some(stored), Some(event))
+                    if crate::reader::normalize_cwd(stored)
+                        == crate::reader::normalize_cwd(&event.to_string_lossy())
+            );
+            if session_end && !scoped_to_session && !same_cwd {
                 tx.commit()?;
                 return Ok(HookSessionAdmission::InvalidScopedEnd);
             }
-            (owner, ended_at, ended_count)
+            let scope = if session_end {
+                (
+                    WorkspaceId::from_slice(&ws)?,
+                    ProjectId::from_slice(&project)?,
+                )
+            } else {
+                (session.workspace_id, session.project_id)
+            };
+            (owner, ended_at, ended_count, cwd, scope)
         }
         None if session_end => {
             tx.commit()?;
@@ -1728,13 +1760,31 @@ pub fn admit_hook_session_event(
                 "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), now, session.actor_user.as_deref()],
             )?;
-            (session.actor_user.clone(), None, 0)
+            (
+                session.actor_user.clone(),
+                None,
+                0,
+                None,
+                (session.workspace_id, session.project_id),
+            )
         }
+    };
+    let (workspace_id, project_id) = scope;
+    let rescoped;
+    let obs = if (obs.workspace_id, obs.project_id) == scope {
+        obs
+    } else {
+        rescoped = NewObservation {
+            workspace_id,
+            project_id,
+            ..obs.clone()
+        };
+        &rescoped
     };
     let guard = AdmittedSession {
         session_id: session.id,
-        workspace_id: session.workspace_id,
-        project_id: session.project_id,
+        workspace_id,
+        project_id,
         agent_kind: session.agent_kind,
         owner,
     };
@@ -1777,6 +1827,29 @@ pub fn admit_hook_session_event(
     } else {
         IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
     };
+    // Compare-and-set on the source cwd so a stale or out-of-order move never
+    // rebinds a newer location. Only the first admission of a keyed move may
+    // rebind: a redelivery (complete or resumed) already had its chance in the
+    // transaction that claimed the key, and replaying it after A -> B -> A
+    // would drag the session back. An unkeyed move cannot prove it is not
+    // such a replay. Earlier observations keep their scope.
+    if let (Some(from), Some(stored), Some(target)) =
+        (moved_from_cwd, stored_cwd.as_deref(), session.cwd.as_ref())
+        && ingest_key.is_some()
+        && ended_at.is_none()
+        && matches!(ingest, IngestObservationOutcome::Inserted(_))
+        && crate::reader::normalize_cwd(stored) == crate::reader::normalize_cwd(from)
+    {
+        tx.execute(
+            "UPDATE sessions SET workspace_id = ?1, project_id = ?2, cwd = ?3 WHERE id = ?4",
+            params![
+                session.workspace_id.as_bytes(),
+                session.project_id.as_bytes(),
+                target.to_string_lossy(),
+                session.id.as_bytes()
+            ],
+        )?;
+    }
     tx.commit()?;
     if !session_end {
         Ok(HookSessionAdmission::Observation {
@@ -2700,6 +2773,72 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
     Ok(id)
 }
 
+/// Publish a live session's turn-checkpoint baton.
+///
+/// A session that publishes a baton per completed turn keeps ONE open row:
+/// its own unclaimed baton is refreshed in place (same id, new content and
+/// timestamp) instead of expiring it and inserting another every turn. The
+/// session must still be open and the baton must carry the session row's own
+/// scope and owner, the same contract as [`end_session_with_handoff`]; a
+/// checkpoint that lost the race with the session's end, or with a purge,
+/// returns `None` and touches nothing, so it can neither retire the end's
+/// baton nor resurrect a claimed one.
+pub fn checkpoint_session_handoff(
+    conn: &mut Connection,
+    handoff: &NewHandoff,
+) -> StoreResult<Option<HandoffId>> {
+    let Some(session_id) = handoff.from_session_id.as_ref() else {
+        return Err(StoreError::InvalidState(
+            "checkpoint handoff has no source session".into(),
+        ));
+    };
+    let tx = conn.transaction()?;
+    let live: Option<(Vec<u8>, Vec<u8>, Option<String>)> = tx
+        .query_row(
+            "SELECT workspace_id, project_id, actor_user FROM sessions \
+             WHERE id = ?1 AND ended_at IS NULL",
+            params![session_id.as_bytes()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((workspace_id, project_id, actor_user)) = live else {
+        return Ok(None);
+    };
+    if workspace_id.as_slice() != handoff.workspace_id.as_bytes()
+        || project_id.as_slice() != handoff.project_id.as_bytes()
+        || actor_user != handoff.owner_user
+    {
+        return Err(StoreError::InvalidState(
+            "checkpoint handoff scope or owner does not match its session".into(),
+        ));
+    }
+    let existing: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM handoffs \
+             WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+               AND owner_user IS ?4 AND state = 'open' \
+             ORDER BY created_at DESC LIMIT 1",
+            params![
+                session_id.as_bytes(),
+                workspace_id,
+                project_id,
+                actor_user.as_deref()
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let id = match existing {
+        Some(id) => {
+            let id = HandoffId::from_slice(&id)?;
+            refresh_handoff_row(&tx, &id, handoff)?;
+            id
+        }
+        None => insert_handoff_row(&tx, handoff)?,
+    };
+    tx.commit()?;
+    Ok(Some(id))
+}
+
 /// Atomically stamp a session ended and insert its automatic handoff.
 ///
 /// A failed handoff insert rolls the end stamp back, so a keyed retry can run
@@ -2765,68 +2904,133 @@ fn bound_handoff_list(items: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<HandoffId> {
-    validate_identity_storage_key(h.owner_user.as_deref(), "handoff owner")?;
-    let id = HandoffId::new();
-    let now = Timestamp::now().as_microsecond();
+/// A handoff's prose and cwd in their stored form.
+struct HandoffFields {
+    summary: String,
+    open_questions: String,
+    next_steps: String,
+    files_touched: String,
+    cwd: Option<String>,
+}
+
+fn handoff_fields(h: &NewHandoff) -> StoreResult<HandoffFields> {
     // Store-boundary bound (defense in depth): the MCP/hook callers already
     // scrub and cap handoff prose, but the store is the last gate before
     // durable persistence — mirror the observation body's bound so a caller
     // that ever forgets cannot write unbounded content to the DB. Generous
     // enough never to fire under the callers' tighter caps.
-    let summary = bound_handoff_field(&h.summary);
-    let open_q = serde_json::to_string(&bound_handoff_list(&h.open_questions))?;
-    let next_s = serde_json::to_string(&bound_handoff_list(&h.next_steps))?;
-    let files = serde_json::to_string(&bound_handoff_list(&h.files_touched))?;
-    let from_session: Option<&[u8]> = h.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
+    //
     // Normalize the stored cwd: strip trailing path separators (keep a bare root
     // as "/"). The hook extractor preserves whatever the agent payload sent,
     // so this single write point guarantees a consistent stored form for both
     // manual and auto (SessionEnd) handoffs, keeping the next session's
     // path-boundary match robust to trailing slash/backslash drift.
-    let cwd: Option<String> = h.cwd.as_ref().map(|p| {
-        let s = p.to_string_lossy();
-        let trimmed = s.trim_end_matches(['/', '\\']);
-        if trimmed.is_empty() {
-            "/".to_string()
-        } else {
-            trimmed.to_string()
-        }
-    });
+    Ok(HandoffFields {
+        summary: bound_handoff_field(&h.summary),
+        open_questions: serde_json::to_string(&bound_handoff_list(&h.open_questions))?,
+        next_steps: serde_json::to_string(&bound_handoff_list(&h.next_steps))?,
+        files_touched: serde_json::to_string(&bound_handoff_list(&h.files_touched))?,
+        cwd: h.cwd.as_ref().map(|p| {
+            let s = p.to_string_lossy();
+            let trimmed = s.trim_end_matches(['/', '\\']);
+            if trimmed.is_empty() {
+                "/".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }),
+    })
+}
+
+/// A newer automatic handoff from the exact same cwd is the only one that
+/// can ever win there, even before a SessionStart occurs. Bound abandoned
+/// same-directory sessions without touching deliberate manual handoffs or
+/// independent parent/sibling cwd scopes — and without crossing an operator
+/// boundary: the same directory inside a shared container is the norm, so
+/// owner equality is the only thing keeping one operator's SessionEnd from
+/// retiring another's pending baton. `keep` spares the baton being refreshed.
+fn expire_same_cwd_auto_handoffs(
+    conn: &Transaction<'_>,
+    h: &NewHandoff,
+    cwd: Option<&str>,
+    keep: Option<&HandoffId>,
+    now: i64,
+) -> StoreResult<()> {
+    let expired = conn.execute(
+        "UPDATE handoffs SET state = 'expired' \
+         WHERE workspace_id = ?1 AND project_id = ?2 \
+           AND state = 'open' AND from_session_id IS NOT NULL \
+           AND (cwd = ?3 OR (cwd IS NULL AND ?3 IS NULL)) \
+           AND owner_user IS ?4 AND id IS NOT ?5",
+        params![
+            h.workspace_id.as_bytes(),
+            h.project_id.as_bytes(),
+            cwd,
+            h.owner_user.as_deref(),
+            keep.map(HandoffId::as_bytes)
+        ],
+    )?;
+    if expired > 0 {
+        audit(
+            conn,
+            "expire_superseded_handoffs",
+            Some(h.workspace_id.as_bytes()),
+            Some(h.project_id.as_bytes()),
+            None,
+            None,
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+/// Rewrite an open automatic handoff with a newer checkpoint of the same
+/// session, as if it had just been inserted.
+fn refresh_handoff_row(conn: &Transaction<'_>, id: &HandoffId, h: &NewHandoff) -> StoreResult<()> {
+    let now = Timestamp::now().as_microsecond();
+    let fields = handoff_fields(h)?;
+    expire_same_cwd_auto_handoffs(conn, h, fields.cwd.as_deref(), Some(id), now)?;
+    conn.execute(
+        "UPDATE handoffs SET cwd = ?2, summary = ?3, open_questions = ?4, next_steps = ?5, \
+         files_touched = ?6, created_at = ?7 WHERE id = ?1 AND state = 'open'",
+        params![
+            id.as_bytes(),
+            fields.cwd,
+            fields.summary,
+            fields.open_questions,
+            fields.next_steps,
+            fields.files_touched,
+            now
+        ],
+    )?;
+    audit(
+        conn,
+        "refresh_handoff",
+        Some(h.workspace_id.as_bytes()),
+        Some(h.project_id.as_bytes()),
+        None,
+        None,
+        now,
+    )?;
+    Ok(())
+}
+
+fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<HandoffId> {
+    validate_identity_storage_key(h.owner_user.as_deref(), "handoff owner")?;
+    let id = HandoffId::new();
+    let now = Timestamp::now().as_microsecond();
+    let HandoffFields {
+        summary,
+        open_questions: open_q,
+        next_steps: next_s,
+        files_touched: files,
+        cwd,
+    } = handoff_fields(h)?;
+    let from_session: Option<&[u8]> = h.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
     let from_agent = h.from_agent.as_str();
     let to_agent = h.to_agent.map(AgentKind::as_str);
-    // A newer automatic handoff from the exact same cwd is the only one that
-    // can ever win there, even before a SessionStart occurs. Bound abandoned
-    // same-directory sessions without touching deliberate manual handoffs or
-    // independent parent/sibling cwd scopes — and without crossing an operator
-    // boundary: the same directory inside a shared container is the norm, so
-    // owner equality is the only thing keeping one operator's SessionEnd from
-    // retiring another's pending baton.
     if from_session.is_some() {
-        let expired = conn.execute(
-            "UPDATE handoffs SET state = 'expired' \
-             WHERE workspace_id = ?1 AND project_id = ?2 \
-               AND state = 'open' AND from_session_id IS NOT NULL \
-               AND (cwd = ?3 OR (cwd IS NULL AND ?3 IS NULL)) \
-               AND owner_user IS ?4",
-            params![
-                h.workspace_id.as_bytes(),
-                h.project_id.as_bytes(),
-                cwd,
-                h.owner_user.as_deref()
-            ],
-        )?;
-        if expired > 0 {
-            audit(
-                conn,
-                "expire_superseded_handoffs",
-                Some(h.workspace_id.as_bytes()),
-                Some(h.project_id.as_bytes()),
-                None,
-                None,
-                now,
-            )?;
-        }
+        expire_same_cwd_auto_handoffs(conn, h, cwd.as_deref(), None, now)?;
     }
     // Insert + audit atomically. Handoffs are keyed by agent/session, not a DB
     // user, so the audit author is NULL — the row records the lifecycle event
@@ -6514,6 +6718,125 @@ pub(crate) mod tests {
             .query_row("SELECT state FROM handoffs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(state, "accepted", "an accepted handoff is not backlog");
+    }
+
+    // A turn checkpoint refreshes only its own session's unclaimed baton in
+    // the same scope and owner bucket (invariant #16): a claimed baton,
+    // another session's, a manual one, another operator's bucket and another
+    // project all survive. The refreshed baton keeps its id, and a checkpoint
+    // that arrives after the session ended touches nothing.
+    #[test]
+    fn checkpoint_session_handoff_refreshes_only_the_live_sessions_own_baton() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other_proj = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        let other_session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &other_session).unwrap();
+        let baton =
+            |from: Option<SessionId>, project: ProjectId, owner: &str, cwd: &str| NewHandoff {
+                workspace_id: ws,
+                project_id: project,
+                from_session_id: from,
+                from_agent: AgentKind::OpenCode,
+                to_agent: None,
+                cwd: Some(cwd.into()),
+                summary: format!("{cwd} baton"),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: Some(owner.into()),
+            };
+        let first = checkpoint_session_handoff(
+            &mut conn,
+            &baton(Some(session.id), proj, "user:alice", "/turn/1"),
+        )
+        .unwrap()
+        .expect("a live session publishes its baton");
+        let claimed = insert_handoff(
+            &mut conn,
+            &baton(Some(session.id), proj, "user:alice", "/claimed"),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE handoffs SET state = 'accepted' WHERE id = ?1",
+            params![claimed.as_bytes()],
+        )
+        .unwrap();
+        let survivors = [
+            claimed,
+            insert_handoff(
+                &mut conn,
+                &baton(Some(other_session.id), proj, "user:alice", "/sibling"),
+            )
+            .unwrap(),
+            insert_handoff(&mut conn, &baton(None, proj, "user:alice", "/manual")).unwrap(),
+            insert_handoff(
+                &mut conn,
+                &baton(Some(session.id), proj, "user:bob", "/bob"),
+            )
+            .unwrap(),
+            insert_handoff(
+                &mut conn,
+                &baton(Some(session.id), other_proj, "user:alice", "/elsewhere"),
+            )
+            .unwrap(),
+        ];
+
+        let second = checkpoint_session_handoff(
+            &mut conn,
+            &baton(Some(session.id), proj, "user:alice", "/turn/2"),
+        )
+        .unwrap();
+
+        assert_eq!(second, Some(first), "the live baton is refreshed in place");
+        let (state, summary): (String, String) = conn
+            .query_row(
+                "SELECT state, summary FROM handoffs WHERE id = ?1",
+                params![first.as_bytes()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), summary.as_str()),
+            ("open", "/turn/2 baton")
+        );
+        for survivor in survivors {
+            let untouched: bool = conn
+                .query_row(
+                    "SELECT summary NOT LIKE '/turn/%' FROM handoffs WHERE id = ?1",
+                    params![survivor.as_bytes()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(untouched);
+        }
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM handoffs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 6, "no expired row per turn");
+
+        let wrong_scope = checkpoint_session_handoff(
+            &mut conn,
+            &baton(Some(session.id), other_proj, "user:alice", "/turn/3"),
+        );
+        assert!(matches!(wrong_scope, Err(StoreError::InvalidState(_))));
+
+        end_session(&mut conn, &session.id, None).unwrap();
+        let late = checkpoint_session_handoff(
+            &mut conn,
+            &baton(Some(session.id), proj, "user:alice", "/late"),
+        )
+        .unwrap();
+        assert_eq!(late, None, "a checkpoint after the end touches nothing");
+        let summary: String = conn
+            .query_row(
+                "SELECT summary FROM handoffs WHERE id = ?1",
+                params![first.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(summary, "/turn/2 baton");
     }
 
     fn embed_failure_rows(conn: &Connection) -> i64 {
@@ -11223,6 +11546,7 @@ pub(crate) mod tests {
                 &bob_event,
                 &OwnerFilter::User(bob.into()),
                 Some("fresh-key"),
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -11241,6 +11565,7 @@ pub(crate) mod tests {
                 &bob_event,
                 &OwnerFilter::User(alice.into()),
                 Some("fresh-key"),
+                None,
             )
             .unwrap(),
             HookSessionAdmission::Observation {
@@ -11275,6 +11600,7 @@ pub(crate) mod tests {
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
                 None,
+                None,
             )
             .unwrap(),
             HookSessionAdmission::Observation {
@@ -11298,6 +11624,196 @@ pub(crate) mod tests {
         assert_eq!(session_project.as_slice(), proj.as_bytes());
     }
 
+    // An explicit native move rebinds the live row only when the stored cwd
+    // still matches the move's source (compared through `normalize_cwd`), the
+    // move is keyed, and the session is open. Every other shape is recorded
+    // like any scope-drifted event; only owner/agent mismatch is refused.
+    #[test]
+    fn native_move_rebinds_live_session_only_from_its_current_cwd() {
+        for (case, stored_cwd, from, key, ended, owner, rebinds) in [
+            (
+                "moves",
+                "/repo/alpha",
+                "/repo/alpha",
+                Some("move"),
+                false,
+                "user:alice",
+                true,
+            ),
+            (
+                "case-folded windows source",
+                r"C:\Repo\Alpha",
+                "c:/repo/alpha/",
+                Some("move"),
+                false,
+                "user:alice",
+                true,
+            ),
+            (
+                "stale source",
+                "/repo/alpha",
+                "/repo/elsewhere",
+                Some("move"),
+                false,
+                "user:alice",
+                false,
+            ),
+            (
+                "unix case differs",
+                "/Repo/alpha",
+                "/repo/alpha",
+                Some("move"),
+                false,
+                "user:alice",
+                false,
+            ),
+            (
+                "unkeyed",
+                "/repo/alpha",
+                "/repo/alpha",
+                None,
+                false,
+                "user:alice",
+                false,
+            ),
+            (
+                "ended",
+                "/repo/alpha",
+                "/repo/alpha",
+                Some("move"),
+                true,
+                "user:alice",
+                false,
+            ),
+        ] {
+            let (_tmp, mut conn, ws, proj) = fresh_db();
+            let mut source = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+            source.agent_kind = AgentKind::OpenCode;
+            source.cwd = Some(stored_cwd.into());
+            begin_session(&mut conn, &source).unwrap();
+            if ended {
+                end_session(&mut conn, &source.id, None).unwrap();
+            }
+            let target = get_or_create_project(&mut conn, &ws, "beta", None).unwrap();
+            let mut moved = source.clone();
+            moved.project_id = target;
+            moved.cwd = Some("/repo/beta".into());
+            let mut start = hook_observation(&moved);
+            start.kind = ObservationKind::SessionStart;
+            let owner = OwnerFilter::User(owner.into());
+            assert!(
+                matches!(
+                    admit_hook_session_event(&mut conn, &moved, &start, &owner, key, Some(from)),
+                    Ok(HookSessionAdmission::Observation {
+                        ingest: IngestObservationOutcome::Inserted(_),
+                        ..
+                    })
+                ),
+                "{case}: the move event itself is always recorded"
+            );
+            let (project, cwd): (Vec<u8>, String) = conn
+                .query_row(
+                    "SELECT project_id, cwd FROM sessions WHERE id = ?1",
+                    params![source.id.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let expected = if rebinds {
+                (target, "/repo/beta")
+            } else {
+                (proj, stored_cwd)
+            };
+            assert_eq!(
+                (project.as_slice(), cwd.as_str()),
+                (expected.0.as_bytes().as_slice(), expected.1),
+                "{case}"
+            );
+        }
+    }
+
+    // Identity still wins over a move: a foreign operator's move is refused
+    // before anything is written, and a completed move replayed after the
+    // session moved back never rebinds it to the stale target.
+    #[test]
+    fn native_move_rejects_foreign_owner_and_ignores_completed_replay() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut source = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        source.agent_kind = AgentKind::OpenCode;
+        source.cwd = Some("/repo/alpha".into());
+        begin_session(&mut conn, &source).unwrap();
+        let target = get_or_create_project(&mut conn, &ws, "beta", None).unwrap();
+        let mut moved = source.clone();
+        moved.project_id = target;
+        moved.cwd = Some("/repo/beta".into());
+        let mut start = hook_observation(&moved);
+        start.kind = ObservationKind::SessionStart;
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &moved,
+                &start,
+                &OwnerFilter::User("user:bob".into()),
+                Some("move"),
+                Some("/repo/alpha")
+            ),
+            Err(StoreError::SessionCollision)
+        ));
+        let keys: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ingest_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(keys, 0, "a refused move must not claim its key");
+
+        let owner = OwnerFilter::User("user:alice".into());
+        admit_hook_session_event(
+            &mut conn,
+            &moved,
+            &start,
+            &owner,
+            Some("move"),
+            Some("/repo/alpha"),
+        )
+        .unwrap();
+        complete_observation_ingest(&mut conn, &target, "move").unwrap();
+        let mut back = hook_observation(&source);
+        back.kind = ObservationKind::SessionStart;
+        admit_hook_session_event(
+            &mut conn,
+            &source,
+            &back,
+            &owner,
+            Some("return"),
+            Some("/repo/beta"),
+        )
+        .unwrap();
+        complete_observation_ingest(&mut conn, &proj, "return").unwrap();
+        assert!(matches!(
+            admit_hook_session_event(
+                &mut conn,
+                &moved,
+                &start,
+                &owner,
+                Some("move"),
+                Some("/repo/alpha")
+            )
+            .unwrap(),
+            HookSessionAdmission::Observation {
+                ingest: IngestObservationOutcome::AlreadyComplete,
+                ..
+            }
+        ));
+        let (project, cwd): (Vec<u8>, String) = conn
+            .query_row(
+                "SELECT project_id, cwd FROM sessions WHERE id = ?1",
+                params![source.id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (project.as_slice(), cwd.as_str()),
+            (proj.as_bytes().as_slice(), "/repo/alpha")
+        );
+    }
+
     // Identity is still identity: a different operator or a different agent
     // reusing the UUID stays terminal, in the same scope-moved shape as above.
     #[test]
@@ -11317,6 +11833,7 @@ pub(crate) mod tests {
                 &observation,
                 &OwnerFilter::User("user:bob".into()),
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -11330,6 +11847,7 @@ pub(crate) mod tests {
                 &other_agent,
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
             ),
             Err(StoreError::SessionCollision)
@@ -11361,6 +11879,7 @@ pub(crate) mod tests {
                 &end,
                 &OwnerFilter::User("user:alice".into()),
                 None,
+                None,
             )
             .unwrap(),
             HookSessionAdmission::InvalidScopedEnd
@@ -11378,6 +11897,180 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
             .unwrap();
         assert_eq!(observations, 0);
+    }
+
+    // A scope-drifted SessionEnd (a marker appeared under a running session)
+    // still ends that session, in the scope it was recorded in — but only
+    // from the session's own cwd, and never for another operator or agent
+    // (invariant #16). Every refused shape leaves the session open and writes
+    // nothing.
+    #[test]
+    fn drifted_session_end_ends_only_the_same_actor_agent_and_cwd() {
+        enum Expect {
+            Ended,
+            Ignored,
+            Collision,
+        }
+        let alice = OwnerFilter::User("user:alice".into());
+        let bob = OwnerFilter::User("user:bob".into());
+        for (case, stored_cwd, event_cwd, owner, agent, expect) in [
+            (
+                "same actor, agent and cwd",
+                Some("/repo/app"),
+                Some("/repo/app/"),
+                &alice,
+                AgentKind::OpenCode,
+                Expect::Ended,
+            ),
+            (
+                "windows case-only cwd drift",
+                Some(r"C:\Repo\App"),
+                Some("c:/repo/app"),
+                &alice,
+                AgentKind::OpenCode,
+                Expect::Ended,
+            ),
+            (
+                "other agent kinds too",
+                Some("/repo/app"),
+                Some("/repo/app"),
+                &alice,
+                AgentKind::Codex,
+                Expect::Ended,
+            ),
+            (
+                "different cwd",
+                Some("/repo/app"),
+                Some("/repo/other"),
+                &alice,
+                AgentKind::OpenCode,
+                Expect::Ignored,
+            ),
+            (
+                "unix case differs",
+                Some("/repo/App"),
+                Some("/repo/app"),
+                &alice,
+                AgentKind::OpenCode,
+                Expect::Ignored,
+            ),
+            (
+                "event without cwd",
+                Some("/repo/app"),
+                None,
+                &alice,
+                AgentKind::OpenCode,
+                Expect::Ignored,
+            ),
+            (
+                "session without cwd",
+                None,
+                Some("/repo/app"),
+                &alice,
+                AgentKind::OpenCode,
+                Expect::Ignored,
+            ),
+            (
+                "other operator",
+                Some("/repo/app"),
+                Some("/repo/app"),
+                &bob,
+                AgentKind::OpenCode,
+                Expect::Collision,
+            ),
+            (
+                "unattributed caller",
+                Some("/repo/app"),
+                Some("/repo/app"),
+                &OwnerFilter::Unattributed,
+                AgentKind::OpenCode,
+                Expect::Collision,
+            ),
+        ] {
+            let (_tmp, mut conn, ws, proj) = fresh_db();
+            let mut session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+            session.agent_kind = agent;
+            session.cwd = stored_cwd.map(Into::into);
+            begin_session(&mut conn, &session).unwrap();
+            let marker_ws = get_or_create_workspace(&mut conn, "windows").unwrap();
+            let marker_proj = get_or_create_project(&mut conn, &marker_ws, "app", None).unwrap();
+            let mut drifted = session.clone();
+            drifted.workspace_id = marker_ws;
+            drifted.project_id = marker_proj;
+            drifted.cwd = event_cwd.map(Into::into);
+            let end = session_end_observation(&drifted);
+
+            let result =
+                admit_hook_session_event(&mut conn, &drifted, &end, owner, Some("end"), None);
+            let ended: Option<i64> = conn
+                .query_row(
+                    "SELECT ended_at FROM sessions WHERE id = ?1",
+                    params![session.id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let landed: Vec<Vec<u8>> = conn
+                .prepare("SELECT project_id FROM observations")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            match expect {
+                Expect::Ended => {
+                    let Ok(HookSessionAdmission::EndOpen {
+                        session: admitted, ..
+                    }) = result
+                    else {
+                        panic!("{case}: expected the end to be admitted, got {result:?}");
+                    };
+                    assert_eq!(
+                        (admitted.workspace_id, admitted.project_id),
+                        (ws, proj),
+                        "{case}"
+                    );
+                    assert_eq!(landed, vec![proj.as_bytes().to_vec()], "{case}");
+                    end_admitted_session(&mut conn, &admitted, None).unwrap();
+                    let ended: Option<i64> = conn
+                        .query_row(
+                            "SELECT ended_at FROM sessions WHERE id = ?1",
+                            params![session.id.as_bytes()],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert!(ended.is_some(), "{case}");
+                }
+                Expect::Ignored => {
+                    assert!(
+                        matches!(result, Ok(HookSessionAdmission::InvalidScopedEnd)),
+                        "{case}: {result:?}"
+                    );
+                    assert!(ended.is_none() && landed.is_empty(), "{case}");
+                }
+                Expect::Collision => {
+                    assert!(
+                        matches!(result, Err(StoreError::SessionCollision)),
+                        "{case}: {result:?}"
+                    );
+                    assert!(ended.is_none() && landed.is_empty(), "{case}");
+                }
+            }
+        }
+
+        // Same operator and cwd, but another agent reusing the id.
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        session.agent_kind = AgentKind::OpenCode;
+        session.cwd = Some("/repo/app".into());
+        begin_session(&mut conn, &session).unwrap();
+        let mut drifted = session.clone();
+        drifted.project_id = get_or_create_project(&mut conn, &ws, "marker", None).unwrap();
+        drifted.agent_kind = AgentKind::ClaudeCode;
+        let end = session_end_observation(&drifted);
+        assert!(matches!(
+            admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None),
+            Err(StoreError::SessionCollision)
+        ));
     }
 
     #[test]
@@ -11401,6 +12094,7 @@ pub(crate) mod tests {
                     &hook_observation(&session),
                     &OwnerFilter::User(owner.into()),
                     Some(key),
+                    None,
                 )
             })
         };
@@ -11437,6 +12131,7 @@ pub(crate) mod tests {
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
                 Some("tuple-key"),
+                None,
             ),
             Err(StoreError::InvalidState(_))
         ));
@@ -11461,6 +12156,7 @@ pub(crate) mod tests {
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
                 Some("agent-key"),
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -11485,6 +12181,7 @@ pub(crate) mod tests {
                 &hook_observation(&owned),
                 &OwnerFilter::User("user:bob".into()),
                 Some("denied-owner"),
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -11499,6 +12196,7 @@ pub(crate) mod tests {
             &shared,
             &hook_observation(&shared),
             &OwnerFilter::User("user:alice".into()),
+            None,
             None,
         )
         .unwrap();
@@ -11519,6 +12217,7 @@ pub(crate) mod tests {
                 &hook_observation(&shared),
                 &OwnerFilter::User("user:bob".into()),
                 Some("shared-bob"),
+                None,
             )
             .unwrap(),
             HookSessionAdmission::Observation { .. }
@@ -11552,6 +12251,7 @@ pub(crate) mod tests {
                 &session_end_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
                 Some(key),
+                None,
             )
             .unwrap();
             match admission {
@@ -11590,6 +12290,7 @@ pub(crate) mod tests {
                 &session_end_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
                 Some(key),
+                None,
             )
             .unwrap();
             match admission {
@@ -11618,6 +12319,7 @@ pub(crate) mod tests {
                 &session_end_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
                 Some("missing-end"),
+                None,
             )
             .unwrap(),
             HookSessionAdmission::InvalidMissingEnd
@@ -11645,6 +12347,7 @@ pub(crate) mod tests {
                 &hook_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
                 Some("ordinary-complete"),
+                None,
             )
             .unwrap(),
             HookSessionAdmission::Observation {
@@ -11664,6 +12367,7 @@ pub(crate) mod tests {
                 &session,
                 &hook_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
             )
             .unwrap(),
@@ -11714,6 +12418,7 @@ pub(crate) mod tests {
                 &receiver,
                 &lifecycle_observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
             )
             .unwrap(),
