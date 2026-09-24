@@ -16,6 +16,9 @@ globalThis.fetch = async (input, options = {}) => {
 };
 const { default: plugin } = await import(pathToFileURL(process.argv[2]).href);
 
+// Plugin-scoped durable storage outlives any one loaded instance.
+const storage = new Map();
+
 function host(directory, records) {
   const hooks = new Map();
   const events = [];
@@ -28,6 +31,11 @@ function host(directory, records) {
     },
     ctx: {
       location: { directory },
+      storage: {
+        async get(key) { return storage.get(key); },
+        async set(key, value) { storage.set(key, structuredClone(value)); },
+        async remove(key) { storage.delete(key); },
+      },
       session: {
         async get({ sessionID }) {
           const record = records.get(sessionID);
@@ -107,11 +115,33 @@ try {
 
   await b.hooks.get("session.prompt")({ sessionID: "root-b", messageID: "b1", prompt: { text: "beta" } });
   await b.hooks.get("session.context")({ sessionID: "root-b", system: [] });
+  const ends = () => requests.filter((r) => r.url.searchParams.get("event") === "session-end");
+  a.emit({ type: "session.deleted", data: { sessionID: "child" } });
+  await until(() => ends().length === 1, "deletion ends the session");
+  assert.equal(ends()[0].payload.sessionID, "child");
+  assert.equal(ends()[0].payload.agent_id, "root-a", "child close must retain ancestry to suppress automatic handoffs");
   await disposeA();
-  assert.ok(requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-a"));
-  assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-b"), "location cleanup must not close another instance");
-  assert.equal(requests.find((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "child").payload.agent_id, "root-a", "child close must retain ancestry to suppress automatic handoffs");
-  console.log("PASS: resumed sessions, retained handoff, child isolation, terminal events, content-only output, per-location cleanup");
+  assert.equal(ends().length, 1, "unload leaves sessions resumable: only deletion ends one");
+
+  // After a reload, deleting a session the new instance never touched still
+  // ends it, once, from the location that captured it.
+  const reloaded = host(root, records);
+  const disposeReloaded = await plugin.setup(reloaded.ctx);
+  try {
+    reloaded.emit({ type: "session.deleted", data: { sessionID: "root-a" } });
+    b.emit({ type: "session.deleted", data: { sessionID: "root-a" } });
+    await until(() => ends().length === 2, "deletion after reload ends the session");
+    const end = ends()[1];
+    assert.equal(end.payload.sessionID, "root-a");
+    assert.equal(end.payload.cwd, root);
+    assert.equal(end.payload.agent_id, undefined, "a root session carries no ancestry");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(ends().length, 2, "another location must not end it too");
+    assert.equal(storage.has("ai-memory/session/root-a"), false, "the ended session's record is dropped");
+  } finally {
+    await disposeReloaded();
+  }
+  console.log("PASS: resumed sessions, retained handoff, child isolation, terminal events, content-only output, unload keeps sessions open, deletion after reload");
 } finally {
   await disposeB();
 }

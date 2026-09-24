@@ -3273,6 +3273,21 @@ const OPENCODE2_BINDING: &str = r#"
       handoffFetches.delete(id);
     }
 
+    // Unload does not end sessions, so deletion is their end, and it can
+    // arrive after a reload for a session this instance never touched. The
+    // plugin's durable storage keeps where each captured session runs and its
+    // parent, so the right location still ends it with its ancestry.
+    type OwnedSession = { directory: string; parentID: string | null };
+    const ownedKey = (id: SessionID) => `ai-memory/session/${id}`;
+    function rememberOwned(id: SessionID, owned: OwnedSession): void {
+      ctx.storage.set(ownedKey(id), owned).catch(() => {});
+    }
+    async function recallOwned(id: SessionID): Promise<OwnedSession | undefined> {
+      const value = (await ctx.storage.get(ownedKey(id)).catch(() => undefined)) as Partial<OwnedSession> | undefined;
+      if (typeof value?.directory !== "string") return undefined;
+      return { directory: value.directory, parentID: typeof value.parentID === "string" ? value.parentID : null };
+    }
+
     async function ensureSession(id: SessionID): Promise<SessionInfo | undefined> {
       const session = await sessionInfo(id);
       // The public event stream can reach multiple loaded location plugins.
@@ -3280,6 +3295,9 @@ const OPENCODE2_BINDING: &str = r#"
       if (session.location.directory !== directory) {
         sessions.delete(id);
         return undefined;
+      }
+      if (!startedSessions.has(id)) {
+        rememberOwned(id, { directory: session.location.directory, parentID: session.parentID ?? null });
       }
       startSession(id, session.location.directory, { title: session.title, ...subagentMarker(session) });
       return session;
@@ -3351,7 +3369,15 @@ const OPENCODE2_BINDING: &str = r#"
             } else if (event.type === "session.deleted") {
               const id = event.data.sessionID;
               const session = await sessions.get(id)?.catch(() => undefined);
-              endSession(id, directory, undefined, subagentMarker(session));
+              let marker = subagentMarker(session);
+              const owned = await recallOwned(id);
+              if (!startedSessions.has(id) && owned?.directory === directory) {
+                // Captured before a reload: end it here, not in every location.
+                startedSessions.add(id);
+                marker = owned.parentID ? { agent_id: owned.parentID as SessionID } : {};
+              }
+              if (startedSessions.has(id)) ctx.storage.remove(ownedKey(id)).catch(() => {});
+              endSession(id, directory, undefined, marker);
               forgetSession(id);
             } else if (event.type === "session.moved") {
               const id = event.data.sessionID;
@@ -3361,6 +3387,10 @@ const OPENCODE2_BINDING: &str = r#"
               // moves keep their ingest key, and stale ordinary events cannot
               // silently rebind a live session in the store.
               if (previousCwd === directory && event.data.location.directory !== previousCwd) {
+                rememberOwned(id, {
+                  directory: event.data.location.directory,
+                  parentID: previous?.parentID ?? null,
+                });
                 postHook("session-start", {
                   sessionID: id,
                   cwd: event.data.location.directory,
@@ -3450,10 +3480,10 @@ const OPENCODE2_BINDING: &str = r#"
           // Unload is best-effort; a dead host has nothing to unregister.
         }
       }
-      for (const [id, pending] of sessions) {
-        const session = await pending.catch(() => undefined);
-        if (session) endSession(id, directory, undefined, subagentMarker(session));
-      }
+      // Unload is not a session end: a reload or service restart leaves every
+      // session resumable, and an ended row can no longer checkpoint, claim
+      // its startup context or publish a baton while its capture continues.
+      // `session.deleted` is the end; turn checkpoints cover the rest.
       await drainHookQueueForDispose();
       // Whatever is still in flight after the budget fails over to the spool.
       hookAbort.abort();

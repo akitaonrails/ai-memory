@@ -644,6 +644,7 @@ pub(crate) enum WriteCmd {
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
         receiving_session: Option<NewSession>,
+        busy_since: jiff::Timestamp,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
@@ -2627,18 +2628,24 @@ impl WriterHandle {
     /// SessionStart response.
     ///
     /// When a managed run was requested but is no longer claimable, the
-    /// handoff remains open and both result fields are false.
+    /// handoff remains open and both result fields are false. `busy_since` is
+    /// the same cutoff the selection used
+    /// ([`crate::ReaderPool::startup_handoff`]), re-applied in the claim's
+    /// transaction: a baton whose open source captured anything after it stays
+    /// open.
     pub async fn accept_startup_context(
         &self,
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
         receiving_session: Option<NewSession>,
+        busy_since: jiff::Timestamp,
     ) -> StoreResult<StartupContextAcceptance> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
             handoff,
             managed_run_id,
             receiving_session,
+            busy_since,
             reply: tx,
         })
         .await?;
@@ -3655,6 +3662,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 handoff,
                 managed_run_id,
                 receiving_session,
+                busy_since,
                 reply,
             } => {
                 let result = (|| {
@@ -3683,7 +3691,11 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                         return Ok(StartupContextAcceptance::default());
                     }
                     let handoff_accepted = match handoff {
-                        Some(acceptance) => ops::accept_handoff_in_transaction(&tx, &acceptance)?,
+                        Some(acceptance) => ops::accept_handoff_in_transaction(
+                            &tx,
+                            &acceptance,
+                            Some(busy_since.as_microsecond()),
+                        )?,
                         None => false,
                     };
                     tx.commit()?;

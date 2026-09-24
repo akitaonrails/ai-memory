@@ -93,8 +93,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service outlives the CLI and closing a terminal is not a session end. The
   checkpoint is deterministic (no LLM call), is written in the session's own
   scope, keeps one open baton per live session (refreshed in place, audited as
-  `refresh_handoff`), and never touches a session that already ended. Child
-  sessions neither claim startup context nor publish batons. (#865)
+  `refresh_handoff`), and never touches a session that already ended. A live
+  session's baton is handed to a starting session only once the source has
+  captured nothing for ten minutes, re-checked inside the claim; a checkpoint
+  never retires another live session's baton, and a claim retires older batons
+  of quiet sessions but not of one in use. A session still at work in the same
+  directory therefore no longer hands its context to the next session to
+  start. Plugin unload no longer ends sessions; `session.deleted` does, also
+  after a reload (the plugin records each session's location in its storage).
+  Child sessions neither claim startup context nor publish batons. (#865)
 - `install-hooks --agent opencode2 --capture-assistant` extends the
   assistant/Stop capture double opt-in to OpenCode 2: the plugin forwards the
   last completed assistant text through the native hook's sanitizer before it

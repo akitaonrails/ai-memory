@@ -69,6 +69,14 @@ pub const MAX_HOOK_BATCH_ITEMS: usize = 256;
 const AUTOMATIC_HANDOFF_ADMISSION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(750);
 
+/// How long a still-open session must be quiet before its turn-checkpoint
+/// baton is handed to a new session. Nothing distinguishes a closed terminal
+/// from a parallel session in the same directory; a session that captured
+/// anything this recently is treated as in use. The live incident this
+/// guards against delivered batons from sessions 74 seconds and 0 seconds
+/// (mid-turn) away from their last event.
+const LIVE_BATON_QUIET_PERIOD: jiff::SignedDuration = jiff::SignedDuration::from_mins(10);
+
 /// Maximum cwd-resolution cache entries kept per server process. The cache is
 /// an optimization only; evicted entries are re-resolved through the writer.
 pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
@@ -1250,6 +1258,16 @@ async fn fetch_and_accept_handoff(
     actor: Option<IdentityKey>,
     skip_webhooks: Vec<String>,
 ) -> anyhow::Result<Option<String>> {
+    fetch_and_accept_handoff_at(state, query, actor, skip_webhooks, jiff::Timestamp::now()).await
+}
+
+async fn fetch_and_accept_handoff_at(
+    state: &HookState,
+    query: HandoffQuery,
+    actor: Option<IdentityKey>,
+    skip_webhooks: Vec<String>,
+    now: jiff::Timestamp,
+) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     // A managed run's ledger is additive, not a replacement. Returning it here
     // skipped `latest_open_handoff` below, so a session launched by
@@ -1290,9 +1308,20 @@ async fn fetch_and_accept_handoff(
         Some(key) => ai_memory_core::OwnerFilter::User(key.storage_key()),
         None => ai_memory_core::OwnerFilter::Unattributed,
     };
+    // A duration never fails here; the fallback keeps every live session's
+    // baton, the conservative side.
+    let busy_since = now
+        .saturating_sub(LIVE_BATON_QUIET_PERIOD)
+        .unwrap_or(jiff::Timestamp::MIN);
     let handoff = state
         .reader
-        .latest_open_handoff(ws, proj, query.cwd.clone(), owner_filter.clone())
+        .startup_handoff(
+            ws,
+            proj,
+            query.cwd.clone(),
+            owner_filter.clone(),
+            busy_since,
+        )
         .await?;
     let handoff_md = handoff.as_ref().map(render_handoff_markdown);
     // The brief is additive and non-destructive: unlike the handoff (a
@@ -1390,6 +1419,7 @@ async fn fetch_and_accept_handoff(
                     }),
                 managed.as_ref().map(|managed| managed.run_id),
                 receiving_session,
+                busy_since,
             )
             .await?
     } else {
@@ -8847,6 +8877,9 @@ mod tests {
                 }
             }
         }
+        // Both sources are still open, so their batons wait out the quiet period.
+        let quiet =
+            jiff::Timestamp::now() + LIVE_BATON_QUIET_PERIOD + jiff::SignedDuration::from_secs(1);
         for (project, other) in [("alpha", "beta"), ("beta", "alpha")] {
             let query = HandoffQuery {
                 workspace: Some("checkpoint-workspace".into()),
@@ -8855,13 +8888,13 @@ mod tests {
                 session_id: Some(SessionId::new().to_string()),
                 ..Default::default()
             };
-            let first = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new())
+            let first = fetch_and_accept_handoff_at(&state, query.clone(), None, Vec::new(), quiet)
                 .await
                 .unwrap()
                 .unwrap();
             assert!(first.contains(&format!("Latest assistant response: {project}-latest")));
             assert!(!first.contains(&format!("{other}-")));
-            let second = fetch_and_accept_handoff(&state, query, None, Vec::new())
+            let second = fetch_and_accept_handoff_at(&state, query, None, Vec::new(), quiet)
                 .await
                 .unwrap();
             assert!(
@@ -8869,6 +8902,89 @@ mod tests {
                 "a consumed or superseded baton must not reappear"
             );
         }
+    }
+
+    // Live incident: parallel OpenCode sessions in one directory. Every
+    // completed turn retired the other sessions' batons, and the next session
+    // to start was handed the baton of a session still in use (once mid-turn,
+    // once 74 seconds after its last turn), carrying another conversation.
+    #[tokio::test]
+    async fn opencode_parallel_live_batons_are_owned_and_wait_for_quiet() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let (alpha, beta) = (SessionId::new().to_string(), SessionId::new().to_string());
+        for (session, text) in [(&alpha, "alpha work"), (&beta, "beta work")] {
+            for event in ["user-prompt", "stop"] {
+                let mut env = opencode_turn_event(session, event, text);
+                crate::assistant_capture::apply_assistant_backstop(&mut env, true);
+                process(&state, env, None, Vec::new()).await.unwrap();
+            }
+        }
+        let open_batons = || async {
+            state
+                .reader
+                .list_handoffs(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                    10,
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|h| h.lifecycle.state == ai_memory_core::HandoffState::Open)
+                .count()
+        };
+        assert_eq!(
+            open_batons().await,
+            2,
+            "a turn must not retire another live session's baton"
+        );
+
+        // Alpha is mid-turn again; beta just finished one. `between` separates
+        // beta's last event from alpha's newest one.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let between = jiff::Timestamp::now();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        process(
+            &state,
+            opencode_turn_event(&alpha, "user-prompt", "alpha continues"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let receiver = || HandoffQuery {
+            agent: Some("opencode2".into()),
+            session_id: Some(SessionId::new().to_string()),
+            ..Default::default()
+        };
+        let busy = fetch_and_accept_handoff_at(
+            &state,
+            receiver(),
+            None,
+            Vec::new(),
+            jiff::Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        assert!(busy.is_none(), "a session in use keeps its baton: {busy:?}");
+        assert_eq!(open_batons().await, 2);
+
+        // Ten minutes after `between`: beta has been quiet, alpha has not.
+        let later = between + LIVE_BATON_QUIET_PERIOD;
+        let delivered = fetch_and_accept_handoff_at(&state, receiver(), None, Vec::new(), later)
+            .await
+            .unwrap()
+            .expect("a quiet live session's baton is deliverable");
+        assert!(delivered.contains("beta work"), "{delivered}");
+        assert!(!delivered.contains("alpha"), "{delivered}");
+        assert_eq!(
+            open_batons().await,
+            1,
+            "claiming one baton must not sweep the baton of a session in use"
+        );
     }
 
     // Live incident: a `.ai-memory.toml` naming a workspace appeared under
@@ -10965,7 +11081,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            state
+            let id = state
                 .writer
                 .insert_handoff(NewHandoff {
                     workspace_id: state.workspace_id,
@@ -10981,7 +11097,10 @@ mod tests {
                     owner_user: None,
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            // A SessionEnd baton: its source is over.
+            state.writer.end_session(session_id, None).await.unwrap();
+            id
         }
 
         let stale = insert_auto(&state, "/repo/api", "STALE-SPECIFIC").await;
