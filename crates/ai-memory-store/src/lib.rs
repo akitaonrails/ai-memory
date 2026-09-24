@@ -5918,6 +5918,7 @@ mod tests {
                 Some(acceptance(first_handoff, None)),
                 Some(run.run_id),
                 None,
+                jiff::Timestamp::now(),
             )
             .await
             .unwrap();
@@ -5944,6 +5945,7 @@ mod tests {
                 Some(acceptance(second_handoff, None)),
                 Some(run.run_id),
                 None,
+                jiff::Timestamp::now(),
             )
             .await
             .unwrap();
@@ -6010,6 +6012,7 @@ mod tests {
                 Some(acceptance(selected_auto, Some("/repo/api/src".into()))),
                 Some(run.run_id),
                 None,
+                jiff::Timestamp::now(),
             )
             .await
             .unwrap();
