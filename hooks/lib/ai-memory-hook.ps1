@@ -296,6 +296,32 @@ function Test-AiMemoryCaptureOwnedExternally {
     return (-not [string]::IsNullOrWhiteSpace($env:AI_MEMORY_CAPTURE_OWNER))
 }
 
+# Parity with `payload_is_subagent` in the native router
+# (`commands/hook.rs`): a subagent/child payload must not take the parent
+# session's handoff. True when any known child-session marker key holds a
+# non-empty string.
+function Test-AiMemorySubagentPayload {
+    param([object] $ParsedPayload)
+    if ($null -eq $ParsedPayload) { return $false }
+    foreach ($Name in @(
+        "subagentType", "subagent_type", "agent_type", "agent_id", "parentSessionId"
+    )) {
+        $Value = $ParsedPayload.$Name
+        if ($Value -is [string] -and $Value.Trim().Length -gt 0) { return $true }
+    }
+    return $false
+}
+
+# Parity with `clip_chars` in the native router: Grok's additionalContext
+# is capped (10 000 chars) so an oversized handoff cannot flood the model
+# context through the script fallback either.
+function Clip-AiMemoryChars {
+    param([string] $Text, [int] $MaxChars)
+    if ($Text.Length -le $MaxChars) { return $Text }
+    $keep = [Math]::Max(0, $MaxChars - 12)
+    return ($Text.Substring(0, $keep) + "`n[truncated]")
+}
+
 function Invoke-AiMemoryHook {
     param(
         [Parameter(Mandatory = $true)] [string] $Event,
@@ -382,8 +408,24 @@ function Invoke-AiMemoryHook {
         }
         $Shown = $null
         if ($GrokPostTool) {
+            if (Test-AiMemorySubagentPayload $ParsedPayload) {
+                # A child session must not accept the parent handoff (and the
+                # GET is destructive), so bail before any fetch. Parity with
+                # the native router and the shell `post-tool-use.sh` gate.
+                [Console]::Out.Write("{}")
+                return
+            }
             $ShownKey = [string]$NativeSessionId
-            if (-not $ShownKey) { $ShownKey = "grok-post-$PID" }
+            if (-not $ShownKey) {
+                # Stable fallback (parity with the shell bundle's
+                # `cksum("grok:$CWD")`): hash agent+cwd, never the process id —
+                # each hook invocation is a new process, so a `$PID`-keyed
+                # marker would never match and the destructive GET would run
+                # on every tool call.
+                $Sha = [System.Security.Cryptography.SHA256]::Create()
+                $Bytes = $Sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("grok:$Cwd"))
+                $ShownKey = "grok-post-" + (($Bytes | ForEach-Object { $_.ToString("x2") }) -join "").Substring(0, 16)
+            }
             $Shown = Get-AiMemoryBriefedFile -Key "post-$ShownKey"
             if (Test-Path $Shown -PathType Leaf) {
                 [Console]::Out.Write("{}")
@@ -424,7 +466,7 @@ function Invoke-AiMemoryHook {
                     $Wrapped = @{
                         hookSpecificOutput = @{
                             hookEventName = "PostToolUse"
-                            additionalContext = $Response.Content
+                            additionalContext = (Clip-AiMemoryChars ([string]$Response.Content) 10000)
                         }
                     }
                     [Console]::Out.Write(($Wrapped | ConvertTo-Json -Depth 5 -Compress))

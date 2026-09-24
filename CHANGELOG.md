@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Native `ai-memory upgrade` for GitHub-release installs (Linux/macOS
+  tarballs and Windows x86_64 zip): downloads the matching release archive,
+  verifies the `.sha256` sidecar, replaces the on-disk binary (and a sibling
+  `hooks/` tree when present), then re-runs `install-hooks --apply` for staged
+  agents. Windows uses rename-aside self-replace (running `.exe` → `.old`,
+  promote `.new`) because the mapped image cannot be overwritten in place.
+  Refuses package-managed paths (Homebrew/AUR/`/usr`), containers, and
+  unwritable prefixes; the Docker wrapper's `upgrade` path is unchanged. Pin
+  with `--version` / force a re-download with `--force`. Optional
+  `AI_MEMORY_RELEASE_BASE_URL` / `release_base_url` overrides the Releases
+  base for mirrors and hermetic tests (loaded via `Config`, not ad-hoc env).
+  Downloads refuse bodies over 128 MiB (Content-Length and streamed cap).
+  (#801, #802)
 - `ai-memory run` accepts a repeatable `--env KEY=VALUE` and an `--env-file
   <path>` (blank lines and `#` comments skipped) to pass extra environment
   into the spawned harness — e.g. a per-account `CLAUDE_CONFIG_DIR` for
@@ -137,6 +150,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory so its later end lands there. Checked against OpenCode 2.0.14. (#865)
 
 ### Fixed
+- Native `ai-memory upgrade` no longer refuses every Linux install by probing
+  the running executable for write (Linux `ETXTBSY`); it only requires the
+  parent directory to be writable for rename-based replace. (#802)
+- Native `ai-memory upgrade` accepts release archives whose entries are
+  `./`-prefixed (`tar -C … -czf … .` as in `release.yml`), instead of
+  rejecting `Component::CurDir` as an unsafe path. (#802)
+- Native `ai-memory upgrade` treats Linuxbrew (`/home/linuxbrew/.linuxbrew/`)
+  as package-managed and refuses self-replace there. (#802)
+- Native `ai-memory upgrade` container refusal now uses the shared
+  `running_in_container` helper (`AI_MEMORY_IN_CONTAINER`, `/.dockerenv`,
+  `/run/.containerenv` / Podman), matching staged-hooks detection. (#802)
 - `memory_query`'s vector stream called the generic `Embedder::embed`
   instead of `embed_query` on the configured embedder, so a
   query/document-asymmetric embedder (Google's task-typed embeddings, or

@@ -327,7 +327,12 @@ prompt and tool call now lands in ai-memory, and the next session you
 open in this project will see a handoff with where you left off.
 On macOS the native binary is the recommended path when you do not need
 Docker — either the [menu bar app](#macos-menu-bar-app) above or a
-[release tarball / launchd agent](docs/macos.md).
+[release tarball / launchd agent](docs/macos.md). Later updates for that
+path use `ai-memory upgrade` (checksum-verified GitHub release replace + hook
+refresh) — see
+[`docs/install.md#keeping-ai-memory-up-to-date`](docs/install.md#keeping-ai-memory-up-to-date).
+The same native upgrade path covers Windows x86_64 zip installs under a
+writable prefix (see [`docs/windows.md`](docs/windows.md) Scenario C).
 
 Wiring another agent is the same two commands with a different name —
 `--client codex`, `--agent codex`, and so on for every row of the support
