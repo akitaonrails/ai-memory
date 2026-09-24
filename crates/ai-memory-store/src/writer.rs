@@ -164,6 +164,7 @@ pub(crate) enum WriteCmd {
         obs: NewObservation,
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
+        moved_from_cwd: Option<String>,
         reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
     },
     EndAdmittedSession {
@@ -219,6 +220,10 @@ pub(crate) enum WriteCmd {
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
+    },
+    CheckpointSessionHandoff {
+        handoff: NewHandoff,
+        reply: oneshot::Sender<StoreResult<Option<HandoffId>>>,
     },
     AcceptHandoff {
         acceptance: HandoffAcceptance,
@@ -1021,12 +1026,15 @@ impl WriterHandle {
     }
 
     /// Atomically validate/admit a hook session and insert its observation.
+    /// `moved_from_cwd` marks an explicit native relocation; see
+    /// `ops::admit_hook_session_event`.
     pub async fn admit_hook_session_event(
         &self,
         session: NewSession,
         obs: Sanitized<NewObservation>,
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
+        moved_from_cwd: Option<String>,
     ) -> StoreResult<HookSessionAdmission> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AdmitHookSessionEvent {
@@ -1034,6 +1042,7 @@ impl WriterHandle {
             obs: obs.into_inner(),
             owner_filter,
             ingest_key,
+            moved_from_cwd,
             reply: tx,
         })
         .await?;
@@ -1207,6 +1216,21 @@ impl WriterHandle {
     pub async fn insert_handoff(&self, handoff: NewHandoff) -> StoreResult<HandoffId> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::InsertHandoff { handoff, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Publish a live session's turn-checkpoint baton; `None` when the session
+    /// already ended or is gone. See `ops::checkpoint_session_handoff`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn checkpoint_session_handoff(
+        &self,
+        handoff: NewHandoff,
+    ) -> StoreResult<Option<HandoffId>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CheckpointSessionHandoff { handoff, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
@@ -2857,6 +2881,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 obs,
                 owner_filter,
                 ingest_key,
+                moved_from_cwd,
                 reply,
             } => {
                 let result = ops::admit_hook_session_event(
@@ -2865,6 +2890,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &obs,
                     &owner_filter,
                     ingest_key.as_deref(),
+                    moved_from_cwd.as_deref(),
                 );
                 send_or_warn(reply, result, "admit_hook_session_event");
             }
@@ -2957,6 +2983,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
+            }
+            WriteCmd::CheckpointSessionHandoff { handoff, reply } => {
+                let result = ops::checkpoint_session_handoff(&mut conn, &handoff);
+                send_or_warn(reply, result, "checkpoint_session_handoff");
             }
             WriteCmd::AcceptHandoff { acceptance, reply } => {
                 let result = ops::accept_handoff(&mut conn, &acceptance);

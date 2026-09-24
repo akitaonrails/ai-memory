@@ -414,9 +414,51 @@ ai-memory status
 
 `stop`, `restart`, and `uninstall` are the remaining commands. Because
 the bind is loopback, the service account does not affect reachability:
-agents running as your user still reach `127.0.0.1:49374`. Only the data
-directory is account-sensitive, which is what the absolute path above
-settles.
+agents running as your user still reach `127.0.0.1:49374`.
+
+### ⚠️ Run the service as the owning user when the data dir is in a profile
+
+The absolute `--data-dir` above stops the *empty-directory* trap, but it
+does **not** make a `LocalSystem` service safe over a data directory that
+lives under your user profile (`C:\Users\you\AppData\Local\ai-memory`).
+The data directory is account-sensitive, and so is the **wiki's git
+repository inside it**. libgit2 enforces the same dubious-ownership guard
+as Git itself (CVE-2022-24765): when the process account is not the owner
+of the repository, every commit fails with `code=Owner (-36)`. The server
+still starts, capture still works, and search still answers — but the
+wiki git history silently stops advancing, because a wiki commit failure
+is not fatal. As of ai-memory 2.4.x the server logs this at **ERROR** on
+startup with the same remedy below; on older builds it was a WARN that was
+easy to miss.
+
+**Whenever the data directory lives under a user profile, run the service
+as that user** rather than as `LocalSystem`. In the WinSW XML add a
+`<serviceaccount>` block:
+
+```xml
+  <serviceaccount>
+    <username>.\you</username>
+    <password>your-account-password</password>
+  </serviceaccount>
+```
+
+(or set it from the service's **Log On** tab in `services.msc` after
+install, then `restart`). Use `.\you` for a local account or
+`DOMAIN\you` for a domain account. `LocalSystem` is only appropriate when
+the data directory is in a location that account owns outright (e.g. a
+dedicated `C:\ProgramData\ai-memory` created and owned by the service
+account).
+
+> **WinSW error 1069 / stale password.** If `start` fails with *"The
+> service did not start due to a logon failure"* (error 1069), the
+> `<serviceaccount>` credentials are wrong or stale. This bites
+> **Microsoft-account, PIN, and Windows Hello** users especially: the
+> WinSW `<password>` must be your *account password*, which for a
+> Microsoft account is your online Microsoft password (not your PIN or
+> Hello gesture), and it must be updated in the service config whenever
+> that password changes — Windows does not roll it forward. Consider a
+> local account, or a dedicated service account with a non-expiring
+> password, for an unattended service.
 
 Keep running `install-mcp` and `install-hooks` **as your own user**, not
 as the service — they write per-user agent config, and the rule at the

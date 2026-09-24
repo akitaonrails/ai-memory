@@ -46,7 +46,7 @@ const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message"];
 /// The raw field that carries the assistant's final message for `(agent, event)`,
 /// or `None` when the pair has no verified assistant-message field.
 ///
-/// Closed table: `ClaudeCode + Stop` and `Codex + Stop` are supported today.
+/// Closed table: Claude Code, Codex, and OpenCode support `Stop` capture.
 /// Extend deliberately — a new entry opts an agent/event into capture and MUST
 /// have its field name present in [`ASSISTANT_MESSAGE_FIELDS`] so the strip
 /// covers it (enforced by `closed_table_fields_are_all_stripped`).
@@ -58,7 +58,7 @@ const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message"];
 #[must_use]
 pub fn assistant_message_field(agent: AgentKind, event: HookEvent) -> Option<&'static str> {
     match (agent, event) {
-        (AgentKind::ClaudeCode, HookEvent::Stop) | (AgentKind::Codex, HookEvent::Stop) => {
+        (AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode, HookEvent::Stop) => {
             Some("last_assistant_message")
         }
         _ => None,
@@ -223,10 +223,10 @@ pub fn strip_assistant_message_raw(raw: &mut serde_json::Value) -> bool {
 mod tests {
     use super::*;
 
-    /// Only `ClaudeCode + Stop` and `Codex + Stop` are capture candidates; every
+    /// Only Claude Code, Codex, and OpenCode Stop are capture candidates; every
     /// other agent/event pair across the full agent surface must return `None`.
     #[test]
-    fn only_claude_and_codex_stop_are_capture_candidates() {
+    fn only_supported_stop_events_are_capture_candidates() {
         let events = [
             HookEvent::SessionStart,
             HookEvent::UserPrompt,
@@ -243,8 +243,10 @@ mod tests {
         ];
         for agent in AgentKind::ALL {
             for event in events {
-                let expected = matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex)
-                    && event == HookEvent::Stop;
+                let expected = matches!(
+                    agent,
+                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode
+                ) && event == HookEvent::Stop;
                 assert_eq!(
                     assistant_message_field(agent, event).is_some(),
                     expected,
@@ -401,6 +403,26 @@ mod tests {
         assert!(out.captured);
         assert!(raw.get("last_assistant_message").is_none());
         assert!(raw.get(ASSISTANT_MARKER_KEY).is_some());
+    }
+
+    #[test]
+    fn client_transform_captures_opencode_stop_before_spooling() {
+        let secret = "AKIA".to_string() + &"A".repeat(16);
+        let mut raw = serde_json::json!({
+            "last_assistant_message": format!("Completed work with {secret}"),
+            "turn_checkpoint": true,
+        });
+        let out = transform_for_client(&mut raw, AgentKind::OpenCode, HookEvent::Stop);
+        assert!(out.captured && out.changed);
+        assert!(raw.get("last_assistant_message").is_none());
+        assert!(!raw.to_string().contains(&secret));
+        assert_eq!(raw["turn_checkpoint"], true);
+        assert!(
+            raw[ASSISTANT_MARKER_KEY]["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("Completed work")
+        );
     }
 
     #[test]

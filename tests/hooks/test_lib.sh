@@ -108,6 +108,20 @@ assert_eq "extract cwd from cursor workspace_roots" "/home/u/cur" \
 PAYLOAD_CURSOR_TOOL='{"session_id":"x","cwd":"","hook_event_name":"postToolUse","workspace_roots":["/home/u/cur"]}'
 assert_eq "extract cwd falls through cursor empty cwd" "/home/u/cur" \
     "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_TOOL")"
+# A large tool result must not make extraction quadratic in the payload
+# size: `${payload#*"key"}` pinned a CPU for minutes at a few hundred KB (#870).
+BIG=$(awk 'BEGIN { for (i = 0; i < 262144; i++) printf "x" }')
+PAYLOAD_CURSOR_BIG="{\"tool_output\":\"$BIG\",\"cwd\":\"\",\"workspace_roots\":[\"/home/u/big\"]}"
+assert_eq "extract cwd from a 256 KB cursor tool payload" "/home/u/big" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_CURSOR_BIG")"
+# Only the first occurrence of a key is read, so a non-string top-level value
+# never lets a nested field of the same name take its place.
+PAYLOAD_NULL_CWD='{"cwd":null,"tool_input":{"cwd":"/tmp/nested"},"workspace_roots":["/home/u/top"]}'
+assert_eq "extract cwd ignores nested cwd after a null one" "/home/u/top" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_NULL_CWD")"
+PAYLOAD_EMPTY_ROOTS='{"cwd":"","workspace_roots":[],"tool_input":{"workspace_roots":["/tmp/nested"]}}'
+assert_eq "extract cwd ignores nested roots after an empty array" "" \
+    "$(ai_memory_extract_cwd "$PAYLOAD_EMPTY_ROOTS")"
 
 antigravity_initial() {
     if ai_memory_antigravity_is_initial_invocation "$1"; then
@@ -128,6 +142,11 @@ assert_eq "antigravity fractional invocation fails closed" "no" \
     "$(antigravity_initial '{"invocationNum":0.5,"conversationId":"agy"}')"
 assert_eq "extract antigravity conversation id" "agy" \
     "$(ai_memory_extract_session_id '{"conversationId":"agy"}')"
+PAYLOAD_AGY_BIG="{\"prompt\":\"$BIG\",\"invocationNum\":0,\"conversationId\":\"agy\"}"
+assert_eq "antigravity initial invocation after a 256 KB field" "yes" \
+    "$(antigravity_initial "$PAYLOAD_AGY_BIG")"
+assert_eq "extract session id after a 256 KB field" "agy" \
+    "$(ai_memory_extract_session_id "$PAYLOAD_AGY_BIG")"
 
 FAKE_CURL_BIN="$TMP/fake-curl-bin"
 FAKE_CURL_LOG="$TMP/fake-curl.log"

@@ -3339,6 +3339,32 @@ impl ReaderPool {
         .await
     }
 
+    /// The recorded `(workspace, project)` of a session that has not ended.
+    /// A mid-session checkpoint writes its artifacts there, next to where the
+    /// session's eventual end writes them, whatever scope the event resolved
+    /// to.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn open_session_scope(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT workspace_id, project_id FROM sessions \
+                     WHERE id = ?1 AND ended_at IS NULL",
+                    params![session_id.as_bytes()],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .optional()?;
+            row.map(|(ws, proj)| Ok((WorkspaceId::from_slice(&ws)?, ProjectId::from_slice(&proj)?)))
+                .transpose()
+        })
+        .await
+    }
+
     /// Ids of every session that touches `(workspace_id, project_id)`: a
     /// `sessions` row in the scope OR at least one observation stamped into
     /// it. The second leg catches the phantom projects that mid-session

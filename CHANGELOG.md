@@ -82,6 +82,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (not bare JSON 401), forms call existing `POST /auth/login` /
   `/auth/password` / `/auth/logout`, and `--web-ui-dir` custom SPAs stay
   unchanged. (#811)
+- `docs/jev-reranker-adapter.md` documents a stdlib-only adapter
+  (`docs/examples/jev-reranker-adapter/jev_rerank_shim.py`) that serves the
+  `AI_MEMORY_RERANKER=llm` request leg from a Jev `/v1/systemone` judge
+  endpoint while reverse-proxying consolidation/lint/bootstrap traffic to
+  the configured provider unchanged. In the contributor's own 102-query
+  golden-set benchmark the judge matched the hosted reranker's
+  hit@1/MRR/NDCG@10 (0.778/0.838/0.873 vs 0.778/0.840/0.875) at 0.205 s
+  mean latency instead of 20.2 s — in that run the hosted mean sat on the
+  server's 20 s completion timeout, which made the reranker stall every
+  query before falling back. (#873)
+- MCP tool calls from OpenCode 2 (2.0.4+) are routed by the native session id
+  the client sends in `params._meta["ai.opencode/sessionID"]`, ahead of the
+  `Mcp-Session-Id` transport header, which OpenCode shares across every
+  session in a directory. Concurrent OpenCode sessions in different projects
+  no longer read each other's active project; explicit `workspace`/`project`
+  arguments still win and `X-Memory-Actor-Session-Id` keeps precedence. (#864)
+- OpenCode 2 turn checkpoints: every completed root turn
+  (`session.execution.succeeded`, `.failed` or `.interrupted`, OpenCode
+  2.0.10+) now refreshes `sessions/<id>.md` and the session's automatic
+  handoff without ending the native session, because OpenCode 2's shared
+  service outlives the CLI and closing a terminal is not a session end. The
+  checkpoint is deterministic (no LLM call), is written in the session's own
+  scope, keeps one open baton per live session (refreshed in place, audited as
+  `refresh_handoff`), and never touches a session that already ended. Child
+  sessions neither claim startup context nor publish batons. (#865)
+- `install-hooks --agent opencode2 --capture-assistant` extends the
+  assistant/Stop capture double opt-in to OpenCode 2: the plugin forwards the
+  last completed assistant text through the native hook's sanitizer before it
+  reaches the spool or the wire. The captured excerpt continues the work in
+  the next session's automatic handoff; it is not rendered into the
+  git-tracked session page. (#865)
 
 ### Changed
 - Grok Build CLI shows a pending handoff, and an opted-in `[briefing]`, as
@@ -99,6 +130,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   take another (the multi-session claim-once invariant is preserved).
   Delivery of this PostToolUse handoff is exempt from `AI_MEMORY_CAPTURE_OWNER`
   capture suppression, like the other context-delivery events. (#840)
+- The generated OpenCode 2 plugin binds to the OpenCode 2.0.10+ event and hook
+  API (`session.execution.*`, `session.text.ended`, `session.moved`, the
+  `context` hook). Startup context is claimed once per root session and
+  retained on every later model request; content-only tool results are
+  captured; each location instance owns its own queue, spool state and
+  cleanup; an explicit `session.moved` rebinds the live session to its new
+  directory so its later end lands there. Checked against OpenCode 2.0.14. (#865)
 
 ### Fixed
 - `ai-memory run` auto-wired only the first config home per agent and
@@ -179,7 +217,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of `embed_query` on the configured embedder, so a
   query/document-asymmetric embedder (Google's task-typed embeddings, or
   the new query/document prefixes above) embedded the search query on the
-  document side instead of the query side. (#859)
+  document side instead of the query side. Indexed writes are unchanged;
+  only the query-side helper moves onto the query task. (#859, #861)
+- The Linux/macOS Docker wrapper now keeps its native host client in
+  `${XDG_DATA_HOME:-~/.local/share}/ai-memory/native-runner` instead of
+  `~/.cache/ai-memory/native-runner`. `ai-memory run` auto-wires hooks whose
+  command is that client's path (Claude Code, Codex, Kimi Code, Command Code,
+  Kiro CLI v3, Grok, Antigravity CLI), so flushing `~/.cache` left every hook of
+  those harnesses pointing at a missing binary. The wrapper also keeps the
+  release's `hooks/` bundle beside the client, so auto-wire no longer fails
+  with "could not locate hooks directory" for script-based harnesses on a host
+  where `install-hooks` never ran. (#874)
+- Fixed pre-push installation from linked worktrees and preserved the managed
+  block's position during reinstallation. Configured `core.hooksPath` overrides
+  and ambiguous markers are rejected without replacing the existing hook. The
+  block now keeps its shell options and `SSL_CERT_FILE` inside its subshell and
+  propagates a failure explicitly, so user hook commands after it keep their
+  own semantics and a failing test run still blocks the push. (#824)
+- Isolated the pre-push test process from Git's repository environment and
+  global/system configuration so fixture commands use their own repositories.
+  Existing installations need to run `scripts/install-git-hooks.sh` again. (#824)
+- A Windows service running as `LocalSystem` over a user-owned data
+  directory no longer breaks the wiki git history silently. libgit2's
+  dubious-ownership guard (CVE-2022-24765) fails every wiki commit with
+  `code=Owner` when the process account does not own the repository, but
+  the failure was WARN-only, so capture and search kept working while no
+  wiki checkpoint was ever committed. The startup baseline checkpoint now
+  surfaces an owner-check failure at ERROR with the remedy (run the
+  service as the owning user), and `docs/windows.md` Scenario E documents
+  running the service under a `<serviceaccount>`, corrects the claim that
+  only the data directory is account-sensitive, and notes the WinSW
+  error-1069 / stale-password gotcha for Microsoft-account / PIN / Hello
+  users. The owner check itself is deliberately left enabled. (#872)
+- A Windows folder no longer splits into two projects. The hook router
+  derived a project's *name* from the cwd after
+  `normalize_project_path_key` had ASCII-lowercased the whole
+  drive-letter/UNC path — basename included — so a session in
+  `D:\...\Default Project` was captured under `default project` while the
+  CLI (which keeps the raw basename) used `Default Project`. Because
+  `get_or_create_project` matches names case-sensitively, one folder
+  minted two projects. The router now takes the name from the raw cwd; the
+  cache key and cwd-prefix match keep the case-folded path, so #806 handoff
+  stickiness is unaffected. (#871)
 - Auto-improve review no longer stages a proposal whose LLM-produced page
   path contains a Windows-illegal character (e.g. a `:` copied from a
   conventional-commit subject). That path passed the deliberately tolerant
@@ -252,6 +331,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checksum block, which concatenates every platform's file. The zip's smoke
   test now requires LF rather than tolerating either, so the format the
   release claims is the format it ships. (#838)
+- `purge-session` now removes every page version the session owns at
+  `sessions/<id>.md` (including versions written before OKF sources existed
+  and summaries of sessions that never recorded a summary pointer), while a
+  manual page at the same path survives. (#862)
+- Shell hooks no longer pin a CPU core for minutes on a large payload. The
+  `hooks/_lib.sh` extractors for `cwd`/`workspacePaths`/`workspace_roots`,
+  the session id, and Antigravity's `invocationNum` located each key with
+  `${payload#*"key"}`, which is quadratic in the payload size under dash and
+  bash: a 200 KB Cursor `postToolUse` event spent minutes in
+  `ai_memory_extract_cwd`, and concurrent hooks stayed at 100% CPU before
+  ever reaching the POST. A shared `ai_memory_after_key` helper now finds the
+  first occurrence with one linear `awk` pass (about 50 ms at 200 KB) and
+  feeds the unchanged `sed` parsing, so the extracted values are the same as
+  before. (#870)
+- The generated TypeScript integrations (OpenCode 1 and 2, OMP, Pi,
+  OpenClaw) no longer flash a console window on Windows for every captured
+  event: their `git` lookups set `windowsHide`. The repo-root project lookup
+  behind those spawns is memoized per cwd instead of running two synchronous
+  `git` processes on every event. (#863)
+- A `SessionEnd` whose resolved scope drifted from its session (a
+  `.ai-memory.toml` appeared under the running session) was refused as a
+  foreign-scope end and stranded the session open forever. It now ends the
+  session when owner and agent match and the event comes from the session's
+  own (normalized) cwd; a different cwd, operator or agent is still refused. (#865)
+- Generated TypeScript integrations no longer overwrite each other's spooled
+  events written in the same millisecond, and a host that tears its capture
+  state down cancels still-pending deliveries after the drain budget instead
+  of waiting out each request's timeout. (#865)
 
 ## [2.4.0] - 2026-09-21
 

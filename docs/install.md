@@ -589,8 +589,8 @@ The client sanitizes (built-in patterns) and truncates the excerpt before it
 touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
 before storing. If either side is off — or the marker is malformed — the Stop
 stays empty. Re-running `install-hooks` without `--capture-assistant` removes
-the flag (idempotent). `--capture-assistant` is Claude Code and Codex on a
-native hook platform only; on any other agent or the script fallback the
+the flag (idempotent). `--capture-assistant` is Claude Code, Codex and
+OpenCode 2 (`--agent opencode2`) on a native hook platform only; on any other agent or the script fallback the
 installer refuses it rather than enabling something that cannot take effect. Assistant text is
 privacy-sensitive — read the `SECURITY.md` notes on what it can contain and where
 it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
@@ -1212,6 +1212,26 @@ Restart OpenCode after installing or changing the plugin; plugins are
 loaded at startup.
 
 ### OpenCode 2 (beta)
+
+The generated plugin targets the OpenCode 2.0.10+ event API (checked against
+2.0.14). OpenCode 2 runs one long-lived service behind every CLI, so closing a
+terminal is not a session end: each completed root turn instead writes a
+deterministic checkpoint (no LLM call) of `sessions/<id>.md` and refreshes the
+session's automatic handoff, keeping one open baton per live session. The next
+session claims the latest checkpoint. Startup context is claimed once per root
+session and retained on every later model request; child sessions never claim
+it or publish a baton.
+
+Assistant text stays opt-in, as for Claude Code and Codex: set
+`capture_assistant = true` on the server and install with
+`ai-memory install-hooks --agent opencode2 --capture-assistant --apply`. The
+plugin hands the last completed text to the native hook, which sanitizes and
+caps it before it reaches the spool or the wire; the excerpt then rides in the
+next session's automatic handoff. A bare re-apply preserves the opt-in.
+
+For a commented `opencode.jsonc`, preview `install-mcp --client opencode2` and
+merge the entry into the existing `mcp.servers` object by hand: the apply path
+writes strict JSON.
 
 The 2.0 beta installs side by side as `opencode2` and shares v1's config
 dir and session store, but its MCP schema and plugin API changed. Wire it

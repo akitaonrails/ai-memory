@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Installs this repo's pre-push hook into .git/hooks without discarding an
-# existing user hook. Run once per clone (from Git Bash on Windows):
+# Installs this repo's pre-push hook without moving existing user commands.
+# Run once per clone (from Git Bash on Windows):
 #
 #   scripts/install-git-hooks.sh
 #
@@ -12,48 +12,121 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
-hook="$repo_root/.git/hooks/pre-push"
+cd "$repo_root"
+if git config --get core.hooksPath >/dev/null; then
+    echo 'core.hooksPath is set; this installer only manages the shared repository hook directory' >&2
+    exit 1
+else
+    # `$?` is still the condition's status here: 1 means the key is unset, and
+    # anything else is a Git failure the installer must not guess past.
+    config_status=$?
+    if [[ "$config_status" -ne 1 ]]; then
+        exit "$config_status"
+    fi
+fi
+hook=$(git rev-parse --git-path hooks/pre-push)
 begin="# >>> ai-memory pre-push >>>"
 end="# <<< ai-memory pre-push <<<"
-tmp=$(mktemp "${hook}.XXXXXX")
-trap 'rm -f "$tmp"' EXIT
 
-if [[ -f "$hook" ]]; then
-    awk -v begin="$begin" -v end="$end" '
-        $0 == begin { skip = 1; next }
-        $0 == end { skip = 0; next }
-        !skip { print }
-    ' "$hook" > "$tmp"
-    if grep -q '[^[:space:]]' "$tmp"; then
-        printf '\n' >> "$tmp"
+managed_block=$(cat <<'HOOK'
+# >>> ai-memory pre-push >>>
+# Runs the full test tier before a push. See scripts/install-git-hooks.sh.
+
+# Git's hook environment would redirect fixture commands into this checkout.
+# Isolate Cargo and its children, and keep this block's shell options and
+# exports away from user hook code around it.
+(
+    set -euo pipefail
+
+    # macOS: stop reqwest re-reading the Keychain in every test process.
+    if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ] && [ -z "${SSL_CERT_FILE:-}" ] && [ -f /etc/ssl/cert.pem ]; then
+        export SSL_CERT_FILE=/etc/ssl/cert.pem
+    fi
+
+    # A plain assignment, so `set -e` still aborts if `git rev-parse` fails.
+    git_local_env_vars=$(git rev-parse --local-env-vars)
+    # A surrounding user hook may have narrowed IFS; the list below is split on
+    # newlines, so fall back to the default before splitting it. Unset rather
+    # than assigned: Bash 3.2 expands ANSI-C quoting inside this heredoc.
+    unset IFS
+    # Unquoted on purpose: the output is one variable name per line.
+    for git_local_env_var in $git_local_env_vars; do
+        unset "$git_local_env_var"
+    done
+    # Fixture repositories must not inherit machine settings such as signing.
+    # Git for Windows maps /dev/null to nul.
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+
+    if command -v cargo-nextest >/dev/null 2>&1; then
+        echo "pre-push: cargo nextest run --workspace -P full"
+        cargo nextest run --workspace -P full
     else
-        printf '%s\n\n' '#!/usr/bin/env bash' '# Installed by scripts/install-git-hooks.sh.' > "$tmp"
+        echo "pre-push: cargo test --workspace --all-targets (nextest not installed)"
+        cargo test --workspace --all-targets
+    fi
+)
+# Bash ignores `set -e` inside a subshell tested by `||`, `&&`, `!` or `if`, so
+# the subshell stays a plain command and its status is propagated here. A user
+# hook without `set -e` would otherwise run on and let the push through.
+ai_memory_pre_push_status=$?
+if [ "$ai_memory_pre_push_status" -ne 0 ]; then
+    exit "$ai_memory_pre_push_status"
+fi
+unset ai_memory_pre_push_status
+# <<< ai-memory pre-push <<<
+HOOK
+)
+
+has_content=0
+if [[ -f "$hook" ]]; then
+    if grep -q '[^[:space:]]' "$hook"; then
+        has_content=1
+    else
+        # As above, `$?` is grep's status: 1 is a blank hook, 2 a read error.
+        read_status=$?
+        if [[ "$read_status" -ne 1 ]]; then
+            exit "$read_status"
+        fi
+    fi
+fi
+
+mkdir -p "${hook%/*}"
+tmp=$(mktemp "${hook}.XXXXXX")
+if [[ "$has_content" -eq 1 ]]; then
+    # ENVIRON preserves backslashes; BINMODE prevents Windows CRLF translation.
+    if ! AI_MEMORY_PRE_PUSH_BLOCK="$managed_block" awk -v BINMODE=3 -v begin="$begin" -v end="$end" '
+        {
+            marker = $0
+            sub(/\r$/, "", marker)
+            if (marker == begin) {
+                if (inside || seen) { invalid = 1; exit 1 }
+                inside = seen = 1
+                print ENVIRON["AI_MEMORY_PRE_PUSH_BLOCK"]
+                next
+            }
+            if (marker == end) {
+                if (!inside) { invalid = 1; exit 1 }
+                inside = 0
+                next
+            }
+            if (!inside) print
+        }
+        END {
+            if (invalid || inside) exit 1
+            if (!seen) {
+                print ""
+                print ENVIRON["AI_MEMORY_PRE_PUSH_BLOCK"]
+            }
+        }
+    ' "$hook" > "$tmp"; then
+        printf 'invalid managed markers in %s; original unchanged, temporary file retained at %s\n' "$hook" "$tmp" >&2
+        exit 1
     fi
 else
     printf '%s\n\n' '#!/usr/bin/env bash' '# Installed by scripts/install-git-hooks.sh.' > "$tmp"
+    printf '%s\n' "$managed_block" >> "$tmp"
 fi
-
-cat >> "$tmp" <<'HOOK'
-# >>> ai-memory pre-push >>>
-# Runs the full test tier before a push. See scripts/install-git-hooks.sh.
-set -euo pipefail
-
-# macOS: stop reqwest re-reading the Keychain in every test process.
-if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ] && [ -z "${SSL_CERT_FILE:-}" ] && [ -f /etc/ssl/cert.pem ]; then
-    export SSL_CERT_FILE=/etc/ssl/cert.pem
-fi
-
-if command -v cargo-nextest >/dev/null 2>&1; then
-    echo "pre-push: cargo nextest run --workspace -P full"
-    cargo nextest run --workspace -P full
-else
-    echo "pre-push: cargo test --workspace --all-targets (nextest not installed)"
-    cargo test --workspace --all-targets
-fi
-# <<< ai-memory pre-push <<<
-HOOK
 
 mv "$tmp" "$hook"
-trap - EXIT
 chmod +x "$hook"
 echo "installed $hook"

@@ -10,6 +10,7 @@ use crate::cli::InstallHooksArgs;
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic};
 use crate::commands::render_shared::{
     ts_capture_policy_v1, ts_resolve_token_fn, ts_spool_runtime, ts_string_literal,
+    ts_timeout_signal,
 };
 
 pub(crate) const PLUGIN_ID: &str = "ai-memory";
@@ -340,12 +341,7 @@ const AGENT = "openclaw";
 {token_line}{resolve_fn}
 {capture_policy}
 
-function timeoutSignal(ms: number): AbortSignal | undefined {{
-  if (typeof AbortSignal === "undefined") return undefined;
-  const factory = (AbortSignal as unknown as {{ timeout?: (ms: number) => AbortSignal }}).timeout;
-  return factory ? factory(ms) : undefined;
-}}
-
+{timeout_signal}
 function authHeaders(): Record<string, string> {{
   const token = resolveToken();
   return token ? {{ Authorization: `Bearer ${{token}}` }} : {{}};
@@ -388,26 +384,7 @@ function tomlKey(text: string, key: string): string | undefined {{
 }}
 
 
-function repoRootProject(cwd: string | undefined): string | undefined {{
-  if (!cwd) return undefined;
-  try {{
-    const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (inside !== "true") return undefined;
-    const common = execFileSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (!common) return undefined;
-    const root = dirname(common);
-    if (!root || root === dirname(root)) return undefined;
-    return basename(root);
-  }} catch (_e) {{
-    return undefined;
-  }}
-}}
+{repo_root_project}
 {apply_marker_params}
 
 function textFrom(value: unknown): string {{
@@ -603,6 +580,8 @@ export default definePluginEntry({{
 "#,
         server_literal = ts_string_literal(server_url),
         token_line = token_line,
+        repo_root_project = super::install_hooks::TS_REPO_ROOT_PROJECT,
+        timeout_signal = ts_timeout_signal(),
         spool_runtime = ts_spool_runtime(),
     )
 }
@@ -624,6 +603,7 @@ mod tests {
                 .contains("if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);")
         );
         assert!(plugin.contains("else requestSpoolDrain();"));
+        crate::commands::render_shared::assert_shared_ts_delivery_runtime("openclaw", &plugin);
         assert!(plugin.contains(r#"return join(env, "hook-spool");"#));
         for f in [
             "mkdirSync",
@@ -698,6 +678,8 @@ mod tests {
         assert!(plugin.contains("if (existsSync(join(probe, \".git\")))"));
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
+        assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
+        assert_eq!(plugin.matches("windowsHide: true").count(), 2);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
