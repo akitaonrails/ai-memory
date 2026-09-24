@@ -33,6 +33,9 @@ fundamentally cannot run while another process holds the SQLite WAL writer. See
 
 `purge-session` answers *"forget this conversation"*: after it runs, the
 session is gone from the API, from `status` counts and from search.
+It removes both earlier and later summary versions identified as belonging to
+that session; hand-written versions at the same path remain, including a later
+live wiki file.
 
 ```bash
 ai-memory purge-session \

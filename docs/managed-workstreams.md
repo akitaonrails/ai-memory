@@ -572,8 +572,16 @@ the launched Crush process continues its normal native session writes.
 The Linux/macOS Docker shell wrapper cannot inspect host projects or execute a
 host agent from inside its helper container. For `run`, `show`, `continue`,
 `resume`, and `workstreams`, it downloads the matching native release into
-`~/.cache/ai-memory/native-runner`, verifies the published SHA-256 checksum, and
-executes that host client. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
+`${XDG_DATA_HOME:-~/.local/share}/ai-memory/native-runner`, verifies the
+published SHA-256 checksum, and executes that host client. The release's
+`hooks/` bundle is kept beside it so auto-wire can stage hook scripts on a host
+where `install-hooks` never ran. The client lives with the host's ai-memory data
+rather than under `~/.cache` because auto-wired hook configuration runs it
+directly: a cache flush must not break capture. A client downloaded by an older
+wrapper stays in `~/.cache/ai-memory/native-runner`, and hooks auto-wired from it
+keep that path until a newer client version auto-wires again. To move them now,
+re-run `ai-memory install-hooks --agent <agent> --apply`, then delete the old
+directory. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
 specific native build. Native package, release, and source installs need no
 shim. On native Windows, use the published `ai-memory.exe` or a source build.
 

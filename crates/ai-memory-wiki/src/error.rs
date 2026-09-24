@@ -60,6 +60,21 @@ pub enum WikiError {
     /// `409 Conflict` at the admin layer.
     #[error("destination page file already exists: {0}")]
     DestinationPageExists(String),
+
+    /// libgit2 refused a wiki-repository operation because the repository is
+    /// not owned by the account this process runs as (`code=Owner`, the
+    /// CVE-2022-24765 dubious-ownership guard). Kept distinct from a generic
+    /// I/O error so startup can surface it at ERROR with a fix: on a Windows
+    /// LocalSystem service over a user-owned data dir every wiki commit fails
+    /// this check, and it was previously logged WARN-only so nothing surfaced.
+    /// The owner check is deliberately left enabled (disabling it is
+    /// `unsafe` and reopens the CVE); the remedy is to run the service as the
+    /// owning user.
+    #[error(
+        "wiki git repository is not owned by the current account \
+         (libgit2 owner check, code=Owner): {0}"
+    )]
+    GitOwner(String),
 }
 
 impl From<serde_yaml::Error> for WikiError {

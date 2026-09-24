@@ -708,6 +708,14 @@ fn should_try_commit_cli_fallback(error: &git2::Error) -> bool {
         return true;
     }
 
+    // An owner-check failure must NOT fall back to the git CLI: the CLI runs
+    // the same CVE-2022-24765 ownership guard and would refuse identically, so
+    // a fallback would only mask the real cause. Let it map through to
+    // `WikiError::GitOwner` and surface at ERROR instead.
+    if matches!(error.code(), ErrorCode::Owner) {
+        return false;
+    }
+
     #[cfg(windows)]
     {
         // On native Windows, libgit2 can fail to reopen a freshly initialised
@@ -873,6 +881,14 @@ fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<std::p
 }
 
 fn map_git_err(e: git2::Error) -> WikiError {
+    // An owner-check failure (`code=Owner`, CVE-2022-24765 dubious-ownership
+    // guard) is kept as a distinct variant so startup can log it at ERROR with
+    // an actionable fix instead of burying it in a generic WARN. Everything
+    // else stays an opaque I/O error, matching prior behaviour.
+    if matches!(e.code(), ErrorCode::Owner) {
+        warn!(error = %e, "libgit2 wiki owner-validation error");
+        return WikiError::GitOwner(e.to_string());
+    }
     warn!(error = %e, "libgit2 error");
     WikiError::Io(std::io::Error::other(e.to_string()))
 }
@@ -1268,6 +1284,43 @@ mod tests {
             "failed to open",
         );
         assert!(!is_racy_read(&other_message));
+    }
+
+    /// A libgit2 owner-check failure is not silently "recovered": it must not
+    /// trigger the git CLI fallback (the CLI enforces the same CVE-2022-24765
+    /// guard and would refuse identically), and it must map to the distinct
+    /// `GitOwner` variant so startup can surface it at ERROR. A generic error
+    /// still maps to the opaque I/O variant — proving the classification bites.
+    #[test]
+    fn owner_error_is_surfaced_not_recovered() {
+        let owner = git2::Error::new(
+            ErrorCode::Owner,
+            git2::ErrorClass::Config,
+            "repository path is not owned by current user",
+        );
+        assert!(
+            !should_try_commit_cli_fallback(&owner),
+            "an owner error must not fall back to the git CLI (same guard)"
+        );
+        assert!(
+            matches!(map_git_err(owner), WikiError::GitOwner(_)),
+            "an owner error must map to the distinct GitOwner variant"
+        );
+
+        // Control: a NotFound error still asks for the CLI fallback, and a
+        // generic error is still the opaque I/O variant (not GitOwner).
+        let not_found = git2::Error::new(
+            ErrorCode::NotFound,
+            git2::ErrorClass::Repository,
+            "not found",
+        );
+        assert!(should_try_commit_cli_fallback(&not_found));
+        let generic = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "some other failure",
+        );
+        assert!(matches!(map_git_err(generic), WikiError::Io(_)));
     }
 
     /// A racy read keeps the commit path-scoped; any other failure walks.

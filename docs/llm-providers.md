@@ -191,8 +191,11 @@ request sends the query plus at most 30 bounded page titles and search snippets
 to the configured provider; all values are JSON-encoded and treated as
 untrusted data. A timeout, provider error, or incomplete/invalid score set
 preserves the normal order. `global=true` and supplemental global-preference
-hits keep their existing non-RRF ranking. Concurrent provider calls are capped
-at four; saturated queries keep their local ranking without waiting.
+at four; saturated queries keep their local ranking without waiting. If the
+configured provider is too slow for interactive reranking, a judge-endpoint
+adapter can serve the reranker leg in sub-second time while consolidation
+keeps the hosted model — see
+[`docs/jev-reranker-adapter.md`](jev-reranker-adapter.md).
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`,

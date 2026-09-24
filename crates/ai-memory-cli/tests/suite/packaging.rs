@@ -1153,6 +1153,1028 @@ fn macos_docs_use_valid_install_commands_and_release_body_points_to_them() {
     assert!(release.contains("follow the bundled docs/macos.md"));
 }
 
+// ---------------------------------------------------------------------------
+// The generated pre-push hook and the Git environment it hands to Cargo.
+//
+// Git exports the repository-local environment to every hook it runs. The test
+// suite builds throwaway Git repositories as fixtures, and a fixture that
+// inherits GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE runs against the checkout
+// being pushed instead of its own temp directory. These tests pin the scrub.
+//
+// `cargo` here is a fake -- an exported Bash function that records its argv and
+// the environment it was given and returns a chosen code. It is an observation
+// boundary only: nothing below runs the real test suite. Git's own repository
+// and config resolution is never mocked: both fixture repositories are real and
+// every probe is a read-only `git` command.
+//
+// Unix and Windows both run these; on Windows via Git for Windows' bash.exe.
+// Every give-up path goes through `skip_pre_push_tests`.
+// ---------------------------------------------------------------------------
+
+/// Every external command the installer, the generated hook, and the probes
+/// below actually run. Shell builtins (`printf`, `echo`, `command`) are not
+/// here; neither is `cargo`, which is an exported function.
+#[cfg(any(unix, windows))]
+const FIXTURE_TOOLS: &[&str] = &[
+    "awk", "bash", "cat", "chmod", "env", "git", "grep", "mkdir", "mktemp", "mv", "sort", "uname",
+];
+
+/// The runner's last line, which hands over to the installed hook.
+#[cfg(any(unix, windows))]
+const RUNNER_EXEC: &str = "exec bash \"$AI_MEMORY_FIXTURE_HOOK\"\n";
+
+/// Give up on the pre-push tests, or refuse to.
+///
+/// A contributor whose machine lacks Git Bash or a fixture tool gets a skip,
+/// matching the convention in `install_hooks`' shell-contract test. On CI that
+/// same skip would turn a missing prerequisite into a green Windows job that
+/// proved nothing, so there it is a failure with the concrete reason.
+#[cfg(any(unix, windows))]
+fn skip_pre_push_tests<T>(reason: &str) -> Option<T> {
+    let on_ci = ["GITHUB_ACTIONS", "CI"].iter().any(|key| {
+        std::env::var_os(key).is_some_and(|value| !value.is_empty() && value != "false")
+    });
+    assert!(
+        !on_ci,
+        "the pre-push hook regressions must run on CI, but {reason}"
+    );
+    eprintln!("skipping pre-push hook tests: {reason}");
+    None
+}
+
+/// Resolve `tool` against a `PATH`-shaped value, trying the bare name and the
+/// `.exe` Windows carries.
+#[cfg(any(unix, windows))]
+fn resolve_in_path(path: &std::ffi::OsStr, tool: &str) -> Option<PathBuf> {
+    std::env::split_paths(path).find_map(|dir| {
+        let bare = dir.join(tool);
+        if bare.is_file() {
+            return Some(bare);
+        }
+        let exe = dir.join(format!("{tool}.exe"));
+        exe.is_file().then_some(exe)
+    })
+}
+
+/// macOS hands back `/var/folders/...` while Git reports `/private/var/...`.
+/// Windows canonicalization yields a `\\?\` verbatim path that Git Bash cannot
+/// use, so leave it alone there.
+#[cfg(unix)]
+fn sandbox_root(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(path).unwrap()
+}
+
+#[cfg(windows)]
+fn sandbox_root(path: PathBuf) -> PathBuf {
+    path
+}
+
+/// The Git for Windows installation root, derived from wherever `bash.exe`
+/// lives. Mirrors the discovery in `install_hooks`' shell-contract test, plus
+/// the root implied by a `git.exe` already on `PATH`.
+#[cfg(windows)]
+fn git_for_windows_root() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(root) = std::env::var_os("EXEPATH") {
+        candidates.push(PathBuf::from(root));
+    }
+    for env_key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(env_key) {
+            candidates.push(PathBuf::from(root).join("Git"));
+        }
+    }
+    // `<root>/cmd/git.exe` and `<root>/mingw64/bin/git.exe` both sit under the
+    // installation root; walk up to it.
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        if !dir.join("git.exe").is_file() {
+            continue;
+        }
+        let mut up = dir.clone();
+        for _ in 0..2 {
+            if !up.pop() {
+                break;
+            }
+            candidates.push(up.clone());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .find(|root| {
+            root.join("usr").join("bin").join("bash.exe").is_file()
+                || root.join("bin").join("bash.exe").is_file()
+        })
+        .or_else(|| skip_pre_push_tests("Git for Windows bash.exe was not found"))
+}
+
+/// The `PATH` the fixture hands the installer and the hook.
+///
+/// It must hold every tool those scripts run and must not hold `cargo-nextest`,
+/// which the hook branches on. `cargo` is an exported Bash function, so it
+/// never needs to be on `PATH` at all.
+///
+/// Unix: symlink each tool into the fixture's own `bin`. Dropping inherited
+/// `PATH` directories instead would cost a contributor with `cargo-nextest`
+/// next to `git` or `bash` those unrelated commands.
+#[cfg(unix)]
+fn fixture_path(bin: &Path) -> Option<std::ffi::OsString> {
+    let dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    for tool in FIXTURE_TOOLS {
+        let Some(real) = dirs
+            .iter()
+            .map(|dir| dir.join(tool))
+            .find(|candidate| candidate.is_file())
+        else {
+            return skip_pre_push_tests(&format!("{tool} was not found on PATH"));
+        };
+        std::os::unix::fs::symlink(real, bin.join(tool)).unwrap();
+    }
+    Some(bin.as_os_str().to_owned())
+}
+
+/// Windows: NTFS has no mode bits and MSYS will not treat a plain fixture file
+/// as executable, so a curated `bin` of shims is not available. Use the Git for
+/// Windows tool directories instead -- they hold every tool in
+/// [`FIXTURE_TOOLS`], and `cargo-nextest` (installed under `~/.cargo/bin`) is
+/// excluded by construction rather than by filtering the inherited `PATH`.
+#[cfg(windows)]
+fn fixture_path(_bin: &Path) -> Option<std::ffi::OsString> {
+    let root = git_for_windows_root()?;
+    let dirs: Vec<PathBuf> = [
+        Path::new("usr").join("bin"),
+        Path::new("mingw64").join("bin"),
+        Path::new("mingw32").join("bin"),
+        PathBuf::from("bin"),
+        PathBuf::from("cmd"),
+    ]
+    .iter()
+    .map(|relative| root.join(relative))
+    .filter(|dir| dir.is_dir())
+    .collect();
+    Some(std::env::join_paths(dirs).expect("Git for Windows paths must not contain ';'"))
+}
+
+#[cfg(any(unix, windows))]
+fn log_field<'a>(log: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key}:");
+    log.lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no `{key}:` line in:\n{log}"))
+}
+
+/// Windows temp paths can use an 8.3 alias while Git reports the long name.
+/// Resolve both paths before comparing them; invalid paths still fail.
+#[cfg(any(unix, windows))]
+fn assert_same_directory(reported: &str, expected: &str, context: &str) {
+    let resolve = |label: &str, value: &str| {
+        std::fs::canonicalize(value).unwrap_or_else(|err| {
+            panic!("{context}\nthe {label} path `{value}` is not a directory: {err}")
+        })
+    };
+    assert_eq!(
+        resolve("reported", reported),
+        resolve("expected", expected),
+        "{context}"
+    );
+}
+
+#[cfg(any(unix, windows))]
+fn log_section<'a>(log: &'a str, name: &str) -> &'a str {
+    let begin = format!("{name}-begin\n");
+    let end = format!("{name}-end\n");
+    let start = log
+        .find(begin.as_str())
+        .unwrap_or_else(|| panic!("no `{name}-begin` in:\n{log}"))
+        + begin.len();
+    let rest = &log[start..];
+    let stop = rest
+        .find(end.as_str())
+        .unwrap_or_else(|| panic!("no `{name}-end` in:\n{log}"));
+    &rest[..stop]
+}
+
+/// A retained sandbox for the generated pre-push hook.
+///
+/// `hook_repo` stands in for the checkout being pushed; `fixture_repo` for the
+/// throwaway repository a test would build. Both are real Git repositories in
+/// the same temp root, so even the pre-fix hook cannot reach this checkout.
+#[cfg(any(unix, windows))]
+struct PrePushFixture {
+    hook_repo: PathBuf,
+    fixture_repo: PathBuf,
+    home: PathBuf,
+    hook: PathBuf,
+    runner: PathBuf,
+    cargo_log: PathBuf,
+    caller_log: PathBuf,
+    global_config: PathBuf,
+    system_config: PathBuf,
+    path: std::ffi::OsString,
+    bash: PathBuf,
+    git: PathBuf,
+    /// `Some` under Git Bash, where scripts need MSYS paths. `None` on Unix.
+    cygpath: Option<PathBuf>,
+    hook_toplevel: String,
+    fixture_toplevel: String,
+}
+
+#[cfg(any(unix, windows))]
+impl PrePushFixture {
+    fn new() -> Option<Self> {
+        // `keep()`: the sandbox is the evidence behind a failure, so it outlives
+        // the test rather than being deleted on drop.
+        let root = sandbox_root(tempfile::tempdir().unwrap().keep());
+        assert!(
+            !root.starts_with(repo_root()),
+            "the sandbox must live outside this checkout, got {}",
+            root.display()
+        );
+
+        // Every fixture path carries an apostrophe and a space, so a path
+        // interpolated into a shell literal anywhere below would break.
+        let work = root.join("it's a sandbox");
+        let home = work.join("home");
+        let bin = work.join("bin");
+        let hook_repo = work.join("hook repo");
+        let fixture_repo = work.join("fixture repo");
+        for dir in [&home, &bin, &hook_repo, &fixture_repo] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+
+        // Synthetic machine config. The caller must keep seeing these; Cargo
+        // must not.
+        let global_config = work.join("global.gitconfig");
+        let system_config = work.join("system.gitconfig");
+        std::fs::write(&global_config, "[fixture]\n\tglobal = from-global-config\n").unwrap();
+        std::fs::write(&system_config, "[fixture]\n\tsystem = from-system-config\n").unwrap();
+
+        let path = fixture_path(&bin)?;
+        for tool in FIXTURE_TOOLS {
+            if resolve_in_path(&path, tool).is_none() {
+                return skip_pre_push_tests(&format!(
+                    "{tool} is missing from the fixture PATH ({})",
+                    path.to_string_lossy()
+                ));
+            }
+        }
+        if let Some(found) = resolve_in_path(&path, "cargo-nextest") {
+            return skip_pre_push_tests(&format!(
+                "cargo-nextest is reachable at {}, so the fallback branch is not deterministic",
+                found.display()
+            ));
+        }
+        let cygpath = resolve_in_path(&path, "cygpath");
+        if cfg!(windows) && cygpath.is_none() {
+            return skip_pre_push_tests("cygpath is missing from the Git for Windows PATH");
+        }
+
+        let mut fixture = Self {
+            bash: resolve_in_path(&path, "bash").expect("checked above"),
+            git: resolve_in_path(&path, "git").expect("checked above"),
+            hook: hook_repo.join(".git").join("hooks").join("pre-push"),
+            runner: work.join("runner.sh"),
+            cargo_log: work.join("cargo.log"),
+            caller_log: work.join("caller.log"),
+            cygpath,
+            path,
+            hook_repo,
+            fixture_repo,
+            home,
+            global_config,
+            system_config,
+            hook_toplevel: String::new(),
+            fixture_toplevel: String::new(),
+        };
+        fixture.git(&fixture.hook_repo, &["init", "-q"]);
+        fixture.git(&fixture.fixture_repo, &["init", "-q"]);
+        // Compare Git's own answers rather than Rust path strings: Git Bash
+        // reports `C:/...` where Rust reports `C:\...`.
+        fixture.hook_toplevel = fixture.git(&fixture.hook_repo, &["rev-parse", "--show-toplevel"]);
+        fixture.fixture_toplevel =
+            fixture.git(&fixture.fixture_repo, &["rev-parse", "--show-toplevel"]);
+        Some(fixture)
+    }
+
+    /// Drop the ambient Git environment and point HOME and the global/system
+    /// config at the sandbox.
+    fn isolate(&self, command: &mut Command) {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(&key);
+            }
+        }
+        command
+            .env("PATH", &self.path)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("GIT_CONFIG_GLOBAL", &self.global_config)
+            .env("GIT_CONFIG_SYSTEM", &self.system_config);
+    }
+
+    /// The paths the generated scripts read. They go through the environment so
+    /// no path is ever interpolated into a shell literal.
+    fn shell_env(&self, command: &mut Command) {
+        command
+            .env("AI_MEMORY_FIXTURE_REPO", self.git_arg(&self.fixture_repo))
+            .env(
+                "AI_MEMORY_FIXTURE_CARGO_LOG",
+                self.shell_arg(&self.cargo_log),
+            )
+            .env(
+                "AI_MEMORY_FIXTURE_CALLER_LOG",
+                self.shell_arg(&self.caller_log),
+            )
+            .env("AI_MEMORY_FIXTURE_HOOK", self.shell_arg(&self.hook));
+    }
+
+    /// Bash needs MSYS paths for scripts and redirections on Windows.
+    fn shell_arg(&self, path: &Path) -> String {
+        self.cygpath_arg("-u", path)
+    }
+
+    /// Native Git cannot resolve an MSYS `/tmp` mount. Use `C:/...` paths for
+    /// its arguments so correctness does not depend on MSYS argument conversion.
+    fn git_arg(&self, path: &Path) -> String {
+        self.cygpath_arg("-m", path)
+    }
+
+    fn cygpath_arg(&self, mode: &str, path: &Path) -> String {
+        let Some(cygpath) = &self.cygpath else {
+            return path.display().to_string();
+        };
+        let output = Command::new(cygpath).arg(mode).arg(path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "cygpath {mode} {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn git(&self, dir: &Path, args: &[&str]) -> String {
+        let mut command = Command::new(&self.git);
+        self.isolate(&mut command);
+        let output = command.args(args).current_dir(dir).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// A read-only probe block, reused by the fake Cargo and by the user hook.
+    fn probe(&self, name: &str) -> String {
+        let log = if name == "cargo" {
+            "AI_MEMORY_FIXTURE_CARGO_LOG"
+        } else {
+            "AI_MEMORY_FIXTURE_CALLER_LOG"
+        };
+        format!(
+            r#"{{
+  printf '{name}-begin\n'
+  env | grep '^GIT_' | LC_ALL=C sort
+  printf '{name}-end\n'
+  printf '{name}-ifs:[%s]\n' "${{IFS-<unset>}}"
+  printf '{name}-opts:[%s]\n' "$-"
+  printf '{name}-pipefail:[%s]\n' "$([[ -o pipefail ]] && echo on || echo off)"
+  printf '{name}-ssl:[%s]\n' "${{SSL_CERT_FILE-<unset>}}"
+  printf '{name}-toplevel:%s\n' "$(git -C "$AI_MEMORY_FIXTURE_REPO" rev-parse --show-toplevel 2>&1)"
+  printf '{name}-injected:%s\n' "$(git -C "$AI_MEMORY_FIXTURE_REPO" config --get fixture.injected 2>&1)"
+  printf '{name}-counted:%s\n' "$(git -C "$AI_MEMORY_FIXTURE_REPO" config --get fixture.counted 2>&1)"
+  printf '{name}-global:%s\n' "$(git -C "$AI_MEMORY_FIXTURE_REPO" config --get fixture.global 2>&1)"
+  printf '{name}-system:%s\n' "$(git -C "$AI_MEMORY_FIXTURE_REPO" config --get fixture.system 2>&1)"
+}} >> "${log}" 2>&1
+"#
+        )
+    }
+
+    /// The runner that stands in for Cargo and then execs the installed hook.
+    ///
+    /// Both fakes are exported Bash functions: a function needs no execute bit,
+    /// which NTFS cannot give a fixture file under Git Bash, and it lets the
+    /// hook's `command -v cargo-nextest` probe answer what the test asked for.
+    fn write_runner(&self, exit_code: i32, with_nextest: bool) {
+        let mut runner = format!(
+            "#!/usr/bin/env bash\n\
+             cargo() {{\n\
+             \x20 printf 'cargo-argv:%s\\n' \"$*\" >> \"$AI_MEMORY_FIXTURE_CARGO_LOG\"\n\
+             {probe}\
+             \x20 return {exit_code}\n\
+             }}\n\
+             export -f cargo\n",
+            probe = self.probe("cargo"),
+        );
+        if with_nextest {
+            runner.push_str("cargo-nextest() { return 0; }\nexport -f cargo-nextest\n");
+        }
+        runner.push_str(RUNNER_EXEC);
+        std::fs::write(&self.runner, runner).unwrap();
+    }
+
+    /// Make the hook's `git rev-parse --local-env-vars` fail with `code`. The
+    /// exported function shadows `git` for that one call and defers to the real
+    /// binary for everything else, including the probes.
+    fn fail_local_env_vars(&self, code: i32) {
+        let runner = std::fs::read_to_string(&self.runner).unwrap();
+        let prelude = runner
+            .strip_suffix(RUNNER_EXEC)
+            .expect("write_runner must run first");
+        let git = format!(
+            "git() {{\n\
+             \x20 if [ \"$1\" = rev-parse ] && [ \"$2\" = --local-env-vars ]; then return {code}; fi\n\
+             \x20 command git \"$@\"\n\
+             }}\n\
+             export -f git\n"
+        );
+        std::fs::write(&self.runner, format!("{prelude}{git}{RUNNER_EXEC}")).unwrap();
+    }
+
+    /// Seed a user hook whose own content precedes the managed block.
+    fn write_user_hook(&self, prelude: &str) {
+        std::fs::write(
+            &self.hook,
+            format!(
+                "#!/usr/bin/env bash\n# A user hook that predates the managed block.\n{prelude}{}",
+                self.probe("before"),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Append the user's trailing content after the managed block's end marker.
+    fn append_after_managed_block(&self) {
+        let installed = std::fs::read_to_string(&self.hook).unwrap();
+        assert!(
+            installed
+                .trim_end()
+                .ends_with("# <<< ai-memory pre-push <<<"),
+            "the managed block should close the installed hook:\n{installed}"
+        );
+        std::fs::write(&self.hook, format!("{installed}{}", self.probe("after"))).unwrap();
+    }
+
+    fn install_hook(&self) {
+        self.install_hook_from(&self.hook_repo);
+    }
+
+    fn install_hook_from(&self, cwd: &Path) {
+        let mut command = Command::new(&self.bash);
+        command.arg(self.shell_arg(&repo_root().join("scripts/install-git-hooks.sh")));
+        self.isolate(&mut command);
+        let output = command.current_dir(cwd).output().unwrap();
+        assert!(
+            output.status.success(),
+            "installer failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Run the installed hook with exactly the repository-local environment Git
+    /// exports to a pre-push hook. Every injected path is inside the sandbox.
+    fn run_hook(&self) -> std::process::Output {
+        let mut command = Command::new(&self.bash);
+        command.arg(self.shell_arg(&self.runner));
+        self.isolate(&mut command);
+        self.shell_env(&mut command);
+        command
+            .current_dir(&self.hook_repo)
+            .env("GIT_DIR", self.hook_repo.join(".git"))
+            .env("GIT_COMMON_DIR", self.hook_repo.join(".git"))
+            .env("GIT_WORK_TREE", &self.hook_repo)
+            .env("GIT_INDEX_FILE", self.hook_repo.join(".git").join("index"))
+            .env("GIT_PREFIX", "")
+            .env(
+                "GIT_CONFIG_PARAMETERS",
+                "'fixture.injected=from-parameters'",
+            )
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "fixture.counted")
+            .env("GIT_CONFIG_VALUE_0", "from-count");
+        command.output().unwrap()
+    }
+
+    fn cargo_log(&self) -> String {
+        std::fs::read_to_string(&self.cargo_log).unwrap_or_default()
+    }
+
+    fn caller_log(&self) -> String {
+        std::fs::read_to_string(&self.caller_log).unwrap_or_default()
+    }
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_scrubs_the_repository_git_environment_before_cargo() {
+    let Some(fixture) = PrePushFixture::new() else {
+        return;
+    };
+    fixture.write_runner(0, false);
+    fixture.install_hook();
+
+    let output = fixture.run_hook();
+    assert!(
+        output.status.success(),
+        "hook failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fixture.cargo_log();
+    let git_env = log_section(&log, "cargo");
+    for leaked in [
+        "GIT_DIR=",
+        "GIT_COMMON_DIR=",
+        "GIT_WORK_TREE=",
+        "GIT_INDEX_FILE=",
+        "GIT_CONFIG_PARAMETERS=",
+        "GIT_CONFIG_COUNT=",
+        "GIT_PREFIX=",
+    ] {
+        assert!(
+            !git_env.contains(leaked),
+            "{leaked} reached cargo; a fixture repo would act on the pushed checkout:\n{git_env}"
+        );
+    }
+    for expected in [
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_CONFIG_SYSTEM=/dev/null",
+    ] {
+        assert!(
+            git_env.contains(expected),
+            "cargo should run with {expected}:\n{git_env}"
+        );
+    }
+
+    // The decisive check: a child `git` aimed at the fixture repository must
+    // land there, not in the repository whose hook is running.
+    assert_same_directory(
+        log_field(&log, "cargo-toplevel"),
+        &fixture.fixture_toplevel,
+        &format!("child git resolved the wrong repository:\n{log}"),
+    );
+    for (key, source) in [
+        ("cargo-injected", "GIT_CONFIG_PARAMETERS"),
+        ("cargo-counted", "GIT_CONFIG_COUNT"),
+        ("cargo-global", "the global config"),
+        ("cargo-system", "the system config"),
+    ] {
+        assert_eq!(
+            log_field(&log, key),
+            "",
+            "{source} still reached the fixture repository:\n{log}"
+        );
+    }
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_leaves_the_user_hook_environment_intact_around_the_block() {
+    let Some(fixture) = PrePushFixture::new() else {
+        return;
+    };
+    fixture.write_runner(0, false);
+    fixture.write_user_hook("");
+    fixture.install_hook();
+    fixture.append_after_managed_block();
+
+    let output = fixture.run_hook();
+    assert!(
+        output.status.success(),
+        "hook failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fixture.caller_log();
+    for stage in ["before", "after"] {
+        let git_env = log_section(&log, stage);
+        for kept in ["GIT_DIR=", "GIT_INDEX_FILE=", "GIT_CONFIG_COUNT=1"] {
+            assert!(
+                git_env.contains(kept),
+                "the scrub escaped the managed block and took {kept} from the {stage} content:\n{git_env}"
+            );
+        }
+        // The scrub's own settings must not leak outward either: the caller
+        // keeps its synthetic global/system config and never sees NOSYSTEM.
+        assert!(
+            !git_env.contains("GIT_CONFIG_GLOBAL=/dev/null")
+                && !git_env.contains("GIT_CONFIG_SYSTEM=/dev/null"),
+            "the {stage} content must keep the caller's own config paths:\n{git_env}"
+        );
+        assert!(
+            !git_env.contains("GIT_CONFIG_NOSYSTEM"),
+            "the {stage} content must not inherit the scrub's GIT_CONFIG_NOSYSTEM:\n{git_env}"
+        );
+        // The caller's Git still resolves through the inherited GIT_DIR, which
+        // points at the hook's repository rather than the fixture repository
+        // the command names.
+        assert_same_directory(
+            log_field(&log, &format!("{stage}-toplevel")),
+            &fixture.hook_toplevel,
+            &format!("the {stage} content lost the repository Git gave it:\n{log}"),
+        );
+        for (key, expected, source) in [
+            ("global", "from-global-config", "the global config"),
+            ("system", "from-system-config", "the system config"),
+            ("injected", "from-parameters", "GIT_CONFIG_PARAMETERS"),
+            ("counted", "from-count", "GIT_CONFIG_COUNT"),
+        ] {
+            assert_eq!(
+                log_field(&log, &format!("{stage}-{key}")),
+                expected,
+                "the {stage} content lost {source}:\n{log}"
+            );
+        }
+    }
+    // The block's own shell options and exports stay inside it too: the block
+    // is replaced in place, so user commands after it run with whatever it
+    // leaves behind.
+    for key in ["opts", "pipefail", "ssl"] {
+        assert_eq!(
+            log_field(&log, &format!("after-{key}")),
+            log_field(&log, &format!("before-{key}")),
+            "the managed block's {key} leaked into the trailing user content:\n{log}"
+        );
+    }
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_reinstall_keeps_user_content_and_one_managed_block() {
+    let Some(fixture) = PrePushFixture::new() else {
+        return;
+    };
+    fixture.write_runner(0, false);
+    fixture.write_user_hook("printf 'order-before\\n'\n");
+    fixture.install_hook();
+    fixture.append_after_managed_block();
+    let original = std::fs::read_to_string(&fixture.hook).unwrap();
+    let original = format!("{original}printf 'order-after\\n'\n");
+    std::fs::write(&fixture.hook, &original).unwrap();
+    fixture.install_hook();
+
+    let installed = std::fs::read_to_string(&fixture.hook).unwrap();
+    assert_eq!(
+        installed, original,
+        "reinstalling changed the hook's layout"
+    );
+    assert_eq!(
+        installed.matches("# >>> ai-memory pre-push >>>").count(),
+        1,
+        "reinstalling duplicated the managed block:\n{installed}"
+    );
+    assert_eq!(
+        installed.matches("printf 'before-begin\\n'").count(),
+        1,
+        "reinstalling lost or duplicated the user's leading content:\n{installed}"
+    );
+    assert_eq!(
+        installed.matches("printf 'after-begin\\n'").count(),
+        1,
+        "reinstalling lost or duplicated the user's trailing content:\n{installed}"
+    );
+
+    let output = fixture.run_hook();
+    assert!(
+        output.status.success(),
+        "reinstalled hook failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = fixture.cargo_log();
+    assert_same_directory(
+        log_field(&log, "cargo-toplevel"),
+        &fixture.fixture_toplevel,
+        "the scrub did not survive a reinstall",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.find("order-before").unwrap() < stdout.find("pre-push: cargo").unwrap());
+    assert!(stdout.find("pre-push: cargo").unwrap() < stdout.find("order-after").unwrap());
+    fixture.write_runner(29, false);
+    let failed = fixture.run_hook();
+    assert_eq!(failed.status.code(), Some(29));
+    assert!(!String::from_utf8_lossy(&failed.stdout).contains("order-after"));
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_stops_before_cargo_and_user_content_when_the_scrub_fails() {
+    let Some(fixture) = PrePushFixture::new() else {
+        return;
+    };
+    fixture.write_runner(0, false);
+    fixture.fail_local_env_vars(23);
+    // No `set -e` in the user hook: the block alone has to stop the push.
+    fixture.write_user_hook("");
+    fixture.install_hook();
+    fixture.append_after_managed_block();
+
+    let output = fixture.run_hook();
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "a failed scrub must fail the hook: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !fixture.cargo_log().contains("cargo-argv:"),
+        "Cargo ran without the scrub:\n{}",
+        fixture.cargo_log()
+    );
+    let caller = fixture.caller_log();
+    assert!(
+        caller.contains("before-begin") && !caller.contains("after-begin"),
+        "the user's trailing content ran after the block failed:\n{caller}"
+    );
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_installs_from_a_linked_worktree_subdirectory() {
+    let Some(fixture) = PrePushFixture::new() else {
+        return;
+    };
+    fixture.git(
+        &fixture.hook_repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-qm",
+            "fixture",
+        ],
+    );
+    let linked = fixture.hook_repo.parent().unwrap().join("linked checkout");
+    fixture.git(
+        &fixture.hook_repo,
+        &["worktree", "add", "--detach", &fixture.git_arg(&linked)],
+    );
+    let nested = linked.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    assert!(linked.join(".git").is_file());
+    fixture.install_hook_from(&nested);
+    assert!(
+        fixture.hook.is_file(),
+        "linked worktrees must use the shared hook"
+    );
+    fixture.install_hook_from(&fixture.hook_repo);
+
+    fixture.write_runner(0, false);
+    let runner = std::fs::read_to_string(&fixture.runner).unwrap();
+    std::fs::write(
+        &fixture.runner,
+        runner.replace(
+            "exec bash \"$AI_MEMORY_FIXTURE_HOOK\"",
+            "exec git hook run pre-push",
+        ),
+    )
+    .unwrap();
+    let mut command = Command::new(&fixture.bash);
+    command.arg(fixture.shell_arg(&fixture.runner));
+    fixture.isolate(&mut command);
+    fixture.shell_env(&mut command);
+    let output = command.current_dir(&nested).output().unwrap();
+    assert!(
+        output.status.success(),
+        "Git failed to run the shared hook: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        log_field(&fixture.cargo_log(), "cargo-argv"),
+        "test --workspace --all-targets"
+    );
+    assert_same_directory(
+        log_field(&fixture.cargo_log(), "cargo-toplevel"),
+        &fixture.fixture_toplevel,
+        "the shared hook must isolate Cargo's Git environment",
+    );
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_refuses_configured_hooks_paths_without_writing() {
+    for (scope, value) in [
+        ("--local", ""),
+        ("--local", ".git/hooks"),
+        ("--local", "/dev/null"),
+        ("--local", "custom hooks"),
+        ("--global", "absolute"),
+    ] {
+        let Some(fixture) = PrePushFixture::new() else {
+            return;
+        };
+        let shared = fixture.home.join("shared hooks");
+        std::fs::create_dir(&shared).unwrap();
+        let shared_hook = shared.join("pre-push");
+        std::fs::write(&shared_hook, "#!/bin/sh\necho user-owned\n").unwrap();
+        let path = if value == "absolute" {
+            fixture.git_arg(&shared)
+        } else {
+            value.to_owned()
+        };
+        fixture.git(
+            &fixture.hook_repo,
+            &["config", scope, "core.hooksPath", &path],
+        );
+        let mut command = Command::new(&fixture.bash);
+        command.arg(fixture.shell_arg(&repo_root().join("scripts/install-git-hooks.sh")));
+        fixture.isolate(&mut command);
+        let output = command.current_dir(&fixture.hook_repo).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("core.hooksPath is set"));
+        assert!(!fixture.hook.exists());
+        assert!(!fixture.hook_repo.join("custom hooks").exists());
+        assert_eq!(
+            std::fs::read_to_string(shared_hook).unwrap(),
+            "#!/bin/sh\necho user-owned\n"
+        );
+        assert_eq!(
+            fixture.git(&fixture.hook_repo, &["config", "--get", "core.hooksPath"]),
+            path
+        );
+    }
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_refuses_ambiguous_markers_without_replacing_the_user_hook() {
+    let begin = "# >>> ai-memory pre-push >>>";
+    let end = "# <<< ai-memory pre-push <<<";
+    for body in [
+        format!("{begin}\necho user-owned\n"),
+        format!("echo user-owned\n{end}\n"),
+        format!("{begin}\n{end}\n{begin}\n{end}\n"),
+    ] {
+        let Some(fixture) = PrePushFixture::new() else {
+            return;
+        };
+        std::fs::write(&fixture.hook, &body).unwrap();
+        let mut command = Command::new(&fixture.bash);
+        command.arg(fixture.shell_arg(&repo_root().join("scripts/install-git-hooks.sh")));
+        fixture.isolate(&mut command);
+        let output = command.current_dir(&fixture.hook_repo).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid managed markers"));
+        assert_eq!(std::fs::read_to_string(&fixture.hook).unwrap(), body);
+    }
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_replaces_crlf_markers_and_stale_block_in_place() {
+    let Some(fixture) = PrePushFixture::new() else {
+        return;
+    };
+    let before = "#!/usr/bin/env bash\r\nprintf 'before\\n'\r\n";
+    let after = "printf 'after\\n'\r\n";
+    std::fs::write(&fixture.hook, format!("{before}# >>> ai-memory pre-push >>>\r\necho stale-block\r\n# <<< ai-memory pre-push <<<\r\n{after}")).unwrap();
+    fixture.install_hook();
+    let installed = std::fs::read_to_string(&fixture.hook).unwrap();
+    assert!(
+        installed.starts_with(before),
+        "changed prefix: {installed:?}"
+    );
+    assert!(installed.ends_with(after), "changed suffix: {installed:?}");
+    assert!(!installed.contains("stale-block"));
+    assert!(installed.contains("git rev-parse --local-env-vars"));
+    fixture.install_hook();
+    assert_eq!(std::fs::read_to_string(&fixture.hook).unwrap(), installed);
+}
+
+#[test]
+#[cfg(unix)]
+fn pre_push_hook_preserves_an_unreadable_existing_hook() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(fixture) = PrePushFixture::new() else {
+        return;
+    };
+    let original = "#!/usr/bin/env bash\necho user-owned\n";
+    std::fs::write(&fixture.hook, original).unwrap();
+    std::fs::set_permissions(&fixture.hook, std::fs::Permissions::from_mode(0o200)).unwrap();
+    if std::fs::File::open(&fixture.hook).is_ok() {
+        skip_pre_push_tests::<()>("the process can read a write-only file");
+        return;
+    }
+    let mut command = Command::new(&fixture.bash);
+    command.arg(fixture.shell_arg(&repo_root().join("scripts/install-git-hooks.sh")));
+    fixture.isolate(&mut command);
+    let output = command.current_dir(&fixture.hook_repo).output().unwrap();
+    std::fs::set_permissions(&fixture.hook, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        !output.status.success(),
+        "a read error must abort installation"
+    );
+    assert_eq!(std::fs::read_to_string(&fixture.hook).unwrap(), original);
+}
+
+/// A user hook that narrowed `IFS` before the managed block used to break the
+/// split of `git rev-parse --local-env-vars`, leaving the whole newline-joined
+/// list as one word.
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_splits_the_local_env_var_list_under_a_narrowed_ifs() {
+    let Some(fixture) = PrePushFixture::new() else {
+        return;
+    };
+    fixture.write_runner(0, false);
+    fixture.write_user_hook("IFS=:\n");
+    fixture.install_hook();
+    fixture.append_after_managed_block();
+
+    let output = fixture.run_hook();
+    assert!(
+        output.status.success(),
+        "the hook did not survive a narrowed IFS: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = fixture.cargo_log();
+    assert_same_directory(
+        log_field(&log, "cargo-toplevel"),
+        &fixture.fixture_toplevel,
+        "the scrub did not survive a narrowed IFS",
+    );
+
+    let caller = fixture.caller_log();
+    for stage in ["before", "after"] {
+        assert_eq!(
+            log_field(&caller, &format!("{stage}-ifs")),
+            "[:]",
+            "the managed block changed the user hook's IFS:\n{caller}"
+        );
+    }
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn pre_push_hook_keeps_the_full_tier_and_propagates_a_cargo_failure() {
+    for (with_nextest, expected_argv, expected_notice) in [
+        (
+            true,
+            "nextest run --workspace -P full",
+            "pre-push: cargo nextest run --workspace -P full",
+        ),
+        (
+            false,
+            "test --workspace --all-targets",
+            "pre-push: cargo test --workspace --all-targets (nextest not installed)",
+        ),
+    ] {
+        let Some(fixture) = PrePushFixture::new() else {
+            return;
+        };
+        fixture.write_runner(0, with_nextest);
+        fixture.install_hook();
+
+        let output = fixture.run_hook();
+        assert!(
+            output.status.success(),
+            "hook failed with {expected_argv:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            log_field(&fixture.cargo_log(), "cargo-argv"),
+            expected_argv,
+            "wrong cargo invocation for nextest={with_nextest}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected_notice),
+            "the hook stopped announcing what it runs: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    // A failing test run must still stop the push.
+    let Some(fixture) = PrePushFixture::new() else {
+        return;
+    };
+    fixture.write_runner(3, true);
+    fixture.install_hook();
+    let output = fixture.run_hook();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "the subshell swallowed cargo's exit status: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// The slow tier. These drive the real wrapper scripts, a fake `uname`, and
 /// fake container engines, 10-20s each, and cannot break from an ordinary Rust
 /// edit. `.config/nextest.toml` skips every `slow::` module in the everyday
@@ -1526,6 +2548,152 @@ mod slow {
                 expected.push_str(&format!("arg={arg}\n"));
             }
             assert_eq!(std::fs::read_to_string(&record).unwrap(), expected);
+        }
+        assert!(
+            !docker_record.exists(),
+            "managed host command entered Docker"
+        );
+    }
+
+    /// `run` auto-wires hooks whose command is the native client's own path,
+    /// so the client must not live where a cache flush deletes it, and its
+    /// release `hooks/` bundle must sit beside it for script-based harnesses.
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_installs_native_client_and_hook_bundle_outside_the_cache() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release");
+        std::fs::create_dir_all(release.join("hooks/claude-code")).unwrap();
+        let record = tmp.path().join("native-record.txt");
+        std::fs::write(
+            release.join("ai-memory"),
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\n",
+                shell_path(&record)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            release.join("ai-memory"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(
+            release.join("hooks/claude-code/session-start.sh"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        let tarball = tmp.path().join("release.tar.gz");
+        let tar = Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&release)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(tar.success(), "building the fake release tarball failed");
+        let sum = sha256_file(&tarball);
+
+        // Serve the tarball and its checksum the way the GitHub release does;
+        // the checksum names the asset the wrapper asked for.
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let curl = bin.join("curl");
+        std::fs::write(
+            &curl,
+            format!(
+                "#!/usr/bin/env bash\n\
+                 url=''; out=''\n\
+                 while [ \"$#\" -gt 0 ]; do\n\
+                   case \"$1\" in\n\
+                     -o) out=\"$2\"; shift 2 ;;\n\
+                     -*) shift ;;\n\
+                     *) url=\"$1\"; shift ;;\n\
+                   esac\n\
+                 done\n\
+                 case \"$url\" in\n\
+                   *.tar.gz.sha256) body=\"{sum}  $(basename \"${{url%.sha256}}\")\" ;;\n\
+                   *.tar.gz) cp {tarball} \"$out\"; exit 0 ;;\n\
+                   *) exit 22 ;;\n\
+                 esac\n\
+                 if [ -n \"$out\" ]; then printf '%s\\n' \"$body\" > \"$out\"; else printf '%s\\n' \"$body\"; fi\n",
+                tarball = shell_path(&tarball),
+            ),
+        )
+        .unwrap();
+        let docker = bin.join("docker");
+        let docker_record = tmp.path().join("docker-record.txt");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\nexit 99\n",
+                shell_path(&docker_record)
+            ),
+        )
+        .unwrap();
+        for script in [&curl, &docker] {
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            shell_path(&bin),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        // Default data home, then an explicit XDG_DATA_HOME.
+        for (case, xdg_data_home) in [("default", false), ("xdg", true)] {
+            let home = tmp.path().join(format!("home-{case}"));
+            let cache = tmp.path().join(format!("cache-{case}"));
+            let data_home = if xdg_data_home {
+                tmp.path().join(format!("data-{case}"))
+            } else {
+                home.join(".local/share")
+            };
+            std::fs::create_dir_all(&home).unwrap();
+            let _ = std::fs::remove_file(&record);
+
+            let mut command = shell_script_command(&repo_root().join("bin/ai-memory"));
+            command
+                .args(["workstreams", "--limit", "5"])
+                .env("HOME", &home)
+                .env("XDG_CACHE_HOME", &cache)
+                .env("AI_MEMORY_DOCKER", &docker)
+                .env("PATH", &path)
+                .env_remove("AI_MEMORY_NATIVE_BIN");
+            if xdg_data_home {
+                command.env("XDG_DATA_HOME", &data_home);
+            } else {
+                command.env_remove("XDG_DATA_HOME");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: wrapper failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let runner = data_home.join("ai-memory/native-runner");
+            assert!(
+                runner.join("ai-memory").is_file(),
+                "{case}: native client missing from {}",
+                runner.display()
+            );
+            assert!(
+                runner.join("hooks/claude-code/session-start.sh").is_file(),
+                "{case}: release hooks bundle not kept beside the client"
+            );
+            assert!(
+                !cache.join("ai-memory/native-runner").exists(),
+                "{case}: native client was installed under the cache"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&record).unwrap(),
+                "workstreams\n--limit\n5\n",
+                "{case}: wrapper did not exec the installed client"
+            );
         }
         assert!(
             !docker_record.exists(),

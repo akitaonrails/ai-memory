@@ -9,7 +9,7 @@
 #
 # Special wrapper-only subcommands (not forwarded to the binary):
 #   ai-memory upgrade       Pull the latest image + remind to re-stage hooks.
-#   ai-memory run ...       Use a cached native client so it can exec host agents.
+#   ai-memory run ...       Use a local native client so it can exec host agents.
 #   ai-memory show ...      Use that client for host project/harness discovery.
 #   ai-memory continue ...  Use that client to resume the newest linked checkout.
 #   ai-memory workstreams   Use that client to inspect the host checkout identity.
@@ -55,6 +55,10 @@ DATA_VOLUME="${AI_MEMORY_DATA_VOLUME:-ai-memory-data}"
 CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/ai-memory"
 VERSION_CHECK_FILE="${CACHE_DIR}/last-version-check"
 HOOKS_STAGE_DIR="${HOME}/.local/share/ai-memory/hooks"
+# `run` auto-wires hooks whose command is this client's own path, so a cache
+# flush would break every hook until the next managed launch. Keep it with the
+# host's ai-memory data instead of under CACHE_DIR.
+NATIVE_RUNNER_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/ai-memory/native-runner"
 WRAPPER_URL="${AI_MEMORY_WRAPPER_URL:-https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-wrapper}"
 WRAPPER_SHA256_URL="${AI_MEMORY_WRAPPER_SHA256_URL:-${WRAPPER_URL}.sha256}"
 
@@ -354,7 +358,7 @@ cmd_upgrade() {
   fi
   echo "→ pulling ${IMAGE}"
   "${DOCKER}" pull "${IMAGE}"
-  rm -f "${CACHE_DIR}/native-runner/last-check"
+  rm -f "${NATIVE_RUNNER_DIR}/last-check"
 
   local found_agents=()
   if [ -d "${HOOKS_STAGE_DIR}" ]; then
@@ -455,7 +459,7 @@ cmd_upgrade() {
 
 # Managed launch/discovery commands must execute on the host: checkouts, harnesses,
 # and native transcript stores are host resources, not contents of the helper
-# container. Keep a checksum-verified release client beside the wrapper cache.
+# container. Keep a checksum-verified release client under NATIVE_RUNNER_DIR.
 native_host_binary() {
   if [ -n "${AI_MEMORY_NATIVE_BIN:-}" ]; then
     [ -x "${AI_MEMORY_NATIVE_BIN}" ] || {
@@ -486,7 +490,7 @@ native_host_binary() {
   esac
   artifact="ai-memory-${os}-${arch}"
   base="https://github.com/akitaonrails/ai-memory/releases/latest/download/${artifact}.tar.gz"
-  native_dir="${CACHE_DIR}/native-runner"
+  native_dir="${NATIVE_RUNNER_DIR}"
   binary="${native_dir}/ai-memory"
   archive="${native_dir}/${artifact}.tar.gz"
   check_file="${native_dir}/last-check"
@@ -533,6 +537,13 @@ native_host_binary() {
     [ -x "${tmp}/ai-memory" ] || chmod +x "${tmp}/ai-memory"
     mv "${tmp}/${artifact}.tar.gz" "${archive}"
     mv "${tmp}/ai-memory" "${binary}"
+    # `run` auto-wires hooks through this client, and install-hooks looks for
+    # its script bundle beside the binary. Without it, auto-wiring fails for
+    # every script-based harness on a host where nothing was staged yet.
+    if [ -d "${tmp}/hooks" ]; then
+      rm -rf "${native_dir}/hooks"
+      mv "${tmp}/hooks" "${native_dir}/hooks"
+    fi
     rm -rf "${tmp}"
     touch "${check_file}"
   fi

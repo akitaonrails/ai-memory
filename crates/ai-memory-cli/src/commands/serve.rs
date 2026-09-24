@@ -30,7 +30,7 @@ use ai_memory_web::{
     HtmlAuthRedirectConfig, WebMountSpec, html_auth_redirect_mw, normalize_prefix,
     split_web_routers, web_base_href,
 };
-use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
+use ai_memory_wiki::{WatcherHandle, Wiki, WikiError, WikiResult, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
@@ -1045,12 +1045,30 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         Ok(n) => tracing::info!(count = n, "wrote _meta.md scope manifests"),
         Err(e) => tracing::warn!(error = %e, "scope-manifest backfill failed (non-fatal)"),
     }
-    match wiki.ensure_upgrade_baseline_checkpoint() {
-        Ok(Some(oid)) => {
-            tracing::info!(checkpoint = %oid, "created wiki upgrade baseline checkpoint")
+    let baseline_checkpoint = wiki.ensure_upgrade_baseline_checkpoint();
+    match classify_baseline_checkpoint(&baseline_checkpoint) {
+        BaselineCheckpointLog::Created => {
+            if let Ok(Some(oid)) = &baseline_checkpoint {
+                tracing::info!(checkpoint = %oid, "created wiki upgrade baseline checkpoint");
+            }
         }
-        Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)"),
+        BaselineCheckpointLog::Clean => {}
+        // An owner-check failure is silent-but-fatal to the wiki git history:
+        // capture keeps working, but no checkpoint is ever committed, so it
+        // must not hide in a WARN. This is the Windows LocalSystem-service /
+        // user-owned-data-dir case (docs/windows.md Scenario E).
+        BaselineCheckpointLog::OwnerFailure => tracing::error!(
+            error = %baseline_checkpoint.as_ref().err().map(ToString::to_string).unwrap_or_default(),
+            "wiki git commits are failing libgit2's owner check: the wiki repository is not \
+             owned by the account running ai-memory. Run the service AS THE OWNING USER (see \
+             docs/windows.md Scenario E) — capture continues, but no wiki checkpoints will be \
+             committed until this is fixed."
+        ),
+        BaselineCheckpointLog::OtherFailure => {
+            if let Err(e) = &baseline_checkpoint {
+                tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)");
+            }
+        }
     }
 
     // Keep the guard alive for the lifetime of `serve`.
@@ -2718,6 +2736,31 @@ async fn seed_active_project_fallback(reader: &ReaderPool, active_project: &Acti
     }
 }
 
+/// How a wiki baseline-checkpoint attempt should be surfaced at startup.
+/// Extracted from the logging call so the owner-vs-other classification is
+/// unit-testable without standing up a server: a real LocalSystem-service
+/// owner failure needs a native Windows box, which is out of scope here.
+#[derive(Debug, PartialEq, Eq)]
+enum BaselineCheckpointLog {
+    /// A checkpoint commit was created (INFO).
+    Created,
+    /// Nothing to commit (silent).
+    Clean,
+    /// libgit2 refused on its ownership guard — actionable, logged at ERROR.
+    OwnerFailure,
+    /// Any other failure — non-fatal, logged at WARN as before.
+    OtherFailure,
+}
+
+fn classify_baseline_checkpoint<T>(result: &WikiResult<Option<T>>) -> BaselineCheckpointLog {
+    match result {
+        Ok(Some(_)) => BaselineCheckpointLog::Created,
+        Ok(None) => BaselineCheckpointLog::Clean,
+        Err(WikiError::GitOwner(_)) => BaselineCheckpointLog::OwnerFailure,
+        Err(_) => BaselineCheckpointLog::OtherFailure,
+    }
+}
+
 fn host_without_port(host: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[')
         && let Some((inside, _)) = rest.split_once(']')
@@ -2747,6 +2790,41 @@ mod tests {
     use std::pin::Pin;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    /// An owner-check failure of the startup wiki baseline checkpoint must be
+    /// classified as an ERROR-worthy `OwnerFailure`, not the WARN-only
+    /// `OtherFailure` that hid it before (#872). A generic error stays
+    /// `OtherFailure`, and the success/clean cases are unchanged — this is the
+    /// seam that decides the log level, so it bites here.
+    ///
+    /// A full native-Windows LocalSystem-service repro (the environment that
+    /// actually raises `code=Owner`) is out of scope; this covers the mapping
+    /// from `WikiError::GitOwner` to the ERROR branch.
+    #[test]
+    fn owner_failure_baseline_checkpoint_is_error_not_warn() {
+        let owner: WikiResult<Option<()>> = Err(WikiError::GitOwner("not owned".into()));
+        assert_eq!(
+            classify_baseline_checkpoint(&owner),
+            BaselineCheckpointLog::OwnerFailure,
+            "owner-check failure must be surfaced at ERROR, not buried in a WARN"
+        );
+
+        let other: WikiResult<Option<()>> = Err(WikiError::Io(std::io::Error::other("disk gone")));
+        assert_eq!(
+            classify_baseline_checkpoint(&other),
+            BaselineCheckpointLog::OtherFailure,
+            "a non-owner failure stays a non-fatal WARN"
+        );
+
+        assert_eq!(
+            classify_baseline_checkpoint(&Ok::<_, WikiError>(Some(()))),
+            BaselineCheckpointLog::Created
+        );
+        assert_eq!(
+            classify_baseline_checkpoint(&Ok::<Option<()>, WikiError>(None)),
+            BaselineCheckpointLog::Clean
+        );
+    }
 
     async fn wait_for_maintenance_success(
         store: &Store,

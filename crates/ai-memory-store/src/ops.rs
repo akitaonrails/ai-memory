@@ -3937,7 +3937,7 @@ pub struct PurgeSessionSummary {
     pub observations_deleted: u64,
     /// `handoffs` rows removed — only those this session *authored*.
     pub handoffs_deleted: u64,
-    /// `pages` rows removed, counting every version in the supersession chain.
+    /// `pages` rows removed, counting every version the session wrote.
     pub pages_deleted: u64,
     /// `auto_improve_runs` rows removed.
     pub auto_improve_runs_deleted: u64,
@@ -3961,9 +3961,10 @@ pub struct PurgeSessionSummary {
 ///   `project_id` wherever the table carries them, so even a mismatched id
 ///   cannot reach a row in another workspace or project;
 /// - derived pages are deleted by **id**, from a set collected and
-///   scope-checked first — never by path. Two projects may hold the same
-///   `sessions/<uuid>.md` path, and a hand-written page can occupy the path a
-///   session later claims; deleting by path would take those with it.
+///   scope-checked first — never by path alone. Two projects may hold the
+///   same `sessions/<uuid>.md` path, and hand-written versions can share the
+///   path with the session's own; only the recorded summary and versions
+///   whose frontmatter `session_id` names this session are collected.
 ///
 /// # Ordering
 ///
@@ -4010,22 +4011,27 @@ pub fn purge_session(
 
     // ---- collect, before anything is cut ----
 
-    // The derived page and every version of it. Walk from the recorded
-    // summary page across the supersession chain, staying inside the scope.
+    // The recorded summary, plus every version at the session's page path
+    // whose frontmatter names this session — the key each session-page
+    // writer stamps, and the one OKF derives `sources` from. Manual edits at
+    // that path, before, after or between summaries, carry no such key.
     let page_ids: Vec<Vec<u8>> = {
         let mut stmt = tx.prepare(
-            "WITH RECURSIVE chain(id) AS ( \
-                 SELECT summary_page_id FROM sessions \
-                  WHERE id = ?1 AND summary_page_id IS NOT NULL \
-                 UNION \
-                 SELECT p.id FROM pages p JOIN chain c ON p.supersedes = c.id \
-             ) \
-             SELECT p.id FROM pages p JOIN chain c ON p.id = c.id \
-              WHERE p.workspace_id = ?2 AND p.project_id = ?3",
+            "SELECT id FROM pages \
+              WHERE workspace_id = ?2 AND project_id = ?3 \
+                AND (id = (SELECT summary_page_id FROM sessions WHERE id = ?1) \
+                     OR (path = ?4 AND json_extract(frontmatter_json, '$.session_id') = ?5))",
         )?;
-        stmt.query_map(rusqlite::params![&sid[..], &wid[..], &pid[..]], |row| {
-            row.get::<_, Vec<u8>>(0)
-        })?
+        stmt.query_map(
+            rusqlite::params![
+                &sid[..],
+                &wid[..],
+                &pid[..],
+                format!("sessions/{session_id}.md"),
+                session_id.to_string()
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
@@ -4094,6 +4100,24 @@ pub fn purge_session(
             rusqlite::params![&id[..], &wid[..], &pid[..]],
         )? as u64;
     }
+    // A later manual rewrite at this path is still the live wiki file.
+    let removed_paths = {
+        let mut stmt = tx.prepare(
+            "SELECT EXISTS(SELECT 1 FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
+             AND path = ?3 AND is_latest = 1)",
+        )?;
+        let mut paths_to_remove = Vec::new();
+        for path in removed_paths {
+            let has_live_page: bool = stmt.query_row(
+                rusqlite::params![&wid[..], &pid[..], path.as_str()],
+                |row| row.get(0),
+            )?;
+            if !has_live_page {
+                paths_to_remove.push(path);
+            }
+        }
+        paths_to_remove
+    };
 
     // Deleted explicitly rather than left to the cascade so the row count is
     // known and can be reported. Measured: this does *not* change what the
@@ -6111,6 +6135,114 @@ pub(crate) mod tests {
             summary.removed_paths,
             vec![PagePath::new("sessions/target.md").unwrap()]
         );
+    }
+
+    /// A session page as its writers stamp it (synth, consolidator): the
+    /// frontmatter names the session, and OKF derives `sources` from that.
+    fn session_page(ws: WorkspaceId, proj: ProjectId, sid: SessionId, body: &str) -> NewPage {
+        let mut generated = page(ws, proj, &format!("sessions/{sid}.md"), body);
+        generated.frontmatter_json = serde_json::json!({"session_id": sid.to_string()});
+        generated
+    }
+
+    #[test]
+    fn purge_session_removes_older_summary_versions_without_deleting_prior_manual_page() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        let path = format!("sessions/{sid}.md");
+        let manual = upsert_page(&mut conn, &page(ws, proj, &path, "manual")).unwrap();
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+
+        let mut latest = None;
+        for version in 1..=3 {
+            let generated = session_page(ws, proj, sid, &format!("summary {version}"));
+            latest = Some(upsert_page(&mut conn, &generated).unwrap());
+        }
+        end_session(&mut conn, &sid, latest.as_ref()).unwrap();
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        assert_eq!(summary.pages_deleted, 3);
+        // The manual version survives, but as history: nothing is latest at
+        // the path any more, so its wiki file is unlinked with the summary.
+        assert_eq!(summary.removed_paths, vec![PagePath::new(path).unwrap()]);
+        let survivor: (Vec<u8>, bool) = conn
+            .query_row("SELECT id, is_latest FROM pages", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(survivor, (manual.as_bytes().to_vec(), false));
+    }
+
+    #[test]
+    fn purge_session_keeps_later_manual_page_and_its_wiki_path() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        let path = format!("sessions/{sid}.md");
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        let first = upsert_page(&mut conn, &session_page(ws, proj, sid, "summary")).unwrap();
+        let middle_manual =
+            upsert_page(&mut conn, &page(ws, proj, &path, "manual interim")).unwrap();
+        let latest =
+            upsert_page(&mut conn, &session_page(ws, proj, sid, "updated summary")).unwrap();
+        end_session(&mut conn, &sid, Some(&latest)).unwrap();
+        let manual = upsert_page(&mut conn, &page(ws, proj, &path, "manual rewrite")).unwrap();
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        assert_eq!(summary.pages_deleted, 2);
+        assert!(summary.removed_paths.is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 2);
+        let survivor: (Vec<u8>, bool) = conn
+            .query_row(
+                "SELECT id, is_latest FROM pages WHERE is_latest = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(survivor, (manual.as_bytes().to_vec(), true));
+        assert_ne!(first, manual);
+        assert_ne!(middle_manual, manual);
+    }
+
+    /// A session page can exist while `summary_page_id` is NULL: the session
+    /// has not ended, or a move cleared the link. Its pages are still the
+    /// session's and must go with it.
+    #[test]
+    fn purge_session_removes_pages_of_a_session_without_a_recorded_summary() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        upsert_page(&mut conn, &session_page(ws, proj, sid, "checkpoint 1")).unwrap();
+        upsert_page(&mut conn, &session_page(ws, proj, sid, "checkpoint 2")).unwrap();
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        assert_eq!(summary.pages_deleted, 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0);
+        assert_eq!(
+            summary.removed_paths,
+            vec![PagePath::new(format!("sessions/{sid}.md")).unwrap()]
+        );
+    }
+
+    /// The OKF migration conformed only latest rows, so a version superseded
+    /// before it ran carries `session_id` but no derived `sources`.
+    #[test]
+    fn purge_session_removes_summary_versions_written_before_okf_sources() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        let old = upsert_page(&mut conn, &session_page(ws, proj, sid, "old summary")).unwrap();
+        conn.execute(
+            "UPDATE pages SET frontmatter_json = json_remove(frontmatter_json, '$.sources') \
+             WHERE id = ?1",
+            params![old.as_bytes()],
+        )
+        .unwrap();
+        let latest = upsert_page(&mut conn, &session_page(ws, proj, sid, "new summary")).unwrap();
+        end_session(&mut conn, &sid, Some(&latest)).unwrap();
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        assert_eq!(summary.pages_deleted, 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0);
     }
 
     /// The blast radius must stop at the session. A sibling session in the
