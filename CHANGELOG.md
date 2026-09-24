@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-existing identity, so upgrading installs need no migration, and a
   query-only prefix change never needs a rebuild. See
   `docs/llm-providers.md`. (#859)
+- Added the optional `ai-memory-relay` companion for external lifecycle events.
+  It queues events locally and sends ordered batches through the public hook API,
+  using stable event identities for retries. The package has its own workspace
+  and does not change the server's capture or storage defaults. (#823)
 - `auto_improve.patchable_page_prefixes` makes the folders whose page bodies the
   reviewer reads configurable, defaulting to the historical `_rules/` and
   `procedures/`. Only those two folders' contents were ever sent; every other

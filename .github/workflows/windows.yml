@@ -70,6 +70,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo test --workspace --all-targets
+      - name: Check the external lifecycle relay
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check --manifest-path companions/ai-memory-relay/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --manifest-path companions/ai-memory-relay/Cargo.toml --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path companions/ai-memory-relay/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --manifest-path companions/ai-memory-relay/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: false
+      - name: External lifecycle delivery against the real server
+        run: >
+          uv run --no-project python tests/e2e/external_relay_smoke.py
+          --ai-memory-bin "${{ github.workspace }}/target/debug/ai-memory.exe"
+          --relay-bin "${{ github.workspace }}/target/debug/ai-memory-relay.exe"
+          --timeout-seconds 120
 
   # `ci.yml`'s `hooks-shell` job covers the POSIX bundle across four awks, all
   # on Linux. The suite also drives `hooks/lib/ai-memory-hook.ps1`, and that
