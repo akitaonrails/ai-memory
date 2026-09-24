@@ -2488,8 +2488,11 @@ mirrors or hermetic tests, set `AI_MEMORY_RELEASE_BASE_URL` (or
 `release_base_url` in config.toml) to a Releases-compatible base that serves
 `{base}/latest/tag` and `{base}/download/<tag>/<asset>` (+ `.sha256`). That
 override is a trust boundary: archive and checksum are fetched from the same
-base, so point it only at origins you control. Each response body is capped
-at 128 MiB.
+base, so the `.sha256` only proves the base served a consistent pair, not that
+the binary is genuine — point it only at origins you control. Prefer an
+`https://` base; a plain-`http://` base has no transit protection, so an
+on-path attacker can substitute both the archive and its matching checksum.
+Each response body is capped at 128 MiB.
 
 ### Shared notes
 
