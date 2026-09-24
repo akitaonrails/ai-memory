@@ -637,7 +637,8 @@ backfill_on_start = true           # on first SessionStart in a brand-new (empty
                                    # backfill` runs it by hand.
 run_autowire = true                # `ai-memory run <harness>` auto-installs that harness's
                                    # hooks + MCP on first launch if missing (idempotent,
-                                   # one-time per harness+version). Also `--no-autowire`.
+                                   # one-time per harness+version+install location).
+                                   # Also `--no-autowire`.
 
 [decay]                            # M8 retention params
 lambda = 0.02                      # ↓ to forget less aggressively (fallback λ)

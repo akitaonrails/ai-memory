@@ -14,10 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callers who previously had to wrap the launch in `env KEY=VAL harness`.
   Both flags are wrapper-owned like `--yolo`/`--executable` and must precede
   the harness name; a `--env` entry overrides a same-key `--env-file` line.
-  The resolved environment reaches both the spawned process and ai-memory's
-  own native-session resolution, so the two agree on where a
-  `CLAUDE_CONFIG_DIR`-style override points the session store. See
-  `docs/managed-workstreams.md`. (#820)
+  The resolved environment reaches the spawned process, ai-memory's own
+  native-session resolution, first-launch auto-wire and the global Crush
+  config the managed context packet is layered onto, so the session store,
+  hooks and MCP all follow a `CLAUDE_CONFIG_DIR`-style override, and
+  auto-wire warns when the override puts Pi and OMP in one extensions
+  directory. See `docs/managed-workstreams.md`. (#820)
 - `contradiction_band_min` / `contradiction_band_max` config keys (env:
   `AI_MEMORY_CONTRADICTION_BAND_MIN` / `AI_MEMORY_CONTRADICTION_BAND_MAX`)
   make `memory_lint`'s A5 zero-LLM contradiction-detection cosine-similarity
@@ -99,6 +101,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture suppression, like the other context-delivery events. (#840)
 
 ### Fixed
+- `ai-memory run` auto-wired only the first config home per agent and
+  version: its sentinel ignored where hooks and MCP were installed, so a second
+  account (another exported `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...) was
+  skipped. The sentinel now also keys on the resolved hook and MCP config
+  paths. The Codex MCP entry ignored `CODEX_HOME`: `install-mcp` and auto-wire
+  now write `$CODEX_HOME/config.toml`, matching `hooks.json`; `uninstall`
+  sweeps the legacy `~/.codex/config.toml` too, and `install-hooks` still
+  infers the server URL and token from it until the entry is rewritten. (#820)
+- OMP paths now follow OMP's own profile rules. A named profile (`--profile`,
+  `OMP_PROFILE`, or the legacy `PI_PROFILE`, previously ignored) owns
+  `~/.omp/profiles/<name>/agent` and ignores `PI_CODING_AGENT_DIR`, as OMP
+  does; `install-hooks` wrote the extension into `PI_CODING_AGENT_DIR`
+  instead, where that OMP never loads it. An empty, whitespace or `default`
+  profile selects the default profile rather than a `profiles/default` or
+  blank-named directory, a `PI_CODING_AGENT_DIR` a parent OMP derived for its
+  profile no longer leaks into the default profile, and a name OMP refuses is
+  refused. `install-mcp
+  --client omp` and auto-wire write `mcp.json` into the same agent dir instead
+  of always `~/.omp/agent`; `ai-memory run omp` imports sessions from it and
+  honors `PI_CODING_AGENT_SESSION_DIR` and a leading native `--profile`; `uninstall`
+  sweeps the active, default-profile and `~/.omp/agent` locations and no
+  longer aborts every agent's cleanup on an invalid profile name. ai-memory
+  also follows OMP's `PI_CONFIG_DIR`, which renames the `~/.omp` root (joined
+  under the home, as OMP joins it), for profiles, the extension, `mcp.json`,
+  session import and the `uninstall` sweep, which still covers the `~/.omp`
+  locations earlier releases wrote to; and on Linux and macOS `ai-memory run
+  omp`, `backfill` and `doctor` read sessions from `$XDG_DATA_HOME/omp/sessions`
+  (`$XDG_DATA_HOME/omp/profiles/<name>/sessions` for a named profile) when
+  that OMP directory exists and the agent dir is not relocated, as OMP does.
+  (#820)
+- A whitespace-only `KIMI_CODE_HOME`, `KIRO_HOME` or `GROK_HOME` pointed
+  installs at a blank-named directory under the working directory, and a
+  whitespace-only relocation variable did the same for `ai-memory run`'s
+  native session import. Blank now counts as unset everywhere, as it already
+  did for the `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `PI_CODING_AGENT_DIR`
+  installers, and `ai-memory run` drops such a value from the harness it
+  launches so the harness uses its default home as well. Crush's managed
+  context likewise read a whitespace-only `CRUSH_GLOBAL_CONFIG` or
+  `XDG_CONFIG_HOME` as a directory, and now falls back to the default global
+  config. (#820)
+- `ai-memory uninstall` left `ai-memory run`'s auto-wire sentinels in
+  `<data_dir>/autowire-state/`, so after the hooks were removed the next
+  managed launch of that harness on the same binary version skipped wiring and
+  captured nothing. Removing hooks or MCP (a full uninstall, `--only hooks` or
+  `--only mcp`) now deletes every sentinel and lists them in the dry-run plan.
+  `--only mcp`, `--only instructions` and `--only skills` also no longer delete
+  the stored hook bearer that the still-installed hooks read. (#820)
+- A managed Crush launch with a context packet dropped the `CRUSH.md` and
+  `AGENTS.md` Crush loads by default: Crush only adds them while
+  `global_context_paths` is empty, and the packet filled it. The launcher now
+  adds them first when the user's config lists none, and no longer refuses to
+  start over a global `crush.json` Crush accepts (an empty file, `null`, or
+  `null` options), read from the path cleaned as Crush cleans it. The global
+  `crushrc` beside that config, which Crush stopped reading once the config
+  dir moved, is now sourced from its own directory as well. (#820)
+- Two fresh managed launches in one checkout could import each other's
+  transcript: after exit, `ai-memory run` took the newest session there even
+  when a hook in the child had already linked the run's own session. The
+  hook-linked session now wins when this checkout's store holds it (a process
+  the child starts inherits the run id). Crush, which has no hooks, claims only the
+  one top-level session created during a fresh run and imports nothing, with
+  a warning, when another launch created one too; its title and sub-agent
+  sessions are no longer taken for the conversation, and in a data directory
+  outside the project only a session that edited a file in the project is
+  claimed. (#820)
+- `ai-memory run crush`, `backfill` and `doctor` looked for Crush sessions only
+  in `<cwd>/.crush/crush.db`, so a launch from a project subdirectory, or a
+  project whose Crush config sets `options.data_directory`, imported nothing.
+  They now find the store as Crush does: `options.data_directory` from Crush's
+  JSON configs, else the closest `.crush` up to the git worktree root (not one
+  directly in the home), else `<cwd>/.crush`. (#820)
+- A Kiro v3 resume that falls back to the default session store drops
+  `KIRO_HOME` from the child, but auto-wire still installed hooks and MCP
+  under `KIRO_HOME`; it now wires the default home that resume reads. (#820)
 - `memory_query`'s vector stream called the generic `Embedder::embed`
   instead of `embed_query` on the configured embedder, so a
   query/document-asymmetric embedder (Google's task-typed embeddings, or

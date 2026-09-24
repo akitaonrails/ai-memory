@@ -109,13 +109,13 @@ fn capture_inspection_reports_external_ownership_without_side_effects() {
 mod slow {
     use super::*;
     use std::process::Command;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use ai_memory_core::SessionId;
     use ai_memory_store::ReaderPool;
     use sha2::{Digest, Sha256};
 
-    use crate::e2e_support::{ServerGuard, free_port};
+    use crate::e2e_support::{ServerGuard, start_serve};
 
     const TOKEN: &str = "external-capture-local-test-token";
     const MARKER: &str = "external_capture_handoff_marker";
@@ -163,46 +163,27 @@ mod slow {
                 "workspace = \"external-test\"\nproject = \"capture-test\"\n",
             )
             .unwrap();
-            let port = free_port();
-            let base = format!("http://127.0.0.1:{port}");
-            let server = ServerGuard(
-                command(root.as_path())
-                    .args([
-                        "serve",
-                        "--transport",
-                        "http",
-                        "--bind",
-                        &format!("127.0.0.1:{port}"),
-                        "--workspace",
-                        "external-test",
-                        "--project",
-                        "capture-test",
-                        "--no-watcher",
-                    ])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .unwrap(),
-            );
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                if client
-                    .get(format!("{base}/mcp"))
-                    .bearer_auth(TOKEN)
-                    .send()
-                    .await
-                    .is_ok()
-                {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "server readiness timeout");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            let (server, base) = start_serve(&client, &root.as_path().join("serve.log"), |port| {
+                let mut cmd = command(root.as_path());
+                cmd.args([
+                    "serve",
+                    "--transport",
+                    "http",
+                    "--bind",
+                    &format!("127.0.0.1:{port}"),
+                    "--workspace",
+                    "external-test",
+                    "--project",
+                    "capture-test",
+                    "--no-watcher",
+                ]);
+                cmd
+            })
+            .await;
             let reader = ReaderPool::new(&root.as_path().join("data/db/memory.sqlite"), 2).unwrap();
             Self {
                 _server: server,

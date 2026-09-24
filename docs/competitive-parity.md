@@ -140,7 +140,7 @@ implemented without a separate decision.** Ordered by leverage.
    wiki (push/pull the source-of-truth dir, rebuild the index) — a cleaner,
    file-first P2P story than an opaque KV LWW.
 5. **Close the setup-friction gap vs the built-in.** Our one honest structural
-   weakness for the solo user. Much is already done (`run --autowire`, `doctor`,
+   weakness for the solo user. Much is already done (`run` auto-wire, `doctor`,
    `backfill`, `install-self-routing`); surface it as *the* onboarding path in the
    README hero, add a one-line `ai-memory run claude` quickstart, and ship a
    "coming from Claude built-in?" importer (the `~/.claude/.../memory/` format is

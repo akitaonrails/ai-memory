@@ -11,7 +11,9 @@ use crate::cli::UninstallArgs;
 use crate::commands::apply_shared::apply_atomic;
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
-use crate::commands::path_util::{claude_config_dir, claude_config_paths, home_dir};
+use crate::commands::path_util::{
+    agent_config_home, claude_config_dir, claude_config_paths, home_dir,
+};
 use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
@@ -72,6 +74,7 @@ enum DeleteKind {
     OpenClawEntrypoint,
     KiroCliV3Hooks,
     ManagedSkill,
+    AutowireSentinel,
 }
 
 impl DeleteKind {
@@ -86,6 +89,7 @@ impl DeleteKind {
             Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
             Self::KiroCliV3Hooks => "Kiro CLI v3 hook file",
             Self::ManagedSkill => "managed Agent Skill",
+            Self::AutowireSentinel => "auto-wire sentinel",
         }
     }
 }
@@ -130,6 +134,38 @@ fn push_rewrite(plan: &mut Vec<PlannedChange>, path: PathBuf, removed: Vec<Strin
     });
 }
 
+/// The OMP agent dirs an ai-memory install may have written to, active first:
+/// the one OMP loads now (`--profile`, `OMP_PROFILE`, `PI_PROFILE`, else
+/// `PI_CODING_AGENT_DIR`), the default profile's, where earlier releases put
+/// the extension whenever `PI_CODING_AGENT_DIR` was set, the active one as
+/// earlier releases resolved it (they ignored `PI_CONFIG_DIR` and wrote under
+/// `~/.omp`), and `~/.omp/agent`, where `install-mcp` always wrote the MCP
+/// entry. A profile name OMP refuses is reported and skipped instead of
+/// aborting every other agent's cleanup.
+fn omp_agent_dirs(home: Option<&Path>, profile: Option<&str>) -> Vec<PathBuf> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let env = |name: &str| std::env::var_os(name);
+    let without_config_dir = |name: &str| (name != "PI_CONFIG_DIR").then(|| env(name)).flatten();
+    let mut dirs = Vec::with_capacity(4);
+    match ai_memory_workstream::omp_agent_dir(home, profile, env) {
+        Ok(dir) => dirs.push(dir),
+        Err(error) => eprintln!("warning: skipping the active OMP profile: {error:#}"),
+    }
+    let fallbacks = [
+        ai_memory_workstream::omp_agent_dir(home, Some("default"), env).ok(),
+        ai_memory_workstream::omp_agent_dir(home, profile, without_config_dir).ok(),
+        Some(home.join(".omp").join("agent")),
+    ];
+    for dir in fallbacks.into_iter().flatten() {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
 fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: DeleteKind) {
     if generated_file_is_ours(&path, kind) {
         plan.push(PlannedChange::DeleteFile { path, kind });
@@ -139,13 +175,19 @@ fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: Del
 /// Build the full removal plan by reading each existing config file and
 /// running the matching pure stripper. Missing files / no-matches
 /// produce no entry. `name`/`url` identify the MCP server.
-fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
+fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<PlannedChange>> {
     let mut plan = Vec::new();
     let want = |k: crate::cli::UninstallOnly| args.only.is_none() || args.only == Some(k);
     let name = args.mcp_name.as_deref();
     let url = args.mcp_url.as_str();
     let home = home_dir();
     let claude_config_dir = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let omp_dirs = if want(crate::cli::UninstallOnly::Hooks) || want(crate::cli::UninstallOnly::Mcp)
+    {
+        omp_agent_dirs(home.as_deref(), args.profile.as_deref())
+    } else {
+        Vec::new()
+    };
 
     // ---- Hooks (JSON configs) ----
     if want(crate::cli::UninstallOnly::Hooks) {
@@ -299,12 +341,10 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
         let plugin2 = install_hooks::opencode2_plugin_path()?;
         push_generated_delete(&mut plan, plugin2, DeleteKind::OpenCode2Plugin);
 
-        let omp_profile = args.profile.as_deref();
-        let omp = install_hooks::omp_extension_path(omp_profile)?;
-        push_generated_delete(&mut plan, omp.clone(), DeleteKind::OmpExtension);
-
-        let legacy_omp = omp.with_file_name("ai-memory.ts");
-        if legacy_omp != omp {
+        for dir in &omp_dirs {
+            let omp = dir.join("extensions").join("ai-memory-omp.ts");
+            let legacy_omp = omp.with_file_name("ai-memory.ts");
+            push_generated_delete(&mut plan, omp, DeleteKind::OmpExtension);
             push_generated_delete(&mut plan, legacy_omp, DeleteKind::OmpExtension);
         }
 
@@ -367,6 +407,17 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                     Path::new(".claude.json"),
                     Path::new(".claude.json"),
                 )
+            } else if matches!(client, Codex) {
+                // Older installs wrote the Codex MCP entry to ~/.codex/config.toml
+                // even with CODEX_HOME set, so sweep that file too.
+                claude_config_paths(
+                    home.as_deref(),
+                    agent_config_home(std::env::var_os("CODEX_HOME")).as_deref(),
+                    Path::new(".codex/config.toml"),
+                    Path::new("config.toml"),
+                )
+            } else if matches!(client, Omp) {
+                omp_dirs.iter().map(|dir| dir.join("mcp.json")).collect()
             } else {
                 let Ok(path) = install_mcp::mcp_config_path(client) else {
                     continue;
@@ -435,6 +486,24 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                     DeleteKind::ManagedSkill,
                 );
             }
+        }
+    }
+
+    // ---- Auto-wire sentinels (ai-memory's own state) ----
+    // `ai-memory run` skips wiring while a sentinel exists, so one left behind
+    // would stop the next managed launch from reinstalling what this removes.
+    // All of them go: one keyed on a config home this environment cannot see
+    // costs only an idempotent re-apply.
+    if want(crate::cli::UninstallOnly::Hooks) || want(crate::cli::UninstallOnly::Mcp) {
+        let dir = crate::commands::run_autowire::autowire_state_dir(data_dir);
+        let mut sentinels: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        sentinels.sort();
+        for path in sentinels {
+            push_generated_delete(&mut plan, path, DeleteKind::AutowireSentinel);
         }
     }
 
@@ -599,7 +668,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     let name = args.mcp_name.clone();
     let url = args.mcp_url.clone();
 
-    let plan = build_plan(&args)?;
+    let plan = build_plan(&args, &config.data_dir)?;
     print_plan(&plan);
     if args.purge_data {
         for path in data_purge::purge_preview(&config.data_dir) {
@@ -642,9 +711,13 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     }
 
     // Removing the hooks removes the only readers of the stored bearer, so
-    // leaving it on disk would strand a live credential (#552). Best-effort:
-    // an unremovable file must not fail a teardown that otherwise succeeded.
-    if let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir) {
+    // leaving it on disk would strand a live credential (#552). An uninstall
+    // that keeps the hooks (`--only mcp|instructions|skills`) keeps it: the
+    // native hook, the shell hooks and the generated TypeScript integrations
+    // (the Pi one also bridges MCP) all still read it. Best-effort: an
+    // unremovable file must not fail a teardown that otherwise succeeded.
+    let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
+    if hooks_removed && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir) {
         eprintln!(
             "ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
             config.data_dir.display()
@@ -1051,6 +1124,9 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
             content.contains("Auto-generated by `ai-memory install-hooks --agent omp --apply`")
                 && content.contains("const AGENT = \"omp\";")
         }
+        // Auto-wire writes its sentinels empty; anything else in that
+        // directory is not one of them.
+        DeleteKind::AutowireSentinel => content.is_empty(),
         DeleteKind::PiExtension => {
             content.contains("Auto-generated by `ai-memory install-hooks --agent pi --apply`")
                 && content.contains("const AGENT = \"pi\";")

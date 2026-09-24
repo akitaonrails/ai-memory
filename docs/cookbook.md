@@ -128,6 +128,30 @@ compacted or merged stays in git and the supersession chain, recoverable with
   add the export endpoint" (`memory_message_send`), and over there "check my
   inbox" (`memory_message_pop`). See [`agent-messaging.md`](agent-messaging.md).
 
+## Recipe: several accounts or an external launcher
+
+Give each account or provider its own config home and pass it with `--env`, so
+the harness, its hooks and MCP, and transcript import all use that one home:
+
+```bash
+ai-memory run --env CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude
+ai-memory run --env CODEX_HOME="$HOME/.codex-work" codex   # the dir must exist
+```
+
+- `--env` and `--env-file` belong to `ai-memory run`, so they go before the
+  harness name.
+- A launcher or orchestrator that starts harnesses with its own environment
+  (provider keys, an account's config dir) can write it to a file and pass
+  `--env-file <path>`, one `KEY=VALUE` per line. Values are taken literally, so
+  use absolute paths in the file.
+- Auto-wire runs once per config home, so the second account gets its hooks +
+  MCP on its own first launch. To wire one by hand, export the variable for the
+  installers: `CLAUDE_CONFIG_DIR="$HOME/.claude-work" ai-memory install-hooks
+  --agent claude-code --apply`, then the same for `install-mcp --client
+  claude-code --apply`.
+
+See [`managed-workstreams.md`](managed-workstreams.md).
+
 ## Recipe: run the server on a Mac
 
 Use the menu bar app when you want one `.app` that starts the server and
@@ -154,9 +178,12 @@ Memory stays in `~/Library/Application Support/ai-memory`. Replacing the
 
 ## From the terminal (CLI)
 
-Most people never need these — the agent does it — but they exist:
+Your agent runs most of these for you; `run` and `continue` are how you start it:
 
 ```bash
+ai-memory run <harness>              # launch a harness, hooks + MCP auto-wired
+ai-memory continue                   # resume the newest managed checkout
+ai-memory workstreams                # list this checkout's managed workstreams
 ai-memory status                     # counts, paths, health
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
@@ -169,10 +196,13 @@ ai-memory serve                      # run the server
 
 ## When it isn't doing what you expect
 
-- **Nothing is being remembered**: hooks may not be installed. Easiest fix —
-  start the harness with `ai-memory run <harness>`, which auto-installs its
-  hooks + MCP on first launch; or wire it by hand with `ai-memory install-hooks
-  --agent <your-agent> --apply`. Then check `ai-memory status` / `ai-memory doctor`.
+- **Nothing is being remembered**: hooks may not be installed. `ai-memory run
+  <harness>` installs its hooks + MCP on the first launch per harness,
+  ai-memory version and config home, and again after `ai-memory uninstall`. If that harness
+  already launched through `run` and its hooks went missing another way
+  (removed by hand, a failed first wire), install them by hand: `ai-memory
+  install-hooks --agent <your-agent> --apply` and `ai-memory install-mcp
+  --client <client> --apply`. Then check `ai-memory status` / `ai-memory doctor`.
 - **Only *some* agents are being remembered**: run `ai-memory doctor`. It lists
   every harness that has local sessions in this project and whether the server
   captured them — so a harness you rotated in without installing its hook (a
