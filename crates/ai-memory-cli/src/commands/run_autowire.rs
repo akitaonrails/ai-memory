@@ -421,6 +421,26 @@ pub(crate) fn ensure_wired_with(
     // Not every hook-capable harness has an MCP client the installer can write
     // (e.g. Pi bridges MCP through its generated extension); skip those quietly.
     let mcp_failure = match installs.mcp {
+        // The sentinel is version-keyed, so this whole step re-runs on every
+        // upgrade. install-mcp replaces the `ai-memory` entry wholesale, so a
+        // plain re-run would overwrite a session-aware Claude Code bridge the
+        // user installed with `install-mcp --session-aware` back to static HTTP,
+        // silently disabling per_session for their MCP calls. Preserve it, in
+        // the file this launch would write.
+        Some(args)
+            if install_mcp::existing_entry_is_session_aware(
+                args.client,
+                args.config_file.as_deref(),
+                &args.name,
+            ) =>
+        {
+            eprintln!(
+                "ai-memory: keeping the existing session-aware {} MCP bridge; not \
+                 overwriting it with the static HTTP registration.",
+                harness.as_str()
+            );
+            None
+        }
         Some(args) => install_mcp::run(config, args)
             .err()
             .map(|error| format!("{error:#}")),
@@ -1013,6 +1033,16 @@ mod tests {
         }
     }
 
+    const SESSION_AWARE_BRIDGE: &str = r#"{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "stdio",
+      "command": "ai-memory",
+      "args": ["mcp-bridge", "--server-url", "http://127.0.0.1:49374/mcp"]
+    }
+  }
+}"#;
+
     fn test_config(home: &Path, data_dir: &Path) -> Config {
         let mut config = Config::load(None, Some(home.to_path_buf())).unwrap();
         config.data_dir = data_dir.to_path_buf();
@@ -1085,6 +1115,93 @@ mod tests {
             std::fs::read(&mcp).unwrap(),
             before_mcp,
             "a gated re-launch must not rewrite MCP config"
+        );
+    }
+
+    /// Auto-wire must not downgrade a deliberately-installed session-aware
+    /// bridge to static HTTP. The sentinel is version-keyed, so this step
+    /// re-runs on every upgrade; without the guard that re-run rewrites the
+    /// Claude Code MCP entry wholesale, silently disabling the per_session
+    /// isolation the user opted into with `install-mcp --session-aware`.
+    #[test]
+    fn wiring_preserves_an_existing_session_aware_bridge() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let settings = data.path().join("claude-settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let mcp = data.path().join("claude.json");
+        std::fs::write(&mcp, SESSION_AWARE_BRIDGE).unwrap();
+
+        let config = test_config(home.path(), data.path());
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+
+        let mcp_json = std::fs::read_to_string(&mcp).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(&mcp_json).unwrap();
+        let server = &entry["mcpServers"]["ai-memory"];
+        assert_eq!(
+            server["type"].as_str(),
+            Some("stdio"),
+            "auto-wire must keep the session-aware bridge, not downgrade it to http: {mcp_json}"
+        );
+        assert!(
+            server["args"]
+                .as_array()
+                .is_some_and(|args| args.iter().any(|arg| arg == "mcp-bridge")),
+            "the preserved entry must still be the mcp-bridge: {mcp_json}"
+        );
+        // The hooks still install, and the attempt is still recorded, so a plain
+        // re-launch stays gated.
+        assert!(
+            wire_targets(&config, ManagedHarness::Claude, &overrides, &[])
+                .unwrap()
+                .sentinel
+                .exists(),
+            "the attempt must be recorded even when the MCP bridge is preserved"
+        );
+    }
+
+    /// Under `--env CLAUDE_CONFIG_DIR` the guard reads the relocated
+    /// `.claude.json` this launch writes, not the default one, so a bridge
+    /// installed for that account is kept too.
+    #[test]
+    fn wiring_preserves_a_session_aware_bridge_in_the_relocated_home() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let root = data.path().join("claude-home");
+        std::fs::create_dir_all(&root).unwrap();
+        let mcp = root.join(".claude.json");
+        std::fs::write(&mcp, SESSION_AWARE_BRIDGE).unwrap();
+
+        let config = test_config(home.path(), data.path());
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            confine_to: Some(data.path().to_path_buf()),
+            ..WireOverrides::default()
+        };
+        ensure_wired_with(
+            &config,
+            ManagedHarness::Claude,
+            &overrides,
+            &env_pair("CLAUDE_CONFIG_DIR", &root),
+        );
+
+        let mcp_json = std::fs::read_to_string(&mcp).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(&mcp_json).unwrap();
+        assert_eq!(
+            entry["mcpServers"]["ai-memory"]["type"].as_str(),
+            Some("stdio"),
+            "the relocated session-aware bridge must be kept: {mcp_json}"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("settings.json"))
+                .is_ok_and(|s| s.contains("ai-memory") || s.contains("ai_memory")),
+            "the hooks still install in the relocated home"
         );
     }
 

@@ -93,6 +93,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "git2",
+ "icu_normalizer",
  "jiff",
  "regex",
  "rusqlite",

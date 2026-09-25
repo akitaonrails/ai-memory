@@ -17,10 +17,11 @@
 //! core capability rather than a detail.
 
 use ai_memory_core::{
-    ActorContext, AgentKind, HandoffAcceptance, IdentityKey, NewHandoff, NewPage, NewSession,
-    NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId, owner_stamp,
+    ActorContext, AgentKind, HandoffAcceptance, HandoffState, IdentityKey, NewHandoff, NewPage,
+    NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId,
+    owner_stamp,
 };
-use ai_memory_store::Store;
+use ai_memory_store::{PrepareWorkstreamRun, Store, WorkstreamSelection};
 
 fn operator(name: &str) -> String {
     IdentityKey::User(name.into()).storage_key()
@@ -515,5 +516,287 @@ async fn accept_reopens_an_ended_receiver_session_but_keeps_claim_once() {
     assert!(
         !stolen,
         "the resurrection path must not let a second session steal an accepted baton"
+    );
+}
+
+/// Parallel live sessions in one directory each own a turn-checkpoint baton.
+/// One session's checkpoint, and a receiver claiming it, must leave the other
+/// live session's baton open: before this held, every completed turn retired
+/// the other sessions' batons and the survivor went to whoever started next.
+#[tokio::test]
+async fn parallel_live_sessions_keep_their_own_checkpoint_batons() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let baton = |session: SessionId, summary: &str| NewHandoff {
+        workspace_id: ws,
+        project_id: proj,
+        from_session_id: Some(session),
+        from_agent: AgentKind::OpenCode,
+        to_agent: None,
+        cwd: Some("/repo".into()),
+        summary: summary.into(),
+        open_questions: Vec::new(),
+        next_steps: Vec::new(),
+        files_touched: Vec::new(),
+        owner_user: None,
+    };
+    let alpha = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let beta = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let alpha_baton = store
+        .writer
+        .checkpoint_session_handoff(baton(alpha, "alpha"))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let beta_baton = store
+        .writer
+        .checkpoint_session_handoff(baton(beta, "beta"))
+        .await
+        .unwrap()
+        .unwrap();
+    let state = |id| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .handoff_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle
+                .state
+        }
+    };
+    assert_eq!(state(alpha_baton).await, HandoffState::Open);
+
+    let receiver = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let claimed = store
+        .writer
+        .accept_handoff(HandoffAcceptance {
+            handoff_id: beta_baton,
+            workspace_id: ws,
+            project_id: proj,
+            accepting_agent: AgentKind::OpenCode,
+            accepting_session: Some(receiver),
+            accepting_user: None,
+            owner_filter: OwnerFilter::Any,
+            receiving_cwd: Some("/repo".into()),
+        })
+        .await
+        .unwrap();
+    assert!(claimed);
+    assert_eq!(
+        state(alpha_baton).await,
+        HandoffState::Open,
+        "claiming one live session's baton must not sweep another's"
+    );
+
+    // Once alpha ends, its baton is an ordinary SessionEnd baton again and the
+    // same-cwd supersession applies to it.
+    store.writer.end_session(alpha, None).await.unwrap();
+    let gamma = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    store
+        .writer
+        .checkpoint_session_handoff(baton(gamma, "gamma"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state(alpha_baton).await, HandoffState::Expired);
+}
+
+/// Automatic delivery re-checks the source inside the claim, and the claim's
+/// sweep retires batons of quiet (abandoned) open sessions while sparing one
+/// still in use. The selection runs on a reader before the writer claims, so
+/// a source can resume in between; and OpenCode sessions that never end would
+/// otherwise leave one open baton each, surfacing older conversations one by
+/// one to later sessions.
+#[tokio::test]
+async fn startup_claim_rechecks_the_source_and_sweeps_only_quiet_open_batons() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let mut batons = Vec::new();
+    // Checkpoint order, oldest first: busy, abandoned, quiet.
+    for summary in ["busy", "abandoned", "quiet"] {
+        let session = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: summary.into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        let id = store
+            .writer
+            .checkpoint_session_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: Some(session),
+                from_agent: AgentKind::OpenCode,
+                to_agent: None,
+                cwd: Some("/repo".into()),
+                summary: summary.into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        batons.push((session, id));
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    let [
+        (_, busy),
+        (abandoned_session, abandoned),
+        (quiet_session, quiet),
+    ] = batons[..]
+    else {
+        unreachable!()
+    };
+    // Only "busy" captured anything in the last hour.
+    let hour_ago = (jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1)).as_microsecond();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    for session in [abandoned_session, quiet_session] {
+        conn.execute(
+            "UPDATE observations SET created_at = ?1 WHERE session_id = ?2",
+            rusqlite::params![hour_ago, session.as_bytes()],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
+    let claim = |handoff_id, receiver| HandoffAcceptance {
+        handoff_id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::OpenCode,
+        accepting_session: Some(receiver),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: Some("/repo".into()),
+    };
+    let state = |id| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .handoff_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle
+                .state
+        }
+    };
+
+    // Selected earlier, but its source is in use by the time of the claim.
+    let receiver = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let raced = store
+        .writer
+        .accept_startup_context(Some(claim(busy, receiver)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(!raced.handoff_accepted, "a source in use keeps its baton");
+    assert_eq!(state(busy).await, HandoffState::Open);
+
+    let receiver = open_session(&store, ws, proj, AgentKind::OpenCode).await;
+    let delivered = store
+        .writer
+        .accept_startup_context(Some(claim(quiet, receiver)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(delivered.handoff_accepted);
+    assert_eq!(
+        state(abandoned).await,
+        HandoffState::Expired,
+        "an older baton of a quiet open session is superseded"
+    );
+    assert_eq!(
+        state(busy).await,
+        HandoffState::Open,
+        "a session in use keeps its baton even when it is older"
+    );
+}
+
+/// Two workstreams launched at once in one checkout each get a managed run.
+/// A session one run's child links marks that run only: the other run's
+/// status must neither report it nor count as linked, or its launcher would
+/// import the other launch's transcript.
+#[tokio::test]
+async fn a_session_linked_by_one_managed_run_is_not_another_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let prepare = |name: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "repo".into(),
+        worktree_fingerprint: "worktree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New(name.into()),
+        lease_owner: format!("launcher-{name}"),
+    };
+    let alpha = store
+        .writer
+        .prepare_workstream_run(prepare("alpha"))
+        .await
+        .unwrap();
+    let beta = store
+        .writer
+        .prepare_workstream_run(prepare("beta"))
+        .await
+        .unwrap();
+    assert_ne!(alpha.workstream_id, beta.workstream_id);
+    let status = async |run| {
+        let status = store.reader.managed_run_status(run).await.unwrap().unwrap();
+        (status.native_session_id, status.native_session_linked)
+    };
+
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(beta.run_id, AgentKind::Codex, "native-beta")
+            .await
+            .unwrap()
+    );
+    assert_eq!(status(alpha.run_id).await, (None, false));
+    assert_eq!(
+        status(beta.run_id).await,
+        (Some("native-beta".into()), true)
+    );
+
+    // Control: alpha's own link marks alpha, and leaves beta as it was.
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(alpha.run_id, AgentKind::Codex, "native-alpha")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        status(alpha.run_id).await,
+        (Some("native-alpha".into()), true)
+    );
+    assert_eq!(
+        status(beta.run_id).await,
+        (Some("native-beta".into()), true)
     );
 }
