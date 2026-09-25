@@ -561,7 +561,6 @@ pub(super) async fn run_from_with_wiring(
             &home,
             &repository.cwd,
             started_at,
-            prepared.native_session_id.as_deref(),
             server_status.as_ref(),
         )
         .await
@@ -672,16 +671,12 @@ async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &
     }
 }
 
-/// The native session this run used. `prepared_session` is the session the
-/// run was prepared with, which the server reports until a hook in the child
-/// links another.
 async fn resolve_native_session_after_run(
     plan: &LaunchPlan,
     harness: ManagedHarness,
     home: &Path,
     cwd: &Path,
     started_at: SystemTime,
-    prepared_session: Option<&str>,
     server_status: Option<&ManagedRunStatus>,
 ) -> Result<Option<String>> {
     if plan.mode == LaunchMode::Passthrough {
@@ -690,12 +685,13 @@ async fn resolve_native_session_after_run(
     if let Some(native_session_id) = &plan.expected_session_id {
         return Ok(Some(native_session_id.clone()));
     }
-    let reported = server_status.and_then(|status| status.native_session_id.as_deref());
-    // A hook links its session under this run's id, which a concurrent launch
-    // in the same checkout cannot do; discovery only sees the newest session.
-    // A descendant process inherits the id too, so the session must also be
-    // this checkout's.
-    let linked = reported.filter(|linked| Some(*linked) != prepared_session);
+    // A session linked under this run's id was reported by this run's child,
+    // which a concurrent launch in the same checkout cannot do; discovery
+    // only sees the newest session there. A descendant process inherits the
+    // id too, so the session must also be this checkout's.
+    let linked = server_status
+        .filter(|status| status.native_session_linked)
+        .and_then(|status| status.native_session_id.as_deref());
     if let Some(linked) = linked
         && native_session_in_checkout(harness, home, cwd, plan.session_dir.as_deref(), linked)
             .unwrap_or(false)
@@ -727,9 +723,9 @@ async fn resolve_native_session_after_run(
     // A linked session set aside above belongs to another checkout, so it is
     // no fallback either.
     Ok(discovered.or_else(|| {
-        reported
-            .filter(|reported| Some(*reported) != linked)
-            .map(str::to_string)
+        server_status
+            .and_then(|status| status.native_session_id.clone())
+            .filter(|reported| Some(reported.as_str()) != linked)
     }))
 }
 
@@ -2668,6 +2664,91 @@ mod tests {
         assert!(error.to_string().contains("--fresh cannot be combined"));
     }
 
+    /// A session linked during the run was reported by this run's child, so
+    /// it wins over a newer session another launch made in the same checkout,
+    /// even when it repeats the session the run was prepared with. A child's
+    /// own descendants inherit the run id, so a linked session this checkout
+    /// does not hold is set aside. Without a link, discovery still decides.
+    #[tokio::test]
+    async fn a_session_linked_during_the_run_wins_over_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let session_root = temp.path().join(".codex/sessions/2026/01/01");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&session_root).unwrap();
+        let started_at = SystemTime::now();
+        let rollout = |name: &str, id: &str, cwd: &Path| {
+            std::fs::write(
+                session_root.join(format!("rollout-{name}.jsonl")),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "session_meta",
+                        "payload": {"id": id, "cwd": cwd}
+                    })
+                ),
+            )
+            .unwrap();
+        };
+        rollout("prepared", "prepared", &cwd);
+        rollout("nested", "nested", &temp.path().join("other-checkout"));
+        rollout("concurrent", "concurrent-newer", &cwd);
+        let plan = build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+        let status = |linked: bool, native: &str| ManagedRunStatus {
+            run_id: ManagedRunId::new(),
+            workstream_id: WorkstreamId::new(),
+            agent: AgentKind::Codex,
+            native_session_id: Some(native.to_string()),
+            native_session_linked: linked,
+            context_delivered: true,
+            state: "active".to_string(),
+        };
+        for (linked, native, expected) in [
+            (true, "prepared", Some("prepared")),
+            (false, "prepared", Some("concurrent-newer")),
+            (true, "nested", Some("concurrent-newer")),
+        ] {
+            let status = status(linked, native);
+            assert_eq!(
+                resolve_native_session_after_run(
+                    &plan,
+                    ManagedHarness::Codex,
+                    temp.path(),
+                    &cwd,
+                    started_at,
+                    Some(&status),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                expected,
+                "linked={linked} native={native}"
+            );
+        }
+        // With nothing to discover here, the other checkout's session is not
+        // taken as a fallback either; an unlinked report still is.
+        let empty = temp.path().join("empty-checkout");
+        std::fs::create_dir_all(&empty).unwrap();
+        for (linked, expected) in [(true, None), (false, Some("nested"))] {
+            let status = status(linked, "nested");
+            assert_eq!(
+                resolve_native_session_after_run(
+                    &plan,
+                    ManagedHarness::Codex,
+                    temp.path(),
+                    &empty,
+                    started_at,
+                    Some(&status),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                expected,
+                "linked={linked}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn utility_launch_does_not_adopt_a_recent_unrelated_session() {
         let temp = tempfile::tempdir().unwrap();
@@ -2704,7 +2785,6 @@ mod tests {
                 &cwd,
                 started_at,
                 None,
-                None,
             )
             .await
             .unwrap()
@@ -2720,104 +2800,12 @@ mod tests {
                 &cwd,
                 started_at,
                 None,
-                None,
             )
             .await
             .unwrap()
             .as_deref(),
             Some("unrelated-current")
         );
-    }
-
-    /// A hook links the run's own session under its run id, so a newer
-    /// session another launch made in the same checkout does not replace it.
-    /// A report that only repeats the session the run was prepared with is no
-    /// link, and discovery still decides.
-    #[tokio::test]
-    async fn hook_linked_session_wins_over_a_newer_concurrent_session() {
-        let temp = tempfile::tempdir().unwrap();
-        let cwd = temp.path().join("repo");
-        let session_root = temp.path().join(".codex/sessions/2026/01/01");
-        std::fs::create_dir_all(&cwd).unwrap();
-        std::fs::create_dir_all(&session_root).unwrap();
-        let started_at = SystemTime::now();
-        let rollout = |name: &str, id: &str, cwd: &Path| {
-            std::fs::write(
-                session_root.join(format!("rollout-{name}.jsonl")),
-                format!(
-                    "{}\n",
-                    serde_json::json!({
-                        "type": "session_meta",
-                        "payload": {"id": id, "cwd": cwd}
-                    })
-                ),
-            )
-            .unwrap();
-        };
-        rollout("linked", "hook-linked", &cwd);
-        // A descendant process in another checkout inherits the run id.
-        rollout("nested", "nested", &temp.path().join("other-checkout"));
-        rollout("concurrent", "concurrent-newer", &cwd);
-        let plan = build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
-        let status = |native: &str| ManagedRunStatus {
-            run_id: ManagedRunId::new(),
-            workstream_id: WorkstreamId::new(),
-            agent: AgentKind::Codex,
-            native_session_id: Some(native.to_string()),
-            context_delivered: true,
-            state: "active".to_string(),
-        };
-        let resolve = async |native: &str, prepared: Option<&str>| {
-            resolve_native_session_after_run(
-                &plan,
-                ManagedHarness::Codex,
-                temp.path(),
-                &cwd,
-                started_at,
-                prepared,
-                Some(&status(native)),
-            )
-            .await
-            .unwrap()
-        };
-        assert_eq!(
-            resolve("hook-linked", None).await.as_deref(),
-            Some("hook-linked")
-        );
-        assert_eq!(
-            resolve("hook-linked", Some("earlier")).await.as_deref(),
-            Some("hook-linked")
-        );
-        assert_eq!(
-            resolve("hook-linked", Some("hook-linked")).await.as_deref(),
-            Some("concurrent-newer")
-        );
-        assert_eq!(
-            resolve("nested", Some("earlier")).await.as_deref(),
-            Some("concurrent-newer")
-        );
-        // With nothing to discover here, the other checkout's session is not
-        // taken as a fallback either; the prepared session still is.
-        let empty = temp.path().join("empty-checkout");
-        std::fs::create_dir_all(&empty).unwrap();
-        for (prepared, expected) in [(Some("earlier"), None), (Some("nested"), Some("nested"))] {
-            assert_eq!(
-                resolve_native_session_after_run(
-                    &plan,
-                    ManagedHarness::Codex,
-                    temp.path(),
-                    &empty,
-                    started_at,
-                    prepared,
-                    Some(&status("nested")),
-                )
-                .await
-                .unwrap()
-                .as_deref(),
-                expected,
-                "prepared={prepared:?}"
-            );
-        }
     }
 
     /// Two new Crush sessions in one store cannot be told apart, and that is
@@ -2863,6 +2851,7 @@ mod tests {
             workstream_id: WorkstreamId::new(),
             agent: AgentKind::Crush,
             native_session_id: Some("prepared".to_string()),
+            native_session_linked: false,
             context_delivered: false,
             state: "active".to_string(),
         };
@@ -2876,7 +2865,6 @@ mod tests {
                 temp.path(),
                 &cwd,
                 started_at,
-                Some("prepared"),
                 Some(&status),
             )
             .await

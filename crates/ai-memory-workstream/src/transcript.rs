@@ -2843,9 +2843,10 @@ fn discover_opencode(
         .unwrap_or_default()
         .as_millis() as i64;
     let mut statement = connection.prepare(
-        "SELECT id FROM session WHERE directory = ?1 AND time_updated >= ?2 ORDER BY time_updated DESC LIMIT 1",
+        "SELECT id FROM session WHERE directory IN (?1, ?3) AND time_updated >= ?2 ORDER BY time_updated DESC LIMIT 1",
     )?;
-    match statement.query_row(params![cwd.to_string_lossy(), since], |row| row.get(0)) {
+    let (native, forward) = opencode_directories(cwd);
+    match statement.query_row(params![native, since, forward], |row| row.get(0)) {
         Ok(id) => Ok(Some(id)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(error.into()),
@@ -2868,9 +2869,10 @@ fn list_opencode_sessions(
     )?;
     let mut statement = connection.prepare(
         "SELECT id, time_updated FROM session \
-         WHERE directory = ?1 ORDER BY time_updated DESC LIMIT ?2",
+         WHERE directory IN (?1, ?3) ORDER BY time_updated DESC LIMIT ?2",
     )?;
-    let rows = statement.query_map(params![cwd.to_string_lossy(), limit as i64], |row| {
+    let (native, forward) = opencode_directories(cwd);
+    let rows = statement.query_map(params![native, limit as i64, forward], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     let mut sessions = Vec::new();
@@ -3100,6 +3102,20 @@ fn opencode_db(home: &Path, session_dir: Option<&Path>) -> PathBuf {
     )
 }
 
+/// The spellings of `cwd` an OpenCode store may hold in `directory`. On
+/// Windows OpenCode records forward slashes (`C:/Users/me/repo`) while the
+/// checkout path uses backslashes, so an exact match on the native spelling
+/// found no session there. Other platforms have one spelling.
+fn opencode_directories(cwd: &Path) -> (String, String) {
+    let native = cwd.to_string_lossy().into_owned();
+    let forward = if cfg!(windows) {
+        native.replace('\\', "/")
+    } else {
+        native.clone()
+    };
+    (native, forward)
+}
+
 /// OpenCode 2.0 beta transcript adapter.
 ///
 /// The beta keeps v1's database file but replaced its tables: `session_v2`
@@ -3303,10 +3319,11 @@ fn discover_opencode2(
         .unwrap_or_default()
         .as_millis() as i64;
     let mut statement = connection.prepare(
-        "SELECT id FROM session_v2 WHERE directory = ?1 AND time_updated >= ?2 \
+        "SELECT id FROM session_v2 WHERE directory IN (?1, ?3) AND time_updated >= ?2 \
          ORDER BY time_updated DESC LIMIT 1",
     )?;
-    match statement.query_row(params![cwd.to_string_lossy(), since], |row| row.get(0)) {
+    let (native, forward) = opencode_directories(cwd);
+    match statement.query_row(params![native, since, forward], |row| row.get(0)) {
         Ok(id) => Ok(Some(id)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(error.into()),
@@ -3329,9 +3346,10 @@ fn list_opencode2_sessions(
     )?;
     let mut statement = connection.prepare(
         "SELECT id, time_updated FROM session_v2 \
-         WHERE directory = ?1 ORDER BY time_updated DESC LIMIT ?2",
+         WHERE directory IN (?1, ?3) ORDER BY time_updated DESC LIMIT ?2",
     )?;
-    let rows = statement.query_map(params![cwd.to_string_lossy(), limit as i64], |row| {
+    let (native, forward) = opencode_directories(cwd);
+    let rows = statement.query_map(params![native, limit as i64, forward], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     let mut sessions = Vec::new();
@@ -4677,6 +4695,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.as_deref(), Some("newer"));
+    }
+
+    // OpenCode records `C:/Users/me/repo`; the checkout path is
+    // `C:\Users\me\repo`. Both the v1 and v2 stores are found from the native
+    // spelling, and a sibling directory still is not.
+    #[cfg(windows)]
+    #[test]
+    fn opencode_stores_match_forward_slash_directories_on_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let forward = |path: &Path| path.to_string_lossy().replace('\\', "/");
+        for table in ["session", "session_v2"] {
+            let db_root = temp.path().join(table);
+            fs::create_dir_all(&db_root).unwrap();
+            let connection = Connection::open(db_root.join("opencode.db")).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE {table}( \
+                         id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_updated INTEGER NOT NULL);"
+                ))
+                .unwrap();
+            for (id, directory, updated) in [
+                ("mine", forward(&cwd), 100_i64),
+                ("sibling", forward(&temp.path().join("repo-other")), 200_i64),
+            ] {
+                connection
+                    .execute(
+                        &format!("INSERT INTO {table} VALUES (?1, ?2, ?3)"),
+                        params![id, directory, updated],
+                    )
+                    .unwrap();
+            }
+            let (discover, list): (fn(_, _, _, _) -> _, fn(_, _, _, _) -> _) = if table == "session"
+            {
+                (discover_opencode, list_opencode_sessions)
+            } else {
+                (discover_opencode2, list_opencode2_sessions)
+            };
+            let found = discover(temp.path(), Some(&db_root), &cwd, UNIX_EPOCH).unwrap();
+            assert_eq!(found.as_deref(), Some("mine"), "{table}");
+            let listed = list(temp.path(), Some(&db_root), &cwd, 10).unwrap();
+            let ids: Vec<_> = listed
+                .iter()
+                .map(|s| s.native_session_id.as_str())
+                .collect();
+            assert_eq!(ids, ["mine"], "{table}");
+        }
     }
 
     /// Build a two-bucket kimi store: `session_a` checked out at `cwd`,

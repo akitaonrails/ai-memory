@@ -333,7 +333,12 @@ resume, continue, session, or fork selector.
    Direct launches continue to use the same handoff path without a managed
    packet.
 4. When the child exits, ai-memory reads the native transcript store without
-   modifying it. Visible user/assistant messages, completed tool calls/results,
+   modifying it. A session named on the command line (or chosen before the
+   spawn) is the one it reads. Otherwise a session linked during the run under
+   its `AI_MEMORY_RUN_ID`, even the workstream's current one, is read when the
+   native store holds it for this checkout; only without such a link does it
+   look for the newest session in the checkout, which a concurrent launch
+   there could own. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
    workstream ledger. Hidden reasoning and unsupported/private records are
    excluded and recorded as extraction-loss annotations. Each delivered
@@ -396,16 +401,7 @@ Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session.
 
-When a fresh launch cannot name its session up front, the session a hook in
-the child links under the run's `AI_MEMORY_RUN_ID` is the one imported when
-the native store holds it for this checkout (a process the child starts
-inherits that id too), so a concurrent launch in the same checkout cannot hand
-it a different transcript. Only without such a link does ai-memory look for
-the session after exit. A
-hook that links the very session the run was prepared with, as when a native
-picker resumes the workstream's current session without naming it, is not yet
-told apart from no link, so the look after exit still decides there.
-Crush has no hooks: a fresh Crush launch claims the one top-level session
+Crush has no hooks to link its session: a fresh Crush launch claims the one top-level session
 created while it ran (its title and sub-agent sessions do not count), and
 imports nothing, with a warning, when another launch on the same store created
 one too; resume that session with `--session <id>` to link it. `--continue`

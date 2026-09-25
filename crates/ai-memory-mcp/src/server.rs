@@ -3262,13 +3262,38 @@ impl AiMemoryServer {
                 .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if !dry {
+                self.reconcile_consolidation_job(session_id).await;
+            }
             ok_json(&serde_json::json!({ "outcomes": outcomes }))
         } else {
             let outcome = consolidator
                 .consolidate_session(session_id, dry, actor, author_id, instructions)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if !dry {
+                self.reconcile_consolidation_job(session_id).await;
+            }
             ok_json(&outcome)
+        }
+    }
+
+    /// Reconcile the durable SessionEnd job row after a successful manual
+    /// `memory_consolidate` so the operator does not see a `failed` job for a
+    /// session that is now consolidated. The automatic worker owns the job's
+    /// lease, so the reconcile never touches a `running` row; a best-effort
+    /// failure here must not fail the consolidate that already wrote the page.
+    async fn reconcile_consolidation_job(&self, session_id: SessionId) {
+        if let Err(error) = self
+            .writer
+            .reconcile_session_consolidation_completed(session_id)
+            .await
+        {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "failed to reconcile session consolidation job after manual consolidate"
+            );
         }
     }
 
