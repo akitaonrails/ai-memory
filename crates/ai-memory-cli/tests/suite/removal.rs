@@ -1715,3 +1715,115 @@ fn default_uninstall_removes_installed_kimi_code_flavored_url() {
     );
     assert!(after["mcpServers"].get("other").is_some());
 }
+
+/// `ai-memory run` skips auto-wire while its sentinel exists, so an uninstall
+/// that leaves one makes the next managed launch skip wiring and capture
+/// nothing. Hooks or MCP in scope clear every sentinel, even with no other
+/// wiring left; instructions and skills leave them alone.
+#[test]
+fn uninstall_clears_autowire_sentinels_with_hooks_or_mcp() {
+    let _guard = cli_test_lock();
+    for only in [
+        None,
+        Some("hooks"),
+        Some("mcp"),
+        Some("instructions"),
+        Some("skills"),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let state = home.path().join(".ai-memory-data/autowire-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let sentinels = [
+            state.join(format!(
+                "claude-code-{}-0123456789abcdef",
+                env!("CARGO_PKG_VERSION")
+            )),
+            // An older release's name, before the location hash.
+            state.join("codex-2.3.1"),
+        ];
+        for path in &sentinels {
+            std::fs::write(path, b"").unwrap();
+        }
+        let foreign = state.join("notes.txt");
+        std::fs::write(&foreign, "not a sentinel").unwrap();
+        let clears = matches!(only, None | Some("hooks" | "mcp"));
+        let uninstall = |extra: &[&str]| {
+            let mut args = vec!["uninstall"];
+            if let Some(only) = only {
+                args.extend(["--only", only]);
+            }
+            args.extend_from_slice(extra);
+            let output = command_with_home(home.path())
+                .args(&args)
+                .current_dir(project.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let plan = uninstall(&[]);
+        assert_eq!(
+            plan.contains("auto-wire sentinel"),
+            clears,
+            "{only:?}: {plan}"
+        );
+        assert!(
+            sentinels.iter().all(|path| path.exists()),
+            "a dry run must not delete"
+        );
+        uninstall(&["--apply", "--yes"]);
+        for path in &sentinels {
+            assert_eq!(path.exists(), !clears, "{only:?}: {}", path.display());
+        }
+        assert!(
+            foreign.exists(),
+            "a file auto-wire did not write must survive"
+        );
+    }
+}
+
+/// The stored hook bearer is read by the hooks, so only an uninstall that
+/// removes them may delete it.
+#[test]
+fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let output = command_with_home(home.path())
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&["install-mcp", "--client", "claude-code", "--apply"]);
+    run(&["install-hooks", "--agent", "claude-code", "--apply"]);
+    let data = home.path().join(".ai-memory-data");
+    let bearer = [data.join("auth-token"), data.join("auth-header")];
+    for path in &bearer {
+        std::fs::write(path, "secret\n").unwrap();
+    }
+
+    run(&["uninstall", "--only", "mcp", "--apply", "--yes"]);
+    for path in &bearer {
+        assert!(path.exists(), "--only mcp removed {}", path.display());
+    }
+    run(&["uninstall", "--only", "hooks", "--apply", "--yes"]);
+    for path in &bearer {
+        assert!(
+            !path.exists(),
+            "removing the hooks keeps {}",
+            path.display()
+        );
+    }
+}

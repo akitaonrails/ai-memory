@@ -198,9 +198,9 @@ ai-memory serve                      # run the server
 
 - **Nothing is being remembered**: hooks may not be installed. `ai-memory run
   <harness>` installs its hooks + MCP on the first launch per harness,
-  ai-memory version and config home. If that harness already launched through
-  `run` and its hooks went missing (removed by hand, a failed first wire),
-  install them by hand: `ai-memory
+  ai-memory version and config home, and again after `ai-memory uninstall`. If that harness
+  already launched through `run` and its hooks went missing another way
+  (removed by hand, a failed first wire), install them by hand: `ai-memory
   install-hooks --agent <your-agent> --apply` and `ai-memory install-mcp
   --client <client> --apply`. Then check `ai-memory status` / `ai-memory doctor`.
 - **Only *some* agents are being remembered**: run `ai-memory doctor`. It lists
