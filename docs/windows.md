@@ -181,8 +181,9 @@ Docker. Each tagged release publishes
 `ai-memory-windows-x86_64.zip` (see the repo's Releases page).
 
 ```powershell
-# Download + extract into your user data dir (any stable path works; the
-# native hook exec-form command is rendered from wherever ai-memory.exe lives).
+# First-time install: download + extract into your user data dir (any stable
+# path works; the native hook exec-form command is rendered from wherever
+# ai-memory.exe lives).
 $Dest = "$env:LOCALAPPDATA\ai-memory"
 New-Item -ItemType Directory -Force $Dest | Out-Null
 Invoke-WebRequest `
@@ -203,6 +204,24 @@ if (($UserPath -split ';') -notcontains $Dest) {
 & "$Dest\ai-memory.exe" install-hooks --agent claude-code --apply `
     --server-url "https://memory.example.com" --auth-token "<token>"
 ```
+
+Later updates for this install use the same command as Linux/macOS release
+binaries. From a writable prefix (for example `%LOCALAPPDATA%\ai-memory`),
+run:
+
+```powershell
+ai-memory upgrade
+# optional: pin a tag, or force a re-download of the current tag
+ai-memory upgrade --version v2.3.2
+ai-memory upgrade --force
+```
+
+That downloads `ai-memory-windows-x86_64.zip` + `.sha256`, verifies the
+checksum, replaces `ai-memory.exe` via rename-aside (Windows cannot overwrite
+a running image), refreshes a sibling `hooks/` tree when present, then
+re-stages hooks for agents already under the data-dir hooks tree. Keep the
+manual zip download above as a fallback if the install directory is not
+writable (for example under Program Files).
 
 The zip mirrors the Linux release tarball, minus the Linux-only service
 assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +

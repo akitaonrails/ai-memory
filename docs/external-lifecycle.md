@@ -149,6 +149,9 @@ Use the tuple recipe when event IDs have narrower scope.
   saturation rather than opening an unbounded number of requests.
 
 Maintain a durable producer-side queue if offline/restart recovery matters.
+The optional [lifecycle relay](../companions/ai-memory-relay) supplies one through
+a separate CLI. It accepts events from the orchestrator and sends only the first
+pending event of each session in a batch.
 Flush earlier events for a session before sending its terminal event. Serialize
 delivery within a session where order matters; different sessions can share the
 server concurrently. Late observations and a later terminal event use existing

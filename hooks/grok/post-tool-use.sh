@@ -29,8 +29,11 @@ if [ -f "$SHOWN" ]; then
     exit 0
 fi
 
+# Subagent payloads must not take the parent's handoff — same key set as
+# the native router (`commands/hook.rs::payload_is_subagent`): subagentType,
+# subagent_type, agent_type, agent_id, parentSessionId.
 case "$PAYLOAD" in
-    *'"subagentType"'*|*'\"subagentType\"'*|*'"parentSessionId"'*)
+    *'"subagentType"'*|*'"subagent_type"'*|*'"agent_type"'*|*'"agent_id"'*|*'"parentSessionId"'*|*'\"subagentType\"'*)
         printf '{}\n'
         exit 0
         ;;

@@ -265,6 +265,13 @@ pub struct Config {
     pub tcp_keepalive_secs: u64,
     /// Base URL used by thin-client CLI commands to contact the running server.
     pub server_url: String,
+    /// Optional override for the GitHub Releases base URL used by
+    /// `ai-memory upgrade` (archive + `.sha256` download). Empty/unset
+    /// means `https://github.com/akitaonrails/ai-memory/releases`. Set via
+    /// `AI_MEMORY_RELEASE_BASE_URL` or `release_base_url` in config.toml —
+    /// intended for hermetic tests and mirrors, not day-to-day installs.
+    #[serde(default)]
+    pub release_base_url: Option<String>,
     /// URL subpath the server is mounted under (e.g. `/wiki`). Thin-client
     /// CLI commands prepend it to every `/admin/*` request so deployments
     /// hosted behind a reverse proxy under a subpath don't 404. Settable via
@@ -912,6 +919,7 @@ impl Default for Config {
             bind: DEFAULT_BIND.into(),
             tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
+            release_base_url: None,
             base_path: String::new(),
             home_dir: None,
             log_level: "info".into(),

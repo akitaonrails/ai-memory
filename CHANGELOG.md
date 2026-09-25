@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Native `ai-memory upgrade` for GitHub-release installs (Linux/macOS
+  tarballs and Windows x86_64 zip): downloads the matching release archive,
+  verifies the `.sha256` sidecar, replaces the on-disk binary (and a sibling
+  `hooks/` tree when present), then re-runs `install-hooks --apply` for staged
+  agents. Windows uses rename-aside self-replace (running `.exe` → `.old`,
+  promote `.new`) because the mapped image cannot be overwritten in place.
+  Refuses package-managed paths (Homebrew/AUR/`/usr`), containers, and
+  unwritable prefixes; the Docker wrapper's `upgrade` path is unchanged. Pin
+  with `--version` / force a re-download with `--force`. Optional
+  `AI_MEMORY_RELEASE_BASE_URL` / `release_base_url` overrides the Releases
+  base for mirrors and hermetic tests (loaded via `Config`, not ad-hoc env).
+  Downloads refuse bodies over 128 MiB (Content-Length and streamed cap).
+  (#801, #802)
 - `ai-memory run` accepts a repeatable `--env KEY=VALUE` and an `--env-file
   <path>` (blank lines and `#` comments skipped) to pass extra environment
   into the spawned harness — e.g. a per-account `CLAUDE_CONFIG_DIR` for
@@ -53,6 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-existing identity, so upgrading installs need no migration, and a
   query-only prefix change never needs a rebuild. See
   `docs/llm-providers.md`. (#859)
+- Added the optional `ai-memory-relay` companion for external lifecycle events.
+  It queues events locally and sends ordered batches through the public hook API,
+  using stable event identities for retries. The package has its own workspace
+  and does not change the server's capture or storage defaults. (#823)
 - `auto_improve.patchable_page_prefixes` makes the folders whose page bodies the
   reviewer reads configurable, defaulting to the historical `_rules/` and
   `procedures/`. Only those two folders' contents were ever sent; every other
@@ -213,6 +230,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Kiro v3 resume that falls back to the default session store drops
   `KIRO_HOME` from the child, but auto-wire still installed hooks and MCP
   under `KIRO_HOME`; it now wires the default home that resume reads. (#820)
+- Native `ai-memory upgrade` no longer refuses every Linux install by probing
+  the running executable for write (Linux `ETXTBSY`); it only requires the
+  parent directory to be writable for rename-based replace. (#802)
+- Native `ai-memory upgrade` accepts release archives whose entries are
+  `./`-prefixed (`tar -C … -czf … .` as in `release.yml`), instead of
+  rejecting `Component::CurDir` as an unsafe path. (#802)
+- Native `ai-memory upgrade` treats Linuxbrew (`/home/linuxbrew/.linuxbrew/`)
+  as package-managed and refuses self-replace there. (#802)
+- Native `ai-memory upgrade` container refusal now uses the shared
+  `running_in_container` helper (`AI_MEMORY_IN_CONTAINER`, `/.dockerenv`,
+  `/run/.containerenv` / Podman), matching staged-hooks detection. (#802)
 - `memory_query`'s vector stream called the generic `Embedder::embed`
   instead of `embed_query` on the configured embedder, so a
   query/document-asymmetric embedder (Google's task-typed embeddings, or

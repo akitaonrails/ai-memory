@@ -547,12 +547,12 @@ fn source_candidates(explicit: Option<&Path>, sub: &str, exe: Option<PathBuf>) -
     if let Some(exe) = exe {
         // Release tarball: `hooks/` sits in the same dir as the binary.
         if let Some(dir) = exe.parent() {
-            v.push(dir.join("hooks").join(sub));
+            v.push(dir.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
         }
         // Repo-local fallback for `cargo run setup-agent` during dev:
         // target/<profile>/<bin> → repo root.
         if let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
-            v.push(root.join("hooks").join(sub));
+            v.push(root.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
         }
     }
     v

@@ -5204,13 +5204,13 @@ fn hook_source_candidates(
     let mut candidates = Vec::with_capacity(5);
     // Cargo-run from the repo.
     if let Some(root) = repo_root {
-        candidates.push(root.join("hooks").join(sub));
+        candidates.push(root.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
     }
     // Release tarball (macOS/Windows/Linux archive): the `hooks/` bundle
     // ships in the same directory as the binary, so it's reachable without
     // `--source` (issue #107).
     if let Some(dir) = exe_dir {
-        candidates.push(dir.join("hooks").join(sub));
+        candidates.push(dir.join(crate::install_layout::HOOKS_DIR_NAME).join(sub));
     }
     // Docker image lays them out under /usr/local/share/ai-memory/.
     candidates.push(PathBuf::from(format!(

@@ -539,10 +539,10 @@ embed                generate-auth-token  setup-agent
 bootstrap            install-instructions install-skills
 reorg                purge-project        rename-project
 move-project         move-session         uninstall
-auth                 user                 completions
-handoffs             purge-session        compact
-api-key              export-okf           message
-doctor               backfill
+upgrade              auth                 user
+completions          handoffs             purge-session
+compact              api-key              export-okf
+message              doctor               backfill
 ```
 
 Run `ai-memory --help` for the full tree.

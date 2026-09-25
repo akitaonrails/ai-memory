@@ -75,6 +75,18 @@ jobs:
       # block that fails to compile (e.g. an indented shell example rustdoc
       # reads as Rust) shipped unnoticed. Run them explicitly.
       - run: cargo test --workspace --doc
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: false
+      - name: Build the external lifecycle relay
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo build --locked --manifest-path companions/ai-memory-relay/Cargo.toml
+      - name: External lifecycle delivery against the real server
+        run: >
+          uv run --no-project python tests/e2e/external_relay_smoke.py
+          --ai-memory-bin "${{ github.workspace }}/target/debug/ai-memory"
+          --relay-bin "${{ github.workspace }}/target/debug/ai-memory-relay"
       - name: Vendored tailwind.css is current
         if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- crates/ai-memory-web/static/tailwind.css
@@ -125,13 +137,13 @@ jobs:
       # is here to catch before it reaches windows.yml or a release.
       - run: cargo xwin build --workspace --all-targets --target x86_64-pc-windows-msvc
 
-  # The companion importer is deliberately outside the root workspace
-  # (its own [workspace] in companions/ai-memory-importer/Cargo.toml), so
-  # none of the jobs above compile it. Gate it here with the same
-  # fmt/clippy/test trio docs/companion-crates.md prescribes, or a
-  # toolchain bump / convention change rots it silently.
+  # Companions have their own workspaces and need separate checks.
   companions:
-    name: companions (ai-memory-importer)
+    name: companions (${{ matrix.companion }})
+    strategy:
+      fail-fast: false
+      matrix:
+        companion: [ai-memory-importer, ai-memory-relay]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -140,10 +152,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
-          workspaces: companions/ai-memory-importer
-      - run: cargo fmt --check --manifest-path companions/ai-memory-importer/Cargo.toml
-      - run: cargo clippy --manifest-path companions/ai-memory-importer/Cargo.toml --all-targets -- -D warnings
-      - run: cargo test --manifest-path companions/ai-memory-importer/Cargo.toml
+          workspaces: companions/${{ matrix.companion }}
+      - run: cargo fmt --check --manifest-path companions/${{ matrix.companion }}/Cargo.toml
+      - run: cargo clippy --locked --manifest-path companions/${{ matrix.companion }}/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path companions/${{ matrix.companion }}/Cargo.toml
 
   # Build the release binary on its own so a release-only failure
   # (LTO crash, codegen issue, dead-code-with-debug-assertions) doesn't
@@ -308,6 +320,13 @@ jobs:
           log-level: warn
           command: check
           arguments: --all-features
+      - name: Relay dependency policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          log-level: warn
+          command: check
+          manifest-path: companions/ai-memory-relay/Cargo.toml
+          arguments: --all-features
 
   audit:
     name: cargo-audit
@@ -323,6 +342,7 @@ jobs:
           --ignore RUSTSEC-2024-0320
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
+      - run: cargo audit --file companions/ai-memory-relay/Cargo.lock
 
   gitleaks:
     name: gitleaks (secret scan)

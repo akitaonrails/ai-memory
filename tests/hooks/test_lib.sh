@@ -542,6 +542,115 @@ unset -f curl
 unset AI_MEMORY_CAPTURE_OWNER
 unset AI_MEMORY_DATA_DIR
 
+# --- grok post-tool-use.sh: shipped shell handoff path -----------------
+# The native router (`commands/hook.rs`) and this script implement the same
+# contract: one destructive `GET /handoff` per Grok session on the first
+# PostToolUse, wrapped as PostToolUse additionalContext; child-session
+# payloads never fetch (the GET would burn the parent's baton). A PATH curl
+# shim runs the real shipped script, so what is asserted is what ships.
+GROK_HOOK="$(dirname "$0")/../../hooks/grok/post-tool-use.sh"
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/curl" <<'EOF'
+#!/bin/sh
+# Fake curl: log "METHOD URL"; answer 200 to a POST, HANDOFF BODY to a GET.
+_gm=GET
+_gu=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -X) shift; [ $# -gt 0 ] || break; _gm=$1 ;;
+        http://* | https://*) _gu=$1 ;;
+    esac
+    shift
+done
+printf '%s %s\n' "$_gm" "$_gu" >>"$GROK_LOG"
+if [ "$_gm" = POST ]; then printf '200'; else printf 'HANDOFF BODY'; fi
+EOF
+chmod +x "$TMP/bin/curl"
+PATH="$TMP/bin:$PATH"
+export PATH
+
+grok_case() {
+    GROK_CASE_DIR="$TMP/grok-$1"
+    mkdir -p "$GROK_CASE_DIR/data"
+    AI_MEMORY_DATA_DIR="$GROK_CASE_DIR/data"
+    export AI_MEMORY_DATA_DIR
+    GROK_LOG="$GROK_CASE_DIR/curl.log"
+    : >"$GROK_LOG"
+    export GROK_LOG
+}
+grok_gets() { awk '/^GET /{ n++ } END { print n + 0 }' "$GROK_LOG"; }
+grok_run() {
+    printf '%s' "$1" | sh "$(dirname "$0")/../../hooks/grok/post-tool-use.sh" 2>/dev/null
+}
+grok_payload() {
+    printf '{"session_id":"%s","cwd":"%s","tool_name":"read_file"}' "$1" "$GROK_CASE_DIR"
+}
+
+# 1. First PostToolUse of a session: fetches once and wraps as additionalContext.
+grok_case first
+OUT=$(grok_run "$(grok_payload g-sess)")
+case "$OUT" in
+    *'"hookSpecificOutput"'*'"PostToolUse"'*'"additionalContext":"HANDOFF BODY"'*)
+        PASS=$((PASS + 1)); printf '  ok  %s\n' "grok: first post-tool-use wraps the handoff" ;;
+    *) FAIL=$((FAIL + 1)); printf '  FAIL grok: first post-tool-use wraps the handoff\n    got =%s\n' "$OUT" ;;
+esac
+assert_eq "grok: first post-tool-use GETs the handoff with session id" "1" "$(grok_gets)"
+[ -f "$AI_MEMORY_DATA_DIR/briefed/post-g-sess" ] && PASS=$((PASS + 1)) || {
+    FAIL=$((FAIL + 1)); printf '  FAIL grok: shown marker post-g-sess missing\n'
+}
+
+# 2. Second call in the same session: `{}`, no second (destructive) GET.
+OUT=$(grok_run "$(grok_payload g-sess)")
+assert_eq "grok: second post-tool-use prints empty object" "{}" "$OUT"
+assert_eq "grok: second call does not re-fetch the handoff" "1" "$(grok_gets)"
+
+# 3. Subagent payloads never fetch — every key the native router knows.
+grok_child_payload() {
+    printf '{"session_id":"child","cwd":"%s","tool_name":"read_file","%s":"planner-a"}' \
+        "$GROK_CASE_DIR" "$1"
+}
+for key in subagentType subagent_type agent_type agent_id parentSessionId; do
+    grok_case "child-$key"
+    OUT=$(grok_run "$(grok_child_payload "$key")")
+    assert_eq "grok: $key payload does not fetch the handoff" "{}" "$OUT"
+    assert_eq "grok: $key payload sent zero GETs" "0" "$(grok_gets)"
+done
+
+unset AI_MEMORY_DATA_DIR GROK_LOG
+PATH=${PATH#"$TMP/bin:"}
+export PATH
+
+# --- grok PowerShell bundle parity -------------------------------------
+# The PS lib is the documented fallback when the native binary is absent.
+# Static parity first (no pwsh needed): the child-session key set must
+# match the native router's five keys, and the per-process `$PID` fallback
+# key must never come back (it breaks the once-per-session gate).
+PS_LIB="$(dirname "$0")/../../hooks/lib/ai-memory-hook.ps1"
+for key in subagentType subagent_type agent_type agent_id parentSessionId; do
+    if grep -q "\"$key\"" "$PS_LIB"; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        printf '  FAIL grok ps: child key %s missing from the subagent gate\n' "$key"
+    fi
+done
+if grep -q 'grok-post-\$PID' "$PS_LIB"; then
+    FAIL=$((FAIL + 1)); printf '  FAIL grok ps: per-process $PID shown-key fallback is back\n'
+else
+    PASS=$((PASS + 1)); printf '  ok  grok ps: shown-key fallback is stable, not per-process\n'
+fi
+
+# Behavioral probe: pure functions only, so a pwsh run adds real evidence
+# where pwsh exists (Windows CI / dev boxes) and skips elsewhere (same
+# posture as the Node-required runtime evidence in render_shared.rs).
+if command -v pwsh >/dev/null 2>&1; then
+    PS_OUT=$(pwsh -NoProfile -File "$(dirname "$0")/test_grok_ps.ps1" "$PS_LIB" 2>&1) \
+        && PASS=$((PASS + $(printf '%s\n' "$PS_OUT" | sed -n 's/.*checks=\([0-9]*\).*/\1/p') )) \
+        || { FAIL=$((FAIL + 1)); printf '  FAIL grok ps behavioral probe\n%s\n' "$PS_OUT"; }
+else
+    printf '  skip grok ps behavioral probe (pwsh unavailable)\n'
+fi
+
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

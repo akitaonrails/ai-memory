@@ -80,6 +80,7 @@ pub mod setup_agent;
 pub mod show;
 pub mod status;
 pub mod uninstall;
+pub mod upgrade;
 pub mod user;
 pub mod workstream_search;
 pub mod workstreams;

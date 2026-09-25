@@ -211,6 +211,13 @@ pub enum Command {
     /// Remove ai-memory's wiring (hooks, MCP, instructions, and default-root
     /// managed skills) from all detected agents. Dry-run unless `--apply`.
     Uninstall(UninstallArgs),
+    /// Upgrade a GitHub-release native install: download the matching
+    /// release asset, verify its `.sha256`, atomically replace this
+    /// binary (and sibling `hooks/` when present), then re-stage hooks
+    /// for agents already under the data-dir hooks tree. Docker-wrapper
+    /// installs keep using the shell wrapper's `upgrade` (image pull);
+    /// package-managed installs (Homebrew, AUR, …) are refused.
+    Upgrade(UpgradeArgs),
     /// Manage optional upstream LLM provider authentication.
     Auth(AuthArgs),
     /// Manage human users and deprecated 1.x compatibility tokens. All
@@ -1000,6 +1007,19 @@ pub struct UninstallArgs {
     /// profile's files are swept as well.
     #[arg(long)]
     pub profile: Option<String>,
+}
+
+/// Arguments for `upgrade`.
+#[derive(Debug, Args)]
+pub struct UpgradeArgs {
+    /// Pin a specific release tag (with or without a leading `v`). Defaults
+    /// to the latest GitHub Release for akitaonrails/ai-memory.
+    #[arg(long)]
+    pub version: Option<String>,
+    /// Re-download and replace even when the installed version already
+    /// matches the resolved release tag.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `reorg`.
@@ -3840,5 +3860,16 @@ mod tests {
     #[test]
     fn completions_requires_a_shell() {
         assert!(Cli::try_parse_from(["ai-memory", "completions"]).is_err());
+    }
+
+    #[test]
+    fn upgrade_parses_version_and_force() {
+        let cli = Cli::try_parse_from(["ai-memory", "upgrade", "--version", "v2.3.2", "--force"])
+            .unwrap();
+        let Command::Upgrade(args) = cli.command else {
+            panic!("expected upgrade command");
+        };
+        assert_eq!(args.version.as_deref(), Some("v2.3.2"));
+        assert!(args.force);
     }
 }
