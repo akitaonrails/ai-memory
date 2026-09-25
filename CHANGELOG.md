@@ -174,8 +174,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   captured; each location instance owns its own queue, spool state and
   cleanup; an explicit `session.moved` rebinds the live session to its new
   directory so its later end lands there. Checked against OpenCode 2.0.14. (#865)
-
-### Changed
 - Quieted the default server log: the reconciliation-pass summary that fired
   every 30 s regardless of activity dropped from `info` to `debug`, and the
   default log filter now pins the external `rmcp` MCP SDK to `warn` (its
