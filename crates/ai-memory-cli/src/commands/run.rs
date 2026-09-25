@@ -389,7 +389,17 @@ pub(super) async fn run_from_with_wiring(
             .or_else(|| std::env::var_os(name))
     };
     if config.run_autowire && !no_autowire {
-        super::run_autowire::ensure_wired_with(config, harness, wire_overrides, &run_env);
+        // A Kiro v3 resume from the default store drops `KIRO_HOME` from the
+        // child, so its hooks and MCP belong under the default home.
+        let mut wire_env = run_env.clone();
+        if remove_kiro_home {
+            upsert_env(
+                &mut wire_env,
+                "KIRO_HOME".to_string(),
+                home.join(".kiro").display().to_string(),
+            );
+        }
+        super::run_autowire::ensure_wired_with(config, harness, wire_overrides, &wire_env);
     }
     if plan.mode == LaunchMode::Session
         && let Some(native_session_id) = &plan.expected_session_id
@@ -2929,6 +2939,89 @@ mod tests {
             std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")),
             "MCP missing in {}",
             mcp.display()
+        );
+
+        server.abort();
+    }
+
+    /// A Kiro v3 session stored under the default home is resumed with
+    /// `KIRO_HOME` removed from the child, so auto-wire must wire that default
+    /// home. Wiring the `--env` home instead left the resumed session with no
+    /// hooks and no MCP.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kiro_v3_default_store_resume_autowires_the_home_the_child_reads() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        const SESSION: &str = "sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e";
+        let (address, server) = mock_workstream_server(Some(SESSION)).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "KIRO_HOME");
+
+        let session_dir = home
+            .path()
+            .join(".kiro/sessions/checkout-fixture")
+            .join(SESSION);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("session.json"),
+            serde_json::json!({
+                "schemaVersion": "1.0.0",
+                "dataModelVersion": 1,
+                "id": SESSION,
+                "workspacePaths": [repo.path()],
+                "createdAt": "2026-08-06T10:00:00Z",
+                "lastModifiedAt": "2026-08-06T10:05:00Z",
+                "agentMode": "vibe",
+                "status": "idle"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(session_dir.join("messages.jsonl"), "{}\n").unwrap();
+        let custom = home.path().join("custom-kiro");
+        std::fs::create_dir_all(custom.join("sessions")).unwrap();
+
+        let config = launch_config(home.path(), data.path(), address);
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            confine_to: Some(home.path().to_path_buf()),
+            ..WireOverrides::default()
+        };
+        let env = vec![("KIRO_HOME".to_string(), custom.display().to_string())];
+        let exit = run_from_with_wiring(
+            &config,
+            run_args(RunHarnessChoice::Kiro, script, env, &["--v3"]),
+            repo.path(),
+            &overrides,
+        )
+        .await
+        .expect("managed Kiro v3 resume completes");
+        assert_eq!(exit, 0);
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            "unset",
+            "the default-store resume must drop KIRO_HOME from the child"
+        );
+
+        let kiro_default = home.path().join(".kiro");
+        let hooks = kiro_default.join("hooks").join("ai-memory.json");
+        assert!(
+            std::fs::read_to_string(&hooks).is_ok_and(|s| s.contains("ai-memory")),
+            "hooks missing in {}",
+            hooks.display()
+        );
+        let mcp = kiro_default.join("settings").join("mcp.json");
+        assert!(
+            std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")),
+            "MCP missing in {}",
+            mcp.display()
+        );
+        assert!(
+            !custom.join("hooks").exists() && !custom.join("settings").exists(),
+            "the KIRO_HOME the child no longer reads must stay untouched"
         );
 
         server.abort();
