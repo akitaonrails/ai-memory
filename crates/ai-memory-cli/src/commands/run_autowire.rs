@@ -679,6 +679,7 @@ mod tests {
                 Vec::new(),
                 None,
                 &run_env,
+                None,
             )
             .unwrap();
             assert_eq!(plan.session_dir, None, "{harness:?} session store");

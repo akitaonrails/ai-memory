@@ -369,7 +369,7 @@ is labelled completed evidence and must never be replayed as a pending call.
 | OpenCode | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only |
 | OpenCode 2 beta | native default creation | `--session <id>` | same `opencode.db` as v1 (the beta channel keeps v1's filename; the beta adds `session_v2`/`session_message` tables beside v1's); launched via the `opencode2` binary |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
-| Crush | native default creation | `--session <id>` | `<project>/.crush/crush.db` opened read-only |
+| Crush | native default creation | `--session <id>` | `<data dir>/crush.db` opened read-only: `options.data_directory` from Crush's JSON configs, else the closest `.crush` up to the git worktree root, else `<cwd>/.crush` |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
 | Command Code | native default creation | `--session <uuid>` | `~/.commandcode/projects/*/<uuid>.jsonl` |
 | Kiro CLI v2 | native default creation | `--resume-id <uuid>` | `$KIRO_HOME/sessions/cli/<uuid>.jsonl` (+ sibling `<uuid>.json` metadata) |
@@ -395,8 +395,32 @@ An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
 ai-memory links the selected native session and resets an unrelated adapter
 cursor rather than assuming it belongs to the old session.
+
+When a fresh launch cannot name its session up front, the session a hook in
+the child links under the run's `AI_MEMORY_RUN_ID` is the one imported when
+the native store holds it for this checkout (a process the child starts
+inherits that id too), so a concurrent launch in the same checkout cannot hand
+it a different transcript. Only without such a link does ai-memory look for
+the session after exit. A
+hook that links the very session the run was prepared with, as when a native
+picker resumes the workstream's current session without naming it, is not yet
+told apart from no link, so the look after exit still decides there.
+Crush has no hooks: a fresh Crush launch claims the one top-level session
+created while it ran (its title and sub-agent sessions do not count), and
+imports nothing, with a warning, when another launch on the same store created
+one too; resume that session with `--session <id>` to link it. `--continue`
+claims the one session it touched on the same terms. When the data directory
+lies outside the project, as a global `data_directory` does, other projects'
+sessions share it and Crush records no directory per session, so a run claims
+only a session that edited a file in this project (its sub-agents' edits
+count), and only when it is the one; otherwise it imports nothing, with the
+same warning. The store's real location decides, so a `.crush` symlinked to a
+shared directory is shared. Another project's session that edited a file here
+still counts as this project's.
 Pi and OMP `--session-dir` values and Crush `--data-dir` values are passed
-through unchanged and used as the read-only import root. Native store
+through unchanged and used as the read-only import root. Without `--data-dir`,
+ai-memory finds Crush's data directory as Crush does, except that it does not
+run a `crushrc` to read one set only there; pass `--data-dir` in that case. Native store
 environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
 `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`,
@@ -572,9 +596,17 @@ Antigravity CLI v1.1.7. Antigravity is not part of the no-argument
 auto-detection set; name it explicitly.
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
-its one-time context from the server, copies the existing global Crush JSON into
-a private temporary directory, appends an ephemeral context path, and points the
-child at that directory with `CRUSH_GLOBAL_CONFIG`. Delivery is acknowledged
+its one-time context from the server, copies the global Crush JSON the launch
+would read (`$CRUSH_GLOBAL_CONFIG/crush.json`, else
+`$XDG_CONFIG_HOME/crush/crush.json`, else `~/.config/crush/crush.json`, with
+`--env` entries first and a blank value counting as unset) into a private
+temporary directory, appends an ephemeral context path, and points the child at
+that directory with `CRUSH_GLOBAL_CONFIG`. When that JSON lists no
+`global_context_paths`, the launcher first adds the `CRUSH.md` and `AGENTS.md`
+Crush would have loaded by default, so the packet does not replace them. A
+global `crushrc` next to that JSON is carried over by a generated `crushrc` in
+the temporary directory that sources it from its own directory, where Crush
+runs it. Delivery is acknowledged
 only after the child starts, so a spawn failure cannot lose the packet. The
 original config is not modified. ai-memory opens the project database read-only;
 the launched Crush process continues its normal native session writes.
