@@ -26,7 +26,7 @@ use ai_memory_core::{PagePath, ProjectId, WorkspaceId};
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::error::{WikiError, WikiResult};
 use crate::wiki::Wiki;
@@ -414,7 +414,11 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
             }
         }
     }
-    info!(
+    // debug!, not info!: this fires every RECONCILE_INTERVAL regardless of
+    // activity, so at info it is ~half the default server log (#894). Its
+    // failure signals stay loud — the per-page `warn!` above, the
+    // `watcher_degraded` `error!`, and the `info!` recovery transition.
+    debug!(
         indexed = stats.indexed,
         skipped_orphans = stats.skipped_orphans,
         skipped_purged_sessions = stats.skipped_purged_sessions,

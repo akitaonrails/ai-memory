@@ -9,7 +9,7 @@
 //!
 //! ## Ship inert (slice 2)
 //!
-//! The V67 schema is additive and every project defaults to `open`, so this is a
+//! The V68 schema is additive and every project defaults to `open`, so this is a
 //! pure pass-through until an operator opts a project into `restricted` (a
 //! follow-up slice adds the management surface). The gate short-circuits to
 //! ALLOW for:
@@ -40,7 +40,7 @@ use crate::error::StoreResult;
 pub const RESTRICTED_PROJECT_FORBIDDEN: &str =
     "project access is restricted; root, the project creator, or a matching grant is required";
 
-/// A project's enforcement mode, stored in `projects.access_mode` (V67).
+/// A project's enforcement mode, stored in `projects.access_mode` (V68).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
     /// Today's behaviour: any authenticated user is admitted.
@@ -73,7 +73,7 @@ impl AccessMode {
     }
 }
 
-/// A user's grant level on a project (`project_grants.level`, V67).
+/// A user's grant level on a project (`project_grants.level`, V68).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantLevel {
     /// Read the project's pages/observations/status.

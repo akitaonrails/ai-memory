@@ -769,7 +769,7 @@ async fn automatic_supersession_does_not_reach_across_operators() {
             })
             .await
             .unwrap();
-        store
+        let id = store
             .writer
             .insert_handoff(NewHandoff {
                 workspace_id: ws,
@@ -785,7 +785,9 @@ async fn automatic_supersession_does_not_reach_across_operators() {
                 owner_user: stamp,
             })
             .await
-            .unwrap()
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        id
     }
 
     let bob = auto_handoff(&store, ws, proj, "bob", "bob's baton").await;

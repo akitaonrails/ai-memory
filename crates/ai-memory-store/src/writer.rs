@@ -217,6 +217,10 @@ pub(crate) enum WriteCmd {
         job: SessionConsolidationJob,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    ReconcileSessionConsolidationCompleted {
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
@@ -644,6 +648,7 @@ pub(crate) enum WriteCmd {
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
         receiving_session: Option<NewSession>,
+        busy_since: jiff::Timestamp,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
@@ -1249,6 +1254,22 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ReleaseSessionConsolidation { job, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Reconcile a session's durable consolidation job row to `completed` after
+    /// a manual `memory_consolidate` produced the page out-of-band. Never
+    /// touches a `running` lease. Returns the number of rows updated.
+    pub async fn reconcile_session_consolidation_completed(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReconcileSessionConsolidationCompleted {
+            session_id,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -2670,18 +2691,24 @@ impl WriterHandle {
     /// SessionStart response.
     ///
     /// When a managed run was requested but is no longer claimable, the
-    /// handoff remains open and both result fields are false.
+    /// handoff remains open and both result fields are false. `busy_since` is
+    /// the same cutoff the selection used
+    /// ([`crate::ReaderPool::startup_handoff`]), re-applied in the claim's
+    /// transaction: a baton whose open source captured anything after it stays
+    /// open.
     pub async fn accept_startup_context(
         &self,
         handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
         receiving_session: Option<NewSession>,
+        busy_since: jiff::Timestamp,
     ) -> StoreResult<StartupContextAcceptance> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
             handoff,
             managed_run_id,
             receiving_session,
+            busy_since,
             reply: tx,
         })
         .await?;
@@ -3040,6 +3067,13 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ReleaseSessionConsolidation { job, reply } => {
                 let result = crate::session_consolidation::release(&mut conn, &job);
                 send_or_warn(reply, result, "release_session_consolidation");
+            }
+            WriteCmd::ReconcileSessionConsolidationCompleted { session_id, reply } => {
+                let result =
+                    crate::session_consolidation::reconcile_session_consolidation_completed(
+                        &mut conn, session_id,
+                    );
+                send_or_warn(reply, result, "reconcile_session_consolidation_completed");
             }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
@@ -3716,6 +3750,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 handoff,
                 managed_run_id,
                 receiving_session,
+                busy_since,
                 reply,
             } => {
                 let result = (|| {
@@ -3744,7 +3779,11 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                         return Ok(StartupContextAcceptance::default());
                     }
                     let handoff_accepted = match handoff {
-                        Some(acceptance) => ops::accept_handoff_in_transaction(&tx, &acceptance)?,
+                        Some(acceptance) => ops::accept_handoff_in_transaction(
+                            &tx,
+                            &acceptance,
+                            Some(busy_since.as_microsecond()),
+                        )?,
                         None => false,
                     };
                     tx.commit()?;

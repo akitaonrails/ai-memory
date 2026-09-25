@@ -69,6 +69,14 @@ pub const MAX_HOOK_BATCH_ITEMS: usize = 256;
 const AUTOMATIC_HANDOFF_ADMISSION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(750);
 
+/// How long a still-open session must be quiet before its turn-checkpoint
+/// baton is handed to a new session. Nothing distinguishes a closed terminal
+/// from a parallel session in the same directory; a session that captured
+/// anything this recently is treated as in use. The live incident this
+/// guards against delivered batons from sessions 74 seconds and 0 seconds
+/// (mid-turn) away from their last event.
+const LIVE_BATON_QUIET_PERIOD: jiff::SignedDuration = jiff::SignedDuration::from_mins(10);
+
 /// Maximum cwd-resolution cache entries kept per server process. The cache is
 /// an optimization only; evicted entries are re-resolved through the writer.
 pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
@@ -1250,6 +1258,16 @@ async fn fetch_and_accept_handoff(
     actor: Option<IdentityKey>,
     skip_webhooks: Vec<String>,
 ) -> anyhow::Result<Option<String>> {
+    fetch_and_accept_handoff_at(state, query, actor, skip_webhooks, jiff::Timestamp::now()).await
+}
+
+async fn fetch_and_accept_handoff_at(
+    state: &HookState,
+    query: HandoffQuery,
+    actor: Option<IdentityKey>,
+    skip_webhooks: Vec<String>,
+    now: jiff::Timestamp,
+) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     // A managed run's ledger is additive, not a replacement. Returning it here
     // skipped `latest_open_handoff` below, so a session launched by
@@ -1290,9 +1308,20 @@ async fn fetch_and_accept_handoff(
         Some(key) => ai_memory_core::OwnerFilter::User(key.storage_key()),
         None => ai_memory_core::OwnerFilter::Unattributed,
     };
+    // A duration never fails here; the fallback keeps every live session's
+    // baton, the conservative side.
+    let busy_since = now
+        .saturating_sub(LIVE_BATON_QUIET_PERIOD)
+        .unwrap_or(jiff::Timestamp::MIN);
     let handoff = state
         .reader
-        .latest_open_handoff(ws, proj, query.cwd.clone(), owner_filter.clone())
+        .startup_handoff(
+            ws,
+            proj,
+            query.cwd.clone(),
+            owner_filter.clone(),
+            busy_since,
+        )
         .await?;
     let handoff_md = handoff.as_ref().map(render_handoff_markdown);
     // The brief is additive and non-destructive: unlike the handoff (a
@@ -1390,6 +1419,7 @@ async fn fetch_and_accept_handoff(
                     }),
                 managed.as_ref().map(|managed| managed.run_id),
                 receiving_session,
+                busy_since,
             )
             .await?
     } else {
@@ -3231,7 +3261,14 @@ fn build_auto_handoff(
                     prompts.push(text.to_string());
                 }
             }
-            ObservationKind::PostToolUse | ObservationKind::PreToolUse if !obs.title.is_empty() => {
+            // Skip `tool <family>` / bare-`<family>` labels: a family is a
+            // partition of the calls, not a name for a tool, so "Tools used:
+            // tool file, tool non-file" tells the receiver nothing. Only a
+            // harness's own tool name is worth listing.
+            ObservationKind::PostToolUse | ObservationKind::PreToolUse
+                if !obs.title.is_empty()
+                    && crate::payload::tool_family_from_title(&obs.title).is_none() =>
+            {
                 tools.insert(obs.title.as_str());
             }
             _ => {}
@@ -3343,10 +3380,12 @@ fn derive_open_questions(
     // abnormally while working in the tree.
     //
     // The signal is the tool *family*, not the tool name. A PostToolUse
-    // observation's title is `canonical_tool_name(tool_family)`, which is
-    // only ever "file" / "search-list" / "non-file" / "unknown" — the
-    // reserved protocol deliberately carries no raw tool names. Matching
-    // "edit"/"write"/"patch" against that title can never succeed.
+    // observation's title carries the family in one of two spellings: the
+    // majority path (every closed-tool agent) writes `safe_tool_title`'s
+    // `"tool file"` / `"tool non-file"` / …, while the reserved-protocol
+    // path writes the bare `canonical_tool_name` form `"file"` / …. Both
+    // must match here, and `tool_family_from_title` recognises both; a raw
+    // tool name ("edit"/"write"/"patch") is neither and correctly does not.
     //
     // That same closed schema means read and write are indistinguishable:
     // `ToolFamily::File` covers both, and `ToolOutcome` is only
@@ -3354,7 +3393,8 @@ fn derive_open_questions(
     // made — only that the session touched files and then ended without a
     // normal Stop, which is worth telling the receiver either way.
     if let Some(tool) = last_tool {
-        let touched_files = tool.title == canonical_tool_name(ToolFamily::File);
+        let touched_files =
+            crate::payload::tool_family_from_title(&tool.title) == Some(ToolFamily::File);
         if touched_files && last_stop.is_none() {
             return vec![
                 "Session ended without a normal stop while working with files".into(),
@@ -8855,6 +8895,9 @@ mod tests {
                 }
             }
         }
+        // Both sources are still open, so their batons wait out the quiet period.
+        let quiet =
+            jiff::Timestamp::now() + LIVE_BATON_QUIET_PERIOD + jiff::SignedDuration::from_secs(1);
         for (project, other) in [("alpha", "beta"), ("beta", "alpha")] {
             let query = HandoffQuery {
                 workspace: Some("checkpoint-workspace".into()),
@@ -8863,13 +8906,13 @@ mod tests {
                 session_id: Some(SessionId::new().to_string()),
                 ..Default::default()
             };
-            let first = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new())
+            let first = fetch_and_accept_handoff_at(&state, query.clone(), None, Vec::new(), quiet)
                 .await
                 .unwrap()
                 .unwrap();
             assert!(first.contains(&format!("Latest assistant response: {project}-latest")));
             assert!(!first.contains(&format!("{other}-")));
-            let second = fetch_and_accept_handoff(&state, query, None, Vec::new())
+            let second = fetch_and_accept_handoff_at(&state, query, None, Vec::new(), quiet)
                 .await
                 .unwrap();
             assert!(
@@ -8877,6 +8920,89 @@ mod tests {
                 "a consumed or superseded baton must not reappear"
             );
         }
+    }
+
+    // Live incident: parallel OpenCode sessions in one directory. Every
+    // completed turn retired the other sessions' batons, and the next session
+    // to start was handed the baton of a session still in use (once mid-turn,
+    // once 74 seconds after its last turn), carrying another conversation.
+    #[tokio::test]
+    async fn opencode_parallel_live_batons_are_owned_and_wait_for_quiet() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let (alpha, beta) = (SessionId::new().to_string(), SessionId::new().to_string());
+        for (session, text) in [(&alpha, "alpha work"), (&beta, "beta work")] {
+            for event in ["user-prompt", "stop"] {
+                let mut env = opencode_turn_event(session, event, text);
+                crate::assistant_capture::apply_assistant_backstop(&mut env, true);
+                process(&state, env, None, Vec::new()).await.unwrap();
+            }
+        }
+        let open_batons = || async {
+            state
+                .reader
+                .list_handoffs(
+                    state.workspace_id,
+                    state.project_id,
+                    None,
+                    ai_memory_core::OwnerFilter::Any,
+                    10,
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|h| h.lifecycle.state == ai_memory_core::HandoffState::Open)
+                .count()
+        };
+        assert_eq!(
+            open_batons().await,
+            2,
+            "a turn must not retire another live session's baton"
+        );
+
+        // Alpha is mid-turn again; beta just finished one. `between` separates
+        // beta's last event from alpha's newest one.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let between = jiff::Timestamp::now();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        process(
+            &state,
+            opencode_turn_event(&alpha, "user-prompt", "alpha continues"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let receiver = || HandoffQuery {
+            agent: Some("opencode2".into()),
+            session_id: Some(SessionId::new().to_string()),
+            ..Default::default()
+        };
+        let busy = fetch_and_accept_handoff_at(
+            &state,
+            receiver(),
+            None,
+            Vec::new(),
+            jiff::Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        assert!(busy.is_none(), "a session in use keeps its baton: {busy:?}");
+        assert_eq!(open_batons().await, 2);
+
+        // Ten minutes after `between`: beta has been quiet, alpha has not.
+        let later = between + LIVE_BATON_QUIET_PERIOD;
+        let delivered = fetch_and_accept_handoff_at(&state, receiver(), None, Vec::new(), later)
+            .await
+            .unwrap()
+            .expect("a quiet live session's baton is deliverable");
+        assert!(delivered.contains("beta work"), "{delivered}");
+        assert!(!delivered.contains("alpha"), "{delivered}");
+        assert_eq!(
+            open_batons().await,
+            1,
+            "claiming one baton must not sweep the baton of a session in use"
+        );
     }
 
     // Live incident: a `.ai-memory.toml` naming a workspace appeared under
@@ -10973,7 +11099,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            state
+            let id = state
                 .writer
                 .insert_handoff(NewHandoff {
                     workspace_id: state.workspace_id,
@@ -10989,7 +11115,10 @@ mod tests {
                     owner_user: None,
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            // A SessionEnd baton: its source is over.
+            state.writer.end_session(session_id, None).await.unwrap();
+            id
         }
 
         let stale = insert_auto(&state, "/repo/api", "STALE-SPECIFIC").await;
@@ -13664,6 +13793,29 @@ mod tests {
         assert!(q[1].contains("working tree"), "got: {q:?}");
     }
 
+    /// The same file-activity heuristic, but for the *majority* spelling: every
+    /// closed-tool agent stores `safe_tool_title`'s `"tool file"`, not the bare
+    /// `canonical_tool_name` `"file"` of the reserved-protocol path. Before
+    /// #895 this spelling never matched, so the heuristic was dead for almost
+    /// every real session.
+    #[test]
+    fn open_questions_detects_abnormal_exit_after_prefixed_file_activity() {
+        let obs = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: unknown",
+            ),
+            // No Stop observation — session ended mid-task.
+        ];
+        let last = Some("fix the bug".to_string());
+        let q = derive_open_questions(&obs, &last);
+        assert_eq!(q.len(), 2, "got: {q:?}");
+        assert!(q[0].contains("without a normal stop"), "got: {q:?}");
+        assert!(q[1].contains("working tree"), "got: {q:?}");
+    }
+
     /// Guard against the regression this heuristic already had once: only
     /// titles the ingest path can actually produce may drive it, so a raw
     /// tool name must NOT trigger the file branch.
@@ -13681,6 +13833,68 @@ mod tests {
                  drive the file heuristic; got: {q:?}"
             );
         }
+    }
+
+    /// An automatic handoff built only from closed-tool observations (whose
+    /// titles are `safe_tool_title`'s `"tool file"` / `"tool non-file"` family
+    /// labels) must NOT emit a `Tools used:` line: a family is a partition of
+    /// the calls, not a name for a tool, so the label leaks nothing useful into
+    /// the handoff. A real tool name still produces the line (#895).
+    #[test]
+    fn auto_handoff_omits_tool_family_labels_from_tools_used() {
+        use ai_memory_core::{ProjectId, WorkspaceId};
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: unknown",
+            ),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file",
+                "tool_family: non-file\noutcome: success",
+            ),
+        ];
+        let handoff = build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            &observations,
+            None,
+            false,
+        );
+        assert!(
+            handoff
+                .next_steps
+                .iter()
+                .all(|s| !s.starts_with("Tools used:")),
+            "family labels must not surface as a Tools used line; got: {:?}",
+            handoff.next_steps
+        );
+
+        // Control: a real harness tool name still produces the line.
+        let with_real_tool = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(ObservationKind::PostToolUse, "Edit", "edited main.rs"),
+        ];
+        let handoff = build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            &with_real_tool,
+            None,
+            false,
+        );
+        assert!(
+            handoff.next_steps.iter().any(|s| s == "Tools used: Edit"),
+            "a real tool name must still be listed; got: {:?}",
+            handoff.next_steps
+        );
     }
 
     /// A search/list tool is file-adjacent but not file activity; it must

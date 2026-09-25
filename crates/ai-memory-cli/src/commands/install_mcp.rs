@@ -430,6 +430,47 @@ fn resolve_config_file(args: &InstallMcpArgs) -> Result<PathBuf> {
     mcp_config_path(args.client)
 }
 
+/// True when the client's MCP config already holds a session-aware ai-memory
+/// bridge under `name` — a Claude Code stdio entry whose args run `mcp-bridge`.
+///
+/// Auto-wire consults this before its version-keyed re-wire so it never
+/// downgrades a deliberately-installed bridge to the static HTTP registration,
+/// which would silently disable `[auto_scope] per_session` for MCP calls. Only
+/// Claude Code has a session-aware variant, so every other client answers
+/// `false`. A missing file or any parse error also answers `false`: the caller
+/// then falls back to its normal install, which is the safe default.
+pub(crate) fn existing_entry_is_session_aware(
+    client: McpClient,
+    config_file: Option<&Path>,
+    name: &str,
+) -> bool {
+    if !matches!(client, McpClient::ClaudeCode) {
+        return false;
+    }
+    let path = match config_file {
+        Some(path) => path.to_path_buf(),
+        None => match mcp_config_path(client) {
+            Ok(path) => path,
+            Err(_) => return false,
+        },
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(entry) = root.get("mcpServers").and_then(|servers| servers.get(name)) else {
+        return false;
+    };
+    let is_stdio = entry.get("type").and_then(serde_json::Value::as_str) == Some("stdio");
+    let runs_bridge = entry
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|args| args.iter().any(|arg| arg.as_str() == Some("mcp-bridge")));
+    is_stdio && runs_bridge
+}
+
 /// Mutate the resolved client config file in place. Idempotent —
 /// re-runs that produce the same content are reported as no-op.
 fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {

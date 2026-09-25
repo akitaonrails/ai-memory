@@ -289,7 +289,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
-| `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for opt-in SessionEnd LLM consolidation. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. |
+| `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for the *automatic* SessionEnd LLM consolidation worker. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. A manual `memory_consolidate` writes its page out-of-band and then reconciles this table (flipping a `failed`/`pending`/`superseded` row for the session to `completed`, never touching a live `running` lease), so the operator does not see a `failed` job for a session that is in fact consolidated. |
 | `observations_fts` | FTS5 virtual table over raw observation `(title, body)`, used only as bounded fallback. |
 | `workstreams`, `managed_runs`, `workstream_native_sessions` | Optional lease state plus per-harness native source and delivery cursors for `ai-memory run`. |
 | `workstream_events`, `workstream_events_fts` | Append-only normalized visible transcript events and full-text search; immutable sanitized source batches also live under `raw/workstreams/`. |
@@ -606,7 +606,11 @@ prefixed `AI_MEMORY_*`.
 
 ```toml
 bind = "127.0.0.1:49374"
-log_level = "info"
+log_level = "info"                 # default filter also pins `rmcp=warn` (the MCP SDK's
+                                   # per-request info logs) and drops the 30s reconcile
+                                   # summary to debug (#894). Restore either via log_level
+                                   # (e.g. "info,rmcp=info", "debug") or RUST_LOG;
+                                   # `tracing_appender=warn` stays forced (feedback-loop guard)
 tcp_keepalive_secs = 60            # idle time before TCP keepalive probes an accepted `serve`
                                    # connection; reaps sockets left half-open by a dead peer
                                    # (laptop sleep, VPN flap) that would otherwise leak fds
@@ -681,9 +685,17 @@ per_user = false                  # shared + own slots in agent context
 
 [consolidation]                    # LLM consolidation prompt sizing
 max_input_tokens = 100000          # approximate whole-input target; min 6000
+                                   # a flat chars-per-token heuristic, so it
+                                   # UNDER-budgets denser corpora: pt-BR prose
+                                   # and source code tokenize at fewer chars per
+                                   # token than English and can overshoot the
+                                   # provider's real limit by ~40% — lower this
+                                   # (or input_token_safety_margin) for such a corpus
 max_output_tokens = 32000          # provider generation limit; min 1000
                                    # their sum must fit the model context window;
                                    # leave headroom for tokenizer variance
+input_token_safety_margin = 0.8    # scales the char budget, (0.0, 1.0]; the
+                                   # 0.8 default buys pt-BR/code headroom
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review

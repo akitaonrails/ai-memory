@@ -356,7 +356,7 @@ async fn gate_is_skipped_when_operators_are_not_distinguished() {
     }
 }
 
-/// (c) MIGRATION IDEMPOTENCY — V67 applies cleanly (the table exists, the column
+/// (c) MIGRATION IDEMPOTENCY — V68 applies cleanly (the table exists, the column
 /// defaults to 'open'), the CHECK constraints bite, and re-opening the store
 /// (which re-runs the migration set) is a no-op that preserves the data.
 #[tokio::test]

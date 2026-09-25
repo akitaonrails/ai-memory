@@ -1,6 +1,6 @@
 # Design proposal: per-project authorization for multi-user servers (#708)
 
-**Implementation status.** Slice 2 has landed: the inert V67 schema
+**Implementation status.** Slice 2 has landed: the inert V68 schema
 (`project_grants` + `projects.access_mode`, default `open`) and the
 `authorize_project` choke point (`ai-memory-store/src/project_authz.rs`),
 wired into `ScopeResolver` read/write resolution and the writer actor. It is

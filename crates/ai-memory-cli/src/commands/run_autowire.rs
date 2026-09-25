@@ -131,8 +131,23 @@ pub(crate) fn ensure_wired_with(
 
     // Not every hook-capable harness has an MCP client the installer can write
     // (e.g. Pi bridges MCP through its generated extension); skip those quietly.
-    if let Some(client) = install_hooks::mcp_client_for_agent(agent)
-        && let Err(error) = install_mcp::run(
+    if let Some(client) = install_hooks::mcp_client_for_agent(agent) {
+        // The sentinel is version-keyed, so this whole step re-runs on every
+        // upgrade. install-mcp replaces the `ai-memory` entry wholesale, so a
+        // plain re-run would overwrite a session-aware Claude Code bridge the
+        // user installed with `install-mcp --session-aware` back to static HTTP,
+        // silently disabling per_session for their MCP calls. Preserve it.
+        if install_mcp::existing_entry_is_session_aware(
+            client,
+            overrides.mcp_config_file.as_deref(),
+            "ai-memory",
+        ) {
+            eprintln!(
+                "ai-memory: keeping the existing session-aware {} MCP bridge; not \
+                 overwriting it with the static HTTP registration.",
+                harness.as_str()
+            );
+        } else if let Err(error) = install_mcp::run(
             config,
             InstallMcpArgs {
                 client,
@@ -144,14 +159,14 @@ pub(crate) fn ensure_wired_with(
                 session_aware: false,
                 flavor: None,
             },
-        )
-    {
-        eprintln!(
-            "ai-memory: could not auto-install the {} MCP server ({error:#}); continuing \
-             launch. Wire it manually with `ai-memory install-mcp --client {} --apply`.",
-            harness.as_str(),
-            agent.kind().as_str()
-        );
+        ) {
+            eprintln!(
+                "ai-memory: could not auto-install the {} MCP server ({error:#}); continuing \
+                 launch. Wire it manually with `ai-memory install-mcp --client {} --apply`.",
+                harness.as_str(),
+                agent.kind().as_str()
+            );
+        }
     }
 
     // Record the attempt even on partial failure: re-applying an idempotent
@@ -294,6 +309,59 @@ mod tests {
             std::fs::read(&mcp).unwrap(),
             before_mcp,
             "a gated re-launch must not rewrite MCP config"
+        );
+    }
+
+    /// Auto-wire must not downgrade a deliberately-installed session-aware
+    /// bridge to static HTTP. The sentinel is version-keyed, so this step
+    /// re-runs on every upgrade; without the guard that re-run rewrites the
+    /// Claude Code MCP entry wholesale, silently disabling the per_session
+    /// isolation the user opted into with `install-mcp --session-aware`.
+    #[test]
+    fn wiring_preserves_an_existing_session_aware_bridge() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let settings = data.path().join("claude-settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let mcp = data.path().join("claude.json");
+        let bridge = r#"{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "stdio",
+      "command": "ai-memory",
+      "args": ["mcp-bridge", "--server-url", "http://127.0.0.1:49374/mcp"]
+    }
+  }
+}"#;
+        std::fs::write(&mcp, bridge).unwrap();
+
+        let config = test_config(home.path(), data.path());
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+        };
+        ensure_wired_with(&config, ManagedHarness::Claude, &overrides);
+
+        let mcp_json = std::fs::read_to_string(&mcp).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(&mcp_json).unwrap();
+        let server = &entry["mcpServers"]["ai-memory"];
+        assert_eq!(
+            server["type"].as_str(),
+            Some("stdio"),
+            "auto-wire must keep the session-aware bridge, not downgrade it to http: {mcp_json}"
+        );
+        assert!(
+            server["args"]
+                .as_array()
+                .is_some_and(|args| args.iter().any(|arg| arg == "mcp-bridge")),
+            "the preserved entry must still be the mcp-bridge: {mcp_json}"
+        );
+        // The hooks still install, and the attempt is still recorded, so a plain
+        // re-launch stays gated.
+        assert!(
+            sentinel_path(&config.data_dir, AgentChoice::ClaudeCode).exists(),
+            "the attempt must be recorded even when the MCP bridge is preserved"
         );
     }
 

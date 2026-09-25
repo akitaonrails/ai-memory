@@ -5539,18 +5539,73 @@ impl ReaderPool {
         cwd_filter: Option<String>,
         owner_filter: OwnerFilter,
     ) -> StoreResult<Option<Handoff>> {
+        self.open_handoff_for(workspace_id, project_id, cwd_filter, owner_filter, None)
+            .await
+    }
+
+    /// [`Self::latest_open_handoff`] for automatic delivery to a starting
+    /// session: the baton of a session that is still open and captured
+    /// anything after `busy_since` is not a candidate.
+    ///
+    /// A turn checkpoint publishes a live session's baton, and nothing tells
+    /// a closed terminal apart from a parallel session still at work in the
+    /// same directory. Handing the baton of a session in use to a new one
+    /// gives that session another conversation's context and consumes the
+    /// baton its own successor needed. Once the session has been quiet since
+    /// `busy_since`, its baton is deliverable again; ended sessions and
+    /// manual handoffs are unaffected.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn startup_handoff(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cwd_filter: Option<String>,
+        owner_filter: OwnerFilter,
+        busy_since: Timestamp,
+    ) -> StoreResult<Option<Handoff>> {
+        self.open_handoff_for(
+            workspace_id,
+            project_id,
+            cwd_filter,
+            owner_filter,
+            Some(busy_since.as_microsecond()),
+        )
+        .await
+    }
+
+    async fn open_handoff_for(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cwd_filter: Option<String>,
+        owner_filter: OwnerFilter,
+        busy_since: Option<i64>,
+    ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
             // Ownership belongs in the query, not just in
             // `is_handoff_candidate`: prompt-derived fields from another
             // operator must never be loaded or deserialized for this caller.
             let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 3);
+            let busy_index = if owner_param.is_some() { 4 } else { 3 };
+            let busy_clause = if busy_since.is_some() {
+                format!(
+                    " AND NOT EXISTS (SELECT 1 FROM sessions s \
+                         WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
+                           AND EXISTS (SELECT 1 FROM observations o \
+                                       WHERE o.session_id = s.id AND o.created_at > ?{busy_index}))"
+                )
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
                         created_at, accepted_by, accepted_at, accepted_by_session, \
                         owner_user, accepted_by_user \
                  FROM handoffs \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'{owner_clause} \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'{owner_clause}{busy_clause} \
                  ORDER BY created_at DESC"
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -5558,6 +5613,9 @@ impl ReaderPool {
                 vec![workspace_id.as_bytes(), project_id.as_bytes()];
             if let Some(owner) = owner_param.as_ref() {
                 binds.push(owner);
+            }
+            if let Some(since) = busy_since.as_ref() {
+                binds.push(since);
             }
             let rows = stmt.query_map(binds.as_slice(), row_to_handoff)?;
             let mut selected: Option<Handoff> = None;
@@ -10608,7 +10666,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            store
+            let id = store
                 .writer
                 .insert_handoff(NewHandoff {
                     workspace_id,
@@ -10624,7 +10682,10 @@ mod tests {
                     owner_user: None,
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            // A SessionEnd baton: its source is over.
+            store.writer.end_session(session_id, None).await.unwrap();
+            id
         }
 
         let superseded_same_cwd =

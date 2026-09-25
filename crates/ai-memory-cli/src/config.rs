@@ -983,6 +983,15 @@ pub struct ConsolidationSettings {
     /// Maximum tokens the provider may generate for a consolidation response.
     /// Small-context models must lower this together with `max_input_tokens`.
     pub max_output_tokens: u32,
+    /// Safety margin applied to the `max_input_tokens` budget (`0 < m <= 1`).
+    ///
+    /// `max_input_tokens` is an approximate char-count heuristic (a flat
+    /// chars-per-token ratio), so it under-budgets denser corpora — pt-BR text
+    /// and source code tokenize at fewer chars per token than English prose and
+    /// can overshoot a provider's real input limit by ~40%. This margin shrinks
+    /// the effective char budget (default 0.8); lower it further for a corpus
+    /// that is mostly non-English or code. (#884)
+    pub input_token_safety_margin: f64,
 }
 
 impl Default for ConsolidationSettings {
@@ -990,6 +999,8 @@ impl Default for ConsolidationSettings {
         Self {
             max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            input_token_safety_margin:
+                ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
         }
     }
 }
@@ -1551,6 +1562,21 @@ impl Config {
                 config.consolidation.max_output_tokens
             );
         }
+        // The safety margin scales the input budget, so a non-positive value
+        // would starve every prompt and one above 1.0 would loosen the budget
+        // past the nominal token limit it is meant to tighten (#884). NaN also
+        // fails every comparison below, so it is rejected here too.
+        let safety_margin = config.consolidation.input_token_safety_margin;
+        if !(safety_margin > 0.0 && safety_margin <= 1.0) {
+            anyhow::bail!(
+                "consolidation.input_token_safety_margin must be in (0.0, 1.0] \
+                 (got {safety_margin}); it scales the approximate input-token budget"
+            );
+        }
+        // The safety margin scales the input budget, so a non-positive value
+        // would starve every prompt and one above 1.0 would loosen the budget
+        // past the nominal token limit it is meant to tighten (#884). NaN also
+        // fails every comparison below, so it is rejected here too.
         // Zero (or a sub-second remainder rounded down) would cut every
         // provider request off before it is sent.
         if config.llm_timeout_secs == 0 {
@@ -2901,6 +2927,49 @@ mod tests {
                 "unexpected error for {value}: {error:#}"
             );
         }
+    }
+
+    /// #884: the input-token safety margin must stay in `(0.0, 1.0]` — a
+    /// non-positive value starves every prompt and a value above 1.0 loosens
+    /// the budget past the limit it exists to tighten.
+    #[test]
+    fn load_rejects_an_out_of_range_input_token_safety_margin() {
+        for value in ["0.0", "-0.1", "1.5", "nan"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[consolidation]\ninput_token_safety_margin = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an out-of-range safety margin must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("consolidation.input_token_safety_margin"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// A valid margin survives the config round-trip and the default is 0.8.
+    #[test]
+    fn load_accepts_a_valid_input_token_safety_margin() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[consolidation]\ninput_token_safety_margin = 0.6\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect("a margin inside (0.0, 1.0] must load");
+        assert_eq!(config.consolidation.input_token_safety_margin, 0.6);
+        assert_eq!(
+            ConsolidationSettings::default().input_token_safety_margin,
+            0.8
+        );
     }
 
     /// A small-context provider needs both sides of the context allocation to
