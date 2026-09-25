@@ -13864,6 +13864,7 @@ mod tests {
             None,
             &observations,
             None,
+            false,
         );
         assert!(
             handoff
@@ -13887,6 +13888,7 @@ mod tests {
             None,
             &with_real_tool,
             None,
+            false,
         );
         assert!(
             handoff.next_steps.iter().any(|s| s == "Tools used: Edit"),
