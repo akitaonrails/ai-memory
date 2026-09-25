@@ -333,7 +333,12 @@ resume, continue, session, or fork selector.
    Direct launches continue to use the same handoff path without a managed
    packet.
 4. When the child exits, ai-memory reads the native transcript store without
-   modifying it. Visible user/assistant messages, completed tool calls/results,
+   modifying it. A session named on the command line (or chosen before the
+   spawn) is the one it reads. Otherwise a session linked during the run under
+   its `AI_MEMORY_RUN_ID`, even the workstream's current one, is read when the
+   native store holds it for this checkout; only without such a link does it
+   look for the newest session in the checkout, which a concurrent launch
+   there could own. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
    workstream ledger. Hidden reasoning and unsupported/private records are
    excluded and recorded as extraction-loss annotations. Each delivered

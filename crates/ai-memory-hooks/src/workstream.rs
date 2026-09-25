@@ -261,6 +261,7 @@ async fn run_status(
             workstream_id: status.workstream_id,
             agent: status.agent,
             native_session_id: status.native_session_id,
+            native_session_linked: status.native_session_linked,
             context_delivered: status.context_delivered,
             state: status.state,
         })
@@ -971,6 +972,48 @@ mod tests {
             .await
             .unwrap();
         (workspace_id, project_id)
+    }
+
+    /// The launcher reads whether the run's child linked a session from the
+    /// run status, so the route must carry it.
+    #[tokio::test]
+    async fn run_status_reports_a_session_linked_during_the_run() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let prepared = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        let status = async || {
+            let response = run_status(
+                State(state.clone()),
+                None,
+                AxumPath(prepared.run_id.to_string()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            serde_json::from_slice::<ManagedRunStatus>(&body).unwrap()
+        };
+        assert!(!status().await.native_session_linked);
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(prepared.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+        let linked = status().await;
+        assert!(linked.native_session_linked);
+        assert_eq!(linked.native_session_id.as_deref(), Some("native-1"));
     }
 
     #[tokio::test]

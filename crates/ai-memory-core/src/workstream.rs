@@ -245,6 +245,12 @@ pub struct ManagedRunStatus {
     /// Native session linked by SessionStart, if observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
+    /// Whether `native_session_id` was linked during this run (by a hook in
+    /// the child, or by the launcher before the spawn) rather than carried
+    /// over from the workstream when the run was prepared. An older server
+    /// does not send it and reads as `false`.
+    #[serde(default)]
+    pub native_session_linked: bool,
     /// Whether the SessionStart context packet was returned successfully.
     pub context_delivered: bool,
     /// Current run state (`active`, `finished`, or `expired`).
@@ -346,6 +352,21 @@ pub struct WorkstreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_run_status_reads_as_nothing_linked() {
+        let status: ManagedRunStatus = serde_json::from_value(serde_json::json!({
+            "run_id": "018f0000-0000-7000-8000-000000000002",
+            "workstream_id": "018f0000-0000-7000-8000-000000000001",
+            "agent": "codex",
+            "native_session_id": "prepared",
+            "context_delivered": false,
+            "state": "active"
+        }))
+        .unwrap();
+
+        assert!(!status.native_session_linked);
+    }
 
     #[test]
     fn older_prepare_response_defaults_to_no_adoption() {

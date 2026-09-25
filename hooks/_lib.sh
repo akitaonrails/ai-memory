@@ -254,7 +254,12 @@ ai_memory_url_encode() {
         s="$rest"
         case $c in
             [A-Za-z0-9._~-]) out="$out$c" ;;
-            *) out="$out$(printf '%%%02X' "'$c")" ;;
+            *)
+                # bash 3.2 (macOS /bin/sh) sign-extends bytes >= 0x80, so
+                # `printf '%X' "'$c"` printed FFFFFFFFFFFFFFC3 for 0xC3.
+                b=$(printf '%d' "'$c")
+                [ "$b" -lt 0 ] && b=$((b + 256))
+                out="$out$(printf '%%%02X' "$b")" ;;
         esac
     done
     printf '%s' "$out"

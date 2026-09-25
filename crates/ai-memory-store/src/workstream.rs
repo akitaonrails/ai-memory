@@ -141,6 +141,9 @@ pub struct StoredManagedRunStatus {
     pub agent: AgentKind,
     /// Native session observed by hooks.
     pub native_session_id: Option<String>,
+    /// Whether a session was linked during this run, rather than carried
+    /// over from the workstream when the run was prepared.
+    pub native_session_linked: bool,
     /// SessionStart delivery acknowledgement.
     pub context_delivered: bool,
     /// State string.
@@ -575,8 +578,9 @@ pub(crate) fn link_native_session(
         ],
     )?;
     tx.execute(
-        "UPDATE managed_runs SET native_session_id = ?1, sync_after = ?2 WHERE id = ?3",
-        params![native_session_id, initial_delivery, run_id.as_bytes()],
+        "UPDATE managed_runs SET native_session_id = ?1, sync_after = ?2, \
+             native_session_linked_at = ?3 WHERE id = ?4",
+        params![native_session_id, initial_delivery, now, run_id.as_bytes()],
     )?;
     tx.commit()?;
     Ok(true)
@@ -793,6 +797,8 @@ pub(crate) fn finish_run(
     if input.complete {
         tx.execute(
             "UPDATE managed_runs SET state = 'finished', native_session_id = COALESCE(?1, native_session_id), \
+                 native_session_linked_at = CASE WHEN ?1 IS NULL OR ?1 = native_session_id \
+                     THEN native_session_linked_at END, \
                  ended_at = ?2, lease_expires_at = ?2, exit_code = ?3 WHERE id = ?4",
             params![
                 native_session,
@@ -804,6 +810,8 @@ pub(crate) fn finish_run(
     } else {
         tx.execute(
             "UPDATE managed_runs SET native_session_id = COALESCE(?1, native_session_id), \
+                 native_session_linked_at = CASE WHEN ?1 IS NULL OR ?1 = native_session_id \
+                     THEN native_session_linked_at END, \
                  lease_expires_at = ?2 WHERE id = ?3",
             params![native_session, now + LEASE_MICROS, input.run_id.as_bytes()],
         )?;
@@ -826,7 +834,8 @@ pub(crate) fn run_status(
 ) -> StoreResult<Option<StoredManagedRunStatus>> {
     let row = conn
         .query_row(
-            "SELECT workstream_id, agent_kind, native_session_id, context_delivered, state \
+            "SELECT workstream_id, agent_kind, native_session_id, \
+             native_session_linked_at IS NOT NULL, context_delivered, state \
              FROM managed_runs WHERE id = ?1",
             params![run_id.as_bytes()],
             |row| {
@@ -835,18 +844,27 @@ pub(crate) fn run_status(
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, bool>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
         .optional()?;
     row.map(
-        |(workstream, agent, native_session_id, context_delivered, state)| {
+        |(
+            workstream,
+            agent,
+            native_session_id,
+            native_session_linked,
+            context_delivered,
+            state,
+        )| {
             Ok(StoredManagedRunStatus {
                 run_id,
                 workstream_id: WorkstreamId::from_slice(&workstream)?,
                 agent: AgentKind::from_wire(&agent),
                 native_session_id,
+                native_session_linked,
                 context_delivered,
                 state,
             })

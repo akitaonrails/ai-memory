@@ -87,6 +87,25 @@ fn resolve_file_appender(
     (None, notices)
 }
 
+/// The `EnvFilter` directive used when `RUST_LOG` is unset.
+///
+/// Two overrides bracket the operator's `log_level`, and order is
+/// load-bearing because a later directive wins in an `EnvFilter`:
+///
+/// - `rmcp=warn` is **prepended**, so it is the weakest directive and an
+///   operator can restore the external MCP SDK's per-request info logs
+///   through `log_level` (e.g. `info,rmcp=info`) without setting `RUST_LOG`.
+///   Left at info, `rmcp` alone is ~half the default server log (#894).
+/// - `tracing_appender=warn` stays **appended**, so it is the strongest and
+///   cannot be lowered through `log_level`. That guard is invariant #15: the
+///   appender must never log at its own level or it feeds itself (the loop
+///   that filled 137 GB for agentmemory #519).
+///
+/// `RUST_LOG` (`EnvFilter::try_from_default_env`) still overrides all of this.
+fn default_filter(log_level: &str) -> String {
+    format!("rmcp=warn,{log_level},tracing_appender=warn")
+}
+
 /// Initialise the global tracing subscriber.
 ///
 /// Returns a guard whose drop flushes any pending log lines; `None` when no
@@ -106,9 +125,8 @@ pub fn init(config: &Config, warnings: DegradeWarnings) -> Result<Option<WorkerG
         }
     }
 
-    let default_filter = format!("{},tracing_appender=warn", config.log_level);
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_filter(&config.log_level)));
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
@@ -138,6 +156,56 @@ pub fn init(config: &Config, warnings: DegradeWarnings) -> Result<Option<WorkerG
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The effective per-target level `EnvFilter` resolves the default filter
+    /// to. `EnvFilter`'s `Display` reprints its live directives (last wins per
+    /// target), so it reflects the real conflict resolution, not the raw
+    /// string. Returns `None` for a target the filter carries no directive for.
+    fn effective_level(log_level: &str, target: &str) -> Option<String> {
+        let printed = EnvFilter::new(default_filter(log_level)).to_string();
+        printed
+            .split(',')
+            .find_map(|d| d.strip_prefix(&format!("{target}=")).map(str::to_owned))
+    }
+
+    #[test]
+    fn default_filter_suppresses_rmcp_and_the_appender() {
+        // (a) With a plain `info` level, both the noisy external MCP SDK and
+        // the appender are pinned to warn.
+        assert_eq!(effective_level("info", "rmcp").as_deref(), Some("warn"));
+        assert_eq!(
+            effective_level("info", "tracing_appender").as_deref(),
+            Some("warn")
+        );
+    }
+
+    #[test]
+    fn operator_can_restore_rmcp_through_log_level() {
+        // (b) `rmcp=warn` is prepended (weakest), so a log_level directive for
+        // the same target wins and brings the SDK's info logs back — while the
+        // appender stays warn.
+        assert_eq!(
+            effective_level("info,rmcp=info", "rmcp").as_deref(),
+            Some("info"),
+            "an operator must be able to restore rmcp via log_level"
+        );
+        assert_eq!(
+            effective_level("info,rmcp=info", "tracing_appender").as_deref(),
+            Some("warn"),
+            "restoring rmcp must not disturb the appender guard"
+        );
+    }
+
+    #[test]
+    fn log_level_cannot_lower_the_appender_below_warn() {
+        // (c) `tracing_appender=warn` is appended (strongest), so no log_level
+        // directive can lower it — the invariant #15 feedback-loop guard.
+        assert_eq!(
+            effective_level("info,tracing_appender=trace", "tracing_appender").as_deref(),
+            Some("warn"),
+            "the appender guard must be non-overridable through log_level"
+        );
+    }
 
     // Issue #158: the log directory EXISTS but the filesystem is read-only —
     // dir creation "succeeds", file creation fails. The old code panicked

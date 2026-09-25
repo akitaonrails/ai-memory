@@ -133,7 +133,14 @@ fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
         if obs.kind == ObservationKind::SessionStart {
             continue;
         }
-        if !obs.title.is_empty() && !looks_like_title_scaffolding(&obs.title) {
+        // A `tool <family>` label is a partition of the calls, not a title:
+        // `looks_like_scaffolding` does not catch it, so reject it here or a
+        // session whose only non-prompt observation is a closed-tool call
+        // ("tool non-file") would take the label as its page title.
+        if !obs.title.is_empty()
+            && !looks_like_title_scaffolding(&obs.title)
+            && !is_safe_tool_title(&obs.title)
+        {
             return obs.title.clone();
         }
     }
@@ -749,15 +756,24 @@ mod tests {
     /// loop reached the `SessionStart` and the harness's model id became the
     /// page title. The prompt was never scaffolding — it was absent, which is
     /// why no filter on the string could have caught this.
+    ///
+    /// A `tool <family>` label (`safe_tool_title`) is not a title either: it
+    /// is a partition of the calls, so the fallback loop must skip it and fall
+    /// through to the session's own identity, never surface "tool non-file" as
+    /// the page title (#895).
     #[test]
     fn a_model_id_on_session_start_never_becomes_the_title() {
         let sid = test_session_id();
-        let with_a_later_title = vec![
+        let with_only_a_tool_family_label = vec![
             obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
             obs(ObservationKind::UserPrompt, ""),
             obs(ObservationKind::PostToolUse, "tool non-file"),
         ];
-        assert_eq!(derive_title(&with_a_later_title, sid), "tool non-file");
+        assert_eq!(
+            derive_title(&with_only_a_tool_family_label, sid),
+            format!("Session {sid}"),
+            "a tool-family label is not a page title"
+        );
 
         let nothing_else = vec![
             obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
