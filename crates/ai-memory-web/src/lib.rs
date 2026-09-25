@@ -12,6 +12,8 @@
 //! - `GET /w/:workspace/:project`         → page tree + recent activity
 //! - `GET /w/:workspace/:project/p/*path` → rendered markdown + metadata
 //! - `GET /search?q=…`                    → FTS5 hit list
+//! - `GET /pending`                       → root-only pending-writes triage;
+//!   its buttons post to `/admin/pending-writes/*`, not to this crate
 //! - `GET /login` / `GET /change-password` → public human-auth HTML forms
 //! - `GET /static/*`                      → embedded CSS + logo (public)
 //!

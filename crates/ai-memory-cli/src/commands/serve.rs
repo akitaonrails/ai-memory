@@ -1481,6 +1481,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     web_slug: &args.web_slug,
                     base_href: &base_href,
                     base_path: &base_path,
+                    trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
                 },
             )?;
             // HTML navigational 401/403 → builtin login / change-password.
@@ -4277,6 +4278,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -4421,6 +4423,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -4481,6 +4484,7 @@ mod tests {
                 web_slug: "/",
                 base_href: "/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();

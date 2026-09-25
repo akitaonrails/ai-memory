@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+
+{% block title %}Pending writes — ai-memory{% endblock %}
+
+{% block content %}
+<div class="mb-6">
+  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Pending writes</h1>
+  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">
+    Auto-improvement proposals that wait for a decision. Open a proposal to read it, then approve or reject it.
+  </p>
+</div>
+
+<form action="pending" method="get" id="pending-filter" class="mb-4 flex flex-wrap items-end gap-3 text-sm">
+  <label class="flex flex-col gap-1">
+    <span class="font-medium text-slate-700 dark:text-slate-300">Project</span>
+    <select name="project" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      {% for option in projects %}
+      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="flex flex-col gap-1">
+    <span class="font-medium text-slate-700 dark:text-slate-300">Sort</span>
+    <select name="sort" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      {% for option in sorts %}
+      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit" class="rounded-md bg-blue-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-blue-700">Apply</button>
+</form>
+
+<p class="mb-4 text-sm text-slate-500 dark:text-slate-400">
+  <span id="pending-count">{{ rows.len() }}</span> shown · {{ total }} pending in {{ project_count }} project{% if project_count != 1 %}s{% endif %}
+  {% if truncated %}· only the oldest {{ limit }} of this selection are listed; pick a project, or use <code>ai-memory pending-writes list</code>{% endif %}
+</p>
+
+<p id="pending-status" class="mb-4 hidden rounded-md px-3 py-2 text-sm" role="status" aria-live="polite"></p>
+
+{% if rows.is_empty() %}
+<p class="text-sm text-slate-400 dark:text-slate-600">No pending proposals.</p>
+{% else %}
+<ul id="pending-list" class="space-y-3">
+  {% for row in rows %}
+  <li class="pending-item rounded-md border border-slate-200 dark:border-slate-800"
+      data-id="{{ row.id }}"
+      data-workspace="{{ row.workspace }}"
+      data-project="{{ row.project }}"
+      data-path="{{ row.target_path }}">
+    <details>
+      <summary class="cursor-pointer select-none px-4 py-3">
+        <div class="inline-flex flex-wrap items-center gap-2 align-middle">
+          <span class="text-sm font-medium text-slate-800 dark:text-slate-100">{{ row.title }}</span>
+          {% if row.rewrites_existing %}
+          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-300">{{ row.operation }}</span>
+          {% else %}
+          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ row.operation }}</span>
+          {% endif %}
+          {% if row.is_rule %}
+          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-300">rule</span>
+          {% endif %}
+          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ row.kind }}</span>
+        </div>
+        <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400 dark:text-slate-500">
+          <span>{{ row.scope_label }}</span>
+          <span class="font-mono break-all">{{ row.target_path }}</span>
+          <span>confidence {{ row.confidence_pct }}%</span>
+          <span>staged {{ row.staged_relative }}</span>
+        </div>
+      </summary>
+      <div class="border-t border-slate-200 dark:border-slate-800 px-4 py-4 space-y-4">
+        {% if row.is_rule %}
+        <p class="rounded-md bg-amber-50 dark:bg-amber-950 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
+          This proposal writes under <code>_rules/</code>. Every agent session loads those pages as instructions. Read the full body before you approve it.
+        </p>
+        {% endif %}
+        {% if row.rewrites_existing %}
+        <p class="rounded-md bg-amber-50 dark:bg-amber-950 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
+          This proposal replaces an existing page. Compare it with the
+          <a href="{{ row.target_href }}" class="underline">current page</a> before you approve it.
+        </p>
+        {% endif %}
+        <div>
+          <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500 mb-2">Rationale</h2>
+          <pre class="whitespace-pre-wrap break-words rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-sm text-slate-700 dark:text-slate-300">{{ row.rationale }}</pre>
+        </div>
+        <div>
+          <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500 mb-2">Proposed body ({{ row.edit_mode }})</h2>
+          <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-sm text-slate-700 dark:text-slate-300">{{ row.body_markdown }}</pre>
+        </div>
+        <p class="text-xs text-slate-400 dark:text-slate-500 font-mono break-all">id {{ row.id }}</p>
+        <div class="flex flex-wrap items-center gap-2">
+          <button type="button" data-action="approve"
+                  class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">Approve</button>
+          <button type="button" data-action="reject"
+                  class="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50">Reject</button>
+          <input type="text" name="reason" maxlength="500" placeholder="Reject reason (optional)" aria-label="Reject reason"
+                 class="flex-1 min-w-0 max-w-md rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+      </div>
+    </details>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<script>
+(function () {
+  {% include "_js_cookie.html" %}
+  var basePath = document
+    .querySelector('meta[name="ai-memory-base-path"]')
+    ?.getAttribute("content") || "";
+  var status = document.getElementById("pending-status");
+  var count = document.getElementById("pending-count");
+  var filter = document.getElementById("pending-filter");
+
+  filter.querySelectorAll("select").forEach(function (select) {
+    select.addEventListener("change", function () { filter.submit(); });
+  });
+
+  function showStatus(ok, text) {
+    status.textContent = text;
+    status.classList.remove("hidden", "bg-green-50", "text-green-800", "bg-red-50", "text-red-800");
+    status.classList.add(ok ? "bg-green-50" : "bg-red-50", ok ? "text-green-800" : "text-red-800");
+  }
+
+  // The decision goes to the existing admin handlers; this page never writes.
+  function decide(item, action) {
+    var buttons = item.querySelectorAll("button");
+    var reason = item.querySelector('input[name="reason"]');
+    var path = item.getAttribute("data-path");
+    var query = new URLSearchParams({
+      workspace: item.getAttribute("data-workspace"),
+      project: item.getAttribute("data-project")
+    });
+    var url = basePath + "/admin/pending-writes/" +
+      encodeURIComponent(item.getAttribute("data-id")) + "/" + action + "?" + query.toString();
+    buttons.forEach(function (b) { b.disabled = true; });
+    fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-CSRF-Token": decodeURIComponent(cookie("ai_memory_csrf") || "")
+      },
+      body: JSON.stringify(action === "reject" ? { reason: reason.value.trim() } : {})
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (json) {
+        if (resp.ok) {
+          item.remove();
+          count.textContent = String(document.querySelectorAll(".pending-item").length);
+          showStatus(true, (action === "approve" ? "Approved " : "Rejected ") + path + ".");
+          return;
+        }
+        buttons.forEach(function (b) { b.disabled = false; });
+        if (resp.status === 409) {
+          showStatus(false, "The page at " + path + " changed after the proposal was staged. The proposal is now marked as a conflict. Reload the page.");
+          return;
+        }
+        showStatus(false, (action === "approve" ? "Approve" : "Reject") + " failed for " + path +
+          " (" + resp.status + "): " + ((json && json.error) || "unknown error"));
+      });
+    }).catch(function () {
+      buttons.forEach(function (b) { b.disabled = false; });
+      showStatus(false, "Network error. Try again.");
+    });
+  }
+
+  document.querySelectorAll(".pending-item").forEach(function (item) {
+    item.querySelectorAll("button[data-action]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        decide(item, button.getAttribute("data-action"));
+      });
+    });
+  });
+})();
+</script>
+{% endblock %}

@@ -949,7 +949,9 @@ embeddings spec, and is not covered by a live test against Copilot here.
   keeping deletes and semantic rewrites review-gated.
 * **Richer read surfaces for the web UI.** The multi-workspace read-only
   wiki browser shipped in `ai-memory-web` (`/web` — project list, page
-  tree, page view, search). It stays read-only by design: the wiki is a
+  tree, page view, search, and the root-only `/web/pending` triage page,
+  whose approve and reject buttons post to the existing
+  `/admin/pending-writes/*` routes). It stays read-only by design: the wiki is a
   machine-authored record, and a browser edit surface would break the
   invariant the whole store rests on (#482). Better *reading* — richer
   navigation, diff/history views, graph exploration — is open. See

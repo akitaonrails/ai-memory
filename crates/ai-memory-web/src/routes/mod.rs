@@ -12,6 +12,7 @@ mod api;
 mod index;
 mod login;
 mod page;
+mod pending;
 mod project;
 mod search;
 mod statics;
@@ -23,6 +24,7 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .route("/w/{workspace}/{project}", get(project::handler))
         .route("/w/{workspace}/{project}/p/{*path}", get(page::handler))
         .route("/search", get(search::handler))
+        .route("/pending", get(pending::handler))
         .with_state(state)
 }
 

@@ -16,12 +16,27 @@ pub struct WebState {
     pub reader: ReaderPool,
     /// Wiki handle — reads page bodies from disk.
     pub wiki: Wiki,
+    /// A trusted identity proxy asserts usernames, so the deployment tells
+    /// operators apart even with no `users` rows. Root-only pages pass it to
+    /// `ReaderPool::distinguishes_operators`, as the `/admin` gate does.
+    pub trusted_proxy_identity: bool,
 }
 
 impl WebState {
     /// Build a new shared state.
     #[must_use]
     pub fn new(reader: ReaderPool, wiki: Wiki) -> Self {
-        Self { reader, wiki }
+        Self {
+            reader,
+            wiki,
+            trusted_proxy_identity: false,
+        }
+    }
+
+    /// Record whether a trusted identity proxy is configured.
+    #[must_use]
+    pub fn with_trusted_proxy_identity(mut self, trusted_proxy_identity: bool) -> Self {
+        self.trusted_proxy_identity = trusted_proxy_identity;
+        self
     }
 }

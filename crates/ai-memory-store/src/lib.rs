@@ -42,9 +42,9 @@ pub use auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalOperation,
     AutoImproveProposalStatus, AutoImproveProposalSummary, AutoImproveRejectionSummary,
     AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, FailAutoImproveProposal,
-    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, RejectAutoImproveProposal,
-    SkippedProposal, StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport,
-    artifact_path_for,
+    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, PendingAutoImproveReview,
+    PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal, StageAutoImproveRun,
+    StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
 pub use decay::{

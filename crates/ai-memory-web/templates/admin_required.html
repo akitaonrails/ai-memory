@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block title %}Root access required — ai-memory{% endblock %}
+
+{% block content %}
+<div class="text-center py-20">
+  <p class="text-6xl font-bold text-slate-200 dark:text-slate-800">403</p>
+  <h1 class="mt-4 text-2xl font-semibold text-slate-700 dark:text-slate-300">Root access required</h1>
+  <p class="mt-2 text-sm text-slate-500 dark:text-slate-400">Only the root account can approve or reject pending writes.</p>
+  <a href="." class="mt-6 inline-block rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
+    Back to home
+  </a>
+</div>
+{% endblock %}

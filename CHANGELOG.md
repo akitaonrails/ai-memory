@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The builtin web UI has a root-only `/web/pending` page to triage pending
+  auto-improvement proposals. It lists the proposals of all projects, with a
+  project filter and a sort, and shows the rationale and the proposed body.
+  Approve and reject post to the existing
+  `/admin/pending-writes/{id}/approve|reject` routes with the session cookie
+  and the CSRF header, so admission, audit, and attribution stay the same.
+  `ai-memory-web` adds no write route. (#855)
 - Inert per-project-authorization schema and the `authorize_project` choke
   point (first slice of #708). A new `project_grants` table
   (`(workspace, project, user) -> read|write`) and a `projects.access_mode`

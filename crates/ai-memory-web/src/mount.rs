@@ -291,6 +291,9 @@ pub struct WebMountSpec<'a> {
     /// Normalised base path (`""` or `/<core>`) the whole surface is
     /// nested under; stamped into the `ai-memory-base-path` meta tag.
     pub base_path: &'a str,
+    /// A trusted identity proxy is configured; the root-only pending-writes
+    /// page needs it to decide whether operators are told apart.
+    pub trusted_proxy_identity: bool,
 }
 
 /// Public SPA vs dual-auth wiki/API split.
@@ -360,7 +363,14 @@ pub fn split_web_routers(
             spec.base_path,
             mount,
         ),
-        protected: mount_builtin_browser(protected_api, reader, wiki, &slug, mount, browser_inject),
+        protected: mount_builtin_browser(
+            protected_api,
+            crate::WebState::new(reader, wiki)
+                .with_trusted_proxy_identity(spec.trusted_proxy_identity),
+            &slug,
+            mount,
+            browser_inject,
+        ),
         html_auth: Some(auth_cfg),
     })
 }
@@ -481,8 +491,7 @@ fn mount_builtin_public(
 /// query string the caller passed.
 fn mount_builtin_browser(
     router: axum::Router,
-    reader: ReaderPool,
-    wiki: Wiki,
+    state: crate::WebState,
     slug: &str,
     mount: &str,
     inject: Arc<WebInjectState>,
@@ -492,10 +501,9 @@ fn mount_builtin_browser(
     // response so they resolve under `{base_path}{web_slug}/` — the
     // same anchoring the custom SPA gets via its injected index.
     let base_href = inject.base_href.clone();
-    let web_router = crate::router(reader, wiki).layer(axum::middleware::from_fn_with_state(
-        inject,
-        inject_web_base_href,
-    ));
+    let web_router = crate::routes::build(Arc::new(state)).layer(
+        axum::middleware::from_fn_with_state(inject, inject_web_base_href),
+    );
     info!(mount, base_href, "read-only wiki browser mounted");
     if slug.is_empty() {
         return router.merge(web_router);
@@ -653,6 +661,7 @@ mod tests {
                 web_slug,
                 base_href: &base_href,
                 base_path: &base,
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1053,6 +1062,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: &base,
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1132,6 +1142,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: &base_href,
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1190,6 +1201,7 @@ mod tests {
                 web_slug: "/",
                 base_href: &base_href,
                 base_path: &base,
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1277,6 +1289,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1332,6 +1345,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();
@@ -1376,6 +1390,7 @@ mod tests {
                 web_slug: "/web",
                 base_href: "/web/",
                 base_path: "",
+                trusted_proxy_identity: false,
             },
         )
         .unwrap();

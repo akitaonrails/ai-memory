@@ -61,6 +61,14 @@ fn join_root(web_root: &str, leaf: &str) -> String {
     }
 }
 
+/// Response marker for a 403 that means "this page is root-only".
+///
+/// [`html_auth_redirect_mw`] sends every other HTML 403 to the
+/// change-password form; a signed-in non-root user must see the refusal
+/// instead.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdminRequired;
+
 /// Allow only same-origin relative paths under `web_root`.
 ///
 /// Rejects protocol-relative `//`, absolute URLs (`http:` / `https:`),
@@ -141,7 +149,9 @@ pub async fn html_auth_redirect_mw(
                 urlencoding_encode(&sanitize_next(Some(&full_path_and_query), &cfg.web_root));
             Redirect::to(&format!("{}?next={next_q}", cfg.login_path)).into_response()
         }
-        StatusCode::FORBIDDEN => Redirect::to(&cfg.change_password_path).into_response(),
+        StatusCode::FORBIDDEN if resp.extensions().get::<AdminRequired>().is_none() => {
+            Redirect::to(&cfg.change_password_path).into_response()
+        }
         _ => resp,
     }
 }
