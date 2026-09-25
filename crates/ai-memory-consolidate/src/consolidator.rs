@@ -154,9 +154,23 @@ impl Consolidator {
     ///
     /// `max_input_tokens + max_output_tokens` must fit the provider's context
     /// window. Callers validate the supported minimums when resolving config.
+    ///
+    /// `safety_margin` shrinks the char-count input budget so the flat
+    /// chars-per-token heuristic does not over-admit on denser-than-English
+    /// corpora (pt-BR, code); it is validated to `0 < margin <= 1` at config
+    /// load. See [`DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN`] (#884).
     #[must_use]
-    pub fn with_prompt_limits(mut self, max_input_tokens: usize, max_output_tokens: u32) -> Self {
-        self.budgets = PromptBudgets::from_limits(max_input_tokens, max_output_tokens);
+    pub fn with_prompt_limits(
+        mut self,
+        max_input_tokens: usize,
+        max_output_tokens: u32,
+        safety_margin: f64,
+    ) -> Self {
+        self.budgets = PromptBudgets::from_limits_with_margin(
+            max_input_tokens,
+            max_output_tokens,
+            safety_margin,
+        );
         self
     }
 
@@ -1137,6 +1151,17 @@ pub const DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS: usize = 100_000;
 /// Default maximum generated tokens for a consolidation response.
 pub const DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS: u32 = 32_000;
 
+/// Default multiplier applied to the char-count input budget (#884).
+///
+/// `max_input_tokens` is turned into a char budget with a flat
+/// [`CHARS_PER_TOKEN`] heuristic. That ratio holds for English prose but
+/// over-admits on denser corpora — pt-BR prose and source code tokenize at
+/// closer to ~2.1 chars/token, so a 3:1 estimate overshot the real token
+/// count by ~40% and tripped provider `max_input_tokens` limits. Shrinking
+/// the effective char budget to 80% of the nominal value buys that headroom
+/// back for the common case while leaving English budgets close to before.
+pub const DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN: f64 = 0.8;
+
 /// Conservative character-to-token estimate for provider-neutral budgeting.
 /// The exact tokenizer is provider/model-specific, so this is a target rather
 /// than a hard token count. Three characters per token plus the default
@@ -1190,8 +1215,26 @@ struct PromptBudgets {
 
 impl PromptBudgets {
     fn from_limits(max_input_tokens: usize, max_output_tokens: u32) -> Self {
+        // A bare limit applies no safety margin (margin 1.0), preserving the
+        // historical char budget; production tightens it via config (#884).
+        Self::from_limits_with_margin(max_input_tokens, max_output_tokens, 1.0)
+    }
+
+    /// Derive budgets from the token limits, shrinking the char-count input
+    /// budget by `safety_margin` (#884). The margin compensates for the flat
+    /// [`CHARS_PER_TOKEN`] heuristic over-admitting on denser-than-English
+    /// corpora (pt-BR, code). Callers pass a validated `0 < margin <= 1`.
+    fn from_limits_with_margin(
+        max_input_tokens: usize,
+        max_output_tokens: u32,
+        safety_margin: f64,
+    ) -> Self {
+        let nominal = max_input_tokens.saturating_mul(CHARS_PER_TOKEN);
+        // `safety_margin` is validated to `0 < margin <= 1` at config load, so
+        // the product never exceeds `nominal` and the cast cannot overflow.
+        let max_input_chars = (nominal as f64 * safety_margin) as usize;
         Self {
-            max_input_chars: max_input_tokens.saturating_mul(CHARS_PER_TOKEN),
+            max_input_chars,
             max_output_tokens,
         }
     }
@@ -1455,14 +1498,33 @@ fn indent_for_prompt(s: &str) -> String {
 
 /// ASCII-slug a rule title for the `_rules/<slug>.md` path.
 ///
-/// Lower-cases, replaces runs of non-`[a-z0-9]` with `-`, trims
-/// leading/trailing hyphens, and caps at 60 chars. Falls back to
-/// `rule` when the input has no alphanumerics (e.g. a non-Latin
-/// title) so we always produce a valid PagePath.
+/// Folds Latin diacritics to ASCII (NFD-decompose, drop the combining
+/// marks), lower-cases, replaces runs of non-`[a-z0-9]` with `-`, trims
+/// leading/trailing hyphens, and caps at 60 chars at a word boundary.
+/// Falls back to `rule` when the input has no folding-surviving
+/// alphanumerics (e.g. a CJK-only title) so we always produce a valid
+/// PagePath.
+///
+/// Diacritic folding (#886) is why `estável`/`retenção` slug as
+/// `estavel`/`retencao` instead of `est-vel`/`reten-o`: without the fold
+/// each accented letter is a non-ASCII scalar that the run-collapse turns
+/// into a `-`, splitting the word. The truncation cuts at the last hyphen
+/// within the 60-char budget so a long title ends on a whole word rather
+/// than mid-word. Non-decomposable Latin-1 letters (ß, ø, æ) still fall to
+/// `-`, which is acceptable; all pt-BR letters decompose to ASCII.
 fn slugify_for_rule(title: &str) -> String {
-    let mut out = String::with_capacity(title.len());
+    // NFD decomposition splits `é` into `e` + U+0301 (combining acute),
+    // `ç` into `c` + U+0327, etc. Reuses ai-memory-core's icu_normalizer.
+    let decomposed = icu_normalizer::DecomposingNormalizer::new_nfd().normalize(title);
+    let mut out = String::with_capacity(decomposed.len());
     let mut prev_dash = true; // leading dashes get folded
-    for c in title.chars() {
+    for c in decomposed.chars() {
+        // Drop the combining marks NFD left behind (the Combining
+        // Diacritical Marks block), rather than folding them to a `-`,
+        // so the base letter stands alone: `e` + U+0301 -> `e`.
+        if ('\u{0300}'..='\u{036F}').contains(&c) {
+            continue;
+        }
         let lower = c.to_ascii_lowercase();
         if lower.is_ascii_alphanumeric() {
             out.push(lower);
@@ -1479,7 +1541,13 @@ fn slugify_for_rule(title: &str) -> String {
         return "rule".into();
     }
     if out.len() > 60 {
-        out.truncate(60);
+        // `out` is ASCII here, so byte index 60 is a char boundary. Cut at
+        // the last hyphen inside the window to end on a whole word; only
+        // hard-cut at 60 when the window holds no hyphen (one long token).
+        match out[..60].rfind('-') {
+            Some(idx) => out.truncate(idx),
+            None => out.truncate(60),
+        }
         while out.ends_with('-') {
             out.pop();
         }
@@ -1727,6 +1795,54 @@ mod tests {
         );
     }
 
+    /// #884: the safety margin scales the char budget by exactly the factor,
+    /// and margin 1.0 reproduces the un-margined budget.
+    #[test]
+    fn safety_margin_scales_input_char_budget() {
+        let full = PromptBudgets::from_limits(10_000, 1_000);
+        assert_eq!(full.max_input_chars, 30_000);
+        assert_eq!(
+            PromptBudgets::from_limits_with_margin(10_000, 1_000, 1.0),
+            full,
+            "margin 1.0 must leave the budget unchanged"
+        );
+        let tightened = PromptBudgets::from_limits_with_margin(10_000, 1_000, 0.8);
+        assert_eq!(
+            tightened.max_input_chars, 24_000,
+            "margin 0.8 must shrink the char budget to 0.8x"
+        );
+        // Output allowance is independent of the input margin.
+        assert_eq!(tightened.max_output_tokens, 1_000);
+    }
+
+    /// #884: a large observation set is packed to the tightened budget, so a
+    /// margin actually reduces how much prompt content is admitted.
+    #[test]
+    fn safety_margin_trims_packed_observations() {
+        let tightened = PromptBudgets::from_limits_with_margin(
+            DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+            0.8,
+        );
+        let full = PromptBudgets::from_limits(
+            DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
+            DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
+        );
+        assert!(tightened.max_input_chars < full.max_input_chars);
+        let observations = (0..256).map(|_| obs_of_size(4_000)).collect::<Vec<_>>();
+        let request = build_request(
+            SessionId::new(),
+            &observations,
+            &"x".repeat(50_000),
+            Some(&"preference ".repeat(500)),
+            tightened,
+        );
+        assert!(
+            estimated_input_chars::<ConsolidatedPage>(&request) <= tightened.max_input_chars,
+            "packed request must respect the tightened budget"
+        );
+    }
+
     /// The batch path must include schema and dynamic slot snapshots in its
     /// envelope instead of assuming a fixed number of slots.
     #[test]
@@ -1804,6 +1920,45 @@ mod tests {
         let slug = slugify_for_rule(&long);
         assert!(slug.len() <= 60);
         assert!(!slug.ends_with('-'));
+    }
+
+    /// #886: Latin diacritics fold to ASCII instead of splitting the word
+    /// into a hyphen (`estável` -> `estavel`, not `est-vel`).
+    #[test]
+    fn slugify_folds_latin_diacritics() {
+        assert_eq!(slugify_for_rule("Modelo estável"), "modelo-estavel");
+        assert_eq!(
+            slugify_for_rule("Política de retenção"),
+            "politica-de-retencao"
+        );
+        // Every pt-BR accented letter decomposes to ASCII.
+        assert_eq!(
+            slugify_for_rule("á é í ó ú â ê ô ã õ ç à ü"),
+            "a-e-i-o-u-a-e-o-a-o-c-a-u"
+        );
+    }
+
+    /// #886: a title longer than 60 chars is cut at a hyphen (word
+    /// boundary), not mid-word.
+    #[test]
+    fn slugify_truncates_at_word_boundary() {
+        let title = "aaaaaaaa bbbbbbbb cccccccc dddddddd eeeeeeee ffffffff gggggggg hhhhhhhh";
+        let slug = slugify_for_rule(title);
+        assert!(slug.len() <= 60);
+        assert!(!slug.ends_with('-'));
+        // The cut lands on the last whole word inside the budget, dropping
+        // the partial `gggggggg` rather than slicing it.
+        assert_eq!(
+            slug,
+            "aaaaaaaa-bbbbbbbb-cccccccc-dddddddd-eeeeeeee-ffffffff"
+        );
+    }
+
+    /// #886: a CJK-only title still folds to nothing and falls back to the
+    /// static slug — diacritic folding must not resurrect it.
+    #[test]
+    fn slugify_cjk_still_falls_back() {
+        assert_eq!(slugify_for_rule("中文标题"), "rule");
     }
 
     fn update_with_summary(summary: Option<&str>) -> crate::types::ConsolidatedPageUpdate {
@@ -2121,6 +2276,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.frontmatter["slot_kind"], "state");
+    }
+
+    #[test]
+    fn build_update_appends_md_to_bare_non_rule_path() {
+        // #885: the LLM returns a multi-page path with no extension
+        // (`decisions/smart-model-luna`). The non-rule branch routes it
+        // through `slugify_page_path`, which must land it as a portable
+        // `.md` page rather than storing it extensionless.
+        let update = crate::types::ConsolidatedPageUpdate {
+            path: "decisions/smart-model-luna".into(),
+            tier: Tier::Semantic,
+            kind: crate::types::PageKind::Fact,
+            title: "Smart model Luna".into(),
+            body_markdown: "body".into(),
+            summary: None,
+            tags: Vec::new(),
+            slot_kind: SlotKind::State,
+            relations: Relations::default(),
+            entities: Vec::new(),
+        };
+        let (req, _) = build_update(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            &update,
+            true,
+            &ai_memory_core::ActorContext::anonymous(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.path.as_str(), "decisions/smart-model-luna.md");
     }
 
     #[test]

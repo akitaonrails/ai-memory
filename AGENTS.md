@@ -549,6 +549,16 @@ Additional boundary rules:
   wrong hash makes `brew install` fail for everyone. This is a mandatory,
   recurring post-release step (it has been forgotten repeatedly); do not rely
   on a contributor PR to the tap to remember it.
+- **Reclaim build storage after every release — run `cargo clean`.** The
+  multi-worktree, multi-target-dir release flow (integration worktrees, per-agent
+  worktrees, separate `CARGO_TARGET_DIR`s) leaves many stale 100–180 MB test
+  binaries behind and has exhausted disk (see the `target/` bloat note under
+  Platform notes). Once a release is tagged and its artifacts are published, run
+  `cargo clean` (and `cargo clean` in each release worktree / extra target dir
+  you created, then remove finished `git worktree`s). This is a mandatory
+  post-release cleanup step, not optional housekeeping — treat it like the tap
+  bump above. During normal development, `cargo sweep --time 7` weekly is the
+  lighter-touch equivalent.
 - **No version bumps or release tags without explicit user approval.**
   Do not bump crate/package versions automatically.
 - **PR evaluation:** report pros, cons, and recommended fix, then ask for

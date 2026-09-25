@@ -1218,7 +1218,12 @@ The generated plugin targets the OpenCode 2.0.10+ event API (checked against
 terminal is not a session end: each completed root turn instead writes a
 deterministic checkpoint (no LLM call) of `sessions/<id>.md` and refreshes the
 session's automatic handoff, keeping one open baton per live session. The next
-session claims the latest checkpoint. Startup context is claimed once per root
+session claims the latest checkpoint of a session that has captured nothing for
+ten minutes. Nothing tells a closed terminal from a parallel session still at
+work in the same directory, so this is a heuristic: a session in use keeps its
+baton, one session's turn never retires another live session's baton, and a
+claim retires only older batons of quiet sessions. A tool or model call that
+runs longer than ten minutes without a captured event looks quiet. Startup context is claimed once per root
 session and retained on every later model request; child sessions never claim
 it or publish a baton.
 

@@ -280,6 +280,38 @@ pub fn release(conn: &mut Connection, job: &SessionConsolidationJob) -> StoreRes
     require_claim_update(changed)
 }
 
+/// Reconcile the durable job row after a manual `memory_consolidate` produced
+/// the page out-of-band from the automatic SessionEnd worker.
+///
+/// A manual consolidate writes the page directly through the consolidator and
+/// never touches this queue, so the session's job row can sit in a terminal
+/// `failed` (or `pending`/`superseded`) state for a session that is, in fact,
+/// consolidated — a two-sources-of-truth inconsistency the operator sees. This
+/// flips those rows to `completed`.
+///
+/// It deliberately never touches a `running` row: that state is an active
+/// worker lease, and stomping it would violate the single-writer/collaboration
+/// invariants (a live automatic attempt must finish and settle its own row
+/// through the claim-guarded `complete`/`fail`). `completed` rows are already
+/// consistent and left untouched. Unlike `complete`/`fail`, this is not
+/// claim-guarded: it is a session-scoped reconcile, not a lease transition.
+///
+/// Returns the number of job rows updated (0 when there was no job, or the only
+/// row was already `completed` or `running`).
+pub fn reconcile_session_consolidation_completed(
+    conn: &mut Connection,
+    session_id: SessionId,
+) -> StoreResult<usize> {
+    let now = Timestamp::now().as_microsecond();
+    let changed = conn.execute(
+        "UPDATE session_consolidation_jobs \
+         SET state = 'completed', completed_at = ?1, claim_id = NULL, last_error = NULL \
+         WHERE session_id = ?2 AND state IN ('failed', 'pending', 'superseded')",
+        params![now, session_id.as_bytes()],
+    )?;
+    Ok(changed)
+}
+
 fn require_claim_update(changed: usize) -> StoreResult<()> {
     if changed == 1 {
         Ok(())
@@ -578,6 +610,112 @@ mod tests {
             .complete_session_consolidation(reclaimed)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_reconcile_completes_a_terminally_failed_job() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        // Drive the job to terminal `failed`: spend every attempt but the last
+        // with a scheduled retry, then fail the final attempt with no retry.
+        for _ in 1..SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+            let job = store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .writer
+                .fail_session_consolidation(job, "retry".into(), Some(now))
+                .await
+                .unwrap();
+        }
+        let terminal = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.attempts(), SESSION_CONSOLIDATION_MAX_ATTEMPTS);
+        store
+            .writer
+            .fail_session_consolidation(terminal, "terminal".into(), None)
+            .await
+            .unwrap();
+        // A terminally failed job is never re-claimed by the worker.
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now + 1_000, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a terminally failed job must not be re-claimed"
+        );
+
+        // The manual reconcile flips the terminal row to `completed`.
+        let updated = store
+            .writer
+            .reconcile_session_consolidation_completed(session_id)
+            .await
+            .unwrap();
+        assert_eq!(updated, 1, "the failed job row must be reconciled");
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now + 1_000, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a reconciled job stays completed and is never re-claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_reconcile_leaves_a_live_running_lease_intact() {
+        // Invariant #16 / #2 guard: a manual reconcile must never stomp a live
+        // worker lease. This control fails if the reconcile WHERE clause is
+        // widened to touch `state = 'running'`.
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let leased = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.attempts(), 1);
+
+        // Reconcile while the automatic worker holds the lease: it must not
+        // touch the `running` row.
+        let updated = store
+            .writer
+            .reconcile_session_consolidation_completed(session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            updated, 0,
+            "a live running lease must be left intact by the reconcile"
+        );
+
+        // The lease is still valid: its own claim-guarded completion succeeds,
+        // proving the reconcile did not clear claim_id or change its state.
+        store
+            .writer
+            .complete_session_consolidation(leased)
+            .await
+            .expect("the untouched lease must still complete through its own claim");
     }
 
     #[tokio::test]
