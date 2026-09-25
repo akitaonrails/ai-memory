@@ -104,7 +104,14 @@ const server = createServer((req, res) => {
   res.writeHead(404);
   res.end();
 });
-await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", () => resolve()));
+await new Promise<void>((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(port, "127.0.0.1", () => resolve());
+}).catch((error) => {
+  // Taken before Node could bind it; nothing has run yet, so the test retries.
+  if (error?.code === "EADDRINUSE") process.exit(75);
+  throw error;
+});
 
 const hooks: any = await (AiMemoryHooks as any)({ directory });
 await hooks.event({ event: { type: "session.created", properties: { info: { id: "s1", directory } } } });
@@ -124,7 +131,7 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
     /// `GIT_CONFIG_*` leaking in from the harness would point it somewhere
     /// outside the fixture. `PATH` and the rest of the environment stay so
     /// Node and git still resolve.
-    fn run_plugin(dir: &Path, port: u16, owner: Option<&str>) -> Value {
+    fn run_plugin(dir: &Path, port: u16, owner: Option<&str>) -> Option<Value> {
         let mut command = hermetic("node");
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("GIT_") {
@@ -146,13 +153,41 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
             command.env("AI_MEMORY_CAPTURE_OWNER", owner);
         }
         let output = command.output().expect("run generated plugin");
+        if output.status.code() == Some(PORT_TAKEN) {
+            return None;
+        }
         assert!(
             output.status.success(),
             "generated plugin run failed (owner={owner:?})\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        serde_json::from_slice(&output.stdout).expect("harness JSON")
+        Some(serde_json::from_slice(&output.stdout).expect("harness JSON"))
+    }
+
+    /// The harness's exit code when its port was taken before it could bind.
+    const PORT_TAKEN: i32 = 75;
+
+    /// Writes the plugin, rendered for `port`, and the harness into `dir`.
+    fn write_fixture(dir: &Path, port: u16) {
+        let plugin = render_opencode_plugin(dir, &format!("http://127.0.0.1:{port}"));
+        std::fs::write(dir.join("ai-memory.ts"), &plugin).unwrap();
+        std::fs::write(dir.join("harness.ts"), HARNESS).unwrap();
+    }
+
+    /// One plugin run on `port`. The plugin names its server at render time,
+    /// and [`free_port`] releases the port before Node binds it, so under a
+    /// parallel test load another socket can take it first. The harness then
+    /// stops before the plugin runs and the fixture moves to a fresh port.
+    fn run_on_free_port(dir: &Path, port: &mut u16, owner: Option<&str>) -> Value {
+        for _ in 0..5 {
+            if let Some(run) = run_plugin(dir, *port, owner) {
+                return run;
+            }
+            *port = free_port();
+            write_fixture(dir, *port);
+        }
+        panic!("the harness could not bind a free port in 5 attempts");
     }
 
     fn spooled_entries(dir: &Path) -> usize {
@@ -187,12 +222,10 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
             return;
         }
         let dir = fixture_root();
-        let port = free_port();
-        let plugin = render_opencode_plugin(&dir, &format!("http://127.0.0.1:{port}"));
-        std::fs::write(dir.join("ai-memory.ts"), &plugin).unwrap();
-        std::fs::write(dir.join("harness.ts"), HARNESS).unwrap();
+        let mut port = free_port();
+        write_fixture(&dir, port);
 
-        let owned = run_plugin(&dir, port, Some("orchestrator-a"));
+        let owned = run_on_free_port(&dir, &mut port, Some("orchestrator-a"));
         assert!(
             delivered_events(&owned).is_empty(),
             "owned run must POST nothing: {owned}"
@@ -206,7 +239,7 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
         // plugin and harness must capture normally. Without them the
         // assertions above could pass on a harness that never delivers.
         for (label, owner) in [("unset", None), ("whitespace", Some(" \t\n"))] {
-            let captured = run_plugin(&dir, port, owner);
+            let captured = run_on_free_port(&dir, &mut port, owner);
             let events = delivered_events(&captured);
             for expected in ["session-start", "user-prompt", "session-end"] {
                 assert!(
@@ -220,5 +253,22 @@ console.log(JSON.stringify({ events, handoffs, system: transformed.system }));
                 "{label}: {captured}"
             );
         }
+    }
+
+    /// A port taken before Node binds it moves the fixture to a fresh one
+    /// instead of failing the run.
+    #[test]
+    fn generated_plugin_fixture_moves_off_a_taken_port() {
+        if !node_strip_types_available() {
+            return;
+        }
+        let dir = fixture_root();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = taken.local_addr().unwrap().port();
+        let mut port = busy;
+        write_fixture(&dir, port);
+        let run = run_on_free_port(&dir, &mut port, None);
+        assert_ne!(port, busy);
+        assert!(delivered_events(&run).contains(&"session-start"), "{run}");
     }
 }
