@@ -252,31 +252,56 @@ pub(crate) fn opencode_plugin_path() -> anyhow::Result<std::path::PathBuf> {
         .join("ai-memory.ts"))
 }
 
-/// OMP lifecycle extension at `<agent dir>/extensions/ai-memory-omp.ts`. The
-/// agent dir is OMP's own ([`ai_memory_workstream::omp_agent_dir`]):
-/// `~/.omp/profiles/<name>/agent` for a named profile (`--profile`, then
-/// `OMP_PROFILE`, then `PI_PROFILE`), else `$PI_CODING_AGENT_DIR`, else
-/// `~/.omp/agent`, with `~/.omp` renamed by `PI_CONFIG_DIR`. XDG never moves
-/// it: OMP only relocates sessions there.
+/// `$PI_CODING_AGENT_DIR/extensions/ai-memory.ts` when the var is set, else
+/// `~/.omp/agent/extensions/ai-memory.ts` — OMP lifecycle extension.
 ///
-/// OMP loads extensions only from that directory, so an extension written
-/// anywhere else is never loaded: capture silently does nothing, with a
-/// successful-looking install. Session import resolves OMP transcripts through
-/// the same agent dir, so both halves of an install agree on it.
+/// `PI_CODING_AGENT_DIR` relocates OMP's whole agent config home
+/// (`~/.omp/agent`), so extensions written to the default path are never
+/// loaded by an OMP configured that way: capture silently does nothing, with
+/// a successful-looking install. ai-memory already honors the variable when
+/// it resolves OMP transcripts (`ManagedHarness::Omp` in
+/// `ai-memory-workstream`), so ignoring it here left one half of the same
+/// install pointing somewhere the other half did not.
 pub(crate) fn omp_extension_path(profile: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
-    omp_extension_path_with(profile, &|name| std::env::var_os(name))
+    // Bind the OsString before borrowing from it: `var_os(..).as_ref()` in a
+    // single expression drops the temporary at the end of the statement.
+    let env_profile = std::env::var_os("OMP_PROFILE");
+    let profile = profile.or_else(|| env_profile.as_ref().and_then(|s| s.to_str()));
+    omp_extension_path_in(std::env::var_os("PI_CODING_AGENT_DIR"), profile)
 }
 
-/// The env comes in as a parameter so tests can exercise every branch without
-/// mutating process env (mirrors [`codex_hooks_path_in`]).
-fn omp_extension_path_with(
+/// The env value comes in as a parameter so tests can exercise both branches
+/// without mutating process env (mirrors [`codex_hooks_path_in`]).
+fn omp_extension_path_in(
+    env_override: Option<std::ffi::OsString>,
     profile: Option<&str>,
-    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let home = home_dir().context("could not locate $HOME for ~/.omp")?;
-    Ok(ai_memory_workstream::omp_agent_dir(&home, profile, env)?
-        .join("extensions")
-        .join("ai-memory-omp.ts"))
+    // Precedence: `PI_CODING_AGENT_DIR` wins over `--profile`.
+    //
+    // OMP documents each separately — the variable "can override the agent
+    // directory", and `--profile <name>` moves it to
+    // `~/.omp/profiles/<name>/agent` — but does not define what happens when
+    // both are set. Rather than guess at a composition (an earlier revision
+    // derived `$DIR/profiles/<name>/agent`, and re-rooted differently
+    // depending on whether the path's last component happened to be named
+    // "agent", so the result changed with the directory's *name*), this
+    // takes the reading each is documented to have: the variable names the
+    // agent directory outright, so when it is set that is the agent
+    // directory. The profile then has nothing left to relocate, and the
+    // caller says so instead of silently picking one.
+    let base_dir = if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        dir
+    } else {
+        let root = home_dir()
+            .context("could not locate $HOME for ~/.omp")?
+            .join(".omp");
+        if let Some(profile_name) = profile {
+            root.join("profiles").join(profile_name).join("agent")
+        } else {
+            root.join("agent")
+        }
+    };
+    Ok(base_dir.join("extensions").join("ai-memory-omp.ts"))
 }
 
 /// `$PI_CODING_AGENT_DIR/extensions/ai-memory-pi.ts` when the var is set, else
@@ -1382,7 +1407,13 @@ pub(crate) fn hook_config_target_with(
         AgentChoice::OpenCode => opencode_plugin_path(),
         AgentChoice::OpenCode2 => opencode2_plugin_path(),
         AgentChoice::Pi => pi_extension_path_in(env("PI_CODING_AGENT_DIR")),
-        AgentChoice::Omp => omp_extension_path_with(None, env),
+        AgentChoice::Omp => {
+            let profile = env("OMP_PROFILE");
+            omp_extension_path_in(
+                env("PI_CODING_AGENT_DIR"),
+                profile.as_ref().and_then(|name| name.to_str()),
+            )
+        }
         AgentChoice::KimiCode => kimi_code_config_path_in(env("KIMI_CODE_HOME")),
         AgentChoice::CommandCode => command_code_settings_path(),
         AgentChoice::KiroCli => kiro_cli_home_join(env("KIRO_HOME"), "agents"),
@@ -4190,13 +4221,11 @@ pub(crate) fn shared_extensions_dir(
 /// [`shared_extensions_dir`].
 pub(crate) fn warn_agents_share_extensions_dir(dir: &Path) {
     eprintln!(
-        "warning: Pi and OMP both resolve to {}, an agent dir they share\n\
-         \x20 (PI_CODING_AGENT_DIR, or OMP's PI_CONFIG_DIR).\n\
+        "warning: Pi and OMP both resolve to {} — they share PI_CODING_AGENT_DIR.\n\
          \x20 Each agent loads every *.ts in that directory, so installing both\n\
          \x20 captures each event twice, once as `pi` and once as `omp`.\n\
-         \x20 Give them separate homes, or move OMP to a named profile, which\n\
-         \x20 ignores PI_CODING_AGENT_DIR (OMP_PROFILE=<name>, or `--profile <name>`\n\
-         \x20 on both `omp` and `ai-memory install-hooks --agent omp`).",
+         \x20 Give them separate homes, or scope OMP to a profile:\n\
+         \x20     ai-memory install-hooks --agent omp --profile <name> --apply",
         dir.display()
     );
 }
@@ -4255,11 +4284,10 @@ fn remove_legacy_extension(new_path: &Path, agent: &str) {
     }
 }
 
-/// Generate an Oh My Pi extension at `<agent dir>/extensions/ai-memory-omp.ts`
-/// (see [`omp_extension_path`]).
+/// Generate an Oh My Pi extension at `~/.omp/agent/extensions/ai-memory-omp.ts`.
 ///
-/// OMP discovers direct `*.ts` / `*.js` files under its agent dir's
-/// `extensions/` at startup, so no separate settings merge is needed. The extension uses OMP's
+/// OMP discovers direct `*.ts` / `*.js` files under `~/.omp/agent/extensions/`
+/// at startup, so no separate settings merge is needed. The extension uses OMP's
 /// lifecycle API for capture and `before_agent_start` for handoff injection.
 fn apply_to_omp_extension(
     server_url: &str,
@@ -4289,8 +4317,7 @@ fn apply_to_omp_extension(
     if !matches!(outcome, ApplyOutcome::NoOp) {
         println!();
         println!(
-            "OMP auto-loads direct TypeScript extensions from {} on next start.",
-            path.parent().unwrap_or(&path).display()
+            "OMP auto-loads direct TypeScript extensions from ~/.omp/agent/extensions/ on next start."
         );
         println!("If you're already inside an `omp` session, restart it for the");
         println!("new extension to take effect.");
@@ -4298,21 +4325,23 @@ fn apply_to_omp_extension(
     Ok(())
 }
 
-/// Where `--apply` would write the OMP extension. Without a `$HOME` the hint
-/// still names the layout, rooted at a literal `~`.
-fn omp_extension_hint_with(
+fn omp_extension_hint_in(
+    env_override: Option<std::ffi::OsString>,
     profile: Option<&str>,
-    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-) -> Result<String> {
-    let home = home_dir().unwrap_or_else(|| PathBuf::from("~"));
-    Ok(ai_memory_workstream::omp_agent_dir(&home, profile, env)?
-        .join("extensions")
-        .join("ai-memory-omp.ts")
-        .display()
-        .to_string())
+) -> String {
+    omp_extension_path_in(env_override, profile).map_or_else(
+        |_| {
+            if let Some(name) = profile {
+                format!("~/.omp/profiles/{}/agent/extensions/ai-memory-omp.ts", name)
+            } else {
+                "~/.omp/agent/extensions/ai-memory-omp.ts".to_string()
+            }
+        },
+        |p| p.display().to_string(),
+    )
 }
 
-/// Where `--apply` would write the Pi extension; see [`omp_extension_hint_with`].
+/// See [`omp_extension_hint_in`]; same reasoning for Pi.
 fn pi_extension_hint_in(env_override: Option<std::ffi::OsString>) -> String {
     pi_extension_path_in(env_override).map_or_else(
         |_| "~/.pi/agent/extensions/ai-memory-pi.ts".to_string(),
@@ -4329,7 +4358,7 @@ fn render_omp_extension(
 ) -> Result<()> {
     println!(
         "// Oh My Pi / OMP extension — write to {}",
-        omp_extension_hint_with(profile, &|name| std::env::var_os(name))?
+        omp_extension_hint_in(std::env::var_os("PI_CODING_AGENT_DIR"), profile)
     );
     println!("// Or re-run with `--apply` to install it automatically.");
     println!("// Restart OMP after changing extensions; config is loaded at startup.");
@@ -4345,7 +4374,13 @@ fn resolve_omp_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
     if let Some(p) = &args.config_file {
         return Ok(p.clone());
     }
-    omp_extension_path(args.profile.as_deref())
+    // See `omp_extension_path`: bind before borrowing.
+    let env_profile = std::env::var_os("OMP_PROFILE");
+    let profile = args
+        .profile
+        .as_deref()
+        .or_else(|| env_profile.as_ref().and_then(|s| s.to_str()));
+    omp_extension_path(profile)
 }
 
 fn apply_to_pi_extension(
@@ -9207,10 +9242,7 @@ model = "gpt-5"
         let env = || Some(std::ffi::OsString::from(custom));
 
         for hint in [
-            omp_extension_hint_with(None, &|name| {
-                (name == "PI_CODING_AGENT_DIR").then(env).flatten()
-            })
-            .unwrap(),
+            omp_extension_hint_in(env(), None),
             pi_extension_hint_in(env()),
         ] {
             assert!(
@@ -9232,7 +9264,7 @@ model = "gpt-5"
             (
                 ".omp",
                 "ai-memory-omp.ts",
-                omp_extension_hint_with(None, &|_| None).unwrap(),
+                omp_extension_hint_in(None, None),
             ),
             (".pi", "ai-memory-pi.ts", pi_extension_hint_in(None)),
         ] {
@@ -9258,151 +9290,56 @@ model = "gpt-5"
         }
     }
 
-    fn omp_profile_extension(profile: &str) -> PathBuf {
-        [
-            ".omp",
-            "profiles",
-            profile,
-            "agent",
-            "extensions",
-            "ai-memory-omp.ts",
-        ]
-        .iter()
-        .collect()
-    }
-
-    fn omp_default_extension() -> PathBuf {
-        [".omp", "agent", "extensions", "ai-memory-omp.ts"]
-            .iter()
-            .collect()
-    }
-
-    /// OMP gives a named profile its own agent dir and ignores
-    /// `PI_CODING_AGENT_DIR` for it (`DirResolver` in OMP 18.2.5 drops the
-    /// override whenever a profile is active). Installing into the override
-    /// instead put the extension where that OMP never looks.
+    /// Precedence must not depend on what the override directory is *named*.
+    /// An earlier revision re-rooted only when the last component happened to
+    /// be "agent", so `/custom/agent` and `/custom/pi-agent` behaved
+    /// differently for the same inputs.
     #[test]
-    fn omp_named_profile_ignores_pi_coding_agent_dir() {
-        for custom in ["/custom/agent", "/custom/pi-agent"] {
-            let env = env_of(&[("PI_CODING_AGENT_DIR", custom)]);
-            let explicit = omp_extension_path_with(Some("work"), &env).unwrap();
-            assert!(
-                explicit.ends_with(omp_profile_extension("work")),
-                "got {explicit:?}"
-            );
-
-            let env = env_of(&[("PI_CODING_AGENT_DIR", custom), ("OMP_PROFILE", "work")]);
-            let from_env = omp_extension_path_with(None, &env).unwrap();
-            assert_eq!(from_env, explicit);
-        }
-    }
-
-    /// Profile names go through OMP's own normalization: `--profile` beats
-    /// `OMP_PROFILE`, a set `OMP_PROFILE` (even empty) masks `PI_PROFILE`,
-    /// names are trimmed, empty/whitespace/`default` select the default
-    /// profile, and a name OMP refuses is refused here too.
-    #[test]
-    fn omp_extension_path_normalizes_profile_like_omp() {
-        let default = omp_default_extension();
-        let work = omp_profile_extension("work");
-        type Case<'a> = (
-            Option<&'a str>,
-            &'a [(&'static str, &'static str)],
-            &'a PathBuf,
-        );
-        let cases: &[Case] = &[
-            (None, &[("OMP_PROFILE", "")], &default),
-            (None, &[("OMP_PROFILE", "   ")], &default),
-            (None, &[("OMP_PROFILE", "default")], &default),
-            (None, &[("OMP_PROFILE", " work ")], &work),
-            (None, &[("PI_PROFILE", "work")], &work),
-            (
-                None,
-                &[("OMP_PROFILE", ""), ("PI_PROFILE", "work")],
-                &default,
-            ),
-            (Some("work"), &[("OMP_PROFILE", "other")], &work),
-            (Some("default"), &[("OMP_PROFILE", "other")], &default),
-        ];
-        for (explicit, pairs, expected) in cases {
-            let path = omp_extension_path_with(*explicit, &env_of(pairs)).unwrap();
-            assert!(
-                path.ends_with(expected),
-                "{explicit:?} {pairs:?} -> {path:?}"
-            );
-        }
-
-        for (explicit, pairs) in [
-            (None, &[("OMP_PROFILE", "Work")][..]),
-            (None, &[("OMP_PROFILE", "../x")][..]),
-            (None, &[("OMP_PROFILE", "work.")][..]),
-            (None, &[("PI_PROFILE", "con")][..]),
-            (Some(""), &[][..]),
-        ] {
-            assert!(
-                omp_extension_path_with(explicit, &env_of(pairs)).is_err(),
-                "{explicit:?} {pairs:?} must be refused"
-            );
-        }
-    }
-
-    /// The preview names the file `--apply` writes, so it follows
-    /// `OMP_PROFILE` even when `--profile` is absent.
-    #[test]
-    fn omp_preview_hint_follows_omp_profile() {
-        let hint = omp_extension_hint_with(None, &env_of(&[("OMP_PROFILE", "work")])).unwrap();
-        assert!(
-            hint.ends_with(&omp_profile_extension("work").display().to_string()),
-            "got {hint}"
-        );
-    }
-
-    /// `PI_CONFIG_DIR` renames OMP's `~/.omp` root, extensions included, while
-    /// an XDG data dir moves only OMP's sessions.
-    #[test]
-    fn omp_extension_path_follows_pi_config_dir_but_not_xdg() {
-        let renamed: PathBuf = [".omp-alt", "agent", "extensions", "ai-memory-omp.ts"]
-            .iter()
-            .collect();
-        let path =
-            omp_extension_path_with(None, &env_of(&[("PI_CONFIG_DIR", ".omp-alt")])).unwrap();
-        assert!(path.ends_with(&renamed), "{path:?}");
-        let profiled: PathBuf = [
-            ".omp-alt",
-            "profiles",
-            "work",
-            "agent",
-            "extensions",
-            "ai-memory-omp.ts",
-        ]
-        .iter()
-        .collect();
-        let path = omp_extension_path_with(Some("work"), &env_of(&[("PI_CONFIG_DIR", ".omp-alt")]))
-            .unwrap();
-        assert!(path.ends_with(&profiled), "{path:?}");
-
-        let xdg = tempfile::tempdir().unwrap();
-        std::fs::create_dir(xdg.path().join("omp")).unwrap();
-        let xdg_value = xdg.path().to_string_lossy().into_owned();
-        let path = omp_extension_path_with(None, &|name: &str| {
-            (name == "XDG_DATA_HOME").then(|| std::ffi::OsString::from(&xdg_value))
-        })
+    fn omp_profile_precedence_is_independent_of_the_override_dir_name() {
+        let a = omp_extension_path_in(
+            Some(std::ffi::OsString::from("/custom/agent")),
+            Some("work"),
+        )
         .unwrap();
-        assert!(path.ends_with(omp_default_extension()), "{path:?}");
+        let b = omp_extension_path_in(
+            Some(std::ffi::OsString::from("/custom/pi-agent")),
+            Some("work"),
+        )
+        .unwrap();
+
+        // The override names the agent dir in both cases; the profile does
+        // not re-root it, and neither result invents a `profiles/` segment.
+        assert!(
+            a.ends_with("agent/extensions/ai-memory-omp.ts"),
+            "got {a:?}"
+        );
+        assert!(
+            b.ends_with("pi-agent/extensions/ai-memory-omp.ts"),
+            "got {b:?}"
+        );
+        for p in [&a, &b] {
+            assert!(
+                !p.to_string_lossy().contains("profiles"),
+                "PI_CODING_AGENT_DIR names the agent dir outright: {p:?}"
+            );
+        }
     }
 
     /// With no override, `--profile` relocates to the documented
     /// `~/.omp/profiles/<name>/agent/extensions`.
     #[test]
     fn omp_profile_relocates_when_no_override_is_set() {
-        let path = omp_extension_path_with(Some("work"), &|_| None).unwrap();
+        let path = omp_extension_path_in(None, Some("work")).unwrap();
         assert!(
-            path.ends_with(omp_profile_extension("work")),
+            path.ends_with(".omp/profiles/work/agent/extensions/ai-memory-omp.ts"),
             "got {path:?}"
         );
 
-        let plain = omp_extension_path_with(None, &|_| None).unwrap();
-        assert!(plain.ends_with(omp_default_extension()), "got {plain:?}");
+        let plain = omp_extension_path_in(None, None).unwrap();
+        assert!(
+            plain.ends_with(".omp/agent/extensions/ai-memory-omp.ts"),
+            "got {plain:?}"
+        );
     }
 
     /// `run` resolves the other Pi-family agent through its launch env, so
@@ -9436,16 +9373,6 @@ model = "gpt-5"
             ),
             None
         );
-        // A named profile moves OMP off the shared directory.
-        let profiled = env_of(&[("PI_CODING_AGENT_DIR", root), ("OMP_PROFILE", "work")]);
-        assert_eq!(
-            shared_extensions_dir(
-                AgentChoice::Pi,
-                &extensions.join("ai-memory-pi.ts"),
-                &profiled
-            ),
-            None
-        );
     }
 
     /// A blank relocation variable is unset for every auto-wired agent's hook
@@ -9469,16 +9396,6 @@ model = "gpt-5"
             (
                 AgentChoice::Omp,
                 "PI_CODING_AGENT_DIR",
-                &[".omp", "agent", "extensions", "ai-memory-omp.ts"],
-            ),
-            (
-                AgentChoice::Omp,
-                "OMP_PROFILE",
-                &[".omp", "agent", "extensions", "ai-memory-omp.ts"],
-            ),
-            (
-                AgentChoice::Omp,
-                "PI_CONFIG_DIR",
                 &[".omp", "agent", "extensions", "ai-memory-omp.ts"],
             ),
             (
@@ -9612,8 +9529,7 @@ model = "gpt-5"
         } else {
             "/custom/omp-agent"
         };
-        let path =
-            omp_extension_path_with(None, &env_of(&[("PI_CODING_AGENT_DIR", custom)])).unwrap();
+        let path = omp_extension_path_in(Some(std::ffi::OsString::from(custom)), None).unwrap();
         assert_eq!(
             path,
             Path::new(custom)
@@ -9622,12 +9538,7 @@ model = "gpt-5"
         );
 
         for env in [None, Some(std::ffi::OsString::new())] {
-            let path = omp_extension_path_with(None, &|name| {
-                (name == "PI_CODING_AGENT_DIR")
-                    .then(|| env.clone())
-                    .flatten()
-            })
-            .unwrap();
+            let path = omp_extension_path_in(env, None).unwrap();
             assert!(
                 path.ends_with(
                     Path::new(".omp")
@@ -9643,7 +9554,7 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_path_honours_profile() {
-        let path = omp_extension_path_with(Some("my-profile"), &|_| None).unwrap();
+        let path = omp_extension_path_in(None, Some("my-profile")).unwrap();
         assert!(
             path.ends_with(
                 Path::new(".omp")
@@ -9858,17 +9769,15 @@ model = "gpt-5"
             match alias {
                 "opencode" => assert!(stdout.contains("install-hooks --agent opencode --apply")),
                 "openclaw" => assert!(stdout.contains("install-hooks --agent openclaw --apply")),
-                // The agent-distinct names the installers write, not the
-                // pre-rename `ai-memory.ts`.
                 "omp" | "oh-my-pi" => {
                     assert!(stdout.contains("install-hooks --agent omp --apply"));
-                    assert!(stdout.contains("~/.omp/agent/extensions/ai-memory-omp.ts"));
+                    assert!(stdout.contains("~/.omp/agent/extensions/ai-memory.ts"));
                 }
                 "pi" => {
                     assert!(stdout.contains("install-hooks --agent pi --apply"));
-                    assert!(stdout.contains("~/.pi/agent/extensions/ai-memory-pi.ts"));
+                    assert!(stdout.contains("~/.pi/agent/extensions/ai-memory.ts"));
                     assert!(stdout.contains("MCP tools come through the same generated bridge"));
-                    assert!(!stdout.contains("~/.omp/agent/extensions"));
+                    assert!(!stdout.contains("~/.omp/agent/extensions/ai-memory.ts"));
                 }
                 _ => unreachable!(),
             }

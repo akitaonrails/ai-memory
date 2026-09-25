@@ -304,9 +304,9 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
             }
         }
         (None, Ok(target)) if hook_relocated => (vec![hook_install(Some(target))], None),
-        // `--env` set a value the resolver refused (an OMP profile OMP itself
-        // rejects). The installer would fall back to ai-memory's own
-        // environment and wire a home this launch does not use.
+        // `--env` relocated a target the resolver could not place. The
+        // installer would fall back to ai-memory's own environment and wire a
+        // home this launch does not use.
         (None, Err(error)) if hook_relocated => (Vec::new(), Some(format!("{error:#}"))),
         (None, _) => (vec![hook_install(None)], None),
     };
@@ -571,11 +571,12 @@ mod tests {
                 "extensions/ai-memory-pi.ts",
                 None,
             ),
+            // OMP's `mcp.json` stays in `~/.omp/agent`, so nothing pins it.
             (
                 ManagedHarness::Omp,
                 "PI_CODING_AGENT_DIR",
                 "extensions/ai-memory-omp.ts",
-                Some("mcp.json"),
+                None,
             ),
             (
                 ManagedHarness::Kimi,
@@ -631,67 +632,6 @@ mod tests {
         assert_eq!(LaunchEnv::new(&empty).var_os("PATH"), Some(OsString::new()));
     }
 
-    /// A named OMP profile owns its agent dir and ignores
-    /// `PI_CODING_AGENT_DIR`, as OMP does, so both the extension and the MCP
-    /// file move there.
-    #[test]
-    fn run_env_omp_profile_moves_extension_and_mcp() {
-        let home = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let config = test_config(home.path(), data.path());
-        let run_env = [
-            (
-                "PI_CODING_AGENT_DIR".to_string(),
-                data.path().join("pi-family").display().to_string(),
-            ),
-            ("OMP_PROFILE".to_string(), "work".to_string()),
-            // Blank masks a PI_CONFIG_DIR the developer's shell may export.
-            ("PI_CONFIG_DIR".to_string(), String::new()),
-        ];
-        let installs = planned_installs(&config, ManagedHarness::Omp, &run_env);
-        let agent_dir: PathBuf = [".omp", "profiles", "work", "agent"].iter().collect();
-        let extension = installs.hooks[0].config_file.clone().unwrap();
-        assert!(
-            extension.ends_with(agent_dir.join("extensions").join("ai-memory-omp.ts")),
-            "{}",
-            extension.display()
-        );
-        let mcp = installs.mcp.and_then(|args| args.config_file).unwrap();
-        assert!(
-            mcp.ends_with(agent_dir.join("mcp.json")),
-            "{}",
-            mcp.display()
-        );
-    }
-
-    /// `--env PI_CONFIG_DIR` renames OMP's root for this launch, so both the
-    /// extension and `mcp.json` follow it.
-    #[test]
-    fn run_env_pi_config_dir_moves_extension_and_mcp() {
-        let home = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let config = test_config(home.path(), data.path());
-        let run_env = [
-            ("PI_CONFIG_DIR".to_string(), ".omp-alt".to_string()),
-            ("PI_CODING_AGENT_DIR".to_string(), String::new()),
-            ("OMP_PROFILE".to_string(), String::new()),
-        ];
-        let installs = planned_installs(&config, ManagedHarness::Omp, &run_env);
-        let agent_dir: PathBuf = [".omp-alt", "agent"].iter().collect();
-        let extension = installs.hooks[0].config_file.clone().unwrap();
-        assert!(
-            extension.ends_with(agent_dir.join("extensions").join("ai-memory-omp.ts")),
-            "{}",
-            extension.display()
-        );
-        let mcp = installs.mcp.and_then(|args| args.config_file).unwrap();
-        assert!(
-            mcp.ends_with(agent_dir.join("mcp.json")),
-            "{}",
-            mcp.display()
-        );
-    }
-
     /// A blank `--env` value masks the process one and counts as unset, so
     /// hooks, MCP and native session import all fall back to the defaults the
     /// installers pick on their own, never to a whitespace-named directory.
@@ -707,16 +647,7 @@ mod tests {
                 ManagedHarness::Pi,
                 &["PI_CODING_AGENT_SESSION_DIR", "PI_CODING_AGENT_DIR"][..],
             ),
-            (
-                ManagedHarness::Omp,
-                &[
-                    "PI_CODING_AGENT_SESSION_DIR",
-                    "PI_CODING_AGENT_DIR",
-                    "OMP_PROFILE",
-                    "PI_CONFIG_DIR",
-                    "XDG_DATA_HOME",
-                ][..],
-            ),
+            (ManagedHarness::Omp, &["PI_CODING_AGENT_DIR"][..]),
             (ManagedHarness::Kimi, &["KIMI_CODE_HOME"][..]),
             (ManagedHarness::KiroV3, &["KIRO_HOME"][..]),
             (ManagedHarness::Grok, &["GROK_HOME"][..]),
@@ -732,7 +663,10 @@ mod tests {
                 install_hooks::hook_config_target_with(agent, &|_| None).ok(),
                 "{harness:?} hooks"
             );
-            if let Some(client) = install_hooks::mcp_client_for_agent(agent) {
+            // OMP's `mcp.json` reads no relocation variable, so nothing pins it.
+            if let Some(client) = install_hooks::mcp_client_for_agent(agent)
+                && harness != ManagedHarness::Omp
+            {
                 assert_eq!(
                     installs.mcp.and_then(|args| args.config_file),
                     install_mcp::mcp_config_path_with(client, &|_| None).ok(),
@@ -745,10 +679,6 @@ mod tests {
                 Vec::new(),
                 None,
                 &run_env,
-                Some(ai_memory_workstream::LaunchRoots {
-                    home: home.path(),
-                    cwd: home.path(),
-                }),
             )
             .unwrap();
             assert_eq!(plan.session_dir, None, "{harness:?} session store");
@@ -776,14 +706,6 @@ mod tests {
                 Some(root.join("extensions")),
                 "{harness:?}"
             );
-            let profiled = [
-                (
-                    "PI_CODING_AGENT_DIR".to_string(),
-                    root.display().to_string(),
-                ),
-                ("OMP_PROFILE".to_string(), "work".to_string()),
-            ];
-            assert_eq!(shared(&profiled), None, "{harness:?} with an OMP profile");
         }
         assert_eq!(
             wire_targets(
@@ -895,28 +817,6 @@ mod tests {
         let kept = plan(&looped);
         assert_eq!(kept.hooks.len(), 1);
         assert!(kept.mcp.is_some());
-    }
-
-    /// A profile OMP refuses, set through `--env`, is reported instead of
-    /// letting the installers resolve again from ai-memory's own environment
-    /// and wire a profile this launch does not use.
-    #[test]
-    fn run_env_invalid_omp_profile_is_reported_not_rerouted() {
-        let home = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let config = test_config(home.path(), data.path());
-        let run_env = [("OMP_PROFILE".to_string(), "Work".to_string())];
-        let installs = planned_installs(&config, ManagedHarness::Omp, &run_env);
-        assert!(installs.hooks.is_empty());
-        assert!(installs.mcp.is_none());
-        for reason in [&installs.hooks_skipped, &installs.mcp_skipped] {
-            assert!(
-                reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("Invalid OMP profile")),
-                "{reason:?}"
-            );
-        }
     }
 
     /// Without `--env` relocating anything, auto-wire leaves target selection to

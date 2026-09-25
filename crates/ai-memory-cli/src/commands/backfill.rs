@@ -40,8 +40,8 @@ use serde::{Deserialize, Serialize};
 
 use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
 use ai_memory_workstream::{
-    LaunchRoots, ManagedHarness, build_launch_plan_with_env, export_transcript,
-    list_native_sessions, wait_for_transcript_flush,
+    ManagedHarness, build_launch_plan, export_transcript, list_native_sessions,
+    wait_for_transcript_flush,
 };
 
 use super::doctor::SCANNED_HARNESSES;
@@ -270,11 +270,9 @@ async fn collect_local_sessions(
 ) -> Vec<SessionRef> {
     let mut out = Vec::new();
     for &harness in SCANNED_HARNESSES {
-        let roots = LaunchRoots { home, cwd };
-        let session_dir =
-            build_launch_plan_with_env(harness, None, Vec::new(), None, &[], Some(roots))
-                .ok()
-                .and_then(|plan| plan.session_dir);
+        let session_dir = build_launch_plan(harness, None, Vec::new(), None)
+            .ok()
+            .and_then(|plan| plan.session_dir);
         let Ok(sessions) = list_native_sessions(
             harness,
             home,
@@ -330,11 +328,9 @@ async fn import_one(
     cwd: &Path,
     session: &SessionRef,
 ) -> Result<usize> {
-    let roots = LaunchRoots { home, cwd };
-    let session_dir =
-        build_launch_plan_with_env(session.harness, None, Vec::new(), None, &[], Some(roots))
-            .ok()
-            .and_then(|plan| plan.session_dir);
+    let session_dir = build_launch_plan(session.harness, None, Vec::new(), None)
+        .ok()
+        .and_then(|plan| plan.session_dir);
     // These are historical sessions, so the flush wait is a quick no-op; ignore
     // its result and read whatever is on disk.
     let _ = wait_for_transcript_flush(

@@ -374,7 +374,7 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Command Code | native default creation | `--session <uuid>` | `~/.commandcode/projects/*/<uuid>.jsonl` |
 | Kiro CLI v2 | native default creation | `--resume-id <uuid>` | `$KIRO_HOME/sessions/cli/<uuid>.jsonl` (+ sibling `<uuid>.json` metadata) |
 | Kiro CLI v3 | native default creation with `--v3` | `--v3 --resume-id <sess_uuid>` | `$KIRO_HOME/sessions/<checkout-bucket>/<sess_uuid>/messages.jsonl` (+ sibling `session.json` metadata) |
-| OMP | native default creation | `--resume=<id>` | `<agent dir>/sessions/**/*.jsonl`: `~/.omp/agent`, `~/.omp/profiles/<name>/agent` under a named profile, or `$PI_CODING_AGENT_DIR` for the default profile, with `~/.omp` renamed by `PI_CONFIG_DIR`; on Linux and macOS, `$XDG_DATA_HOME/omp/sessions` (`.../omp/profiles/<name>/sessions`) once that OMP directory exists and the agent dir is not relocated |
+| OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 | Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
 
@@ -400,11 +400,7 @@ through unchanged and used as the read-only import root. Native store
 environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
 `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`,
-`KIRO_HOME`, and `GROK_HOME`, plus OMP's `PI_CONFIG_DIR` and profile (a
-leading `--profile`, then `OMP_PROFILE`, then `PI_PROFILE`), which ignores
-`PI_CODING_AGENT_DIR` as OMP does. A `--profile` later in the command line is
-left to OMP; set
-`OMP_PROFILE` (or `--env OMP_PROFILE=<name>`) when you need it there. A blank
+`KIRO_HOME`, and `GROK_HOME`. A blank
 value (empty or whitespace only) counts as unset everywhere: session import,
 hooks and MCP all fall back to the default home, and `ai-memory run` removes
 it from the launched harness's environment so the harness does too.

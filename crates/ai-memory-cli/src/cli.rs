@@ -1002,9 +1002,8 @@ pub struct UninstallArgs {
     /// Skip the interactive confirmation when a TTY is attached.
     #[arg(long)]
     pub yes: bool,
-    /// OMP profile whose extension and MCP entry to remove, as `omp
-    /// --profile` names it. Beats `OMP_PROFILE` and `PI_PROFILE`; the default
-    /// profile's files are swept as well.
+    /// Profile to use for OMP extensions, which relocates the path to
+    /// `~/.omp/profiles/<profile>/agent/extensions/`.
     #[arg(long)]
     pub profile: Option<String>,
 }
@@ -1670,9 +1669,8 @@ pub enum AgentChoice {
     /// lifecycle capture and bridges ai-memory's HTTP MCP tools into Pi.
     Pi,
     /// Oh My Pi (`omp`) — TypeScript extension
-    /// under `~/.omp/agent/extensions/`, or the active profile's agent dir.
-    /// `--apply` writes the extension file directly; restart `omp` for it to
-    /// load.
+    /// under `~/.omp/agent/extensions/`. `--apply` writes the extension
+    /// file directly; restart `omp` for it to load.
     #[value(alias = "oh-my-pi")]
     Omp,
     /// OpenClaw personal AI gateway — native plugin package with
@@ -1936,8 +1934,7 @@ pub enum McpClient {
     /// Real Pi coding agent. Uses ai-memory's generated bridge extension
     /// because Pi has no native MCP config.
     Pi,
-    /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`, or the active profile's
-    /// agent dir.
+    /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`.
     #[value(alias = "oh-my-pi")]
     Omp,
     /// Google Antigravity CLI (`agy`) — `~/.gemini/config/mcp_config.json`.
@@ -2439,9 +2436,8 @@ pub struct InstallHooksArgs {
     /// `--no-capture-prompts` install. Only valid for Claude Code.
     #[arg(long, conflicts_with = "no_capture_prompts")]
     pub capture_prompts: bool,
-    /// OMP profile to install into, as `omp --profile` names it:
-    /// `~/.omp/profiles/<profile>/agent/extensions/`. Beats `OMP_PROFILE` and
-    /// `PI_PROFILE`; `default` selects the default profile.
+    /// Profile to use for OMP extensions, which relocates the path to
+    /// `~/.omp/profiles/<profile>/agent/extensions/`.
     #[arg(long)]
     pub profile: Option<String>,
 }

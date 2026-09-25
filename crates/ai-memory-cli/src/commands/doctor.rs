@@ -27,9 +27,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use ai_memory_core::AgentKind;
-use ai_memory_workstream::{
-    LaunchRoots, ManagedHarness, build_launch_plan_with_env, list_native_sessions,
-};
+use ai_memory_workstream::{ManagedHarness, build_launch_plan, list_native_sessions};
 
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -183,11 +181,9 @@ pub(crate) async fn scan_local(home: &Path, cwd: &Path, since_days: u32) -> Vec<
         // Honor harness home relocations (CODEX_HOME, KIMI_CODE_HOME, …) via the
         // same launch-plan resolver `ai-memory run` uses; fall back to the
         // default $HOME-relative store when a probe plan cannot be built.
-        let roots = LaunchRoots { home, cwd };
-        let session_dir =
-            build_launch_plan_with_env(harness, None, Vec::new(), None, &[], Some(roots))
-                .ok()
-                .and_then(|plan| plan.session_dir);
+        let session_dir = build_launch_plan(harness, None, Vec::new(), None)
+            .ok()
+            .and_then(|plan| plan.session_dir);
         let Ok(sessions) =
             list_native_sessions(harness, home, cwd, session_dir.as_deref(), SCAN_LIMIT).await
         else {

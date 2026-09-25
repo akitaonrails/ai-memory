@@ -88,16 +88,14 @@ fi
 if [[ "$AGENT" == "omp" || "$AGENT" == "oh-my-pi" ]]; then
     echo "OMP uses a generated TypeScript extension, not shell hook scripts."
     echo "Run: ai-memory install-hooks --agent omp --apply"
-    echo "Then restart OMP so it loads the extension install-hooks reports"
-    echo "(default ~/.omp/agent/extensions/ai-memory-omp.ts)."
+    echo "Then restart OMP so it loads ~/.omp/agent/extensions/ai-memory.ts."
     exit 0
 fi
 
 if [[ "$AGENT" == "pi" ]]; then
     echo "Pi uses a generated TypeScript extension, not shell hook scripts."
     echo "Run: ai-memory install-hooks --agent pi --apply"
-    echo "Then restart Pi so it loads the extension install-hooks reports"
-    echo "(default ~/.pi/agent/extensions/ai-memory-pi.ts)."
+    echo "Then restart Pi so it loads ~/.pi/agent/extensions/ai-memory.ts."
     echo "MCP tools come through the same generated bridge extension."
     exit 0
 fi
