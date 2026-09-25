@@ -1360,6 +1360,14 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             //     the users-table lookup, including before the first user is
             //     created. Admin mode separately switches on a fresh
             //     store-backed users-exist read.
+            store
+                .writer
+                .set_new_project_mode(if config.auth.new_projects_restricted {
+                    ai_memory_store::AccessMode::Restricted
+                } else {
+                    ai_memory_store::AccessMode::Open
+                })
+                .await?;
             let mut auth_state = AuthState::new(config.auth.bearer_token.clone())
                 .with_secure_cookie(config.auth.secure_cookie);
             let root_user = config

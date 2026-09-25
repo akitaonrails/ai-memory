@@ -1,16 +1,38 @@
 # Design proposal: per-project authorization for multi-user servers (#708)
 
-**Implementation status.** Slice 2 has landed: the inert V68 schema
-(`project_grants` + `projects.access_mode`, default `open`) and the
+**Implementation status.** Slices 2 and 3 have landed. Slice 2 is the inert
+V68 schema (`project_grants` + `projects.access_mode`, default `open`) and the
 `authorize_project` choke point (`ai-memory-store/src/project_authz.rs`),
-wired into `ScopeResolver` read/write resolution and the writer actor. It is
-always-allow (no project is `restricted` yet), so there is no behaviour change.
-**Slice 3 is pending** and is what makes `restricted` safe end-to-end: closing
-the two bypass classes below (unscoped/global reads filtered before `LIMIT`;
-raw-id entry points resolving through `authorize_project`), the root-only
-management surface (setting `restricted`, issuing grants), and a
-`projects.created_by` source for the creator check. Sections below are the
-original design pass, retained as the spec.
+wired into `ScopeResolver` read/write resolution and the writer actor. Slice 3
+makes `restricted` safe end-to-end:
+
+- **Creator.** V69 adds `projects.created_by`, set when a database user's call
+  creates the project; `resolve_project_authz` derives `is_creator` from it.
+  Projects that predate V69 have none, and admit only root and grants once
+  restricted.
+- **Every surface opts in.** MCP tools, `/api/v1`, the web pages, hook routes
+  and captures attach `ScopeResolver::with_project_authz` (or its free-function
+  form, `authorize_scope_for`) for every database user. Root and installs with
+  no database users attach nothing and behave as before.
+- **Read-shaped mutations need write.** Tools that take read-shaped arguments
+  but mutate (delete, feedback, sweep, lint, auto-improve, handoff accept and
+  cancel, message pop and cancel, a message's recipient) resolve at
+  `ProjectAccess::Write`.
+- **Unscoped reads** — search, listings, the graph and the workspace
+  overview — are filtered in SQL before `LIMIT` with the same rule the choke
+  point applies; the global preferences scope stays readable by everyone.
+- **Raw-id entry points** (managed runs, workstreams, session-scoped
+  consolidation) resolve the id to its project and authorize it.
+- **Management surface**, root-only: `ai-memory project access`,
+  `ai-memory user grant|revoke|grants`, `ai-memory project grants`, and the
+  matching `/admin` routes; every change is recorded in `audit_log`.
+  `[auth] new_projects_restricted` makes new projects start `restricted`.
+- **Captures** into a project the author may not write are dropped and counted
+  (`dropped_unauthorized`), never retried.
+
+Per-project administrators remain out of scope: granting, revoking and
+restricting are root's alone. Sections below are the original design pass,
+retained as the spec.
 
 **Original status: proposal for review — not implemented.** This was the design
 pass promised on #708 before any code lands. It changes a security boundary, so

@@ -110,7 +110,7 @@ async fn one_operators_page_is_readable_by_another_in_the_same_project() {
     // Carol's read of the same project: no owner coordinate involved.
     let hits = store
         .reader
-        .search_pages("SQLite".to_string(), 10)
+        .search_pages("SQLite".to_string(), 10, None)
         .await
         .unwrap();
 

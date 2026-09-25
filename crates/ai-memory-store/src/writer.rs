@@ -61,6 +61,22 @@ pub(crate) enum WriteCmd {
         repo_path: Option<String>,
         reply: oneshot::Sender<StoreResult<ProjectId>>,
     },
+    GetOrCreateProjectAs {
+        workspace_id: WorkspaceId,
+        name: String,
+        repo_path: Option<String>,
+        creator: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<(ProjectId, bool)>>,
+    },
+    SetNewProjectMode {
+        mode: crate::AccessMode,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    SetAccessMode {
+        project_id: ProjectId,
+        mode: crate::AccessMode,
+        reply: oneshot::Sender<StoreResult<Option<crate::AccessMode>>>,
+    },
     EnsureProjectWorkspace {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -487,6 +503,19 @@ pub(crate) enum WriteCmd {
         token_hash: [u8; TOKEN_HASH_LEN],
         reply: oneshot::Sender<StoreResult<UserId>>,
     },
+    GrantMemory {
+        user_id: UserId,
+        repository_id: ProjectId,
+        role: crate::GrantLevel,
+        granted_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<crate::grants::GrantOutcome>>,
+    },
+    RevokeMemory {
+        user_id: UserId,
+        repository_id: ProjectId,
+        revoked_by: Option<UserId>,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     RotateUserToken {
         user_id: UserId,
         token_hash: [u8; TOKEN_HASH_LEN],
@@ -768,6 +797,67 @@ impl WriterHandle {
             workspace_id,
             name: name.into(),
             repo_path,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// [`Self::get_or_create_project`] on behalf of `creator`, who is recorded
+    /// as the project's `created_by` in the same transaction when this call
+    /// creates the row. Returns whether it did — see
+    /// [`ops::get_or_create_project_as`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn get_or_create_project_as(
+        &self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, bool)> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::GetOrCreateProjectAs {
+            workspace_id,
+            name: name.into(),
+            repo_path,
+            creator,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Set the access mode newly created projects start in — the server's
+    /// `[auth] new_projects_restricted`. Called once at startup; until then,
+    /// and on every install that never calls it, new projects are open.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down.
+    pub async fn set_new_project_mode(&self, mode: crate::AccessMode) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetNewProjectMode { mode, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Set one project's access mode, returning the mode it had, or `None` when
+    /// there is no such project.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn set_access_mode(
+        &self,
+        project_id: ProjectId,
+        mode: crate::AccessMode,
+    ) -> StoreResult<Option<crate::AccessMode>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetAccessMode {
+            project_id,
+            mode,
             reply: tx,
         })
         .await?;
@@ -2181,6 +2271,56 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Grant `user_id` `role` on `repository_id` (#708).
+    ///
+    /// `granted_by` is the operator making the change, or `None` when they
+    /// act through the root bearer token (no `users` row).
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn grant_memory(
+        &self,
+        user_id: UserId,
+        repository_id: ProjectId,
+        role: crate::GrantLevel,
+        granted_by: Option<UserId>,
+    ) -> StoreResult<crate::grants::GrantOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::GrantMemory {
+            user_id,
+            repository_id,
+            role,
+            granted_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Revoke whatever `user_id` actively holds on `repository_id`.
+    ///
+    /// Returns whether anything was in force to revoke, so calling it twice is
+    /// harmless and still reports honestly.
+    ///
+    /// # Errors
+    /// Writer closed or SQL.
+    pub async fn revoke_memory(
+        &self,
+        user_id: UserId,
+        repository_id: ProjectId,
+        revoked_by: Option<UserId>,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RevokeMemory {
+            user_id,
+            repository_id,
+            revoked_by,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a token-only compatibility identity.
     ///
     /// # Errors
@@ -2772,8 +2912,25 @@ fn send_or_warn<T>(reply: oneshot::Sender<T>, result: T, op: &'static str) {
 }
 
 fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
+    // The mode a newly created project starts in — the server's
+    // `[auth] new_projects_restricted`, set once at startup. Held here because
+    // this actor performs every project insert, so no creation path can
+    // forget to apply it.
+    let mut new_project_mode = crate::AccessMode::Open;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            WriteCmd::SetNewProjectMode { mode, reply } => {
+                new_project_mode = mode;
+                send_or_warn(reply, Ok(()), "set_new_project_mode");
+            }
+            WriteCmd::SetAccessMode {
+                project_id,
+                mode,
+                reply,
+            } => {
+                let result = crate::grants::set_access_mode(&conn, project_id, mode);
+                send_or_warn(reply, result, "set_access_mode");
+            }
             WriteCmd::Shutdown => break,
             WriteCmd::AuthorizeProject {
                 workspace_id,
@@ -2803,13 +2960,35 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 repo_path,
                 reply,
             } => {
-                let result = ops::get_or_create_project(
+                // Through the creator-aware path with no creator, so the
+                // server's new-project mode applies here too.
+                let result = ops::get_or_create_project_as(
                     &mut conn,
                     &workspace_id,
                     &name,
                     repo_path.as_deref(),
-                );
+                    None,
+                    new_project_mode,
+                )
+                .map(|(id, _)| id);
                 send_or_warn(reply, result, "get_or_create_project");
+            }
+            WriteCmd::GetOrCreateProjectAs {
+                workspace_id,
+                name,
+                repo_path,
+                creator,
+                reply,
+            } => {
+                let result = ops::get_or_create_project_as(
+                    &mut conn,
+                    &workspace_id,
+                    &name,
+                    repo_path.as_deref(),
+                    creator,
+                    new_project_mode,
+                );
+                send_or_warn(reply, result, "get_or_create_project_as");
             }
             WriteCmd::EnsureProjectWorkspace {
                 workspace_id,
@@ -3479,6 +3658,38 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = users::insert_user(&conn, &new_user, &token_hash);
                 send_or_warn(reply, result, "create_user");
+            }
+            WriteCmd::GrantMemory {
+                user_id,
+                repository_id,
+                role,
+                granted_by,
+                reply,
+            } => {
+                let result = crate::grants::grant(
+                    &conn,
+                    user_id,
+                    repository_id,
+                    role,
+                    granted_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "grant_memory");
+            }
+            WriteCmd::RevokeMemory {
+                user_id,
+                repository_id,
+                revoked_by,
+                reply,
+            } => {
+                let result = crate::grants::revoke(
+                    &conn,
+                    user_id,
+                    repository_id,
+                    revoked_by,
+                    jiff::Timestamp::now().as_microsecond(),
+                );
+                send_or_warn(reply, result, "revoke_memory");
             }
             WriteCmd::RotateUserToken {
                 user_id,

@@ -334,7 +334,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     // Keywords unique to evicted pages should disappear from search.
     let cognee_hits = store
         .reader
-        .search_pages("cognee".into(), 5)
+        .search_pages("cognee".into(), 5, None)
         .await
         .expect("search cognee");
     assert!(
@@ -344,7 +344,7 @@ async fn m8_retention_lifecycle_end_to_end() {
 
     let jiff_hits = store
         .reader
-        .search_pages("jiff".into(), 5)
+        .search_pages("jiff".into(), 5, None)
         .await
         .expect("search jiff");
     assert!(
@@ -358,7 +358,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     // distinct standalone keywords to test each page independently.
     let backpressure_hits = store
         .reader
-        .search_pages("backpressure".into(), 5)
+        .search_pages("backpressure".into(), 5, None)
         .await
         .expect("search backpressure");
     let bp_paths: HashSet<&str> = backpressure_hits.iter().map(|h| h.path.as_str()).collect();
@@ -369,7 +369,7 @@ async fn m8_retention_lifecycle_end_to_end() {
 
     let mutations_hits = store
         .reader
-        .search_pages("mutations".into(), 5)
+        .search_pages("mutations".into(), 5, None)
         .await
         .expect("search mutations");
     let mut_paths: HashSet<&str> = mutations_hits.iter().map(|h| h.path.as_str()).collect();
@@ -380,7 +380,7 @@ async fn m8_retention_lifecycle_end_to_end() {
 
     let karpathy_hits = store
         .reader
-        .search_pages("karpathy".into(), 5)
+        .search_pages("karpathy".into(), 5, None)
         .await
         .expect("search karpathy");
     let karpathy_paths: HashSet<&str> = karpathy_hits.iter().map(|h| h.path.as_str()).collect();
@@ -394,7 +394,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     // for a standalone token from the body instead of `iii-engine`.
     let sidecar_hits = store
         .reader
-        .search_pages("sidecar".into(), 5)
+        .search_pages("sidecar".into(), 5, None)
         .await
         .expect("search sidecar");
     let sidecar_paths: HashSet<&str> = sidecar_hits.iter().map(|h| h.path.as_str()).collect();
@@ -408,7 +408,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     // term unique to that page should still return it.
     let midterm_hits = store
         .reader
-        .search_pages("dyn".into(), 5)
+        .search_pages("dyn".into(), 5, None)
         .await
         .expect("search dyn");
     let midterm_paths: HashSet<&str> = midterm_hits.iter().map(|h| h.path.as_str()).collect();

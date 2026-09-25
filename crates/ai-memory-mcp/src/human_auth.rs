@@ -1076,12 +1076,23 @@ pub async fn require_dual_auth(
     }
 }
 
+/// Stamp a browser session's identity onto the request.
+///
+/// `authorization` decides whether the session also carries an
+/// [`ai_memory_core::AuthorizedViewer`]. A root session never does: root is
+/// the operator, authorized above per-repository granularity, and stamping one
+/// would make the operator's own grants (of which there are none) the limit of
+/// what they can reach.
 fn inject_session(req: &mut Request<axum::body::Body>, live: LiveWebSession) {
     let level = if live.user.role == UserRole::Root {
         AuthLevel::Root
     } else {
         AuthLevel::User
     };
+    if level == AuthLevel::User {
+        req.extensions_mut()
+            .insert(ai_memory_core::AuthorizedViewer(live.user.id));
+    }
     let actor = ActorContext {
         user: Some(live.user.username.clone()),
         name: live.user.name.clone(),

@@ -10,11 +10,11 @@ use std::collections::HashSet;
 use std::fmt;
 
 use ai_memory_core::{
-    ActiveProject, ActiveProjectLookup, ActorKey, ProjectId, ReadPointer, WorkspaceId,
+    ActiveProject, ActiveProjectLookup, ActorKey, ProjectId, ReadPointer, UserId, WorkspaceId,
 };
 
 use crate::error::StoreError;
-use crate::project_authz::{ProjectAccess, ProjectPrincipal};
+use crate::project_authz::{GrantLevel, ProjectAccess, ProjectPrincipal};
 use crate::{ReaderPool, WriterHandle};
 
 /// Canonical error for partial explicit scope arguments.
@@ -341,11 +341,195 @@ pub async fn create_explicit_scope(
     })
 }
 
+/// Run a resolved scope through the per-project choke point (#708).
+///
+/// A read is decided on the read pool; a write on the writer actor's own
+/// connection when a writer is given, so the check cannot race a concurrent
+/// grant change against the write it guards.
+async fn decide_scope(
+    reader: &ReaderPool,
+    writer: Option<&WriterHandle>,
+    scope: ResolvedScope,
+    principal: &ProjectPrincipal,
+    distinguishes_operators: bool,
+    need: ProjectAccess,
+) -> Result<(), ScopeResolutionError> {
+    let decision = match (need, writer) {
+        (ProjectAccess::Write, Some(writer)) => {
+            writer
+                .authorize_project(
+                    scope.workspace_id,
+                    scope.project_id,
+                    principal.clone(),
+                    distinguishes_operators,
+                    need,
+                )
+                .await?
+        }
+        _ => {
+            reader
+                .authorize_project(
+                    scope.workspace_id,
+                    scope.project_id,
+                    principal.clone(),
+                    distinguishes_operators,
+                    need,
+                )
+                .await?
+        }
+    };
+    if decision.is_ok() {
+        return Ok(());
+    }
+    // A refusal names the project and both levels, so it says what to ask
+    // for and can never be mistaken for an empty or missing project. Built on
+    // the denial path only, where the extra lookups cost nothing that matters.
+    let held = reader
+        .resolve_project_authz(
+            scope.workspace_id,
+            scope.project_id,
+            principal.clone(),
+            distinguishes_operators,
+        )
+        .await?
+        .grant;
+    let name = reader
+        .project_name_by_id(scope.workspace_id, scope.project_id)
+        .await?
+        .unwrap_or_else(|| "the resolved project".to_owned());
+    Err(ScopeResolutionError::Forbidden(refusal_message(
+        &name, held, need,
+    )))
+}
+
+fn refusal_message(project: &str, held: Option<GrantLevel>, need: ProjectAccess) -> String {
+    let need = match need {
+        ProjectAccess::Read => "read",
+        ProjectAccess::Write => "write",
+    };
+    match held {
+        Some(held) => format!(
+            "not authorized for {project}: you have {} access and this needs {need}. \
+             Ask the server operator to raise your access.",
+            held.as_str()
+        ),
+        None => format!(
+            "not authorized for {project}. This is an access problem, not an empty \
+             memory — ask the server operator to grant you {need} access on it."
+        ),
+    }
+}
+
+/// Authorize a scope resolved outside a [`ScopeResolver`] for `viewer` (#708).
+///
+/// For routes that name a project directly — admin, web, hook captures — and
+/// so have no current-project default to resolve through. `viewer` is the
+/// database user the request authenticated as; `None` (the root token, or an
+/// install with no database users) skips the check, as a resolver with no
+/// principal attached does.
+///
+/// # Errors
+/// [`ScopeResolutionError::Forbidden`] when a restricted project refuses the
+/// viewer; store failures otherwise.
+pub async fn authorize_scope_for(
+    reader: &ReaderPool,
+    writer: Option<&WriterHandle>,
+    scope: ResolvedScope,
+    viewer: Option<UserId>,
+    need: ProjectAccess,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    let Some(viewer) = viewer else {
+        return Ok(scope);
+    };
+    decide_scope(
+        reader,
+        writer,
+        scope,
+        &ProjectPrincipal::user(viewer),
+        true,
+        need,
+    )
+    .await?;
+    Ok(scope)
+}
+
+/// [`lookup_existing_scope`], authorized for `viewer` at `need`.
+///
+/// # Errors
+/// As [`lookup_existing_scope`] and [`authorize_scope_for`].
+pub async fn lookup_existing_scope_guarded(
+    reader: &ReaderPool,
+    workspace: &str,
+    project: &str,
+    viewer: Option<UserId>,
+    need: ProjectAccess,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    let scope = lookup_existing_scope(reader, workspace, project).await?;
+    authorize_scope_for(reader, None, scope, viewer, need).await
+}
+
+/// [`create_explicit_scope`] on behalf of `viewer`, authorized for a write.
+///
+/// A project this call creates records `viewer` as its creator in the same
+/// transaction, and the choke point admits a creator, so they can write to and
+/// read back what they just made. A project that already existed is decided
+/// like any other write — "create" is never a way into somebody else's
+/// restricted project, and because the writer decides which case applies,
+/// there is no window between a lookup and a create for another user to win.
+///
+/// # Errors
+/// As [`create_explicit_scope`] and [`authorize_scope_for`].
+pub async fn create_explicit_scope_guarded(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    workspace: &str,
+    project: &str,
+    viewer: Option<UserId>,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    let workspace_id = writer.get_or_create_workspace(workspace.to_owned()).await?;
+    let (project_id, _) = writer
+        .get_or_create_project_as(workspace_id, project.to_owned(), None, viewer)
+        .await?;
+    let scope = ResolvedScope {
+        workspace_id,
+        project_id,
+    };
+    authorize_scope_for(reader, Some(writer), scope, viewer, ProjectAccess::Write).await
+}
+
+/// [`resolve_many_existing_scopes`], every scope authorized for `viewer`.
+///
+/// A refused scope fails the whole call rather than being dropped: silently
+/// returning the permitted subset would answer a cross-project search with a
+/// short list that looks like "nothing was found there", and a refusal must
+/// never read as empty memory.
+///
+/// # Errors
+/// As [`resolve_many_existing_scopes`] and [`authorize_scope_for`].
+pub async fn resolve_many_existing_scopes_guarded(
+    reader: &ReaderPool,
+    scopes: &[ScopeName],
+    max: usize,
+    viewer: Option<UserId>,
+    need: ProjectAccess,
+) -> Result<Vec<ResolvedScope>, ScopeResolutionError> {
+    let resolved = resolve_many_existing_scopes(reader, scopes, max).await?;
+    for scope in &resolved {
+        authorize_scope_for(reader, None, *scope, viewer, need).await?;
+    }
+    Ok(resolved)
+}
+
 /// Look up the reserved global preferences scope
 /// ([`ai_memory_core::GLOBAL_SCOPE_PROJECT`] in the default workspace)
 /// without creating it. Returns `Ok(None)` when it doesn't exist yet — the
 /// scope participates in default reads by existence, so an absent scope
 /// means "nothing to union in", never an error (issue #154).
+///
+/// Unauthorized by design, together with [`create_global_scope`]: the global
+/// scope is unioned into everybody's default reads, and the unscoped-read
+/// filters admit it for every viewer (#708). Per-project authorization is
+/// about project scopes; the global preferences scope is common ground.
 ///
 /// # Errors
 /// Propagates store failures only; a missing workspace or project is `None`.
@@ -476,31 +660,15 @@ impl<'a> ScopeResolver<'a> {
         let Some(principal) = self.authz.as_ref() else {
             return Ok(());
         };
-        let decision = match (need, self.writer) {
-            (ProjectAccess::Write, Some(writer)) => {
-                writer
-                    .authorize_project(
-                        scope.workspace_id,
-                        scope.project_id,
-                        principal.clone(),
-                        self.distinguishes_operators,
-                        need,
-                    )
-                    .await?
-            }
-            _ => {
-                self.reader
-                    .authorize_project(
-                        scope.workspace_id,
-                        scope.project_id,
-                        principal.clone(),
-                        self.distinguishes_operators,
-                        need,
-                    )
-                    .await?
-            }
-        };
-        decision.map_err(|err| ScopeResolutionError::Forbidden(err.message().to_owned()))
+        decide_scope(
+            self.reader,
+            self.writer,
+            scope,
+            principal,
+            self.distinguishes_operators,
+            need,
+        )
+        .await
     }
 
     /// Attach the active-project map used for current-project defaults.
@@ -529,9 +697,13 @@ impl<'a> ScopeResolver<'a> {
         explicit_project: Option<&str>,
         actor: &ActorKey,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
-        self.resolve_read_args_traced(explicit_workspace, explicit_project, actor)
-            .await
-            .map(|(scope, _)| scope)
+        self.resolve_existing_args(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            ProjectAccess::Read,
+        )
+        .await
     }
 
     /// [`Self::resolve_read_args`], plus where the scope came from.
@@ -541,17 +713,58 @@ impl<'a> ScopeResolver<'a> {
         explicit_project: Option<&str>,
         actor: &ActorKey,
     ) -> Result<(ResolvedScope, ScopeSource), ScopeResolutionError> {
+        self.resolve_existing_args_traced(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            ProjectAccess::Read,
+        )
+        .await
+    }
+
+    /// Resolve read-shaped arguments naming an EXISTING scope, authorized at
+    /// `need` (#708).
+    ///
+    /// The argument shape is not the access level. Tools that delete a page,
+    /// record feedback, sweep, lint, accept a handoff or pop a message take the
+    /// same arguments as a read and all mutate; resolving them as a read would
+    /// let a `read` grant do each of those. The shape says which scope; `need`
+    /// says what the caller may do to it. Never creates — that is
+    /// [`Self::resolve_write_args`].
+    pub async fn resolve_existing_args(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ActorKey,
+        need: ProjectAccess,
+    ) -> Result<ResolvedScope, ScopeResolutionError> {
+        self.resolve_existing_args_traced(explicit_workspace, explicit_project, actor, need)
+            .await
+            .map(|(scope, _)| scope)
+    }
+
+    /// [`Self::resolve_existing_args`], plus where the scope came from.
+    pub async fn resolve_existing_args_traced(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ActorKey,
+        need: ProjectAccess,
+    ) -> Result<(ResolvedScope, ScopeSource), ScopeResolutionError> {
         match (
             trimmed_opt(explicit_workspace),
             trimmed_opt(explicit_project),
         ) {
             (Some(workspace), Some(project)) => {
                 let scope = self.lookup_existing(workspace, project).await?;
-                self.authorize_scope(scope, ProjectAccess::Read).await?;
+                self.authorize_scope(scope, need).await?;
                 Ok((scope, ScopeSource::Explicit))
             }
             (Some(_), None) => Err(ScopeResolutionError::WorkspaceProjectPairRequired),
-            (None, project) => self.resolve_current_or_project_traced(project, actor).await,
+            (None, project) => {
+                self.resolve_current_or_project_traced(project, actor, need)
+                    .await
+            }
         }
     }
 
@@ -562,7 +775,7 @@ impl<'a> ScopeResolver<'a> {
         explicit_project: Option<&str>,
         actor: &ActorKey,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
-        self.resolve_current_or_project_traced(explicit_project, actor)
+        self.resolve_current_or_project_traced(explicit_project, actor, ProjectAccess::Read)
             .await
             .map(|(scope, _)| scope)
     }
@@ -571,6 +784,7 @@ impl<'a> ScopeResolver<'a> {
         &self,
         explicit_project: Option<&str>,
         actor: &ActorKey,
+        need: ProjectAccess,
     ) -> Result<(ResolvedScope, ScopeSource), ScopeResolutionError> {
         // Read path, so `read_pointer`: it adds the startup seed for a caller
         // the pointer knows nothing about, which is every caller in the window
@@ -600,7 +814,7 @@ impl<'a> ScopeResolver<'a> {
                     workspace_id: active_ws,
                     project_id,
                 };
-                self.authorize_scope(scope, ProjectAccess::Read).await?;
+                self.authorize_scope(scope, need).await?;
                 return Ok((scope, ScopeSource::Explicit));
             }
             if active.map(|(ws, _)| ws) != Some(self.default_workspace_id)
@@ -613,7 +827,7 @@ impl<'a> ScopeResolver<'a> {
                     workspace_id: self.default_workspace_id,
                     project_id,
                 };
-                self.authorize_scope(scope, ProjectAccess::Read).await?;
+                self.authorize_scope(scope, need).await?;
                 return Ok((scope, ScopeSource::Explicit));
             }
             return Err(ScopeResolutionError::ProjectNotFoundInActiveOrDefault {
@@ -626,7 +840,7 @@ impl<'a> ScopeResolver<'a> {
             workspace_id,
             project_id,
         };
-        self.authorize_scope(scope, ProjectAccess::Read).await?;
+        self.authorize_scope(scope, need).await?;
         Ok((scope, source))
     }
 
@@ -676,8 +890,12 @@ impl<'a> ScopeResolver<'a> {
                 .map(|(workspace_id, _)| workspace_id)
                 .unwrap_or(self.default_workspace_id),
         };
-        let project_id = writer
-            .get_or_create_project(workspace_id, project.to_owned(), None)
+        // A project this call creates records the caller as its creator, whom
+        // the choke point below then admits; one that already existed is
+        // decided like any other write, so "create" is never a way in.
+        let creator = self.authz.as_ref().and_then(|principal| principal.user_id);
+        let (project_id, _) = writer
+            .get_or_create_project_as(workspace_id, project.to_owned(), None, creator)
             .await?;
         let scope = ResolvedScope {
             workspace_id,
@@ -687,13 +905,21 @@ impl<'a> ScopeResolver<'a> {
         Ok(scope)
     }
 
-    /// Resolve and de-duplicate an explicit multi-scope list.
+    /// Resolve and de-duplicate an explicit multi-scope list, every scope
+    /// authorized for a read.
+    ///
+    /// A refused scope fails the whole call rather than being dropped — see
+    /// [`resolve_many_existing_scopes_guarded`].
     pub async fn resolve_many_existing(
         &self,
         scopes: &[ScopeName],
         max: usize,
     ) -> Result<Vec<ResolvedScope>, ScopeResolutionError> {
-        resolve_many_existing_scopes(self.reader, scopes, max).await
+        let resolved = resolve_many_existing_scopes(self.reader, scopes, max).await?;
+        for scope in &resolved {
+            self.authorize_scope(*scope, ProjectAccess::Read).await?;
+        }
+        Ok(resolved)
     }
 }
 
@@ -705,6 +931,331 @@ fn trimmed_opt(value: Option<&str>) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::Store;
+    use ai_memory_core::NewUser;
+
+    use crate::{AccessMode, GrantLevel};
+
+    async fn user_named(store: &Store, username: &str, byte: u8) -> UserId {
+        store
+            .writer
+            .create_user(
+                NewUser {
+                    username: username.to_owned(),
+                    name: None,
+                    email: None,
+                },
+                [byte; crate::TOKEN_HASH_LEN],
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A restricted project plus two users, neither holding anything on it.
+    async fn guard_fixture(store: &Store) -> (WorkspaceId, ProjectId, UserId, UserId) {
+        // Grants only decide anything in a restricted project; every project
+        // these tests create starts restricted.
+        store
+            .writer
+            .set_new_project_mode(AccessMode::Restricted)
+            .await
+            .unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "client-work", None)
+            .await
+            .unwrap();
+        let alice = user_named(store, "alice", 1).await;
+        let bob = user_named(store, "bob", 2).await;
+        (ws, project, alice, bob)
+    }
+
+    async fn grant(store: &Store, user: UserId, project: ProjectId, level: GrantLevel) {
+        store
+            .writer
+            .grant_memory(user, project, level, None)
+            .await
+            .unwrap();
+    }
+
+    fn created_by(store: &Store, project: ProjectId) -> Option<UserId> {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.query_row(
+            "SELECT created_by FROM projects WHERE id = ?1",
+            rusqlite::params![project.as_bytes()],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .unwrap()
+        .map(|raw| UserId::from_slice(&raw).unwrap())
+    }
+
+    fn as_user<'a>(
+        store: &'a Store,
+        ws: WorkspaceId,
+        project: ProjectId,
+        user: UserId,
+    ) -> ScopeResolver<'a> {
+        ScopeResolver::new(&store.reader, ws, project)
+            .with_writer(&store.writer)
+            .with_project_authz(ProjectPrincipal::user(user), true)
+    }
+
+    /// The argument shape and the level are independent, and must stay so.
+    ///
+    /// Mutating tools take the same arguments as reads. Resolving those as a
+    /// read is what would let a `read` grant delete pages, so the level is the
+    /// caller's to state — on the explicit-pair branch and on the
+    /// current-project fallback alike.
+    #[tokio::test]
+    async fn the_argument_shape_does_not_decide_the_level() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, project, alice, _) = guard_fixture(&store).await;
+        grant(&store, alice, project, GrantLevel::Read).await;
+        let resolver = as_user(&store, ws, project, alice);
+        let actor = ActorKey::default();
+
+        for (label, workspace, name) in [
+            ("explicit pair", Some("default"), Some("client-work")),
+            ("current-project fallback", None, None),
+        ] {
+            resolver
+                .resolve_existing_args(workspace, name, &actor, ProjectAccess::Read)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: a reader may read: {e}"));
+            let err = resolver
+                .resolve_existing_args(workspace, name, &actor, ProjectAccess::Write)
+                .await
+                .unwrap_err();
+            assert!(
+                err.is_forbidden(),
+                "{label}: a reader must not reach a write: {err:?}"
+            );
+        }
+    }
+
+    /// Root and an install with no database users both arrive as no viewer,
+    /// and neither may change behaviour.
+    #[tokio::test]
+    async fn no_viewer_resolves_exactly_as_before() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, project, _, _) = guard_fixture(&store).await;
+
+        let scope = lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "client-work",
+            None,
+            ProjectAccess::Write,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scope,
+            ResolvedScope {
+                workspace_id: ws,
+                project_id: project
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_reaches_only_what_they_were_granted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (_, project, alice, bob) = guard_fixture(&store).await;
+        grant(&store, alice, project, GrantLevel::Read).await;
+        let lookup = |user, need| {
+            lookup_existing_scope_guarded(&store.reader, "default", "client-work", Some(user), need)
+        };
+
+        lookup(alice, ProjectAccess::Read).await.unwrap();
+        assert!(
+            lookup(alice, ProjectAccess::Write)
+                .await
+                .unwrap_err()
+                .is_forbidden()
+        );
+        // Bob holds nothing. The refusal must say so — not resolve to an
+        // empty project, which would read as "there is nothing here".
+        let err = lookup(bob, ProjectAccess::Read).await.unwrap_err();
+        assert!(err.is_forbidden(), "{err:?}");
+        assert!(!err.is_not_found());
+    }
+
+    #[tokio::test]
+    async fn creating_authorizes_against_a_project_that_already_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, project, alice, bob) = guard_fixture(&store).await;
+        grant(&store, alice, project, GrantLevel::Read).await;
+        let create = |name: &'static str, user| {
+            create_explicit_scope_guarded(&store.reader, &store.writer, "default", name, Some(user))
+        };
+
+        // "Create" is not a way around the choke point: the project is already
+        // there, so Bob's write is refused exactly as a read would be, and
+        // Alice's read grant does not cover a write.
+        assert!(create("client-work", bob).await.unwrap_err().is_forbidden());
+        assert!(
+            create("client-work", alice)
+                .await
+                .unwrap_err()
+                .is_forbidden()
+        );
+        assert_eq!(created_by(&store, project), None);
+
+        // A project that does not exist yet is created with Bob as its
+        // creator, who is admitted without any grant.
+        let fresh = create("brand-new", bob).await.unwrap();
+        assert_eq!(fresh.workspace_id, ws);
+        assert_eq!(created_by(&store, fresh.project_id), Some(bob));
+        assert!(
+            store
+                .reader
+                .grants_for(bob, fresh.project_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the creator needs no grant"
+        );
+        lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "brand-new",
+            Some(bob),
+            ProjectAccess::Write,
+        )
+        .await
+        .expect("the creator reaches what they created");
+
+        // A second "create" of the same name by someone else is a write to an
+        // existing project: refused, and it does not make them its creator.
+        assert!(create("brand-new", alice).await.unwrap_err().is_forbidden());
+        assert_eq!(created_by(&store, fresh.project_id), Some(bob));
+    }
+
+    /// With no viewer — root, or an install with no database users — a created
+    /// project records no creator: there is no user to attribute it to.
+    #[tokio::test]
+    async fn creating_without_a_viewer_records_no_creator() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        guard_fixture(&store).await;
+        let fresh = create_explicit_scope_guarded(
+            &store.reader,
+            &store.writer,
+            "default",
+            "unattributed",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created_by(&store, fresh.project_id), None);
+    }
+
+    /// The MCP write path creates through the resolver, not the free function,
+    /// and must behave the same.
+    #[tokio::test]
+    async fn write_args_record_the_creator_and_check_everyone_else() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, project, alice, bob) = guard_fixture(&store).await;
+        let actor = ActorKey::default();
+
+        let as_bob = as_user(&store, ws, project, bob);
+        let created = as_bob
+            .resolve_write_args(Some("default"), Some("bobs-repo"), &actor)
+            .await
+            .unwrap();
+        assert_eq!(created_by(&store, created.project_id), Some(bob));
+        as_bob
+            .resolve_write_args(Some("default"), Some("bobs-repo"), &actor)
+            .await
+            .expect("the creator writes to it again");
+
+        let err = as_user(&store, ws, project, alice)
+            .resolve_write_args(Some("default"), Some("bobs-repo"), &actor)
+            .await
+            .unwrap_err();
+        assert!(err.is_forbidden(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_scope_fails_the_search_instead_of_shortening_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, granted, alice, _) = guard_fixture(&store).await;
+        let refused = store
+            .writer
+            .get_or_create_project(ws, "other-team", None)
+            .await
+            .unwrap();
+        grant(&store, alice, granted, GrantLevel::Read).await;
+        let names = [
+            ScopeName::new("default", "client-work"),
+            ScopeName::new("default", "client-work"),
+            ScopeName::new("default", "other-team"),
+        ];
+
+        let err = resolve_many_existing_scopes_guarded(
+            &store.reader,
+            &names,
+            25,
+            Some(alice),
+            ProjectAccess::Read,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_forbidden(), "{err:?}");
+        let err = as_user(&store, ws, granted, alice)
+            .resolve_many_existing(&names, 25)
+            .await
+            .unwrap_err();
+        assert!(err.is_forbidden(), "the resolver agrees: {err:?}");
+
+        // Every scope granted: the call succeeds, still de-duplicated.
+        grant(&store, alice, refused, GrantLevel::Read).await;
+        let resolved = as_user(&store, ws, granted, alice)
+            .resolve_many_existing(&names, 25)
+            .await
+            .unwrap();
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_grant_denies_like_one_never_granted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (_, project, alice, bob) = guard_fixture(&store).await;
+        store
+            .writer
+            .grant_memory(alice, project, GrantLevel::Write, Some(bob))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .writer
+                .revoke_memory(alice, project, Some(bob))
+                .await
+                .unwrap()
+        );
+        let err = lookup_existing_scope_guarded(
+            &store.reader,
+            "default",
+            "client-work",
+            Some(alice),
+            ProjectAccess::Read,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_forbidden(), "{err:?}");
+    }
 
     #[tokio::test]
     async fn read_args_reject_partial_scope() {

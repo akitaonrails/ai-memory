@@ -32,6 +32,15 @@ pub struct IngestMetrics {
     /// Events accepted but deliberately not stored — capture policy or the
     /// subagent drop. Still a 202: the client must not retry these.
     dropped_by_policy: AtomicU64,
+    /// Events accepted but not stored because the authenticated user holds no
+    /// `write` access to the project the capture resolved to.
+    ///
+    /// Separate from `dropped_by_policy` on purpose. A policy drop is the
+    /// operator's own configuration working as intended; this one means
+    /// somebody's agent has been recording into a repository all day and none
+    /// of it is landing. Those want different answers, so they must not share
+    /// a counter.
+    dropped_unauthorized: AtomicU64,
     /// Events shed because the global ingest semaphore had no permit (429).
     shed_saturated: AtomicU64,
     /// Events shed by the per-source rate limiter (429).
@@ -49,6 +58,10 @@ impl IngestMetrics {
     /// One event accepted-but-dropped by capture policy or subagent rules.
     pub fn record_dropped_by_policy(&self) {
         self.dropped_by_policy.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One capture dropped because its author may not write that repository.
+    pub fn record_dropped_unauthorized(&self) {
+        self.dropped_unauthorized.fetch_add(1, Ordering::Relaxed);
     }
     /// One event shed because ingest capacity was exhausted.
     pub fn record_shed_saturated(&self) {
@@ -69,6 +82,7 @@ impl IngestMetrics {
         IngestMetricsSnapshot {
             accepted: self.accepted.load(Ordering::Relaxed),
             dropped_by_policy: self.dropped_by_policy.load(Ordering::Relaxed),
+            dropped_unauthorized: self.dropped_unauthorized.load(Ordering::Relaxed),
             shed_saturated: self.shed_saturated.load(Ordering::Relaxed),
             shed_rate_limited: self.shed_rate_limited.load(Ordering::Relaxed),
             last_persisted_ms: match self.last_persisted_ms.load(Ordering::Relaxed) {
@@ -86,6 +100,8 @@ pub struct IngestMetricsSnapshot {
     pub accepted: u64,
     /// Events accepted but intentionally not stored.
     pub dropped_by_policy: u64,
+    /// Captures dropped because their author may not write that repository.
+    pub dropped_unauthorized: u64,
     /// Events shed because ingest capacity was exhausted.
     pub shed_saturated: u64,
     /// Events shed by the per-source rate limiter.
@@ -103,6 +119,7 @@ mod tests {
         let snap = IngestMetrics::default().snapshot();
         assert_eq!(snap.accepted, 0);
         assert_eq!(snap.dropped_by_policy, 0);
+        assert_eq!(snap.dropped_unauthorized, 0);
         assert_eq!(snap.shed_saturated, 0);
         assert_eq!(snap.shed_rate_limited, 0);
         assert_eq!(
@@ -144,6 +161,7 @@ mod tests {
             vec![
                 "accepted",
                 "dropped_by_policy",
+                "dropped_unauthorized",
                 "last_persisted_ms",
                 "shed_rate_limited",
                 "shed_saturated"

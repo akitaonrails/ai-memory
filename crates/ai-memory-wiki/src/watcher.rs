@@ -696,7 +696,7 @@ mod tests {
         assert_eq!(
             store
                 .reader
-                .search_pages("zimbabwe".into(), 10)
+                .search_pages("zimbabwe".into(), 10, None)
                 .await
                 .unwrap()
                 .len(),
@@ -743,7 +743,7 @@ mod tests {
         assert!(
             store
                 .reader
-                .search_pages("zimbabwe".into(), 10)
+                .search_pages("zimbabwe".into(), 10, None)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -762,7 +762,7 @@ mod tests {
 
         let back = store
             .reader
-            .search_pages("zimbabwe".into(), 10)
+            .search_pages("zimbabwe".into(), 10, None)
             .await
             .unwrap();
         assert!(
@@ -874,7 +874,7 @@ mod tests {
         while std::time::Instant::now() < deadline {
             hits = store
                 .reader
-                .search_pages("outside".into(), 5)
+                .search_pages("outside".into(), 5, None)
                 .await
                 .unwrap();
             if !hits.is_empty() {
@@ -911,7 +911,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("reindex".into(), 5)
+            .search_pages("reindex".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -988,7 +988,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("existed".into(), 5)
+            .search_pages("existed".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -1034,14 +1034,14 @@ mod tests {
 
         let kept = store
             .reader
-            .search_pages("validtoken".into(), 5)
+            .search_pages("validtoken".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(kept.len(), 1, "the valid project's page must be indexed");
 
         let stranded = store
             .reader
-            .search_pages("orphantoken".into(), 5)
+            .search_pages("orphantoken".into(), 5, None)
             .await
             .unwrap();
         assert!(
@@ -1074,7 +1074,7 @@ mod tests {
 
         let stranded = store
             .reader
-            .search_pages("eventtoken".into(), 5)
+            .search_pages("eventtoken".into(), 5, None)
             .await
             .unwrap();
         assert!(
@@ -1178,7 +1178,7 @@ mod tests {
         // Only `real.md` should land in the index.
         let hits = store
             .reader
-            .search_pages("real content".into(), 5)
+            .search_pages("real content".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1, "only the real page should be indexed");
@@ -1187,14 +1187,14 @@ mod tests {
         // Neither reserved file should be searchable.
         let log_hits = store
             .reader
-            .search_pages("logtoken".into(), 5)
+            .search_pages("logtoken".into(), 5, None)
             .await
             .unwrap();
         assert!(log_hits.is_empty(), "log.md must not be indexed");
 
         let rotated_hits = store
             .reader
-            .search_pages("rotatedlogtoken".into(), 5)
+            .search_pages("rotatedlogtoken".into(), 5, None)
             .await
             .unwrap();
         assert!(
@@ -1204,7 +1204,7 @@ mod tests {
 
         let regular_hits = store
             .reader
-            .search_pages("regularlogtoken".into(), 5)
+            .search_pages("regularlogtoken".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1216,7 +1216,7 @@ mod tests {
 
         let boot_hits = store
             .reader
-            .search_pages("boottoken".into(), 5)
+            .search_pages("boottoken".into(), 5, None)
             .await
             .unwrap();
         assert!(boot_hits.is_empty(), "bootstrap.md must not be indexed");
@@ -1290,7 +1290,7 @@ mod tests {
 
         let page_hits = store
             .reader
-            .search_pages("uniquetoken".into(), 5)
+            .search_pages("uniquetoken".into(), 5, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1302,7 +1302,7 @@ mod tests {
 
         let meta_hits = store
             .reader
-            .search_pages("manifesttoken".into(), 5)
+            .search_pages("manifesttoken".into(), 5, None)
             .await
             .unwrap();
         assert!(
@@ -1312,7 +1312,7 @@ mod tests {
 
         let ledger_hits = store
             .reader
-            .search_pages("rawledgertoken".into(), 5)
+            .search_pages("rawledgertoken".into(), 5, None)
             .await
             .unwrap();
         assert!(
@@ -1327,7 +1327,7 @@ mod tests {
         // into the gigabytes within days.
         let stamped_hits = store
             .reader
-            .search_pages("stampedledgertoken".into(), 5)
+            .search_pages("stampedledgertoken".into(), 5, None)
             .await
             .unwrap();
         assert!(
@@ -1399,7 +1399,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("directsymlinksecret".into(), 5)
+            .search_pages("directsymlinksecret".into(), 5, None)
             .await
             .unwrap();
         assert!(hits.is_empty(), "direct symlink event must not be indexed");

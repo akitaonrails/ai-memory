@@ -95,6 +95,9 @@ pub async fn run(config: &Config, args: UserArgs) -> Result<()> {
         UserCommand::Disable(args) => disable(&ep, args).await,
         UserCommand::Enable(args) => enable(&ep, args).await,
         UserCommand::Patch(args) => patch(&ep, args).await,
+        UserCommand::Grant(args) => crate::commands::grant::grant(&ep, &args).await,
+        UserCommand::Revoke(args) => crate::commands::grant::revoke(&ep, &args).await,
+        UserCommand::Grants(args) => crate::commands::grant::list_for_user(&ep, &args).await,
     }
 }
 
@@ -409,7 +412,7 @@ fn confirm(prompt: &str) -> Result<()> {
     Ok(())
 }
 
-fn url_encode(s: &str) -> String {
+pub(crate) fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {

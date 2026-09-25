@@ -23,6 +23,7 @@
 
 mod assistant_capture;
 pub mod capture_policy;
+mod grants;
 pub mod log;
 pub mod payload;
 pub mod router;

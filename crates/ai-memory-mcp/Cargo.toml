@@ -20,6 +20,9 @@ ai-memory-wiki.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 flate2.workspace = true
+# Tests insert grant rows directly, so the decision tests do not depend on
+# the grant management API.
+rusqlite.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 serde.workspace = true
