@@ -11,8 +11,9 @@
 //! community-standard `npx mcp-remote` stdio shim so the same HTTP
 //! endpoint still works.
 //!
-//! OMP uses a native `~/.omp/agent/mcp.json` file with the same
-//! `mcpServers` root as several other clients.
+//! OMP uses a native `mcp.json` in its agent dir (`~/.omp/agent`, a named
+//! profile's `~/.omp/profiles/<name>/agent`, or `$PI_CODING_AGENT_DIR`) with
+//! the same `mcpServers` root as several other clients.
 
 use std::path::{Path, PathBuf};
 
@@ -164,8 +165,10 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
 }
 
 /// [`mcp_config_path`] with the relocation variables (`CLAUDE_CONFIG_DIR`,
-/// `CODEX_HOME`, `GROK_HOME`, `KIMI_CODE_HOME` and `KIRO_HOME`) read through
-/// `env`, so `ai-memory run --env` can point auto-wire at the same config home
+/// `CODEX_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`, and OMP's
+/// `OMP_PROFILE`, `PI_PROFILE`, `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR`) read
+/// through `env`,
+/// so `ai-memory run --env` can point auto-wire at the same config home
 /// it launches the harness with.
 pub(crate) fn mcp_config_path_with(
     client: crate::cli::McpClient,
@@ -223,7 +226,11 @@ pub(crate) fn mcp_config_path_with(
         McpClient::Pi => bail!(
             "Pi has no native mcp.json; use `ai-memory install-hooks --agent pi --apply` to install the generated MCP bridge extension."
         ),
-        McpClient::Omp => home()?.join(".omp").join("agent").join("mcp.json"),
+        // OMP reads mcp.json from its agent dir, the one its extensions live
+        // in, so a profile, PI_CODING_AGENT_DIR or PI_CONFIG_DIR moves it too.
+        McpClient::Omp => {
+            ai_memory_workstream::omp_agent_dir(&home()?, None, env)?.join("mcp.json")
+        }
         McpClient::AntigravityCli => home()?
             .join(".gemini")
             .join("config")
@@ -1370,7 +1377,10 @@ fn hook_server_url_from_mcp_url(url: &str) -> String {
 
 fn render_omp(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
-        "# Oh My Pi / OMP — merge into ~/.omp/agent/mcp.json:\n\
+        "# Oh My Pi / OMP — merge into mcp.json in OMP's agent dir:\n\
+         # ~/.omp/agent/mcp.json by default, ~/.omp/profiles/<name>/agent/mcp.json\n\
+         # under a named profile (OMP_PROFILE), or $PI_CODING_AGENT_DIR/mcp.json\n\
+         # when that variable relocates the default profile.\n\
          #\n\
          # The current Oh My Pi package exposes the `omp` binary and native\n\
          # `.omp` config directories. Restart `omp` after changing MCP config.\n\
@@ -1698,6 +1708,7 @@ mod tests {
             (McpClient::Grok, "GROK_HOME", "config.toml"),
             (McpClient::KimiCode, "KIMI_CODE_HOME", "mcp.json"),
             (McpClient::KiroCli, "KIRO_HOME", "settings/mcp.json"),
+            (McpClient::Omp, "PI_CODING_AGENT_DIR", "mcp.json"),
         ] {
             let env = |name: &str| (name == var).then(|| root.as_os_str().to_owned());
             assert_eq!(
@@ -1706,6 +1717,44 @@ mod tests {
                 "{client:?} must follow {var}"
             );
         }
+    }
+
+    /// OMP's MCP file lives in the same agent dir as its extensions: a named
+    /// profile owns it and ignores `PI_CODING_AGENT_DIR`, as OMP does.
+    #[test]
+    fn omp_mcp_config_follows_the_profile_agent_dir() {
+        let home = home_dir().unwrap();
+        let profile = home
+            .join(".omp")
+            .join("profiles")
+            .join("work")
+            .join("agent")
+            .join("mcp.json");
+        for pairs in [
+            &[("OMP_PROFILE", "work")][..],
+            &[("OMP_PROFILE", "work"), ("PI_CODING_AGENT_DIR", "/custom")][..],
+            &[("PI_PROFILE", "work")][..],
+        ] {
+            let env = |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            };
+            assert_eq!(
+                mcp_config_path_with(McpClient::Omp, &env).unwrap(),
+                profile,
+                "{pairs:?}"
+            );
+        }
+        let invalid = |name: &str| (name == "OMP_PROFILE").then(|| "Work".into());
+        assert!(mcp_config_path_with(McpClient::Omp, &invalid).is_err());
+        let renamed = |name: &str| (name == "PI_CONFIG_DIR").then(|| ".omp-alt".into());
+        assert_eq!(
+            mcp_config_path_with(McpClient::Omp, &renamed).unwrap(),
+            home.join(".omp-alt").join("agent").join("mcp.json"),
+            "PI_CONFIG_DIR renames OMP's root"
+        );
     }
 
     /// A blank relocation variable is unset, the rule every installer and
@@ -1720,6 +1769,9 @@ mod tests {
             (McpClient::Grok, "GROK_HOME", ".grok/config.toml"),
             (McpClient::KimiCode, "KIMI_CODE_HOME", ".kimi-code/mcp.json"),
             (McpClient::KiroCli, "KIRO_HOME", ".kiro/settings/mcp.json"),
+            (McpClient::Omp, "PI_CODING_AGENT_DIR", ".omp/agent/mcp.json"),
+            (McpClient::Omp, "OMP_PROFILE", ".omp/agent/mcp.json"),
+            (McpClient::Omp, "PI_CONFIG_DIR", ".omp/agent/mcp.json"),
         ] {
             for blank in ["", "   ", "\t", " \n"] {
                 let env = |name: &str| (name == var).then(|| std::ffi::OsString::from(blank));
@@ -2309,7 +2361,14 @@ mod tests {
         let grok_token = render_with_token(McpClient::Grok);
         assert!(grok_token.contains("[mcp_servers.ai-memory.headers]"));
         assert!(!grok_token.contains("http_headers"));
-        assert!(render_for_test(McpClient::Omp).contains("~/.omp/agent/mcp.json"));
+        let omp = render_for_test(McpClient::Omp);
+        for location in [
+            "~/.omp/agent/mcp.json",
+            "~/.omp/profiles/<name>/agent/mcp.json",
+            "$PI_CODING_AGENT_DIR/mcp.json",
+        ] {
+            assert!(omp.contains(location), "{location} missing from:\n{omp}");
+        }
         let pi = render_pi(&args_for(McpClient::Pi)).unwrap();
         assert!(pi.contains("Pi has no native mcp.json"));
         assert!(pi.contains("install-hooks --agent pi --apply"));

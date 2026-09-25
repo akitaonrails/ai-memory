@@ -132,6 +132,38 @@ fn push_rewrite(plan: &mut Vec<PlannedChange>, path: PathBuf, removed: Vec<Strin
     });
 }
 
+/// The OMP agent dirs an ai-memory install may have written to, active first:
+/// the one OMP loads now (`--profile`, `OMP_PROFILE`, `PI_PROFILE`, else
+/// `PI_CODING_AGENT_DIR`), the default profile's, where earlier releases put
+/// the extension whenever `PI_CODING_AGENT_DIR` was set, the active one as
+/// earlier releases resolved it (they ignored `PI_CONFIG_DIR` and wrote under
+/// `~/.omp`), and `~/.omp/agent`, where `install-mcp` always wrote the MCP
+/// entry. A profile name OMP refuses is reported and skipped instead of
+/// aborting every other agent's cleanup.
+fn omp_agent_dirs(home: Option<&Path>, profile: Option<&str>) -> Vec<PathBuf> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let env = |name: &str| std::env::var_os(name);
+    let without_config_dir = |name: &str| (name != "PI_CONFIG_DIR").then(|| env(name)).flatten();
+    let mut dirs = Vec::with_capacity(4);
+    match ai_memory_workstream::omp_agent_dir(home, profile, env) {
+        Ok(dir) => dirs.push(dir),
+        Err(error) => eprintln!("warning: skipping the active OMP profile: {error:#}"),
+    }
+    let fallbacks = [
+        ai_memory_workstream::omp_agent_dir(home, Some("default"), env).ok(),
+        ai_memory_workstream::omp_agent_dir(home, profile, without_config_dir).ok(),
+        Some(home.join(".omp").join("agent")),
+    ];
+    for dir in fallbacks.into_iter().flatten() {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
 fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: DeleteKind) {
     if generated_file_is_ours(&path, kind) {
         plan.push(PlannedChange::DeleteFile { path, kind });
@@ -148,6 +180,12 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
     let url = args.mcp_url.as_str();
     let home = home_dir();
     let claude_config_dir = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let omp_dirs = if want(crate::cli::UninstallOnly::Hooks) || want(crate::cli::UninstallOnly::Mcp)
+    {
+        omp_agent_dirs(home.as_deref(), args.profile.as_deref())
+    } else {
+        Vec::new()
+    };
 
     // ---- Hooks (JSON configs) ----
     if want(crate::cli::UninstallOnly::Hooks) {
@@ -301,12 +339,10 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
         let plugin2 = install_hooks::opencode2_plugin_path()?;
         push_generated_delete(&mut plan, plugin2, DeleteKind::OpenCode2Plugin);
 
-        let omp_profile = args.profile.as_deref();
-        let omp = install_hooks::omp_extension_path(omp_profile)?;
-        push_generated_delete(&mut plan, omp.clone(), DeleteKind::OmpExtension);
-
-        let legacy_omp = omp.with_file_name("ai-memory.ts");
-        if legacy_omp != omp {
+        for dir in &omp_dirs {
+            let omp = dir.join("extensions").join("ai-memory-omp.ts");
+            let legacy_omp = omp.with_file_name("ai-memory.ts");
+            push_generated_delete(&mut plan, omp, DeleteKind::OmpExtension);
             push_generated_delete(&mut plan, legacy_omp, DeleteKind::OmpExtension);
         }
 
@@ -378,6 +414,8 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                     Path::new(".codex/config.toml"),
                     Path::new("config.toml"),
                 )
+            } else if matches!(client, Omp) {
+                omp_dirs.iter().map(|dir| dir.join("mcp.json")).collect()
             } else {
                 let Ok(path) = install_mcp::mcp_config_path(client) else {
                     continue;

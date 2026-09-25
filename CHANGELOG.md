@@ -163,6 +163,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now write `$CODEX_HOME/config.toml`, matching `hooks.json`; `uninstall`
   sweeps the legacy `~/.codex/config.toml` too, and `install-hooks` still
   infers the server URL and token from it until the entry is rewritten. (#820)
+- OMP paths now follow OMP's own profile rules. A named profile (`--profile`,
+  `OMP_PROFILE`, or the legacy `PI_PROFILE`, previously ignored) owns
+  `~/.omp/profiles/<name>/agent` and ignores `PI_CODING_AGENT_DIR`, as OMP
+  does; `install-hooks` wrote the extension into `PI_CODING_AGENT_DIR`
+  instead, where that OMP never loads it. An empty, whitespace or `default`
+  profile selects the default profile rather than a `profiles/default` or
+  blank-named directory, a `PI_CODING_AGENT_DIR` a parent OMP derived for its
+  profile no longer leaks into the default profile, and a name OMP refuses is
+  refused. `install-mcp
+  --client omp` and auto-wire write `mcp.json` into the same agent dir instead
+  of always `~/.omp/agent`; `ai-memory run omp` imports sessions from it and
+  honors `PI_CODING_AGENT_SESSION_DIR` and a leading native `--profile`; `uninstall`
+  sweeps the active, default-profile and `~/.omp/agent` locations and no
+  longer aborts every agent's cleanup on an invalid profile name. ai-memory
+  also follows OMP's `PI_CONFIG_DIR`, which renames the `~/.omp` root (joined
+  under the home, as OMP joins it), for profiles, the extension, `mcp.json`,
+  session import and the `uninstall` sweep, which still covers the `~/.omp`
+  locations earlier releases wrote to; and on Linux and macOS `ai-memory run
+  omp`, `backfill` and `doctor` read sessions from `$XDG_DATA_HOME/omp/sessions`
+  (`$XDG_DATA_HOME/omp/profiles/<name>/sessions` for a named profile) when
+  that OMP directory exists and the agent dir is not relocated, as OMP does.
+  (#820)
 - A whitespace-only `KIMI_CODE_HOME`, `KIRO_HOME` or `GROK_HOME` pointed
   installs at a blank-named directory under the working directory, and a
   whitespace-only relocation variable did the same for `ai-memory run`'s
