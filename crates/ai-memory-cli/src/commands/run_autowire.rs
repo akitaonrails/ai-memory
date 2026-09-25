@@ -52,7 +52,8 @@ pub(crate) fn agent_choice_for_harness(harness: ManagedHarness) -> Option<AgentC
     })
 }
 
-/// Where auto-wire records its sentinels.
+/// Where auto-wire records its sentinels. `uninstall` clears it whenever it
+/// removes hooks or MCP, so the next managed launch wires again.
 pub(crate) fn autowire_state_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("autowire-state")
 }
@@ -438,7 +439,8 @@ pub(crate) fn ensure_wired_with(
     // Record the attempt even on partial failure: re-applying an idempotent
     // install on every launch would nag and churn config. A user who wants a
     // retry can re-run install-hooks manually or delete this sentinel under
-    // `<data_dir>/autowire-state/`.
+    // `<data_dir>/autowire-state/`; `ai-memory uninstall` clears them all when
+    // it removes hooks or MCP.
     write_sentinel(&sentinel);
 }
 
@@ -1141,5 +1143,46 @@ mod tests {
             r#"{"existingMcpKey":1}"#,
             "a present sentinel must short-circuit before the MCP install"
         );
+    }
+
+    /// Clearing the auto-wire state (what `uninstall` does) makes the next
+    /// launch wire again; `uninstall` and the gate must agree on the directory.
+    #[test]
+    fn clearing_autowire_state_rewires_the_next_launch() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = test_config(home.path(), data.path());
+        let settings = data.path().join("claude-settings.json");
+        let mcp = data.path().join("claude.json");
+        let user_settings = r#"{"existingUserKey":1}"#;
+        let user_mcp = r#"{"existingMcpKey":1}"#;
+        std::fs::write(&settings, user_settings).unwrap();
+        std::fs::write(&mcp, user_mcp).unwrap();
+        let overrides = WireOverrides {
+            hooks_dir: Some(repo_hooks()),
+            hooks_config_file: Some(settings.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+
+        // The wiring is removed by hand; the sentinel alone keeps it that way.
+        std::fs::write(&settings, user_settings).unwrap();
+        std::fs::write(&mcp, user_mcp).unwrap();
+        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), user_mcp);
+
+        // Moving the state aside is, for the gate, the same as clearing it.
+        std::fs::rename(
+            autowire_state_dir(data.path()),
+            data.path().join("cleared-autowire-state"),
+        )
+        .unwrap();
+        ensure_wired_with(&config, ManagedHarness::Claude, &overrides, &[]);
+        assert!(
+            std::fs::read_to_string(&settings)
+                .is_ok_and(|s| s.contains("ai-memory") || s.contains("ai_memory"))
+        );
+        assert!(std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")));
     }
 }

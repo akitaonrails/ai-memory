@@ -364,7 +364,9 @@ Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 `ai-memory run`).
 
 `ai-memory uninstall --apply` removes everything ai-memory installed,
-and only what it installed. Install commands are idempotent and write
+and only what it installed. It also clears `ai-memory run`'s auto-wire
+record, so the next managed launch wires that harness again; to keep it
+unwired, launch with `--no-autowire` or set `AI_MEMORY_RUN_AUTOWIRE=false`. Install commands are idempotent and write
 timestamped backups next to any file they touch.
 
 ## Everyday use

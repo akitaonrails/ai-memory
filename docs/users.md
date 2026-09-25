@@ -492,6 +492,10 @@ the data dir, both `0600` (the data dir itself is `0700`):
 | `<data_dir>/auth-token` | the native `ai-memory hook` command |
 | `<data_dir>/auth-header` | the shell hooks, via `curl -H @<file>` |
 
+`ai-memory uninstall` deletes both files when it removes the hooks (a full
+uninstall or `--only hooks`); `--only mcp`, `--only instructions` and `--only
+skills` keep them for the hooks still installed.
+
 It is deliberately **not** written into the agent's own config any more. Before
 #552 it went onto the hook's command line — `--auth-token <token>` for native
 hooks, an `AI_MEMORY_AUTH_TOKEN=` shell prefix for the script hooks — which put

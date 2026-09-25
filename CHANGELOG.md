@@ -176,6 +176,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Native `ai-memory upgrade` accepts release archives whose entries are
   `./`-prefixed (`tar -C … -czf … .` as in `release.yml`), instead of
   rejecting `Component::CurDir` as an unsafe path. (#802)
+- `ai-memory uninstall` left `ai-memory run`'s auto-wire sentinels in
+  `<data_dir>/autowire-state/`, so after the hooks were removed the next
+  managed launch of that harness on the same binary version skipped wiring and
+  captured nothing. Removing hooks or MCP (a full uninstall, `--only hooks` or
+  `--only mcp`) now deletes every sentinel and lists them in the dry-run plan.
+  `--only mcp`, `--only instructions` and `--only skills` also no longer delete
+  the stored hook bearer that the still-installed hooks read. (#820)
 - Native `ai-memory upgrade` treats Linuxbrew (`/home/linuxbrew/.linuxbrew/`)
   as package-managed and refuses self-replace there. (#802)
 - Native `ai-memory upgrade` container refusal now uses the shared
