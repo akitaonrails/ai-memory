@@ -459,6 +459,7 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | `ai-memory pending-writes diff <id>` | Show markdown diff. |
 | `ai-memory pending-writes approve <id>` | Apply through the normal wiki mutation path. |
 | `ai-memory pending-writes reject <id>` | Discard proposal with audit trail. |
+| `GET {web_slug}/pending` | Root-only browser page. It lists pending proposals across all projects, with a project filter and a sort. Approve and reject post to the `/admin/pending-writes/{id}/approve\|reject` routes with the session cookie and the CSRF header. |
 
 Pending proposals should be visible as markdown under `_pending/auto-improve/`
 so humans can review them in the wiki/Obsidian workflow. SQLite can still hold

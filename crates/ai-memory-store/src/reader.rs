@@ -29,8 +29,8 @@ use uuid::Uuid;
 use crate::auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
-    AutoImproveTelemetryCount, OwnedAutoImproveProposalDetail, bytes32, opt_bytes32,
-    summary_from_row, to_sql_err,
+    AutoImproveTelemetryCount, OwnedAutoImproveProposalDetail, PendingAutoImproveReview,
+    PendingAutoImproveScope, bytes32, opt_bytes32, summary_from_row, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
@@ -7856,6 +7856,114 @@ impl ReaderPool {
                 for row in rows {
                     out.push(row?);
                 }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Every project with pending auto-improvement proposals, with its
+    /// pending count, ordered by workspace and project name.
+    ///
+    /// Unscoped by design: the only caller is the root-only `/web/pending`
+    /// triage page, which gates on `Capability::Admin` before reading.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_pending_auto_improve_scopes(
+        &self,
+    ) -> StoreResult<Vec<PendingAutoImproveScope>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT p.workspace_id, p.project_id, workspaces.name, projects.name, \
+                        COUNT(*) \
+                 FROM auto_improve_proposals p \
+                 JOIN workspaces ON workspaces.id = p.workspace_id \
+                 JOIN projects ON projects.id = p.project_id \
+                   AND projects.workspace_id = p.workspace_id \
+                 WHERE p.status = ?1 \
+                 GROUP BY p.workspace_id, p.project_id \
+                 ORDER BY workspaces.name, projects.name",
+            )?;
+            let rows = stmt.query_map(
+                params![AutoImproveProposalStatus::Pending.as_str()],
+                |row| {
+                    let pending: i64 = row.get(4)?;
+                    Ok(PendingAutoImproveScope {
+                        workspace_id: WorkspaceId::from_slice(&row.get::<_, Vec<u8>>(0)?)
+                            .map_err(to_sql_err)?,
+                        project_id: ProjectId::from_slice(&row.get::<_, Vec<u8>>(1)?)
+                            .map_err(to_sql_err)?,
+                        workspace_name: row.get(2)?,
+                        project_name: row.get(3)?,
+                        pending: u64::try_from(pending).unwrap_or_default(),
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// List pending auto-improvement proposals, oldest first, with the names
+    /// and bodies a reviewer needs. `scope` limits the list to one project;
+    /// `None` lists every project.
+    ///
+    /// Unscoped by design when `scope` is `None`: the only caller is the
+    /// root-only `/web/pending` triage page, which gates on
+    /// `Capability::Admin` before reading. One joined query instead of a
+    /// per-project fan-out.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_pending_auto_improve_reviews(
+        &self,
+        scope: Option<(WorkspaceId, ProjectId)>,
+        limit: usize,
+    ) -> StoreResult<Vec<PendingAutoImproveReview>> {
+        self.with_conn(move |conn| {
+            let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            let (workspace_id, project_id) = scope
+                .map(|(ws, proj)| (Some(ws.as_bytes().to_vec()), Some(proj.as_bytes().to_vec())))
+                .unwrap_or_default();
+            let mut stmt = conn.prepare(
+                "SELECT p.id, p.run_id, p.workspace_id, p.project_id, p.status, p.operation, \
+                        p.target_path, p.kind, p.title, p.confidence, p.staged_at, \
+                        p.decided_at, workspaces.name, projects.name, p.rationale, \
+                        p.body_markdown, p.edit_mode \
+                 FROM auto_improve_proposals p \
+                 JOIN workspaces ON workspaces.id = p.workspace_id \
+                 JOIN projects ON projects.id = p.project_id \
+                   AND projects.workspace_id = p.workspace_id \
+                 WHERE p.status = ?1 \
+                   AND (?2 IS NULL OR (p.workspace_id = ?2 AND p.project_id = ?3)) \
+                 ORDER BY p.staged_at ASC LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    AutoImproveProposalStatus::Pending.as_str(),
+                    workspace_id,
+                    project_id,
+                    limit
+                ],
+                |row| {
+                    Ok(PendingAutoImproveReview {
+                        summary: summary_from_row(row)?,
+                        workspace_name: row.get(12)?,
+                        project_name: row.get(13)?,
+                        rationale: row.get(14)?,
+                        body_markdown: row.get(15)?,
+                        edit_mode: row.get(16)?,
+                    })
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
             }
             Ok(out)
         })

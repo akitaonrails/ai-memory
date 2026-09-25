@@ -39,7 +39,11 @@ load. Its data routes remain protected. When `--web-ui-dir` is **absent**, the
 builtin wiki exposes public `GET {web_slug}/login` and
 `GET {web_slug}/change-password` HTML pages that call the same `/auth/*`
 endpoints; navigational browser GETs to protected wiki routes redirect there
-instead of returning bare JSON 401/403. `/api/v1` stays JSON either way. Start
+instead of returning bare JSON 401/403. `/api/v1` stays JSON either way.
+The builtin wiki also serves the root-only `GET {web_slug}/pending` page. It
+lists pending auto-improvement proposals and posts approve and reject to the
+existing `/admin/pending-writes/*` routes. A signed-in non-root user gets a
+403 page, not the change-password redirect. Start
 with:
 
 ```http

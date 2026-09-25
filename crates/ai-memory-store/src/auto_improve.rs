@@ -313,6 +313,45 @@ pub struct OwnedAutoImproveProposalDetail {
     pub staged_by_actor_user: Option<String>,
 }
 
+/// One pending proposal with the names and bodies a human reviewer reads.
+///
+/// Feeds the root-only `/web/pending` triage page, which lists every project's
+/// queue at once; the decision itself still goes through
+/// `/admin/pending-writes/{id}/approve|reject`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingAutoImproveReview {
+    /// The list-view fields.
+    pub summary: AutoImproveProposalSummary,
+    /// Owning workspace name.
+    pub workspace_name: String,
+    /// Owning project name.
+    pub project_name: String,
+    /// Why the reviewer proposed this edit.
+    pub rationale: String,
+    /// Full proposed page body.
+    pub body_markdown: String,
+    /// `full_page` or `patch`.
+    pub edit_mode: String,
+}
+
+/// One project that has pending proposals, with its pending count.
+///
+/// Feeds the `/web/pending` project filter, so every project with a pending
+/// proposal is listed even when the page reads only part of the queue.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingAutoImproveScope {
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Workspace name.
+    pub workspace_name: String,
+    /// Project name.
+    pub project_name: String,
+    /// Pending proposals in this project.
+    pub pending: u64,
+}
+
 /// One append-only status-history entry for a proposal.
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoImproveProposalEvent {
