@@ -399,13 +399,7 @@ pub(super) async fn run_from_with_wiring(
             .or_else(|| std::env::var_os(name))
     };
     if config.run_autowire && !no_autowire {
-        let wire_env = autowire_env(
-            harness,
-            &run_env,
-            &plan.args,
-            remove_kiro_home.then(|| home.join(".kiro")).as_deref(),
-            &launch_env,
-        );
+        let wire_env = autowire_env(harness, &run_env, &plan.args, &launch_env);
         super::run_autowire::ensure_wired_with(config, harness, wire_overrides, &wire_env);
     }
     if plan.mode == LaunchMode::Session
@@ -947,14 +941,11 @@ fn upsert_env(entries: &mut Vec<(String, String)>, key: String, value: String) {
 /// `--env` entries, adjusted where the child runs with something else. OMP
 /// ranks `--profile` above `OMP_PROFILE`, so the flag is passed on through the
 /// profile variables (see [`omp_profile_flag_env`], which reads the launch
-/// environment `launch_env`); a Kiro v3 resume from the default store drops
-/// `KIRO_HOME` from the child, so its hooks and MCP belong under
-/// `default_kiro_home`.
+/// environment `launch_env`).
 fn autowire_env(
     harness: ManagedHarness,
     run_env: &[(String, String)],
     native_args: &[OsString],
-    default_kiro_home: Option<&Path>,
     launch_env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Vec<(String, String)> {
     let mut env = run_env.to_vec();
@@ -968,9 +959,6 @@ fn autowire_env(
         for (name, value) in omp_profile_flag_env(&profile, launch_env) {
             set(&name, value);
         }
-    }
-    if let Some(kiro_home) = default_kiro_home {
-        set("KIRO_HOME", kiro_home.display().to_string());
     }
     env
 }
@@ -3262,89 +3250,6 @@ mod tests {
         server.abort();
     }
 
-    /// A Kiro v3 session stored under the default home is resumed with
-    /// `KIRO_HOME` removed from the child, so auto-wire must wire that default
-    /// home. Wiring the `--env` home instead left the resumed session with no
-    /// hooks and no MCP.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn kiro_v3_default_store_resume_autowires_the_home_the_child_reads() {
-        use crate::commands::run_autowire::WireOverrides;
-
-        const SESSION: &str = "sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e";
-        let (address, server) = mock_workstream_server(Some(SESSION)).await;
-        let home = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        let (script, captured) = capture_env_script(repo.path(), "KIRO_HOME");
-
-        let session_dir = home
-            .path()
-            .join(".kiro/sessions/checkout-fixture")
-            .join(SESSION);
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(
-            session_dir.join("session.json"),
-            serde_json::json!({
-                "schemaVersion": "1.0.0",
-                "dataModelVersion": 1,
-                "id": SESSION,
-                "workspacePaths": [repo.path()],
-                "createdAt": "2026-08-06T10:00:00Z",
-                "lastModifiedAt": "2026-08-06T10:05:00Z",
-                "agentMode": "vibe",
-                "status": "idle"
-            })
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::write(session_dir.join("messages.jsonl"), "{}\n").unwrap();
-        let custom = home.path().join("custom-kiro");
-        std::fs::create_dir_all(custom.join("sessions")).unwrap();
-
-        let config = launch_config(home.path(), data.path(), address);
-        let overrides = WireOverrides {
-            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
-            confine_to: Some(home.path().to_path_buf()),
-            ..WireOverrides::default()
-        };
-        let env = vec![("KIRO_HOME".to_string(), custom.display().to_string())];
-        let exit = run_from_with_wiring(
-            &config,
-            run_args(RunHarnessChoice::Kiro, script, env, &["--v3"]),
-            repo.path(),
-            &overrides,
-        )
-        .await
-        .expect("managed Kiro v3 resume completes");
-        assert_eq!(exit, 0);
-        assert_eq!(
-            std::fs::read_to_string(&captured).unwrap(),
-            "unset",
-            "the default-store resume must drop KIRO_HOME from the child"
-        );
-
-        let kiro_default = home.path().join(".kiro");
-        let hooks = kiro_default.join("hooks").join("ai-memory.json");
-        assert!(
-            std::fs::read_to_string(&hooks).is_ok_and(|s| s.contains("ai-memory")),
-            "hooks missing in {}",
-            hooks.display()
-        );
-        let mcp = kiro_default.join("settings").join("mcp.json");
-        assert!(
-            std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")),
-            "MCP missing in {}",
-            mcp.display()
-        );
-        assert!(
-            !custom.join("hooks").exists() && !custom.join("settings").exists(),
-            "the KIRO_HOME the child no longer reads must stay untouched"
-        );
-
-        server.abort();
-    }
-
     #[test]
     fn blank_home_overrides_names_only_blank_home_variables() {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
@@ -3618,9 +3523,9 @@ mod tests {
         server.abort();
     }
 
-    /// OMP ranks `--profile` above `OMP_PROFILE`, and a Kiro v3 default-store
-    /// resume drops `KIRO_HOME`, so auto-wire sees what the child will run
-    /// with; everything else in `--env` passes through untouched.
+    /// OMP ranks `--profile` above `OMP_PROFILE`, so auto-wire sees what the
+    /// child will run with; everything else in `--env` passes through
+    /// untouched.
     #[test]
     fn autowire_env_follows_what_the_child_runs_with() {
         let run_env = vec![
@@ -3647,17 +3552,17 @@ mod tests {
         let launch = only(run_env.clone());
 
         let args = [OsString::from("--profile"), OsString::from("work")];
-        let omp = autowire_env(ManagedHarness::Omp, &run_env, &args, None, &launch);
+        let omp = autowire_env(ManagedHarness::Omp, &run_env, &args, &launch);
         assert_eq!(lookup(&omp, "OMP_PROFILE"), ["work"]);
         assert_eq!(lookup(&omp, "KIRO_HOME"), ["/custom"]);
         assert_eq!(lookup(&omp, "FOO"), ["x"]);
         assert_eq!(
-            autowire_env(ManagedHarness::Pi, &run_env, &args, None, &launch),
+            autowire_env(ManagedHarness::Pi, &run_env, &args, &launch),
             run_env,
             "only OMP reads --profile"
         );
         assert_eq!(
-            autowire_env(ManagedHarness::Omp, &run_env, &[], None, &launch),
+            autowire_env(ManagedHarness::Omp, &run_env, &[], &launch),
             run_env
         );
 
@@ -3677,22 +3582,11 @@ mod tests {
             ManagedHarness::Omp,
             &inherited,
             &default_args,
-            None,
             &only(inherited.clone()),
         );
         assert_eq!(
             ai_memory_workstream::omp_agent_dir(home, None, only(wired)).unwrap(),
             home.join(".omp").join("agent")
         );
-
-        let kiro = autowire_env(
-            ManagedHarness::KiroV3,
-            &run_env,
-            &[],
-            Some(Path::new("/home/me/.kiro")),
-            &launch,
-        );
-        assert_eq!(lookup(&kiro, "KIRO_HOME"), ["/home/me/.kiro"]);
-        assert_eq!(lookup(&kiro, "OMP_PROFILE"), ["other"]);
     }
 }
