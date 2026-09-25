@@ -196,13 +196,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context likewise read a whitespace-only `CRUSH_GLOBAL_CONFIG` or
   `XDG_CONFIG_HOME` as a directory, and now falls back to the default global
   config. (#820)
-- `ai-memory uninstall` left `ai-memory run`'s auto-wire sentinels in
-  `<data_dir>/autowire-state/`, so after the hooks were removed the next
-  managed launch of that harness on the same binary version skipped wiring and
-  captured nothing. Removing hooks or MCP (a full uninstall, `--only hooks` or
-  `--only mcp`) now deletes every sentinel and lists them in the dry-run plan.
-  `--only mcp`, `--only instructions` and `--only skills` also no longer delete
-  the stored hook bearer that the still-installed hooks read. (#820)
 - A managed Crush launch with a context packet dropped the `CRUSH.md` and
   `AGENTS.md` Crush loads by default: Crush only adds them while
   `global_context_paths` is empty, and the packet filled it. The launcher now

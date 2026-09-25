@@ -14,9 +14,7 @@ not already wired, so capture and recall work without a separate `install-hooks`
 / `install-mcp` step (a common footgun: `ai-memory run kimi` used to capture
 nothing if the Kimi hooks were never installed). Auto-wire is idempotent and
 one-time per harness, binary version and install location (a second config home,
-such as another `CLAUDE_CONFIG_DIR`, gets its own first launch; `ai-memory
-uninstall` of hooks or MCP clears that record, so the next launch wires again),
-preserves
+such as another `CLAUDE_CONFIG_DIR`, gets its own first launch), preserves
 unrelated user config, runs
 before the harness starts so it picks up the fresh hooks, and is best-effort —
 if an install fails it warns and still launches. Harnesses without installer
