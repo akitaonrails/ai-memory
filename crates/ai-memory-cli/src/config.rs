@@ -771,6 +771,15 @@ pub struct AuthSettings {
     /// `Authorization: Bearer <token>`. Generate one with
     /// `ai-memory generate-auth-token`.
     pub bearer_token: Option<String>,
+    /// Create every new project `restricted` rather than `open` (#708).
+    ///
+    /// Off by default: a new project is open to every authenticated user, as
+    /// every project was before per-project access existed. On, a new project
+    /// admits only its creator — who is granted `write` on it — and root,
+    /// until someone grants others. Existing projects are never changed by
+    /// this; an operator restricts one with `ai-memory project access`. The
+    /// reserved `scratch` and global-preferences projects are always open.
+    pub new_projects_restricted: bool,
     /// Mark the browser session cookie `Secure`. Human authentication on a
     /// non-loopback listener requires this explicit HTTPS reverse-proxy
     /// posture. It may be false only for direct loopback smoke/development.

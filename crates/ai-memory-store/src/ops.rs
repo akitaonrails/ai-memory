@@ -250,12 +250,65 @@ fn warn_project_name_in_other_workspaces(name: &str, also_in: &[String]) {
 
 /// Resolve a project by `(workspace_id, name)`, creating it if missing.
 /// Atomic.
+///
+/// Test-only: the writer creates through [`get_or_create_project_as`], which
+/// applies the server's new-project access mode. This keeps the plain shape
+/// the store's own tests build fixtures with; a new project here is `open`.
+#[cfg(test)]
 pub fn get_or_create_project(
     conn: &mut Connection,
     workspace_id: &ai_memory_core::WorkspaceId,
     name: &str,
     repo_path: Option<&str>,
 ) -> StoreResult<ai_memory_core::ProjectId> {
+    get_or_create_project_as(
+        conn,
+        workspace_id,
+        name,
+        repo_path,
+        None,
+        crate::AccessMode::Open,
+    )
+    .map(|(id, _)| id)
+}
+
+/// The access mode a newly created project starts in.
+///
+/// `default` is the server's `[auth] new_projects_restricted` setting. The
+/// two reserved projects are always open whatever it says: `scratch` is where
+/// every cwd-less event lands, and the global preferences scope is shared by
+/// construction and unioned into everybody's reads.
+pub(crate) fn initial_access_mode(name: &str, default: crate::AccessMode) -> crate::AccessMode {
+    if name == ai_memory_core::DEFAULT_PROJECT_NAME || name == ai_memory_core::GLOBAL_SCOPE_PROJECT
+    {
+        crate::AccessMode::Open
+    } else {
+        default
+    }
+}
+
+/// [`get_or_create_project`] on behalf of a user, reporting whether this call
+/// created the row.
+///
+/// When it does, `creator` is recorded in `projects.created_by` (V69) in the
+/// same transaction as the insert, and the new project starts in the server's
+/// new-project access mode. The choke point admits a project's creator
+/// unconditionally, so a creator can always read back what they just made —
+/// including a hook capture that opens a new restricted project. A caller that
+/// finds the row already there gets no such standing: the choke point then
+/// decides against whoever created it, which is what closes the race between
+/// two users naming the same new project.
+///
+/// # Errors
+/// Propagates SQLite failures.
+pub fn get_or_create_project_as(
+    conn: &mut Connection,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+    repo_path: Option<&str>,
+    creator: Option<ai_memory_core::UserId>,
+    new_project_mode: crate::AccessMode,
+) -> StoreResult<(ai_memory_core::ProjectId, bool)> {
     let repo_path = repo_path.map(normalize_repo_path_key);
     let tx = conn.transaction()?;
     let mut also_in = Vec::new();
@@ -283,6 +336,20 @@ pub fn get_or_create_project(
                 Timestamp::now().as_microsecond()
             ],
         )?;
+        // `open` and no creator are the column defaults, so the insert above
+        // is the one upstream always ran; only what differs needs a write.
+        if initial_access_mode(name, new_project_mode) == crate::AccessMode::Restricted {
+            tx.execute(
+                "UPDATE projects SET access_mode = 'restricted' WHERE id = ?1",
+                params![id.as_bytes()],
+            )?;
+        }
+        if let Some(creator) = creator {
+            tx.execute(
+                "UPDATE projects SET created_by = ?1 WHERE id = ?2",
+                params![creator.as_bytes(), id.as_bytes()],
+            )?;
+        }
         created = true;
         id
     };
@@ -293,6 +360,211 @@ pub fn get_or_create_project(
     if created {
         warn_project_name_in_other_workspaces(name, &also_in);
     }
+    Ok((id, created))
+}
+
+/// How [`resolve_project_by_identity`] reached the project it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityResolution {
+    /// A project already carried this identity.
+    Matched,
+    /// The name-matched project carried no identity and the caller may write
+    /// to it, so it took this one. Existing projects migrate this way.
+    Claimed,
+    /// The name-matched project carried no identity, but the caller may not
+    /// write to it. It is returned unclaimed, for the caller's grant check to
+    /// refuse — never split, which would let the first outsider after an
+    /// upgrade take the identity away from the team whose project it is.
+    Unclaimed,
+    /// No project existed under the name; one was created with the identity.
+    Created,
+    /// The name belonged to a project with a different identity, so a new one
+    /// was created under a distinct name.
+    Split,
+}
+
+impl IdentityResolution {
+    /// Whether this call created the project — and so recorded its creator.
+    #[must_use]
+    pub fn created(self) -> bool {
+        matches!(self, Self::Created | Self::Split)
+    }
+}
+
+/// Resolve the project a repository identity routes to, creating it if
+/// needed, in one transaction (#708).
+///
+/// 1. A project in the workspace already carrying `identity` wins, whatever
+///    it is called.
+/// 2. Otherwise the candidate is `candidate` (the cwd-prefix parent the hook
+///    router found) or the project named `name`:
+///    - none → create `name` with the identity;
+///    - it carries no identity → claim it when `creator` may write to it (or
+///      there is no creator: no database users, or root), else
+///      return it unclaimed;
+///    - it carries a different identity → create a new project named from
+///      the identity ([`ai_memory_core::repository_identity::split_name_base`],
+///      then `-2`, `-3`, …).
+///
+/// An identity already on a project is never overwritten. A created project
+/// records its creator in `created_by`, as [`get_or_create_project_as`] does. A
+/// split
+/// project gets no `repo_path`: the path belongs to the project the name
+/// matched, and sharing it would let prefix matching route that project's
+/// other captures here.
+///
+/// # Errors
+/// Propagates SQLite failures.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_project_by_identity(
+    conn: &mut Connection,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    identity: &ai_memory_core::repository_identity::RepositoryIdentity,
+    name: &str,
+    repo_path: Option<&str>,
+    candidate: Option<ai_memory_core::ProjectId>,
+    creator: Option<ai_memory_core::UserId>,
+    new_project_mode: crate::AccessMode,
+) -> StoreResult<(ai_memory_core::ProjectId, IdentityResolution)> {
+    let repo_path = repo_path.map(normalize_repo_path_key);
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+
+    let matched: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM projects WHERE workspace_id = ?1 AND identity = ?2",
+            params![workspace_id.as_bytes(), identity.identity],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let (id, resolution) = if let Some(bytes) = matched {
+        (
+            ai_memory_core::ProjectId::from_slice(&bytes)?,
+            IdentityResolution::Matched,
+        )
+    } else {
+        let candidate_row: Option<(Vec<u8>, String)> = match candidate {
+            Some(candidate) => tx
+                .query_row(
+                    "SELECT id, identity FROM projects WHERE workspace_id = ?1 AND id = ?2",
+                    params![workspace_id.as_bytes(), candidate.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?,
+            None => tx
+                .query_row(
+                    "SELECT id, identity FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                    params![workspace_id.as_bytes(), name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?,
+        };
+        match candidate_row {
+            None => {
+                let id = insert_project_with_identity(
+                    &tx,
+                    workspace_id,
+                    name,
+                    repo_path.as_deref(),
+                    identity,
+                    initial_access_mode(name, new_project_mode),
+                    creator,
+                    now,
+                )?;
+                (id, IdentityResolution::Created)
+            }
+            Some((bytes, held)) if held.is_empty() => {
+                let id = ai_memory_core::ProjectId::from_slice(&bytes)?;
+                // The same decision the choke point makes, on this
+                // transaction, so the claim cannot race a grant change.
+                let may_write = match creator {
+                    None => true,
+                    Some(user) => crate::project_authz::resolve_project_authz(
+                        &tx,
+                        *workspace_id,
+                        id,
+                        &crate::ProjectPrincipal::user(user),
+                        true,
+                    )?
+                    .authorize(crate::ProjectAccess::Write)
+                    .is_ok(),
+                };
+                if may_write {
+                    tx.execute(
+                        "UPDATE projects SET identity = ?1, identity_source = ?2 WHERE id = ?3",
+                        params![identity.identity, identity.source.as_str(), id.as_bytes()],
+                    )?;
+                    (id, IdentityResolution::Claimed)
+                } else {
+                    (id, IdentityResolution::Unclaimed)
+                }
+            }
+            Some(_) => {
+                let base = ai_memory_core::repository_identity::split_name_base(&identity.identity);
+                let mut split_name = base.clone();
+                let mut n = 2_u32;
+                while tx
+                    .query_row(
+                        "SELECT 1 FROM projects WHERE workspace_id = ?1 AND name = ?2",
+                        params![workspace_id.as_bytes(), split_name],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some()
+                {
+                    split_name = format!("{base}-{n}");
+                    n += 1;
+                }
+                let id = insert_project_with_identity(
+                    &tx,
+                    workspace_id,
+                    &split_name,
+                    None,
+                    identity,
+                    initial_access_mode(&split_name, new_project_mode),
+                    creator,
+                    now,
+                )?;
+                (id, IdentityResolution::Split)
+            }
+        }
+    };
+    tx.commit()?;
+    if resolution.created() && scheduler_state_table_exists(conn)? {
+        crate::auto_improve::ensure_scheduler_state(conn, *workspace_id, id)?;
+    }
+    Ok((id, resolution))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_project_with_identity(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+    repo_path: Option<&str>,
+    identity: &ai_memory_core::repository_identity::RepositoryIdentity,
+    mode: crate::AccessMode,
+    creator: Option<ai_memory_core::UserId>,
+    now: i64,
+) -> StoreResult<ai_memory_core::ProjectId> {
+    let id = ai_memory_core::ProjectId::new();
+    tx.execute(
+        "INSERT INTO projects \
+         (id, workspace_id, name, repo_path, created_at, identity, identity_source, access_mode, \
+          created_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id.as_bytes(),
+            workspace_id.as_bytes(),
+            name,
+            repo_path,
+            now,
+            identity.identity,
+            identity.source.as_str(),
+            mode.as_str(),
+            creator.map(|creator| creator.as_bytes().to_vec()),
+        ],
+    )?;
     Ok(id)
 }
 
@@ -4425,37 +4697,6 @@ pub fn purge_session(
     })
 }
 
-/// Delete a project's rows inside one transaction.
-///
-/// This is a *logical* delete unless `compaction` is [`Compaction::Reclaim`].
-/// The rows are gone and nothing reaches them through the API or search, but
-/// their bytes remain in free pages of the database file until it is
-/// rewritten — as with any SQLite delete. Neither mode is forensic erasure:
-/// the wiki git history and any earlier backup still hold the content.
-///
-/// Execution order:
-/// 1. Count rows in each dependent table (pages/all versions, sessions,
-///    observations, handoffs, embeddings) before the delete so we can
-///    report how many rows were removed.
-/// 2. Collect all distinct page paths stored under the project — these are
-///    the on-disk files the caller must clean up after this function returns.
-/// 3. DELETE FROM projects WHERE id = ? — the ON DELETE CASCADE clauses in
-///    V01 + V02 propagate the delete to pages, sessions, observations,
-///    handoffs, and page_embeddings automatically.
-/// 4. Commit and return the [`PurgeSummary`].
-///
-/// The `workspace_project_label` string is passed in by the caller (the
-/// admin handler has the human-readable names; the writer only has IDs) and
-/// forwarded verbatim into [`PurgeSummary::label`] for logging.
-///
-/// `force` overrides the live-managed-run guard (step 0): `workstreams`
-/// cascades out of `projects`, so purging a scope whose lease is still live
-/// would delete the lease row out from under a running agent.
-///
-/// # Errors
-/// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
-/// still live and `force` is false, or [`StoreError`] if any SQL statement
-/// fails. The transaction is rolled back automatically on error.
 /// Whether `(workspace_id, project_id)` — or the whole workspace — was purged
 /// and tombstoned by [`purge_project`] / [`delete_workspace`] (#607).
 ///
@@ -4589,6 +4830,37 @@ pub fn clear_bootstrap_progress(conn: &Connection, fingerprint: &str) -> StoreRe
     Ok(())
 }
 
+/// Delete a project's rows inside one transaction.
+///
+/// This is a *logical* delete unless `compaction` is [`Compaction::Reclaim`].
+/// The rows are gone and nothing reaches them through the API or search, but
+/// their bytes remain in free pages of the database file until it is
+/// rewritten — as with any SQLite delete. Neither mode is forensic erasure:
+/// the wiki git history and any earlier backup still hold the content.
+///
+/// Execution order:
+/// 1. Count rows in each dependent table (pages/all versions, sessions,
+///    observations, handoffs, embeddings) before the delete so we can
+///    report how many rows were removed.
+/// 2. Collect all distinct page paths stored under the project — these are
+///    the on-disk files the caller must clean up after this function returns.
+/// 3. DELETE FROM projects WHERE id = ? — the ON DELETE CASCADE clauses in
+///    V01 + V02 propagate the delete to pages, sessions, observations,
+///    handoffs, and page_embeddings automatically.
+/// 4. Commit and return the [`PurgeSummary`].
+///
+/// The `workspace_project_label` string is passed in by the caller (the
+/// admin handler has the human-readable names; the writer only has IDs) and
+/// forwarded verbatim into [`PurgeSummary::label`] for logging.
+///
+/// `force` overrides the live-managed-run guard (step 0): `workstreams`
+/// cascades out of `projects`, so purging a scope whose lease is still live
+/// would delete the lease row out from under a running agent.
+///
+/// # Errors
+/// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
+/// still live and `force` is false, or [`StoreError`] if any SQL statement
+/// fails. The transaction is rolled back automatically on error.
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -4975,6 +5247,13 @@ pub fn move_project_workspace(
         "UPDATE handoffs SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
     )? as u64;
+    // Grants carry the workspace in their key (#708). A grant left on the old
+    // workspace would point at a pair that no longer exists, and deleting that
+    // workspace would cascade it away from a project that still exists.
+    tx.execute(
+        "UPDATE project_grants SET workspace_id = ?1 WHERE project_id = ?2",
+        params![&to[..], &pid[..]],
+    )?;
     let audit_log_moved = tx.execute(
         "UPDATE audit_log SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],

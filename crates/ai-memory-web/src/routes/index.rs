@@ -11,12 +11,17 @@ use crate::state::WebState;
 use crate::templates::{OkfDialog, ProjectCard, ProjectsView, humanize, project_href};
 
 /// Handler for `GET /`.
+///
+/// Lists only the repositories the viewer may read once authorization is on
+/// (#708): the card grid is a list of repository names, and a name is itself
+/// what a team from another organisation must not see.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
 ) -> Result<Html<String>, StatusCode> {
     let summaries = state
         .reader
-        .list_projects_with_stats()
+        .list_projects_with_stats(viewer.map(|axum::Extension(viewer)| viewer.user()))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

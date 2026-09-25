@@ -961,4 +961,63 @@ mod tests {
         assert!(after.contains("superseded_at IS NOT NULL"), "{after}");
         assert!(!after.contains("supersedes IS NULL"), "{after}");
     }
+
+    /// Upstream's `UNIQUE (workspace_id, name)` is case-sensitive, so one
+    /// workspace may hold both `API` and `api`. The identity index is on
+    /// case-folded values, and backfilling `lower(name)` into it failed the
+    /// whole upgrade on such an install. Looked up by name, not number: this
+    /// migration is renumbered on every upstream sync that adds one of its own.
+    #[test]
+    fn project_identity_upgrades_a_workspace_with_names_differing_only_in_case() {
+        let identity_version = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|m| m.name() == "project_identity")
+            .map(refinery::Migration::version)
+            .expect("the project_identity migration is embedded");
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, identity_version - 1).unwrap();
+        let workspace_id = [7_u8; 16];
+        conn.execute(
+            "INSERT INTO workspaces (id, name, created_at) VALUES (?1, 'acme', 1)",
+            params![workspace_id.as_slice()],
+        )
+        .unwrap();
+        for (id, name) in [([1_u8; 16], "API"), ([2_u8; 16], "api")] {
+            conn.execute(
+                "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, ?3, 1)",
+                params![id.as_slice(), workspace_id.as_slice(), name],
+            )
+            .unwrap();
+        }
+
+        run(&mut conn).expect("names differing only in case must not fail the upgrade");
+
+        // Both projects survive, and neither is claimed: which one a future
+        // `api/` checkout resolves to is not the migration's decision.
+        let unclaimed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE identity = '' AND identity_source = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unclaimed, 2);
+
+        // The index still does its job once the resolver claims an identity.
+        conn.execute(
+            "UPDATE projects SET identity = 'api', identity_source = 'folder_name' WHERE name = 'api'",
+            [],
+        )
+        .unwrap();
+        let duplicate = conn.execute(
+            "UPDATE projects SET identity = 'api', identity_source = 'folder_name' WHERE name = 'API'",
+            [],
+        );
+        assert!(
+            duplicate.is_err(),
+            "a claimed identity must stay unique per workspace"
+        );
+    }
 }

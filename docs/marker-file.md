@@ -57,7 +57,9 @@ hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
 `project_strategy`, `drop_subagent`, `default_global`, `briefing`, and
 `briefing_budget` query params to the server when a marker declares them;
 handoff lookup also sends `cwd` when no marker exists so the default
-`project = basename(cwd)` route works consistently.
+`project = basename(cwd)` route works consistently. Every client also sends
+`identity` / `identity_src` when the checkout has a repository identity (see
+[Repository identity](#repository-identity)), with or without a marker.
 
 ## Schema
 
@@ -75,6 +77,15 @@ project = "pe-portais"
 # linked worktrees and subdirectories share one project. Ignored when
 # `project` is present.
 project_strategy = "repo-root"
+
+# Optional. Pin this checkout's repository identity: the key its captures
+# route by, whatever the folder is called and wherever it is checked out.
+# Outranks `project` and the git remote. Use it for a directory with no
+# remote that must not collide with every other folder of the same name,
+# for two checkouts that should share one memory, or for a monorepo
+# subdirectory that deserves its own. Case-folded. See "Repository
+# identity" below.
+identity = "acme/platform"
 
 # Optional. Opt this project into drop_subagent_captures: set it to "true"
 # and the server accepts but does NOT store this project's subagent-session
@@ -359,6 +370,42 @@ so the worktree has no `.ai-memory.toml` ancestor of its own) and even
 when the server runs in a container that cannot see the host checkout.
 Put the marker anywhere on the walk-up path from the worktree — commonly
 a single `~/.ai-memory.toml` — to select the strategy.
+
+### Repository identity
+
+A project's name comes from its folder, and folder names collide: two
+unrelated repositories both checked out as `api/` would otherwise share one
+project. On a server with per-project grants (#708) that means one grant, so
+every client resolves a **repository identity** for the checkout and sends it
+with each event. The first rung that yields one wins:
+
+1. `identity = "…"` in the marker;
+2. `project = "…"` in the marker;
+3. the `upstream` git remote, else `origin`, normalised
+   (`git@github.com:Acme/API.git` → `github.com/acme/api`);
+4. the folder name.
+
+Only rungs 1 and 3 change routing. A declared `project` routes by name as it
+always has — a statement outranks the remote, so a fork whose marker names
+its own project is never filed under the repository it forked from — and a
+bare folder name routes exactly as before. What routes by identity is an
+undeclared checkout with a remote, or a checkout with an explicit
+`identity`:
+
+- The project already carrying the identity wins, whatever it is called:
+  `~/work/api` and `~/dev/acme-api`, both cloned from `github.com/acme/api`,
+  are one project.
+- An existing project with that name and no identity yet is **claimed in
+  place** by the first capture that may write to it, so upgrading moves no
+  memory.
+- If the name already belongs to a different identity, the new repository
+  gets its own project, named from its owner (`github.com/orgb/api` →
+  `orgb-api`, then `orgb-api-2`, …).
+
+The remote is normalised on the host, so credentials embedded in a remote
+URL never leave the machine. Other remote names (`fork`, `mine`) are
+ignored on purpose: they differ per person, and would give one repository a
+different identity for each of them.
 
 ### Single workspace, no per-repo overrides
 

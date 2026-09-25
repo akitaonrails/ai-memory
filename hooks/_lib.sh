@@ -80,7 +80,7 @@ ai_memory_parse_toml_flag() {
 ai_memory_marker_declares_settings() {
     file="$1"
     [ -f "$file" ] || return 1
-    for key in workspace project project_strategy drop_subagent_captures; do
+    for key in workspace project project_strategy drop_subagent_captures identity; do
         [ -n "$(ai_memory_parse_toml_key "$file" "$key")" ] && return 0
     done
     for key in default_global inject_on_session_start max_chars; do
@@ -293,6 +293,89 @@ ai_memory_repo_root_project() {
     basename "$root"
 }
 
+# Normalise a git remote URL ("$1") into a repository identity, or print
+# nothing when it names no network-reachable repository (a local path, a bare
+# host). Port of `normalize_remote_url` in
+# crates/ai-memory-core/src/repository_identity.rs, checked against the same
+# fixture (crates/ai-memory-core/fixtures/remote_identity_cases.json) so the
+# two cannot drift. Credentials are dropped here, on the host, so they never
+# reach the server. Variables are prefixed: POSIX functions share the
+# caller's scope.
+ai_memory_normalize_remote() {
+    _ai_rn_raw=$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    [ -n "$_ai_rn_raw" ] || return 0
+    case "$_ai_rn_raw" in
+        *://*)
+            _ai_rn_has_scheme=1
+            _ai_rn_scheme=$(printf '%s' "${_ai_rn_raw%%://*}" | tr '[:upper:]' '[:lower:]')
+            _ai_rn_rest=${_ai_rn_raw#*://}
+            ;;
+        *)
+            _ai_rn_has_scheme=""
+            _ai_rn_scheme=""
+            _ai_rn_rest=$_ai_rn_raw
+            ;;
+    esac
+    [ "$_ai_rn_scheme" = "file" ] && return 0
+    # Credentials: everything up to the LAST `@` before the path.
+    _ai_rn_auth=${_ai_rn_rest%%/*}
+    _ai_rn_tail=${_ai_rn_rest#"$_ai_rn_auth"}
+    case "$_ai_rn_auth" in *@*) _ai_rn_auth=${_ai_rn_auth##*@} ;; esac
+    _ai_rn_hp="$_ai_rn_auth$_ai_rn_tail"
+    if [ -n "$_ai_rn_has_scheme" ]; then
+        _ai_rn_host=${_ai_rn_hp%%/*}
+        case "$_ai_rn_hp" in */*) _ai_rn_path=${_ai_rn_hp#*/} ;; *) _ai_rn_path="" ;; esac
+        case "$_ai_rn_host" in
+            *:*)
+                case "${_ai_rn_host##*:}" in
+                    *[!0-9]*) ;;
+                    *) _ai_rn_host=${_ai_rn_host%:*} ;;
+                esac
+                ;;
+        esac
+        [ -n "$_ai_rn_host" ] && [ -n "$_ai_rn_path" ] || return 0
+    else
+        # scp-like `host:path`, or a filesystem path: a `:` before any `/`.
+        case "$_ai_rn_hp" in *:*) ;; *) return 0 ;; esac
+        _ai_rn_host=${_ai_rn_hp%%:*}
+        case "$_ai_rn_host" in */*) return 0 ;; esac
+        _ai_rn_path=${_ai_rn_hp#*:}
+        # A one-character host is a Windows drive letter.
+        [ "${#_ai_rn_host}" -gt 1 ] && [ -n "$_ai_rn_path" ] || return 0
+        case "$_ai_rn_path" in *\\*) return 0 ;; esac
+    fi
+    _ai_rn_id=$(printf '%s/%s' "$_ai_rn_host" "$_ai_rn_path" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's#/*$##' -e 's#\.git$##' -e 's#/*$##' -e 's#//*#/#g')
+    case "$_ai_rn_id" in */*) printf '%s' "$_ai_rn_id" ;; esac
+}
+
+# Print `&identity=<v>&identity_src=<rung>` for the checkout at "$1", or
+# nothing. "$2" is the marker's `identity`, "$3" its declared `project`.
+# Mirrors `repository_identity` in hook_capture.rs: an explicit identity is
+# sent; a declared project outranks the remote and routes by name, so git is
+# not consulted; otherwise the `upstream` remote, else `origin`.
+ai_memory_identity_qs() {
+    _ai_id_cwd="$1"; _ai_id_explicit="$2"; _ai_id_project="$3"
+    _ai_id_explicit=$(printf '%s' "$_ai_id_explicit" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [ -n "$_ai_id_explicit" ]; then
+        _ai_id_value=$(printf '%s' "$_ai_id_explicit" | tr '[:upper:]' '[:lower:]')
+        printf '&identity=%s&identity_src=explicit' "$(ai_memory_url_encode "$_ai_id_value")"
+        return 0
+    fi
+    [ -n "$(printf '%s' "$_ai_id_project" | tr -d '[:space:]')" ] && return 0
+    [ -n "$_ai_id_cwd" ] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+    for _ai_id_remote in upstream origin; do
+        _ai_id_url=$(git -C "$_ai_id_cwd" config --get "remote.$_ai_id_remote.url" 2>/dev/null) || continue
+        _ai_id_value=$(ai_memory_normalize_remote "$_ai_id_url")
+        if [ -n "$_ai_id_value" ]; then
+            printf '&identity=%s&identity_src=git_remote' "$(ai_memory_url_encode "$_ai_id_value")"
+            return 0
+        fi
+    done
+}
+
 # Build a query-string suffix from "$1" plus any marker file walked up from
 # it. Returns the suffix with the leading `&`, or nothing when cwd is absent.
 # `cwd` is always included so `GET /handoff` resolves the same basename project
@@ -312,6 +395,7 @@ ai_memory_marker_qs() {
     # deliberate marker rescope from a host-derived repo-root name. Only the
     # latter may yield to session-sticky attribution (#394).
     ps=""
+    idn=""
     # The nearest marker that declares more than `[capture]` (#668): a nested
     # capture-only marker (e.g. one that only sets ignore_paths) must not
     # shadow an outer marker's workspace/project/etc.
@@ -321,8 +405,12 @@ ai_memory_marker_qs() {
         pr=$(ai_memory_parse_toml_key "$marker" project)
         st=$(ai_memory_parse_toml_key "$marker" project_strategy)
         ds=$(ai_memory_parse_toml_key "$marker" drop_subagent_captures)
+        idn=$(ai_memory_parse_toml_key "$marker" identity)
         [ -n "$pr" ] && ps="marker"
     fi
+    # Before repo-root can fill `pr`: a repo-root name is an inference, while
+    # the identity chain's declared-project rung means a name in the marker.
+    iq=$(ai_memory_identity_qs "$cwd" "$idn" "$pr")
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
     # pinned one. A marker's explicit project / project_strategy still win.
@@ -347,6 +435,7 @@ ai_memory_marker_qs() {
     [ -n "$pr" ] && qs="${qs}&project=$(ai_memory_url_encode "$pr")"
     [ -n "$ps" ] && qs="${qs}&project_src=$(ai_memory_url_encode "$ps")"
     [ -n "$st" ] && qs="${qs}&project_strategy=$(ai_memory_url_encode "$st")"
+    qs="${qs}${iq}"
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     [ -n "$ds" ] && qs="${qs}&drop_subagent=$(ai_memory_url_encode "$ds")"

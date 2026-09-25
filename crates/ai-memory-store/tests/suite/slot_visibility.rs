@@ -349,6 +349,7 @@ async fn briefing_slots_follow_the_same_visibility_rule() {
                 10,
                 ai_memory_core::OwnerFilter::Any,
                 &mine,
+                None,
             )
             .await
             .unwrap(),
@@ -412,6 +413,7 @@ async fn recent_pages_hide_other_operators_personal_slots() {
             100,
             ai_memory_core::OwnerFilter::Any,
             &mine,
+            None,
         )
         .await
         .unwrap()

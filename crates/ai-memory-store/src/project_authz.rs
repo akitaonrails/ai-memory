@@ -7,12 +7,12 @@
 //! (the one place every scoped MCP/API/web path funnels through) and by the
 //! writer actor as defense in depth for writes.
 //!
-//! ## Ship inert (slice 2)
+//! ## Open until an operator restricts
 //!
 //! The V68 schema is additive and every project defaults to `open`, so this is a
-//! pure pass-through until an operator opts a project into `restricted` (a
-//! follow-up slice adds the management surface). The gate short-circuits to
-//! ALLOW for:
+//! pure pass-through until the root operator opts a project into `restricted`
+//! (`ai-memory project access`), or sets `[auth] new_projects_restricted`. The
+//! gate short-circuits to ALLOW for:
 //! - a deployment that does not distinguish operators (single-user / loopback),
 //!   where there is no notion of "another user" to gate against, and
 //! - any `open` project.
@@ -114,10 +114,11 @@ pub enum ProjectAccess {
 
 /// The caller, reduced to the facts the gate needs.
 ///
-/// Root and creator are supplied by the auth layer; the grant is looked up from
-/// `project_grants` by [`Self::user_id`]. No `projects.created_by` column exists
-/// yet, so `is_creator` is threaded through the type for complete, testable
-/// semantics and populated by the management surface in a follow-up slice.
+/// Root is supplied by the auth layer; the grant is looked up from
+/// `project_grants` by [`Self::user_id`]. The creator is derived per project
+/// from `projects.created_by` (V69) when [`resolve_project_authz`] runs, so a
+/// principal built once per request is right for every project it reaches;
+/// [`Self::is_creator`] only forces it on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectPrincipal {
     /// Authenticated as the configured root operator.
@@ -147,6 +148,17 @@ impl ProjectPrincipal {
             is_root: true,
             is_creator: false,
             user_id: None,
+        }
+    }
+
+    /// A database user: not root, and the creator only of the projects whose
+    /// `created_by` names them.
+    #[must_use]
+    pub fn user(user_id: UserId) -> Self {
+        Self {
+            is_root: false,
+            is_creator: false,
+            user_id: Some(user_id),
         }
     }
 }
@@ -211,22 +223,31 @@ pub fn authorize_project(ctx: &ProjectAuthz, need: ProjectAccess) -> Result<(), 
     ctx.authorize(need)
 }
 
-/// Read `projects.access_mode`, degrading to [`AccessMode::Open`] on any read
-/// failure and for an unknown project. Never fails closed.
-fn read_access_mode(conn: &Connection, project_id: ProjectId) -> AccessMode {
+/// Read `projects.access_mode` and `projects.created_by`, degrading to
+/// [`AccessMode::Open`] with no creator on any read failure and for an unknown
+/// project. Never fails closed.
+fn read_project_row(conn: &Connection, project_id: ProjectId) -> (AccessMode, Option<UserId>) {
     match conn.query_row(
-        "SELECT access_mode FROM projects WHERE id = ?1",
+        "SELECT access_mode, created_by FROM projects WHERE id = ?1",
         params![project_id.as_bytes()],
-        |row| row.get::<_, Option<String>>(0),
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+            ))
+        },
     ) {
-        Ok(value) => AccessMode::from_db(value.as_deref()),
-        Err(rusqlite::Error::QueryReturnedNoRows) => AccessMode::Open,
+        Ok((mode, creator)) => (
+            AccessMode::from_db(mode.as_deref()),
+            creator.and_then(|raw| UserId::from_slice(&raw).ok()),
+        ),
+        Err(rusqlite::Error::QueryReturnedNoRows) => (AccessMode::Open, None),
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 "could not read projects.access_mode; degrading project authz to open",
             );
-            AccessMode::Open
+            (AccessMode::Open, None)
         }
     }
 }
@@ -257,7 +278,9 @@ fn read_grant(
 
 /// Resolve the full [`ProjectAuthz`] for a project from a live connection.
 ///
-/// `open` short-circuits without touching `project_grants`. A `restricted`
+/// `open` short-circuits without touching `project_grants`. The caller is the
+/// creator when [`ProjectPrincipal::is_creator`] says so or the project's
+/// `created_by` is their [`ProjectPrincipal::user_id`]. A `restricted`
 /// project whose grants cannot be read degrades to `open` with a warning rather
 /// than denying every caller (#678).
 ///
@@ -271,7 +294,8 @@ pub fn resolve_project_authz(
     principal: &ProjectPrincipal,
     distinguishes_operators: bool,
 ) -> StoreResult<ProjectAuthz> {
-    let mut access_mode = read_access_mode(conn, project_id);
+    let (mut access_mode, creator) = read_project_row(conn, project_id);
+    let is_creator = principal.is_creator || (creator.is_some() && creator == principal.user_id);
     let grant = if access_mode == AccessMode::Restricted {
         match principal.user_id {
             Some(user_id) => match read_grant(conn, workspace_id, project_id, user_id) {
@@ -296,7 +320,7 @@ pub fn resolve_project_authz(
         distinguishes_operators,
         access_mode,
         is_root: principal.is_root,
-        is_creator: principal.is_creator,
+        is_creator,
         grant,
     })
 }

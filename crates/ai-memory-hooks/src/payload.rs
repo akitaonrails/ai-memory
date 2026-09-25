@@ -89,6 +89,14 @@ pub struct HookQuery {
     /// `.ai-memory.toml` named it, `repo-root` when the host hook derived it
     /// from the enclosing checkout. Absent on older clients (#394).
     pub project_src: Option<String>,
+    /// Repository identity the client resolved for this checkout (#708):
+    /// an explicit marker `identity`, or a normalised git remote. Paired
+    /// with `identity_src`. Absent on older clients and for checkouts that
+    /// declare a `project`, which keep routing by name.
+    pub identity: Option<String>,
+    /// Which rung produced `identity`: `explicit` or `git_remote`. Anything
+    /// else, or a malformed identity, is ignored and the event routes by name.
+    pub identity_src: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -117,6 +125,10 @@ pub struct HookEnvelope {
     /// Where `project_override` came from. Always [`ProjectSource::Unspecified`]
     /// when there is no override, so the two can never disagree (#394).
     pub project_source: ProjectSource,
+    /// Repository identity from the client, already validated by
+    /// [`ai_memory_core::repository_identity::accept_wire_identity`]. `None`
+    /// routes by project name, as every event did before identities existed.
+    pub identity: Option<ai_memory_core::repository_identity::RepositoryIdentity>,
     /// Whether this project opted into `drop_subagent_captures` via its
     /// `.ai-memory.toml` (forwarded as the `drop_subagent` query flag). The
     /// ingest router consults this per-event so the drop is scoped to the
@@ -164,6 +176,7 @@ impl std::fmt::Debug for HookEnvelope {
             .field("workspace_override", &self.workspace_override)
             .field("project_override", &self.project_override)
             .field("project_strategy", &self.project_strategy)
+            .field("identity", &self.identity)
             .field("drop_subagent_requested", &self.drop_subagent_requested)
             .field(
                 "recall_default_global_requested",
@@ -502,6 +515,12 @@ impl HookEnvelope {
         } else {
             ProjectSource::Unspecified
         };
+        let identity = match (query.identity.as_deref(), query.identity_src.as_deref()) {
+            (Some(identity), Some(source)) => {
+                ai_memory_core::repository_identity::accept_wire_identity(identity, source)
+            }
+            _ => None,
+        };
         let drop_subagent_requested = query_flag_truthy(query.drop_subagent.as_deref());
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
@@ -563,6 +582,7 @@ impl HookEnvelope {
             project_override,
             project_strategy,
             project_source,
+            identity,
             drop_subagent_requested,
             recall_default_global_requested,
             all_owners_requested,

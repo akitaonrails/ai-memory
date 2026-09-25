@@ -285,7 +285,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 
 | Table | What |
 |---|---|
-| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. |
+| `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by — an explicit marker `identity` or a normalised git remote, resolved client-side — unique per workspace when set; empty until a capture claims the project. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68) reach it, decided by `ai_memory_store::authorize_project` — `docs/users.md#per-project-access`. |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
@@ -543,6 +543,7 @@ upgrade              auth                 user
 completions          handoffs             purge-session
 compact              api-key              export-okf
 message              doctor               backfill
+project
 ```
 
 Run `ai-memory --help` for the full tree.

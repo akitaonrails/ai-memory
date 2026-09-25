@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `identity = "…"` in `.ai-memory.toml` pins the repository identity a
+  checkout's captures route by, outranking `project` and the git remote — see
+  [marker-file.md](docs/marker-file.md#repository-identity). (#708)
 - The builtin web UI has a root-only `/web/pending` page to triage pending
   auto-improvement proposals. It lists the proposals of all projects, with a
   project filter and a sort, and shows the rationale and the proposed body.
@@ -28,6 +31,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `restricted` yet, this is a pure pass-through; enforcing `restricted` across
   the unscoped-read and raw-id bypass classes plus the root-only management
   surface (setting `restricted`, issuing grants) follow in a later slice. (#708)
+- Per-project authorization is enforced (second slice of #708, completing
+  [`design-per-project-authz.md`](docs/design-per-project-authz.md)). A
+  `restricted` project admits root, its creator and grant holders; `open`, the
+  default and what every existing project stays after upgrading, admits any
+  authenticated user exactly as before. Every surface attaches the choke point
+  for database users — MCP tools, hook routes and captures, the web UI and
+  `/api/v1` — and read-shaped tools that mutate (delete, feedback, sweep, lint,
+  auto-improve, handoff accept/cancel, message pop/cancel) need `write`.
+  Unscoped reads — search, listings, the graph and the workspace overview —
+  leave out projects a user may not read, filtered in the query before
+  `LIMIT`; managed-run, workstream and session-id entry points authorize the
+  project the id resolves to. A refusal is a 403 naming the project and the
+  level needed, never an empty result. Installs with no database users, and
+  the root token, are never checked. (#708)
+- `projects.created_by` (V69) records the database user whose call created a
+  project, and the choke point derives "creator" from it, so a creator keeps
+  their project if it is later restricted, without a grant. Projects that
+  predate it have no recorded creator. (#708)
+- Root-only management of access and grants:
+  `ai-memory project access --workspace W --project P --mode open|restricted`
+  (`POST /admin/projects/access`) — restricting names the page authors it now
+  refuses and grants nobody automatically;
+  `ai-memory user grant --user U --workspace W --project P --level read|write`,
+  `ai-memory user revoke …`, `ai-memory user grants [--user U]` and
+  `ai-memory project grants --workspace W --project P`
+  (`POST /admin/users/{username}/grant|revoke`,
+  `GET /admin/users/{username}/grants`, `GET /admin/projects/grants`). Every
+  grant, level change and revoke is recorded in `audit_log`
+  (`grant_access` / `revoke_access`). (#708)
+- `[auth] new_projects_restricted` (`AI_MEMORY_AUTH__NEW_PROJECTS_RESTRICTED`),
+  default `false`: when set, every project created from then on starts
+  `restricted`. The reserved `scratch` project and the global preferences scope
+  always start open; the global scope cannot be restricted. (#708)
+- Cross-project messages respect access: sending into a restricted project's
+  inbox, popping it and cancelling its outbox need `write` on it; listing needs
+  `read`. (#708)
 - Native `ai-memory upgrade` for GitHub-release installs (Linux/macOS
   tarballs and Windows x86_64 zip): downloads the matching release archive,
   verifies the `.sha256` sidecar, replaces the on-disk binary (and a sibling
@@ -161,6 +200,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   git-tracked session page. (#865)
 
 ### Changed
+- Captures from a checkout with no declared `project` and a git remote now route
+  by the repository's identity — the normalised `upstream` remote, else `origin`
+  — instead of the folder name (`projects.identity`, V70). Two unrelated
+  repositories sharing a folder name now get two projects (the second named
+  after its owner, e.g. `orgb-api`); one repository cloned into differently
+  named folders converges on one project, the first to claim the identity —
+  an existing second project keeps its history but stops receiving captures.
+  Existing projects are claimed in place, so upgrading moves no memory, and a
+  user who may not write to a project cannot claim its identity. Checkouts
+  that declare `project` in their marker route by name exactly as before. Every
+  hook client (native, shell, PowerShell, TypeScript) resolves the identity
+  host-side and sends it as `identity` / `identity_src`; credentials in a remote
+  URL never leave the machine. (#708)
+- A capture into a project its author may not write is dropped server-side
+  and counted as `dropped_unauthorized` in status, never stored. The native
+  hook client treats a 403 from the server as final and drops the event
+  instead of retrying it. (#708)
 - Grok Build CLI shows a pending handoff, and an opted-in `[briefing]`, as
   `PostToolUse` `additionalContext` on the first tool of a session.
   `SessionStart` and `UserPromptSubmit` still do not accept the handoff (Grok

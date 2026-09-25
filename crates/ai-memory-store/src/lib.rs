@@ -20,6 +20,7 @@ pub mod belief;
 pub mod decay;
 mod error;
 mod fts_query;
+mod grants;
 mod maintenance;
 mod migrations;
 mod ops;
@@ -53,10 +54,11 @@ pub use decay::{
     salience_after_feedback,
 };
 pub use error::{StoreError, StoreResult};
+pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DeleteWorkspaceSummary,
-    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission,
+    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IdentityResolution,
     IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
     MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
     PAGE_WINDOW_BACKFILL_BATCH, PageWindowBackfillSummary, PagesMode, PurgeSessionSummary,
@@ -83,9 +85,10 @@ pub use reader::{
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, ScopeSource,
-    WORKSPACE_PROJECT_PAIR_REQUIRED, create_explicit_scope, create_global_scope,
-    lookup_existing_scope, lookup_existing_workspace, lookup_global_scope,
-    resolve_many_existing_scopes,
+    WORKSPACE_PROJECT_PAIR_REQUIRED, authorize_scope_for, create_explicit_scope,
+    create_explicit_scope_guarded, create_global_scope, lookup_existing_scope,
+    lookup_existing_scope_guarded, lookup_existing_workspace, lookup_global_scope,
+    resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{
@@ -1946,7 +1949,7 @@ mod tests {
         store.writer.upsert_page(dep).await.unwrap();
 
         // Graph: exactly one resolved cross-project edge, app -> infra.
-        let edges = store.reader.cross_project_edges(None).await.unwrap();
+        let edges = store.reader.cross_project_edges(None, None).await.unwrap();
         assert_eq!(edges.len(), 1, "one resolved cross-project edge");
         assert_eq!(edges[0].from_project, "app");
         assert_eq!(edges[0].to_project, "infra");
@@ -2242,7 +2245,11 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = store.reader.search_pages("quick".into(), 10).await.unwrap();
+        let hits = store
+            .reader
+            .search_pages("quick".into(), 10, None)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "alpha.md");
         assert!(hits[0].snippet.contains("<mark>quick</mark>"));
@@ -2264,7 +2271,11 @@ mod tests {
         assert_eq!(counts.pages_latest, 1);
         assert_eq!(counts.pages_all, 2);
 
-        let hits = store.reader.search_pages("quick".into(), 10).await.unwrap();
+        let hits = store
+            .reader
+            .search_pages("quick".into(), 10, None)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(
             hits[0].snippet.contains("different"),
@@ -2360,7 +2371,7 @@ mod tests {
 
         let global = store
             .reader
-            .search_pages_with_meta(query.into(), 10, None)
+            .search_pages_with_meta(query.into(), 10, None, None)
             .await
             .unwrap();
         assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");
@@ -2421,7 +2432,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("pick: handoff bootstrap".into(), 10)
+            .search_pages("pick: handoff bootstrap".into(), 10, None)
             .await
             .unwrap();
         assert!(
@@ -2458,7 +2469,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("descricao sessao".into(), 10)
+            .search_pages("descricao sessao".into(), 10, None)
             .await
             .unwrap();
         assert!(
@@ -2489,7 +2500,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages("quick OR slow".into(), 10)
+            .search_pages("quick OR slow".into(), 10, None)
             .await
             .unwrap();
         assert!(!hits.is_empty(), "OR must remain an FTS5 operator");
@@ -4474,7 +4485,7 @@ mod tests {
             .await
             .unwrap();
 
-        let summaries = store.reader.list_projects_with_stats().await.unwrap();
+        let summaries = store.reader.list_projects_with_stats(None).await.unwrap();
         assert_eq!(summaries.len(), 1);
         let s = &summaries[0];
         assert_eq!(s.workspace_name, "default");
@@ -4610,7 +4621,7 @@ mod tests {
         assert_briefing_kinds(
             &store
                 .reader
-                .briefing_for_workspace(ws, 100, ai_memory_core::OwnerFilter::Any)
+                .briefing_for_workspace(ws, 100, ai_memory_core::OwnerFilter::Any, None)
                 .await
                 .unwrap()
                 .recent_pages,
@@ -4664,13 +4675,13 @@ mod tests {
 
         let source_links = store
             .reader
-            .page_links(ws, proj, "notes/source.md".into())
+            .page_links(ws, proj, "notes/source.md".into(), None)
             .await
             .unwrap();
         assert_eq!(source_links.links[0].kind, "session");
         let target_links = store
             .reader
-            .page_links(ws, proj, "sessions/session.md".into())
+            .page_links(ws, proj, "sessions/session.md".into(), None)
             .await
             .unwrap();
         assert_eq!(target_links.backlinks[0].kind, "note");

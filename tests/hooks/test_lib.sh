@@ -240,6 +240,31 @@ assert_eq "capture-only marker: marker_qs forwards the OUTER scope" \
     "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
 
+# --- repository identity (#708) ----------------------------------------
+# An undeclared checkout sends its normalised remote, with the credentials in
+# the URL dropped on this side; a declared project outranks the remote and
+# routes by name (nothing sent); an explicit identity outranks both.
+# Normalisation itself is checked case by case against the shared fixture by
+# `identity_parity_tests` in install_hooks.rs.
+if command -v git >/dev/null 2>&1; then
+    mkdir -p "$TMP/idrepo"
+    git -C "$TMP/idrepo" init -q
+    git -C "$TMP/idrepo" remote add origin "https://someone:tok3n@git.example.test/Acme/API.git"
+    ID_CWD=$(ai_memory_url_encode "$TMP/idrepo")
+    assert_eq "identity: undeclared checkout sends its remote" \
+        "&cwd=$ID_CWD&identity=$(ai_memory_url_encode git.example.test/acme/api)&identity_src=git_remote" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    printf 'project = "mine"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: a declared project routes by name" \
+        "&cwd=$ID_CWD&project=mine&project_src=marker" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    printf 'project = "mine"\nidentity = "Acme/Platform"\n' >"$TMP/idrepo/.ai-memory.toml"
+    assert_eq "identity: an explicit identity outranks the project" \
+        "&cwd=$ID_CWD&project=mine&project_src=marker&identity=$(ai_memory_url_encode acme/platform)&identity_src=explicit" \
+        "$(ai_memory_marker_qs "$TMP/idrepo")"
+    rm -rf "$TMP/idrepo"
+fi
+
 # A marker declaring [briefing] but no workspace/project is NOT capture-only
 # (it declares a forwarded setting), so it stays a resolution boundary: the
 # outer marker's scope must not leak through it.

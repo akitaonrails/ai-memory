@@ -3543,7 +3543,7 @@ export default AiMemoryOpencode2;
 /// purpose: `findMarker` stays untouched, well-exercised, nearest-marker
 /// behavior for every other caller.
 pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(text: string): boolean {
-  for (const key of ["workspace", "project", "project_strategy", "drop_subagent_captures"]) {
+  for (const key of ["workspace", "project", "project_strategy", "drop_subagent_captures", "identity"]) {
     if (tomlKey(text, key) !== undefined) return true;
   }
   for (const key of ["default_global", "inject_on_session_start", "max_chars"]) {
@@ -3600,17 +3600,21 @@ function findSettingsMarker(cwd: string | undefined): string | undefined {
 fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
     let Some(default) = default_strategy else {
         return format!(
-            "{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{}",
+            "{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{TS_IDENTITY}\n{}",
             r#"function applyMarkerParams(url: URL, cwd: string | undefined): void {
   const managedRun = process.env.AI_MEMORY_RUN_ID;
   if (managedRun) url.searchParams.set("managed_run", managedRun);
   const marker = findSettingsMarker(cwd);
-  if (!marker || !cwd) return;
+  if (!marker || !cwd) {
+    applyIdentityParams(url, cwd, undefined, undefined);
+    return;
+  }
   url.searchParams.set("cwd", cwd);
   try {
     const body = readFileSync(marker, "utf8");
     const workspace = tomlKey(body, "workspace");
     const project = tomlKey(body, "project");
+    applyIdentityParams(url, cwd, tomlKey(body, "identity"), project);
     const projectStrategy = tomlKey(body, "project_strategy");
     const dropSubagent = tomlKey(body, "drop_subagent_captures");
     const defaultGlobal = tomlFlag(body, "default_global");
@@ -3644,6 +3648,7 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   let defaultGlobal: string | undefined;
   let briefing: string | undefined;
   let briefingBudget: string | undefined;
+  let explicitIdentity: string | undefined;
   const marker = findSettingsMarker(cwd);
   if (marker) {
     try {
@@ -3655,9 +3660,12 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
       defaultGlobal = tomlFlag(body, "default_global");
       briefing = tomlFlag(body, "inject_on_session_start");
       briefingBudget = tomlFlag(body, "max_chars");
+      explicitIdentity = tomlKey(body, "identity");
     } catch (_e) {
     }
   }
+  // Before repo-root can fill `project`: a repo-root name is an inference.
+  applyIdentityParams(url, cwd, explicitIdentity, project);
   if (!projectStrategy) projectStrategy = DEFAULT_PROJECT_STRATEGY;
   if (!project && (projectStrategy === "repo-root" || projectStrategy === "repo_root")) {
     const repoProject = repoRootProject(cwd);
@@ -3672,10 +3680,88 @@ fn ts_apply_marker_params(default_strategy: Option<&str>) -> String {
   if (briefingBudget) url.searchParams.set("briefing_budget", briefingBudget);
 }"#;
     format!(
-        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{body}",
+        "const DEFAULT_PROJECT_STRATEGY = {};\n{TS_TOML_FLAG}\n{TS_FIND_SETTINGS_MARKER}\n{TS_IDENTITY}\n{body}",
         ts_string_literal(default)
     )
 }
+
+/// Repository identity for the TypeScript plugins (#708): a port of
+/// `normalize_remote_url` in `ai-memory-core::repository_identity`, checked
+/// against the shared `fixtures/remote_identity_cases.json`, and
+/// `applyIdentityParams`, which mirrors `repository_identity` in
+/// `hook_capture.rs` — an explicit marker `identity` is sent; a declared
+/// `project` outranks the remote and routes by name, so git is not consulted;
+/// otherwise the `upstream` remote, else `origin`. Normalising here keeps
+/// credentials embedded in a remote URL on the host.
+pub(crate) const TS_IDENTITY: &str = r#"function normalizeRemote(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  let scheme: string | undefined;
+  let rest = trimmed;
+  const idx = trimmed.indexOf("://");
+  if (idx >= 0) {
+    scheme = trimmed.slice(0, idx).toLowerCase();
+    rest = trimmed.slice(idx + 3);
+  }
+  if (scheme === "file") return undefined;
+  let pathStart = rest.indexOf("/");
+  if (pathStart < 0) pathStart = rest.length;
+  const at = rest.slice(0, pathStart).lastIndexOf("@");
+  const hp = at >= 0 ? rest.slice(at + 1) : rest;
+  let host: string;
+  let path: string;
+  if (scheme !== undefined) {
+    const slash = hp.indexOf("/");
+    host = slash >= 0 ? hp.slice(0, slash) : hp;
+    path = slash >= 0 ? hp.slice(slash + 1) : "";
+    const colon = host.lastIndexOf(":");
+    if (colon >= 0 && /^[0-9]*$/.test(host.slice(colon + 1))) host = host.slice(0, colon);
+    if (!host || !path) return undefined;
+  } else {
+    const colon = hp.indexOf(":");
+    if (colon < 0) return undefined;
+    const slash = hp.indexOf("/");
+    if (slash >= 0 && slash < colon) return undefined;
+    host = hp.slice(0, colon);
+    path = hp.slice(colon + 1);
+    if (host.length <= 1 || !path) return undefined;
+    if (path.includes("\\")) return undefined;
+  }
+  let id = `${host}/${path}`.toLowerCase().replace(/\/+$/, "");
+  if (id.endsWith(".git")) id = id.slice(0, -4);
+  id = id.replace(/\/+$/, "").replace(/\/\/+/g, "/");
+  return id && id.includes("/") ? id : undefined;
+}
+
+function applyIdentityParams(
+  url: URL,
+  cwd: string | undefined,
+  explicit: string | undefined,
+  project: string | undefined,
+): void {
+  const declared = explicit?.trim();
+  if (declared) {
+    url.searchParams.set("identity", declared.toLowerCase());
+    url.searchParams.set("identity_src", "explicit");
+    return;
+  }
+  if (project?.trim() || !cwd) return;
+  for (const name of ["upstream", "origin"]) {
+    try {
+      const remote = execFileSync("git", ["-C", cwd, "config", "--get", `remote.${name}.url`], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const identity = normalizeRemote(remote);
+      if (identity) {
+        url.searchParams.set("identity", identity);
+        url.searchParams.set("identity_src", "git_remote");
+        return;
+      }
+    } catch (_e) {
+    }
+  }
+}"#;
 
 /// `tomlFlag` mirrors the native hook's `parse_toml_flag`: unlike `tomlKey`
 /// (quoted strings only) it also accepts a bare token (`default_global =
@@ -8692,7 +8778,7 @@ model = "gpt-5"
         assert!(plugin.contains("function declaresSettings"));
         assert!(plugin.contains("const marker = findSettingsMarker(cwd);"));
         assert!(plugin.contains(
-            "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\"])"
+            "for (const key of [\"workspace\", \"project\", \"project_strategy\", \"drop_subagent_captures\", \"identity\"])"
         ));
         assert!(plugin.contains(
             "for (const key of [\"default_global\", \"inject_on_session_start\", \"max_chars\"])"
@@ -11613,5 +11699,180 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         fs::create_dir_all(cwd_overlay.parent().unwrap()).unwrap();
         fs::write(&cwd_overlay, "# active").unwrap();
         assert_eq!(find_grok_project_overlay(&cwd, None), Some(cwd_overlay));
+    }
+}
+
+/// The four clients that normalise a git remote into a repository identity
+/// (#708) must agree on every case, or one repository lands in two projects
+/// depending on which harness captured it. The Rust core is the reference and
+/// checks itself against `remote_identity_cases.json`; these run the same
+/// cases through the shell, PowerShell and TypeScript ports. Each port is
+/// skipped when its interpreter is not installed, so the check never fails for
+/// a missing tool — CI runs it wherever the tool exists.
+#[cfg(test)]
+mod identity_parity_tests {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    const CASES: &str = include_str!("../../../ai-memory-core/fixtures/remote_identity_cases.json");
+
+    fn cases() -> Vec<(String, Option<String>)> {
+        let cases: serde_json::Value = serde_json::from_str(CASES).unwrap();
+        cases["normalize"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| {
+                (
+                    case["url"].as_str().unwrap().to_owned(),
+                    case["identity"].as_str().map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+
+    fn repo_file(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative)
+    }
+
+    /// Compare one port's output, one line per case, with the fixture.
+    fn assert_agrees(port: &str, stdout: &[u8]) {
+        let text = String::from_utf8_lossy(stdout);
+        let got: Vec<&str> = text.split('\n').collect();
+        let cases = cases();
+        for (i, (url, expected)) in cases.iter().enumerate() {
+            let got = got
+                .get(i)
+                .copied()
+                .unwrap_or("<missing>")
+                .trim_end_matches('\r');
+            assert_eq!(
+                got,
+                expected.as_deref().unwrap_or(""),
+                "{port} normalised {url:?} differently from the core"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shell_port_agrees_with_the_core() {
+        if Command::new("sh").arg("-c").arg("true").status().is_err() {
+            return;
+        }
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(r#". "$1"; shift; for u in "$@"; do printf '%s\n' "$(ai_memory_normalize_remote "$u")"; done"#)
+            .arg("sh")
+            .arg(repo_file("hooks/_lib.sh"))
+            .args(cases().into_iter().map(|(url, _)| url))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_agrees("hooks/_lib.sh", &output.stdout);
+    }
+
+    #[test]
+    fn the_powershell_port_agrees_with_the_core() {
+        let Some(pwsh) = ["pwsh", "powershell"].into_iter().find(|exe| {
+            Command::new(exe)
+                .args(["-NoProfile", "-Command", "exit 0"])
+                .status()
+                .is_ok()
+        }) else {
+            return;
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = tmp.path().join("parity.ps1");
+        std::fs::write(
+            &script,
+            "param([string] $Lib, [string] $Cases)\n\
+             . $Lib\n\
+             foreach ($u in (Get-Content -Raw $Cases | ConvertFrom-Json)) {\n\
+                 $id = ConvertTo-AiMemoryRepositoryIdentity -Url $u\n\
+                 if ($id) { [Console]::Out.Write(\"$id`n\") } else { [Console]::Out.Write(\"`n\") }\n\
+             }\n\
+             $decisions = @(\n\
+                 (Get-AiMemoryIdentityQuery -Cwd '' -Explicit ' Acme/Platform ' -Project 'proj'),\n\
+                 (Get-AiMemoryIdentityQuery -Cwd '' -Explicit '' -Project 'proj'),\n\
+                 (Get-AiMemoryIdentityQuery -Cwd '' -Explicit '' -Project '')\n\
+             )\n\
+             [Console]::Error.Write($decisions -join '|')\n",
+        )
+        .unwrap();
+        let urls = tmp.path().join("urls.json");
+        let list: Vec<String> = cases().into_iter().map(|(url, _)| url).collect();
+        std::fs::write(&urls, serde_json::to_string(&list).unwrap()).unwrap();
+        let output = Command::new(pwsh)
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&script)
+            .arg(repo_file("hooks/lib/ai-memory-hook.ps1"))
+            .arg(&urls)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_agrees("hooks/lib/ai-memory-hook.ps1", &output.stdout);
+        // Same decisions as the other clients: explicit wins over a declared
+        // project; a declared project alone sends nothing; no cwd sends nothing.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "&identity=acme%2Fplatform&identity_src=explicit||"
+        );
+    }
+
+    #[test]
+    fn the_typescript_port_agrees_with_the_core() {
+        let strips_types = Command::new("node")
+            .args(["--experimental-strip-types", "-e", "0"])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !strips_types {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let module = tmp.path().join("parity.ts");
+        let list: Vec<String> = cases().into_iter().map(|(url, _)| url).collect();
+        let source = format!(
+            "import {{ execFileSync }} from \"node:child_process\";\n\
+             void execFileSync;\n\
+             {}\n\
+             const urls: string[] = {};\n\
+             process.stdout.write(urls.map((u) => normalizeRemote(u) ?? \"\").join(\"\\n\") + \"\\n\");\n\
+             const decide = (explicit?: string, project?: string): string => {{\n\
+               const url = new URL(\"http://h/hook\");\n\
+               applyIdentityParams(url, undefined, explicit, project);\n\
+               return url.search;\n\
+             }};\n\
+             process.stderr.write([decide(\" Acme/Platform \", \"proj\"), decide(undefined, \"proj\"), decide()].join(\"|\"));\n",
+            super::TS_IDENTITY,
+            serde_json::to_string(&list).unwrap()
+        );
+        std::fs::write(&module, source).unwrap();
+        let output = Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_agrees("TS_IDENTITY", &output.stdout);
+        // An explicit identity wins over a declared project; a declared
+        // project alone sends nothing; no cwd sends nothing.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "?identity=acme%2Fplatform&identity_src=explicit||"
+        );
     }
 }

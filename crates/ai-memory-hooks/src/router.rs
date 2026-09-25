@@ -88,8 +88,8 @@ pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
 const SUBAGENT_SESSIONS_MAX: usize = 4096;
 
 /// Resolved-project cache key:
-/// `(cwd, workspace_override, project_override, project_strategy)`.
-pub type ProjectCacheKey = (String, String, String, String);
+/// `(cwd, workspace_override, project_override, project_strategy, identity)`.
+pub type ProjectCacheKey = (String, String, String, String, String);
 
 /// Shared bounded resolved-project cache.
 pub type ProjectCache = Arc<tokio::sync::Mutex<ProjectCacheStore>>;
@@ -421,6 +421,24 @@ fn ingest_rate_key(env: &HookEnvelope, actor_user: Option<&str>) -> String {
     )
 }
 
+/// A capture whose author may not write the project it
+/// resolved to.
+///
+/// A distinct type rather than a string, because the two call paths have to
+/// tell it apart from a genuine failure and do opposite things with it: this
+/// one is *final*. The event can never succeed, so the client must stop
+/// holding it, exactly as it would for a capture-policy drop.
+#[derive(Debug)]
+pub struct CaptureNotAuthorized;
+
+impl std::fmt::Display for CaptureNotAuthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("capture not authorized for this repository")
+    }
+}
+
+impl std::error::Error for CaptureNotAuthorized {}
+
 /// Shared state passed to the hook handler.
 #[derive(Clone)]
 pub struct HookState {
@@ -604,6 +622,7 @@ async fn handle_hook(
     Query(query): Query<HookQuery>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     headers: HeaderMap,
     Json(mut body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -630,11 +649,16 @@ async fn handle_hook(
     // extensions — so `process()` can key the `ActiveProject` map by the
     // authenticated identity when `[auto_scope] mode = per_actor` is on.
     let actor = actor_identity(actor_ext);
+    // Captured here for the same reason as the actor: the request extensions
+    // are gone by the time the spawned task runs. `AuthorizedViewer` is the
+    // gated marker, so this is `None` whenever per-repository authorization is
+    // off, and captures behave exactly as they always have.
+    let viewer = viewer_ext.map(|axum::Extension(v)| v.user());
     // Same reason: the skip-list header is read here, while the request
     // extensions still exist, and travels with the event into `process()`.
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
-    if should_drop_subagent(&state, &env).await {
+    if should_drop_subagent(&state, &env, viewer).await {
         state.ingest_metrics.record_dropped_by_policy();
         return (StatusCode::ACCEPTED, "subagent capture dropped");
     }
@@ -664,6 +688,7 @@ async fn handle_hook(
             actor,
             level_ext.map_or(ai_memory_core::AuthLevel::Anonymous, |v| v.0),
             skip_webhooks,
+            viewer,
         )
         .await;
         // Stamped only when `process_envelope` actually cleared the writer.
@@ -777,6 +802,7 @@ async fn handle_hook_batch(
     State(state): State<Arc<HookState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     headers: HeaderMap,
     Json(items): Json<Vec<HookBatchItem>>,
 ) -> impl IntoResponse {
@@ -791,6 +817,9 @@ async fn handle_hook_batch(
     // All items in a batch share the drain's single identity, so the actor is
     // captured once from the batch request (mirrors `handle_hook`).
     let actor = actor_identity(actor_ext);
+    // Same marker as the single-event path: `None` for root and on an
+    // install with no database users.
+    let viewer = viewer_ext.map(|axum::Extension(v)| v.user());
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     let mut accepted_indices = Vec::new();
@@ -816,7 +845,7 @@ async fn handle_hook_batch(
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
         // as committed so the client clears it from its spool, but do not store
         // it. Keeps the contiguous-prefix ack contract intact.
-        if should_drop_subagent(&state, &env).await {
+        if should_drop_subagent(&state, &env, viewer).await {
             state.ingest_metrics.record_dropped_by_policy();
             accepted_indices.push(idx);
             continue;
@@ -859,9 +888,20 @@ async fn handle_hook_batch(
             actor.clone(),
             level_ext.map_or(ai_memory_core::AuthLevel::Anonymous, |v| v.0),
             skip_webhooks.clone(),
+            viewer,
         )
         .await
         {
+            if e.downcast_ref::<CaptureNotAuthorized>().is_some() {
+                // Counted as accepted so the client DROPS it. The item can
+                // never be stored, so leaving it spooled would retry it until
+                // its attempt budget ran out and stall every item behind it.
+                // Same treatment a capture-policy drop already gets.
+                state.ingest_metrics.record_dropped_unauthorized();
+                warn!("hook batch capture dropped: author may not write this project");
+                accepted_indices.push(idx);
+                continue;
+            }
             if matches!(
                 e.downcast_ref::<StoreError>(),
                 Some(StoreError::SessionCollision)
@@ -1134,7 +1174,11 @@ const fn canonical_tool_name(family: ToolFamily) -> &'static str {
 /// `stop` / `session_end`) of a session already known to be a subagent. No-op
 /// (returns `false`) unless this event's project opted in via the per-event
 /// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
-async fn should_drop_subagent(state: &HookState, env: &HookEnvelope) -> bool {
+async fn should_drop_subagent(
+    state: &HookState,
+    env: &HookEnvelope,
+    viewer: Option<ai_memory_core::UserId>,
+) -> bool {
     if !env.drop_subagent_requested {
         return false;
     }
@@ -1147,6 +1191,8 @@ async fn should_drop_subagent(state: &HookState, env: &HookEnvelope) -> bool {
         env.workspace_override.as_deref(),
         env.project_override.as_deref(),
         env.project_strategy,
+        env.identity.as_ref(),
+        viewer,
     )
     .await
     else {
@@ -1222,6 +1268,24 @@ pub struct HandoffQuery {
     pub managed_run: Option<String>,
     /// Native session identifier observed in the SessionStart payload.
     pub session_id: Option<String>,
+    /// Repository identity the client resolved (#708). Same contract as
+    /// [`crate::payload::HookQuery::identity`].
+    pub identity: Option<String>,
+    /// Rung that produced `identity`; see
+    /// [`crate::payload::HookQuery::identity_src`].
+    pub identity_src: Option<String>,
+}
+
+impl HandoffQuery {
+    /// The validated repository identity, or `None` to route by name.
+    fn repository_identity(
+        &self,
+    ) -> Option<ai_memory_core::repository_identity::RepositoryIdentity> {
+        ai_memory_core::repository_identity::accept_wire_identity(
+            self.identity.as_deref()?,
+            self.identity_src.as_deref()?,
+        )
+    }
 }
 
 /// Synchronous endpoint used by `session-start.sh` to discover any
@@ -1238,17 +1302,25 @@ async fn handle_handoff(
     Query(query): Query<HandoffQuery>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let actor = actor_identity(actor_ext);
     let skip_webhooks = admission_skips(level_ext, &headers);
-    match fetch_and_accept_handoff(&state, query, actor, skip_webhooks).await {
+    let viewer = viewer_ext.map(|axum::Extension(viewer)| viewer.user());
+    match fetch_and_accept_handoff(&state, query, actor, skip_webhooks, viewer).await {
         Ok(Some(markdown)) => (StatusCode::OK, markdown),
         Ok(None) => (StatusCode::OK, String::new()),
-        Err(e) => {
-            warn!(error = %e, "handoff fetch failed");
-            (StatusCode::OK, String::new())
-        }
+        // A refusal is the one failure that must not look like "no handoff":
+        // it is a 403 carrying the reason, which the hook client reports on
+        // stderr and never injects as context (#708).
+        Err(e) => match e.downcast_ref::<ai_memory_store::ScopeResolutionError>() {
+            Some(refusal) if refusal.is_forbidden() => (StatusCode::FORBIDDEN, refusal.to_string()),
+            _ => {
+                warn!(error = %e, "handoff fetch failed");
+                (StatusCode::OK, String::new())
+            }
+        },
     }
 }
 
@@ -1257,8 +1329,17 @@ async fn fetch_and_accept_handoff(
     query: HandoffQuery,
     actor: Option<IdentityKey>,
     skip_webhooks: Vec<String>,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<Option<String>> {
-    fetch_and_accept_handoff_at(state, query, actor, skip_webhooks, jiff::Timestamp::now()).await
+    fetch_and_accept_handoff_at(
+        state,
+        query,
+        actor,
+        skip_webhooks,
+        viewer,
+        jiff::Timestamp::now(),
+    )
+    .await
 }
 
 async fn fetch_and_accept_handoff_at(
@@ -1266,6 +1347,7 @@ async fn fetch_and_accept_handoff_at(
     query: HandoffQuery,
     actor: Option<IdentityKey>,
     skip_webhooks: Vec<String>,
+    viewer: Option<ai_memory_core::UserId>,
     now: jiff::Timestamp,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
@@ -1276,7 +1358,7 @@ async fn fetch_and_accept_handoff_at(
     // too. The brief already reaches the managed path (it is recomposed per
     // session, so resolving it twice was harmless); the handoff is single-use
     // and had no second chance.
-    let managed = fetch_managed_context(state, &query, agent).await?;
+    let managed = fetch_managed_context(state, &query, agent, viewer).await?;
     // Keep the active-project key compatible with MCP transports: the native
     // session id is carried separately below to bind a destructive handoff
     // claim to its exact receiver.
@@ -1290,6 +1372,20 @@ async fn fetch_and_accept_handoff_at(
         query.workspace.as_deref(),
         query.project.as_deref(),
         ProjectStrategy::parse(query.project_strategy.as_deref()),
+        query.repository_identity().as_ref(),
+        viewer,
+    )
+    .await?;
+    // Everything below returns this repository's content — its handoff and
+    // its pinned, rules and slot pages — and claims its handoff, all keyed
+    // only on a project the caller named or a directory they are in (#708).
+    // Checked before the active-project pointer is published, so a refused
+    // repository does not become the caller's default for later calls.
+    crate::grants::authorize_resolved(
+        &state.reader,
+        Some((ws, proj)),
+        viewer,
+        ai_memory_store::ProjectAccess::Read,
     )
     .await?;
     // Session-start handoff delivery is a foreground action. Publish it so
@@ -1491,6 +1587,7 @@ async fn fetch_managed_context(
     state: &HookState,
     query: &HandoffQuery,
     agent: AgentKind,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<Option<PendingManagedContext>> {
     let Some(raw_run_id) = query.managed_run.as_deref() else {
         return Ok(None);
@@ -1499,6 +1596,18 @@ async fn fetch_managed_context(
         warn!(managed_run = %raw_run_id, "invalid managed run id on SessionStart");
         return Ok(None);
     };
+    // The run id reaches a workstream's event ledger without naming its
+    // repository; the same rule as the `/workstream/runs/*` routes applies.
+    if viewer.is_some() {
+        let scope = state.reader.managed_run_scope(run_id).await?;
+        crate::grants::authorize_resolved(
+            &state.reader,
+            scope,
+            viewer,
+            ai_memory_store::ProjectAccess::Write,
+        )
+        .await?;
+    }
     if let Some(native_session_id) = query
         .session_id
         .as_deref()
@@ -2002,12 +2111,19 @@ fn cache_key_for(
     workspace_override: Option<&str>,
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
-) -> (String, String, String, String) {
+    identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
+) -> ProjectCacheKey {
     (
         cwd_norm.unwrap_or_default().to_string(),
         workspace_override.unwrap_or_default().to_string(),
         project_override.unwrap_or_default().to_string(),
         project_strategy.as_str().to_string(),
+        // Two repositories can sit at the same path on two machines. Without
+        // the identity in the key, whichever resolved first would answer for
+        // both.
+        identity
+            .map(|i| format!("{}:{}", i.source.as_str(), i.identity))
+            .unwrap_or_default(),
     )
 }
 
@@ -2056,6 +2172,8 @@ async fn resolve_project_ids_inner(
     workspace_override: Option<&str>,
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
+    identity: Option<&ai_memory_core::repository_identity::RepositoryIdentity>,
+    creator: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
     let cwd_raw = cwd.filter(|s| !s.is_empty());
     let cwd_norm = cwd_raw.map(normalize_project_path_key);
@@ -2066,11 +2184,15 @@ async fn resolve_project_ids_inner(
         return Ok((state.workspace_id, state.project_id));
     }
 
+    // Only the rungs that carry something a name does not route by identity:
+    // a declared `project` and a folder name keep routing by name.
+    let identity = identity.filter(|i| i.source.routes_by_identity());
     let cache_key = cache_key_for(
         cwd_norm.as_deref(),
         workspace_override,
         project_override,
         project_strategy,
+        identity,
     );
 
     {
@@ -2253,17 +2375,44 @@ async fn resolve_project_ids_inner(
     // The match is keyed on the actual cwd (`cwd_norm`), not the stored
     // `repo_path`: `repo_path` is now the git root or None (issue #103),
     // whereas cwd->parent matching needs the full deep path.
-    let proj = if project_override.is_none()
-        && let Some(rp) = cwd_norm.as_deref().filter(|s| !s.is_empty())
-        && let Some((parent_id, parent_name)) = state
+    let parent = match cwd_norm.as_deref().filter(|s| !s.is_empty()) {
+        Some(rp) if project_override.is_none() => state
             .reader
             .find_project_by_cwd_prefix(ws, rp.to_string(), state.home_dir.as_deref())
             .await
-            .map_err(|e| anyhow::anyhow!("find_project_by_cwd_prefix: {e}"))?
+            .map_err(|e| anyhow::anyhow!("find_project_by_cwd_prefix: {e}"))?,
+        _ => None,
+    };
+    let proj = if let Some(identity) = identity {
+        // A repository identity decides the project before any name does: the
+        // project already carrying it wins, whatever it is called, and the
+        // name (or the cwd-prefix parent) is only the candidate for a project
+        // that has not been claimed yet. One writer transaction, so two
+        // captures racing on a new repository cannot both create it.
+        let (proj, resolution) = state
+            .writer
+            .resolve_project_by_identity(
+                ws,
+                identity.clone(),
+                project_name,
+                repo_path,
+                parent.map(|(parent_id, _)| parent_id),
+                creator,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve_project_by_identity: {e}"))?;
+        debug!(
+            identity = %identity.identity,
+            source = identity.source.as_str(),
+            ?resolution,
+            "hook router: resolved project by repository identity"
+        );
+        proj
+    } else if let Some((parent_id, parent_name)) = parent
         && parent_name != project_name
     {
         debug!(
-            cwd = rp,
+            cwd = ?cwd_norm,
             derived = %project_name,
             parent = %parent_name,
             "hook router: cwd inside existing project — using parent instead of \
@@ -2271,11 +2420,16 @@ async fn resolve_project_ids_inner(
         );
         parent_id
     } else {
+        // `creator` is the authorized viewer, set only when per-repository
+        // authorization is on. A repository this capture opens is granted to
+        // them in the same transaction; without that the capture would create
+        // it and then be refused on it, as would every capture after it.
         state
             .writer
-            .get_or_create_project(ws, project_name, repo_path)
+            .get_or_create_project_as(ws, project_name, repo_path, creator)
             .await
             .map_err(|e| anyhow::anyhow!("get_or_create_project: {e}"))?
+            .0
     };
     let ids = (ws, proj);
     state.project_cache.lock().await.insert(cache_key, ids);
@@ -2301,6 +2455,8 @@ async fn resolve_project_ids(
         workspace_override,
         project_override,
         project_strategy,
+        None,
+        None,
     )
     .await?;
     if has_publishable_scope_hint(cwd, project_override) {
@@ -2445,10 +2601,17 @@ async fn process_envelope(
     actor: Option<IdentityKey>,
     level: ai_memory_core::AuthLevel,
     skip_webhooks: Vec<String>,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> bool {
     let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
-    if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks).await {
-        if matches!(
+    if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks, viewer).await {
+        if e.downcast_ref::<CaptureNotAuthorized>().is_some() {
+            // Counted separately from a policy drop so an operator can tell
+            // "my configuration is discarding these" from "somebody has been
+            // working all day and none of it is being kept".
+            state.ingest_metrics.record_dropped_unauthorized();
+            warn!("capture dropped: author may not write this project");
+        } else if matches!(
             e.downcast_ref::<StoreError>(),
             Some(StoreError::SessionCollision)
         ) {
@@ -2539,6 +2702,7 @@ async fn process(
         actor,
         ai_memory_core::AuthLevel::Anonymous,
         skip_webhooks,
+        None,
     )
     .await
     {
@@ -2564,6 +2728,7 @@ async fn process_authorized(
     // Admission webhooks this request opted out of (see `admission_skips`).
     // Empty for every caller with no HTTP request behind it.
     skip_webhooks: Vec<String>,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(&env)?;
     // An OpenCode `session.moved` relocation, forwarded by the plugin as a
@@ -2658,10 +2823,44 @@ async fn process_authorized(
                 env.workspace_override.as_deref(),
                 env.project_override.as_deref(),
                 env.project_strategy,
+                env.identity.as_ref(),
+                viewer,
             )
             .await?
         }
     };
+
+    // A capture is a write, so it needs `write` — the same rule the MCP write
+    // tools follow. The check lands here, rather than in the handler, because
+    // here is the first moment the repository is known: the handler answers
+    // 202 before this resolution runs, and resolving it up there would put a
+    // database round trip in front of every tool call an agent makes.
+    //
+    // The consequence is that the refusal cannot be an HTTP status, and that
+    // is the right outcome anyway. A 403 would reach the client as an ordinary
+    // failure and be retried until it burnt the entry's attempt budget, which
+    // is how this project once spent 10.7M tokens re-sending something that
+    // could never succeed. Dropping it here is final by construction.
+    //
+    // Decided on the read pool, not the writer actor: this runs for every
+    // captured event, and a round trip through the single writer per event is
+    // the contention the hook path is built to avoid.
+    match ai_memory_store::authorize_scope_for(
+        &state.reader,
+        None,
+        ai_memory_store::ResolvedScope {
+            workspace_id: ws,
+            project_id: proj,
+        },
+        viewer,
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(err) if err.is_forbidden() => return Err(CaptureNotAuthorized.into()),
+        Err(err) => return Err(err.into()),
+    }
 
     // Hooks are fire-and-forget and may arrive out of order. Begin the
     // session idempotently before every observation so a resumed agent
@@ -2711,6 +2910,7 @@ async fn process_authorized(
         env.workspace_override.as_deref(),
         env.project_override.as_deref(),
         env.project_strategy,
+        env.identity.as_ref(),
     );
     let mut attempts = 0;
     // Keep the successful keyed-ingest gate until every downstream effect has
@@ -2774,6 +2974,8 @@ async fn process_authorized(
                     env.workspace_override.as_deref(),
                     env.project_override.as_deref(),
                     env.project_strategy,
+                    env.identity.as_ref(),
+                    viewer,
                 )
                 .await?;
             }
@@ -3707,6 +3909,8 @@ mod tests {
             briefing_budget: None,
             managed_run: None,
             session_id: None,
+            identity: None,
+            identity_src: None,
         }
     }
 
@@ -3737,6 +3941,7 @@ mod tests {
             handle_handoff(
                 State(state.clone()),
                 Query(session_start_query(&tmp.path().to_string_lossy())),
+                None,
                 None,
                 None,
                 HeaderMap::new(),
@@ -3803,6 +4008,7 @@ mod tests {
             handle_handoff(
                 State(state.clone()),
                 Query(session_start_query(&tmp.path().to_string_lossy())),
+                None,
                 None,
                 None,
                 HeaderMap::new(),
@@ -3883,6 +4089,518 @@ mod tests {
     }
 
     /// Build a minimal `HookState` backed by a real on-disk store.
+    /// A capture is a write, so it needs `write`.
+    ///
+    /// Captures wrote observations into whichever repository a working
+    /// directory resolved to, with no grant check at all — the one mutating
+    /// path that checked nothing. The refusal has to be silent at the HTTP
+    /// layer (the handler answered 202 long before the repository was known),
+    /// so what this pins is the part that matters: nothing is stored, and the
+    /// drop is counted where an operator can see it.
+    #[tokio::test]
+    async fn a_capture_needs_writer_on_the_repository_it_lands_in() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Grants only decide anything in a restricted project.
+        state
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let cwd = tmp.path().to_path_buf();
+
+        // Which repository a capture lands in is resolved from the cwd, not
+        // from the server's baked project, so ask the resolver rather than
+        // assuming: a grant on the wrong repository would make this test pass
+        // for the wrong reason.
+        let probe = SessionId::new().to_string();
+        capture_as(&state, &cwd, &probe, None).await.unwrap();
+        let landed = state
+            .reader
+            .observations_for_session(probe.parse().unwrap())
+            .await
+            .unwrap()[0]
+            .project_id;
+
+        let reader = user_holding(
+            &state,
+            "ray",
+            landed,
+            Some(ai_memory_store::GrantLevel::Read),
+        )
+        .await;
+        let writer = user_holding(
+            &state,
+            "wren",
+            landed,
+            Some(ai_memory_store::GrantLevel::Write),
+        )
+        .await;
+        let stranger = user_holding(&state, "sam", landed, None).await;
+
+        // A read-only grant, and no grant at all, are both refused.
+        for (who, user) in [("reader", reader), ("stranger", stranger)] {
+            let session = SessionId::new().to_string();
+            let err = capture_as(&state, &cwd, &session, Some(user))
+                .await
+                .expect_err("{who} must not be able to capture");
+            assert!(
+                err.downcast_ref::<CaptureNotAuthorized>().is_some(),
+                "{who}: the refusal must be the terminal kind, not a generic failure: {err}"
+            );
+            let stored = state
+                .reader
+                .observations_for_session(session.parse().unwrap())
+                .await
+                .unwrap();
+            assert!(stored.is_empty(), "{who} stored an observation anyway");
+        }
+
+        // Counted where an operator looks, and not confused with a policy drop.
+        let snap = state.ingest_metrics.snapshot();
+        assert_eq!(
+            snap.dropped_unauthorized, 0,
+            "the router records it, not this layer"
+        );
+
+        // A writer's capture lands, exactly as before.
+        let session = SessionId::new().to_string();
+        capture_as(&state, &cwd, &session, Some(writer))
+            .await
+            .expect("a writer may capture");
+        let stored = state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1, "the writer's capture must be stored");
+    }
+
+    /// An unauthorized batch item is CONSUMED, never left to be retried.
+    ///
+    /// This is the half that could have become a retry loop. The batch ack
+    /// tells the client which items to drop from its spool; reporting an
+    /// unauthorized item as not-accepted would leave it there to be re-sent
+    /// until its attempt budget ran out, and every attempt would be refused
+    /// for the same reason. It also stalls every item behind it. So it is
+    /// acked like any other policy drop, and simply not stored.
+    #[tokio::test]
+    async fn an_unauthorized_batch_item_is_consumed_rather_than_retried() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Grants only decide anything in a restricted project.
+        state
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let cwd = tmp.path().to_path_buf();
+
+        let probe = SessionId::new().to_string();
+        capture_as(&state, &cwd, &probe, None).await.unwrap();
+        let landed = state
+            .reader
+            .observations_for_session(probe.parse().unwrap())
+            .await
+            .unwrap()[0]
+            .project_id;
+        let reader = user_holding(
+            &state,
+            "ray",
+            landed,
+            Some(ai_memory_store::GrantLevel::Read),
+        )
+        .await;
+
+        let session = SessionId::new().to_string();
+        let items = vec![HookBatchItem {
+            url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+            body: serde_json::json!({
+                "session_id": session,
+                "cwd": cwd.to_string_lossy(),
+                "prompt": "hello",
+            }),
+        }];
+        let before = state.ingest_metrics.snapshot().dropped_unauthorized;
+        let response = handle_hook_batch(
+            State(Arc::new(state.clone())),
+            None,
+            Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            Some(axum::Extension(ai_memory_core::AuthorizedViewer(reader))),
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            ack["accepted"], 1,
+            "the client must be told to drop it, or it will re-send it forever: {ack}"
+        );
+
+        let stored = state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap();
+        assert!(stored.is_empty(), "an acked item must still not be stored");
+        assert_eq!(
+            state.ingest_metrics.snapshot().dropped_unauthorized,
+            before + 1,
+            "the drop must be visible to an operator"
+        );
+    }
+
+    /// With no viewer, captures behave exactly as they always have.
+    ///
+    /// `None` is what the `AuthorizedViewer` marker yields for root and on an
+    /// install with no database users.
+    #[tokio::test]
+    async fn a_capture_with_no_viewer_is_untouched_by_the_check() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = SessionId::new().to_string();
+        capture_as(&state, tmp.path(), &session, None)
+            .await
+            .expect("no viewer must not change capture");
+        let stored = state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+    }
+
+    /// A capture that opens a new project records the user capturing as its
+    /// creator.
+    ///
+    /// The hook path creates a project before it checks access, so without a
+    /// creator the first capture from a new checkout would create a restricted
+    /// row and then be refused on it — and so would every capture after it,
+    /// since nobody would ever hold a grant on it. The choke point admits the
+    /// creator without one; a second user reaching the same row finds it
+    /// existing and is checked like anyone else.
+    #[tokio::test]
+    async fn a_capture_opening_a_new_project_admits_its_creator() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Grants only decide anything in a restricted project.
+        state
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let repo = tmp.path().join("fresh-checkout");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cora = user_holding(&state, "cora", state.project_id, None).await;
+        let dan = user_holding(&state, "dan", state.project_id, None).await;
+
+        let first = SessionId::new().to_string();
+        capture_as(&state, &repo, &first, Some(cora))
+            .await
+            .expect("the capture that creates a repository must be kept");
+        let stored = state
+            .reader
+            .observations_for_session(first.parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let created = stored[0].project_id;
+        assert_ne!(created, state.project_id);
+        assert!(
+            state
+                .reader
+                .grants_for(cora, created)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the creator needs no grant"
+        );
+        assert!(
+            state
+                .reader
+                .authorize_project(
+                    stored[0].workspace_id,
+                    created,
+                    ai_memory_store::ProjectPrincipal::user(cora),
+                    true,
+                    ai_memory_store::ProjectAccess::Write,
+                )
+                .await
+                .unwrap()
+                .is_ok(),
+            "the creator is admitted"
+        );
+
+        let second = SessionId::new().to_string();
+        capture_as(&state, &repo, &second, Some(cora))
+            .await
+            .expect("and so must every capture after it");
+
+        let intruder = SessionId::new().to_string();
+        let refused = capture_as(&state, &repo, &intruder, Some(dan)).await;
+        assert!(
+            refused.is_err_and(|e| e.is::<CaptureNotAuthorized>()),
+            "a second user must not inherit the creator's repository"
+        );
+        assert!(
+            state
+                .reader
+                .observations_for_session(intruder.parse().unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state
+                .reader
+                .grants_for(dan, created)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Session start routes by the same identity a capture does, so its
+    /// handoff and briefing come from the project the captures land in. Same
+    /// validation: a rung that routes by name, or a malformed value, is `None`.
+    #[test]
+    fn handoff_query_accepts_identity_on_the_same_terms_as_a_capture() {
+        let query = |identity: &str, source: &str| HandoffQuery {
+            identity: Some(identity.to_owned()),
+            identity_src: Some(source.to_owned()),
+            ..Default::default()
+        };
+        let got = query("github.com/orga/api", "git_remote")
+            .repository_identity()
+            .unwrap();
+        assert_eq!(got.identity, "github.com/orga/api");
+        assert!(
+            query("github.com/orga/api", "manifest")
+                .repository_identity()
+                .is_none()
+        );
+        assert!(
+            query("GitHub.com/Orga/API", "git_remote")
+                .repository_identity()
+                .is_none()
+        );
+        assert!(HandoffQuery::default().repository_identity().is_none());
+    }
+
+    /// A capture that carries the repository identity its client resolved.
+    async fn capture_with_identity(
+        state: &HookState,
+        cwd: &std::path::Path,
+        session: &str,
+        identity: Option<(&str, &str)>,
+    ) -> ProjectId {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                identity: identity.map(|(identity, _)| identity.to_owned()),
+                identity_src: identity.map(|(_, source)| source.to_owned()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session,
+                "cwd": cwd.to_string_lossy(),
+                "prompt": "hello",
+            }),
+        );
+        process_authorized(
+            state,
+            env,
+            None,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap()[0]
+            .project_id
+    }
+
+    /// #708's collision, end to end: two unrelated repositories both checked
+    /// out as `api/` used to land in one project. With the client's identity
+    /// they land in two, and the same repository under a different folder name
+    /// lands back in its own. The two `api/` checkouts share a folder name and
+    /// nothing else, so the path-keyed project cache must not answer for both.
+    #[tokio::test]
+    async fn two_api_checkouts_with_different_remotes_get_two_projects() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let org_a = tmp.path().join("org-a").join("api");
+        let org_b = tmp.path().join("org-b").join("api");
+        let clone = tmp.path().join("elsewhere").join("acme-api");
+        for dir in [&org_a, &org_b, &clone] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let a = capture_with_identity(
+            &state,
+            &org_a,
+            &SessionId::new().to_string(),
+            Some(("github.com/orga/api", "git_remote")),
+        )
+        .await;
+        let b = capture_with_identity(
+            &state,
+            &org_b,
+            &SessionId::new().to_string(),
+            Some(("github.com/orgb/api", "git_remote")),
+        )
+        .await;
+        assert_ne!(a, b, "unrelated repositories must not share a project");
+        assert_eq!(
+            state
+                .reader
+                .project_name_by_id(state.workspace_id, b)
+                .await
+                .unwrap(),
+            Some("orgb-api".to_owned())
+        );
+        let again = capture_with_identity(
+            &state,
+            &clone,
+            &SessionId::new().to_string(),
+            Some(("github.com/orga/api", "git_remote")),
+        )
+        .await;
+        assert_eq!(again, a, "one repository, one project, whatever the folder");
+
+        // A client that sends nothing, or a rung that routes by name, keeps
+        // today's routing: the folder name.
+        let plain = tmp.path().join("plain").join("api");
+        std::fs::create_dir_all(&plain).unwrap();
+        let by_name =
+            capture_with_identity(&state, &plain, &SessionId::new().to_string(), None).await;
+        assert_eq!(
+            by_name, a,
+            "no identity routes by the folder name, as before"
+        );
+        let declared = capture_with_identity(
+            &state,
+            &plain,
+            &SessionId::new().to_string(),
+            Some(("github.com/orgc/api", "manifest")),
+        )
+        .await;
+        assert_eq!(declared, a, "a manifest identity is ignored on the wire");
+    }
+
+    /// Two machines sharing one server can hold unrelated repositories at the
+    /// same path (`~/src/api` on each). The project cache is keyed by path, so
+    /// without the identity in its key whichever resolved first would answer
+    /// for both, and the second machine's captures would land in the first's
+    /// project.
+    #[tokio::test]
+    async fn one_path_with_two_remotes_is_two_projects() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let shared = tmp.path().join("src").join("api");
+        std::fs::create_dir_all(&shared).unwrap();
+
+        let first = capture_with_identity(
+            &state,
+            &shared,
+            &SessionId::new().to_string(),
+            Some(("github.com/orga/api", "git_remote")),
+        )
+        .await;
+        let second = capture_with_identity(
+            &state,
+            &shared,
+            &SessionId::new().to_string(),
+            Some(("github.com/orgb/api", "git_remote")),
+        )
+        .await;
+        assert_ne!(first, second, "the cache answered for the wrong repository");
+
+        // Control: the same repository at that path keeps resolving to its own.
+        let again = capture_with_identity(
+            &state,
+            &shared,
+            &SessionId::new().to_string(),
+            Some(("github.com/orga/api", "git_remote")),
+        )
+        .await;
+        assert_eq!(again, first);
+    }
+
+    /// A capture, with the viewer it is authenticated as.
+    async fn capture_as(
+        state: &HookState,
+        cwd: &std::path::Path,
+        session: &str,
+        viewer: Option<ai_memory_core::UserId>,
+    ) -> anyhow::Result<()> {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session,
+                "cwd": cwd.to_string_lossy(),
+                "prompt": "hello",
+            }),
+        );
+        process_authorized(
+            state,
+            env,
+            None,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            viewer,
+        )
+        .await
+    }
+
+    /// A user holding `role` on the capture fixture's repository.
+    ///
+    /// Uses the real grant API rather than raw SQL, so the test exercises the
+    /// same path an operator's `ai-memory user grant` call takes.
+    async fn user_holding(
+        state: &HookState,
+        username: &str,
+        repository: ProjectId,
+        role: Option<ai_memory_store::GrantLevel>,
+    ) -> ai_memory_core::UserId {
+        let id = state
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: username.to_owned(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        if let Some(role) = role {
+            state
+                .writer
+                .grant_memory(id, repository, role, None)
+                .await
+                .unwrap();
+        }
+        id
+    }
+
     async fn make_state(tmp: &TempDir) -> HookState {
         let store = Store::open(tmp.path()).unwrap();
         let ws = store
@@ -5421,6 +6139,7 @@ mod tests {
                 }),
                 None,
                 None,
+                None,
                 HeaderMap::new(),
                 Json(serde_json::json!({ "session_id": sid })),
             )
@@ -5457,6 +6176,7 @@ mod tests {
             }),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(serde_json::json!({})),
         )
@@ -5485,6 +6205,7 @@ mod tests {
             Query(query.clone()),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(body.clone()),
         )
@@ -5496,6 +6217,7 @@ mod tests {
         let second = handle_hook(
             State(state),
             Query(query),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5527,6 +6249,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -5553,6 +6276,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5590,6 +6314,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(vec![HookBatchItem {
                 url: "http://h/hook?event=session-start&agent=claude-code".into(),
@@ -5616,6 +6341,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5645,6 +6371,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5702,6 +6429,7 @@ mod tests {
             }),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(serde_json::json!({ "prompt": "missing session fails" })),
         )
@@ -5733,6 +6461,7 @@ mod tests {
                 agent: Some("claude-code".into()),
                 ..Default::default()
             }),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5768,6 +6497,7 @@ mod tests {
             .collect::<Vec<_>>();
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5831,6 +6561,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -5922,6 +6653,7 @@ mod tests {
             State(state.clone()),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -5955,6 +6687,7 @@ mod tests {
         let items = vec![opted_in_stop_item("cap-off", "should not persist")];
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -6016,6 +6749,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -6085,6 +6819,7 @@ mod tests {
             State(state.clone()),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -6139,6 +6874,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -6203,6 +6939,7 @@ mod tests {
             State(state.clone()),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -6247,7 +6984,7 @@ mod tests {
                 "sessionId": "shared-session", "subagentType": "general-purpose"
             }),
         );
-        assert!(should_drop_subagent(&state, &marked_project_a).await);
+        assert!(should_drop_subagent(&state, &marked_project_a, None).await);
         assert!(
             state.active_project.get().is_none(),
             "drop preflight may resolve scope but must not publish it as active"
@@ -6264,7 +7001,7 @@ mod tests {
             serde_json::json!({ "sessionId": "shared-session", "toolName": "kept" }),
         );
         assert!(
-            !should_drop_subagent(&state, &unmarked_project_b).await,
+            !should_drop_subagent(&state, &unmarked_project_b, None).await,
             "a subagent session tracked in project-a must not drop same-id events in project-b"
         );
 
@@ -6279,7 +7016,7 @@ mod tests {
             serde_json::json!({ "sessionId": "shared-session", "toolName": "dropped" }),
         );
         assert!(
-            should_drop_subagent(&state, &unmarked_project_a).await,
+            should_drop_subagent(&state, &unmarked_project_a, None).await,
             "the originally tracked project's unmarked tail still drops"
         );
     }
@@ -6301,20 +7038,20 @@ mod tests {
             query("subagent-start"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
-        assert!(should_drop_subagent(&state, &start).await);
+        assert!(should_drop_subagent(&state, &start, None).await);
 
         let subagent_stop = HookEnvelope::from_query_and_body(
             query("subagent-stop"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
-        assert!(should_drop_subagent(&state, &subagent_stop).await);
+        assert!(should_drop_subagent(&state, &subagent_stop, None).await);
 
         let unmarked_stop_tail = HookEnvelope::from_query_and_body(
             query("stop"),
             serde_json::json!({ "sessionId": "tail-session" }),
         );
         assert!(
-            should_drop_subagent(&state, &unmarked_stop_tail).await,
+            should_drop_subagent(&state, &unmarked_stop_tail, None).await,
             "SubagentStop must not clear tracking before the unmarked stop tail"
         );
 
@@ -6323,7 +7060,7 @@ mod tests {
             serde_json::json!({ "sessionId": "tail-session" }),
         );
         assert!(
-            should_drop_subagent(&state, &session_end_tail).await,
+            should_drop_subagent(&state, &session_end_tail, None).await,
             "SessionEnd tail is dropped and then clears tracking"
         );
 
@@ -6332,7 +7069,7 @@ mod tests {
             serde_json::json!({ "sessionId": "tail-session", "toolName": "kept" }),
         );
         assert!(
-            !should_drop_subagent(&state, &after_session_end).await,
+            !should_drop_subagent(&state, &after_session_end, None).await,
             "SessionEnd clears tracking for that scoped session"
         );
     }
@@ -6345,6 +7082,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -6368,6 +7106,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -6405,6 +7144,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(vec![
                 HookBatchItem {
@@ -6439,6 +7179,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(vec![HookBatchItem {
                 url: "http://h/hook?event=pre-tool-use&agent=grok&drop_subagent=1".into(),
@@ -6468,6 +7209,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -6511,6 +7253,7 @@ mod tests {
             State(Arc::new(state)),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -6543,6 +7286,7 @@ mod tests {
 
         let response = handle_hook_batch(
             State(Arc::new(state)),
+            None,
             None,
             None,
             HeaderMap::new(),
@@ -7274,10 +8018,11 @@ mod tests {
                 String::new(),
                 String::new(),
                 ProjectStrategy::Basename.as_str().to_string(),
+                String::new(),
             );
             assert!(
                 cache.contains_key(&key),
-                "cache keyed by (cwd, ws_override, proj_override, project_strategy)"
+                "cache keyed by (cwd, ws_override, proj_override, project_strategy, identity)"
             );
         }
 
@@ -7304,9 +8049,27 @@ mod tests {
     #[test]
     fn project_cache_store_evicts_oldest_untouched_entry() {
         let mut cache = ProjectCacheStore::new(2);
-        let key_a = ("/a".into(), String::new(), String::new(), "basename".into());
-        let key_b = ("/b".into(), String::new(), String::new(), "basename".into());
-        let key_c = ("/c".into(), String::new(), String::new(), "basename".into());
+        let key_a = (
+            "/a".into(),
+            String::new(),
+            String::new(),
+            "basename".into(),
+            String::new(),
+        );
+        let key_b = (
+            "/b".into(),
+            String::new(),
+            String::new(),
+            "basename".into(),
+            String::new(),
+        );
+        let key_c = (
+            "/c".into(),
+            String::new(),
+            String::new(),
+            "basename".into(),
+            String::new(),
+        );
 
         cache.insert(key_a.clone(), (WorkspaceId::new(), ProjectId::new()));
         cache.insert(key_b.clone(), (WorkspaceId::new(), ProjectId::new()));
@@ -7327,8 +8090,20 @@ mod tests {
         let mut cache = ProjectCacheStore::new(4);
         let doomed_ws = WorkspaceId::new();
         let kept_ws = WorkspaceId::new();
-        let key_a = ("/a".into(), String::new(), String::new(), "basename".into());
-        let key_b = ("/b".into(), String::new(), String::new(), "basename".into());
+        let key_a = (
+            "/a".into(),
+            String::new(),
+            String::new(),
+            "basename".into(),
+            String::new(),
+        );
+        let key_b = (
+            "/b".into(),
+            String::new(),
+            String::new(),
+            "basename".into(),
+            String::new(),
+        );
 
         cache.insert(key_a.clone(), (doomed_ws, ProjectId::new()));
         cache.insert(key_b.clone(), (kept_ws, ProjectId::new()));
@@ -7574,6 +8349,7 @@ mod tests {
             bob,
             ai_memory_core::AuthLevel::Anonymous,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7587,6 +8363,7 @@ mod tests {
             Some("default"),
             Some("scratch"),
             ProjectStrategy::Basename,
+            None,
         );
         let mut cache = state.project_cache.lock().await;
         assert_eq!(cache.get(&cache_key), Some((cached_ws, cached_proj)));
@@ -7659,6 +8436,7 @@ mod tests {
             bob,
             ai_memory_core::AuthLevel::User,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7755,6 +8533,7 @@ mod tests {
             bob.clone(),
             ai_memory_core::AuthLevel::User,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7834,6 +8613,7 @@ mod tests {
             bob,
             ai_memory_core::AuthLevel::User,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7907,6 +8687,7 @@ mod tests {
             Some(IdentityKey::User("root".into())),
             ai_memory_core::AuthLevel::Root,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -7930,6 +8711,7 @@ mod tests {
             Some(IdentityKey::User("root".into())),
             ai_memory_core::AuthLevel::Root,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7945,6 +8727,7 @@ mod tests {
             Some(IdentityKey::User("bob".into())),
             ai_memory_core::AuthLevel::User,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -7960,6 +8743,7 @@ mod tests {
             Some(IdentityKey::User("root".into())),
             ai_memory_core::AuthLevel::Root,
             Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -8011,6 +8795,7 @@ mod tests {
                 IdentityKey::User("bob".into()).to_actor_context(),
             )),
             Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            None,
             HeaderMap::new(),
             Json(items),
         )
@@ -8067,6 +8852,7 @@ mod tests {
             None,
             ai_memory_core::AuthLevel::Anonymous,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -8114,6 +8900,7 @@ mod tests {
                 IdentityKey::User("bob".into()).to_actor_context(),
             )),
             Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+            None,
             HeaderMap::new(),
             Json(serde_json::json!({"session_id":"async-owned", "prompt":"foreign"})),
         )
@@ -8906,13 +9693,14 @@ mod tests {
                 session_id: Some(SessionId::new().to_string()),
                 ..Default::default()
             };
-            let first = fetch_and_accept_handoff_at(&state, query.clone(), None, Vec::new(), quiet)
-                .await
-                .unwrap()
-                .unwrap();
+            let first =
+                fetch_and_accept_handoff_at(&state, query.clone(), None, Vec::new(), None, quiet)
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert!(first.contains(&format!("Latest assistant response: {project}-latest")));
             assert!(!first.contains(&format!("{other}-")));
-            let second = fetch_and_accept_handoff_at(&state, query, None, Vec::new(), quiet)
+            let second = fetch_and_accept_handoff_at(&state, query, None, Vec::new(), None, quiet)
                 .await
                 .unwrap();
             assert!(
@@ -8983,6 +9771,7 @@ mod tests {
             receiver(),
             None,
             Vec::new(),
+            None,
             jiff::Timestamp::now(),
         )
         .await
@@ -8992,10 +9781,11 @@ mod tests {
 
         // Ten minutes after `between`: beta has been quiet, alpha has not.
         let later = between + LIVE_BATON_QUIET_PERIOD;
-        let delivered = fetch_and_accept_handoff_at(&state, receiver(), None, Vec::new(), later)
-            .await
-            .unwrap()
-            .expect("a quiet live session's baton is deliverable");
+        let delivered =
+            fetch_and_accept_handoff_at(&state, receiver(), None, Vec::new(), None, later)
+                .await
+                .unwrap()
+                .expect("a quiet live session's baton is deliverable");
         assert!(delivered.contains("beta work"), "{delivered}");
         assert!(!delivered.contains("alpha"), "{delivered}");
         assert_eq!(
@@ -9040,6 +9830,7 @@ mod tests {
                 None,
                 ai_memory_core::AuthLevel::Anonymous,
                 Vec::new(),
+                None,
             )
         };
         for name in ["session-start", "user-prompt"] {
@@ -9504,6 +10295,8 @@ mod tests {
                     briefing_budget: None,
                     managed_run: None,
                     session_id: None,
+                    identity: None,
+                    identity_src: None,
                 }),
                 Some(axum::Extension(ai_memory_core::ActorContext {
                     issuer: Some("https://idp.example".into()),
@@ -9511,6 +10304,7 @@ mod tests {
                     ..ai_memory_core::ActorContext::default()
                 })),
                 Some(axum::Extension(ai_memory_core::AuthLevel::User)),
+                None,
                 HeaderMap::new(),
             )
             .await,
@@ -9737,6 +10531,7 @@ mod tests {
                 None,
                 ai_memory_core::AuthLevel::Anonymous,
                 Vec::new(),
+                None,
             )
             .await
         });
@@ -9754,6 +10549,7 @@ mod tests {
                 None,
                 ai_memory_core::AuthLevel::Anonymous,
                 Vec::new(),
+                None,
             )
             .await
         });
@@ -10010,6 +10806,7 @@ mod tests {
                 State(Arc::new(state.clone())),
                 None,
                 level.map(axum::Extension),
+                None,
                 headers,
                 Json(items),
             )
@@ -10031,6 +10828,123 @@ mod tests {
             !baton_after_session(Some(ai_memory_core::AuthLevel::User), Some("loop-guard")).await,
             "a DB user must not bypass a reject-policy webhook with a header",
         );
+    }
+
+    /// Session start returns a repository's handoff and pinned pages, and
+    /// claims the handoff, keyed only on a project the caller named or a
+    /// directory they are in (#708). Bob, holding nothing on it, gets a 403
+    /// with the reason — never the handoff, never an empty 200 that the hook
+    /// would read as "nothing was left for you" — and the baton stays open for
+    /// someone who may take it.
+    #[tokio::test]
+    async fn session_start_delivers_nothing_from_a_repository_the_viewer_cannot_read() {
+        use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Grants only decide anything in a restricted project. The handoff
+        // lives in `scratch`, which starts open whatever the server default
+        // says, so it is restricted explicitly — which an operator may do.
+        state
+            .writer
+            .set_access_mode(state.project_id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "HANDOFF-MARKER".to_string(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = state.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        state
+            .writer
+            .grant_memory(
+                alice,
+                state.project_id,
+                ai_memory_store::GrantLevel::Read,
+                None,
+            )
+            .await
+            .unwrap();
+        let query = || HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(cwd.clone()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            project_strategy: None,
+            briefing: Some("1".into()),
+            briefing_budget: None,
+            managed_run: None,
+            session_id: None,
+            identity: None,
+            identity_src: None,
+        };
+        let state = Arc::new(state);
+        let session_start = |viewer: Option<ai_memory_core::UserId>| {
+            let state = state.clone();
+            let query = query();
+            async move {
+                read_handoff_response(
+                    handle_handoff(
+                        State(state),
+                        Query(query),
+                        None,
+                        None,
+                        viewer.map(|user| axum::Extension(AuthorizedViewer(user))),
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        let (status, body) = session_start(Some(bob)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("not authorized for scratch"), "{body}");
+        assert!(
+            !body.contains("HANDOFF-MARKER"),
+            "leaked the handoff: {body}"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "a refused session must not consume somebody else's baton",
+        );
+
+        let (status, body) = session_start(Some(alice)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("HANDOFF-MARKER"), "{body}");
     }
 
     /// The session-start claim is destructive (a handoff is single-use), so a
@@ -10076,6 +10990,8 @@ mod tests {
             briefing_budget: None,
             managed_run: None,
             session_id: None,
+            identity: None,
+            identity_src: None,
         };
 
         let state = Arc::new(state);
@@ -10083,6 +10999,7 @@ mod tests {
             handle_handoff(
                 State(state.clone()),
                 Query(query()),
+                None,
                 None,
                 None,
                 HeaderMap::new(),
@@ -10111,6 +11028,7 @@ mod tests {
                 Query(query()),
                 None,
                 Some(axum::Extension(ai_memory_core::AuthLevel::Root)),
+                None,
                 headers,
             )
             .await,
@@ -10248,7 +11166,10 @@ mod tests {
                     briefing_budget: None,
                     managed_run: None,
                     session_id: None,
+                    identity: None,
+                    identity_src: None,
                 }),
+                None,
                 None,
                 None,
                 HeaderMap::new(),
@@ -11063,9 +11984,12 @@ mod tests {
                 briefing_budget: None,
                 managed_run: None,
                 session_id: None,
+                identity: None,
+                identity_src: None,
             },
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -11136,9 +12060,12 @@ mod tests {
                 briefing_budget: None,
                 managed_run: None,
                 session_id: None,
+                identity: None,
+                identity_src: None,
             },
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap()
@@ -11202,9 +12129,11 @@ mod tests {
             briefing_budget: None,
             managed_run: None,
             session_id: Some(session_id.into()),
+            identity: None,
+            identity_src: None,
         };
         let empty_sid = "empty-native-session";
-        let rendered = fetch_and_accept_handoff(&state, query(empty_sid), None, Vec::new())
+        let rendered = fetch_and_accept_handoff(&state, query(empty_sid), None, Vec::new(), None)
             .await
             .unwrap()
             .unwrap();
@@ -11245,11 +12174,16 @@ mod tests {
         assert!(reopened.lifecycle.accepted_by.is_none());
         assert!(reopened.lifecycle.accepted_at.is_none());
         assert!(reopened.lifecycle.accepted_by_session.is_none());
-        let next =
-            fetch_and_accept_handoff(&state, query("next-substantive-session"), None, Vec::new())
-                .await
-                .unwrap()
-                .unwrap();
+        let next = fetch_and_accept_handoff(
+            &state,
+            query("next-substantive-session"),
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(next.contains("REAL-WORK-MARKER"));
     }
 
@@ -11334,8 +12268,10 @@ mod tests {
             briefing_budget: None,
             managed_run: Some(run.run_id.to_string()),
             session_id: Some("native-2".into()),
+            identity: None,
+            identity_src: None,
         };
-        let rendered = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new())
+        let rendered = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new(), None)
             .await
             .unwrap();
 
@@ -11363,7 +12299,7 @@ mod tests {
             "a handoff delivered on a managed SessionStart must be marked accepted"
         );
         assert!(
-            fetch_and_accept_handoff(&state, query, None, Vec::new())
+            fetch_and_accept_handoff(&state, query, None, Vec::new(), None)
                 .await
                 .unwrap()
                 .is_none(),
@@ -11439,6 +12375,8 @@ mod tests {
             briefing_budget: None,
             managed_run: None,
             session_id: None,
+            identity: None,
+            identity_src: None,
         };
 
         let named = ai_memory_core::ActorContext {
@@ -11446,11 +12384,16 @@ mod tests {
             ..ai_memory_core::ActorContext::default()
         };
         for viewer in [ai_memory_core::ActorContext::anonymous(), named] {
-            let rendered =
-                fetch_and_accept_handoff(&state, query.clone(), viewer.identity_key(), Vec::new())
-                    .await
-                    .unwrap()
-                    .expect("the brief must be injected");
+            let rendered = fetch_and_accept_handoff(
+                &state,
+                query.clone(),
+                viewer.identity_key(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the brief must be injected");
             assert!(
                 rendered.contains("the backend runs behind a queue"),
                 "a pre-existing nested slot must survive the upgrade for {viewer:?}: {rendered}"
@@ -11510,12 +12453,15 @@ mod tests {
             briefing_budget: None,
             managed_run: None,
             session_id: None,
+            identity: None,
+            identity_src: None,
         };
 
-        let rendered = fetch_and_accept_handoff(&state, query, carol.identity_key(), Vec::new())
-            .await
-            .unwrap()
-            .expect("the brief must be injected");
+        let rendered =
+            fetch_and_accept_handoff(&state, query, carol.identity_key(), Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("the brief must be injected");
         assert!(rendered.contains("SHARED-CONTEXT"), "{rendered}");
         assert!(
             rendered.contains("CAROL-SECRET"),
@@ -11569,22 +12515,26 @@ mod tests {
             briefing_budget: None,
             managed_run: None,
             session_id: None,
+            identity: None,
+            identity_src: None,
         };
 
         // Non-truthy opt-in: no handoff pending, nothing to inject.
-        let rendered = fetch_and_accept_handoff(&state, query(Some("false")), None, Vec::new())
-            .await
-            .unwrap();
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("false")), None, Vec::new(), None)
+                .await
+                .unwrap();
         assert!(
             rendered.is_none(),
             "non-truthy briefing flag must not inject anything"
         );
 
         // Truthy opt-in, no pending handoff: brief alone (the /clear case).
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new())
-            .await
-            .unwrap()
-            .expect("brief must be injected without a pending handoff");
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("brief must be injected without a pending handoff");
         assert!(
             rendered.contains("project brief") && rendered.contains("single writer actor"),
             "brief must carry the rules page body: {rendered}"
@@ -11618,10 +12568,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new())
-            .await
-            .unwrap()
-            .expect("handoff + brief must both be injected");
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("handoff + brief must both be injected");
         let handoff_pos = rendered.find("resume the auth refactor").unwrap();
         let brief_pos = rendered.find("project brief").unwrap();
         assert!(
@@ -11712,12 +12663,15 @@ mod tests {
             briefing_budget: None,
             managed_run: Some(kimi.run_id.to_string()),
             session_id: Some("kimi-session".into()),
+            identity: None,
+            identity_src: None,
         };
 
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new())
-            .await
-            .unwrap()
-            .expect("managed delta and brief must be injected");
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("managed delta and brief must be injected");
         let delta_pos = rendered.find("portable managed delta sentinel").unwrap();
         let brief_pos = rendered.find("managed briefing sentinel").unwrap();
         assert!(
@@ -11725,7 +12679,7 @@ mod tests {
             "managed delta must precede the project brief: {rendered}"
         );
 
-        let rendered = fetch_and_accept_handoff(&state, query(None), None, Vec::new())
+        let rendered = fetch_and_accept_handoff(&state, query(None), None, Vec::new(), None)
             .await
             .unwrap();
         assert!(
@@ -11733,10 +12687,11 @@ mod tests {
             "delivered managed context must not repeat without a new briefing request"
         );
 
-        let rendered = fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new())
-            .await
-            .unwrap()
-            .expect("an explicit later briefing request must still render the project brief");
+        let rendered =
+            fetch_and_accept_handoff(&state, query(Some("true")), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("an explicit later briefing request must still render the project brief");
         assert!(rendered.contains("managed briefing sentinel"));
         assert!(!rendered.contains("portable managed delta sentinel"));
     }
@@ -11922,9 +12877,12 @@ mod tests {
                 briefing_budget: None,
                 managed_run: None,
                 session_id: None,
+                identity: None,
+                identity_src: None,
             },
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -12045,6 +13003,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 strat.clone(),
+                String::new(),
             )),
             "cache key must remain case-folded for #806 stickiness"
         );
@@ -12054,6 +13013,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 strat,
+                String::new(),
             )),
             "cache key must not carry the original-case basename"
         );
@@ -13589,6 +14549,7 @@ mod tests {
             State(state.clone()),
             None,
             None,
+            None,
             HeaderMap::new(),
             Json(vec![
                 HookBatchItem {
@@ -13647,6 +14608,7 @@ mod tests {
         let state = Arc::new(state);
         let response = handle_hook_batch(
             State(state.clone()),
+            None,
             None,
             None,
             HeaderMap::new(),
