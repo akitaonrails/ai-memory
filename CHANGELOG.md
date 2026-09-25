@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `identity = "…"` in `.ai-memory.toml` pins the repository identity a
+  checkout's captures route by, outranking `project` and the git remote — see
+  [marker-file.md](docs/marker-file.md#repository-identity). (#708)
 - The builtin web UI has a root-only `/web/pending` page to triage pending
   auto-improvement proposals. It lists the proposals of all projects, with a
   project filter and a sort, and shows the rationale and the proposed body.
@@ -197,6 +200,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   git-tracked session page. (#865)
 
 ### Changed
+- Captures from a checkout with no declared `project` and a git remote now route
+  by the repository's identity — the normalised `upstream` remote, else `origin`
+  — instead of the folder name (`projects.identity`, V70). Two unrelated
+  repositories sharing a folder name now get two projects (the second named
+  after its owner, e.g. `orgb-api`); one repository cloned into differently
+  named folders converges on one project, the first to claim the identity —
+  an existing second project keeps its history but stops receiving captures.
+  Existing projects are claimed in place, so upgrading moves no memory, and a
+  user who may not write to a project cannot claim its identity. Checkouts
+  that declare `project` in their marker route by name exactly as before. Every
+  hook client (native, shell, PowerShell, TypeScript) resolves the identity
+  host-side and sends it as `identity` / `identity_src`; credentials in a remote
+  URL never leave the machine. (#708)
 - A capture into a project its author may not write is dropped server-side
   and counted as `dropped_unauthorized` in status, never stored. The native
   hook client treats a 403 from the server as final and drops the event
