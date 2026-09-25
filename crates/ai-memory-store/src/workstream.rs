@@ -794,6 +794,9 @@ pub(crate) fn finish_run(
             ],
         )?;
     }
+    // The CASE has no ELSE on purpose: a finish that reports a different
+    // session yields NULL, clearing the stamp that belonged to the session
+    // linked earlier in the run.
     if input.complete {
         tx.execute(
             "UPDATE managed_runs SET state = 'finished', native_session_id = COALESCE(?1, native_session_id), \
