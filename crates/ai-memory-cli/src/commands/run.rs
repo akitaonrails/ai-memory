@@ -12,8 +12,9 @@ use ai_memory_core::{
     PrepareManagedRunResponse,
 };
 use ai_memory_workstream::{
-    ExportedTranscript, LaunchMode, LaunchPlan, ManagedHarness, NativeSessionCandidate,
-    allows_native_session_adoption, apply_yolo, build_launch_plan, build_launch_plan_with_env,
+    AmbiguousNativeSession, ExportedTranscript, LaunchMode, LaunchPlan, LaunchRoots,
+    ManagedHarness, NativeSessionCandidate, allows_native_session_adoption, apply_yolo,
+    build_launch_plan, build_launch_plan_with_env, crush_global_config_path,
     discover_native_session, export_transcript, has_native_session_selector, inspect_repository,
     kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
     kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
@@ -283,6 +284,10 @@ pub(super) async fn run_from_with_wiring(
             native_args.clone(),
             Some(&candidate.session.native_session_id),
             &run_env,
+            Some(LaunchRoots {
+                home: &home,
+                cwd: &repository.cwd,
+            }),
         ));
         eprintln!(
             "ai-memory: continuing newest checkout-local {} session {}",
@@ -326,6 +331,10 @@ pub(super) async fn run_from_with_wiring(
                             native_args,
                             Some(&native_session_id),
                             &run_env,
+                            Some(LaunchRoots {
+                                home: &home,
+                                cwd: &repository.cwd,
+                            }),
                         ));
                     }
                     Ok(None) => {}
@@ -419,7 +428,8 @@ pub(super) async fn run_from_with_wiring(
     }
 
     let crush_context = if harness == ManagedHarness::Crush && plan.mode == LaunchMode::Session {
-        acquired_try!(prepare_crush_context(&endpoint, &run_path, &home).await)
+        let source = crush_context_source(&home, &repository.cwd, launch_env);
+        acquired_try!(prepare_crush_context(&endpoint, &run_path, &source).await)
     } else {
         None
     };
@@ -471,8 +481,8 @@ pub(super) async fn run_from_with_wiring(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    // A blank home override is unset for session import and auto-wire; drop
-    // it from the child as well, or the harness
+    // A blank home override is unset for session import, auto-wire and the
+    // Crush context config; drop it from the child as well, or the harness
     // would read a blank-named directory under the checkout that nothing else
     // follows.
     for name in blank_home_overrides(harness, &launch_env) {
@@ -698,9 +708,28 @@ async fn resolve_native_session_after_run(
     {
         return Ok(Some(linked.to_string()));
     }
-    let discovered =
-        discover_native_session(harness, home, cwd, plan.session_dir.as_deref(), started_at)
-            .await?;
+    let fresh = !has_native_session_selector(harness, &plan.args);
+    let discovered = match discover_native_session(
+        harness,
+        home,
+        cwd,
+        plan.session_dir.as_deref(),
+        started_at,
+        fresh,
+    )
+    .await
+    {
+        Ok(discovered) => discovered,
+        // The session the run was prepared with is no evidence either: this
+        // launch may not have touched it while another one did.
+        Err(error) if error.is::<AmbiguousNativeSession>() => {
+            eprintln!(
+                "ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     // A linked session set aside above belongs to another checkout, so it is
     // no fallback either.
     Ok(discovered.or_else(|| {
@@ -913,14 +942,20 @@ fn upsert_env(entries: &mut Vec<(String, String)>, key: String, value: String) {
     }
 }
 
-/// The launched harness's home variables (its store overrides) that are set
-/// but blank in the launch environment.
+/// The launched harness's home variables (its store overrides, plus the
+/// config home Crush's managed context is built from) that are set but blank
+/// in the launch environment.
 fn blank_home_overrides(
     harness: ManagedHarness,
     get: &dyn Fn(&str) -> Option<OsString>,
 ) -> Vec<&'static str> {
+    let crush_config: &[&'static str] = match harness {
+        ManagedHarness::Crush => &["CRUSH_GLOBAL_CONFIG", "XDG_CONFIG_HOME"],
+        _ => &[],
+    };
     store_override_vars(harness)
         .iter()
+        .chain(crush_config)
         .copied()
         .filter(|name| {
             let value = get(name);
@@ -953,6 +988,7 @@ fn build_preflighted_launch_plan(
         native_args.clone(),
         linked_session_id,
         env_overrides,
+        Some(LaunchRoots { home, cwd }),
     )?;
     let Some(linked_session_id) = linked_session_id else {
         return Ok((plan, None));
@@ -969,7 +1005,14 @@ fn build_preflighted_launch_plan(
     ) {
         Ok(true) => Ok((plan, None)),
         Ok(false) => Ok((
-            build_launch_plan_with_env(harness, executable, native_args, None, env_overrides)?,
+            build_launch_plan_with_env(
+                harness,
+                executable,
+                native_args,
+                None,
+                env_overrides,
+                Some(LaunchRoots { home, cwd }),
+            )?,
             Some(linked_session_id.to_string()),
         )),
         Err(error) => {
@@ -1098,7 +1141,7 @@ async fn fetch_grok_context(endpoint: &ServerEndpoint, run_path: &str) -> Result
 async fn prepare_crush_context(
     endpoint: &ServerEndpoint,
     run_path: &str,
-    home: &Path,
+    source: &Path,
 ) -> Result<Option<tempfile::TempDir>> {
     let response: ManagedRunContextResponse = post_json(
         endpoint,
@@ -1111,7 +1154,19 @@ async fn prepare_crush_context(
         return Ok(None);
     };
 
-    write_crush_context_config(&crush_global_config_path(home), &context).map(Some)
+    write_crush_context_config(source, &context).map(Some)
+}
+
+/// The global `crush.json` the launched Crush reads. Crush takes a relative
+/// `CRUSH_GLOBAL_CONFIG` from its working directory, and the generated config
+/// dir (and its `crushrc`) must name the user's files absolutely because the
+/// child reads them from elsewhere.
+fn crush_context_source(
+    home: &Path,
+    cwd: &Path,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> PathBuf {
+    cwd.join(crush_global_config_path(home, get))
 }
 
 fn write_crush_context_config(source: &Path, context: &str) -> Result<tempfile::TempDir> {
@@ -1122,27 +1177,61 @@ fn write_crush_context_config(source: &Path, context: &str) -> Result<tempfile::
     let context_path = temp.path().join("managed-workstream.md");
     write_private(&context_path, context.as_bytes())?;
 
-    let mut config = if source.is_file() {
-        let raw = std::fs::read(source)
-            .with_context(|| format!("reading Crush config {}", source.display()))?;
+    // Crush cleans the path (`filepath.Join`) before reading it, so a `..`
+    // after a missing directory still reaches the file.
+    let source = ai_memory_workstream::clean_path(source);
+    let raw = if source.is_file() {
+        std::fs::read(&source)
+            .with_context(|| format!("reading Crush config {}", source.display()))?
+    } else {
+        Vec::new()
+    };
+    // Crush skips an empty file and reads `null` as unset; do the same rather
+    // than refuse a config Crush itself accepts.
+    let mut config = if raw.is_empty() {
+        serde_json::Value::Null
+    } else {
         serde_json::from_slice::<serde_json::Value>(&raw)
             .with_context(|| format!("parsing Crush config {}", source.display()))?
-    } else {
-        serde_json::json!({})
     };
+    if config.is_null() {
+        config = serde_json::json!({});
+    }
     let root = config
         .as_object_mut()
         .context("Crush global config must be a JSON object")?;
-    let options = root
-        .entry("options")
-        .or_insert_with(|| serde_json::json!({}))
+    let options = root.entry("options").or_insert(serde_json::Value::Null);
+    if options.is_null() {
+        *options = serde_json::json!({});
+    }
+    let options = options
         .as_object_mut()
         .context("Crush global config `options` must be a JSON object")?;
     let paths = options
         .entry("global_context_paths")
-        .or_insert_with(|| serde_json::json!([]))
+        .or_insert(serde_json::Value::Null);
+    if paths.is_null() {
+        *paths = serde_json::json!([]);
+    }
+    let paths = paths
         .as_array_mut()
         .context("Crush `options.global_context_paths` must be an array")?;
+    // Crush fills an empty list with `CRUSH.md` beside its global config and
+    // `AGENTS.md` one level up, but only while the list is empty, and it would
+    // resolve them against this temp dir. Seed the user's own ones first so
+    // the packet does not replace them.
+    if paths.is_empty()
+        && let Some(config_dir) = source.parent()
+    {
+        paths.push(serde_json::Value::String(
+            config_dir.join("CRUSH.md").to_string_lossy().into_owned(),
+        ));
+        if let Some(parent) = config_dir.parent() {
+            paths.push(serde_json::Value::String(
+                parent.join("AGENTS.md").to_string_lossy().into_owned(),
+            ));
+        }
+    }
     let context_path = context_path.to_string_lossy().into_owned();
     if !paths
         .iter()
@@ -1152,17 +1241,23 @@ fn write_crush_context_config(source: &Path, context: &str) -> Result<tempfile::
     }
     let rendered = serde_json::to_vec_pretty(&config).context("rendering Crush config")?;
     write_private(&temp.path().join("crush.json"), &rendered)?;
+    // Crush also runs the `crushrc` beside its global config, and with the
+    // config dir moved here it would look for one in this dir. Source the
+    // user's own from the directory Crush runs it in, so its relative paths
+    // and `source` lines still resolve. Its settings merge over the JSON
+    // above and lists concatenate, so the packet stays loaded. Unlike Crush,
+    // the default context files above are seeded even when the script adds
+    // paths of its own.
+    if let Some(config_dir) = source.parent() {
+        let crushrc = config_dir.join("crushrc");
+        if crushrc.is_file() {
+            let quote =
+                |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"));
+            let wrapper = format!("cd {} && source {}\n", quote(config_dir), quote(&crushrc));
+            write_private(&temp.path().join("crushrc"), wrapper.as_bytes())?;
+        }
+    }
     Ok(temp)
-}
-
-fn crush_global_config_path(home: &Path) -> PathBuf {
-    if let Some(dir) = std::env::var_os("CRUSH_GLOBAL_CONFIG").filter(|value| !value.is_empty()) {
-        return PathBuf::from(dir).join("crush.json");
-    }
-    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(dir).join("crush/crush.json");
-    }
-    home.join(".config/crush/crush.json")
 }
 
 fn write_private(path: &Path, content: &[u8]) -> Result<()> {
@@ -2357,9 +2452,15 @@ mod tests {
             "CLAUDE_CONFIG_DIR".to_string(),
             "/accounts/work".to_string(),
         )];
-        let plan =
-            build_launch_plan_with_env(ManagedHarness::Claude, None, Vec::new(), None, &overrides)
-                .unwrap();
+        let plan = build_launch_plan_with_env(
+            ManagedHarness::Claude,
+            None,
+            Vec::new(),
+            None,
+            &overrides,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             plan.session_dir.as_deref(),
             Some(Path::new("/accounts/work/projects"))
@@ -2714,6 +2815,77 @@ mod tests {
             .unwrap()
             .as_deref(),
             Some("unrelated-current")
+        );
+    }
+
+    /// Two new Crush sessions in one store cannot be told apart, and that is
+    /// reported without cancelling the finished run or falling back to the
+    /// session the run was prepared with, which another launch may have
+    /// moved. With no ambiguity a fresh run that created nothing keeps that
+    /// session, and `--continue` claims the session it resumed.
+    #[tokio::test]
+    async fn ambiguous_crush_discovery_keeps_the_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let started = 1_900_000_000_i64;
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(started as u64);
+        let store = |name: &str, sessions: &[(&str, i64, i64)]| {
+            // Inside the checkout: a store only this project uses.
+            let data = cwd.join(name);
+            std::fs::create_dir_all(&data).unwrap();
+            let connection = rusqlite::Connection::open(data.join("crush.db")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, \
+                     updated_at INTEGER NOT NULL, created_at INTEGER NOT NULL);",
+                )
+                .unwrap();
+            for (id, created, updated) in sessions {
+                connection
+                    .execute(
+                        "INSERT INTO sessions VALUES (?1, NULL, ?2, ?3)",
+                        rusqlite::params![id, started + updated, started + created],
+                    )
+                    .unwrap();
+            }
+            data
+        };
+        let crowded = store(
+            "crowded",
+            &[("continued", -1_000, 30), ("a", 5, 20), ("b", 8, 10)],
+        );
+        let quiet = store("quiet", &[("continued", -1_000, 30)]);
+        let status = ManagedRunStatus {
+            run_id: ManagedRunId::new(),
+            workstream_id: WorkstreamId::new(),
+            agent: AgentKind::Crush,
+            native_session_id: Some("prepared".to_string()),
+            native_session_linked: false,
+            context_delivered: false,
+            state: "active".to_string(),
+        };
+        let resolve = async |data: &Path, extra: &[&str]| {
+            let mut args = vec![OsString::from("--data-dir"), data.as_os_str().to_owned()];
+            args.extend(extra.iter().map(OsString::from));
+            let plan = build_launch_plan(ManagedHarness::Crush, None, args, None).unwrap();
+            resolve_native_session_after_run(
+                &plan,
+                ManagedHarness::Crush,
+                temp.path(),
+                &cwd,
+                started_at,
+                Some(&status),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(resolve(&crowded, &[]).await, None);
+        assert_eq!(resolve(&crowded, &["--continue"]).await, None);
+        assert_eq!(resolve(&quiet, &[]).await.as_deref(), Some("prepared"));
+        assert_eq!(
+            resolve(&quiet, &["--continue"]).await.as_deref(),
+            Some("continued")
         );
     }
 
@@ -3165,6 +3337,206 @@ mod tests {
                 ])
             ),
             ["PI_CODING_AGENT_SESSION_DIR"]
+        );
+        assert_eq!(
+            blank_home_overrides(
+                ManagedHarness::Crush,
+                &env(&[("CRUSH_GLOBAL_CONFIG", "  "), ("XDG_CONFIG_HOME", "/x")])
+            ),
+            ["CRUSH_GLOBAL_CONFIG"]
+        );
+        assert!(
+            blank_home_overrides(ManagedHarness::Claude, &env(&[("XDG_CONFIG_HOME", "")]))
+                .is_empty(),
+            "Crush's config home is Crush's alone"
+        );
+    }
+
+    /// The managed Crush context layers onto the global config the child
+    /// would read: `--env` over ai-memory's own environment, blank as unset.
+    /// A relative `CRUSH_GLOBAL_CONFIG` is read from the launch directory, as
+    /// Crush reads it, so the generated config and `crushrc` do not point at
+    /// paths the child would resolve from its temporary config dir.
+    #[test]
+    fn crush_context_source_is_anchored_at_the_launch_dir() {
+        let home = Path::new("/home/user");
+        let cwd = Path::new("/work/repo");
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        assert_eq!(
+            crush_context_source(home, cwd, env(&[("CRUSH_GLOBAL_CONFIG", "cfg")])),
+            cwd.join("cfg").join("crush.json")
+        );
+        assert_eq!(
+            crush_context_source(home, cwd, env(&[])),
+            home.join(".config").join("crush").join("crush.json")
+        );
+    }
+
+    #[test]
+    fn crush_global_config_path_follows_the_launch_env() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let home = Path::new("/home/me");
+        let default = home.join(".config").join("crush").join("crush.json");
+        assert_eq!(
+            crush_global_config_path(
+                home,
+                env(&[
+                    ("CRUSH_GLOBAL_CONFIG", "/team/crush"),
+                    ("XDG_CONFIG_HOME", "/xdg")
+                ])
+            ),
+            Path::new("/team/crush").join("crush.json")
+        );
+        assert_eq!(
+            crush_global_config_path(home, env(&[("XDG_CONFIG_HOME", "/xdg")])),
+            Path::new("/xdg").join("crush").join("crush.json")
+        );
+        assert_eq!(
+            crush_global_config_path(
+                home,
+                env(&[("CRUSH_GLOBAL_CONFIG", "  "), ("XDG_CONFIG_HOME", "")])
+            ),
+            default,
+            "blank counts as unset"
+        );
+        assert_eq!(crush_global_config_path(home, env(&[])), default);
+    }
+
+    /// Crush skips an empty config and reads `null` as unset, so neither may
+    /// stop a managed launch.
+    #[test]
+    fn crush_context_config_accepts_what_crush_accepts() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, content) in [
+            ("empty", ""),
+            ("null-options", r#"{"options": null}"#),
+            (
+                "null-paths",
+                r#"{"options": {"global_context_paths": null}}"#,
+            ),
+            ("null", "null"),
+        ] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let source = dir.join("crush.json");
+            std::fs::write(&source, content).unwrap();
+            let generated = write_crush_context_config(&source, "managed packet")
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            let config: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(generated.path().join("crush.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                config["options"]["global_context_paths"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(3),
+                "{name}: {config}"
+            );
+        }
+    }
+
+    /// Crush cleans the config path before reading it and deriving its default
+    /// context files, so a `..` in `CRUSH_GLOBAL_CONFIG` moves neither.
+    #[test]
+    fn crush_default_context_files_follow_the_cleaned_config_path() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("crush.json"), r#"{"marker": 1}"#).unwrap();
+        // `missing` does not exist: only a cleaned path reaches the file.
+        let source = config_dir.join("missing").join("..").join("crush.json");
+
+        let generated = write_crush_context_config(&source, "managed packet").unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(generated.path().join("crush.json")).unwrap())
+                .unwrap();
+        let paths: Vec<&str> = config["options"]["global_context_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(Path::new(paths[0]), config_dir.join("CRUSH.md"));
+        assert_eq!(Path::new(paths[1]), root.path().join("AGENTS.md"));
+        assert_eq!(config["marker"], 1, "the user's config was read");
+    }
+
+    /// Crush only fills in its default `CRUSH.md` / `AGENTS.md` while
+    /// `global_context_paths` is empty, so the packet must not displace the
+    /// user's own files.
+    #[test]
+    fn crush_context_config_keeps_crush_default_context_files() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("config").join("crush");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let source = config_dir.join("crush.json");
+        std::fs::write(&source, r#"{"options": {"debug": true}}"#).unwrap();
+
+        let generated = write_crush_context_config(&source, "managed packet").unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(generated.path().join("crush.json")).unwrap())
+                .unwrap();
+        let paths: Vec<&str> = config["options"]["global_context_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert_eq!(Path::new(paths[0]), config_dir.join("CRUSH.md"));
+        assert_eq!(
+            Path::new(paths[1]),
+            root.path().join("config").join("AGENTS.md")
+        );
+        assert_eq!(std::fs::read_to_string(paths[2]).unwrap(), "managed packet");
+    }
+
+    /// Crush runs the `crushrc` beside its global config, and moving the
+    /// config dir for the context packet would drop the user's. The generated
+    /// dir sources it from its own directory, so relative `source` lines keep
+    /// working, whatever the path contains.
+    #[cfg(unix)]
+    #[test]
+    fn crush_context_config_carries_the_global_crushrc() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let config_dir = root.join("it's my crush");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let source = config_dir.join("crush.json");
+
+        let generated = write_crush_context_config(&source, "managed packet").unwrap();
+        assert!(!generated.path().join("crushrc").exists());
+
+        std::fs::write(config_dir.join("crushrc"), "source ./extra\n").unwrap();
+        std::fs::write(config_dir.join("extra"), "pwd > \"$OUT\"\n").unwrap();
+        let generated = write_crush_context_config(&source, "managed packet").unwrap();
+        let out = root.join("out");
+        // Crush runs a crushrc from its own directory.
+        let status = std::process::Command::new("bash")
+            .arg(generated.path().join("crushrc"))
+            .current_dir(generated.path())
+            .env("OUT", &out)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap().trim_end(),
+            config_dir.to_str().unwrap()
         );
     }
 

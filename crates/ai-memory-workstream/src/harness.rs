@@ -203,7 +203,24 @@ pub fn build_launch_plan(
     native_args: Vec<OsString>,
     linked_session_id: Option<&str>,
 ) -> Result<LaunchPlan> {
-    build_launch_plan_with_env(harness, executable, native_args, linked_session_id, &[])
+    build_launch_plan_with_env(
+        harness,
+        executable,
+        native_args,
+        linked_session_id,
+        &[],
+        None,
+    )
+}
+
+/// Where a launch runs: the home the harness resolves `~` against and the
+/// directory it starts in.
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchRoots<'a> {
+    /// The native home.
+    pub home: &'a Path,
+    /// The harness's working directory.
+    pub cwd: &'a Path,
 }
 
 /// [`build_launch_plan`] with `--env`/`--env-file` overrides layered in front
@@ -215,28 +232,37 @@ pub fn build_launch_plan(
 /// this same variable, so a caller-scoped override that only reached the
 /// child process would make the two disagree about where the session lives
 /// (see the `CLAUDE_CONFIG_DIR` note in `docs/managed-workstreams.md`).
+///
+/// `roots` name the native home and the launch directory. Crush needs both
+/// (its data directory is found from the launch directory, see
+/// [`crush_data_dir`]); without them that store falls back to the adapter's
+/// default root.
 pub fn build_launch_plan_with_env(
     harness: ManagedHarness,
     executable: Option<OsString>,
     native_args: Vec<OsString>,
     linked_session_id: Option<&str>,
     env_overrides: &[(String, String)],
+    roots: Option<LaunchRoots<'_>>,
 ) -> Result<LaunchPlan> {
     let program = executable.unwrap_or_else(|| OsString::from(harness.executable()));
     let mut args = native_args;
+    let get = |name: &str| {
+        env_overrides
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| OsString::from(value))
+            .or_else(|| std::env::var_os(name))
+    };
     let session_dir = match harness {
         ManagedHarness::Pi | ManagedHarness::Omp => flag_path(&args, &["--session-dir"]),
         ManagedHarness::Crush => flag_path(&args, &["--data-dir", "-D"]),
         _ => None,
     }
-    .or_else(|| {
-        environment_session_dir_with(harness, |name| {
-            env_overrides
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| OsString::from(value))
-                .or_else(|| std::env::var_os(name))
-        })
+    .or_else(|| environment_session_dir_with(harness, get))
+    .or_else(|| match (harness, roots) {
+        (ManagedHarness::Crush, Some(roots)) => Some(crush_data_dir(roots.cwd, roots.home, get)),
+        _ => None,
     });
     let mut expected = explicit_session_id(harness, &args);
     let mode = launch_mode(harness, &args);
@@ -972,6 +998,201 @@ pub fn clean_path(path: &Path) -> PathBuf {
     clean
 }
 
+/// Crush's global `crush.json`, resolved as Crush's `GlobalConfig()` does:
+/// `$CRUSH_GLOBAL_CONFIG/crush.json`, else `$XDG_CONFIG_HOME/crush/crush.json`,
+/// else `~/.config/crush/crush.json`. `get` is the launch environment, and a
+/// blank value counts as unset, as for every other harness home; a managed
+/// launch drops such a value from Crush too.
+pub fn crush_global_config_path(home: &Path, get: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    let dir = |name| env_dir_override(get(name));
+    if let Some(dir) = dir("CRUSH_GLOBAL_CONFIG") {
+        return dir.join("crush.json");
+    }
+    dir("XDG_CONFIG_HOME")
+        .unwrap_or_else(|| home.join(".config"))
+        .join("crush")
+        .join("crush.json")
+}
+
+/// The directory Crush keeps `crush.db` in when no `--data-dir` is given,
+/// resolved as Crush's `setDefaults` does: the last `options.data_directory`
+/// among its JSON configs, else the closest `.crush` from `cwd` up to the git
+/// worktree root (not one directly in the home, and the walk stops at an
+/// entry another user owns), else `<cwd>/.crush`. A relative value is taken
+/// against `cwd`. `get` is the launch environment.
+///
+/// A `crushrc` can set the option as well, but reading it means running the
+/// user's shell script, so a data directory set only there is not seen; pass
+/// `--data-dir` to name it.
+pub fn crush_data_dir(cwd: &Path, home: &Path, get: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    let cwd = clean_path(&std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf()));
+    let boundary = crate::repository::worktree_root(&cwd).unwrap_or_else(|| cwd.clone());
+    // Crush gives up on both upward searches when it cannot stat the start.
+    let walk = path_owner(&cwd)
+        .ok()
+        .map(|owner| (owner, crush_walk_up(&cwd, &boundary)));
+    let configured = crush_config_files(&cwd, home, walk.as_ref(), &get)
+        .iter()
+        .fold(None, |value, file| {
+            crush_config_data_directory(file).or(value)
+        })
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    let dir = configured
+        .or_else(|| {
+            let (owner, dirs) = walk.as_ref()?;
+            crush_closest_data_dir(dirs, *owner, home)
+        })
+        .unwrap_or_else(|| cwd.join(".crush"));
+    // Crush's `SmartJoin`: a path that starts with a slash is absolute on
+    // Windows too.
+    let rooted = cfg!(windows) && dir.to_string_lossy().starts_with(['/', '\\']);
+    if dir.is_absolute() || rooted {
+        clean_path(&dir)
+    } else {
+        clean_path(&cwd.join(dir))
+    }
+}
+
+/// [`crush_data_dir`] against ai-memory's own environment, for a store no
+/// launch plan named (automatic session discovery).
+pub(crate) fn crush_process_data_dir(cwd: &Path, home: &Path) -> PathBuf {
+    crush_data_dir(cwd, home, |name| std::env::var_os(name))
+}
+
+/// Crush's JSON configs in merge order, later ones winning: the system file,
+/// the global config, the global data config, then the project's
+/// `crush.json` and `.crush.json` from the walk's top down to `cwd`.
+fn crush_config_files(
+    cwd: &Path,
+    home: &Path,
+    walk: Option<&(Option<u32>, Vec<PathBuf>)>,
+    get: &impl Fn(&str) -> Option<OsString>,
+) -> Vec<PathBuf> {
+    // Crush tests these with `!= ""` and reads a relative path from its
+    // working directory.
+    let set = |name: &str| {
+        get(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let global_data = if let Some(dir) = set("CRUSH_GLOBAL_DATA") {
+        dir.join("crush.json")
+    } else if let Some(dir) = set("XDG_DATA_HOME") {
+        dir.join("crush").join("crush.json")
+    } else if cfg!(windows) {
+        set("LOCALAPPDATA")
+            .unwrap_or_else(|| {
+                PathBuf::from(get("USERPROFILE").unwrap_or_default())
+                    .join("AppData")
+                    .join("Local")
+            })
+            .join("crush")
+            .join("crush.json")
+    } else {
+        home.join(".local")
+            .join("share")
+            .join("crush")
+            .join("crush.json")
+    };
+    let mut files = Vec::new();
+    if cfg!(not(windows)) {
+        files.push(PathBuf::from("/etc/crush/crush.json"));
+    }
+    files.push(cwd.join(crush_global_config_path(home, get)));
+    files.push(cwd.join(global_data));
+    if let Some((owner, dirs)) = walk {
+        for dir in dirs.iter().rev() {
+            for name in ["crush.json", ".crush.json"] {
+                let file = dir.join(name);
+                if crush_probe(&file, *owner) == CrushProbe::Found {
+                    files.push(file);
+                }
+            }
+        }
+    }
+    files
+}
+
+/// `options.data_directory` from one JSON config, when it sets one.
+fn crush_config_data_directory(file: &Path) -> Option<String> {
+    let raw = std::fs::read(file).ok()?;
+    let config = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
+    config
+        .get("options")?
+        .get("data_directory")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Crush's `LookupClosestBounded(cwd, boundary, ".crush")` over `dirs`.
+fn crush_closest_data_dir(dirs: &[PathBuf], owner: Option<u32>, home: &Path) -> Option<PathBuf> {
+    for dir in dirs {
+        let candidate = dir.join(".crush");
+        match crush_probe(&candidate, owner) {
+            CrushProbe::Missing => continue,
+            CrushProbe::Refused => return None,
+            CrushProbe::Found => return (dir != home).then_some(candidate),
+        }
+    }
+    None
+}
+
+/// `cwd` and each parent up to `boundary`, compared with symlinks resolved,
+/// or up to the filesystem root when `boundary` is not above `cwd` (Crush's
+/// `traverseUpBounded`).
+fn crush_walk_up(cwd: &Path, boundary: &Path) -> Vec<PathBuf> {
+    let resolved = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| clean_path(path));
+    let stop = resolved(boundary);
+    let mut dirs = Vec::new();
+    let mut dir = Some(cwd);
+    while let Some(current) = dir {
+        dirs.push(current.to_path_buf());
+        if resolved(current) == stop {
+            break;
+        }
+        dir = current.parent();
+    }
+    dirs
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CrushProbe {
+    Found,
+    Missing,
+    Refused,
+}
+
+/// Crush's `probeEnt`: an entry owned by someone other than the walk's
+/// owner, or one it cannot stat, is refused.
+fn crush_probe(path: &Path, owner: Option<u32>) -> CrushProbe {
+    match std::fs::metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CrushProbe::Missing,
+        Err(_) => CrushProbe::Refused,
+        Ok(metadata) if owner.is_none_or(|owner| metadata_owner(&metadata) == Some(owner)) => {
+            CrushProbe::Found
+        }
+        Ok(_) => CrushProbe::Refused,
+    }
+}
+
+/// The uid Crush compares while walking up (`fsext.Owner`); `None` on
+/// Windows, where Crush skips the check.
+fn path_owner(path: &Path) -> std::io::Result<Option<u32>> {
+    std::fs::metadata(path).map(|metadata| metadata_owner(&metadata))
+}
+
+#[cfg(unix)]
+fn metadata_owner(metadata: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(metadata.uid())
+}
+
+#[cfg(not(unix))]
+fn metadata_owner(_metadata: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
 fn environment_session_dir_with(
     harness: ManagedHarness,
     get: impl Fn(&str) -> Option<OsString>,
@@ -1454,6 +1675,161 @@ mod tests {
         assert_eq!(
             environment_session_dir_with(ManagedHarness::Omp, get).as_deref(),
             Some(std::path::Path::new("/stores/pi-family/sessions"))
+        );
+    }
+
+    fn git_init(dir: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// Only Crush's global config names: the global JSON files under the temp
+    /// root, never the developer's.
+    fn crush_env(root: &Path) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let config = root.join("global-config").into_os_string();
+        let data = root.join("global-data").into_os_string();
+        move |name| match name {
+            "CRUSH_GLOBAL_CONFIG" => Some(config.clone()),
+            "CRUSH_GLOBAL_DATA" => Some(data.clone()),
+            _ => None,
+        }
+    }
+
+    /// Without `--data-dir` Crush keeps `crush.db` in the closest `.crush`
+    /// between the working directory and the git worktree root, not always
+    /// in `<cwd>/.crush`; outside a worktree it looks only in the cwd.
+    #[test]
+    fn crush_data_dir_takes_the_closest_crush_dir_in_the_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let home = root.join("home");
+        let repo = root.join("repo");
+        let cwd = repo.join("sub").join("deep");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir(root.join(".crush")).unwrap();
+        let resolve = |cwd: &Path| crush_data_dir(cwd, &home, crush_env(&root));
+
+        // `<root>/.crush` is above the cwd but outside any worktree bound.
+        assert_eq!(resolve(&cwd), cwd.join(".crush"));
+        git_init(&repo);
+        assert_eq!(
+            resolve(&cwd),
+            cwd.join(".crush"),
+            "the walk stops at the worktree root"
+        );
+        std::fs::create_dir(repo.join(".crush")).unwrap();
+        assert_eq!(resolve(&cwd), repo.join(".crush"));
+        std::fs::create_dir(repo.join("sub").join(".crush")).unwrap();
+        assert_eq!(resolve(&cwd), repo.join("sub").join(".crush"));
+    }
+
+    /// A `.crush` directly in the home is Crush's global state, never a
+    /// project's data dir.
+    #[test]
+    fn crush_data_dir_skips_a_crush_dir_in_the_home() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let home = root.join("home");
+        let cwd = home.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        git_init(&home);
+        std::fs::create_dir(home.join(".crush")).unwrap();
+        assert_eq!(
+            crush_data_dir(&cwd, &home, crush_env(&root)),
+            cwd.join(".crush")
+        );
+    }
+
+    /// `options.data_directory` wins over the lookup. Later configs override
+    /// earlier ones: the global JSON files, then the project's from the
+    /// worktree root down, `.crush.json` over `crush.json` in one directory.
+    /// A relative value is taken against the cwd and an empty one falls back
+    /// to the lookup.
+    #[test]
+    fn crush_data_dir_follows_data_directory_in_crush_configs() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let home = root.join("home");
+        let repo = root.join("repo");
+        let cwd = repo.join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        git_init(&repo);
+        let write = |file: &Path, dir: &str| {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(
+                file,
+                serde_json::json!({"options": {"data_directory": dir}}).to_string(),
+            )
+            .unwrap();
+        };
+        let resolve = || crush_data_dir(&cwd, &home, crush_env(&root));
+
+        write(
+            &root.join("global-config").join("crush.json"),
+            "/from/global",
+        );
+        assert_eq!(resolve(), Path::new("/from/global"));
+        write(&root.join("global-data").join("crush.json"), "/from/data");
+        assert_eq!(resolve(), Path::new("/from/data"));
+        write(&repo.join(".crush.json"), "/from/repo-hidden");
+        write(&repo.join("crush.json"), "/from/repo");
+        assert_eq!(resolve(), Path::new("/from/repo-hidden"));
+        write(&cwd.join("crush.json"), "state/../store");
+        assert_eq!(resolve(), cwd.join("store"));
+        write(&cwd.join("crush.json"), "");
+        std::fs::create_dir(repo.join(".crush")).unwrap();
+        assert_eq!(resolve(), repo.join(".crush"));
+    }
+
+    /// The launch plan carries the resolved Crush store when it knows where
+    /// the launch runs; `--data-dir` still wins.
+    #[test]
+    fn crush_launch_plan_resolves_the_data_dir_from_the_launch_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let repo = root.join("repo");
+        let cwd = repo.join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+        git_init(&repo);
+        std::fs::create_dir(repo.join(".crush")).unwrap();
+        let env = [
+            (
+                "CRUSH_GLOBAL_CONFIG".to_string(),
+                root.join("global-config").display().to_string(),
+            ),
+            (
+                "CRUSH_GLOBAL_DATA".to_string(),
+                root.join("global-data").display().to_string(),
+            ),
+        ];
+        let plan = |args: Vec<OsString>| {
+            build_launch_plan_with_env(
+                ManagedHarness::Crush,
+                None,
+                args,
+                None,
+                &env,
+                Some(LaunchRoots {
+                    home: &root,
+                    cwd: &cwd,
+                }),
+            )
+            .unwrap()
+            .session_dir
+        };
+        assert_eq!(plan(Vec::new()), Some(repo.join(".crush")));
+        assert_eq!(
+            plan(vec![
+                OsString::from("--data-dir"),
+                OsString::from("/pinned")
+            ]),
+            Some(PathBuf::from("/pinned"))
         );
     }
 

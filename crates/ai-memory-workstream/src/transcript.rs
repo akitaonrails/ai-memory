@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use crate::ManagedHarness;
+use crate::{ManagedHarness, clean_path};
 
 const MAX_SCAN_FILES: usize = 50_000;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
@@ -120,7 +120,7 @@ pub async fn export_transcript(
         return export_opencode2(home, session_dir, native_session_id, source_cursor);
     }
     if harness == ManagedHarness::Crush {
-        return export_crush(cwd, session_dir, native_session_id, source_cursor);
+        return export_crush(home, cwd, session_dir, native_session_id, source_cursor);
     }
     if harness == ManagedHarness::Antigravity {
         // The conversation store keeps every step as an undocumented protobuf
@@ -138,14 +138,48 @@ pub async fn export_transcript(
     export_jsonl(harness, &path, native_session_id, source_cursor)
 }
 
+/// New sessions appeared in a store that records no launch identity and none
+/// can be tied to this run, so a concurrent launch on the same store cannot
+/// be told apart and none is claimed.
+#[derive(Debug)]
+pub struct AmbiguousNativeSession {
+    harness: ManagedHarness,
+    sessions: usize,
+    /// For a store outside the project, how many of them edited a file in it.
+    placed: Option<usize>,
+}
+
+impl std::fmt::Display for AmbiguousNativeSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (sessions, harness) = (self.sessions, self.harness.as_str());
+        match self.placed {
+            None => write!(
+                formatter,
+                "{sessions} new {harness} sessions were created during this run and none records which launch made it"
+            ),
+            Some(placed) => write!(
+                formatter,
+                "{sessions} new {harness} session(s) were created during this run in a data directory outside this project, and {placed} of them edited a file here"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AmbiguousNativeSession {}
+
 /// Discover a session created after `started_at` when the harness could not be
-/// assigned an id before launch and SessionStart did not link one.
+/// assigned an id before launch and SessionStart did not link one. `fresh` is
+/// whether the launch started a new native session rather than continuing the
+/// newest one. Crush, which has no hooks to link its session, claims only the
+/// one session the run created (or, continuing, the one it touched) and fails
+/// with [`AmbiguousNativeSession`] when another launch did the same.
 pub async fn discover_native_session(
     harness: ManagedHarness,
     home: &Path,
     cwd: &Path,
     session_dir: Option<&Path>,
     started_at: SystemTime,
+    fresh: bool,
 ) -> Result<Option<String>> {
     if harness == ManagedHarness::OpenCode {
         return discover_opencode(home, session_dir, cwd, started_at);
@@ -154,7 +188,7 @@ pub async fn discover_native_session(
         return discover_opencode2(home, session_dir, cwd, started_at);
     }
     if harness == ManagedHarness::Crush {
-        return discover_crush(cwd, session_dir, started_at);
+        return discover_crush(home, cwd, session_dir, started_at, fresh);
     }
     let mut candidates = collect_session_files(harness, home, session_dir)?;
     candidates.sort_by(|left, right| {
@@ -195,7 +229,7 @@ pub async fn list_native_sessions(
         return list_opencode2_sessions(home, session_dir, cwd, limit);
     }
     if harness == ManagedHarness::Crush {
-        return list_crush_sessions(cwd, session_dir, limit);
+        return list_crush_sessions(home, cwd, session_dir, limit);
     }
 
     let mut files = collect_session_files(harness, home, session_dir)?;
@@ -280,7 +314,7 @@ pub fn native_session_exists(
         return Ok(opencode2_updated(home, session_dir, native_session_id)?.is_some());
     }
     if harness == ManagedHarness::Crush {
-        return Ok(crush_updated(cwd, session_dir, native_session_id)?.is_some());
+        return Ok(crush_updated(home, cwd, session_dir, native_session_id)?.is_some());
     }
     Ok(locate_session_file(harness, home, cwd, session_dir, native_session_id)?.is_some())
 }
@@ -330,7 +364,7 @@ pub async fn wait_for_transcript_flush(
         } else if harness == ManagedHarness::OpenCode2 {
             opencode2_updated(home, session_dir, native_session_id)?.map(|value| value.to_string())
         } else if harness == ManagedHarness::Crush {
-            crush_updated(cwd, session_dir, native_session_id)?.map(|value| value.to_string())
+            crush_updated(home, cwd, session_dir, native_session_id)?.map(|value| value.to_string())
         } else {
             locate_session_file(harness, home, cwd, session_dir, native_session_id)?.and_then(
                 |path| {
@@ -1955,12 +1989,13 @@ fn export_opencode(
 }
 
 fn export_crush(
+    home: &Path,
     cwd: &Path,
     session_dir: Option<&Path>,
     session: &str,
     source_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
-    let db = crush_db(cwd, session_dir);
+    let db = crush_db(home, cwd, session_dir);
     let connection = Connection::open_with_flags(
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -2861,22 +2896,115 @@ fn list_opencode_sessions(
 }
 
 fn discover_crush(
+    home: &Path,
     cwd: &Path,
     session_dir: Option<&Path>,
     started_at: SystemTime,
+    fresh: bool,
 ) -> Result<Option<String>> {
-    Ok(list_crush_sessions(cwd, session_dir, 1)?
-        .into_iter()
-        .find(|candidate| candidate.updated_at + Duration::from_secs(2) >= started_at)
-        .map(|candidate| candidate.native_session_id))
+    let db = crush_db(home, cwd, session_dir);
+    if !db.is_file() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Title and sub-agent sessions name their session as parent. A fresh
+    // launch looks at what it created; `--continue` at what it resumed.
+    let order = if fresh { "created_at" } else { "updated_at" };
+    let mut statement = connection.prepare(&format!(
+        "SELECT id, {order} FROM sessions WHERE parent_session_id IS NULL \
+         ORDER BY {order} DESC LIMIT 64"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut during_run = Vec::new();
+    for row in rows {
+        let (id, at) = row?;
+        let Some(at) = native_timestamp(at) else {
+            continue;
+        };
+        if at + Duration::from_secs(2) < started_at {
+            break;
+        }
+        if valid_native_session_id(&id) {
+            during_run.push(id);
+        }
+    }
+    // A data directory outside the project (a global `data_directory`) holds
+    // other projects' sessions too, and Crush keeps no directory per session.
+    // What it does keep is the absolute path of each file a session edited;
+    // only a session that edited a file here is known to be this project's.
+    // (`read_files` paths are relative to each session's own directory, so
+    // they place nothing.)
+    let project = crate::repository::worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    // Where the store really is: a `.crush` symlinked to a shared directory
+    // is shared.
+    let resolved = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| clean_path(path));
+    let shared = db
+        .parent()
+        .is_some_and(|dir| !resolved(&cwd.join(dir)).starts_with(resolved(&project)));
+    let placed = if shared {
+        let mut placed = Vec::new();
+        for id in &during_run {
+            let edited = crush_edited_paths(&connection, id)?;
+            if edited.iter().any(|path| path_within(path, &project)) {
+                placed.push(id.clone());
+            }
+        }
+        Some(placed)
+    } else {
+        None
+    };
+    let sessions = during_run.len();
+    if sessions == 0 {
+        return Ok(None);
+    }
+    let placed_count = placed.as_ref().map(Vec::len);
+    let mut claimed = placed.unwrap_or(during_run);
+    if claimed.len() == 1 {
+        return Ok(claimed.pop());
+    }
+    Err(AmbiguousNativeSession {
+        harness: ManagedHarness::Crush,
+        sessions,
+        placed: placed_count,
+    }
+    .into())
+}
+
+/// The files a Crush session edited, as the absolute paths its edit tools
+/// record in `files`, including edits its sub-agent sessions made.
+fn crush_edited_paths(connection: &Connection, session: &str) -> Result<Vec<PathBuf>> {
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE tree(id) AS ( \
+             SELECT ?1 UNION SELECT sessions.id FROM sessions \
+             JOIN tree ON sessions.parent_session_id = tree.id) \
+         SELECT path FROM files WHERE session_id IN (SELECT id FROM tree)",
+    )?;
+    let rows = statement.query_map([session], |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(PathBuf::from(row?))).collect()
+}
+
+/// Whether absolute `path` lies under `root`, compared both as written and
+/// with symlinks resolved (Crush records the path it was given, which may go
+/// through a symlinked `/var` or checkout). A relative path cannot be placed.
+fn path_within(path: &Path, root: &Path) -> bool {
+    let resolved = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| clean_path(path));
+    path.is_absolute()
+        && (clean_path(path).starts_with(clean_path(root))
+            || resolved(path).starts_with(resolved(root)))
 }
 
 fn list_crush_sessions(
+    home: &Path,
     cwd: &Path,
     session_dir: Option<&Path>,
     limit: usize,
 ) -> Result<Vec<NativeSessionCandidate>> {
-    let db = crush_db(cwd, session_dir);
+    let db = crush_db(home, cwd, session_dir);
     if !db.is_file() {
         return Ok(Vec::new());
     }
@@ -2906,8 +3034,13 @@ fn list_crush_sessions(
     Ok(sessions)
 }
 
-fn crush_updated(cwd: &Path, session_dir: Option<&Path>, session: &str) -> Result<Option<i64>> {
-    let db = crush_db(cwd, session_dir);
+fn crush_updated(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+) -> Result<Option<i64>> {
+    let db = crush_db(home, cwd, session_dir);
     if !db.is_file() {
         return Ok(None);
     }
@@ -2926,8 +3059,11 @@ fn crush_updated(cwd: &Path, session_dir: Option<&Path>, session: &str) -> Resul
     }
 }
 
-fn crush_db(cwd: &Path, session_dir: Option<&Path>) -> PathBuf {
-    session_dir.unwrap_or(&cwd.join(".crush")).join("crush.db")
+fn crush_db(home: &Path, cwd: &Path, session_dir: Option<&Path>) -> PathBuf {
+    session_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| crate::harness::crush_process_data_dir(cwd, home))
+        .join("crush.db")
 }
 
 fn native_timestamp(value: i64) -> Option<SystemTime> {
@@ -3793,6 +3929,227 @@ mod tests {
         );
     }
 
+    /// Crush has no hooks to link its session, and a store can be shared by
+    /// launches in several subdirectories. A fresh launch claims the one
+    /// top-level session created while it ran (title and sub-agent sessions
+    /// name a parent) and claims none when another launch created one too;
+    /// `--continue` claims the one session it touched, on the same terms.
+    #[tokio::test]
+    async fn crush_discovery_claims_only_the_session_the_run_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(cwd.join(".crush")).unwrap();
+        let connection = Connection::open(cwd.join(".crush").join("crush.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, \
+                 updated_at INTEGER NOT NULL, created_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+        let started = 1_900_000_000_i64;
+        let started_at = UNIX_EPOCH + Duration::from_secs(started as u64);
+        let insert = |id: &str, parent: Option<&str>, created: i64, updated: i64| {
+            connection
+                .execute(
+                    "INSERT INTO sessions VALUES (?1, ?2, ?3, ?4)",
+                    params![id, parent, started + updated, started + created],
+                )
+                .unwrap();
+        };
+        let discover = |fresh: bool| discover_crush(temp.path(), &cwd, None, started_at, fresh);
+
+        let ambiguous = |fresh: bool| {
+            discover(fresh)
+                .unwrap_err()
+                .downcast::<AmbiguousNativeSession>()
+                .unwrap()
+                .sessions
+        };
+        insert("idle", None, -2_000, -1_000);
+        insert("continued", None, -1_000, 30);
+        insert("continued-task", Some("continued"), 3, 40);
+        assert_eq!(discover(true).unwrap(), None);
+        assert_eq!(discover(false).unwrap().as_deref(), Some("continued"));
+
+        insert("mine", None, 5, 20);
+        insert("mine-title", Some("mine"), 6, 25);
+        assert_eq!(discover(true).unwrap().as_deref(), Some("mine"));
+        assert_eq!(ambiguous(false), 2);
+
+        insert("theirs", None, 8, 10);
+        assert_eq!(ambiguous(true), 2);
+    }
+
+    /// A data directory outside the project can hold another project's
+    /// sessions, and Crush records no directory per session. Only a session
+    /// that edited a file here (an absolute path in `files`) is claimed, and
+    /// only when it is the one; a read (`read_files` keeps paths relative to
+    /// each session's own directory) or a file elsewhere places nothing. A
+    /// store inside the project keeps the plain one-new-session rule.
+    #[tokio::test]
+    async fn crush_discovery_in_a_shared_store_claims_only_an_edit_here() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let started = 1_900_000_000_i64;
+        let started_at = UNIX_EPOCH + Duration::from_secs(started as u64);
+        let store = |name: &str, sessions: &[(&str, &[&str])]| {
+            let dir = if name == ".crush" {
+                repo.join(name)
+            } else {
+                root.join(name)
+            };
+            fs::create_dir_all(&dir).unwrap();
+            let connection = Connection::open(dir.join("crush.db")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, \
+                     updated_at INTEGER NOT NULL, created_at INTEGER NOT NULL); \
+                     CREATE TABLE files(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, \
+                     path TEXT NOT NULL); \
+                     CREATE TABLE read_files(session_id TEXT NOT NULL, path TEXT NOT NULL, \
+                     read_at INTEGER NOT NULL);",
+                )
+                .unwrap();
+            for (nth, (id, paths)) in sessions.iter().enumerate() {
+                let at = started + 5 + nth as i64;
+                // `parent/child` is a sub-agent session of `parent`.
+                let (parent, id) = match id.split_once('/') {
+                    Some((parent, child)) => (Some(parent), child),
+                    None => (None, *id),
+                };
+                connection
+                    .execute(
+                        "INSERT INTO sessions VALUES (?1, ?2, ?3, ?3)",
+                        params![id, parent, at],
+                    )
+                    .unwrap();
+                for path in *paths {
+                    // `read:` marks a file the session only read.
+                    match path.strip_prefix("read:") {
+                        Some(read) => connection.execute(
+                            "INSERT INTO read_files VALUES (?1, ?2, 0)",
+                            params![id, read],
+                        ),
+                        None => connection.execute(
+                            "INSERT INTO files VALUES (?1, ?2, ?3)",
+                            params![format!("{id}-{path}"), id, path],
+                        ),
+                    }
+                    .unwrap();
+                }
+            }
+            dir
+        };
+        let discover = |dir: &Path| discover_crush(&root, &repo, Some(dir), started_at, true);
+        let placed = |dir: &Path| {
+            discover(dir)
+                .unwrap_err()
+                .downcast::<AmbiguousNativeSession>()
+                .unwrap()
+                .placed
+        };
+        let here = repo.join("src").join("main.rs").display().to_string();
+        let elsewhere = "/elsewhere/project-b/main.go";
+
+        let dir = store("shared-foreign", &[("theirs", &[elsewhere])]);
+        assert_eq!(placed(&dir), Some(0));
+
+        let dir = store(
+            "shared-mine",
+            &[
+                ("theirs", &[elsewhere]),
+                ("chat", &[]),
+                ("mine", &[elsewhere, &here]),
+            ],
+        );
+        assert_eq!(discover(&dir).unwrap().as_deref(), Some("mine"));
+
+        // Reads place nothing: Crush keeps them relative to each session's own
+        // directory (absolute only when that fails), and neither does an edit
+        // whose path cannot be placed.
+        let read_here_absolute = format!("read:{here}");
+        let dir = store(
+            "shared-read",
+            &[
+                ("theirs", &["read:src/main.go", &read_here_absolute]),
+                ("relative", &["src/main.go"]),
+                ("chat", &[]),
+            ],
+        );
+        assert_eq!(placed(&dir), Some(0));
+
+        let dir = store("shared-both", &[("one", &[&here]), ("two", &[&here])]);
+        assert_eq!(placed(&dir), Some(2));
+
+        // An edit a sub-agent made places the session that ran it.
+        let dir = store(
+            "shared-task",
+            &[
+                ("theirs", &[elsewhere]),
+                ("mine", &[]),
+                ("mine/task", &[&here]),
+            ],
+        );
+        assert_eq!(discover(&dir).unwrap().as_deref(), Some("mine"));
+
+        let dir = store(".crush", &[("dotfiles", &[elsewhere])]);
+        assert_eq!(discover(&dir).unwrap().as_deref(), Some("dotfiles"));
+
+        // A project `.crush` that links to a shared store is shared.
+        #[cfg(unix)]
+        {
+            let dir = store("shared-linked", &[("theirs", &[elsewhere])]);
+            let linked = repo.join("linked-crush");
+            std::os::unix::fs::symlink(&dir, &linked).unwrap();
+            assert_eq!(placed(&linked), Some(0));
+        }
+    }
+
+    /// Session discovery with no store named by a launch plan finds Crush's
+    /// database where Crush keeps it: the closest `.crush` up to the worktree
+    /// root, not only `<cwd>/.crush`.
+    #[tokio::test]
+    async fn crush_discovery_finds_the_store_above_the_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repo = root.join("repo");
+        let cwd = repo.join("sub");
+        fs::create_dir_all(repo.join(".crush")).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let connection = Connection::open(repo.join(".crush").join("crush.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL);\n\
+                 INSERT INTO sessions VALUES ('above', 1800000000);",
+            )
+            .unwrap();
+
+        let candidates = list_native_sessions(ManagedHarness::Crush, &root, &cwd, None, 8)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.native_session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["above"]
+        );
+    }
+
     /// OpenCode keeps every checkout's sessions in one database, so a session
     /// is this checkout's only when its recorded directory matches; other
     /// harnesses answer as `native_session_exists` does.
@@ -3889,7 +4246,7 @@ mod tests {
                 .unwrap()
         );
 
-        let first = export_crush(&cwd, None, "newer", None).unwrap();
+        let first = export_crush(temp.path(), &cwd, None, "newer", None).unwrap();
         assert_eq!(first.events.len(), 1);
         assert_eq!(first.events[0].content, "visible");
         assert!(first.losses.iter().any(|loss| loss.contains("reasoning")));
@@ -3900,7 +4257,14 @@ mod tests {
                 [json!([{"type":"tool_result","data":{"name":"bash","content":"ok","is_error":false}}]).to_string()],
             )
             .unwrap();
-        let second = export_crush(&cwd, None, "newer", first.source_cursor.as_deref()).unwrap();
+        let second = export_crush(
+            temp.path(),
+            &cwd,
+            None,
+            "newer",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
         assert_eq!(second.events.len(), 1);
         assert_eq!(second.events[0].kind, WorkstreamEventKind::ToolResult);
         assert_eq!(second.events[0].content, "ok");
