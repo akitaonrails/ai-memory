@@ -15,8 +15,8 @@ use ai_memory_core::{
 };
 use ai_memory_store::{
     FinishWorkstreamRun, PrepareWorkstreamRun, ReaderPool, RenameWorkstream, ScopeResolutionError,
-    StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle, create_explicit_scope,
-    lookup_existing_scope,
+    StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle,
+    create_explicit_scope_guarded, lookup_existing_scope_guarded,
 };
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -105,9 +105,53 @@ fn authorize(
     })
 }
 
+/// The user whose grants apply to this request, if any do.
+///
+/// [`ai_memory_core::AuthorizedViewer`] is stamped only when an operator has
+/// switched per-repository authorization on, and never for root. `None`
+/// therefore means no per-repository check applies, which leaves every
+/// existing install behaving exactly as it did before the guard existed.
+fn actor_user(
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+) -> Option<ai_memory_core::UserId> {
+    actor.map(|Extension(viewer)| viewer.user())
+}
+
+/// Authorize the caller on the repository `run_id` belongs to — see
+/// [`crate::grants::authorize_resolved`]. The run routes take the id in the
+/// URL, so without this they would act on any repository's run.
+async fn authorize_run(
+    state: &WorkstreamState,
+    run_id: ManagedRunId,
+    viewer: Option<ai_memory_core::UserId>,
+    required: ai_memory_store::ProjectAccess,
+) -> Result<(), Response> {
+    if viewer.is_none() {
+        return Ok(());
+    }
+    let scope = state
+        .reader
+        .managed_run_scope(run_id)
+        .await
+        .map_err(|failure| error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()))?;
+    crate::grants::authorize_resolved(&state.reader, scope, viewer, required)
+        .await
+        .map_err(scope_refusal)
+}
+
+/// A refusal as a response: 403 for an access problem, 500 otherwise.
+fn scope_refusal(failure: ScopeResolutionError) -> Response {
+    if failure.is_forbidden() {
+        error(StatusCode::FORBIDDEN, failure.to_string())
+    } else {
+        error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string())
+    }
+}
+
 async fn prepare_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     Json(request): Json<PrepareManagedRunRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -190,14 +234,19 @@ async fn prepare_run(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
-    let scope = match create_explicit_scope(
+    let scope = match create_explicit_scope_guarded(
+        &state.reader,
         &state.writer,
         request.workspace.trim(),
         request.project.trim(),
+        actor_user(actor),
     )
     .await
     {
         Ok(scope) => scope,
+        Err(failure) if failure.is_forbidden() => {
+            return error(StatusCode::FORBIDDEN, failure.to_string());
+        }
         Err(failure) => return error(StatusCode::BAD_REQUEST, failure.to_string()),
     };
     let selection = match (request.workstream, request.new_workstream) {
@@ -246,6 +295,7 @@ async fn prepare_run(
 async fn run_status(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalRead) {
@@ -255,6 +305,16 @@ async fn run_status(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
+    if let Err(response) = authorize_run(
+        &state,
+        run_id,
+        actor_user(actor),
+        ai_memory_store::ProjectAccess::Read,
+    )
+    .await
+    {
+        return response;
+    }
     match state.reader.managed_run_status(run_id).await {
         Ok(Some(status)) => Json(ManagedRunStatus {
             run_id: status.run_id,
@@ -274,6 +334,7 @@ async fn run_status(
 async fn heartbeat_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -283,6 +344,16 @@ async fn heartbeat_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
+    if let Err(response) = authorize_run(
+        &state,
+        run_id,
+        actor_user(actor),
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await
+    {
+        return response;
+    }
     match state.writer.heartbeat_managed_run(run_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error(StatusCode::CONFLICT, "managed run lease is not active"),
@@ -293,6 +364,7 @@ async fn heartbeat_run(
 async fn cancel_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -302,6 +374,16 @@ async fn cancel_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
+    if let Err(response) = authorize_run(
+        &state,
+        run_id,
+        actor_user(actor),
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await
+    {
+        return response;
+    }
     match state.writer.cancel_managed_run(run_id).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(failure) => store_error_response(failure),
@@ -311,6 +393,7 @@ async fn cancel_run(
 async fn run_context(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -320,6 +403,16 @@ async fn run_context(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
+    if let Err(response) = authorize_run(
+        &state,
+        run_id,
+        actor_user(actor),
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await
+    {
+        return response;
+    }
     let context = match state.reader.managed_run_context(run_id, 256).await {
         Ok(Some(context)) => context,
         Ok(None) => return error(StatusCode::NOT_FOUND, "active managed run not found"),
@@ -346,6 +439,7 @@ async fn run_context(
 async fn accept_run_context(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     AxumPath(raw_run_id): AxumPath<String>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -355,6 +449,16 @@ async fn accept_run_context(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
+    if let Err(response) = authorize_run(
+        &state,
+        run_id,
+        actor_user(actor),
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await
+    {
+        return response;
+    }
     let status = match state.reader.managed_run_status(run_id).await {
         Ok(Some(status)) => status,
         Ok(None) => return error(StatusCode::NOT_FOUND, "managed run not found"),
@@ -388,6 +492,7 @@ const fn default_event_limit() -> usize {
 async fn list_recent_workstreams(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     Json(request): Json<ListManagedWorkstreamsRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalRead) {
@@ -409,14 +514,19 @@ async fn list_recent_workstreams(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
-    let scope = match lookup_existing_scope(
+    let scope = match lookup_existing_scope_guarded(
         &state.reader,
         request.workspace.trim(),
         request.project.trim(),
+        actor_user(actor),
+        ai_memory_store::ProjectAccess::Read,
     )
     .await
     {
         Ok(scope) => scope,
+        Err(failure) if failure.is_forbidden() => {
+            return error(StatusCode::FORBIDDEN, failure.to_string());
+        }
         Err(failure) if failure.is_not_found() => {
             return error(StatusCode::NOT_FOUND, failure.to_string());
         }
@@ -474,6 +584,7 @@ async fn list_recent_workstreams(
 async fn rename_workstream(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     Json(request): Json<RenameManagedWorkstreamRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -521,14 +632,19 @@ async fn rename_workstream(
             );
         }
     };
-    let scope = match lookup_existing_scope(
+    let scope = match lookup_existing_scope_guarded(
         &state.reader,
         request.workspace.trim(),
         request.project.trim(),
+        actor_user(actor),
+        ai_memory_store::ProjectAccess::Write,
     )
     .await
     {
         Ok(scope) => scope,
+        Err(failure) if failure.is_forbidden() => {
+            return error(StatusCode::FORBIDDEN, failure.to_string());
+        }
         Err(failure) if failure.is_not_found() => {
             return error(StatusCode::NOT_FOUND, failure.to_string());
         }
@@ -566,6 +682,7 @@ async fn rename_workstream(
 async fn search_events(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     AxumPath(raw_workstream_id): AxumPath<String>,
     Query(query): Query<EventQuery>,
 ) -> Response {
@@ -576,6 +693,23 @@ async fn search_events(
         Ok(id) => id,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid workstream id"),
     };
+    // The id reaches a repository's event history without naming it.
+    if let Some(viewer) = actor_user(actor) {
+        let scope = match state.reader.workstream_scope(workstream_id).await {
+            Ok(scope) => scope,
+            Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+        };
+        if let Err(failure) = crate::grants::authorize_resolved(
+            &state.reader,
+            scope,
+            Some(viewer),
+            ai_memory_store::ProjectAccess::Read,
+        )
+        .await
+        {
+            return scope_refusal(failure);
+        }
+    }
     match state
         .reader
         .search_workstream_events(workstream_id, query.q, query.limit.clamp(1, 100))
@@ -589,6 +723,7 @@ async fn search_events(
 async fn link_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     AxumPath(raw_run_id): AxumPath<String>,
     Json(request): Json<LinkManagedRunRequest>,
 ) -> Response {
@@ -599,6 +734,16 @@ async fn link_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
+    if let Err(response) = authorize_run(
+        &state,
+        run_id,
+        actor_user(actor),
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await
+    {
+        return response;
+    }
     if request.native_session_id.trim().is_empty()
         || request.native_session_id.len() > MAX_NATIVE_SESSION_ID_BYTES
     {
@@ -626,6 +771,7 @@ async fn link_run(
 async fn finish_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
+    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     AxumPath(raw_run_id): AxumPath<String>,
     Json(mut request): Json<FinishManagedRunRequest>,
 ) -> Response {
@@ -636,6 +782,16 @@ async fn finish_run(
         Ok(id) => id,
         Err(response) => return response.into_response(),
     };
+    if let Err(response) = authorize_run(
+        &state,
+        run_id,
+        actor_user(actor),
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await
+    {
+        return response;
+    }
     if request.events.len() > MAX_EVENTS_PER_FINISH {
         return error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -996,6 +1152,7 @@ mod tests {
             let response = run_status(
                 State(state.clone()),
                 None,
+                None,
                 AxumPath(prepared.run_id.to_string()),
             )
             .await;
@@ -1046,6 +1203,7 @@ mod tests {
         let ok = rename_workstream(
             State(state.clone()),
             None,
+            None,
             Json(request(Some("typo-nmae"), "refactor-db")),
         )
         .await;
@@ -1063,27 +1221,30 @@ mod tests {
         // A name that exists, but in another worktree, must not be reachable.
         let mut wrong_worktree = request(Some("refactor-db"), "stolen");
         wrong_worktree.worktree_fingerprint = "other-worktree".into();
-        let response = rename_workstream(State(state.clone()), None, Json(wrong_worktree)).await;
+        let response =
+            rename_workstream(State(state.clone()), None, None, Json(wrong_worktree)).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         // Unknown scopes stay 404 rather than being created by the write.
         let mut missing = request(Some("refactor-db"), "stolen");
         missing.workspace = "missing".into();
-        let response = rename_workstream(State(state.clone()), None, Json(missing)).await;
+        let response = rename_workstream(State(state.clone()), None, None, Json(missing)).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         // Neither selector, and both selectors, are caller errors the server
         // rejects on its own rather than trusting clap to have done it.
-        let neither = rename_workstream(State(state.clone()), None, Json(request(None, "x"))).await;
+        let neither =
+            rename_workstream(State(state.clone()), None, None, Json(request(None, "x"))).await;
         assert_eq!(neither.status(), StatusCode::BAD_REQUEST);
         let mut both = request(Some("refactor-db"), "x");
         both.workstream_id = Some(prepared.workstream_id);
-        let both = rename_workstream(State(state.clone()), None, Json(both)).await;
+        let both = rename_workstream(State(state.clone()), None, None, Json(both)).await;
         assert_eq!(both.status(), StatusCode::BAD_REQUEST);
 
         // An invalid destination name is a 400, not a 500.
         let invalid = rename_workstream(
             State(state.clone()),
+            None,
             None,
             Json(request(Some("refactor-db"), "a/b")),
         )
@@ -1101,6 +1262,7 @@ mod tests {
             .unwrap();
         let conflict = rename_workstream(
             State(state),
+            None,
             None,
             Json(request(Some("refactor-db"), "taken")),
         )
@@ -1139,6 +1301,7 @@ mod tests {
         let response = list_recent_workstreams(
             State(state.clone()),
             None,
+            None,
             Json(ListManagedWorkstreamsRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1164,6 +1327,7 @@ mod tests {
         let other_checkout = list_recent_workstreams(
             State(state.clone()),
             None,
+            None,
             Json(ListManagedWorkstreamsRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1183,6 +1347,7 @@ mod tests {
 
         let missing = list_recent_workstreams(
             State(state),
+            None,
             None,
             Json(ListManagedWorkstreamsRequest {
                 workspace: "missing".into(),
@@ -1229,6 +1394,7 @@ mod tests {
         let response = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1263,6 +1429,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1301,6 +1468,7 @@ mod tests {
         let automatic = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1327,6 +1495,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1364,6 +1533,7 @@ mod tests {
         let automatic = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1390,6 +1560,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1427,6 +1598,7 @@ mod tests {
         let automatic = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1453,6 +1625,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1490,6 +1663,7 @@ mod tests {
         let automatic = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1519,6 +1693,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
@@ -1556,6 +1731,7 @@ mod tests {
         let automatic = prepare_run(
             State(state),
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1586,6 +1762,7 @@ mod tests {
         let context = run_context(
             State(state.clone()),
             None,
+            None,
             AxumPath(prepared.run_id.to_string()),
         )
         .await;
@@ -1594,15 +1771,21 @@ mod tests {
         let accept = accept_run_context(
             State(state.clone()),
             None,
+            None,
             AxumPath(prepared.run_id.to_string()),
         )
         .await;
         assert_eq!(accept.status(), StatusCode::NO_CONTENT);
 
         // Delivered context is not re-rendered.
-        let redelivered = run_context(State(state), None, AxumPath(prepared.run_id.to_string()))
-            .await
-            .into_body();
+        let redelivered = run_context(
+            State(state),
+            None,
+            None,
+            AxumPath(prepared.run_id.to_string()),
+        )
+        .await
+        .into_body();
         let body = to_bytes(redelivered, 64 * 1024).await.unwrap();
         let response: ai_memory_core::ManagedRunContextResponse =
             serde_json::from_slice(&body).unwrap();
@@ -1625,6 +1808,7 @@ mod tests {
         for _ in 0..2 {
             let response = cancel_run(
                 State(state.clone()),
+                None,
                 None,
                 AxumPath(prepared.run_id.to_string()),
             )
@@ -1688,6 +1872,7 @@ mod tests {
             run_context(
                 State(state.clone()),
                 None,
+                None,
                 AxumPath(crush.run_id.to_string()),
             )
         };
@@ -1715,6 +1900,7 @@ mod tests {
 
         let accepted = accept_run_context(
             State(state.clone()),
+            None,
             None,
             AxumPath(crush.run_id.to_string()),
         )
@@ -1787,5 +1973,162 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    /// The run and workstream routes take an id in the URL, so they never
+    /// passed through scope resolution (#708): anyone holding a run id could
+    /// read its status, heartbeat or cancel it, and anyone holding a
+    /// workstream id could read that repository's event history. With
+    /// authorization on, each now answers only someone who may reach the
+    /// run's repository at the level the operation needs.
+    #[tokio::test]
+    async fn run_and_workstream_ids_only_answer_someone_who_may_reach_the_repository() {
+        use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+
+        let prepared = prepare_run(
+            State(state.clone()),
+            None,
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "alice-client-work".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "alice".into(),
+            }),
+        )
+        .await;
+        assert_eq!(prepared.status(), StatusCode::OK);
+        let body = to_bytes(prepared.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        let (_, repository) = store
+            .reader
+            .managed_run_scope(prepared.run_id)
+            .await
+            .unwrap()
+            .expect("the run was just prepared");
+
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        let carol = human("carol").await;
+        store
+            .writer
+            .grant_memory(alice, repository, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        // Carol may read the repository but not act on its runs.
+        store
+            .writer
+            .grant_memory(carol, repository, ai_memory_store::GrantLevel::Read, None)
+            .await
+            .unwrap();
+        let as_viewer = |user| Some(Extension(AuthorizedViewer(user)));
+        let run = || AxumPath(prepared.run_id.to_string());
+
+        // Status is a read: bob (nothing) is refused, carol (reader) is not.
+        let refused = run_status(State(state.clone()), None, as_viewer(bob), run()).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let refusal = to_bytes(refused.into_body(), 64 * 1024).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&refusal).contains("not authorized for alice-client-work"),
+            "{}",
+            String::from_utf8_lossy(&refusal)
+        );
+        assert_eq!(
+            run_status(State(state.clone()), None, as_viewer(carol), run())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        // Acting on the run needs write: carol's read is not enough.
+        for viewer in [bob, carol] {
+            assert_eq!(
+                heartbeat_run(State(state.clone()), None, as_viewer(viewer), run())
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN,
+                "heartbeat"
+            );
+            assert_eq!(
+                cancel_run(State(state.clone()), None, as_viewer(viewer), run())
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN,
+                "cancel"
+            );
+        }
+        assert_eq!(
+            heartbeat_run(State(state.clone()), None, as_viewer(alice), run())
+                .await
+                .status(),
+            StatusCode::NO_CONTENT,
+            "alice's own run keeps working"
+        );
+
+        // The event history behind a workstream id.
+        let events = |viewer| {
+            search_events(
+                State(state.clone()),
+                None,
+                viewer,
+                AxumPath(prepared.workstream_id.to_string()),
+                Query(EventQuery::default()),
+            )
+        };
+        assert_eq!(events(as_viewer(bob)).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(events(as_viewer(carol)).await.status(), StatusCode::OK);
+
+        // No viewer — an install with no database users, or root — is unchanged.
+        assert_eq!(
+            run_status(State(state.clone()), None, None, run())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(events(None).await.status(), StatusCode::OK);
+
+        // An id that matches nothing is still "not found", not a refusal.
+        let unknown = run_status(
+            State(state.clone()),
+            None,
+            as_viewer(bob),
+            AxumPath(ManagedRunId::new().to_string()),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 }

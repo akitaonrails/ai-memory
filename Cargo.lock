@@ -221,6 +221,7 @@ dependencies = [
  "http",
  "jiff",
  "rmcp",
+ "rusqlite",
  "schemars",
  "secrecy",
  "serde",

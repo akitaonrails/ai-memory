@@ -339,18 +339,37 @@ impl Consolidator {
         &self,
         session_id: SessionId,
     ) -> ConsolidatorResult<(WorkspaceId, ProjectId)> {
+        Ok(self
+            .session_target(session_id)
+            .await?
+            .unwrap_or((self.workspace_id, self.project_id)))
+    }
+
+    /// The repository a consolidation of `session_id` would write into, or
+    /// `None` when the session has neither observations nor a row.
+    ///
+    /// Exactly [`Self::resolve_target`] without the startup fallback, so a
+    /// caller authorizing the write checks the repository the page will
+    /// actually land in (#708). `None` needs no authorization: with no
+    /// observations there is nothing to consolidate, and the consolidation
+    /// itself fails before writing anything — which also keeps an unknown
+    /// session reported as unknown rather than as a refusal on the server's
+    /// default project.
+    ///
+    /// # Errors
+    /// Propagates store errors.
+    pub async fn session_target(
+        &self,
+        session_id: SessionId,
+    ) -> ConsolidatorResult<Option<(WorkspaceId, ProjectId)>> {
         if let Some(scope) = self
             .reader
             .session_scope_from_observations(session_id)
             .await?
         {
-            return Ok(scope);
+            return Ok(Some(scope));
         }
-        Ok(self
-            .reader
-            .session_project_ids(session_id)
-            .await?
-            .unwrap_or((self.workspace_id, self.project_id)))
+        Ok(self.reader.session_project_ids(session_id).await?)
     }
 
     /// Resolve the session's creating harness from the persisted session row.

@@ -17,6 +17,34 @@ mod project;
 mod search;
 mod statics;
 
+/// Whether the viewer may read `workspace/project` (#708).
+///
+/// For the routes that read a repository by name without resolving a scope
+/// first — the page views and the project listing. Those went straight from a
+/// URL to the page body, so the guard never saw them.
+///
+/// No viewer — an install with no database users, or root — returns `Ok`
+/// without a lookup, so these routes behave exactly as they did before.
+pub(crate) async fn authorize_read(
+    state: &WebState,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    workspace: &str,
+    project: &str,
+) -> Result<(), ai_memory_store::ScopeResolutionError> {
+    let Some(axum::Extension(viewer)) = viewer else {
+        return Ok(());
+    };
+    ai_memory_store::lookup_existing_scope_guarded(
+        &state.reader,
+        workspace,
+        project,
+        Some(viewer.user()),
+        ai_memory_store::ProjectAccess::Read,
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Build the read-only wiki page router (no static assets — those are public).
 pub(crate) fn build(state: Arc<WebState>) -> Router {
     Router::new()

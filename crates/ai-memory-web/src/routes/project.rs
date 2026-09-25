@@ -6,7 +6,7 @@ use std::sync::Arc;
 use askama::Template;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::Html;
+use axum::response::{Html, IntoResponse, Response};
 
 use crate::state::WebState;
 use crate::templates::{Folder, PageRow, ProjectView, humanize, page_href};
@@ -14,7 +14,19 @@ use crate::templates::{Folder, PageRow, ProjectView, humanize, page_href};
 /// Handler for `GET /w/:workspace/:project`.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
+) -> Response {
+    if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
+        return super::page::refusal_response(&refusal);
+    }
+    render(&state, workspace, project).await.into_response()
+}
+
+async fn render(
+    state: &WebState,
+    workspace: String,
+    project: String,
 ) -> Result<Html<String>, StatusCode> {
     let pages = state
         .reader

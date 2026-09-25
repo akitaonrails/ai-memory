@@ -88,6 +88,32 @@ pub struct ActorContext {
     pub client: Option<String>,
 }
 
+/// The user this request is authorized *as*, for per-repository grants.
+///
+/// Distinct from the bare `UserId` the middleware also stamps, and the
+/// distinction is the whole point. `UserId` answers "who wrote this" and is
+/// always present for a database user, because attribution must not depend on
+/// a policy setting. This answers "whose access applies", and is stamped for
+/// every database user — never for the root token, which authenticates from
+/// configuration and is authorized above per-project granularity, and never on
+/// an install with no database users, where there is nobody to tell apart.
+///
+/// Every guard reads a missing `AuthorizedViewer` as "no per-project check
+/// applies". A present one is checked against the project's access mode: an
+/// `open` project admits every viewer, which is how every project behaves
+/// until an operator restricts it, so stamping every user changes nothing on
+/// upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedViewer(pub crate::UserId);
+
+impl AuthorizedViewer {
+    /// The user id inside.
+    #[must_use]
+    pub const fn user(self) -> crate::UserId {
+        self.0
+    }
+}
+
 /// Authorization tier the auth middleware resolved this request to.
 ///
 /// Identity ([`ActorContext`]) carries *who* the request is from;

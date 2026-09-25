@@ -17,8 +17,12 @@ use crate::templates::{
 /// Handler for `GET /w/:workspace/:project/p/*path`.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
 ) -> Response {
+    if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
+        return refusal_response(&refusal);
+    }
     let meta = match state.reader.page_meta(&workspace, &project, &path).await {
         Ok(Some(m)) => m,
         // Not a page — it may be a namespace (directory) link, e.g. the OKF
@@ -140,6 +144,21 @@ async fn namespace_or_not_found(
 }
 
 /// Render a 404 response with the not-found template body.
+/// The HTML answer to a scope the viewer cannot read.
+///
+/// A refusal is a 403 that says so, never the not-found page: a developer
+/// whose grant was never issued must not be sent looking for a typo. A
+/// repository that does not exist is still the ordinary not-found page.
+pub(crate) fn refusal_response(refusal: &ai_memory_store::ScopeResolutionError) -> Response {
+    if refusal.is_forbidden() {
+        (StatusCode::FORBIDDEN, refusal.to_string()).into_response()
+    } else if refusal.is_not_found() {
+        not_found_response()
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    }
+}
+
 fn not_found_response() -> Response {
     let html = NotFoundView {}
         .render()

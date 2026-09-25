@@ -21,8 +21,13 @@ pub(crate) struct SearchParams {
 }
 
 /// Handler for `GET /search?q=…`.
+///
+/// Searches only the repositories the viewer may read (#708) — see
+/// `ReaderPool::search_pages_with_meta`. No viewer (no database users, or
+/// root) searches everything, as before.
 pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
+    viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Query(params): Query<SearchParams>,
 ) -> Result<Html<String>, StatusCode> {
     let query = params.q.trim().to_owned();
@@ -32,7 +37,12 @@ pub(crate) async fn handler(
     } else {
         let raw = state
             .reader
-            .search_pages_with_meta(query.clone(), 50, None)
+            .search_pages_with_meta(
+                query.clone(),
+                50,
+                None,
+                viewer.map(|axum::Extension(viewer)| viewer.user()),
+            )
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

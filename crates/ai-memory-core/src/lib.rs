@@ -46,7 +46,7 @@ pub use active_project::{
     DEFAULT_PER_KEY_TTL, MidSessionRouting, ReadPointer,
 };
 pub use actor::{
-    ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, OwnerFilter,
+    ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey, OwnerFilter,
     SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
     skip_admission_chain_for,
 };

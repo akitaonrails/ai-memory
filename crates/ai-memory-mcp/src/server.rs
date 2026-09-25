@@ -1601,10 +1601,45 @@ struct WritePageArgs {
 
 #[tool_router]
 impl AiMemoryServer {
-    fn scope_resolver(&self) -> ScopeResolver<'_> {
-        ScopeResolver::new(&self.reader, self.workspace_id, self.project_id)
+    /// A resolver bound to the user this request authenticated as (#708).
+    ///
+    /// The viewer is an argument rather than something read from `&self`
+    /// because it is per-request: the server is shared, the caller is not.
+    /// Every tool below reaches its project through here, so this is the one
+    /// place the MCP surface attaches the per-project choke point. A viewer is
+    /// only ever stamped for a database user, so a present one means the
+    /// deployment distinguishes operators; none (root, or an install with no
+    /// database users) attaches no principal and resolves as before.
+    fn scope_resolver_as(&self, viewer: Option<ai_memory_core::UserId>) -> ScopeResolver<'_> {
+        let resolver = ScopeResolver::new(&self.reader, self.workspace_id, self.project_id)
             .with_writer(&self.writer)
-            .with_active_project(&self.active_project)
+            .with_active_project(&self.active_project);
+        match viewer {
+            Some(viewer) => {
+                resolver.with_project_authz(ai_memory_store::ProjectPrincipal::user(viewer), true)
+            }
+            None => resolver,
+        }
+    }
+
+    /// The user whose grants apply to this request, if any do.
+    ///
+    /// Deliberately reads [`ai_memory_core::AuthorizedViewer`] rather than the
+    /// bare `UserId` alongside it. The bare id is always present for a
+    /// database user because attribution must not depend on a policy setting;
+    /// this one is stamped only when an operator has switched per-repository
+    /// authorization on, and never for root. `None` therefore means "no
+    /// per-repository check applies" — an open install, an install that has
+    /// not enabled authorization, or the operator.
+    fn viewer_from_parts(
+        parts: Option<&axum::http::request::Parts>,
+    ) -> Option<ai_memory_core::UserId> {
+        parts.and_then(|parts| {
+            parts
+                .extensions
+                .get::<ai_memory_core::AuthorizedViewer>()
+                .map(|viewer| viewer.user())
+        })
     }
 
     /// Map a scope-resolution failure to the error the caller can act on.
@@ -1836,23 +1871,81 @@ impl AiMemoryServer {
         &self,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_current_or_project(explicit_project, actor)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
             .map_err(Self::scope_error)
     }
 
+    /// Resolve the scope for a tool that only READS it.
+    ///
+    /// Paired with [`Self::effective_ids_for_mutation_args_with_actor`], which
+    /// takes identical arguments and differs only in the level it demands. Two
+    /// methods named for intent rather than one with a role argument: a role
+    /// argument is a thing a call site can forget, or copy from the wrong
+    /// neighbour, and the neighbours here are tools that delete pages. The
+    /// name at the call site should say which one this is.
     async fn effective_ids_for_read_args_with_actor(
         &self,
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.traced_ids_for_read_args(explicit_workspace, explicit_project, actor)
+        self.resolve_existing_args_as(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_store::ProjectAccess::Read,
+        )
+        .await
+    }
+
+    /// Resolve the scope for a tool that CHANGES it, without creating it.
+    ///
+    /// Same argument shape as a read — an explicit workspace/project pair, or
+    /// the current-project fallback chain — and that is exactly the trap this
+    /// exists to close. `memory_delete_page`, `memory_feedback`,
+    /// `memory_forget_sweep`, `memory_lint`, `memory_auto_improve`, the
+    /// handoff accept/cancel pair, and the message queue's pop, cancel and the
+    /// recipient of a send all take read-shaped arguments and all mutate.
+    ///
+    /// Distinct from [`Self::write_target_ids_with_actor`], which may CREATE
+    /// the target. These tools act on something that must already be there.
+    async fn effective_ids_for_mutation_args_with_actor(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        self.resolve_existing_args_as(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_store::ProjectAccess::Write,
+        )
+        .await
+    }
+
+    async fn resolve_existing_args_as(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+        required: ai_memory_store::ProjectAccess,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        self.scope_resolver_as(viewer)
+            .resolve_existing_args(explicit_workspace, explicit_project, actor, required)
             .await
-            .map(|(ids, _)| ids)
+            .map(ai_memory_store::ResolvedScope::as_tuple)
+            .map_err(Self::scope_error)
     }
 
     /// [`Self::effective_ids_for_read_args_with_actor`], plus where the scope
@@ -1864,10 +1957,49 @@ impl AiMemoryServer {
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+    ) -> Result<((WorkspaceId, ProjectId), ai_memory_store::ScopeSource), McpError> {
+        self.traced_ids_for_existing_args(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_store::ProjectAccess::Read,
+        )
+        .await
+    }
+
+    /// [`Self::effective_ids_for_mutation_args_with_actor`], plus where the
+    /// scope came from — for a mutating tool whose empty answer from an
+    /// inferred scope needs the same hint a read's does.
+    async fn traced_ids_for_mutation_args(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+    ) -> Result<((WorkspaceId, ProjectId), ai_memory_store::ScopeSource), McpError> {
+        self.traced_ids_for_existing_args(
+            explicit_workspace,
+            explicit_project,
+            actor,
+            viewer,
+            ai_memory_store::ProjectAccess::Write,
+        )
+        .await
+    }
+
+    async fn traced_ids_for_existing_args(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+        need: ai_memory_store::ProjectAccess,
     ) -> Result<((WorkspaceId, ProjectId), ai_memory_store::ScopeSource), McpError> {
         let (scope, source) = self
-            .scope_resolver()
-            .resolve_read_args_traced(explicit_workspace, explicit_project, actor)
+            .scope_resolver_as(viewer)
+            .resolve_existing_args_traced(explicit_workspace, explicit_project, actor, need)
             .await
             .map_err(Self::scope_error)?;
         if source.is_fallback() {
@@ -1912,6 +2044,7 @@ impl AiMemoryServer {
             explicit_workspace,
             explicit_project,
             &ai_memory_core::ActorKey::default(),
+            None,
         )
         .await
     }
@@ -1921,8 +2054,9 @@ impl AiMemoryServer {
         explicit_workspace: Option<&str>,
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_write_args(explicit_workspace, explicit_project, actor)
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
@@ -1932,12 +2066,13 @@ impl AiMemoryServer {
     async fn resolve_query_scopes(
         &self,
         scopes: &[MemoryScopeArg],
+        viewer: Option<ai_memory_core::UserId>,
     ) -> Result<Vec<(WorkspaceId, ProjectId)>, McpError> {
         let names: Vec<_> = scopes
             .iter()
             .map(|scope| ScopeName::new(&scope.workspace, &scope.project))
             .collect();
-        self.scope_resolver()
+        self.scope_resolver_as(viewer)
             .resolve_many_existing(&names, MAX_QUERY_SCOPES)
             .await
             .map(|scopes| {
@@ -2409,6 +2544,7 @@ impl AiMemoryServer {
                     args.query.clone(),
                     limit,
                     include_expired.then_some(i64::MIN),
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2461,6 +2597,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             let fused = self
@@ -2500,7 +2637,10 @@ impl AiMemoryServer {
         let resolved_scopes = if args.scopes.is_empty() {
             None
         } else {
-            Some(self.resolve_query_scopes(&args.scopes).await?)
+            Some(
+                self.resolve_query_scopes(&args.scopes, Self::viewer_from_parts(Some(&parts)))
+                    .await?,
+            )
         };
         let hits = if let Some(scopes) = &resolved_scopes {
             let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
@@ -2549,6 +2689,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             self.search_project(
@@ -2602,6 +2743,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             self.reader
@@ -2630,7 +2772,12 @@ impl AiMemoryServer {
                     // global write), `hits` already covers it — don't search
                     // it twice.
                     let current = self
-                        .effective_ids_for_read_args_with_actor(None, None, &aps_actor)
+                        .effective_ids_for_read_args_with_actor(
+                            None,
+                            None,
+                            &aps_actor,
+                            Self::viewer_from_parts(Some(&parts)),
+                        )
                         .await?;
                     if current == scope.as_tuple() {
                         Vec::new()
@@ -2696,6 +2843,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
             let pins = self
@@ -2800,7 +2948,7 @@ impl AiMemoryServer {
         if !explicit_scoping && self.active_project.default_global_for(&aps_actor) {
             let global_hits = self
                 .reader
-                .recent_pages_global(limit)
+                .recent_pages_global(limit, Self::viewer_from_parts(Some(&parts)))
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryRecentResponse {
@@ -2813,6 +2961,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let hits = self
@@ -2855,10 +3004,11 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let kind = args.signal;
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // The reason is free-text from the model; scrub it on the way in
@@ -3097,10 +3247,11 @@ impl AiMemoryServer {
         self.require_admin_capability(&parts).await?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let report = run_sweep_with_compaction(
@@ -3138,10 +3289,11 @@ impl AiMemoryServer {
             ));
         };
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let report = run_lint(
@@ -3224,7 +3376,12 @@ impl AiMemoryServer {
             _ => {
                 let aps_actor = Self::actor_key_from_parts(Some(&parts));
                 let (ws, proj) = self
-                    .effective_ids_for_read_args_with_actor(None, None, &aps_actor)
+                    .effective_ids_for_read_args_with_actor(
+                        None,
+                        None,
+                        &aps_actor,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
                     .await?;
                 let latest = self
                     .reader
@@ -3246,6 +3403,32 @@ impl AiMemoryServer {
             }
         };
         let dry = args.dry_run.unwrap_or(false);
+        // A session id reaches a repository without naming it, so it never
+        // passes through scope resolution and the grant check that comes with
+        // it (#708). Authorize the repository the page would land in — the
+        // consolidator's own target, not a guess — before anything runs,
+        // dry runs included: a dry run reports the resolved path and the
+        // admission verdict, which is itself information about that
+        // repository. Writing a page needs `write`.
+        if let Some(viewer) = Self::viewer_from_parts(Some(&parts))
+            && let Some((workspace_id, project_id)) = consolidator
+                .session_target(session_id)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        {
+            ai_memory_store::authorize_scope_for(
+                &self.reader,
+                Some(&self.writer),
+                ai_memory_store::ResolvedScope {
+                    workspace_id,
+                    project_id,
+                },
+                Some(viewer),
+                ai_memory_store::ProjectAccess::Write,
+            )
+            .await
+            .map_err(Self::scope_error)?;
+        }
         // Carry the request's authenticated identity into the write so the
         // consolidated page is attributed to the real operator and any
         // admission webhook authorizes by that actor (rather than the previous
@@ -3320,10 +3503,11 @@ impl AiMemoryServer {
             .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
         let author_id = parts.extensions.get::<ai_memory_core::UserId>().copied();
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let Some(llm) = self.llm.as_ref() else {
@@ -3616,6 +3800,7 @@ impl AiMemoryServer {
                     args.workspace.as_deref(),
                     args.project.as_deref(),
                     &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?
             }
@@ -3777,6 +3962,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // Diagnose cross-project scope-bleed: a read with no explicit scope
@@ -3970,6 +4156,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let owner_filter =
@@ -4133,10 +4320,11 @@ impl AiMemoryServer {
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
 
@@ -4215,6 +4403,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let open_questions = cap_handoff_list(
@@ -4314,6 +4503,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -4371,10 +4561,11 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -4478,10 +4669,11 @@ impl AiMemoryServer {
         let handoff_id = HandoffId::from_str(&args.handoff_id)
             .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // Resolve the cross-owner escape hatch before reading the object. A
@@ -4563,16 +4755,21 @@ impl AiMemoryServer {
                 args.from_workspace.as_deref(),
                 args.from_project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        // Recipient MUST already exist: resolve through the no-create read path
-        // so a typo fails closed with a scope error naming the target, instead
-        // of dropping a message into a phantom inbox nobody reads.
+        // Recipient MUST already exist: resolved without creating it, so a typo
+        // fails closed with a scope error naming the target instead of dropping
+        // a message into a phantom inbox nobody reads. And it needs `write`:
+        // delivering into a project's inbox puts text into its agents' context,
+        // which is a write to that project — otherwise the mailbox would be a
+        // way around a restricted project's grants (#708).
         let (to_ws, to_proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 Some(args.to_workspace.as_str()),
                 Some(args.to_project.as_str()),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         // Messages bypass `Wiki::write_page`, so scrub the agent-supplied text
@@ -4638,6 +4835,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let mailbox = match args.r#box.as_deref().map(str::trim) {
@@ -4697,10 +4895,11 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let ((ws, proj), scope_source) = self
-            .traced_ids_for_read_args(
+            .traced_ids_for_mutation_args(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let specific_id =
@@ -4772,10 +4971,11 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+            .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let specific_id =
@@ -4818,6 +5018,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let counts = self
@@ -4862,6 +5063,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
@@ -4907,6 +5109,7 @@ impl AiMemoryServer {
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
         let actor = crate::actor::actor_from_parts(&parts);
@@ -6724,6 +6927,140 @@ mod tests {
         );
     }
 
+    /// The design's open question 3 (#708): delivering into a restricted
+    /// project's inbox needs `write` on it, or the mailbox is a way around its
+    /// grants. Popping an inbox and cancelling an outbox change a queue, so
+    /// they need `write` on it too; a `read` grant is refused all three.
+    #[tokio::test]
+    async fn a_restricted_projects_queues_need_write() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        let team = store
+            .writer
+            .get_or_create_project(ws, "team", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(team, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let reader = human("ray").await;
+        let member = human("mia").await;
+        grant_role(store.db_path(), reader, team, "read");
+        grant_role(store.db_path(), member, team, "write");
+        let as_user = |user: ai_memory_core::UserId| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(user);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(user));
+            OptionalParts(parts)
+        };
+        let send = |user, from: &'static str, to: &'static str| {
+            let server = &server;
+            async move {
+                server
+                    .memory_message_send(
+                        Parameters(MessageSendArgs {
+                            to_workspace: "default".into(),
+                            to_project: to.into(),
+                            body: "please look at this".into(),
+                            subject: None,
+                            from_project: Some(from.into()),
+                            from_workspace: Some("default".into()),
+                        }),
+                        as_user(user),
+                    )
+                    .await
+            }
+        };
+        let pop = |user| {
+            let server = &server;
+            async move {
+                server
+                    .memory_message_pop(
+                        Parameters(MessagePopArgs {
+                            message_id: None,
+                            project: Some("team".into()),
+                            workspace: Some("default".into()),
+                        }),
+                        as_user(user),
+                    )
+                    .await
+            }
+        };
+        let cancel = |user| {
+            let server = &server;
+            async move {
+                server
+                    .memory_message_cancel(
+                        Parameters(MessageCancelArgs {
+                            message_id: None,
+                            project: Some("team".into()),
+                            workspace: Some("default".into()),
+                        }),
+                        as_user(user),
+                    )
+                    .await
+            }
+        };
+        let refused_for_write = |result: Result<CallToolResult, McpError>| {
+            let err = result.expect_err("a read grant must be refused");
+            assert!(format!("{err:?}").contains("needs write"), "{err:?}");
+        };
+
+        // Into the restricted inbox: `read` is not enough, `write` is.
+        refused_for_write(send(reader, "scratch", "team").await);
+        send(member, "scratch", "team")
+            .await
+            .expect("write delivers");
+        // Out of it: popping consumes the team's mail.
+        refused_for_write(pop(reader).await);
+        let json = |result: CallToolResult| -> serde_json::Value {
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        let popped = json(pop(member).await.expect("write pops"));
+        assert!(
+            popped["message"]
+                .to_string()
+                .contains("please look at this"),
+            "{popped}"
+        );
+        // The team's outbox: sending FROM it reads the sender side only, but
+        // clearing it is a change to the team's queue.
+        send(member, "team", "scratch")
+            .await
+            .expect("send from team");
+        refused_for_write(cancel(reader).await);
+        let cancelled = json(cancel(member).await.expect("write cancels"));
+        assert_eq!(cancelled["cancelled"], 1, "{cancelled}");
+    }
+
     async fn server_project_json(store: &Store, ws: WorkspaceId, name: &str) -> serde_json::Value {
         let proj = store
             .writer
@@ -7839,7 +8176,7 @@ mod tests {
         // Baseline: nothing published, no arg → baked-in default.
         assert_eq!(
             server
-                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default(), None)
                 .await
                 .unwrap(),
             (ws, baked)
@@ -7860,7 +8197,7 @@ mod tests {
         server.active_project.set(ws, other);
         assert_eq!(
             server
-                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(None, &ai_memory_core::ActorKey::default(), None)
                 .await
                 .unwrap(),
             (ws, other)
@@ -7869,7 +8206,11 @@ mod tests {
         // An explicit (existing) project arg wins over the active pointer.
         assert_eq!(
             server
-                .effective_ids_with_actor(Some("scratch"), &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(
+                    Some("scratch"),
+                    &ai_memory_core::ActorKey::default(),
+                    None
+                )
                 .await
                 .unwrap(),
             (ws, baked),
@@ -7879,7 +8220,11 @@ mod tests {
         // An explicit but unknown project name fails closed instead of
         // silently falling through to the active pointer.
         let err = server
-            .effective_ids_with_actor(Some("does-not-exist"), &ai_memory_core::ActorKey::default())
+            .effective_ids_with_actor(
+                Some("does-not-exist"),
+                &ai_memory_core::ActorKey::default(),
+                None,
+            )
             .await
             .expect_err("unknown explicit project must not fall back");
         assert!(
@@ -8046,7 +8391,11 @@ mod tests {
         );
         assert_eq!(
             server
-                .effective_ids_with_actor(Some("sibling"), &ai_memory_core::ActorKey::default())
+                .effective_ids_with_actor(
+                    Some("sibling"),
+                    &ai_memory_core::ActorKey::default(),
+                    None
+                )
                 .await
                 .unwrap(),
             (active_ws, sibling_proj),
@@ -11191,6 +11540,542 @@ mod tests {
         assert_eq!(author.email.as_deref(), Some("alice@example.com"));
     }
 
+    /// Grant `role` on `repository` by writing the row directly, so these
+    /// tests exercise the decision without depending on the grant API.
+    fn grant_role(
+        db: &std::path::Path,
+        user: ai_memory_core::UserId,
+        repository: ProjectId,
+        role: &str,
+    ) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO project_grants \
+             (workspace_id, project_id, user_id, level, granted_by, granted_at) \
+             SELECT workspace_id, ?1, ?2, ?3, ?2, 1 FROM projects WHERE id = ?1",
+            rusqlite::params![
+                repository.as_bytes().to_vec(),
+                user.as_bytes().to_vec(),
+                role
+            ],
+        )
+        .unwrap();
+    }
+
+    fn grant_writer(db: &std::path::Path, user: ai_memory_core::UserId, repository: ProjectId) {
+        grant_role(db, user, repository, "write");
+    }
+
+    /// A reader-only grant must not be able to change anything.
+    ///
+    /// This is the bug this branch exists for. Every tool below takes the same
+    /// read-shaped arguments as `memory_read_page`, and every one of them
+    /// mutates; they all resolved through the read path, so `read` was
+    /// enough to delete a page. The table is the audit: if a tool moves
+    /// between the two lists, that is a deliberate policy change and this test
+    /// is where it has to be argued.
+    #[tokio::test]
+    async fn a_reader_may_read_everything_and_change_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "client-work", None)
+            .await
+            .unwrap();
+        let reader_user = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "ray".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        grant_role(store.db_path(), reader_user, proj, "read");
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        // Seed a page as the operator (no viewer stamped = root or no database users
+        // for this call), so there is something to try to delete.
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/keep.md".into(),
+                    body: "# Keep\n\nSomething to try to delete.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("operator seeds the page");
+
+        let parts_as_reader = || {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(reader_user);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(reader_user));
+            parts
+        };
+
+        // Reads: allowed, and must stay allowed. Raising these would be its
+        // own bug — a reader who cannot read holds nothing at all.
+        server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    include_related: false,
+                    related_depth: None,
+                    path: Some("notes/keep.md".into()),
+                    query: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect("a reader may read");
+        server
+            .memory_status(
+                Parameters(StatusArgs {
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect("a reader may see status");
+
+        // Mutations: refused, and the refusal says what is missing.
+        let err = server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/keep.md".into(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect_err("a reader must not delete a page");
+        let message = err.message.to_string();
+        assert!(
+            message.contains("you have read access and this needs write"),
+            "the refusal must name both levels: {message}"
+        );
+
+        let err = server
+            .memory_feedback(
+                Parameters(FeedbackArgs {
+                    path: "notes/keep.md".into(),
+                    signal: ai_memory_core::FeedbackKind::Stale,
+                    reason: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect_err("a reader must not record feedback");
+        assert!(
+            err.message.to_string().contains("needs write"),
+            "{}",
+            err.message
+        );
+
+        // The page is still there: a refused delete must not half-happen.
+        server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    include_related: false,
+                    related_depth: None,
+                    path: Some("notes/keep.md".into()),
+                    query: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_as_reader()),
+            )
+            .await
+            .expect("the refused delete left the page alone");
+    }
+
+    /// A writer may do the things a reader was just refused.
+    ///
+    /// The other half of the pair: without it, the fix above would also pass
+    /// if the guard simply refused everyone.
+    #[tokio::test]
+    async fn a_writer_may_change_what_a_reader_may_not() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "client-work", None)
+            .await
+            .unwrap();
+        let scribe = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "wren".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        grant_role(store.db_path(), scribe, proj, "write");
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+        let parts = || {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(scribe);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(scribe));
+            parts
+        };
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "notes/mine.md".into(),
+                    body: "# Mine\n\nWritten by a writer.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(parts()),
+            )
+            .await
+            .expect("a writer may write");
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    path: "notes/mine.md".into(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts()),
+            )
+            .await
+            .expect("a writer may delete");
+    }
+
+    /// The finding that started #708, as a test.
+    ///
+    /// Two `role=user` accounts on upstream 2.1.1: alice writes a page into her
+    /// client project and bob reads the whole body back. This asserts both
+    /// halves of the fix — that bob is refused when authorization is on, and
+    /// that he is *not* refused when it is off, because an install that has
+    /// never issued a grant must keep working exactly as it did.
+    #[tokio::test]
+    async fn bob_cannot_read_alices_page_in_a_restricted_project() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let user = |name: &str| {
+            let writer = store.writer.clone();
+            let name = name.to_owned();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name,
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = user("alice").await;
+        let bob = user("bob").await;
+        grant_writer(store.db_path(), alice, proj);
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        // Alice holds write on this repository, so her write lands.
+        let mut alice_parts = test_parts_default();
+        alice_parts.extensions.insert(AuthLevel::User);
+        alice_parts.extensions.insert(alice);
+        alice_parts
+            .extensions
+            .insert(ai_memory_core::AuthorizedViewer(alice));
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    path: "secrets/rates.md".into(),
+                    body: "# Rates\n\nDay rate is confidential.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                }),
+                OptionalParts(alice_parts),
+            )
+            .await
+            .expect("alice holds write on her own repository");
+
+        let read_as = |viewer: Option<ai_memory_core::UserId>| {
+            let server = &server;
+            async move {
+                let mut parts = test_parts_default();
+                parts.extensions.insert(AuthLevel::User);
+                parts.extensions.insert(bob);
+                if let Some(viewer) = viewer {
+                    parts
+                        .extensions
+                        .insert(ai_memory_core::AuthorizedViewer(viewer));
+                }
+                server
+                    .memory_read_page(
+                        Parameters(ReadPageArgs {
+                            include_related: false,
+                            related_depth: None,
+                            path: Some("secrets/rates.md".into()),
+                            query: None,
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        // Authorization ON: bob is stamped as an authorized viewer, holds
+        // nothing, and is refused — with a message that says so rather than
+        // handing back an empty result he would read as "there is nothing here".
+        let err = read_as(Some(bob))
+            .await
+            .expect_err("bob holds no grant on alice's repository");
+        let message = err.message.to_string();
+        assert!(
+            message.contains("not authorized for alice-client-work"),
+            "refusal must name the repository: {message}"
+        );
+        assert!(
+            message.contains("not an empty memory"),
+            "refusal must not be mistakable for an empty repository: {message}"
+        );
+
+        // No viewer (root, or no database users): nothing is
+        // enforced and the install behaves as it did before grants existed.
+        read_as(None)
+            .await
+            .expect("with no viewer, an existing install must be unchanged");
+    }
+
+    /// The other half of #708: bob could not open alice's page, but he could
+    /// still find it. `global` searches and the `default_global` recent
+    /// listing never resolve a scope, so the resolver guard never saw them.
+    #[tokio::test]
+    async fn bob_cannot_find_alices_page_by_searching_in_a_restricted_project() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let client = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        grant_writer(store.db_path(), alice, client);
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: client,
+                path: PagePath::new("secrets/rates.md").unwrap(),
+                title: "Rates".into(),
+                body: "Day rate is confidential.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        // `memory_recent` only goes global for a repo that opted into
+        // `[recall] default_global`; opt the test actor in.
+        server
+            .active_project
+            .set_for(&ai_memory_core::ActorKey::default(), ws, client, true);
+
+        // `authorized` is whether the middleware stamped an AuthorizedViewer:
+        // a database user, rather than root or an install with no users.
+        let as_user = |user: ai_memory_core::UserId, authorized: bool| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(user);
+            if authorized {
+                parts
+                    .extensions
+                    .insert(ai_memory_core::AuthorizedViewer(user));
+            }
+            parts
+        };
+        let text = |result: CallToolResult| {
+            result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap()
+        };
+        let found_by_query = |user, authorized| {
+            let server = &server;
+            async move {
+                let result = server
+                    .memory_query(
+                        Parameters(QueryArgs {
+                            reasoning: None,
+                            answer: None,
+                            include_superseded: None,
+                            pin_first: None,
+                            query: "confidential".into(),
+                            limit: Some(10),
+                            project: None,
+                            workspace: None,
+                            scopes: Vec::new(),
+                            global: Some(true),
+                            include_expired: None,
+                            explain: None,
+                            as_of: None,
+                        }),
+                        OptionalParts(as_user(user, authorized)),
+                    )
+                    .await
+                    .unwrap();
+                text(result).contains("secrets/rates.md")
+            }
+        };
+        let found_by_recent = |user, authorized| {
+            let server = &server;
+            async move {
+                let result = server
+                    .memory_recent(
+                        Parameters(RecentArgs {
+                            limit: Some(10),
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(as_user(user, authorized)),
+                    )
+                    .await
+                    .unwrap();
+                text(result).contains("secrets/rates.md")
+            }
+        };
+
+        // Authorization on: bob holds nothing on alice's repository, so a
+        // global search and the global recent listing do not surface it...
+        assert!(!found_by_query(bob, true).await, "bob found it by search");
+        assert!(!found_by_recent(bob, true).await, "bob found it in recent");
+        // ...while alice, who holds a grant, still finds her own page.
+        assert!(found_by_query(alice, true).await);
+        assert!(found_by_recent(alice, true).await);
+
+        // No viewer is stamped and nothing changes.
+        assert!(found_by_query(bob, false).await);
+        assert!(found_by_recent(bob, false).await);
+    }
+
     fn parts_with_level(level: ai_memory_core::AuthLevel) -> axum::http::request::Parts {
         let mut parts = test_parts_default();
         parts.extensions.insert(level);
@@ -13214,6 +14099,149 @@ mod tests {
             .unwrap();
         store.writer.end_session(session_id, None).await.unwrap();
         session_id
+    }
+
+    /// A session id reaches a repository without naming it, so
+    /// `memory_consolidate` used to write into whichever project a session
+    /// landed in, for anyone holding the id (#708). Bob consolidating alice's
+    /// session is refused before the LLM or the admission chain runs — the
+    /// stub panics if it is called — and a dry run is refused too, because it
+    /// reports the resolved path and admission verdict of her repository.
+    #[tokio::test]
+    async fn bob_cannot_consolidate_a_session_in_alices_repository() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        // Grants only decide anything in a restricted project.
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let alices = store
+            .writer
+            .get_or_create_project(ws, "alice-client-work", None)
+            .await
+            .unwrap();
+        let session = seed_short_completed_session(&store, ws, alices).await;
+        let human = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        // Bob holds read on alice's repository: enough to read it, not to
+        // have a page written into it on his behalf.
+        store
+            .writer
+            .grant_memory(alice, alices, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .grant_memory(bob, alices, ai_memory_store::GrantLevel::Read, None)
+            .await
+            .unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            alices,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, alices)
+            .with_consolidator_arc(wiki, llm, consolidator);
+        let consolidate = |viewer: Option<ai_memory_core::UserId>, id: SessionId, dry: bool| {
+            let server = &server;
+            async move {
+                let mut parts = test_parts_default();
+                if let Some(viewer) = viewer {
+                    parts.extensions.insert(AuthLevel::User);
+                    parts.extensions.insert(viewer);
+                    parts
+                        .extensions
+                        .insert(ai_memory_core::AuthorizedViewer(viewer));
+                }
+                server
+                    .memory_consolidate(
+                        Parameters(ConsolidateArgs {
+                            session_id: Some(id.to_string()),
+                            dry_run: Some(dry),
+                            multi_page: None,
+                            instructions: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        for dry in [true, false] {
+            let err = consolidate(Some(bob), session, dry)
+                .await
+                .expect_err("bob holds only reader on alice's repository");
+            let message = err.message.to_string();
+            assert!(
+                message.contains("not authorized for alice-client-work"),
+                "dry={dry}: {message}"
+            );
+            assert!(
+                message.contains("write"),
+                "names the level needed: {message}"
+            );
+        }
+        let page = format!("sessions/{session}.md");
+        assert!(
+            store
+                .reader
+                .page_meta("default", "alice-client-work", &page)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused consolidation wrote nothing"
+        );
+
+        // Alice, and a caller with no viewer, get the plan.
+        for viewer in [Some(alice), None] {
+            let plan = call_tool_json(consolidate(viewer, session, true).await.unwrap());
+            assert_eq!(plan["dry_run"], true, "{viewer:?}");
+            assert_eq!(plan["path"], page, "{viewer:?}");
+        }
+
+        // An id that matches nothing is still reported as the consolidator
+        // reports it — not as a refusal on the server's default project.
+        let err = consolidate(Some(bob), SessionId::new(), true)
+            .await
+            .expect_err("no such session");
+        assert!(
+            !err.message.contains("not authorized"),
+            "an unknown session read as a refusal: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
