@@ -77,6 +77,15 @@ pub(crate) enum WriteCmd {
         mode: crate::AccessMode,
         reply: oneshot::Sender<StoreResult<Option<crate::AccessMode>>>,
     },
+    ResolveProjectByIdentity {
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        name: String,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<(ProjectId, ops::IdentityResolution)>>,
+    },
     EnsureProjectWorkspace {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -858,6 +867,35 @@ impl WriterHandle {
         self.send(WriteCmd::SetAccessMode {
             project_id,
             mode,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Resolve the project a repository identity routes to, creating it when
+    /// needed — see [`ops::resolve_project_by_identity`] for the rules.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn resolve_project_by_identity(
+        &self,
+        workspace_id: WorkspaceId,
+        identity: ai_memory_core::repository_identity::RepositoryIdentity,
+        name: impl Into<String>,
+        repo_path: Option<String>,
+        candidate: Option<ProjectId>,
+        creator: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<(ProjectId, ops::IdentityResolution)> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ResolveProjectByIdentity {
+            workspace_id,
+            identity,
+            name: name.into(),
+            repo_path,
+            candidate,
+            creator,
             reply: tx,
         })
         .await?;
@@ -2989,6 +3027,27 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     new_project_mode,
                 );
                 send_or_warn(reply, result, "get_or_create_project_as");
+            }
+            WriteCmd::ResolveProjectByIdentity {
+                workspace_id,
+                identity,
+                name,
+                repo_path,
+                candidate,
+                creator,
+                reply,
+            } => {
+                let result = ops::resolve_project_by_identity(
+                    &mut conn,
+                    &workspace_id,
+                    &identity,
+                    &name,
+                    repo_path.as_deref(),
+                    candidate,
+                    creator,
+                    new_project_mode,
+                );
+                send_or_warn(reply, result, "resolve_project_by_identity");
             }
             WriteCmd::EnsureProjectWorkspace {
                 workspace_id,
