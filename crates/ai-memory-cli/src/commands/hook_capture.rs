@@ -260,12 +260,14 @@ fn marker_query_suffix_impl(
     let (mut workspace, mut project, mut strategy, mut drop_subagent, mut default_global) =
         (None, None, None, None, None);
     let (mut briefing, mut briefing_budget) = (None, None);
+    let mut explicit_identity = None;
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
     if let Some(marker) = find_settings_marker(cwd) {
         workspace = parse_toml_key(&marker, "workspace");
         project = parse_toml_key(&marker, "project");
+        explicit_identity = parse_toml_key(&marker, "identity");
         strategy = parse_toml_key(&marker, "project_strategy");
         drop_subagent = parse_toml_key(&marker, "drop_subagent_captures");
         // `[recall] default_global = true` (or top-level; quoted or bare) —
@@ -281,6 +283,10 @@ fn marker_query_suffix_impl(
     // tell a deliberate marker rescope from a host-derived repo-root name.
     // Only the latter may yield to session-sticky attribution (#394).
     let mut project_src = project.as_ref().map(|_| "marker");
+    // Resolved before repo-root can fill `project` below: a repo-root name is
+    // an inference, while the chain's `manifest` rung means a name somebody
+    // wrote in the marker.
+    let identity = repository_identity(cwd, explicit_identity.as_deref(), project.as_deref());
     if strategy.is_none() {
         strategy = default_strategy.map(str::to_owned);
     }
@@ -299,6 +305,13 @@ fn marker_query_suffix_impl(
     }
     if let Some(val) = strategy {
         qs.push_str(&format!("&project_strategy={}", url_encode(&val)));
+    }
+    if let Some(identity) = identity {
+        qs.push_str(&format!(
+            "&identity={}&identity_src={}",
+            url_encode(&identity.identity),
+            identity.source.as_str()
+        ));
     }
     // Per-project `drop_subagent_captures` opt-in: forward the marker's value as
     // the `drop_subagent` flag so the server scopes the drop to this project.
@@ -327,6 +340,38 @@ fn marker_query_suffix_impl(
         }
     }
     qs
+}
+
+/// The repository identity to send with this checkout's events (#708), or
+/// `None` to let the server route by project name as it always has.
+///
+/// Only the rungs that route by identity are sent: an explicit `identity`
+/// from the marker, or — when the marker declares no `project` — the
+/// `upstream`/`origin` remote. A declared `project` outranks the remote and
+/// routes by name, so git is not consulted at all when one is present; that
+/// also keeps the lookup off the hot path for every repository that declares
+/// itself. The remote is normalised here, so credentials embedded in its URL
+/// never leave the machine.
+fn repository_identity(
+    cwd: &str,
+    explicit_identity: Option<&str>,
+    declared_project: Option<&str>,
+) -> Option<ai_memory_core::repository_identity::RepositoryIdentity> {
+    use ai_memory_core::repository_identity::{IdentityInputs, resolve};
+    let declared = |value: Option<&str>| value.is_some_and(|v| !v.trim().is_empty());
+    let (upstream, origin) = if declared(explicit_identity) || declared(declared_project) {
+        (None, None)
+    } else {
+        ai_memory_consolidate::read_identity_remotes(std::path::Path::new(cwd))
+    };
+    resolve(&IdentityInputs {
+        explicit_identity,
+        manifest_name: declared_project,
+        upstream_remote: upstream.as_deref(),
+        origin_remote: origin.as_deref(),
+        folder_name: None,
+    })
+    .filter(|identity| identity.source.routes_by_identity())
 }
 
 /// Build a reqwest client for the hook's one-shot requests. `no_proxy`
@@ -850,6 +895,105 @@ mod tests {
             cwd, r"C:\dev\myproject",
             "round-trips through percent-decoding"
         );
+    }
+
+    /// A throwaway repository with the given remotes, or `None` when there is
+    /// no `git` binary to build one with. The host is not a real forge, so a
+    /// developer's global `url.<base>.insteadOf` rules cannot rewrite it.
+    fn repo_with_remotes(remotes: &[(&str, &str)]) -> Option<tempfile::TempDir> {
+        let git = |args: &[&str], dir: &std::path::Path| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .ok()
+                .filter(std::process::ExitStatus::success)
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q"], tmp.path())?;
+        for (name, url) in remotes {
+            git(&["remote", "add", name, url], tmp.path())?;
+        }
+        Some(tmp)
+    }
+
+    /// An undeclared checkout sends the identity of its remote — `upstream`
+    /// over `origin` — normalised on this side, so the credentials in the URL
+    /// never reach the query string.
+    #[test]
+    fn marker_query_suffix_sends_the_remote_identity_of_an_undeclared_checkout() {
+        let Some(repo) = repo_with_remotes(&[
+            (
+                "origin",
+                "https://someone:s3cret-token@git.example.test/Fork/API.git",
+            ),
+            ("upstream", "git@git.example.test:Acme/API.git"),
+        ]) else {
+            return;
+        };
+        let qs = marker_query_suffix(repo.path().to_str().unwrap(), None);
+        assert!(
+            qs.contains("&identity=git.example.test%2Facme%2Fapi&identity_src=git_remote"),
+            "{qs}"
+        );
+        assert!(
+            !qs.contains("s3cret"),
+            "credentials must not leave the machine: {qs}"
+        );
+
+        let Some(origin_only) = repo_with_remotes(&[(
+            "origin",
+            "https://someone:s3cret-token@git.example.test/Fork/API.git",
+        )]) else {
+            return;
+        };
+        let qs = marker_query_suffix(origin_only.path().to_str().unwrap(), None);
+        assert!(
+            qs.contains("&identity=git.example.test%2Ffork%2Fapi"),
+            "{qs}"
+        );
+        assert!(!qs.contains("s3cret"), "{qs}");
+    }
+
+    /// A declared `project` outranks the remote and routes by name, so nothing
+    /// is sent for it; an explicit `identity` outranks both.
+    #[test]
+    fn marker_query_suffix_lets_declarations_decide_the_identity() {
+        let Some(repo) = repo_with_remotes(&[("upstream", "git@git.example.test:acme/tool.git")])
+        else {
+            return;
+        };
+        let cwd = repo.path().to_str().unwrap();
+        let marker = repo.path().join(".ai-memory.toml");
+
+        std::fs::write(&marker, "project = \"my-fork\"\n").unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(qs.contains("&project=my-fork"), "{qs}");
+        assert!(
+            !qs.contains("&identity="),
+            "a declared project routes by name: {qs}"
+        );
+
+        std::fs::write(
+            &marker,
+            "project = \"my-fork\"\nidentity = \"Acme/Platform\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(
+            qs.contains("&identity=acme%2Fplatform&identity_src=explicit"),
+            "{qs}"
+        );
+    }
+
+    /// No repository, no remote, no declaration: nothing to send, and the
+    /// server routes by folder name exactly as before.
+    #[test]
+    fn marker_query_suffix_sends_no_identity_outside_a_repository() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let qs = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!qs.contains("identity"), "{qs}");
     }
 
     #[test]

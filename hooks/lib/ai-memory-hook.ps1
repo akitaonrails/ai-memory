@@ -170,6 +170,90 @@ function Get-AiMemoryRepoRootProject {
     return Split-Path $root -Leaf
 }
 
+# Normalise a git remote URL into a repository identity, or $null when it
+# names no network-reachable repository (a local path, a bare host). Port of
+# `normalize_remote_url` in crates/ai-memory-core/src/repository_identity.rs,
+# checked against the same fixture
+# (crates/ai-memory-core/fixtures/remote_identity_cases.json) so the two
+# cannot drift. Credentials are dropped here, on the host.
+function ConvertTo-AiMemoryRepositoryIdentity {
+    param([string] $Url)
+    if ($null -eq $Url) { return $null }
+    $raw = $Url.Trim()
+    if (-not $raw) { return $null }
+    $scheme = $null
+    $hasScheme = $false
+    $rest = $raw
+    $idx = $raw.IndexOf("://")
+    if ($idx -ge 0) {
+        $hasScheme = $true
+        $scheme = $raw.Substring(0, $idx).ToLowerInvariant()
+        $rest = $raw.Substring($idx + 3)
+    }
+    if ($scheme -eq "file") { return $null }
+    # Credentials: everything up to the LAST `@` before the path.
+    $pathStart = $rest.IndexOf("/")
+    if ($pathStart -lt 0) { $pathStart = $rest.Length }
+    $at = $rest.Substring(0, $pathStart).LastIndexOf("@")
+    $hp = if ($at -ge 0) { $rest.Substring($at + 1) } else { $rest }
+    if ($hasScheme) {
+        $slash = $hp.IndexOf("/")
+        if ($slash -ge 0) {
+            $h = $hp.Substring(0, $slash)
+            $p = $hp.Substring($slash + 1)
+        } else {
+            $h = $hp
+            $p = ""
+        }
+        $colon = $h.LastIndexOf(":")
+        if ($colon -ge 0 -and $h.Substring($colon + 1) -match '^[0-9]*$') {
+            $h = $h.Substring(0, $colon)
+        }
+        if (-not $h -or -not $p) { return $null }
+    } else {
+        # scp-like `host:path`, or a filesystem path: a `:` before any `/`.
+        $colon = $hp.IndexOf(":")
+        if ($colon -lt 0) { return $null }
+        $slash = $hp.IndexOf("/")
+        if ($slash -ge 0 -and $slash -lt $colon) { return $null }
+        $h = $hp.Substring(0, $colon)
+        $p = $hp.Substring($colon + 1)
+        # A one-character host is a Windows drive letter.
+        if ($h.Length -le 1 -or -not $p) { return $null }
+        if ($p.Contains("\")) { return $null }
+    }
+    $id = "$h/$p".ToLowerInvariant().TrimEnd('/')
+    if ($id.EndsWith(".git")) { $id = $id.Substring(0, $id.Length - 4) }
+    $id = $id.TrimEnd('/')
+    while ($id.Contains("//")) { $id = $id.Replace("//", "/") }
+    if (-not $id -or -not $id.Contains("/")) { return $null }
+    return $id
+}
+
+# `&identity=<v>&identity_src=<rung>` for the checkout at $Cwd, or "".
+# Mirrors `repository_identity` in hook_capture.rs: an explicit marker
+# `identity` is sent; a declared `project` outranks the remote and routes by
+# name, so git is not consulted; otherwise the `upstream` remote, else `origin`.
+function Get-AiMemoryIdentityQuery {
+    param([string] $Cwd, [string] $Explicit, [string] $Project)
+    if ($Explicit -and $Explicit.Trim()) {
+        $value = $Explicit.Trim().ToLowerInvariant()
+        return "&identity=$([uri]::EscapeDataString($value))&identity_src=explicit"
+    }
+    if ($Project -and $Project.Trim()) { return "" }
+    if (-not $Cwd) { return "" }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return "" }
+    foreach ($name in @("upstream", "origin")) {
+        $url = (& git -C $Cwd config --get "remote.$name.url" 2>$null)
+        if (-not $url) { continue }
+        $value = ConvertTo-AiMemoryRepositoryIdentity -Url ([string]$url)
+        if ($value) {
+            return "&identity=$([uri]::EscapeDataString($value))&identity_src=git_remote"
+        }
+    }
+    return ""
+}
+
 function Get-AiMemoryMarkerQuery {
     param([string] $Cwd)
     if (-not $Cwd) { return "" }
@@ -182,14 +266,19 @@ function Get-AiMemoryMarkerQuery {
     # deliberate marker rescope from a host-derived repo-root name. Only the
     # latter may yield to session-sticky attribution (#394).
     $projSrc = $null
+    $explicitIdentity = $null
     $marker = Get-AiMemoryMarkerToml -Cwd $Cwd
     if ($marker) {
         $ws = Get-AiMemoryTomlKey -File $marker -Key "workspace"
         $proj = Get-AiMemoryTomlKey -File $marker -Key "project"
         $strategy = Get-AiMemoryTomlKey -File $marker -Key "project_strategy"
         $dropSubagent = Get-AiMemoryTomlKey -File $marker -Key "drop_subagent_captures"
+        $explicitIdentity = Get-AiMemoryTomlKey -File $marker -Key "identity"
         if ($proj) { $projSrc = "marker" }
     }
+    # Before repo-root can fill $proj: a repo-root name is an inference, while
+    # the identity chain's declared-project rung means a name in the marker.
+    $identityQuery = Get-AiMemoryIdentityQuery -Cwd $Cwd -Explicit $explicitIdentity -Project $proj
     # Install-time default baked into the hook command by
     # `install-hooks --project-strategy` fills the strategy only when no marker
     # pinned one. A marker's explicit project / project_strategy still win.
@@ -206,6 +295,7 @@ function Get-AiMemoryMarkerQuery {
     if ($proj) { $qs += "&project=$([uri]::EscapeDataString($proj))" }
     if ($projSrc) { $qs += "&project_src=$([uri]::EscapeDataString($projSrc))" }
     if ($strategy) { $qs += "&project_strategy=$([uri]::EscapeDataString($strategy))" }
+    $qs += $identityQuery
     # Per-project drop_subagent_captures opt-in: forward to the server, which
     # interprets truthiness (1/true/...) and scopes the drop to this project.
     if ($dropSubagent) { $qs += "&drop_subagent=$([uri]::EscapeDataString($dropSubagent))" }
