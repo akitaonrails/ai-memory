@@ -19,21 +19,36 @@ name: windows
 #
 #   * a nightly run catches toolchain and dependency drift that no code
 #     change would trigger;
-#   * `workflow_dispatch` and the `windows` label give a pull request that
-#     touches platform-sensitive code — path handling, file locking, git
-#     plumbing — a way to opt in before merging;
+#   * a pull request that touches platform-sensitive code — path handling,
+#     file locking, git plumbing, the hook bundle — opts in AUTOMATICALLY:
+#     the leading `changes` job (see below) detects those paths and the
+#     Windows jobs run without anyone remembering a label;
+#   * `workflow_dispatch` and the `windows` label remain manual overrides —
+#     the label forces the Windows jobs on a pull request that falls OUTSIDE
+#     those paths (e.g. a dependency bump someone wants to vet on Windows);
 #   * the job no longer carries `continue-on-error`, so failures in those
-#     scheduled, labelled, and manual runs are red rather than advisory.
+#     scheduled, labelled, path-triggered, and manual runs are red rather
+#     than advisory.
 #
-# If you are changing any of those areas, add the `windows` label to the
-# pull request. During feature iteration this workflow does not run on pushes
+# A pull request that changes those areas now runs Windows on its own; the
+# `windows` label is only needed to force a run for a PR outside them.
+# During feature iteration this workflow does not run on pushes
 # to main: fast Linux CI gates each merge, and the full Windows suite runs
 # nightly, on demand, and MANDATORILY right before a release (dispatch it
 # on the release-candidate SHA and wait for green — see AGENTS.md).
 #
 # The `hooks` job is separate so a Rust failure cannot stop the hook suite from
-# reporting, but it follows the same `windows` label gate on pull requests.
-# Both jobs also run nightly and on manual dispatch.
+# reporting, but it follows the same gate as `test` on pull requests (the
+# path-change auto-trigger plus the `windows` label override). Both jobs also
+# run nightly and on manual dispatch.
+#
+# The `pull_request` trigger is deliberately kept WITHOUT a `paths:` filter.
+# A `paths:` filter on the event would make the whole workflow fire only for
+# path-matching PRs — which would also drop the `labeled` event for a PR
+# outside those paths and so break the manual `windows`-label override. The
+# path gate is instead computed by the leading `changes` job below, and each
+# job's `if:` combines it with the label override; all PRs still enter the
+# workflow so the `labeled` type keeps working.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -44,6 +59,9 @@ on:
 
 permissions:
   contents: read
+  # `dorny/paths-filter` lists a pull request's changed files through the
+  # GitHub API on `pull_request` events; that read scope is what it needs.
+  pull-requests: read
 
 concurrency:
   # A newer push supersedes an in-flight run for the same ref. Nothing
@@ -57,13 +75,48 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # Compute whether a pull request touches platform-sensitive code, so the
+  # Windows jobs auto-run on those PRs without a human remembering the label.
+  # It runs on every event (a cheap Linux job) so the `needs:` edge below is
+  # always satisfied; the filter step only fires on `pull_request`, where its
+  # `platform` output drives the gate. On schedule / manual dispatch the output
+  # is empty and unused, because those jobs' `if:` short-circuits on
+  # `github.event_name != 'pull_request'`.
+  changes:
+    name: detect platform-sensitive changes
+    runs-on: ubuntu-latest
+    outputs:
+      platform: ${{ steps.filter.outputs.platform }}
+    steps:
+      # For `pull_request` events this action reads the changed-file list from
+      # the GitHub API, so no checkout is needed. Pinned to a full commit SHA
+      # with a version comment, matching this repo's third-party-action policy.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # Path handling, file locking, git plumbing, and the hook bundle —
+          # the areas AGENTS.md calls out as needing Windows coverage.
+          filters: |
+            platform:
+              - 'crates/ai-memory-wiki/**'
+              - 'crates/ai-memory-store/**'
+              - 'crates/ai-memory-hooks/**'
+              - 'crates/ai-memory-cli/src/commands/install_hooks.rs'
+              - 'hooks/**'
+              - 'tests/hooks/**'
+              - '.github/workflows/windows.yml'
+
   test:
     name: test (windows-latest)
-    # On a pull request, only when explicitly opted in. The schedule and
-    # manual dispatch always run.
+    needs: changes
+    # On a pull request, run when a platform-sensitive path changed OR the
+    # `windows` label was applied (the manual override for PRs outside those
+    # paths). The schedule and manual dispatch always run.
     if: >-
       github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'windows')
+      contains(github.event.pull_request.labels.*.name, 'windows') ||
+      needs.changes.outputs.platform == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,18 +151,23 @@ jobs:
   # its PowerShell branch is written for was the one platform no job ran it on.
   #
   # Its own job so a Rust failure cannot stop the shell suite from reporting,
-  # but gated behind the `windows` label like `test` above. The project keeps
-  # Windows off per-PR feedback by default (see the header's cost argument), so
-  # a pull request touching `hooks/` opts in with the `windows` label, the same
-  # as any other platform-sensitive change; it also runs nightly and on manual
-  # dispatch. (The job is cheap — a checkout and a few seconds of `sh` — but
-  # consistency with the fast-CI-per-merge rule wins over an every-PR carve-out.)
+  # but gated the same way as `test` above. The project keeps Windows off
+  # per-PR feedback by default (see the header's cost argument), so a pull
+  # request touching a platform-sensitive path — `hooks/` and `tests/hooks/`
+  # among them — opts in automatically via the `changes` job; the `windows`
+  # label forces it for a PR outside those paths. It also runs nightly and on
+  # manual dispatch. (The job is cheap — a checkout and a few seconds of `sh` —
+  # but consistency with the fast-CI-per-merge rule wins over an every-PR
+  # carve-out.)
   hooks:
     name: hook bundle (windows-latest)
-    # On a pull request, only when explicitly opted in (same as `test`).
+    needs: changes
+    # Same gate as `test`: platform-path change OR the `windows` label on a
+    # pull request; schedule and manual dispatch always run.
     if: >-
       github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'windows')
+      contains(github.event.pull_request.labels.*.name, 'windows') ||
+      needs.changes.outputs.platform == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

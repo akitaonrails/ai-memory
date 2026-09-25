@@ -15,5 +15,5 @@ pub use repository::{RepositoryIdentity, inspect_repository};
 pub use transcript::{
     ExportedTranscript, NativeSessionCandidate, discover_native_session, export_transcript,
     kiro_harness_from_source_cursor, kiro_v3_resume_uses_default_store, list_native_sessions,
-    native_session_exists, wait_for_transcript_flush,
+    native_session_exists, native_session_in_checkout, wait_for_transcript_flush,
 };

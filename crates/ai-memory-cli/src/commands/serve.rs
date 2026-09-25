@@ -2542,6 +2542,7 @@ fn configure_consolidator(
         .with_prompt_limits(
             config.consolidation.max_input_tokens,
             config.consolidation.max_output_tokens,
+            config.consolidation.input_token_safety_margin,
         ),
     );
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());

@@ -1792,7 +1792,15 @@ fn powershell_quote(s: &str) -> String {
 fn powershell_call_operator(agent: &str) -> &'static str {
     // Codex evaluates `~/.codex/hooks.json` command strings with PowerShell
     // on Windows (#515, reproduced against Codex CLI on a native install).
-    if agent == "codex" { "& " } else { "" }
+    // Grok Build CLI does the same for `~/.grok/hooks/*.json` (observed on
+    // Grok 1.0.41: every ai-memory hook failed with a ParserError in the
+    // session's `hook_execution` updates, and its hooks guide documents the
+    // PowerShell `$VAR` rewrite).
+    if matches!(agent, "codex" | "grok") {
+        "& "
+    } else {
+        ""
+    }
 }
 
 fn win_double_quote(s: &str) -> String {
@@ -1815,6 +1823,22 @@ fn codex_windows_command_invokes_rather_than_quotes() {
     assert!(
         cmd.starts_with("& \""),
         "codex must use the call operator: {cmd}"
+    );
+}
+
+/// Grok runs its Windows hooks through PowerShell like Codex, so every
+/// ai-memory hook failed to parse and captured nothing.
+#[test]
+fn grok_windows_command_invokes_rather_than_quotes() {
+    let cmd = hook_command(
+        Path::new("stop.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(HookCommandPlatform::WindowsNative, "grok", None, None),
+    );
+    assert!(
+        cmd.starts_with("& \""),
+        "grok must use the call operator: {cmd}"
     );
 }
 
