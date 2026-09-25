@@ -78,13 +78,6 @@ fn checkpoint(cwd: &Path) -> WorkstreamCheckpoint {
     }
 }
 
-/// The git worktree root above `cwd`, or `None` outside a worktree.
-pub(crate) fn worktree_root(cwd: &Path) -> Option<PathBuf> {
-    git(cwd, &["rev-parse", "--show-toplevel"])
-        .filter(|root| !root.is_empty())
-        .map(PathBuf::from)
-}
-
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = git_bytes(cwd, args)?;
     String::from_utf8(output)

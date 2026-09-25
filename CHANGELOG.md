@@ -28,8 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Both flags are wrapper-owned like `--yolo`/`--executable` and must precede
   the harness name; a `--env` entry overrides a same-key `--env-file` line.
   The resolved environment reaches the spawned process, ai-memory's own
-  native-session resolution, first-launch auto-wire and the global Crush
-  config the managed context packet is layered onto, so the session store,
+  native-session resolution and first-launch auto-wire, so the session store,
   hooks and MCP all follow a `CLAUDE_CONFIG_DIR`-style override, and
   auto-wire warns when the override puts Pi and OMP in one extensions
   directory. See `docs/managed-workstreams.md`. (#820)
@@ -192,34 +191,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native session import. Blank now counts as unset everywhere, as it already
   did for the `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `PI_CODING_AGENT_DIR`
   installers, and `ai-memory run` drops such a value from the harness it
-  launches so the harness uses its default home as well. Crush's managed
-  context likewise read a whitespace-only `CRUSH_GLOBAL_CONFIG` or
-  `XDG_CONFIG_HOME` as a directory, and now falls back to the default global
-  config. (#820)
-- A managed Crush launch with a context packet dropped the `CRUSH.md` and
-  `AGENTS.md` Crush loads by default: Crush only adds them while
-  `global_context_paths` is empty, and the packet filled it. The launcher now
-  adds them first when the user's config lists none, and no longer refuses to
-  start over a global `crush.json` Crush accepts (an empty file, `null`, or
-  `null` options), read from the path cleaned as Crush cleans it. The global
-  `crushrc` beside that config, which Crush stopped reading once the config
-  dir moved, is now sourced from its own directory as well. (#820)
-- Two fresh managed launches in one checkout could import each other's
-  transcript: after exit, `ai-memory run` took the newest session there even
-  when a hook in the child had already linked the run's own session. The
-  hook-linked session now wins when this checkout's store holds it (a process
-  the child starts inherits the run id). Crush, which has no hooks, claims only the
-  one top-level session created during a fresh run and imports nothing, with
-  a warning, when another launch created one too; its title and sub-agent
-  sessions are no longer taken for the conversation, and in a data directory
-  outside the project only a session that edited a file in the project is
-  claimed. (#820)
-- `ai-memory run crush`, `backfill` and `doctor` looked for Crush sessions only
-  in `<cwd>/.crush/crush.db`, so a launch from a project subdirectory, or a
-  project whose Crush config sets `options.data_directory`, imported nothing.
-  They now find the store as Crush does: `options.data_directory` from Crush's
-  JSON configs, else the closest `.crush` up to the git worktree root (not one
-  directly in the home), else `<cwd>/.crush`. (#820)
+  launches so the harness uses its default home as well. (#820)
 - Native `ai-memory upgrade` no longer refuses every Linux install by probing
   the running executable for write (Linux `ETXTBSY`); it only requires the
   parent directory to be writable for rename-based replace. (#802)

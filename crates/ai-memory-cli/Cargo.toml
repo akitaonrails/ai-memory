@@ -94,7 +94,6 @@ tempfile.workspace = true
 ai-memory-test-support.workspace = true
 tempfile.workspace = true
 rstest.workspace = true
-rusqlite.workspace = true
 tower.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
