@@ -2127,7 +2127,7 @@ mod tests {
                 "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 12\n".into()
             }
             "#!/bin/sh\nsleep 5\n" => "Start-Sleep -Seconds 20\n".into(),
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n" => {
+            "#!/bin/sh\nprintf '%070000d' 0\n" => {
                 let chunk = "x".repeat(100);
                 format!("for ($i = 0; $i -lt 700; $i++) {{ [Console]::Out.Write('{chunk}') }}\n")
             }
@@ -2336,9 +2336,10 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_eval_stdout_fails_closed() {
-        let script = write_eval_script(
-            "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n",
-        );
+        // One zero-padded printf writes the 70,000 bytes at once. A shell loop
+        // printing one byte per iteration took longer than the gate's 2s
+        // timeout on a loaded machine, which failed the test as a timeout.
+        let script = write_eval_script("#!/bin/sh\nprintf '%070000d' 0\n");
         let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
         let mut rejected = Vec::new();
         let mut warnings = Vec::new();
