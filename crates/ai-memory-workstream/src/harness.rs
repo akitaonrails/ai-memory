@@ -1,10 +1,10 @@
 //! Native command planning without filtering harness arguments.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use ai_memory_core::AgentKind;
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use uuid::Uuid;
 
 /// Harnesses with native-session and transcript adapters.
@@ -203,7 +203,24 @@ pub fn build_launch_plan(
     native_args: Vec<OsString>,
     linked_session_id: Option<&str>,
 ) -> Result<LaunchPlan> {
-    build_launch_plan_with_env(harness, executable, native_args, linked_session_id, &[])
+    build_launch_plan_with_env(
+        harness,
+        executable,
+        native_args,
+        linked_session_id,
+        &[],
+        None,
+    )
+}
+
+/// Where a launch runs: the home the harness resolves `~` against and the
+/// directory it starts in.
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchRoots<'a> {
+    /// The native home.
+    pub home: &'a Path,
+    /// The harness's working directory.
+    pub cwd: &'a Path,
 }
 
 /// [`build_launch_plan`] with `--env`/`--env-file` overrides layered in front
@@ -215,28 +232,43 @@ pub fn build_launch_plan(
 /// this same variable, so a caller-scoped override that only reached the
 /// child process would make the two disagree about where the session lives
 /// (see the `CLAUDE_CONFIG_DIR` note in `docs/managed-workstreams.md`).
+///
+/// `roots` name the native home and the launch directory. OMP needs the home
+/// (a named profile, `PI_CONFIG_DIR`, or an XDG data dir); without it that
+/// store falls back to the adapter's default root.
 pub fn build_launch_plan_with_env(
     harness: ManagedHarness,
     executable: Option<OsString>,
     native_args: Vec<OsString>,
     linked_session_id: Option<&str>,
     env_overrides: &[(String, String)],
+    roots: Option<LaunchRoots<'_>>,
 ) -> Result<LaunchPlan> {
     let program = executable.unwrap_or_else(|| OsString::from(harness.executable()));
     let mut args = native_args;
+    let get = |name: &str| {
+        env_overrides
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| OsString::from(value))
+            .or_else(|| std::env::var_os(name))
+    };
     let session_dir = match harness {
         ManagedHarness::Pi | ManagedHarness::Omp => flag_path(&args, &["--session-dir"]),
         ManagedHarness::Crush => flag_path(&args, &["--data-dir", "-D"]),
         _ => None,
     }
     .or_else(|| {
-        environment_session_dir_with(harness, |name| {
-            env_overrides
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| OsString::from(value))
-                .or_else(|| std::env::var_os(name))
-        })
+        let omp_profile = match harness {
+            ManagedHarness::Omp => omp_profile_flag(&args),
+            _ => None,
+        };
+        environment_session_dir_with(
+            harness,
+            roots.map(|roots| roots.home),
+            omp_profile.as_deref(),
+            get,
+        )
     });
     let mut expected = explicit_session_id(harness, &args);
     let mode = launch_mode(harness, &args);
@@ -917,15 +949,322 @@ fn flag_path(args: &[OsString], names: &[&str]) -> Option<PathBuf> {
     None
 }
 
-fn environment_session_dir_with(
-    harness: ManagedHarness,
+/// A harness home variable's directory, or `None` when it is unset or blank.
+///
+/// Blank (empty or whitespace-only) counts as unset on purpose: an
+/// exported-but-empty variable is far more often an unset shell expansion than
+/// a request to use the filesystem root or a directory named by whitespace.
+/// Session import and the hook/MCP installers share this one rule, so a blank
+/// override never sends one to the default home and the other to `<cwd>/ /`.
+pub fn env_dir_override(value: Option<OsString>) -> Option<PathBuf> {
+    let value = value?;
+    if value.to_str().is_some_and(|text| text.trim().is_empty()) {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
+/// The profile an OMP command line selects with a leading `--profile` (after
+/// an optional `launch` or `acp`), which OMP ranks above `OMP_PROFILE`.
+///
+/// Only the leading position is read. OMP stops extracting global flags at a
+/// subcommand (`omp grep --profile x` greps for `--profile`) and at `--`, and a
+/// string flag such as `--system-prompt` takes a following `--profile` as its
+/// value; telling those apart later in the line needs OMP's own flag tables.
+/// A `--profile` anywhere else is left to the environment instead of guessed,
+/// and so is a leading one that a later `--profile` might override.
+pub fn omp_profile_flag(args: &[OsString]) -> Option<String> {
+    let args: Vec<&str> = args.iter().map(|arg| arg.to_str()).collect::<Option<_>>()?;
+    let mut rest = match args.first() {
+        Some(&"launch" | &"acp") => &args[1..],
+        _ => &args[..],
+    };
+    let mut profile = None;
+    loop {
+        match rest {
+            [flag, value, tail @ ..] if *flag == "--profile" => {
+                profile = Some(*value);
+                rest = tail;
+            }
+            [flag, tail @ ..] if flag.starts_with("--profile=") => {
+                profile = flag.strip_prefix("--profile=");
+                rest = tail;
+            }
+            _ => break,
+        }
+    }
+    let is_profile_flag = |arg: &&str| *arg == "--profile" || arg.starts_with("--profile=");
+    if rest.iter().any(is_profile_flag) {
+        return None;
+    }
+    profile
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+        .map(str::to_owned)
+}
+
+/// The variables that relocate a harness's native store, the ones
+/// [`build_launch_plan_with_env`] resolves its session directory from.
+pub fn store_override_vars(harness: ManagedHarness) -> &'static [&'static str] {
+    match harness {
+        ManagedHarness::Claude => &["CLAUDE_CONFIG_DIR"],
+        ManagedHarness::Codex => &["CODEX_HOME"],
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => &["XDG_DATA_HOME"],
+        ManagedHarness::Pi => &["PI_CODING_AGENT_SESSION_DIR", "PI_CODING_AGENT_DIR"],
+        ManagedHarness::Omp => &[
+            "PI_CODING_AGENT_SESSION_DIR",
+            "PI_CODING_AGENT_DIR",
+            "PI_CONFIG_DIR",
+            "XDG_DATA_HOME",
+        ],
+        ManagedHarness::Kimi => &["KIMI_CODE_HOME"],
+        ManagedHarness::Kiro | ManagedHarness::KiroV3 => &["KIRO_HOME"],
+        ManagedHarness::Grok => &["GROK_HOME"],
+        ManagedHarness::Crush | ManagedHarness::CommandCode | ManagedHarness::Antigravity => &[],
+    }
+}
+
+/// OMP's active profile, resolved the way OMP resolves it
+/// (`normalizeProfileName` and `resolveProfileEnv` in its
+/// `pi-utils/src/dirs.ts`, checked against 18.2.5): an explicit `--profile`
+/// wins, then `OMP_PROFILE` whenever it is set, even to an empty value, and
+/// only then the legacy `PI_PROFILE`. The name is trimmed, and an empty,
+/// whitespace-only or `default` name selects the default profile (`None`).
+///
+/// # Errors
+/// Returns an error for a name OMP itself refuses, so ai-memory never wires a
+/// profile directory OMP will not load.
+fn omp_profile(
+    explicit: Option<&str>,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<String>> {
+    let raw = match explicit {
+        Some("") => bail!("--profile requires a profile name"),
+        Some(name) => name.to_owned(),
+        None => match get("OMP_PROFILE").or_else(|| get("PI_PROFILE")) {
+            Some(value) => value
+                .into_string()
+                .map_err(|value| anyhow!("Invalid OMP profile {value:?}: not valid UTF-8"))?,
+            None => return Ok(None),
+        },
+    };
+    normalize_omp_profile(&raw)
+}
+
+/// OMP's `normalizeProfileName`: trimmed, with empty and `default` meaning the
+/// default profile.
+fn normalize_omp_profile(raw: &str) -> Result<Option<String>> {
+    let name = raw.trim();
+    if name.is_empty() || name == "default" {
+        return Ok(None);
+    }
+    if !is_valid_omp_profile_name(name) {
+        bail!(
+            "Invalid OMP profile \"{raw}\". Profile names must match ^[a-z0-9][a-z0-9._-]{{0,63}}$, \
+             cannot be \".\" or \"..\", cannot end with \".\", and cannot be a Windows reserved \
+             device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, or any of those with an extension)."
+        );
+    }
+    Ok(Some(name.to_owned()))
+}
+
+fn is_valid_omp_profile_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let lower_alnum = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let base = name.split('.').next().unwrap_or(name);
+    let reserved = matches!(base, "con" | "prn" | "aux" | "nul")
+        || (base.len() == 4
+            && (base.starts_with("com") || base.starts_with("lpt"))
+            && base.as_bytes()[3].is_ascii_digit());
+    (1..=64).contains(&bytes.len())
+        && lower_alnum(&bytes[0])
+        && bytes[1..]
+            .iter()
+            .all(|byte| lower_alnum(byte) || matches!(byte, b'.' | b'_' | b'-'))
+        && !name.ends_with('.')
+        && !reserved
+}
+
+/// OMP's agent directory, where it loads extensions and `mcp.json` (and keeps
+/// sessions unless XDG moves them, see [`omp_sessions_dir`]). A named profile
+/// owns `<root>/profiles/<name>/agent` and ignores `PI_CODING_AGENT_DIR`; the
+/// default profile honors a non-blank `PI_CODING_AGENT_DIR`, else
+/// `<root>/agent`. `<root>` is `<home>/.omp`, renamed by `PI_CONFIG_DIR`.
+///
+/// # Errors
+/// Returns the [`omp_profile`] error for a profile name OMP refuses.
+pub fn omp_agent_dir(
+    home: &Path,
+    explicit_profile: Option<&str>,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf> {
+    Ok(match omp_profile(explicit_profile, &get)? {
+        Some(profile) => omp_profile_agent_dir(home, &profile, &get),
+        None => omp_default_agent_dir_override(home, &get)
+            .unwrap_or_else(|| omp_config_root(home, &get).join("agent")),
+    })
+}
+
+/// OMP's config root: `<home>/.omp`, or `<home>/<PI_CONFIG_DIR>` when that
+/// variable renames it. OMP joins the value under the home with Node's
+/// `path.join`, so an absolute value stays under the home and `..` walks up
+/// from it, where `PathBuf::join` would replace the home instead.
+fn omp_config_root(home: &Path, get: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    let name = env_dir_override(get("PI_CONFIG_DIR")).unwrap_or_else(|| PathBuf::from(".omp"));
+    let mut root = home.to_path_buf();
+    for component in name.components() {
+        match component {
+            Component::Normal(part) => root.push(part),
+            Component::ParentDir => {
+                root.pop();
+            }
+            // Node's `path.win32.join` keeps a drive or UNC prefix as plain
+            // segments under the home (`C:\Users\me\server\share\omp`).
+            // Appended as text: pushing `D:` would make it a new prefix.
+            Component::Prefix(prefix) => {
+                let text = prefix.as_os_str().to_string_lossy().into_owned();
+                for part in text.split(['\\', '/']).filter(|part| !part.is_empty()) {
+                    let path = root.as_mut_os_string();
+                    if !path.to_string_lossy().ends_with(['\\', '/']) {
+                        path.push(std::path::MAIN_SEPARATOR_STR);
+                    }
+                    path.push(part);
+                }
+            }
+            Component::RootDir | Component::CurDir => {}
+        }
+    }
+    root
+}
+
+/// `path` with `.` dropped and `..` folded lexically, without touching the
+/// filesystem: Go's `filepath.Clean`, and the normalizing half of Node's
+/// `path.resolve`. A `..` that would climb above the root is dropped.
+pub fn clean_path(path: &Path) -> PathBuf {
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match clean.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    clean.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => clean.push(".."),
+            },
+            other => clean.push(other.as_os_str()),
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        clean.push(".");
+    }
+    clean
+}
+
+/// Where OMP keeps sessions when nothing names the session dir: its agent
+/// dir's `sessions`, except that on Linux and macOS an agent dir at its
+/// default location moves them under `$XDG_DATA_HOME/omp` (a named profile
+/// under `$XDG_DATA_HOME/omp/profiles/<name>`) once that directory exists
+/// (`DirResolver` in OMP's `dirs.ts`). Extensions and `mcp.json` never move.
+fn omp_sessions_dir(
+    home: &Path,
+    explicit_profile: Option<&str>,
+    get: impl Fn(&str) -> Option<OsString>,
+    xdg_platform: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<PathBuf> {
+    let profile = omp_profile(explicit_profile, &get)?;
+    let agent_dir = omp_agent_dir(home, explicit_profile, &get)?;
+    let default_location = match &profile {
+        Some(name) => omp_profile_agent_dir(home, name, &get),
+        None => omp_config_root(home, &get).join("agent"),
+    };
+    // OMP compares the override after `path.resolve`, so a relative or
+    // `..`-laden spelling of the default location still counts as default.
+    let resolved = std::path::absolute(&agent_dir)
+        .map(|dir| clean_path(&dir))
+        .unwrap_or_else(|_| agent_dir.clone());
+    if xdg_platform
+        && resolved == clean_path(&default_location)
+        && let Some(data) = env_dir_override(get("XDG_DATA_HOME"))
+    {
+        let base = match &profile {
+            Some(name) => data.join("omp").join("profiles").join(name),
+            None => data.join("omp"),
+        };
+        if exists(&base) {
+            return Ok(base.join("sessions"));
+        }
+    }
+    Ok(agent_dir.join("sessions"))
+}
+
+/// The default profile's `PI_CODING_AGENT_DIR`, unless it is the agent dir a
+/// parent OMP derived for its profile and exported to its children. OMP drops
+/// such a value (`resolvePreProfileAgentDir` in `dirs.ts`), so a nested launch
+/// back on the default profile uses `~/.omp/agent`, not the parent's profile.
+fn omp_default_agent_dir_override(
+    home: &Path,
     get: impl Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
-    let value = |name| {
-        get(name)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    };
+    let dir = env_dir_override(get("PI_CODING_AGENT_DIR"))?;
+    match inherited_omp_profile(&get) {
+        Some(profile) if dir == omp_profile_agent_dir(home, &profile, &get) => None,
+        _ => Some(dir),
+    }
+}
+
+/// The profile the environment names for OMP (`OMP_PROFILE`, else
+/// `PI_PROFILE`), or failing that `PI_PROFILE` on its own: the one OMP checks
+/// an inherited `PI_CODING_AGENT_DIR` against. Invalid names count as none,
+/// as in OMP's `readProfileFromEnvSafe`.
+fn inherited_omp_profile(get: impl Fn(&str) -> Option<OsString>) -> Option<String> {
+    let normalized =
+        |value: Option<OsString>| normalize_omp_profile(value?.to_str()?).ok().flatten();
+    normalized(get("OMP_PROFILE").or_else(|| get("PI_PROFILE")))
+        .or_else(|| normalized(get("PI_PROFILE")))
+}
+
+/// The `OMP_PROFILE` / `PI_PROFILE` values under which ai-memory's resolvers
+/// see what `omp --profile <profile>` sees in the environment `get` reads. A
+/// named profile needs only `OMP_PROFILE`. `default` selects the default
+/// profile but must keep the profile the environment named, which OMP still
+/// uses to drop a `PI_CODING_AGENT_DIR` inherited from that profile.
+pub fn omp_profile_flag_env(
+    profile: &str,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(String, String)> {
+    match normalize_omp_profile(profile) {
+        Ok(Some(name)) => vec![("OMP_PROFILE".to_string(), name)],
+        Ok(None) => vec![
+            ("OMP_PROFILE".to_string(), String::new()),
+            (
+                "PI_PROFILE".to_string(),
+                inherited_omp_profile(&get).unwrap_or_default(),
+            ),
+        ],
+        // OMP refuses to start with it; pass it on so auto-wire reports it.
+        Err(_) => vec![("OMP_PROFILE".to_string(), profile.to_string())],
+    }
+}
+
+fn omp_profile_agent_dir(
+    home: &Path,
+    profile: &str,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> PathBuf {
+    omp_config_root(home, get)
+        .join("profiles")
+        .join(profile)
+        .join("agent")
+}
+
+fn environment_session_dir_with(
+    harness: ManagedHarness,
+    home: Option<&Path>,
+    omp_profile_flag: Option<&str>,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let value = |name| env_dir_override(get(name));
     match harness {
         ManagedHarness::Claude => value("CLAUDE_CONFIG_DIR").map(|dir| dir.join("projects")),
         ManagedHarness::Codex => value("CODEX_HOME").map(|dir| dir.join("sessions")),
@@ -937,7 +1276,25 @@ fn environment_session_dir_with(
         ManagedHarness::Pi => value("PI_CODING_AGENT_SESSION_DIR")
             .or_else(|| value("PI_CODING_AGENT_DIR").map(|dir| dir.join("sessions"))),
         ManagedHarness::Crush => None,
-        ManagedHarness::Omp => value("PI_CODING_AGENT_DIR").map(|dir| dir.join("sessions")),
+        // OMP reads `PI_CODING_AGENT_SESSION_DIR` as its `--session-dir`
+        // default. A named profile needs the home to resolve, and an invalid
+        // one makes OMP refuse to start, so neither has a store to point at.
+        ManagedHarness::Omp => value("PI_CODING_AGENT_SESSION_DIR").or_else(|| match home {
+            Some(home) => omp_sessions_dir(
+                home,
+                omp_profile_flag,
+                &get,
+                cfg!(any(target_os = "linux", target_os = "macos")),
+                Path::exists,
+            )
+            .ok()
+            // The adapter's default root already covers an unmoved store.
+            .filter(|dir| *dir != home.join(".omp").join("agent").join("sessions")),
+            None => match omp_profile(omp_profile_flag, &get) {
+                Ok(None) => value("PI_CODING_AGENT_DIR").map(|dir| dir.join("sessions")),
+                _ => None,
+            },
+        }),
         // Sessions live under `<KIMI_CODE_HOME>/sessions/<bucket>/<id>/`.
         ManagedHarness::Kimi => value("KIMI_CODE_HOME").map(|dir| dir.join("sessions")),
         // Command Code documents no session-root override. Its user store is
@@ -1389,20 +1746,517 @@ mod tests {
             _ => None,
         };
         assert_eq!(
-            environment_session_dir_with(ManagedHarness::Claude, get).as_deref(),
+            environment_session_dir_with(ManagedHarness::Claude, None, None, get).as_deref(),
             Some(std::path::Path::new("/stores/claude/projects"))
         );
         assert_eq!(
-            environment_session_dir_with(ManagedHarness::Codex, get).as_deref(),
+            environment_session_dir_with(ManagedHarness::Codex, None, None, get).as_deref(),
             Some(std::path::Path::new("/stores/codex/sessions"))
         );
         assert_eq!(
-            environment_session_dir_with(ManagedHarness::OpenCode, get).as_deref(),
+            environment_session_dir_with(ManagedHarness::OpenCode, None, None, get).as_deref(),
             Some(std::path::Path::new("/stores/xdg/opencode"))
         );
         assert_eq!(
-            environment_session_dir_with(ManagedHarness::Omp, get).as_deref(),
+            environment_session_dir_with(ManagedHarness::Omp, None, None, get).as_deref(),
             Some(std::path::Path::new("/stores/pi-family/sessions"))
+        );
+    }
+
+    fn env_of(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let pairs = pairs.to_vec();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn omp_profile_flag_reads_only_a_leading_profile() {
+        let flag =
+            |args: &[&str]| omp_profile_flag(&args.iter().map(OsString::from).collect::<Vec<_>>());
+        assert_eq!(flag(&["--profile", "work"]).as_deref(), Some("work"));
+        assert_eq!(
+            flag(&["--profile=work", "--model", "x"]).as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            flag(&["launch", "--profile", "work"]).as_deref(),
+            Some("work")
+        );
+        // OMP itself does not select a profile from any of these.
+        assert_eq!(flag(&["grep", "--profile", "foo"]), None);
+        assert_eq!(flag(&["--system-prompt", "--profile", "foo"]), None);
+        assert_eq!(flag(&["--", "--profile", "foo"]), None);
+        assert_eq!(flag(&["--profile", "--print"]), None);
+        assert_eq!(flag(&["--profile="]), None);
+        // Ambiguous without OMP's flag tables, so the environment decides.
+        assert_eq!(flag(&["--model", "x", "--profile", "work"]), None);
+        // OMP keeps the last `--profile`.
+        assert_eq!(
+            flag(&["--profile", "work", "--profile=personal"]).as_deref(),
+            Some("personal")
+        );
+        assert_eq!(
+            flag(&["--profile", "work", "--model", "x", "--profile", "b"]),
+            None
+        );
+    }
+
+    /// A `PI_CODING_AGENT_DIR` that a parent OMP derived for its profile is
+    /// dropped once the default profile is back in charge, as OMP does; any
+    /// other value is still honored.
+    #[test]
+    fn omp_default_profile_drops_a_profile_derived_agent_dir() {
+        let home = Path::new("/home/me");
+        let derived = "/home/me/.omp/profiles/work/agent";
+        let default = home.join(".omp/agent");
+        let dir = |explicit: Option<&str>, pairs: &[(&'static str, &'static str)]| {
+            omp_agent_dir(home, explicit, env_of(pairs)).unwrap()
+        };
+        let inherited = [
+            ("OMP_PROFILE", ""),
+            ("PI_PROFILE", "work"),
+            ("PI_CODING_AGENT_DIR", derived),
+        ];
+        assert_eq!(dir(None, &inherited), default);
+        assert_eq!(
+            dir(
+                None,
+                &[
+                    ("OMP_PROFILE", ""),
+                    ("PI_PROFILE", "work"),
+                    ("PI_CONFIG_DIR", ".cfg"),
+                    ("PI_CODING_AGENT_DIR", "/home/me/.cfg/profiles/work/agent")
+                ]
+            ),
+            PathBuf::from("/home/me/.cfg/agent"),
+            "the derived dir follows PI_CONFIG_DIR"
+        );
+        assert_eq!(
+            dir(
+                Some("default"),
+                &[("OMP_PROFILE", "work"), ("PI_CODING_AGENT_DIR", derived)]
+            ),
+            default
+        );
+        assert_eq!(
+            dir(
+                None,
+                &[
+                    ("OMP_PROFILE", ""),
+                    ("PI_PROFILE", "work"),
+                    ("PI_CODING_AGENT_DIR", "/custom")
+                ]
+            ),
+            PathBuf::from("/custom")
+        );
+        assert_eq!(
+            dir(None, &[("PI_CODING_AGENT_DIR", derived)]),
+            PathBuf::from(derived),
+            "without an inherited profile the override is the user's own"
+        );
+        assert_eq!(
+            environment_session_dir_with(ManagedHarness::Omp, Some(home), None, env_of(&inherited)),
+            None
+        );
+    }
+
+    /// OMP keeps sessions in its agent dir: a named profile owns
+    /// `~/.omp/profiles/<name>/agent` and ignores `PI_CODING_AGENT_DIR`,
+    /// `--profile` beats `OMP_PROFILE`, and `PI_CODING_AGENT_SESSION_DIR`
+    /// (OMP's `--session-dir` default) beats both.
+    #[test]
+    fn omp_session_dir_follows_profile_and_session_env() {
+        let home = Path::new("/home/me");
+        let profile = |name: &str| home.join(".omp/profiles").join(name).join("agent/sessions");
+        let resolve = |flag: Option<&str>, pairs: &[(&'static str, &'static str)]| {
+            environment_session_dir_with(ManagedHarness::Omp, Some(home), flag, env_of(pairs))
+        };
+        assert_eq!(
+            resolve(None, &[("OMP_PROFILE", "work")]),
+            Some(profile("work"))
+        );
+        assert_eq!(
+            resolve(
+                None,
+                &[("OMP_PROFILE", "work"), ("PI_CODING_AGENT_DIR", "/x")]
+            ),
+            Some(profile("work"))
+        );
+        assert_eq!(
+            resolve(None, &[("PI_PROFILE", "work")]),
+            Some(profile("work"))
+        );
+        assert_eq!(
+            resolve(Some("work"), &[("OMP_PROFILE", "other")]),
+            Some(profile("work"))
+        );
+        assert_eq!(
+            resolve(
+                Some("default"),
+                &[("OMP_PROFILE", "other"), ("PI_CODING_AGENT_DIR", "/x")]
+            ),
+            Some(PathBuf::from("/x/sessions"))
+        );
+        assert_eq!(
+            resolve(
+                None,
+                &[
+                    ("PI_CODING_AGENT_SESSION_DIR", "/s"),
+                    ("OMP_PROFILE", "work")
+                ]
+            ),
+            Some(PathBuf::from("/s"))
+        );
+        // No home, or a profile OMP refuses to start with: nothing to point at.
+        assert_eq!(
+            environment_session_dir_with(
+                ManagedHarness::Omp,
+                None,
+                None,
+                env_of(&[("OMP_PROFILE", "work")])
+            ),
+            None
+        );
+        assert_eq!(resolve(None, &[("OMP_PROFILE", "Work")]), None);
+
+        let plan = build_launch_plan_with_env(
+            ManagedHarness::Omp,
+            None,
+            vec![OsString::from("--profile"), OsString::from("work")],
+            None,
+            &[
+                ("PI_CODING_AGENT_DIR".to_string(), "/x".to_string()),
+                // Blank masks whatever the developer's shell exports.
+                ("PI_CODING_AGENT_SESSION_DIR".to_string(), String::new()),
+                ("PI_CONFIG_DIR".to_string(), String::new()),
+                ("XDG_DATA_HOME".to_string(), String::new()),
+            ],
+            Some(LaunchRoots { home, cwd: home }),
+        )
+        .unwrap();
+        assert_eq!(plan.session_dir, Some(profile("work")));
+    }
+
+    /// OMP joins `PI_CONFIG_DIR` under the home with Node's `path.join`: an
+    /// absolute value stays under the home, `..` walks up, `~` is literal,
+    /// and a blank value keeps `.omp`.
+    #[test]
+    fn omp_config_root_renames_like_node_path_join() {
+        let home = Path::new("/home/me");
+        for (value, expected) in [
+            (".omp-alt", "/home/me/.omp-alt"),
+            ("/abs/cfg", "/home/me/abs/cfg"),
+            ("../sib", "/home/sib"),
+            ("~/.x", "/home/me/~/.x"),
+            ("./cfg/", "/home/me/cfg"),
+            ("", "/home/me/.omp"),
+            ("  ", "/home/me/.omp"),
+        ] {
+            let env = |name: &str| (name == "PI_CONFIG_DIR").then(|| OsString::from(value));
+            assert_eq!(
+                omp_config_root(home, env),
+                PathBuf::from(expected),
+                "{value:?}"
+            );
+            assert_eq!(
+                omp_agent_dir(home, Some("work"), env).unwrap(),
+                PathBuf::from(expected).join("profiles/work/agent"),
+                "{value:?}"
+            );
+        }
+        assert_eq!(omp_config_root(home, |_| None), home.join(".omp"));
+        assert_eq!(
+            environment_session_dir_with(
+                ManagedHarness::Omp,
+                Some(home),
+                None,
+                env_of(&[("PI_CONFIG_DIR", ".cfg")])
+            ),
+            Some(PathBuf::from("/home/me/.cfg/agent/sessions"))
+        );
+    }
+
+    #[test]
+    fn clean_path_folds_like_go_filepath_clean() {
+        for (raw, expected) in [
+            ("/a/b/../c", "/a/c"),
+            ("/a/./b/", "/a/b"),
+            ("/..", "/"),
+            ("a/../..", ".."),
+            ("", "."),
+            ("./", "."),
+        ] {
+            assert_eq!(
+                clean_path(Path::new(raw)),
+                PathBuf::from(expected),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// `omp --profile default` keeps the profile the environment named, so
+    /// an agent dir inherited from that profile is still dropped.
+    #[test]
+    fn omp_profile_flag_env_keeps_the_inherited_profile_for_default() {
+        let home = Path::new("/home/me");
+        let resolve = |pairs: Vec<(String, String)>| {
+            let inherited = env_of(&[
+                ("OMP_PROFILE", "work"),
+                ("PI_CODING_AGENT_DIR", "/home/me/.omp/profiles/work/agent"),
+            ]);
+            let merged = move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| OsString::from(value))
+                    .or_else(|| inherited(name))
+            };
+            omp_agent_dir(home, None, merged).unwrap()
+        };
+        assert_eq!(
+            resolve(omp_profile_flag_env(
+                "default",
+                env_of(&[("OMP_PROFILE", "work")])
+            )),
+            home.join(".omp/agent")
+        );
+        assert_eq!(
+            resolve(omp_profile_flag_env("other", |_| None)),
+            home.join(".omp/profiles/other/agent")
+        );
+        assert_eq!(
+            omp_profile_flag_env("Bad", |_| None),
+            vec![("OMP_PROFILE".to_string(), "Bad".to_string())],
+            "an invalid name is passed on for the resolver to refuse"
+        );
+    }
+
+    /// OMP resolves `PI_CODING_AGENT_DIR` before deciding whether it moved the
+    /// agent dir, so `..` or a relative spelling of the default still counts
+    /// as the default location and keeps XDG sessions.
+    #[cfg(unix)]
+    #[test]
+    fn omp_xdg_sessions_compare_the_resolved_agent_dir() {
+        let exists = |path: &Path| path == Path::new("/xdg/omp");
+        let sessions = |pairs: &[(&'static str, &'static str)], home: &Path| {
+            omp_sessions_dir(home, None, env_of(pairs), true, exists).unwrap()
+        };
+        let home = Path::new("/home/me");
+        assert_eq!(
+            sessions(
+                &[
+                    ("XDG_DATA_HOME", "/xdg"),
+                    ("PI_CODING_AGENT_DIR", "/home/me/.omp/../.omp/agent")
+                ],
+                home
+            ),
+            PathBuf::from("/xdg/omp/sessions")
+        );
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            sessions(
+                &[
+                    ("XDG_DATA_HOME", "/xdg"),
+                    ("PI_CODING_AGENT_DIR", ".omp/agent")
+                ],
+                &cwd
+            ),
+            PathBuf::from("/xdg/omp/sessions"),
+            "a relative override resolves against the working directory"
+        );
+    }
+
+    /// Node's `path.win32.join` keeps a drive or UNC prefix of `PI_CONFIG_DIR`
+    /// as plain segments under the home.
+    #[cfg(windows)]
+    #[test]
+    fn omp_config_root_keeps_windows_prefixes_like_node() {
+        let home = Path::new(r"C:\Users\me");
+        for (value, expected) in [
+            (r"\\server\share\omp", r"C:\Users\me\server\share\omp"),
+            (r"D:\cfg", r"C:\Users\me\D:\cfg"),
+        ] {
+            let env = |name: &str| (name == "PI_CONFIG_DIR").then(|| OsString::from(value));
+            assert_eq!(
+                omp_config_root(home, env),
+                PathBuf::from(expected),
+                "{value}"
+            );
+        }
+    }
+
+    /// On Linux and macOS, OMP moves sessions (only sessions) under
+    /// `$XDG_DATA_HOME/omp` once that directory exists, unless
+    /// `PI_CODING_AGENT_DIR` moved the agent dir away from its default.
+    #[cfg(unix)]
+    #[test]
+    fn omp_sessions_dir_follows_xdg_data_home() {
+        let home = Path::new("/home/me");
+        let existing = ["/xdg/omp", "/xdg2/omp/profiles/work", "/xdg3/omp"];
+        let exists = |path: &Path| existing.iter().any(|dir| path == Path::new(dir));
+        let sessions =
+            |explicit: Option<&str>, pairs: &[(&'static str, &'static str)], xdg_platform: bool| {
+                omp_sessions_dir(home, explicit, env_of(pairs), xdg_platform, exists).unwrap()
+            };
+        let xdg = [("XDG_DATA_HOME", "/xdg")];
+        assert_eq!(
+            sessions(None, &xdg, true),
+            PathBuf::from("/xdg/omp/sessions")
+        );
+        assert_eq!(
+            sessions(None, &xdg, false),
+            home.join(".omp/agent/sessions"),
+            "Windows keeps the agent dir"
+        );
+        assert_eq!(
+            sessions(None, &[("XDG_DATA_HOME", "/missing")], true),
+            home.join(".omp/agent/sessions")
+        );
+        assert_eq!(
+            sessions(None, &[], true),
+            home.join(".omp/agent/sessions"),
+            "no ~/.local/share fallback"
+        );
+        assert_eq!(
+            sessions(Some("work"), &xdg, true),
+            home.join(".omp/profiles/work/agent/sessions"),
+            "a profile keys on its own XDG dir, not the app root"
+        );
+        assert_eq!(
+            sessions(Some("work"), &[("XDG_DATA_HOME", "/xdg2")], true),
+            PathBuf::from("/xdg2/omp/profiles/work/sessions")
+        );
+        assert_eq!(
+            sessions(
+                None,
+                &[
+                    ("XDG_DATA_HOME", "/xdg"),
+                    ("PI_CODING_AGENT_DIR", "/custom")
+                ],
+                true
+            ),
+            PathBuf::from("/custom/sessions"),
+            "a relocated agent dir keeps its sessions"
+        );
+        assert_eq!(
+            sessions(
+                None,
+                &[
+                    ("XDG_DATA_HOME", "/xdg"),
+                    ("PI_CODING_AGENT_DIR", "/home/me/.omp/agent/")
+                ],
+                true
+            ),
+            PathBuf::from("/xdg/omp/sessions"),
+            "an override naming the default location is not a relocation"
+        );
+        assert_eq!(
+            sessions(
+                None,
+                &[("XDG_DATA_HOME", "/xdg3"), ("PI_CONFIG_DIR", ".cfg")],
+                true
+            ),
+            PathBuf::from("/xdg3/omp/sessions"),
+            "PI_CONFIG_DIR does not rename the XDG app dir"
+        );
+        let probed = std::cell::Cell::new(false);
+        let _ = omp_sessions_dir(
+            home,
+            None,
+            env_of(&[("XDG_DATA_HOME", "  ")]),
+            true,
+            |_: &Path| {
+                probed.set(true);
+                true
+            },
+        );
+        assert!(!probed.get(), "a blank XDG_DATA_HOME is unset");
+    }
+
+    /// The same rule through the launch plan, against the real filesystem.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn omp_session_import_reads_an_existing_xdg_data_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let mut env = vec![(
+            "XDG_DATA_HOME".to_string(),
+            xdg.path().to_string_lossy().into_owned(),
+        )];
+        // Blank masks whatever the developer's shell exports.
+        for name in [
+            "PI_CODING_AGENT_SESSION_DIR",
+            "PI_CODING_AGENT_DIR",
+            "PI_CONFIG_DIR",
+            "OMP_PROFILE",
+        ] {
+            env.push((name.to_string(), String::new()));
+        }
+        let plan = || {
+            build_launch_plan_with_env(
+                ManagedHarness::Omp,
+                None,
+                Vec::new(),
+                None,
+                &env,
+                Some(LaunchRoots {
+                    home: home.path(),
+                    cwd: home.path(),
+                }),
+            )
+            .unwrap()
+            .session_dir
+        };
+        assert_eq!(plan(), None, "no XDG omp dir yet: the default store");
+        std::fs::create_dir(xdg.path().join("omp")).unwrap();
+        assert_eq!(plan(), Some(xdg.path().join("omp").join("sessions")));
+    }
+
+    /// Blank relocation values are unset, the same rule the hook and MCP
+    /// installers apply; otherwise import read `<cwd>/   /...` while auto-wire
+    /// installed into the default home.
+    #[test]
+    fn native_store_environment_overrides_treat_blank_as_unset() {
+        for blank in ["", "   ", "\t"] {
+            for harness in [
+                ManagedHarness::Claude,
+                ManagedHarness::Codex,
+                ManagedHarness::OpenCode,
+                ManagedHarness::OpenCode2,
+                ManagedHarness::Pi,
+                ManagedHarness::Omp,
+                ManagedHarness::Kimi,
+                ManagedHarness::Kiro,
+                ManagedHarness::KiroV3,
+                ManagedHarness::Grok,
+            ] {
+                assert_eq!(
+                    environment_session_dir_with(
+                        harness,
+                        Some(Path::new("/home/me")),
+                        None,
+                        |_| Some(OsString::from(blank))
+                    ),
+                    None,
+                    "{harness:?} with {blank:?}"
+                );
+            }
+        }
+        assert_eq!(
+            environment_session_dir_with(
+                ManagedHarness::Pi,
+                None,
+                None,
+                env_of(&[
+                    ("PI_CODING_AGENT_SESSION_DIR", "   "),
+                    ("PI_CODING_AGENT_DIR", "/stores/pi")
+                ])
+            ),
+            Some(PathBuf::from("/stores/pi/sessions"))
         );
     }
 
@@ -1626,7 +2480,7 @@ mod tests {
     fn grok_home_environment_override_points_at_sessions_root() {
         let get = |name: &str| (name == "GROK_HOME").then(|| OsString::from("/stores/grok"));
         assert_eq!(
-            environment_session_dir_with(ManagedHarness::Grok, get).as_deref(),
+            environment_session_dir_with(ManagedHarness::Grok, None, None, get).as_deref(),
             Some(std::path::Path::new("/stores/grok/sessions"))
         );
     }
@@ -1636,7 +2490,7 @@ mod tests {
         let get =
             |name: &str| (name == "KIMI_CODE_HOME").then(|| OsString::from("/stores/kimi-code"));
         assert_eq!(
-            environment_session_dir_with(ManagedHarness::Kimi, get).as_deref(),
+            environment_session_dir_with(ManagedHarness::Kimi, None, None, get).as_deref(),
             Some(std::path::Path::new("/stores/kimi-code/sessions"))
         );
     }
@@ -1849,12 +2703,12 @@ mod tests {
     fn kiro_home_override_points_at_the_cli_session_store() {
         let get = |name: &str| (name == "KIRO_HOME").then(|| OsString::from("/stores/kiro"));
         assert_eq!(
-            environment_session_dir_with(ManagedHarness::Kiro, get).as_deref(),
+            environment_session_dir_with(ManagedHarness::Kiro, None, None, get).as_deref(),
             Some(std::path::Path::new("/stores/kiro/sessions/cli"))
         );
         let get = |name: &str| (name == "KIRO_HOME").then(|| OsString::from("/stores/kiro"));
         assert_eq!(
-            environment_session_dir_with(ManagedHarness::KiroV3, get).as_deref(),
+            environment_session_dir_with(ManagedHarness::KiroV3, None, None, get).as_deref(),
             Some(std::path::Path::new("/stores/kiro/sessions"))
         );
     }

@@ -1158,7 +1158,11 @@ OpenClaw distinguishes transports explicitly. Use
 `ai-memory install-hooks --agent omp --apply` (or `--agent oh-my-pi`).
 
 **Config file:**
-- User: `~/.omp/agent/mcp.json`
+- User: `mcp.json` in OMP's agent dir: `~/.omp/agent/mcp.json` by default,
+  `~/.omp/profiles/<name>/agent/mcp.json` under a named profile
+  (`OMP_PROFILE`, or the legacy `PI_PROFILE`), or
+  `$PI_CODING_AGENT_DIR/mcp.json` when that variable relocates the default
+  profile; OMP's `PI_CONFIG_DIR` renames the `~/.omp` root in each case
 - Project: `.omp/mcp.json`
 
 The current Oh My Pi package exposes the `omp` binary and native
@@ -1186,20 +1190,19 @@ ai-memory install-hooks --agent omp --apply
 
 This writes `~/.omp/agent/extensions/ai-memory-omp.ts`, which OMP discovers
 as a direct TypeScript extension on startup. Restart `omp` after
-installing or changing the file. When `PI_CODING_AGENT_DIR` is set
-(it relocates OMP's whole `~/.omp/agent` home), the extension is written
-to `$PI_CODING_AGENT_DIR/extensions/ai-memory-omp.ts` instead, and
-`--profile <name>` (or `OMP_PROFILE`) targets
-`~/.omp/profiles/<name>/agent/extensions/` — note `PI_CODING_AGENT_DIR`
-takes precedence over a profile, since it names the agent directory
-outright.
+installing or changing the file. `--profile <name>` (or `OMP_PROFILE`)
+targets `~/.omp/profiles/<name>/agent/extensions/`, and a named profile
+ignores `PI_CODING_AGENT_DIR`, as OMP does. For the default profile,
+`PI_CODING_AGENT_DIR` relocates OMP's whole `~/.omp/agent` home, so the
+extension and `mcp.json` move to `$PI_CODING_AGENT_DIR` instead.
 
 Pi and OMP honour the *same* `PI_CODING_AGENT_DIR`, and each agent loads
 every direct `*.ts` in its extensions directory. Pointing both at one
 directory therefore makes each load both extensions and capture every
-event twice, once under each agent identity. `install-hooks` warns when it
-detects this; give the two agents separate homes, or scope OMP to a
-profile.
+event twice, once under each agent identity. `install-hooks` and the
+`ai-memory run` auto-wire warn when they detect this; give the two agents
+separate homes, or put OMP on a named profile, which leaves
+`PI_CODING_AGENT_DIR` to Pi.
 
 **Gotchas:**
 - OMP extensions are TypeScript modules, not shell hooks; stdout is not

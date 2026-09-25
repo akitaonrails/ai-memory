@@ -270,15 +270,16 @@ pub struct RunArgs {
     pub no_autowire: bool,
     /// Extra environment variable for the spawned harness, `KEY=VALUE`.
     /// Repeatable; wrapper-owned like `--yolo`/`--executable`, so it must
-    /// precede `harness`. Reaches both the spawned process and ai-memory's own
-    /// native-session resolution (e.g. `CLAUDE_CONFIG_DIR`), so the two agree
-    /// on where the harness's session lives. A later `--env` wins over an
-    /// earlier one and over a same-key `--env-file` entry.
+    /// precede `harness`. Reaches the spawned process, ai-memory's own
+    /// native-session resolution and first-launch auto-wire (e.g.
+    /// `CLAUDE_CONFIG_DIR`), so session store, hooks and MCP agree on one
+    /// config home. A later `--env` wins over an earlier one and over a
+    /// same-key `--env-file` entry.
     #[arg(long = "env", value_parser = parse_env_kv, value_name = "KEY=VALUE")]
     pub env: Vec<(String, String)>,
     /// Read `KEY=VALUE` lines from this file (blank lines and `#` comments
-    /// skipped) and merge them into the spawned harness's environment before
-    /// `--env` entries, which override a same-key line here.
+    /// skipped) and merge them into the launch environment (same reach as
+    /// `--env`) before `--env` entries, which override a same-key line here.
     #[arg(long = "env-file", value_name = "PATH")]
     pub env_file: Option<PathBuf>,
     /// Agent harness to launch. When omitted, continue the newest managed or
@@ -1001,8 +1002,9 @@ pub struct UninstallArgs {
     /// Skip the interactive confirmation when a TTY is attached.
     #[arg(long)]
     pub yes: bool,
-    /// Profile to use for OMP extensions, which relocates the path to
-    /// `~/.omp/profiles/<profile>/agent/extensions/`.
+    /// OMP profile whose extension and MCP entry to remove, as `omp
+    /// --profile` names it. Beats `OMP_PROFILE` and `PI_PROFILE`; the default
+    /// profile's files are swept as well.
     #[arg(long)]
     pub profile: Option<String>,
 }
@@ -1668,8 +1670,9 @@ pub enum AgentChoice {
     /// lifecycle capture and bridges ai-memory's HTTP MCP tools into Pi.
     Pi,
     /// Oh My Pi (`omp`) — TypeScript extension
-    /// under `~/.omp/agent/extensions/`. `--apply` writes the extension
-    /// file directly; restart `omp` for it to load.
+    /// under `~/.omp/agent/extensions/`, or the active profile's agent dir.
+    /// `--apply` writes the extension file directly; restart `omp` for it to
+    /// load.
     #[value(alias = "oh-my-pi")]
     Omp,
     /// OpenClaw personal AI gateway — native plugin package with
@@ -1907,7 +1910,7 @@ impl SchemaFlavor {
 pub enum McpClient {
     /// Anthropic Claude Code — `claude mcp add`.
     ClaudeCode,
-    /// OpenAI Codex CLI — `~/.codex/config.toml`.
+    /// OpenAI Codex CLI — `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`).
     Codex,
     /// OpenCode — `opencode.json`. Accepts `opencode` (no hyphen) as
     /// an alias for symmetry with `AgentChoice` and the on-disk
@@ -1933,7 +1936,8 @@ pub enum McpClient {
     /// Real Pi coding agent. Uses ai-memory's generated bridge extension
     /// because Pi has no native MCP config.
     Pi,
-    /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`.
+    /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`, or the active profile's
+    /// agent dir.
     #[value(alias = "oh-my-pi")]
     Omp,
     /// Google Antigravity CLI (`agy`) — `~/.gemini/config/mcp_config.json`.
@@ -2435,8 +2439,9 @@ pub struct InstallHooksArgs {
     /// `--no-capture-prompts` install. Only valid for Claude Code.
     #[arg(long, conflicts_with = "no_capture_prompts")]
     pub capture_prompts: bool,
-    /// Profile to use for OMP extensions, which relocates the path to
-    /// `~/.omp/profiles/<profile>/agent/extensions/`.
+    /// OMP profile to install into, as `omp --profile` names it:
+    /// `~/.omp/profiles/<profile>/agent/extensions/`. Beats `OMP_PROFILE` and
+    /// `PI_PROFILE`; `default` selects the default profile.
     #[arg(long)]
     pub profile: Option<String>,
 }

@@ -349,7 +349,8 @@ way to launch: the first time it runs a harness it auto-installs that harness's
 ai-memory hooks + MCP if they are missing (so capture and recall just work —
 no separate `install-hooks`/`install-mcp` step to forget), it wires the right
 project scope by construction, and it adds cross-harness *session* continuity on
-top of shared memory. Everything is idempotent and one-time per harness.
+top of shared memory. Everything is idempotent and one-time per harness and
+config home.
 
 ```bash
 ai-memory run claude

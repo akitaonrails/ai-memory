@@ -799,7 +799,7 @@ including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 ### OpenAI Codex
 
 ```bash
-# MCP snippet (merge into ~/.codex/config.toml):
+# MCP snippet (merge into $CODEX_HOME/config.toml, default ~/.codex/config.toml):
 docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client codex \
     --server-url "http://homelab:49374/mcp" \
@@ -1338,19 +1338,27 @@ not interchangeable — only Pi's bridges MCP tools.
 #### OMP profiles
 
 `omp --profile <name>` relocates OMP's agent home to
-`~/.omp/profiles/<name>/agent`. Point the installer at the same profile so
-the extension lands where that profile loads it:
+`~/.omp/profiles/<name>/agent`. Point the installers at the same profile so
+the extension and the MCP entry land where that profile loads them:
 
 ```bash
 ai-memory install-hooks --agent omp --profile work --apply
-# or set it once for the shell:
+# or set it once for the shell, which install-mcp also reads:
 OMP_PROFILE=work ai-memory install-hooks --agent omp --apply
+OMP_PROFILE=work ai-memory install-mcp --client omp --apply
 ```
 
-`--profile` takes precedence over `OMP_PROFILE`, and `uninstall --profile
-<name>` removes the same file. `PI_CODING_AGENT_DIR` overrides **both** —
-when it is set it names the agent directory outright, so no profile
-subdirectory is derived from it.
+The profile resolves the way OMP resolves it: `--profile` beats
+`OMP_PROFILE`, which beats the legacy `PI_PROFILE` whenever it is set, even
+to an empty value. Names are trimmed, an empty name or `default` selects the
+default profile, and a name OMP refuses is refused here too. A named profile
+ignores `PI_CODING_AGENT_DIR`, as OMP does; only the default profile honors
+it. OMP's `PI_CONFIG_DIR` renames the `~/.omp` root (joined under your home,
+as OMP joins it), and the extension and `mcp.json` follow it; an
+`$XDG_DATA_HOME/omp` directory moves only OMP's sessions, never these files.
+`uninstall --profile <name>` removes the same files, and also sweeps the
+default profile's directory and the `~/.omp` locations earlier releases wrote
+to, whatever `PI_CONFIG_DIR` says.
 
 ```bash
 ai-memory install-hooks --agent pi --apply \

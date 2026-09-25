@@ -12,13 +12,14 @@ use ai_memory_core::{
     PrepareManagedRunResponse,
 };
 use ai_memory_workstream::{
-    ExportedTranscript, LaunchMode, LaunchPlan, ManagedHarness, NativeSessionCandidate,
-    allows_native_session_adoption, apply_yolo, build_launch_plan, build_launch_plan_with_env,
-    discover_native_session, export_transcript, has_native_session_selector, inspect_repository,
-    kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
-    kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
-    list_native_sessions, native_session_exists, native_session_in_checkout,
-    wait_for_transcript_flush,
+    ExportedTranscript, LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness,
+    NativeSessionCandidate, allows_native_session_adoption, apply_yolo, build_launch_plan,
+    build_launch_plan_with_env, discover_native_session, export_transcript,
+    has_native_session_selector, inspect_repository, kiro_explicit_session_id,
+    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
+    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
+    native_session_exists, native_session_in_checkout, omp_profile_flag, omp_profile_flag_env,
+    store_override_vars, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -100,8 +101,7 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
 /// installers resolve their real per-agent paths — behavior is byte-identical to
 /// the inlined call this replaced. The overrides exist only so the `run` →
 /// autowire → child-spawn seam can be exercised without writing to the
-/// developer's real `$HOME`, mirroring the `ensure_wired` / `ensure_wired_with`
-/// split.
+/// developer's real `$HOME`.
 pub(super) async fn run_from_with_wiring(
     config: &Config,
     args: RunArgs,
@@ -242,14 +242,6 @@ pub(super) async fn run_from_with_wiring(
         resolved_harness
     };
     acquired_try!(ensure_executable_available(harness, executable.as_deref()));
-    // Auto-wire this harness's ai-memory hooks + MCP the first time it launches
-    // here, so managed launch "just works" for capture and recall without a
-    // manual install step. One-time, idempotent, best-effort (it never blocks or
-    // fails the launch); opt out with `--no-autowire` or AI_MEMORY_RUN_AUTOWIRE=false.
-    // Runs before the child spawns so the harness picks up the fresh hooks.
-    if config.run_autowire && !no_autowire {
-        super::run_autowire::ensure_wired_with(config, harness, wire_overrides);
-    }
     let native_grok_rules = user_supplied_grok_rules(&native_args);
     let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
         harness,
@@ -292,6 +284,10 @@ pub(super) async fn run_from_with_wiring(
             native_args.clone(),
             Some(&candidate.session.native_session_id),
             &run_env,
+            Some(LaunchRoots {
+                home: &home,
+                cwd: &repository.cwd,
+            }),
         ));
         eprintln!(
             "ai-memory: continuing newest checkout-local {} session {}",
@@ -335,6 +331,10 @@ pub(super) async fn run_from_with_wiring(
                             native_args,
                             Some(&native_session_id),
                             &run_env,
+                            Some(LaunchRoots {
+                                home: &home,
+                                cwd: &repository.cwd,
+                            }),
                         ));
                     }
                     Ok(None) => {}
@@ -382,6 +382,25 @@ pub(super) async fn run_from_with_wiring(
         eprintln!(
             "ai-memory: Kiro v3 stored this session under the default home despite custom KIRO_HOME; using the default home for this resume"
         );
+    }
+    // Auto-wire this harness's ai-memory hooks + MCP the first time it launches
+    // here, so managed launch "just works" for capture and recall without a
+    // manual install step. One-time, idempotent, best-effort (it never blocks or
+    // fails the launch); opt out with `--no-autowire` or AI_MEMORY_RUN_AUTOWIRE=false.
+    // Runs once the session and its store are settled, so it wires the config
+    // home the child will read, and before the child spawns so the harness
+    // picks up the fresh hooks.
+    // The environment the child runs with: `--env` over ai-memory's own.
+    let launch_env = |name: &str| {
+        run_env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| OsString::from(value))
+            .or_else(|| std::env::var_os(name))
+    };
+    if config.run_autowire && !no_autowire {
+        let wire_env = autowire_env(harness, &run_env, &plan.args, &launch_env);
+        super::run_autowire::ensure_wired_with(config, harness, wire_overrides, &wire_env);
     }
     if plan.mode == LaunchMode::Session
         && let Some(native_session_id) = &plan.expected_session_id
@@ -452,6 +471,13 @@ pub(super) async fn run_from_with_wiring(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    // A blank home override is unset for session import and auto-wire; drop
+    // it from the child as well, or the harness
+    // would read a blank-named directory under the checkout that nothing else
+    // follows.
+    for name in blank_home_overrides(harness, &launch_env) {
+        command.env_remove(name);
+    }
     if remove_kiro_home {
         command.env_remove("KIRO_HOME");
     }
@@ -887,6 +913,48 @@ fn upsert_env(entries: &mut Vec<(String, String)>, key: String, value: String) {
     }
 }
 
+/// The environment auto-wire resolves install targets from: the launch's own
+/// `--env` entries, adjusted where the child runs with something else. OMP
+/// ranks `--profile` above `OMP_PROFILE`, so the flag is passed on through the
+/// profile variables (see [`omp_profile_flag_env`], which reads the launch
+/// environment `launch_env`).
+fn autowire_env(
+    harness: ManagedHarness,
+    run_env: &[(String, String)],
+    native_args: &[OsString],
+    launch_env: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<(String, String)> {
+    let mut env = run_env.to_vec();
+    let mut set = |name: &str, value: String| {
+        env.retain(|(key, _)| key != name);
+        env.push((name.to_string(), value));
+    };
+    if harness == ManagedHarness::Omp
+        && let Some(profile) = omp_profile_flag(native_args).filter(|name| !name.is_empty())
+    {
+        for (name, value) in omp_profile_flag_env(&profile, launch_env) {
+            set(&name, value);
+        }
+    }
+    env
+}
+
+/// The launched harness's home variables (its store overrides) that are set
+/// but blank in the launch environment.
+fn blank_home_overrides(
+    harness: ManagedHarness,
+    get: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<&'static str> {
+    store_override_vars(harness)
+        .iter()
+        .copied()
+        .filter(|name| {
+            let value = get(name);
+            value.is_some() && ai_memory_workstream::env_dir_override(value).is_none()
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_preflighted_launch_plan(
     harness: ManagedHarness,
@@ -911,6 +979,7 @@ fn build_preflighted_launch_plan(
         native_args.clone(),
         linked_session_id,
         env_overrides,
+        Some(LaunchRoots { home, cwd }),
     )?;
     let Some(linked_session_id) = linked_session_id else {
         return Ok((plan, None));
@@ -927,7 +996,14 @@ fn build_preflighted_launch_plan(
     ) {
         Ok(true) => Ok((plan, None)),
         Ok(false) => Ok((
-            build_launch_plan_with_env(harness, executable, native_args, None, env_overrides)?,
+            build_launch_plan_with_env(
+                harness,
+                executable,
+                native_args,
+                None,
+                env_overrides,
+                Some(LaunchRoots { home, cwd }),
+            )?,
             Some(linked_session_id.to_string()),
         )),
         Err(error) => {
@@ -2315,9 +2391,15 @@ mod tests {
             "CLAUDE_CONFIG_DIR".to_string(),
             "/accounts/work".to_string(),
         )];
-        let plan =
-            build_launch_plan_with_env(ManagedHarness::Claude, None, Vec::new(), None, &overrides)
-                .unwrap();
+        let plan = build_launch_plan_with_env(
+            ManagedHarness::Claude,
+            None,
+            Vec::new(),
+            None,
+            &overrides,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             plan.session_dir.as_deref(),
             Some(Path::new("/accounts/work/projects"))
@@ -2706,7 +2788,7 @@ mod tests {
     /// The `ai-memory run` -> autowire -> child-spawn seam: driving the launcher
     /// entry point (`run_from_with_wiring`) must run auto-wire *before* the child
     /// starts, so the harness's ai-memory hooks + MCP are installed and the
-    /// per-(agent, version) sentinel is written as a side effect of `run` itself.
+    /// auto-wire sentinel is written as a side effect of `run` itself.
     /// The autowire path injections keep it off the developer's real `$HOME`, the
     /// child is a harmless `exit 0` script launched in passthrough mode
     /// (`--version`), and a mock server stands in for the workstream endpoints, so
@@ -2779,6 +2861,7 @@ mod tests {
             hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
             hooks_config_file: Some(settings.clone()),
             mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
         };
         let args = || RunArgs {
             workspace: Some("ws".into()),
@@ -2820,10 +2903,12 @@ mod tests {
             mcp_json.contains("ai-memory"),
             "run must auto-install the ai-memory MCP server before spawning: {mcp_json}"
         );
-        let sentinels = std::fs::read_dir(data.path().join("autowire-state"))
-            .expect("autowire-state dir created by the run")
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+        let sentinels = std::fs::read_dir(crate::commands::run_autowire::autowire_state_dir(
+            data.path(),
+        ))
+        .expect("autowire-state dir created by the run")
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
         assert!(
             sentinels
                 .iter()
@@ -2850,5 +2935,297 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    /// A mock workstream server for launches driven through `run_from`: it
+    /// prepares a run, linked to `native_session_id` when one is given, and
+    /// accepts the link and the finish.
+    #[cfg(unix)]
+    async fn mock_workstream_server(
+        native_session_id: Option<&'static str>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post(move || async move {
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: None,
+                        native_session_id: native_session_id.map(str::to_owned),
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                    })
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/link",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, server)
+    }
+
+    #[cfg(unix)]
+    fn capture_env_script(dir: &Path, variable: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let captured = dir.join("captured-env");
+        let script = dir.join("capture-env-harness");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{{variable}-unset}}\" > {}\nexit 0\n",
+                captured.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, captured)
+    }
+
+    #[cfg(unix)]
+    fn launch_config(home: &Path, data: &Path, address: std::net::SocketAddr) -> Config {
+        let mut config = Config::load(None, Some(home.to_path_buf())).unwrap();
+        config.data_dir = data.to_path_buf();
+        config.home_dir = Some(home.to_string_lossy().into_owned());
+        config.server_url = format!("http://{address}");
+        config.run_autowire = true;
+        config
+    }
+
+    #[cfg(unix)]
+    fn run_args(
+        harness: RunHarnessChoice,
+        executable: PathBuf,
+        env: Vec<(String, String)>,
+        native_args: &[&str],
+    ) -> RunArgs {
+        RunArgs {
+            workspace: Some("ws".into()),
+            project: Some("proj".into()),
+            workstream: None,
+            new_workstream: None,
+            executable: Some(executable),
+            yolo: false,
+            fresh: false,
+            no_autowire: false,
+            env,
+            env_file: None,
+            harness: Some(harness),
+            native_args: native_args.iter().map(OsString::from).collect(),
+        }
+    }
+
+    /// `run` must hand its `--env` to auto-wire, or a relocated config home
+    /// launches without hooks or MCP. The guard refuses every install outside
+    /// the test's data dir, so if `run` dropped the env nothing is written at
+    /// all, least of all to the real home.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_entry_point_passes_run_env_to_autowire() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "CLAUDE_CONFIG_DIR");
+        let claude_home = data.path().join("claude-home");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        let config = launch_config(home.path(), data.path(), address);
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            confine_to: Some(data.path().to_path_buf()),
+            ..WireOverrides::default()
+        };
+        let env = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            claude_home.display().to_string(),
+        )];
+        let exit = run_from_with_wiring(
+            &config,
+            run_args(RunHarnessChoice::Claude, script, env, &["--version"]),
+            repo.path(),
+            &overrides,
+        )
+        .await
+        .expect("managed passthrough run completes");
+        assert_eq!(exit, 0);
+        assert_eq!(
+            std::fs::read_to_string(&captured).unwrap(),
+            claude_home.display().to_string()
+        );
+
+        let settings = claude_home.join("settings.json");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .is_ok_and(|s| s.contains("ai-memory") || s.contains("ai_memory")),
+            "hooks missing in {}",
+            settings.display()
+        );
+        let mcp = claude_home.join(".claude.json");
+        assert!(
+            std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")),
+            "MCP missing in {}",
+            mcp.display()
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn blank_home_overrides_names_only_blank_home_variables() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        assert_eq!(
+            blank_home_overrides(ManagedHarness::Claude, &env(&[("CLAUDE_CONFIG_DIR", "  ")])),
+            ["CLAUDE_CONFIG_DIR"]
+        );
+        assert!(
+            blank_home_overrides(ManagedHarness::Claude, &env(&[("CLAUDE_CONFIG_DIR", "/x")]))
+                .is_empty()
+        );
+        assert!(blank_home_overrides(ManagedHarness::Claude, &env(&[])).is_empty());
+        assert!(
+            blank_home_overrides(ManagedHarness::Codex, &env(&[("CLAUDE_CONFIG_DIR", "")]))
+                .is_empty(),
+            "only the launched harness's own variables"
+        );
+        assert_eq!(
+            blank_home_overrides(
+                ManagedHarness::Omp,
+                &env(&[
+                    ("PI_CODING_AGENT_SESSION_DIR", ""),
+                    ("PI_CODING_AGENT_DIR", "/x")
+                ])
+            ),
+            ["PI_CODING_AGENT_SESSION_DIR"]
+        );
+        assert_eq!(
+            blank_home_overrides(
+                ManagedHarness::Omp,
+                &env(&[("PI_CONFIG_DIR", " "), ("XDG_DATA_HOME", "")])
+            ),
+            ["PI_CONFIG_DIR", "XDG_DATA_HOME"]
+        );
+    }
+
+    /// The launched harness must not see a blank store override that session
+    /// import and auto-wire treat as unset, or it reads a blank-named
+    /// directory nothing else follows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_blank_store_override_is_dropped_from_the_child() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "CLAUDE_CONFIG_DIR");
+        let config = launch_config(home.path(), data.path(), address);
+        let mut args = run_args(
+            RunHarnessChoice::Claude,
+            script,
+            vec![("CLAUDE_CONFIG_DIR".to_string(), "   ".to_string())],
+            &["--version"],
+        );
+        args.no_autowire = true;
+        let exit = run_from_with_wiring(&config, args, repo.path(), &WireOverrides::default())
+            .await
+            .expect("managed passthrough run completes");
+        assert_eq!(exit, 0);
+        assert_eq!(std::fs::read_to_string(&captured).unwrap(), "unset");
+
+        server.abort();
+    }
+
+    /// OMP ranks `--profile` above `OMP_PROFILE`, so auto-wire sees what the
+    /// child will run with; everything else in `--env` passes through
+    /// untouched.
+    #[test]
+    fn autowire_env_follows_what_the_child_runs_with() {
+        let run_env = vec![
+            ("OMP_PROFILE".to_string(), "other".to_string()),
+            ("KIRO_HOME".to_string(), "/custom".to_string()),
+            ("FOO".to_string(), "x".to_string()),
+        ];
+        let lookup = |env: &[(String, String)], name: &str| {
+            let values: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .collect();
+            values
+        };
+        // Only the run_env: no process environment leaks into the test.
+        let only = |env: Vec<(String, String)>| {
+            move |name: &str| {
+                env.iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let launch = only(run_env.clone());
+
+        let args = [OsString::from("--profile"), OsString::from("work")];
+        let omp = autowire_env(ManagedHarness::Omp, &run_env, &args, &launch);
+        assert_eq!(lookup(&omp, "OMP_PROFILE"), ["work"]);
+        assert_eq!(lookup(&omp, "KIRO_HOME"), ["/custom"]);
+        assert_eq!(lookup(&omp, "FOO"), ["x"]);
+        assert_eq!(
+            autowire_env(ManagedHarness::Pi, &run_env, &args, &launch),
+            run_env,
+            "only OMP reads --profile"
+        );
+        assert_eq!(
+            autowire_env(ManagedHarness::Omp, &run_env, &[], &launch),
+            run_env
+        );
+
+        // `--profile default` under an environment a profiled parent OMP
+        // exported: OMP drops the inherited agent dir, and so must auto-wire.
+        let home = Path::new("/home/me");
+        let inherited = vec![
+            ("OMP_PROFILE".to_string(), "work".to_string()),
+            (
+                "PI_CODING_AGENT_DIR".to_string(),
+                "/home/me/.omp/profiles/work/agent".to_string(),
+            ),
+            ("PI_CONFIG_DIR".to_string(), String::new()),
+        ];
+        let default_args = [OsString::from("--profile"), OsString::from("default")];
+        let wired = autowire_env(
+            ManagedHarness::Omp,
+            &inherited,
+            &default_args,
+            &only(inherited.clone()),
+        );
+        assert_eq!(
+            ai_memory_workstream::omp_agent_dir(home, None, only(wired)).unwrap(),
+            home.join(".omp").join("agent")
+        );
     }
 }
