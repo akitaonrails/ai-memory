@@ -20,18 +20,16 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 ///
 /// Blank is treated as unset on purpose: an exported-but-empty variable is far
 /// more often an unset shell expansion than a deliberate request to install
-/// into the filesystem root.
+/// into the filesystem root. The rule lives in
+/// [`ai_memory_workstream::env_dir_override`] so native session import applies
+/// the same one and never reads a store the installers did not wire.
 ///
 /// The env value comes in as a parameter so tests can exercise both branches
 /// without mutating process env — which is not merely inconvenient here but
 /// forbidden: `std::env::set_var` is `unsafe` under edition 2024 and this
 /// workspace forbids `unsafe_code`.
 pub(crate) fn agent_config_home(env_override: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let value = env_override?;
-    if value.to_str().is_some_and(|s| s.trim().is_empty()) {
-        return None;
-    }
-    Some(PathBuf::from(value))
+    ai_memory_workstream::env_dir_override(env_override)
 }
 
 /// Claude Code's relocated config root: `$CLAUDE_CONFIG_DIR` when set, else

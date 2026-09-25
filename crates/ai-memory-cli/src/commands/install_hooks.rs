@@ -188,7 +188,14 @@ pub(crate) fn antigravity_hooks_path() -> anyhow::Result<std::path::PathBuf> {
 
 /// `~/.grok/hooks/ai-memory.json` — Grok Build CLI lifecycle hooks.
 pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(install_mcp::grok_home()?
+    grok_hooks_path_in(std::env::var_os("GROK_HOME"))
+}
+
+/// [`grok_hooks_path`] with the `GROK_HOME` value passed in.
+fn grok_hooks_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    Ok(install_mcp::grok_home_in(env_override)?
         .join("hooks")
         .join("ai-memory.json"))
 }
@@ -327,7 +334,8 @@ fn pi_extension_path_in(
         .join("ai-memory-pi.ts"))
 }
 
-/// `$KIMI_CODE_HOME/config.toml` when set, else `~/.kimi-code/config.toml`.
+/// `$KIMI_CODE_HOME/config.toml` when set and not blank, else
+/// `~/.kimi-code/config.toml`.
 /// Kimi Code keeps hooks as `[[hooks]]` entries inside the same
 /// config.toml that stores the user's providers/model, so the apply
 /// path merges TOML-aware instead of rewriting the file.
@@ -341,8 +349,8 @@ pub(crate) fn kimi_code_config_path() -> anyhow::Result<std::path::PathBuf> {
 fn kimi_code_config_path_in(
     env_override: Option<std::ffi::OsString>,
 ) -> anyhow::Result<std::path::PathBuf> {
-    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(dir).join("config.toml"));
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("config.toml"));
     }
     Ok(home_dir()
         .context("could not locate $HOME for ~/.kimi-code/config.toml")?
@@ -375,8 +383,8 @@ fn kiro_cli_home_join(
     env_override: Option<std::ffi::OsString>,
     child: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
-    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(dir).join(child));
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join(child));
     }
     Ok(home_dir()
         .context("could not locate $HOME for ~/.kiro")?
@@ -1179,6 +1187,17 @@ fn apply_base_path_to_hook_url(url: &str, base_path: &str) -> String {
     }
 }
 
+/// The first readable TOML MCP config among `paths` that registers ai-memory.
+fn infer_first_toml_mcp_config(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Option<InferredMcpConfig> {
+    paths.into_iter().find_map(|path| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|content| infer_toml_mcp_config(&content))
+    })
+}
+
 fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpConfig>> {
     if agent == AgentChoice::Grok {
         let cwd = std::env::current_dir()
@@ -1195,6 +1214,14 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
         return Ok(None);
     };
     let path = install_mcp::mcp_config_path(client)?;
+    if matches!(client, McpClient::Codex) {
+        // An entry written before `install-mcp` honored CODEX_HOME still sits
+        // in ~/.codex/config.toml; keep inferring from it until it is rewritten.
+        let legacy = home_dir().map(|home| home.join(".codex").join("config.toml"));
+        return Ok(infer_first_toml_mcp_config(
+            std::iter::once(path).chain(legacy),
+        ));
+    }
     let Ok(content) = fs::read_to_string(path) else {
         return Ok(None);
     };
@@ -1359,6 +1386,46 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // no `McpClient::Zcode` whose config the installer could scrape a
         // server URL or token from.
         AgentChoice::Zcode => None,
+    }
+}
+
+/// The hook config `--apply` writes for an agent that `ai-memory run`
+/// auto-wires, with the relocation variables read through `env` rather than
+/// ai-memory's own environment. It is the default each installer picks when no
+/// `--config-file` is given; for Kiro CLI v2 that default is the agents
+/// directory whose configs receive the hooks, not a single file.
+///
+/// # Errors
+/// When `$HOME` cannot be located, or for an agent `run` does not auto-wire.
+pub(crate) fn hook_config_target_with(
+    agent: AgentChoice,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    match agent {
+        AgentChoice::ClaudeCode => claude_settings_path_in(env("CLAUDE_CONFIG_DIR")),
+        AgentChoice::Codex => codex_hooks_path_in(env("CODEX_HOME")),
+        AgentChoice::OpenCode => opencode_plugin_path(),
+        AgentChoice::OpenCode2 => opencode2_plugin_path(),
+        AgentChoice::Pi => pi_extension_path_in(env("PI_CODING_AGENT_DIR")),
+        AgentChoice::Omp => {
+            let profile = env("OMP_PROFILE");
+            omp_extension_path_in(
+                env("PI_CODING_AGENT_DIR"),
+                profile.as_ref().and_then(|name| name.to_str()),
+            )
+        }
+        AgentChoice::KimiCode => kimi_code_config_path_in(env("KIMI_CODE_HOME")),
+        AgentChoice::CommandCode => command_code_settings_path(),
+        AgentChoice::KiroCli => kiro_cli_home_join(env("KIRO_HOME"), "agents"),
+        AgentChoice::KiroCliV3 => {
+            Ok(kiro_cli_home_join(env("KIRO_HOME"), "hooks")?.join("ai-memory.json"))
+        }
+        AgentChoice::Grok => grok_hooks_path_in(env("GROK_HOME")),
+        AgentChoice::AntigravityCli => antigravity_hooks_path(),
+        other => anyhow::bail!(
+            "{} is not auto-wired by `ai-memory run`",
+            other.kind().as_str()
+        ),
     }
 }
 
@@ -4119,12 +4186,13 @@ export default AiMemoryHooks;
     add_hook_spooling(body).expect("generated TS integration lost its hook-spool anchors")
 }
 
-/// Warn when Pi and OMP resolve to the same extensions directory.
+/// The extensions directory Pi and OMP would share, when `this_agent`'s
+/// extension at `this_path` sits beside the other agent's under `env`.
 ///
 /// Agent-distinct filenames stop the two installs from overwriting each
 /// other, but they do not make sharing a directory safe. OMP discovers
 /// **every** direct `*.ts` under its extensions directory, so with both
-/// files present each agent loads both extensions — and since the Pi
+/// files present each agent loads both extensions, and since the Pi
 /// extension is the OMP one with `const AGENT` swapped, and neither guards
 /// on its host, every lifecycle event is captured twice under two different
 /// agent identities.
@@ -4132,27 +4200,41 @@ export default AiMemoryHooks;
 /// That is not a regression this installer can fix by itself: both agents
 /// honour the same `PI_CODING_AGENT_DIR`, so the collision is upstream. What
 /// it can do is refuse to be silent about it, and name the two ways out.
-fn warn_if_agents_share_extensions_dir(this_agent: &str, this_path: &Path) {
+/// `env` is a parameter because `ai-memory run` resolves the other agent
+/// through its launch environment, not ai-memory's own.
+pub(crate) fn shared_extensions_dir(
+    this_agent: AgentChoice,
+    this_path: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
     let other = match this_agent {
-        "pi" => omp_extension_path(None),
-        "omp" => pi_extension_path(),
-        _ => return,
+        AgentChoice::Pi => AgentChoice::Omp,
+        AgentChoice::Omp => AgentChoice::Pi,
+        _ => return None,
     };
-    let Ok(other_path) = other else { return };
-    let (Some(a), Some(b)) = (this_path.parent(), other_path.parent()) else {
-        return;
-    };
-    if a != b {
-        return;
-    }
+    let other_path = hook_config_target_with(other, env).ok()?;
+    let dir = this_path.parent()?;
+    (other_path.parent() == Some(dir)).then(|| dir.to_path_buf())
+}
+
+/// Print the Pi/OMP double-capture warning for `dir`; see
+/// [`shared_extensions_dir`].
+pub(crate) fn warn_agents_share_extensions_dir(dir: &Path) {
     eprintln!(
         "warning: Pi and OMP both resolve to {} — they share PI_CODING_AGENT_DIR.\n\
          \x20 Each agent loads every *.ts in that directory, so installing both\n\
          \x20 captures each event twice, once as `pi` and once as `omp`.\n\
          \x20 Give them separate homes, or scope OMP to a profile:\n\
          \x20     ai-memory install-hooks --agent omp --profile <name> --apply",
-        a.display()
+        dir.display()
     );
+}
+
+fn warn_if_agents_share_extensions_dir(this_agent: AgentChoice, this_path: &Path) {
+    if let Some(dir) = shared_extensions_dir(this_agent, this_path, &|name| std::env::var_os(name))
+    {
+        warn_agents_share_extensions_dir(&dir);
+    }
 }
 
 /// Remove a pre-rename `ai-memory.ts` sitting beside the new agent-distinct
@@ -4229,7 +4311,7 @@ fn apply_to_omp_extension(
         }
     );
 
-    warn_if_agents_share_extensions_dir("omp", &path);
+    warn_if_agents_share_extensions_dir(AgentChoice::Omp, &path);
     remove_legacy_extension(&path, "omp");
 
     if !matches!(outcome, ApplyOutcome::NoOp) {
@@ -4323,7 +4405,7 @@ fn apply_to_pi_extension(
         }
     );
 
-    warn_if_agents_share_extensions_dir("pi", &path);
+    warn_if_agents_share_extensions_dir(AgentChoice::Pi, &path);
     remove_legacy_extension(&path, "pi");
 
     if !matches!(outcome, ApplyOutcome::NoOp) {
@@ -7623,6 +7705,51 @@ Authorization = "Bearer secret-token"
         assert_eq!(inferred.auth_token.as_deref(), Some("secret-token"));
     }
 
+    /// With CODEX_HOME set, the MCP entry may still live in the legacy
+    /// ~/.codex/config.toml from before install-mcp honored the variable.
+    #[test]
+    fn codex_mcp_inference_prefers_the_relocated_config_then_the_legacy_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let relocated = dir.path().join("relocated.toml");
+        let legacy = dir.path().join("legacy.toml");
+        let entry = |url: &str| {
+            format!(
+                "[mcp_servers.ai-memory]\nurl = \"{url}/mcp\"\n\n\
+                 [mcp_servers.ai-memory.http_headers]\nAuthorization = \"Bearer t\"\n"
+            )
+        };
+        let candidates = || [relocated.clone(), legacy.clone()];
+
+        assert!(infer_first_toml_mcp_config(candidates()).is_none());
+
+        std::fs::write(&legacy, entry("http://legacy:49374")).unwrap();
+        assert_eq!(
+            infer_first_toml_mcp_config(candidates())
+                .and_then(|inferred| inferred.hook_server_url)
+                .as_deref(),
+            Some("http://legacy:49374"),
+            "a missing relocated config falls back to the legacy entry"
+        );
+
+        std::fs::write(&relocated, "[mcp_servers.other]\nurl = \"http://x\"\n").unwrap();
+        assert_eq!(
+            infer_first_toml_mcp_config(candidates())
+                .and_then(|inferred| inferred.hook_server_url)
+                .as_deref(),
+            Some("http://legacy:49374"),
+            "a relocated config without ai-memory still falls back"
+        );
+
+        std::fs::write(&relocated, entry("http://relocated:49374")).unwrap();
+        assert_eq!(
+            infer_first_toml_mcp_config(candidates())
+                .and_then(|inferred| inferred.hook_server_url)
+                .as_deref(),
+            Some("http://relocated:49374"),
+            "the relocated entry wins once it exists"
+        );
+    }
+
     #[test]
     fn grok_mcp_inference_accepts_headers_key() {
         let inferred = infer_toml_mcp_config(
@@ -9151,6 +9278,18 @@ model = "gpt-5"
         }
     }
 
+    fn env_of(
+        pairs: &[(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + use<> {
+        let pairs = pairs.to_vec();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        }
+    }
+
     /// Precedence must not depend on what the override directory is *named*.
     /// An earlier revision re-rooted only when the last component happened to
     /// be "agent", so `/custom/agent` and `/custom/pi-agent` behaved
@@ -9201,6 +9340,92 @@ model = "gpt-5"
             plain.ends_with(".omp/agent/extensions/ai-memory-omp.ts"),
             "got {plain:?}"
         );
+    }
+
+    /// `run` resolves the other Pi-family agent through its launch env, so
+    /// the shared-directory check must use the env it is given, not
+    /// ai-memory's own.
+    #[test]
+    fn shared_extensions_dir_follows_the_supplied_env() {
+        let root = if cfg!(windows) {
+            r"C:\relocated"
+        } else {
+            "/relocated"
+        };
+        let env = env_of(&[("PI_CODING_AGENT_DIR", root)]);
+        let extensions = Path::new(root).join("extensions");
+        for (agent, file) in [
+            (AgentChoice::Pi, "ai-memory-pi.ts"),
+            (AgentChoice::Omp, "ai-memory-omp.ts"),
+        ] {
+            let this_path = extensions.join(file);
+            assert_eq!(
+                shared_extensions_dir(agent, &this_path, &env),
+                Some(extensions.clone())
+            );
+            assert_eq!(shared_extensions_dir(agent, &this_path, &|_| None), None);
+        }
+        assert_eq!(
+            shared_extensions_dir(
+                AgentChoice::ClaudeCode,
+                &extensions.join("ai-memory-pi.ts"),
+                &env
+            ),
+            None
+        );
+    }
+
+    /// A blank relocation variable is unset for every auto-wired agent's hook
+    /// target, the same rule `path_util::agent_config_home` and native session
+    /// import use; otherwise the installer wrote into `<cwd>/   /`.
+    #[test]
+    fn hook_config_target_with_treats_blank_relocation_as_unset() {
+        let home = home_dir().unwrap();
+        let cases: &[(AgentChoice, &str, &[&str])] = &[
+            (
+                AgentChoice::ClaudeCode,
+                "CLAUDE_CONFIG_DIR",
+                &[".claude", "settings.json"],
+            ),
+            (AgentChoice::Codex, "CODEX_HOME", &[".codex", "hooks.json"]),
+            (
+                AgentChoice::Pi,
+                "PI_CODING_AGENT_DIR",
+                &[".pi", "agent", "extensions", "ai-memory-pi.ts"],
+            ),
+            (
+                AgentChoice::Omp,
+                "PI_CODING_AGENT_DIR",
+                &[".omp", "agent", "extensions", "ai-memory-omp.ts"],
+            ),
+            (
+                AgentChoice::KimiCode,
+                "KIMI_CODE_HOME",
+                &[".kimi-code", "config.toml"],
+            ),
+            (AgentChoice::KiroCli, "KIRO_HOME", &[".kiro", "agents"]),
+            (
+                AgentChoice::KiroCliV3,
+                "KIRO_HOME",
+                &[".kiro", "hooks", "ai-memory.json"],
+            ),
+            (
+                AgentChoice::Grok,
+                "GROK_HOME",
+                &[".grok", "hooks", "ai-memory.json"],
+            ),
+        ];
+        for (agent, variable, tail) in cases {
+            let expected: PathBuf = tail.iter().fold(home.clone(), |path, part| path.join(part));
+            for blank in ["", "   ", "\t", " \n"] {
+                let env = |name: &str| (name == *variable).then(|| std::ffi::OsString::from(blank));
+                assert_eq!(
+                    hook_config_target_with(*agent, &env).unwrap(),
+                    expected,
+                    "{agent:?} with {variable}={blank:?}"
+                );
+            }
+        }
     }
 
     /// `remove_legacy_extension` must delete only what this tool generated.

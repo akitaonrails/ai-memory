@@ -40,10 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callers who previously had to wrap the launch in `env KEY=VAL harness`.
   Both flags are wrapper-owned like `--yolo`/`--executable` and must precede
   the harness name; a `--env` entry overrides a same-key `--env-file` line.
-  The resolved environment reaches both the spawned process and ai-memory's
-  own native-session resolution, so the two agree on where a
-  `CLAUDE_CONFIG_DIR`-style override points the session store. See
-  `docs/managed-workstreams.md`. (#820)
+  The resolved environment reaches the spawned process, ai-memory's own
+  native-session resolution and first-launch auto-wire, so the session store,
+  hooks and MCP all follow a `CLAUDE_CONFIG_DIR`-style override, and
+  auto-wire warns when the override puts Pi and OMP in one extensions
+  directory. See `docs/managed-workstreams.md`. (#820)
 - `contradiction_band_min` / `contradiction_band_max` config keys (env:
   `AI_MEMORY_CONTRADICTION_BAND_MIN` / `AI_MEMORY_CONTRADICTION_BAND_MAX`)
   make `memory_lint`'s A5 zero-LLM contradiction-detection cosine-similarity
@@ -183,6 +184,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feedback-loop guard stays non-overridable. (#894)
 
 ### Fixed
+- `ai-memory run` auto-wired only the first config home per agent and
+  version: its sentinel ignored where hooks and MCP were installed, so a second
+  account (another exported `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...) was
+  skipped. The sentinel now also keys on the resolved hook and MCP config
+  paths. The Codex MCP entry ignored `CODEX_HOME`: `install-mcp` and auto-wire
+  now write `$CODEX_HOME/config.toml`, matching `hooks.json`; `uninstall`
+  sweeps the legacy `~/.codex/config.toml` too, and `install-hooks` still
+  infers the server URL and token from it until the entry is rewritten. (#820)
+- A whitespace-only `KIMI_CODE_HOME`, `KIRO_HOME` or `GROK_HOME` pointed
+  installs at a blank-named directory under the working directory, and a
+  whitespace-only relocation variable did the same for `ai-memory run`'s
+  native session import. Blank now counts as unset everywhere, as it already
+  did for the `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `PI_CODING_AGENT_DIR`
+  installers, and `ai-memory run` drops such a value from the harness it
+  launches so the harness uses its default home as well. (#820)
 - Native `ai-memory upgrade` no longer refuses every Linux install by probing
   the running executable for write (Linux `ETXTBSY`); it only requires the
   parent directory to be writable for rename-based replace. (#802)

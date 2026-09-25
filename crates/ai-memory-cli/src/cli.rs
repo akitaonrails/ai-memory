@@ -270,15 +270,16 @@ pub struct RunArgs {
     pub no_autowire: bool,
     /// Extra environment variable for the spawned harness, `KEY=VALUE`.
     /// Repeatable; wrapper-owned like `--yolo`/`--executable`, so it must
-    /// precede `harness`. Reaches both the spawned process and ai-memory's own
-    /// native-session resolution (e.g. `CLAUDE_CONFIG_DIR`), so the two agree
-    /// on where the harness's session lives. A later `--env` wins over an
-    /// earlier one and over a same-key `--env-file` entry.
+    /// precede `harness`. Reaches the spawned process, ai-memory's own
+    /// native-session resolution and first-launch auto-wire (e.g.
+    /// `CLAUDE_CONFIG_DIR`), so session store, hooks and MCP agree on one
+    /// config home. A later `--env` wins over an earlier one and over a
+    /// same-key `--env-file` entry.
     #[arg(long = "env", value_parser = parse_env_kv, value_name = "KEY=VALUE")]
     pub env: Vec<(String, String)>,
     /// Read `KEY=VALUE` lines from this file (blank lines and `#` comments
-    /// skipped) and merge them into the spawned harness's environment before
-    /// `--env` entries, which override a same-key line here.
+    /// skipped) and merge them into the launch environment (same reach as
+    /// `--env`) before `--env` entries, which override a same-key line here.
     #[arg(long = "env-file", value_name = "PATH")]
     pub env_file: Option<PathBuf>,
     /// Agent harness to launch. When omitted, continue the newest managed or
@@ -1907,7 +1908,7 @@ impl SchemaFlavor {
 pub enum McpClient {
     /// Anthropic Claude Code — `claude mcp add`.
     ClaudeCode,
-    /// OpenAI Codex CLI — `~/.codex/config.toml`.
+    /// OpenAI Codex CLI — `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`).
     Codex,
     /// OpenCode — `opencode.json`. Accepts `opencode` (no hyphen) as
     /// an alias for symmetry with `AgentChoice` and the on-disk

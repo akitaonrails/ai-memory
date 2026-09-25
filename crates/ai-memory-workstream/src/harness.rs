@@ -1,7 +1,7 @@
 //! Native command planning without filtering harness arguments.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use ai_memory_core::AgentKind;
 use anyhow::Result;
@@ -917,15 +917,66 @@ fn flag_path(args: &[OsString], names: &[&str]) -> Option<PathBuf> {
     None
 }
 
+/// A harness home variable's directory, or `None` when it is unset or blank.
+///
+/// Blank (empty or whitespace-only) counts as unset on purpose: an
+/// exported-but-empty variable is far more often an unset shell expansion than
+/// a request to use the filesystem root or a directory named by whitespace.
+/// Session import and the hook/MCP installers share this one rule, so a blank
+/// override never sends one to the default home and the other to `<cwd>/ /`.
+pub fn env_dir_override(value: Option<OsString>) -> Option<PathBuf> {
+    let value = value?;
+    if value.to_str().is_some_and(|text| text.trim().is_empty()) {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
+
+/// The variables that relocate a harness's native store, the ones
+/// [`build_launch_plan_with_env`] resolves its session directory from.
+pub fn store_override_vars(harness: ManagedHarness) -> &'static [&'static str] {
+    match harness {
+        ManagedHarness::Claude => &["CLAUDE_CONFIG_DIR"],
+        ManagedHarness::Codex => &["CODEX_HOME"],
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => &["XDG_DATA_HOME"],
+        ManagedHarness::Pi => &["PI_CODING_AGENT_SESSION_DIR", "PI_CODING_AGENT_DIR"],
+        ManagedHarness::Omp => &["PI_CODING_AGENT_DIR"],
+        ManagedHarness::Kimi => &["KIMI_CODE_HOME"],
+        ManagedHarness::Kiro | ManagedHarness::KiroV3 => &["KIRO_HOME"],
+        ManagedHarness::Grok => &["GROK_HOME"],
+        ManagedHarness::Crush | ManagedHarness::CommandCode | ManagedHarness::Antigravity => &[],
+    }
+}
+
+/// `path` with `.` dropped and `..` folded lexically, without touching the
+/// filesystem: Go's `filepath.Clean`, and the normalizing half of Node's
+/// `path.resolve`. A `..` that would climb above the root is dropped.
+pub fn clean_path(path: &Path) -> PathBuf {
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match clean.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    clean.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => clean.push(".."),
+            },
+            other => clean.push(other.as_os_str()),
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        clean.push(".");
+    }
+    clean
+}
+
 fn environment_session_dir_with(
     harness: ManagedHarness,
     get: impl Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
-    let value = |name| {
-        get(name)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    };
+    let value = |name| env_dir_override(get(name));
     match harness {
         ManagedHarness::Claude => value("CLAUDE_CONFIG_DIR").map(|dir| dir.join("projects")),
         ManagedHarness::Codex => value("CODEX_HOME").map(|dir| dir.join("sessions")),
@@ -1403,6 +1454,71 @@ mod tests {
         assert_eq!(
             environment_session_dir_with(ManagedHarness::Omp, get).as_deref(),
             Some(std::path::Path::new("/stores/pi-family/sessions"))
+        );
+    }
+
+    fn env_of(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let pairs = pairs.to_vec();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn clean_path_folds_like_go_filepath_clean() {
+        for (raw, expected) in [
+            ("/a/b/../c", "/a/c"),
+            ("/a/./b/", "/a/b"),
+            ("/..", "/"),
+            ("a/../..", ".."),
+            ("", "."),
+            ("./", "."),
+        ] {
+            assert_eq!(
+                clean_path(Path::new(raw)),
+                PathBuf::from(expected),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// Blank relocation values are unset, the same rule the hook and MCP
+    /// installers apply; otherwise import read `<cwd>/   /...` while auto-wire
+    /// installed into the default home.
+    #[test]
+    fn native_store_environment_overrides_treat_blank_as_unset() {
+        for blank in ["", "   ", "\t"] {
+            for harness in [
+                ManagedHarness::Claude,
+                ManagedHarness::Codex,
+                ManagedHarness::OpenCode,
+                ManagedHarness::OpenCode2,
+                ManagedHarness::Pi,
+                ManagedHarness::Omp,
+                ManagedHarness::Kimi,
+                ManagedHarness::Kiro,
+                ManagedHarness::KiroV3,
+                ManagedHarness::Grok,
+            ] {
+                assert_eq!(
+                    environment_session_dir_with(harness, |_| Some(OsString::from(blank))),
+                    None,
+                    "{harness:?} with {blank:?}"
+                );
+            }
+        }
+        assert_eq!(
+            environment_session_dir_with(
+                ManagedHarness::Pi,
+                env_of(&[
+                    ("PI_CODING_AGENT_SESSION_DIR", "   "),
+                    ("PI_CODING_AGENT_DIR", "/stores/pi")
+                ])
+            ),
+            Some(PathBuf::from("/stores/pi/sessions"))
         );
     }
 

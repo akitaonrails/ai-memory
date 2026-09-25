@@ -45,7 +45,14 @@ fn command_with_home(home: &Path) -> Command {
         .env_remove("KIRO_HOME")
         // Keep Claude installer/removal tests inside their temp HOME unless a
         // test explicitly opts into a relocated config root.
-        .env_remove("CLAUDE_CONFIG_DIR");
+        .env_remove("CLAUDE_CONFIG_DIR")
+        // Codex's hooks.json and MCP config.toml both follow CODEX_HOME, and
+        // uninstall also resolves Grok, Pi and OMP targets from their own
+        // variables, so none of them may point outside the sandbox.
+        .env_remove("CODEX_HOME")
+        .env_remove("GROK_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("OMP_PROFILE");
     command
 }
 
@@ -220,6 +227,66 @@ fn relocated_claude_uninstall_sweeps_active_and_legacy_installs() {
                 root.display()
             );
         }
+    }
+}
+
+/// Older installs wrote the Codex MCP entry to `~/.codex/config.toml` even with
+/// `CODEX_HOME` set. A relocated install now lands in `$CODEX_HOME/config.toml`,
+/// and uninstall sweeps both.
+#[test]
+fn relocated_codex_uninstall_sweeps_active_and_legacy_mcp() {
+    let _guard = cli_test_lock();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let relocated = home.path().join("codex-work");
+    std::fs::create_dir_all(&relocated).unwrap();
+
+    let run = |relocate: bool, args: &[&str]| {
+        let mut command = command_with_home(home.path());
+        if relocate {
+            command.env("CODEX_HOME", &relocated);
+        }
+        command
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+
+    for relocate in [false, true] {
+        let output = run(relocate, &["install-mcp", "--client", "codex", "--apply"]);
+        assert!(
+            output.status.success(),
+            "install failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let legacy = home.path().join(".codex/config.toml");
+    let active = relocated.join("config.toml");
+    for path in [&legacy, &active] {
+        let content = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("installer did not create {}: {error}", path.display()));
+        assert!(
+            content.contains("ai-memory"),
+            "Codex MCP entry missing in {}: {content}",
+            path.display()
+        );
+    }
+
+    let output = run(true, &["uninstall", "--only", "mcp", "--apply", "--yes"]);
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for path in [&legacy, &active] {
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.contains("ai-memory"),
+            "Codex MCP entry survived in {}: {content}",
+            path.display()
+        );
     }
 }
 

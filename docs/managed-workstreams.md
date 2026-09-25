@@ -13,7 +13,9 @@ harness it **auto-installs that harness's ai-memory hooks and MCP** if they are
 not already wired, so capture and recall work without a separate `install-hooks`
 / `install-mcp` step (a common footgun: `ai-memory run kimi` used to capture
 nothing if the Kimi hooks were never installed). Auto-wire is idempotent and
-one-time per harness + binary version, preserves unrelated user config, runs
+one-time per harness, binary version and install location (a second config home,
+such as another `CLAUDE_CONFIG_DIR`, gets its own first launch), preserves
+unrelated user config, runs
 before the harness starts so it picks up the fresh hooks, and is best-effort —
 if an install fails it warns and still launches. Harnesses without installer
 support (Crush) are skipped; Pi wires hooks but has no MCP client to write. Turn
@@ -403,12 +405,16 @@ through unchanged and used as the read-only import root. Native store
 environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
 `PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`,
-`KIRO_HOME`, and `GROK_HOME`.
-Export these in the environment `ai-memory run` itself sees — not only inside a
-harness wrapper script. `ai-memory run` resolves the native session directory
-(and installs hooks) from its own environment; if the harness writes its
-transcript under a custom `CLAUDE_CONFIG_DIR` that `ai-memory run` cannot see,
-the two disagree and the native transcript import fails. When you use per-account
+`KIRO_HOME`, and `GROK_HOME`. A blank
+value (empty or whitespace only) counts as unset everywhere: session import,
+hooks and MCP all fall back to the default home, and `ai-memory run` removes
+it from the launched harness's environment so the harness does too.
+Export these in the environment `ai-memory run` itself sees, or pass them with
+`--env` (below), not only inside a harness wrapper script. `ai-memory run`
+resolves the native session directory, and auto-wires hooks and MCP, from that
+environment; if the harness writes its transcript under a custom
+`CLAUDE_CONFIG_DIR` that `ai-memory run` cannot see, the two disagree and the
+native transcript import fails. When you use per-account
 config directories, set the variable before invoking `ai-memory run` (or in the
 same wrapper that also runs it), so hook installation and native-session
 resolution agree.
@@ -417,12 +423,16 @@ A repeatable `ai-memory run --env KEY=VALUE <harness>` (and `--env-file
 <path>`, one `KEY=VALUE` per line, blank lines and `#` comments skipped) is
 the first-class alternative to the `env KEY=VAL harness` wrapper-alias
 pattern above: it is a wrapper-owned flag, so it must precede the harness
-name, and the resolved environment reaches both the spawned harness process
-*and* `ai-memory run`'s own native-session resolution — the same
-`CLAUDE_CONFIG_DIR`-agreement requirement described above, satisfied without
-having to export the variable into the invoking shell first. A later `--env`
-overrides a same-key `--env-file` entry; neither expands nor interprets the
-value.
+name, and the resolved environment reaches the spawned harness process,
+`ai-memory run`'s own native-session resolution, *and* first-launch auto-wire.
+Hooks, MCP and transcript import then follow the same config home, which is the
+`CLAUDE_CONFIG_DIR`-agreement requirement described above, without exporting the
+variable into the invoking shell first. A later `--env` overrides a same-key
+`--env-file` entry; neither expands nor interprets the value, so let the shell
+expand `$HOME` on the command line and write absolute paths in an
+`--env-file`. Manual `install-hooks` / `install-mcp` do not take `--env`; they
+read their own environment.
+
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never

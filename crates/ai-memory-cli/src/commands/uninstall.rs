@@ -11,7 +11,9 @@ use crate::cli::UninstallArgs;
 use crate::commands::apply_shared::apply_atomic;
 use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
-use crate::commands::path_util::{claude_config_dir, claude_config_paths, home_dir};
+use crate::commands::path_util::{
+    agent_config_home, claude_config_dir, claude_config_paths, home_dir,
+};
 use crate::commands::{data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
 use ai_memory_core::routing_skills::{
@@ -366,6 +368,15 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
                     claude_config_dir.as_deref(),
                     Path::new(".claude.json"),
                     Path::new(".claude.json"),
+                )
+            } else if matches!(client, Codex) {
+                // Older installs wrote the Codex MCP entry to ~/.codex/config.toml
+                // even with CODEX_HOME set, so sweep that file too.
+                claude_config_paths(
+                    home.as_deref(),
+                    agent_config_home(std::env::var_os("CODEX_HOME")).as_deref(),
+                    Path::new(".codex/config.toml"),
+                    Path::new("config.toml"),
                 )
             } else {
                 let Ok(path) = install_mcp::mcp_config_path(client) else {

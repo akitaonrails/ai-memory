@@ -160,14 +160,25 @@ fn validate_kiro_remote_url(server_url: &str) -> Result<()> {
 /// Returns an error for `Pi` (no MCP config), for Claude Desktop on
 /// unsupported OSes, or when `$HOME` can't be resolved.
 pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> {
+    mcp_config_path_with(client, &|name| std::env::var_os(name))
+}
+
+/// [`mcp_config_path`] with the relocation variables (`CLAUDE_CONFIG_DIR`,
+/// `CODEX_HOME`, `GROK_HOME`, `KIMI_CODE_HOME` and `KIRO_HOME`) read through
+/// `env`, so `ai-memory run --env` can point auto-wire at the same config home
+/// it launches the harness with.
+pub(crate) fn mcp_config_path_with(
+    client: crate::cli::McpClient,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
     use crate::cli::McpClient;
     let home = || home_dir().context("could not locate $HOME for config-file auto-detect");
     Ok(match client {
-        McpClient::ClaudeCode => claude_code_config_path_in(std::env::var_os("CLAUDE_CONFIG_DIR"))?,
-        McpClient::Codex => home()?.join(".codex").join("config.toml"),
+        McpClient::ClaudeCode => claude_code_config_path_in(env("CLAUDE_CONFIG_DIR"))?,
+        McpClient::Codex => codex_config_path_in(env("CODEX_HOME"))?,
         // Project scope is `.grok/config.toml` under cwd/repo; pass
         // --config-file for that case rather than inventing a second default.
-        McpClient::Grok => grok_home()?.join("config.toml"),
+        McpClient::Grok => grok_home_in(env("GROK_HOME"))?.join("config.toml"),
         McpClient::OpenCode => home()?
             .join(".config")
             .join("opencode")
@@ -229,8 +240,8 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // Kimi Code keeps its data dir at $KIMI_CODE_HOME when set,
         // falling back to ~/.kimi-code; MCP servers live in mcp.json at
         // that root.
-        McpClient::KimiCode => kimi_code_home(std::env::var_os("KIMI_CODE_HOME"))?.join("mcp.json"),
-        McpClient::KiroCli => kiro_home(std::env::var_os("KIRO_HOME"))?
+        McpClient::KimiCode => kimi_code_home(env("KIMI_CODE_HOME"))?.join("mcp.json"),
+        McpClient::KiroCli => kiro_home(env("KIRO_HOME"))?
             .join("settings")
             .join("mcp.json"),
         McpClient::CommandCode => home()?.join(".commandcode").join("mcp.json"),
@@ -386,23 +397,41 @@ fn claude_code_config_path_in(env_override: Option<std::ffi::OsString>) -> Resul
         .join(".claude.json"))
 }
 
-/// Kimi Code's data dir: `$KIMI_CODE_HOME` when set (non-empty), else
+/// Codex's user config, where its MCP servers live: `$CODEX_HOME/config.toml`
+/// when the var is set, else `~/.codex/config.toml`. Codex keeps its whole
+/// config home under `CODEX_HOME`, which `install-hooks` already honors for
+/// `hooks.json`; writing the MCP entry to the default path left a relocated
+/// Codex with hooks but no ai-memory server. Blank counts as unset, as it does
+/// for the hooks path. The env value comes in as a parameter so tests can
+/// exercise both branches without mutating process env.
+fn codex_config_path_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("config.toml"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.codex/config.toml")?
+        .join(".codex")
+        .join("config.toml"))
+}
+
+/// Kimi Code's data dir: `$KIMI_CODE_HOME` when set and not blank, else
 /// `~/.kimi-code`. The env value comes in as a parameter so tests can
 /// exercise both branches without mutating process env.
 fn kimi_code_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
-    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(dir));
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
     }
     Ok(home_dir()
         .context("could not locate $HOME for config-file auto-detect")?
         .join(".kimi-code"))
 }
 
-/// Kiro CLI's global configuration root: `$KIRO_HOME` when set, otherwise
-/// `~/.kiro`. The override is injected to keep path tests process-local.
+/// Kiro CLI's global configuration root: `$KIRO_HOME` when set and not
+/// blank, otherwise `~/.kiro`. The override is injected to keep path tests
+/// process-local.
 fn kiro_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
-    if let Some(dir) = env_override.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(dir));
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
     }
     Ok(home_dir()
         .context("could not locate $HOME for Kiro configuration")?
@@ -412,8 +441,14 @@ fn kiro_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
 /// Resolve Grok Build CLI's user configuration root. Grok honours
 /// `GROK_HOME`; otherwise it uses `~/.grok`.
 pub(crate) fn grok_home() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("GROK_HOME").filter(|path| !path.is_empty()) {
-        return Ok(PathBuf::from(path));
+    grok_home_in(std::env::var_os("GROK_HOME"))
+}
+
+/// [`grok_home`] with the `GROK_HOME` value passed in, so auto-wire can resolve
+/// it from `ai-memory run --env` and tests stay process-local.
+pub(crate) fn grok_home_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
     }
     Ok(home_dir()
         .context("could not locate $HOME for Grok configuration")?
@@ -1154,7 +1189,7 @@ fn render_codex(args: &InstallMcpArgs) -> String {
     // and NOT a `[mcp_servers.<name>.headers]` sub-table (the key
     // is `http_headers`, with the `http_` prefix).
     let mut out = format!(
-        "# Codex CLI — append to ~/.codex/config.toml\n\
+        "# Codex CLI — append to $CODEX_HOME/config.toml (default ~/.codex/config.toml)\n\
          #\n\
          [mcp_servers.{name}]\n\
          url = \"{url}\"\n\
@@ -1661,6 +1696,92 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn codex_config_path_honours_codex_home() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\codex"
+        } else {
+            "/custom/codex"
+        };
+        let path = codex_config_path_in(Some(std::ffi::OsString::from(custom))).unwrap();
+        assert_eq!(path, std::path::Path::new(custom).join("config.toml"));
+
+        // Unset, empty and blank all fall back to ~/.codex/config.toml, the
+        // same reading `install-hooks` gives CODEX_HOME for hooks.json.
+        for env in [
+            None,
+            Some(std::ffi::OsString::new()),
+            Some(std::ffi::OsString::from("  ")),
+        ] {
+            let path = codex_config_path_in(env).unwrap();
+            assert!(
+                path.ends_with(std::path::Path::new(".codex").join("config.toml")),
+                "default must be ~/.codex/config.toml, got {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Auto-wire resolves MCP targets through `run --env`; every relocatable
+    /// client must read its variable from the supplied lookup, not the process.
+    #[test]
+    fn mcp_config_path_with_reads_relocation_from_the_supplied_env() {
+        let root = if cfg!(windows) {
+            std::path::Path::new(r"C:\relocated")
+        } else {
+            std::path::Path::new("/relocated")
+        };
+        for (client, var, relative) in [
+            (McpClient::ClaudeCode, "CLAUDE_CONFIG_DIR", ".claude.json"),
+            (McpClient::Codex, "CODEX_HOME", "config.toml"),
+            (McpClient::Grok, "GROK_HOME", "config.toml"),
+            (McpClient::KimiCode, "KIMI_CODE_HOME", "mcp.json"),
+            (McpClient::KiroCli, "KIRO_HOME", "settings/mcp.json"),
+        ] {
+            let env = |name: &str| (name == var).then(|| root.as_os_str().to_owned());
+            assert_eq!(
+                mcp_config_path_with(client, &env).unwrap(),
+                root.join(relative),
+                "{client:?} must follow {var}"
+            );
+        }
+    }
+
+    /// A blank relocation variable is unset, the rule every installer and
+    /// native session import share; otherwise the MCP entry, bearer token
+    /// included, landed in a whitespace-named directory under the cwd.
+    #[test]
+    fn mcp_config_path_with_treats_blank_relocation_as_unset() {
+        let home = home_dir().unwrap();
+        for (client, var, relative) in [
+            (McpClient::ClaudeCode, "CLAUDE_CONFIG_DIR", ".claude.json"),
+            (McpClient::Codex, "CODEX_HOME", ".codex/config.toml"),
+            (McpClient::Grok, "GROK_HOME", ".grok/config.toml"),
+            (McpClient::KimiCode, "KIMI_CODE_HOME", ".kimi-code/mcp.json"),
+            (McpClient::KiroCli, "KIRO_HOME", ".kiro/settings/mcp.json"),
+        ] {
+            for blank in ["", "   ", "\t", " \n"] {
+                let env = |name: &str| (name == var).then(|| std::ffi::OsString::from(blank));
+                assert_eq!(
+                    mcp_config_path_with(client, &env).unwrap(),
+                    home.join(relative),
+                    "{client:?} with {var}={blank:?}"
+                );
+            }
+        }
+    }
+
+    /// The snippet names CODEX_HOME rather than a resolved path: it is often
+    /// rendered inside the Docker image, whose paths mean nothing on the host.
+    #[test]
+    fn codex_render_names_codex_home() {
+        let out = render_codex(&args_for(McpClient::Codex));
+        assert!(
+            out.contains("$CODEX_HOME/config.toml"),
+            "render must point a relocated Codex at its config home:\n{out}"
+        );
     }
 
     #[test]

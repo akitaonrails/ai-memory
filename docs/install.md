@@ -799,7 +799,7 @@ including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 ### OpenAI Codex
 
 ```bash
-# MCP snippet (merge into ~/.codex/config.toml):
+# MCP snippet (merge into $CODEX_HOME/config.toml, default ~/.codex/config.toml):
 docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client codex \
     --server-url "http://homelab:49374/mcp" \

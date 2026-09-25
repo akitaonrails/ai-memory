@@ -399,11 +399,11 @@ pub struct Config {
     /// false`; `ai-memory backfill` remains available to run it by hand.
     pub backfill_on_start: bool,
     /// On by default. The first time `ai-memory run <harness>` launches a
-    /// harness (per harness + binary version), it auto-installs that harness's
-    /// ai-memory lifecycle hooks and MCP server if they are not already wired,
-    /// so managed launches capture and can query memory without a manual
-    /// `install-hooks` / `install-mcp` step. Idempotent and one-time per
-    /// harness. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
+    /// harness (per harness, binary version and config home), it auto-installs
+    /// that harness's ai-memory lifecycle hooks and MCP server if they are not
+    /// already wired, so managed launches capture and can query memory without
+    /// a manual `install-hooks` / `install-mcp` step. Idempotent and one-time
+    /// per harness and config home. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
     /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
     pub run_autowire: bool,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input

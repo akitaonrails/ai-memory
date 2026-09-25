@@ -1197,9 +1197,9 @@ outright.
 Pi and OMP honour the *same* `PI_CODING_AGENT_DIR`, and each agent loads
 every direct `*.ts` in its extensions directory. Pointing both at one
 directory therefore makes each load both extensions and capture every
-event twice, once under each agent identity. `install-hooks` warns when it
-detects this; give the two agents separate homes, or scope OMP to a
-profile.
+event twice, once under each agent identity. `install-hooks` and the
+`ai-memory run` auto-wire warn when they detect this; give the two agents
+separate homes, or scope OMP to a profile.
 
 **Gotchas:**
 - OMP extensions are TypeScript modules, not shell hooks; stdout is not
