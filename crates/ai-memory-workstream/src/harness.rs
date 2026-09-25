@@ -2394,6 +2394,7 @@ mod tests {
     /// OMP resolves `PI_CODING_AGENT_DIR` before deciding whether it moved the
     /// agent dir, so `..` or a relative spelling of the default still counts
     /// as the default location and keeps XDG sessions.
+    #[cfg(unix)]
     #[test]
     fn omp_xdg_sessions_compare_the_resolved_agent_dir() {
         let exists = |path: &Path| path == Path::new("/xdg/omp");
@@ -2447,6 +2448,7 @@ mod tests {
     /// On Linux and macOS, OMP moves sessions (only sessions) under
     /// `$XDG_DATA_HOME/omp` once that directory exists, unless
     /// `PI_CODING_AGENT_DIR` moved the agent dir away from its default.
+    #[cfg(unix)]
     #[test]
     fn omp_sessions_dir_follows_xdg_data_home() {
         let home = Path::new("/home/me");
