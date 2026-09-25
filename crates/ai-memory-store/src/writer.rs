@@ -659,6 +659,14 @@ pub(crate) enum WriteCmd {
         input: RenameWorkstream,
         reply: oneshot::Sender<StoreResult<RenamedWorkstream>>,
     },
+    AuthorizeProject {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        principal: crate::ProjectPrincipal,
+        distinguishes_operators: bool,
+        need: crate::ProjectAccess,
+        reply: oneshot::Sender<StoreResult<Result<(), ai_memory_core::AuthzError>>>,
+    },
     Shutdown,
 }
 
@@ -702,6 +710,41 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::GetOrCreateWorkspace {
             name: name.into(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// The per-project authorization choke point (#708), evaluated on the
+    /// **writer** connection as defense in depth for writes: a write decision
+    /// is made against the same connection that will perform the write, so it
+    /// cannot race a concurrent grant/access-mode change between a read-pool
+    /// check and the write.
+    ///
+    /// Returns `Ok(Ok(()))` when admitted, `Ok(Err(Forbidden))` when a
+    /// restricted project refuses the caller, and `Err(_)` only on an
+    /// infrastructure failure. In slice 2 every project is `open`, so this is a
+    /// pass-through.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error from the authz resolver.
+    pub async fn authorize_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        principal: crate::ProjectPrincipal,
+        distinguishes_operators: bool,
+        need: crate::ProjectAccess,
+    ) -> StoreResult<Result<(), ai_memory_core::AuthzError>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::AuthorizeProject {
+            workspace_id,
+            project_id,
+            principal,
+            distinguishes_operators,
+            need,
             reply: tx,
         })
         .await?;
@@ -2732,6 +2775,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             WriteCmd::Shutdown => break,
+            WriteCmd::AuthorizeProject {
+                workspace_id,
+                project_id,
+                principal,
+                distinguishes_operators,
+                need,
+                reply,
+            } => {
+                let result = crate::project_authz::resolve_project_authz(
+                    &conn,
+                    workspace_id,
+                    project_id,
+                    &principal,
+                    distinguishes_operators,
+                )
+                .map(|ctx| ctx.authorize(need));
+                send_or_warn(reply, result, "authorize_project");
+            }
             WriteCmd::GetOrCreateWorkspace { name, reply } => {
                 let result = ops::get_or_create_workspace(&mut conn, &name);
                 send_or_warn(reply, result, "get_or_create_workspace");

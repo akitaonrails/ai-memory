@@ -14,6 +14,7 @@ use ai_memory_core::{
 };
 
 use crate::error::StoreError;
+use crate::project_authz::{ProjectAccess, ProjectPrincipal};
 use crate::{ReaderPool, WriterHandle};
 
 /// Canonical error for partial explicit scope arguments.
@@ -177,6 +178,9 @@ pub enum ScopeResolutionError {
     AmbiguousUnscopedWrite,
     /// A write-create policy was requested without a writer handle.
     WriterRequired,
+    /// The per-project authorization choke point (#708) refused the caller a
+    /// `restricted` project. Carries the policy message.
+    Forbidden(String),
     /// Underlying store failure.
     Store(String),
 }
@@ -205,6 +209,13 @@ impl ScopeResolutionError {
                 | ScopeResolutionError::ProjectNotFoundInWorkspace { .. }
                 | ScopeResolutionError::ProjectNotFoundInActiveOrDefault { .. }
         )
+    }
+
+    /// True when the per-project authorization choke point (#708) refused the
+    /// caller. Surfaces map this to a 403/permission error.
+    #[must_use]
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, ScopeResolutionError::Forbidden(_))
     }
 }
 
@@ -240,6 +251,7 @@ impl fmt::Display for ScopeResolutionError {
             ScopeResolutionError::WriterRequired => {
                 f.write_str("scope resolver requires a writer for create-on-write resolution")
             }
+            ScopeResolutionError::Forbidden(msg) => f.write_str(msg),
             ScopeResolutionError::Store(msg) => f.write_str(msg),
         }
     }
@@ -261,6 +273,14 @@ pub struct ScopeResolver<'a> {
     active_project: Option<&'a ActiveProject>,
     default_workspace_id: WorkspaceId,
     default_project_id: ProjectId,
+    /// Per-project authorization principal (#708). `None` skips the gate
+    /// entirely, preserving legacy behaviour for callers that have not opted
+    /// in. When set, every resolved read/write scope is run through the
+    /// `authorize_project` choke point before it is returned.
+    authz: Option<ProjectPrincipal>,
+    /// Whether the deployment distinguishes operators; only meaningful when
+    /// [`Self::authz`] is set.
+    distinguishes_operators: bool,
 }
 
 /// Look up an explicit workspace/project pair without creating anything.
@@ -413,6 +433,8 @@ impl<'a> ScopeResolver<'a> {
             active_project: None,
             default_workspace_id,
             default_project_id,
+            authz: None,
+            distinguishes_operators: false,
         }
     }
 
@@ -421,6 +443,64 @@ impl<'a> ScopeResolver<'a> {
     pub fn with_writer(mut self, writer: &'a WriterHandle) -> Self {
         self.writer = Some(writer);
         self
+    }
+
+    /// Opt into the per-project authorization choke point (#708).
+    ///
+    /// Once attached, every scope this resolver returns is run through
+    /// `authorize_project`: reads through the read pool, writes through the
+    /// writer actor (defense in depth) when a writer is attached. In slice 2
+    /// every project is `open`, so this is a behaviour-preserving pass-through.
+    #[must_use]
+    pub fn with_project_authz(
+        mut self,
+        principal: ProjectPrincipal,
+        distinguishes_operators: bool,
+    ) -> Self {
+        self.authz = Some(principal);
+        self.distinguishes_operators = distinguishes_operators;
+        self
+    }
+
+    /// Run the resolved scope through the authorization choke point (#708).
+    ///
+    /// A no-op when no principal is attached. A read is decided on the read
+    /// pool; a write is decided on the writer actor's own connection when a
+    /// writer is attached, so the check cannot race a concurrent grant change
+    /// against the write it guards.
+    async fn authorize_scope(
+        &self,
+        scope: ResolvedScope,
+        need: ProjectAccess,
+    ) -> Result<(), ScopeResolutionError> {
+        let Some(principal) = self.authz.as_ref() else {
+            return Ok(());
+        };
+        let decision = match (need, self.writer) {
+            (ProjectAccess::Write, Some(writer)) => {
+                writer
+                    .authorize_project(
+                        scope.workspace_id,
+                        scope.project_id,
+                        principal.clone(),
+                        self.distinguishes_operators,
+                        need,
+                    )
+                    .await?
+            }
+            _ => {
+                self.reader
+                    .authorize_project(
+                        scope.workspace_id,
+                        scope.project_id,
+                        principal.clone(),
+                        self.distinguishes_operators,
+                        need,
+                    )
+                    .await?
+            }
+        };
+        decision.map_err(|err| ScopeResolutionError::Forbidden(err.message().to_owned()))
     }
 
     /// Attach the active-project map used for current-project defaults.
@@ -465,10 +545,11 @@ impl<'a> ScopeResolver<'a> {
             trimmed_opt(explicit_workspace),
             trimmed_opt(explicit_project),
         ) {
-            (Some(workspace), Some(project)) => self
-                .lookup_existing(workspace, project)
-                .await
-                .map(|scope| (scope, ScopeSource::Explicit)),
+            (Some(workspace), Some(project)) => {
+                let scope = self.lookup_existing(workspace, project).await?;
+                self.authorize_scope(scope, ProjectAccess::Read).await?;
+                Ok((scope, ScopeSource::Explicit))
+            }
             (Some(_), None) => Err(ScopeResolutionError::WorkspaceProjectPairRequired),
             (None, project) => self.resolve_current_or_project_traced(project, actor).await,
         }
@@ -519,6 +600,7 @@ impl<'a> ScopeResolver<'a> {
                     workspace_id: active_ws,
                     project_id,
                 };
+                self.authorize_scope(scope, ProjectAccess::Read).await?;
                 return Ok((scope, ScopeSource::Explicit));
             }
             if active.map(|(ws, _)| ws) != Some(self.default_workspace_id)
@@ -531,6 +613,7 @@ impl<'a> ScopeResolver<'a> {
                     workspace_id: self.default_workspace_id,
                     project_id,
                 };
+                self.authorize_scope(scope, ProjectAccess::Read).await?;
                 return Ok((scope, ScopeSource::Explicit));
             }
             return Err(ScopeResolutionError::ProjectNotFoundInActiveOrDefault {
@@ -543,6 +626,7 @@ impl<'a> ScopeResolver<'a> {
             workspace_id,
             project_id,
         };
+        self.authorize_scope(scope, ProjectAccess::Read).await?;
         Ok((scope, source))
     }
 
@@ -575,10 +659,12 @@ impl<'a> ScopeResolver<'a> {
                     (self.default_workspace_id, self.default_project_id)
                 }
             };
-            return Ok(ResolvedScope {
+            let scope = ResolvedScope {
                 workspace_id,
                 project_id,
-            });
+            };
+            self.authorize_scope(scope, ProjectAccess::Write).await?;
+            return Ok(scope);
         };
         let Some(writer) = self.writer else {
             return Err(ScopeResolutionError::WriterRequired);
@@ -593,10 +679,12 @@ impl<'a> ScopeResolver<'a> {
         let project_id = writer
             .get_or_create_project(workspace_id, project.to_owned(), None)
             .await?;
-        Ok(ResolvedScope {
+        let scope = ResolvedScope {
             workspace_id,
             project_id,
-        })
+        };
+        self.authorize_scope(scope, ProjectAccess::Write).await?;
+        Ok(scope)
     }
 
     /// Resolve and de-duplicate an explicit multi-scope list.
