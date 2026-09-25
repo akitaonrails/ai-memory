@@ -428,7 +428,7 @@ async fn unattributed_readers_do_not_see_owned_handoffs() {
     assert!(
         store
             .reader
-            .latest_open_handoff_for_workspace(ws, OwnerFilter::Unattributed)
+            .latest_open_handoff_for_workspace(ws, OwnerFilter::Unattributed, None)
             .await
             .unwrap()
             .is_none()
@@ -437,7 +437,7 @@ async fn unattributed_readers_do_not_see_owned_handoffs() {
     assert!(
         store
             .reader
-            .latest_open_handoff_for_workspace(ws, OwnerFilter::Any)
+            .latest_open_handoff_for_workspace(ws, OwnerFilter::Any, None)
             .await
             .unwrap()
             .is_some()
@@ -721,7 +721,7 @@ async fn an_owner_name_with_a_quote_filters_like_any_other() {
             .pending_handoff_count,
         store
             .reader
-            .briefing_for_workspace(ws, 5, filter())
+            .briefing_for_workspace(ws, 5, filter(), None)
             .await
             .unwrap()
             .pending_handoff_count,
