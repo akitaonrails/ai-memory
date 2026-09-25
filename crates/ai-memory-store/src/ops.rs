@@ -2949,6 +2949,10 @@ fn handoff_fields(h: &NewHandoff) -> StoreResult<HandoffFields> {
 /// boundary: the same directory inside a shared container is the norm, so
 /// owner equality is the only thing keeping one operator's SessionEnd from
 /// retiring another's pending baton. `keep` spares the baton being refreshed.
+///
+/// Another session that is still open owns its turn-checkpoint baton and
+/// refreshes it itself, so it is spared too: with parallel sessions in one
+/// directory, every completed turn would otherwise retire the others' batons.
 fn expire_same_cwd_auto_handoffs(
     conn: &Transaction<'_>,
     h: &NewHandoff,
@@ -2961,13 +2965,17 @@ fn expire_same_cwd_auto_handoffs(
          WHERE workspace_id = ?1 AND project_id = ?2 \
            AND state = 'open' AND from_session_id IS NOT NULL \
            AND (cwd = ?3 OR (cwd IS NULL AND ?3 IS NULL)) \
-           AND owner_user IS ?4 AND id IS NOT ?5",
+           AND owner_user IS ?4 AND id IS NOT ?5 \
+           AND (from_session_id IS ?6 OR NOT EXISTS ( \
+               SELECT 1 FROM sessions s \
+               WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL))",
         params![
             h.workspace_id.as_bytes(),
             h.project_id.as_bytes(),
             cwd,
             h.owner_user.as_deref(),
-            keep.map(HandoffId::as_bytes)
+            keep.map(HandoffId::as_bytes),
+            h.from_session_id.as_ref().map(|s| &s.as_bytes()[..])
         ],
     )?;
     if expired > 0 {
@@ -3082,14 +3090,22 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
 /// handoffs.
 pub fn accept_handoff(conn: &mut Connection, acceptance: &HandoffAcceptance) -> StoreResult<bool> {
     let tx = conn.transaction()?;
-    let claimed = accept_handoff_in_transaction(&tx, acceptance)?;
+    let claimed = accept_handoff_in_transaction(&tx, acceptance, None)?;
     tx.commit()?;
     Ok(claimed)
 }
 
+/// Claim one handoff inside `tx`.
+///
+/// `busy_since` (microseconds) is the automatic-delivery cutoff: when set, a
+/// baton whose source session is still open and captured anything after it is
+/// not claimed, and the post-claim sweep retires older batons of quiet open
+/// sessions too. `None` (an explicit accept) claims regardless and spares
+/// every open session's baton from the sweep.
 pub(crate) fn accept_handoff_in_transaction(
     tx: &Transaction<'_>,
     acceptance: &HandoffAcceptance,
+    busy_since: Option<i64>,
 ) -> StoreResult<bool> {
     let HandoffAcceptance {
         handoff_id,
@@ -3185,13 +3201,18 @@ pub(crate) fn accept_handoff_in_transaction(
     }
     let metadata = tx
         .query_row(
-            "SELECT from_session_id IS NOT NULL, cwd, created_at, owner_user \
+            "SELECT from_session_id IS NOT NULL, cwd, created_at, owner_user, \
+                    EXISTS (SELECT 1 FROM sessions s \
+                            WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
+                              AND EXISTS (SELECT 1 FROM observations o \
+                                          WHERE o.session_id = s.id AND o.created_at > ?4)) \
              FROM handoffs \
              WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 AND state = 'open'",
             params![
                 handoff_id.as_bytes(),
                 workspace_id.as_bytes(),
                 project_id.as_bytes(),
+                busy_since.unwrap_or(i64::MAX),
             ],
             |row| {
                 Ok((
@@ -3199,13 +3220,20 @@ pub(crate) fn accept_handoff_in_transaction(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((automatic, cwd, created_at, owner_user)) = metadata else {
+    let Some((automatic, cwd, created_at, owner_user, source_busy)) = metadata else {
         return Ok(false);
     };
+    // Startup selection happens on a reader before this claim; the source may
+    // have resumed (or refreshed this very baton) in between. Re-checked here,
+    // in the claim's transaction, so a session in use never loses its baton.
+    if source_busy {
+        return Ok(false);
+    }
     // The ownership check rides along in the UPDATE's WHERE rather than being a
     // separate read: the claim stays a single atomic compare-and-set (only one
     // racing session can flip 'open' -> 'accepted'), and a caller who is not
@@ -3274,6 +3302,7 @@ pub(crate) fn accept_handoff_in_transaction(
                 created_at,
                 receiving_cwd.as_deref(),
                 owner_user.as_deref(),
+                busy_since,
             )?;
             if expired > 0 {
                 audit(
@@ -3307,6 +3336,12 @@ fn validate_identity_storage_key(value: Option<&str>, label: &str) -> StoreResul
 /// behalf would take it away from Bob too. Equality on `owner_user` keeps the
 /// unattributed single-operator case (every row NULL) behaving exactly as it
 /// does without ownership.
+///
+/// A session that is still open and in use keeps its baton: it belongs to work
+/// in progress and is refreshed by it. "In use" means it captured anything
+/// after `busy_since`; without a cutoff every open session is spared. A quiet
+/// open session is superseded like an ended one, so abandoned conversations
+/// that never end cannot pile up and surface one by one to later sessions.
 #[allow(clippy::too_many_arguments)]
 fn expire_superseded_auto_handoffs(
     tx: &Transaction<'_>,
@@ -3317,6 +3352,7 @@ fn expire_superseded_auto_handoffs(
     accepted_created_at: i64,
     receiving_cwd: Option<&str>,
     accepted_owner: Option<&str>,
+    busy_since: Option<i64>,
 ) -> StoreResult<usize> {
     let receiving_cwd = receiving_cwd.or(accepted_cwd);
     let accepted_key = crate::reader::handoff_selection_key(
@@ -3329,15 +3365,22 @@ fn expire_superseded_auto_handoffs(
         "SELECT id, cwd, created_at FROM handoffs \
          WHERE workspace_id = ?1 AND project_id = ?2 \
            AND state = 'open' AND from_session_id IS NOT NULL \
-           AND owner_user IS ?3",
+           AND owner_user IS ?3 \
+           AND NOT EXISTS (SELECT 1 FROM sessions s \
+                           WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
+                             AND (?4 IS NULL OR EXISTS (SELECT 1 FROM observations o \
+                                   WHERE o.session_id = s.id AND o.created_at > ?4)))",
     )?;
-    let rows = stmt.query_map(params![workspace_id, project_id, accepted_owner], |row| {
-        Ok((
-            row.get::<_, Vec<u8>>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        params![workspace_id, project_id, accepted_owner, busy_since],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
     let mut ids = Vec::new();
     for row in rows {
         let (id_bytes, cwd, created_at) = row?;

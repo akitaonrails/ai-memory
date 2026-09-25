@@ -165,6 +165,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Native `ai-memory upgrade` container refusal now uses the shared
   `running_in_container` helper (`AI_MEMORY_IN_CONTAINER`, `/.dockerenv`,
   `/run/.containerenv` / Podman), matching staged-hooks detection. (#802)
+- Parallel OpenCode 2 sessions in one directory no longer receive each
+  other's context. Each completed turn's checkpoint retired the automatic
+  handoffs of every other live session there, and the next session to start
+  was handed the handoff of a session still in use (mid-turn, or seconds after
+  its last turn). A checkpoint now spares other live sessions' handoffs; a
+  starting session receives a live session's handoff only once that session
+  has captured nothing for ten minutes, re-checked inside the claim; and the
+  claim retires older handoffs of quiet sessions but not of one in use.
+  (#883)
 - `memory_query`'s vector stream called the generic `Embedder::embed`
   instead of `embed_query` on the configured embedder, so a
   query/document-asymmetric embedder (Google's task-typed embeddings, or
