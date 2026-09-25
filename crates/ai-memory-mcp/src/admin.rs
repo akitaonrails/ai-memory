@@ -24,6 +24,10 @@
 //! - `POST /admin/purge-project`  — delete a project's rows and wiki files
 //!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
 //! - `POST /admin/purge-session`  — delete one session and what it derived.
+//! - `POST /admin/repair-session-times` — correct `started_at`/`ended_at` of
+//!   already-imported sessions from caller-supplied candidate times (the CLI
+//!   computes them from local transcripts; see `ai-memory
+//!   repair-backfill-timestamps`).
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/compact`        — reclaim free pages; deletes nothing.
@@ -588,6 +592,7 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/rename-project`
 /// - `POST /admin/move-project`
 /// - `POST /admin/move-session`
+/// - `POST /admin/repair-session-times`
 /// - `POST /admin/merge-workspace`
 /// - `POST /admin/write-page`
 /// - `POST /admin/delete-page`
@@ -673,6 +678,10 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/move-session", post(handle_move_session))
+        .route(
+            "/admin/repair-session-times",
+            post(handle_repair_session_times),
+        )
         .route("/admin/delete-workspace", post(handle_delete_workspace))
         .route("/admin/compact", post(handle_compact))
         .route("/admin/rename-workspace", post(handle_rename_workspace))
@@ -4035,6 +4044,233 @@ async fn handle_purge_session(
         compacted: summary.compacted,
         pre_checkpoint,
         checkpoint,
+    };
+
+    (StatusCode::OK, Json(json_or_empty(&report)))
+}
+
+// ---------------------------------------------------------------------
+// repair-session-times
+// ---------------------------------------------------------------------
+
+/// Upper bound on how many session candidates one
+/// `POST /admin/repair-session-times` request may carry. The CLI builds this
+/// list from a local transcript scan, which is operator-controlled, but the
+/// request body is still client-supplied input to a single writer-actor
+/// transaction — bounding it keeps that transaction (and the rolled-back dry
+/// run alike) from growing unboundedly on a malformed or hostile request.
+/// Comfortably above what one project's transcript history should ever
+/// produce; the CLI chunks larger batches into requests of this size.
+const MAX_REPAIR_SESSIONS: usize = 2_000;
+
+/// One candidate session correction in `POST /admin/repair-session-times`.
+#[derive(Deserialize)]
+struct RepairSessionTimesItem {
+    /// Full `sessions.id` UUID (native id or its UUID v5, already resolved by
+    /// the caller — same rule the hook router uses).
+    session_id: String,
+    /// Replacement `started_at`, Unix microseconds, read from the caller's
+    /// transcript.
+    started_at_us: i64,
+    /// Replacement `ended_at`, or omitted/`null` to leave the column as it
+    /// is. Never applied when the session is currently open; see
+    /// [`ai_memory_store::RepairedSessionTimes::end_kept_open`].
+    #[serde(default)]
+    ended_at_us: Option<i64>,
+}
+
+/// JSON request body for `POST /admin/repair-session-times`.
+#[derive(Deserialize)]
+struct RepairSessionTimesRequest {
+    /// Workspace name. Must already exist; 404 otherwise.
+    workspace: String,
+    /// Project name. Must already exist; 404 otherwise.
+    project: String,
+    /// Candidate corrections, one per session. A candidate whose
+    /// `session_id` does not belong to this `(workspace, project)` is
+    /// reported `not_found` and left untouched — the id alone is never
+    /// authority over another scope, same as `purge-session`. A candidate
+    /// naming a session whose row is not dated after the candidate's own end
+    /// (i.e. is not actually flattened) is reported `not_flattened` and left
+    /// untouched too — this endpoint repairs the backfill bug, it does not
+    /// let a caller set an arbitrary session's times. Bounded by
+    /// [`MAX_REPAIR_SESSIONS`].
+    sessions: Vec<RepairSessionTimesItem>,
+    /// Without `confirm: true` this is a real dry run: every candidate is
+    /// validated and the exact would-be outcome is reported, but nothing is
+    /// written.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// One session actually rewritten (or, for a dry run, that would be),
+/// mirrored from [`ai_memory_store::RepairedSessionTimes`].
+#[derive(Debug, Serialize)]
+pub struct RepairedSessionTimesReport {
+    /// Session that was rewritten (or, for a dry run, that would be).
+    pub session_id: String,
+    /// `started_at` before the repair.
+    pub old_started_at_us: i64,
+    /// `ended_at` before the repair.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_ended_at_us: Option<i64>,
+    /// `started_at` after the repair.
+    pub new_started_at_us: i64,
+    /// `ended_at` after the repair (unchanged when `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_ended_at_us: Option<i64>,
+    /// `true` when the candidate carried `ended_at_us` but the session was
+    /// open, so only `started_at` was applied.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub end_kept_open: bool,
+}
+
+/// One candidate left untouched, with why.
+#[derive(Debug, Serialize)]
+pub struct SkippedSessionTimesReport {
+    /// Session the candidate named.
+    pub session_id: String,
+    /// `"not_found"`, `"not_flattened"`, `"unchanged"`, `"invalid_time"`,
+    /// `"inverted_times"`, or `"future_time"`.
+    pub reason: &'static str,
+}
+
+/// Wire-format report for `POST /admin/repair-session-times`.
+#[derive(Debug, Serialize)]
+pub struct RepairSessionTimesReport {
+    /// Human workspace name.
+    pub workspace: String,
+    /// Human project name.
+    pub project: String,
+    /// `true` when nothing was written (no `confirm`).
+    pub dry_run: bool,
+    /// Sessions rewritten (or, for a dry run, that would be).
+    pub repaired: Vec<RepairedSessionTimesReport>,
+    /// Sessions left untouched, with why — includes scope mismatches
+    /// (`"not_found"`), sessions not matching the bug's signature
+    /// (`"not_flattened"`), no-op candidates (`"unchanged"`), and refused
+    /// times.
+    pub skipped: Vec<SkippedSessionTimesReport>,
+}
+
+fn repair_skip_reason_label(reason: ai_memory_store::SessionTimesSkipReason) -> &'static str {
+    match reason {
+        ai_memory_store::SessionTimesSkipReason::NotFound => "not_found",
+        ai_memory_store::SessionTimesSkipReason::NotFlattened => "not_flattened",
+        ai_memory_store::SessionTimesSkipReason::Unchanged => "unchanged",
+        ai_memory_store::SessionTimesSkipReason::InvalidTime => "invalid_time",
+        ai_memory_store::SessionTimesSkipReason::InvertedTimes => "inverted_times",
+        ai_memory_store::SessionTimesSkipReason::FutureTime => "future_time",
+    }
+}
+
+/// `POST /admin/repair-session-times` — correct `sessions.started_at`/
+/// `ended_at` for sessions already imported by an older `backfill` that
+/// discarded the transcript's own timestamps.
+///
+/// The CLI (`ai-memory repair-backfill-timestamps`) owns transcript access —
+/// it reads the operator's local harness transcripts, matches each one to a
+/// session id, and posts the computed candidate times here; this endpoint
+/// never touches the filesystem. Every candidate is validated against the
+/// scope: a `session_id` that does not belong to `(workspace, project)` is
+/// `not_found`, exactly like `purge-session`. A candidate whose named session
+/// is not actually flattened (its `started_at` does not postdate the
+/// candidate's own end) is `not_flattened` and left untouched — this targets
+/// the backfill bug specifically, it is not a generic "set session times"
+/// primitive that would happily rewrite a correctly hook-captured session.
+/// Without `confirm` the write runs inside a rolled-back transaction, so the
+/// report is the literal would-be outcome (same pattern as `move-session`). A
+/// confirmed batch writes one `audit_log` row with the repaired sessions'
+/// before/after times, which is the reversibility an operator has after the
+/// fact.
+async fn handle_repair_session_times(
+    State(state): State<Arc<AdminState>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<RepairSessionTimesRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    if req.sessions.len() > MAX_REPAIR_SESSIONS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "sessions: at most {MAX_REPAIR_SESSIONS} candidates per request, got {}",
+                    req.sessions.len()
+                )
+            })),
+        );
+    }
+
+    let (ws_id, proj_id) =
+        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+            Ok(ids) => ids,
+            Err((status, body)) => return (status, body),
+        };
+
+    // Parsed locally (not via the writer) so a single malformed id fails the
+    // whole request before anything is validated against the scope, same as
+    // `purge-session`'s UUID check.
+    let mut candidates = Vec::with_capacity(req.sessions.len());
+    let mut malformed = Vec::new();
+    for item in &req.sessions {
+        match item.session_id.trim().parse::<SessionId>() {
+            Ok(session_id) => candidates.push(ai_memory_store::SessionTimesCandidate {
+                session_id,
+                started_at_us: item.started_at_us,
+                ended_at_us: item.ended_at_us,
+            }),
+            Err(_) => malformed.push(item.session_id.clone()),
+        }
+    }
+    if !malformed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "session_id must be a full UUID",
+                "malformed": malformed,
+            })),
+        );
+    }
+
+    let now_us = jiff::Timestamp::now().as_microsecond();
+    let outcome = match state
+        .writer
+        .repair_session_times(ws_id, proj_id, candidates, now_us, author_id, req.confirm)
+        .await
+    {
+        Ok(summary) => summary,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+    };
+
+    let report = RepairSessionTimesReport {
+        workspace: req.workspace,
+        project: req.project,
+        dry_run: !req.confirm,
+        repaired: outcome
+            .repaired
+            .into_iter()
+            .map(|r| RepairedSessionTimesReport {
+                session_id: r.session_id.to_string(),
+                old_started_at_us: r.old_started_at_us,
+                old_ended_at_us: r.old_ended_at_us,
+                new_started_at_us: r.new_started_at_us,
+                new_ended_at_us: r.new_ended_at_us,
+                end_kept_open: r.end_kept_open,
+            })
+            .collect(),
+        skipped: outcome
+            .skipped
+            .into_iter()
+            .map(|s| SkippedSessionTimesReport {
+                session_id: s.session_id.to_string(),
+                reason: repair_skip_reason_label(s.reason),
+            })
+            .collect(),
     };
 
     (StatusCode::OK, Json(json_or_empty(&report)))
@@ -11510,6 +11746,16 @@ mod tests {
                     "to_workspace": "archive",
                     "project": "scratch",
                     "confirm": true
+                }),
+            ),
+            (
+                "POST",
+                "/admin/repair-session-times",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "sessions": [],
+                    "confirm": false
                 }),
             ),
             (

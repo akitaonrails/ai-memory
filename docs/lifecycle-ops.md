@@ -16,6 +16,7 @@ on a homelab box where mistakes are harder to undo.
 | `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. Logical delete by default; `"compact": true` additionally rebuilds the FTS indexes and `VACUUM`s (see below). |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
+| `repair-backfill-timestamps --project --confirm` | ✅ yes | no | yes, if the operator kept the audit row or the CLI's before/after report (nothing else) | Corrects `sessions.started_at`/`ended_at` for sessions an older `backfill` imported before it carried the transcript's own event time. The CLI reads the operator's local transcripts read-only and posts candidate `(session_id, started_at, ended_at)` tuples to `POST /admin/repair-session-times`, which validates each one against `(workspace, project)` — a candidate outside that scope is `not_found` and untouched — only rewrites a row whose `started_at` postdates the candidate's own end (`not_flattened` otherwise, so a correctly hook-captured session or a re-run is a no-op), refuses negative/inverted/future-dated times, and never assigns an end time to a session still open. Without `--confirm` the server validates and reports inside a rolled-back transaction, so it is a real dry run; a confirmed run writes one `audit_log` row per request with the before/after times. Touches only the two timestamp columns of rows already in scope; `observations` and pages (including the session's own page frontmatter) are untouched. |
 | `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
@@ -612,6 +613,93 @@ The dry run therefore names each scope it would drain, with counts:
 
 `POST /admin/move-session` reports the same list as `source_scopes`. Read it
 before confirming.
+
+### `repair-backfill-timestamps`
+
+```bash
+# Dry run: report what would change for this project
+ai-memory repair-backfill-timestamps --project my-app
+# Apply
+ai-memory repair-backfill-timestamps --project my-app --confirm
+```
+
+Corrects `sessions.started_at`/`ended_at` for sessions an older `backfill`
+already imported. `backfill` used to date every imported session at import
+time rather than from the transcript's own event times, flattening the whole
+imported history onto one day; a companion change fixes new imports, and this
+command repairs sessions a pre-fix `backfill` already wrote.
+
+The CLI is the only part that touches the filesystem: it re-reads the
+operator's local harness transcripts read-only (reusing `backfill`'s own
+session discovery, so it looks at exactly the sessions `backfill` itself
+would import for this checkout), and for each one computes the transcript's
+first and last event timestamp. It resolves each transcript's session id the
+same way the hook router does (`SessionId::from_native`: a UUID native id
+as-is, any other native id hashed to a deterministic UUID v5), then posts the
+candidate `(session_id, started_at, ended_at)` list to
+`POST /admin/repair-session-times`, chunked at up to 2,000 candidates per
+request (one transaction each) when the local batch is larger. The server is
+the only part that validates and writes.
+
+**Request.** `POST /admin/repair-session-times` takes `{"workspace",
+"project", "sessions": [{"session_id", "started_at_us", "ended_at_us"?}, ...],
+"confirm"?}`. `sessions` is capped at 2,000 entries per request so a malformed
+or oversized client request cannot grow the write-actor transaction
+unboundedly; over the cap is a 400 before any scope lookup.
+
+**Validation, per candidate, against the row this same transaction reads for
+it (never the caller's belief about it):**
+
+- **Scope containment**, exactly like `purge-session`: a `session_id` that
+  does not belong to `(workspace, project)` — wrong scope or nonexistent — is
+  reported `skipped: {reason: "not_found"}` and left untouched. The two cases
+  are never distinguished, so an id existing in a different project is not
+  leaked to the caller.
+- **A no-op candidate is `"unchanged"`, not counted as repaired.** Checked
+  before the flattened-signature judgement below, so an exact repeat is
+  always a no-op regardless of whether the row happens to look flattened.
+- **The bug's own signature is the gate, not the caller's say-so.** A row is
+  only rewritten when its current `started_at` sits AFTER the candidate's own
+  end (or start, when the candidate carries no end) — the actual shape of
+  "backfill dated this at import time". A row that already sits at or before
+  that point is `"not_flattened"` and left untouched: this endpoint repairs
+  the specific backfill bug, it is not a generic "set session times"
+  primitive that would happily rewrite a correctly hook-captured session's
+  real times. This also makes a re-run against an already-repaired session,
+  or one a fixed `backfill` imported in the first place, a true no-op.
+- **Sane times**: `started_at_us` and `ended_at_us` (when given) must be
+  positive, and `started_at_us` must not be later than the end the row will
+  actually have once the candidate lands (its own new end, or, when that
+  stays unwritten, whatever end the row already had) — otherwise
+  `"invalid_time"` or `"inverted_times"`.
+- **Never into the future**: either time more than five minutes past "now" is
+  `"future_time"`. Clock-skew margin, not a real correction target.
+- **Never closes an open session**: when the session's current `ended_at` is
+  `NULL`, the candidate's `ended_at_us` is silently withheld — `started_at` is
+  still applied, and the report marks that session `end_kept_open: true`
+  rather than skipping it outright.
+
+**Dry run by default.** Without `confirm: true` the server validates and
+computes the exact would-be write inside a transaction it then rolls back, so
+the report (`repaired`, `skipped`, before/after times) is the literal outcome,
+not an estimate — same pattern as `move-session`. `--confirm` applies through
+the single `WriterHandle`, one transaction per request (chunk).
+
+**What it touches.** Only `sessions.started_at`/`ended_at` of rows already in
+the requested scope — never `observations`, pages, or any other table, and
+never a row outside `(workspace, project)`. Session identity (`sessions.id`
+and its 3-tuple scope) is never written; this is a correction of two
+timestamp columns on rows that already exist, not a move or a delete.
+`observations.created_at` and the `sessions/<id>.md` page's own frontmatter
+timestamps still carry the old import-day times after a repair — only the
+`sessions` row's two columns are corrected; regenerating the session page
+(e.g. via a fresh consolidation) is what would bring its frontmatter in line.
+
+**Reversibility.** A confirmed batch writes one `audit_log` row (`op =
+"repair_session_times"`) per request with every repaired session's before/
+after times in `detail`, and the CLI's human report prints the same old →
+new values per session — an operator who kept either can restore the prior
+values by hand; there is no automatic undo.
 
 ### `checkpoints`
 

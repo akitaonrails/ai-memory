@@ -86,6 +86,9 @@ pub async fn run() -> Result<()> {
         Command::Status(args) => commands::status::run(&config, args).await,
         Command::Doctor(args) => commands::doctor::run(&config, args).await,
         Command::Backfill(args) => commands::backfill::run(&config, args).await,
+        Command::RepairBackfillTimestamps(args) => {
+            commands::repair_backfill_timestamps::run(&config, args).await
+        }
         Command::Run(args) => {
             let exit_code = commands::run::run(&config, args).await?;
             if exit_code != 0 {

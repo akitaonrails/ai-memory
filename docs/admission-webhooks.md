@@ -189,6 +189,9 @@ terminal `purge_project` notification is unchanged.
 - **`rename-workspace`** — a `workspaces.name` column update plus refreshed
   `_meta.md` manifests; workspace paths are stable UUIDs, so no file move
   notification is needed.
+- **`repair-backfill-timestamps`** (`/admin/repair-session-times`) — a
+  `sessions.started_at`/`ended_at` column update only; no wiki page or file
+  is touched, so there is nothing for a mirror to reconcile.
 - **External / manual edits on disk** — reconciled by the watcher, not the
   admission chain (the chain is for the engine's own write path).
 

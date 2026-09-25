@@ -433,6 +433,19 @@ pub(crate) enum WriteCmd {
         commit: bool,
         reply: oneshot::Sender<StoreResult<MoveSessionSummary>>,
     },
+    /// Validate and, when `commit`, apply a batch of session-time
+    /// corrections scoped to `(workspace_id, project_id)`, in one
+    /// transaction (`ai-memory repair-backfill-timestamps`). `commit = false`
+    /// rolls back after validating, so the reply is an exact dry run.
+    RepairSessionTimes {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<ops::SessionTimesCandidate>,
+        now_us: i64,
+        author_id: Option<UserId>,
+        commit: bool,
+        reply: oneshot::Sender<StoreResult<ops::RepairSessionTimesSummary>>,
+    },
     /// Rename a project's `name` column without moving any files (the wiki
     /// is flat on disk). Fails with [`crate::error::StoreError::ProjectNameTaken`]
     /// when `new_name` is already used in the same workspace.
@@ -1881,6 +1894,39 @@ impl WriterHandle {
             target_workspace,
             target_project,
             pages,
+            author_id,
+            commit,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Validate and, when `commit`, apply a batch of session-time
+    /// corrections scoped to `(workspace_id, project_id)`, in one
+    /// transaction. `commit = false` performs the same validation and writes
+    /// then rolls back, so the reply is an exact dry run. See
+    /// [`ops::repair_session_times`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error. Per-candidate scope/validation problems are
+    /// reported in the returned summary, not as an `Err`.
+    pub async fn repair_session_times(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        candidates: Vec<ops::SessionTimesCandidate>,
+        now_us: i64,
+        author_id: Option<UserId>,
+        commit: bool,
+    ) -> StoreResult<ops::RepairSessionTimesSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RepairSessionTimes {
+            workspace_id,
+            project_id,
+            candidates,
+            now_us,
             author_id,
             commit,
             reply: tx,
@@ -3345,6 +3391,26 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     commit,
                 );
                 send_or_warn(reply, result, "move_session");
+            }
+            WriteCmd::RepairSessionTimes {
+                workspace_id,
+                project_id,
+                candidates,
+                now_us,
+                author_id,
+                commit,
+                reply,
+            } => {
+                let result = ops::repair_session_times(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &candidates,
+                    now_us,
+                    author_id,
+                    commit,
+                );
+                send_or_warn(reply, result, "repair_session_times");
             }
             WriteCmd::RenameProject {
                 workspace_id,

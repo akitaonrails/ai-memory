@@ -555,7 +555,7 @@ move-project         move-session         uninstall
 auth                 user                 completions
 handoffs             purge-session        compact
 api-key              export-okf           message
-doctor               backfill
+doctor               backfill             repair-backfill-timestamps
 ```
 
 Run `ai-memory --help` for the full tree.

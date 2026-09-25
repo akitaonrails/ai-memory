@@ -1683,6 +1683,301 @@ fn end_session_row(
     Ok(())
 }
 
+/// A candidate correction for one session's `started_at`/`ended_at`, as
+/// computed by the CLI from the operator's local transcripts and posted to
+/// `POST /admin/repair-session-times` (`ai-memory repair-backfill-timestamps`).
+#[derive(Debug, Clone, Copy)]
+pub struct SessionTimesCandidate {
+    /// Session to repair.
+    pub session_id: SessionId,
+    /// Replacement `started_at`, Unix microseconds.
+    pub started_at_us: i64,
+    /// Replacement `ended_at`, or `None` to leave the column as it is.
+    pub ended_at_us: Option<i64>,
+}
+
+/// Why one candidate produced no change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTimesSkipReason {
+    /// No `sessions` row with this id belongs to the caller's
+    /// `(workspace_id, project_id)` — either the id does not exist at all,
+    /// or it belongs to a different scope. The two are never distinguished:
+    /// like `purge_session`, scope containment must not leak whether an id
+    /// exists elsewhere.
+    NotFound,
+    /// The row already sits at or before the candidate's own end (or start,
+    /// when it carries no end): it does not carry the backfill bug's
+    /// signature (`started_at` dated after the transcript actually ended),
+    /// so it is left alone rather than rewritten on the caller's say-so.
+    /// Makes a repeat run against an already-repaired or never-broken
+    /// session (e.g. one the fixed `backfill` imported) a no-op.
+    NotFlattened,
+    /// The candidate already matches the stored row: nothing to write.
+    Unchanged,
+    /// `started_at_us`, or `ended_at_us` when given, is not a positive
+    /// microsecond timestamp.
+    InvalidTime,
+    /// `ended_at_us` is given and is earlier than `started_at_us`, or
+    /// `started_at_us` is later than the end the row will have once this
+    /// candidate is applied (its own `ended_at_us`, or, when that is absent,
+    /// the row's current `ended_at`).
+    InvertedTimes,
+    /// `started_at_us` or `ended_at_us` is more than five minutes past "now"
+    /// — a repair never moves a session into the future.
+    FutureTime,
+}
+
+/// Microsecond slack allowed past "now" before a candidate time is refused as
+/// being in the future — clock-skew margin, not a real correction target.
+const REPAIR_TIMES_FUTURE_SLACK_US: i64 = 5 * 60 * 1_000_000;
+
+/// One session actually rewritten by [`repair_session_times`].
+#[derive(Debug, Clone, Copy)]
+pub struct RepairedSessionTimes {
+    /// Session that was rewritten.
+    pub session_id: SessionId,
+    /// `started_at` before the repair.
+    pub old_started_at_us: i64,
+    /// `ended_at` before the repair.
+    pub old_ended_at_us: Option<i64>,
+    /// `started_at` after the repair.
+    pub new_started_at_us: i64,
+    /// `ended_at` after the repair (unchanged when `None`).
+    pub new_ended_at_us: Option<i64>,
+    /// The candidate carried an `ended_at_us`, but the session was open
+    /// (`ended_at` was `NULL`) — `started_at` was still applied, `ended_at`
+    /// was deliberately left `NULL`.
+    pub end_kept_open: bool,
+}
+
+/// One candidate that changed nothing — whether because it never matched a
+/// session in scope ([`SessionTimesSkipReason::NotFound`]) or because it did
+/// match one but was refused or was a no-op.
+#[derive(Debug, Clone, Copy)]
+pub struct SkippedSessionTimes {
+    /// Session the candidate named.
+    pub session_id: SessionId,
+    /// Why nothing was written for it.
+    pub reason: SessionTimesSkipReason,
+}
+
+/// Outcome of one [`repair_session_times`] call.
+#[derive(Debug, Clone, Default)]
+pub struct RepairSessionTimesSummary {
+    /// Sessions whose `started_at`/`ended_at` changed (or would change).
+    pub repaired: Vec<RepairedSessionTimes>,
+    /// Sessions that were not touched, with why.
+    pub skipped: Vec<SkippedSessionTimes>,
+}
+
+/// Validate and, when `commit`, apply a batch of session-time corrections
+/// scoped to `(workspace_id, project_id)`, in ONE transaction — the store
+/// side of `POST /admin/repair-session-times`
+/// (`ai-memory repair-backfill-timestamps`).
+///
+/// Every candidate is validated against the row this same transaction reads
+/// for it, never against anything the caller already believed:
+///
+/// - A `session_id` that does not belong to this scope is
+///   [`SessionTimesSkipReason::NotFound`] and left untouched (scope
+///   containment, like `purge_session`'s).
+/// - **The bug's own signature is the gate, not the caller's say-so.** A row
+///   is only a candidate for repair when its current `started_at` sits after
+///   the candidate's own end (or its own start, when the candidate carries no
+///   end) — that is what "backfill imported this at the wrong, later, import
+///   time" looks like. A row that already sits at or before that point is
+///   [`SessionTimesSkipReason::NotFlattened`]: this endpoint is a targeted
+///   bug repair, not a generic "set session times" primitive that would
+///   happily rewrite a correctly hook-captured session's real times. This
+///   also makes a re-run against an already-repaired session, or one a fixed
+///   `backfill` imported in the first place, a true no-op.
+/// - Nonsensical, inverted (see [`SessionTimesSkipReason::InvertedTimes`]),
+///   or future-dated times are refused outright.
+/// - A session whose `ended_at` is currently `NULL` (open) never has an end
+///   time imposed on it, even when the candidate carries one — only
+///   `started_at` is applied in that case, exactly like
+///   [`RepairedSessionTimes::end_kept_open`] reports.
+/// - A candidate that would not change anything is
+///   [`SessionTimesSkipReason::Unchanged`] rather than counted as repaired.
+///
+/// `commit = false` performs the identical validation and writes, then rolls
+/// the transaction back before returning — a dry run is the literal
+/// would-be outcome, not a separate code path, same as [`move_session`]. A
+/// single `audit_log` row (`op = "repair_session_times"`) is written for the
+/// whole batch, with the repaired sessions' old/new times as `detail`; it
+/// survives only when `commit` is true, same rollback.
+///
+/// # Errors
+/// Propagates any SQL failure. Per-candidate scope/validation problems are
+/// reported in the returned summary, never as an `Err`.
+pub fn repair_session_times(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    candidates: &[SessionTimesCandidate],
+    now_us: i64,
+    author_id: Option<ai_memory_core::UserId>,
+    commit: bool,
+) -> StoreResult<RepairSessionTimesSummary> {
+    let tx = conn.transaction()?;
+    let mut summary = RepairSessionTimesSummary::default();
+
+    for candidate in candidates {
+        let sid = candidate.session_id.as_bytes();
+        let row: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT started_at, ended_at FROM sessions \
+                 WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+                params![&sid[..], workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((old_started_at_us, old_ended_at_us)) = row else {
+            summary.skipped.push(SkippedSessionTimes {
+                session_id: candidate.session_id,
+                reason: SessionTimesSkipReason::NotFound,
+            });
+            continue;
+        };
+
+        // Candidate sanity first — a malformed candidate is refused as such
+        // regardless of whether the row it names happens to look flattened.
+        if candidate.started_at_us <= 0 || candidate.ended_at_us.is_some_and(|e| e <= 0) {
+            summary.skipped.push(SkippedSessionTimes {
+                session_id: candidate.session_id,
+                reason: SessionTimesSkipReason::InvalidTime,
+            });
+            continue;
+        }
+        if candidate
+            .ended_at_us
+            .is_some_and(|ended| ended < candidate.started_at_us)
+        {
+            summary.skipped.push(SkippedSessionTimes {
+                session_id: candidate.session_id,
+                reason: SessionTimesSkipReason::InvertedTimes,
+            });
+            continue;
+        }
+        let future_cutoff = now_us + REPAIR_TIMES_FUTURE_SLACK_US;
+        if candidate.started_at_us > future_cutoff
+            || candidate.ended_at_us.is_some_and(|e| e > future_cutoff)
+        {
+            summary.skipped.push(SkippedSessionTimes {
+                session_id: candidate.session_id,
+                reason: SessionTimesSkipReason::FutureTime,
+            });
+            continue;
+        }
+
+        // Never impose an end time on a session the store still has open.
+        let end_kept_open = old_ended_at_us.is_none() && candidate.ended_at_us.is_some();
+        let new_ended_at_us = if old_ended_at_us.is_none() {
+            None
+        } else {
+            candidate.ended_at_us
+        };
+
+        // A candidate that already matches the stored row exactly is a no-op
+        // regardless of whether the row looks flattened — checked before that
+        // judgement call so an exact repeat never needs it.
+        if candidate.started_at_us == old_started_at_us
+            && new_ended_at_us.is_none_or(|new_end| Some(new_end) == old_ended_at_us)
+        {
+            summary.skipped.push(SkippedSessionTimes {
+                session_id: candidate.session_id,
+                reason: SessionTimesSkipReason::Unchanged,
+            });
+            continue;
+        }
+
+        // The bug's signature: backfill dated the row at import time, which
+        // is always AFTER the transcript's own last (or only) event. A row
+        // already dated at or before that point is not the bug, whatever the
+        // caller's candidate says — refuse to touch it. (Passing this check
+        // implies `candidate.started_at_us < old_started_at_us`, so it can
+        // never itself produce an `Unchanged` candidate — the check above is
+        // not redundant with this one.)
+        let candidate_end = candidate.ended_at_us.unwrap_or(candidate.started_at_us);
+        if old_started_at_us <= candidate_end {
+            summary.skipped.push(SkippedSessionTimes {
+                session_id: candidate.session_id,
+                reason: SessionTimesSkipReason::NotFlattened,
+            });
+            continue;
+        }
+
+        // The end the row will actually have once this candidate lands (its
+        // own new end, or, when that stays NULL/unwritten, whatever end it
+        // already had) must not be earlier than the new start — otherwise an
+        // omitted `ended_at_us` on an already-closed session could still
+        // invert the row.
+        if let Some(effective_end) = new_ended_at_us.or(old_ended_at_us)
+            && candidate.started_at_us > effective_end
+        {
+            summary.skipped.push(SkippedSessionTimes {
+                session_id: candidate.session_id,
+                reason: SessionTimesSkipReason::InvertedTimes,
+            });
+            continue;
+        }
+
+        tx.execute(
+            "UPDATE sessions SET started_at = ?1, ended_at = COALESCE(?2, ended_at) \
+             WHERE id = ?3 AND workspace_id = ?4 AND project_id = ?5",
+            params![
+                candidate.started_at_us,
+                new_ended_at_us,
+                &sid[..],
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )?;
+        summary.repaired.push(RepairedSessionTimes {
+            session_id: candidate.session_id,
+            old_started_at_us,
+            old_ended_at_us,
+            new_started_at_us: candidate.started_at_us,
+            new_ended_at_us,
+            end_kept_open,
+        });
+    }
+
+    if !summary.repaired.is_empty() {
+        let detail = serde_json::json!({
+            "sessions": summary
+                .repaired
+                .iter()
+                .map(|r| serde_json::json!({
+                    "session_id": r.session_id.to_string(),
+                    "old_started_at_us": r.old_started_at_us,
+                    "old_ended_at_us": r.old_ended_at_us,
+                    "new_started_at_us": r.new_started_at_us,
+                    "new_ended_at_us": r.new_ended_at_us,
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        audit_with_detail(
+            &tx,
+            "repair_session_times",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            None,
+            author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+            now_us,
+            &detail,
+        )?;
+    }
+
+    if commit {
+        tx.commit()?;
+    } else {
+        tx.rollback()?;
+    }
+    Ok(summary)
+}
+
 /// Append a single observation. Caller is expected to have already
 /// inserted the parent session via [`begin_session`].
 pub fn insert_observation(
@@ -8872,6 +9167,482 @@ pub(crate) mod tests {
             (before..=after).contains(&created_at),
             "created_at {created_at} must fall within [{before}, {after}]"
         );
+    }
+
+    // --- repair_session_times ----------------------------------------------
+
+    fn ended_session(conn: &mut Connection, ws: WorkspaceId, proj: ProjectId) -> SessionId {
+        let sid = SessionId::new();
+        begin_session(conn, &hook_session(sid, ws, proj, None)).unwrap();
+        end_session(conn, &sid, None).unwrap();
+        sid
+    }
+
+    fn open_session(conn: &mut Connection, ws: WorkspaceId, proj: ProjectId) -> SessionId {
+        let sid = SessionId::new();
+        begin_session(conn, &hook_session(sid, ws, proj, None)).unwrap();
+        sid
+    }
+
+    fn session_times(conn: &Connection, sid: SessionId) -> (i64, Option<i64>) {
+        conn.query_row(
+            "SELECT started_at, ended_at FROM sessions WHERE id = ?1",
+            params![&sid.as_bytes()[..]],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// A candidate scoped correctly, with sane, past times that postdate the
+    /// row's flattened `started_at`, is applied and reported as repaired.
+    #[test]
+    fn repair_session_times_applies_a_valid_candidate() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = ended_session(&mut conn, ws, proj);
+        let now = Timestamp::now().as_microsecond();
+        let new_started = now - 1_000_000_000;
+        let new_ended = now - 999_000_000;
+        let summary = repair_session_times(
+            &mut conn,
+            ws,
+            proj,
+            &[SessionTimesCandidate {
+                session_id: sid,
+                started_at_us: new_started,
+                ended_at_us: Some(new_ended),
+            }],
+            now,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(summary.repaired.len(), 1, "{summary:?}");
+        assert!(summary.skipped.is_empty());
+        assert_eq!(session_times(&conn, sid), (new_started, Some(new_ended)));
+    }
+
+    /// `commit = false` performs the same validation and write, then rolls
+    /// back — a real dry run, not a separate code path. The audit row this
+    /// writes must roll back with it.
+    #[test]
+    fn repair_session_times_dry_run_writes_nothing() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = ended_session(&mut conn, ws, proj);
+        let (original_started, original_ended) = session_times(&conn, sid);
+        let now = Timestamp::now().as_microsecond();
+        let summary = repair_session_times(
+            &mut conn,
+            ws,
+            proj,
+            &[SessionTimesCandidate {
+                session_id: sid,
+                started_at_us: now - 1_000_000_000,
+                ended_at_us: Some(now - 999_000_000),
+            }],
+            now,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(summary.repaired.len(), 1, "the report is still computed");
+        assert_eq!(
+            session_times(&conn, sid),
+            (original_started, original_ended),
+            "a dry run must not write anything"
+        );
+        let audit_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE op = 'repair_session_times'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            audit_rows, 0,
+            "a dry run must not leave an audit row either"
+        );
+    }
+
+    /// A repaired batch writes one `audit_log` row for the whole call, with
+    /// the repaired session's old/new times recorded in `detail` — the
+    /// reversibility backing an operator relies on after `--confirm`.
+    #[test]
+    fn repair_session_times_writes_one_audit_row_with_before_after_detail() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = ended_session(&mut conn, ws, proj);
+        let now = Timestamp::now().as_microsecond();
+        let new_started = now - 1_000_000_000;
+        repair_session_times(
+            &mut conn,
+            ws,
+            proj,
+            &[SessionTimesCandidate {
+                session_id: sid,
+                started_at_us: new_started,
+                ended_at_us: None,
+            }],
+            now,
+            None,
+            true,
+        )
+        .unwrap();
+        let (op, detail): (String, String) = conn
+            .query_row(
+                "SELECT op, detail FROM audit_log WHERE op = 'repair_session_times'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(op, "repair_session_times");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let sessions = detail["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "{detail}");
+        assert_eq!(sessions[0]["session_id"], sid.to_string());
+        assert_eq!(sessions[0]["new_started_at_us"], new_started);
+    }
+
+    /// Adversarial: a session id that belongs to a different project than
+    /// the scope the caller passed must be reported `NotFound` and left
+    /// untouched — the same scope containment `purge_session` enforces.
+    /// Control: a sibling session actually inside the requested scope is
+    /// repaired in the same batch.
+    #[test]
+    fn repair_session_times_does_not_touch_a_session_of_another_project() {
+        let (_tmp, mut conn, ws, proj_a) = fresh_db();
+        let proj_b = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let sid_a = ended_session(&mut conn, ws, proj_a);
+        let sid_b = ended_session(&mut conn, ws, proj_b);
+        let (original_started_b, original_ended_b) = session_times(&conn, sid_b);
+        let now = Timestamp::now().as_microsecond();
+        let new_started = now - 1_000_000_000;
+
+        let summary = repair_session_times(
+            &mut conn,
+            ws,
+            proj_a,
+            &[
+                SessionTimesCandidate {
+                    session_id: sid_a,
+                    started_at_us: new_started,
+                    ended_at_us: None,
+                },
+                SessionTimesCandidate {
+                    session_id: sid_b,
+                    started_at_us: new_started,
+                    ended_at_us: None,
+                },
+            ],
+            now,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(summary.repaired.len(), 1, "{summary:?}");
+        assert_eq!(summary.repaired[0].session_id, sid_a, "control must apply");
+        assert_eq!(summary.skipped.len(), 1);
+        assert_eq!(summary.skipped[0].session_id, sid_b);
+        assert_eq!(summary.skipped[0].reason, SessionTimesSkipReason::NotFound);
+        assert_eq!(
+            session_times(&conn, sid_b),
+            (original_started_b, original_ended_b),
+            "a session scoped to project B must not be rewritten by a call scoped to project A"
+        );
+    }
+
+    /// Adversarial: a session id that belongs to a different WORKSPACE (same
+    /// project name, different workspace, so same-named projects do not
+    /// collide) must also be `NotFound` and untouched. Control: a sibling
+    /// session in the requested workspace is repaired in the same batch.
+    #[test]
+    fn repair_session_times_does_not_touch_a_session_of_another_workspace() {
+        let (_tmp, mut conn, ws_a, proj_a) = fresh_db();
+        let ws_b = get_or_create_workspace(&mut conn, "other-workspace").unwrap();
+        let proj_b = get_or_create_project(&mut conn, &ws_b, "scratch", None).unwrap();
+        let sid_a = ended_session(&mut conn, ws_a, proj_a);
+        let sid_b = ended_session(&mut conn, ws_b, proj_b);
+        let (original_started_b, original_ended_b) = session_times(&conn, sid_b);
+        let now = Timestamp::now().as_microsecond();
+        let new_started = now - 1_000_000_000;
+
+        let summary = repair_session_times(
+            &mut conn,
+            ws_a,
+            proj_a,
+            &[
+                SessionTimesCandidate {
+                    session_id: sid_a,
+                    started_at_us: new_started,
+                    ended_at_us: None,
+                },
+                SessionTimesCandidate {
+                    session_id: sid_b,
+                    started_at_us: new_started,
+                    ended_at_us: None,
+                },
+            ],
+            now,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(summary.repaired.len(), 1, "{summary:?}");
+        assert_eq!(summary.repaired[0].session_id, sid_a, "control must apply");
+        assert_eq!(summary.skipped.len(), 1);
+        assert_eq!(summary.skipped[0].session_id, sid_b);
+        assert_eq!(summary.skipped[0].reason, SessionTimesSkipReason::NotFound);
+        assert_eq!(
+            session_times(&conn, sid_b),
+            (original_started_b, original_ended_b),
+            "a session in another workspace must not be rewritten"
+        );
+    }
+
+    /// A session id absent from the store entirely is also `NotFound` — the
+    /// same code path as cross-project, so nonexistence never leaks a
+    /// distinguishable status.
+    #[test]
+    fn repair_session_times_reports_unknown_session_as_not_found() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = Timestamp::now().as_microsecond();
+        let summary = repair_session_times(
+            &mut conn,
+            ws,
+            proj,
+            &[SessionTimesCandidate {
+                session_id: SessionId::new(),
+                started_at_us: now - 1_000_000,
+                ended_at_us: None,
+            }],
+            now,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(summary.repaired.is_empty());
+        assert_eq!(summary.skipped[0].reason, SessionTimesSkipReason::NotFound);
+    }
+
+    /// An open session (`ended_at` still `NULL`) never has an end imposed on
+    /// it, even when the candidate carries one — `started_at` still applies.
+    #[test]
+    fn repair_session_times_never_sets_end_of_an_open_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = open_session(&mut conn, ws, proj);
+        let now = Timestamp::now().as_microsecond();
+        let new_started = now - 1_000_000_000;
+        let summary = repair_session_times(
+            &mut conn,
+            ws,
+            proj,
+            &[SessionTimesCandidate {
+                session_id: sid,
+                started_at_us: new_started,
+                ended_at_us: Some(now - 999_000_000),
+            }],
+            now,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(summary.repaired.len(), 1, "{summary:?}");
+        assert!(summary.repaired[0].end_kept_open);
+        assert_eq!(session_times(&conn, sid), (new_started, None));
+    }
+
+    /// Negative, zero, inverted, and future times are refused outright —
+    /// nothing is written for that candidate.
+    #[test]
+    fn repair_session_times_refuses_bad_times() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = Timestamp::now().as_microsecond();
+        let cases = [
+            (
+                "negative start",
+                SessionTimesCandidate {
+                    session_id: SessionId::new(),
+                    started_at_us: -1,
+                    ended_at_us: None,
+                },
+                SessionTimesSkipReason::InvalidTime,
+            ),
+            (
+                "inverted",
+                SessionTimesCandidate {
+                    session_id: SessionId::new(),
+                    started_at_us: now - 1_000,
+                    ended_at_us: Some(now - 2_000),
+                },
+                SessionTimesSkipReason::InvertedTimes,
+            ),
+            (
+                "future start",
+                SessionTimesCandidate {
+                    session_id: SessionId::new(),
+                    started_at_us: now + 60 * 60 * 1_000_000,
+                    ended_at_us: None,
+                },
+                SessionTimesSkipReason::FutureTime,
+            ),
+        ];
+        for (label, mut candidate, expected_reason) in cases {
+            let sid = ended_session(&mut conn, ws, proj);
+            candidate.session_id = sid;
+            let (original_started, original_ended) = session_times(&conn, sid);
+            let summary =
+                repair_session_times(&mut conn, ws, proj, &[candidate], now, None, true).unwrap();
+            assert!(summary.repaired.is_empty(), "{label}: {summary:?}");
+            assert_eq!(summary.skipped[0].reason, expected_reason, "{label}");
+            assert_eq!(
+                session_times(&conn, sid),
+                (original_started, original_ended),
+                "{label}: must not write anything"
+            );
+        }
+    }
+
+    /// The core bug-signature guard (B1): a session already correctly dated
+    /// by hook capture (its stored `started_at` already sits at or before
+    /// the candidate's own end) must NOT be rewritten, even though the
+    /// candidate itself is perfectly well-formed — this endpoint repairs the
+    /// backfill bug, it is not a generic "set session times" primitive.
+    /// Control: a genuinely flattened sibling session (stored `started_at`
+    /// AFTER the candidate's end, the import-time symptom) is repaired in
+    /// the same batch.
+    #[test]
+    fn repair_session_times_does_not_touch_an_already_correctly_dated_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let correct_sid = SessionId::new();
+        let correct_started: i64 = 1_700_000_000_000_000;
+        let correct_ended: i64 = 1_700_000_100_000_000; // 100s later
+        begin_session(&mut conn, &hook_session(correct_sid, ws, proj, None)).unwrap();
+        conn.execute(
+            "UPDATE sessions SET started_at = ?1, ended_at = ?2 WHERE id = ?3",
+            params![correct_started, correct_ended, &correct_sid.as_bytes()[..]],
+        )
+        .unwrap();
+        // A flattened sibling: real transcript span ends well before its
+        // stored `started_at` (the import-time stamp).
+        let flattened_sid = ended_session(&mut conn, ws, proj);
+
+        let now = Timestamp::now().as_microsecond();
+        // The candidate for the correctly-dated session repeats its own
+        // start and nearly (not exactly, to keep this test distinct from the
+        // dedicated `Unchanged` one) its own end: if this guard did not
+        // exist, the row would still be rewritten to a value it never should
+        // have been touched for, while being counted as a "repair" of a
+        // session that was never broken.
+        let candidate_correct = SessionTimesCandidate {
+            session_id: correct_sid,
+            started_at_us: correct_started,
+            ended_at_us: Some(correct_ended - 1),
+        };
+        let candidate_flattened = SessionTimesCandidate {
+            session_id: flattened_sid,
+            started_at_us: now - 1_000_000_000,
+            ended_at_us: Some(now - 999_000_000),
+        };
+
+        let summary = repair_session_times(
+            &mut conn,
+            ws,
+            proj,
+            &[candidate_correct, candidate_flattened],
+            now,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(summary.repaired.len(), 1, "{summary:?}");
+        assert_eq!(
+            summary.repaired[0].session_id, flattened_sid,
+            "control (flattened session) must be repaired"
+        );
+        assert_eq!(summary.skipped.len(), 1);
+        assert_eq!(summary.skipped[0].session_id, correct_sid);
+        assert_eq!(
+            summary.skipped[0].reason,
+            SessionTimesSkipReason::NotFlattened
+        );
+        assert_eq!(
+            session_times(&conn, correct_sid),
+            (correct_started, Some(correct_ended)),
+            "a correctly-dated hook-captured session must not be touched"
+        );
+    }
+
+    /// S2: a candidate that already matches the stored row exactly is
+    /// `Unchanged`, not counted as repaired, and issues no `UPDATE` — checked
+    /// before the flattened-signature judgement, so an exact repeat is a
+    /// no-op regardless of whether the row happens to look flattened.
+    #[test]
+    fn repair_session_times_skips_a_candidate_identical_to_the_stored_row() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        let started: i64 = 1_700_000_000_000_000;
+        let ended: i64 = 1_700_000_100_000_000; // a normal, sane span
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        conn.execute(
+            "UPDATE sessions SET started_at = ?1, ended_at = ?2 WHERE id = ?3",
+            params![started, ended, &sid.as_bytes()[..]],
+        )
+        .unwrap();
+        let now = Timestamp::now().as_microsecond();
+
+        let summary = repair_session_times(
+            &mut conn,
+            ws,
+            proj,
+            &[SessionTimesCandidate {
+                session_id: sid,
+                started_at_us: started,
+                ended_at_us: Some(ended),
+            }],
+            now,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(summary.repaired.is_empty(), "{summary:?}");
+        assert_eq!(summary.skipped[0].reason, SessionTimesSkipReason::Unchanged);
+        assert_eq!(session_times(&conn, sid), (started, Some(ended)));
+    }
+
+    /// S3: a closed session whose candidate omits `ended_at_us` (leaving the
+    /// stored end alone) must still be refused when its proposed `started_at`
+    /// would land after that surviving end — an omitted end must not let a
+    /// candidate invert the row by the back door.
+    #[test]
+    fn repair_session_times_refuses_a_start_past_the_surviving_end() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        let old_started: i64 = 2_000_000_000_000_000; // far in the future of `ended`
+        let old_ended: i64 = 1_000_000_000_000_000;
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        conn.execute(
+            "UPDATE sessions SET started_at = ?1, ended_at = ?2 WHERE id = ?3",
+            params![old_started, old_ended, &sid.as_bytes()[..]],
+        )
+        .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        // No `ended_at_us`: the stored `ended_at` (1_000_000_000_000_000)
+        // survives, but this proposed start sits after it.
+        let candidate = SessionTimesCandidate {
+            session_id: sid,
+            started_at_us: 1_500_000_000_000_000,
+            ended_at_us: None,
+        };
+
+        let summary =
+            repair_session_times(&mut conn, ws, proj, &[candidate], now, None, true).unwrap();
+        assert!(summary.repaired.is_empty(), "{summary:?}");
+        assert_eq!(
+            summary.skipped[0].reason,
+            SessionTimesSkipReason::InvertedTimes
+        );
+        assert_eq!(session_times(&conn, sid), (old_started, Some(old_ended)));
     }
 
     /// Embeddings are keyed by page_id (PK). Re-storing for the same
