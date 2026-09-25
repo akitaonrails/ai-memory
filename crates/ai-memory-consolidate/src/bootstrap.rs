@@ -734,6 +734,27 @@ pub fn discover_repo_root(start: &Path) -> Result<PathBuf, BootstrapError> {
         .ok_or_else(|| BootstrapError::NotARepo(start.to_path_buf()))
 }
 
+/// URLs of the `upstream` and `origin` remotes of the repository containing
+/// `start`, for resolving its repository identity (#708).
+///
+/// Only those two names are read. Remote names are personal, so picking some
+/// other one would give the same repository a different identity per person;
+/// see `ai_memory_core::repository_identity`. A linked worktree reads the
+/// main repository's remotes, which it shares. `(None, None)` when `start` is
+/// not inside a repository.
+#[must_use]
+pub fn read_identity_remotes(start: &Path) -> (Option<String>, Option<String>) {
+    let Ok(repo) = git2::Repository::discover(start) else {
+        return (None, None);
+    };
+    let url = |name: &str| {
+        repo.find_remote(name)
+            .ok()
+            .and_then(|remote| remote.url().ok().map(str::to_owned))
+    };
+    (url("upstream"), url("origin"))
+}
+
 /// Like [`discover_repo_root`], but when `start` is inside a git
 /// worktree the function follows the `.git` commondir pointer back to
 /// the **main** repository root rather than returning the worktree's
