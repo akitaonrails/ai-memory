@@ -184,6 +184,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feedback-loop guard stays non-overridable. (#894)
 
 ### Fixed
+- A Kiro v3 resume that falls back to the default session store drops
+  `KIRO_HOME` from the child, but auto-wire still installed hooks and MCP
+  under `KIRO_HOME`; it now wires the default home that resume reads. (#820)
 - `ai-memory run` auto-wired only the first config home per agent and
   version: its sentinel ignored where hooks and MCP were installed, so a second
   account (another exported `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...) was

@@ -528,7 +528,8 @@ transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
 checks the configured v3 root first and that default root as a compatibility
 fallback. If a linked session exists only in the fallback, ai-memory removes
 `KIRO_HOME` for that one resume so Kiro can find the session; Kiro consequently
-uses its default-home v3 settings/hooks for that process. Fresh launches and
+uses its default-home v3 settings/hooks for that process, and first-launch
+auto-wire wires that default home rather than `KIRO_HOME`. Fresh launches and
 versions that store the session below the configured root keep `KIRO_HOME`
 unchanged. Every candidate still needs exact id, schema, and checkout metadata.
 The v2 `--yolo` translation is `--trust-all-tools`; an explicit narrower
