@@ -738,6 +738,13 @@ pub async fn drain_with_live_token(
                             PostOutcome::Failed => {
                                 bump_or_drop(path, entry, &mut result);
                             }
+                            PostOutcome::Refused => {
+                                // Never retried: see `PostOutcome::Refused`.
+                                // Dropped rather than charged an attempt, so
+                                // it cannot sit in the spool being re-sent.
+                                let _ = std::fs::remove_file(path);
+                                result.dropped += 1;
+                            }
                             PostOutcome::Unreachable => {
                                 // Same reasoning as the batch arm: the address
                                 // is dead, not the entry. Charge it once, then
@@ -915,6 +922,11 @@ pub async fn drain_with_live_token(
                 }
                 PostOutcome::Saturated => {
                     result.remaining += 1;
+                }
+                PostOutcome::Refused => {
+                    // Terminal; see `PostOutcome::Refused`.
+                    let _ = std::fs::remove_file(path);
+                    result.dropped += 1;
                 }
                 PostOutcome::Failed => {
                     bump_or_drop(&path, &entry, &mut result);

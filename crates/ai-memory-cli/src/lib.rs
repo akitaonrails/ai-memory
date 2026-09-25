@@ -169,6 +169,7 @@ pub async fn run() -> Result<()> {
         Command::Auth(args) => commands::auth::run(&config, args).await,
         Command::User(args) => commands::user::run(&config, args).await,
         Command::ApiKey(args) => commands::api_key::run(&config, args).await,
+        Command::Project(args) => commands::project::run(&config, args).await,
         // `Completions` is handled in the fast-path above (before config/tracing).
         Command::Completions(args) => commands::completions::run(args),
     }
