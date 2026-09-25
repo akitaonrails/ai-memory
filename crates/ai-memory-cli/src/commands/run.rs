@@ -3113,6 +3113,7 @@ mod tests {
     /// A mock workstream server for launches driven through `run_from`: it
     /// prepares a run, linked to `native_session_id` when one is given, and
     /// accepts the link and the finish.
+    #[cfg(unix)]
     async fn mock_workstream_server(
         native_session_id: Option<&'static str>,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -3170,6 +3171,7 @@ mod tests {
         (script, captured)
     }
 
+    #[cfg(unix)]
     fn launch_config(home: &Path, data: &Path, address: std::net::SocketAddr) -> Config {
         let mut config = Config::load(None, Some(home.to_path_buf())).unwrap();
         config.data_dir = data.to_path_buf();
@@ -3179,6 +3181,7 @@ mod tests {
         config
     }
 
+    #[cfg(unix)]
     fn run_args(
         harness: RunHarnessChoice,
         executable: PathBuf,
