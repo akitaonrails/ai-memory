@@ -34,11 +34,14 @@
 mod slow {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
 
-    use crate::e2e_support::{hermetic, run_cli, session_count, start_serve, write_jsonl};
+    use crate::e2e_support::{
+        ServerGuard, free_port, hermetic, run_cli, session_count, write_jsonl,
+    };
 
     const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
     const WORKSPACE: &str = "backfill-e2e-ws";
@@ -159,28 +162,51 @@ mod slow {
         // Start the real server (loopback, no auth, hermetic: no embedder, no
         // wiki watcher — a machine-global inotify instance concurrent server
         // children can exhaust, #745).
+        let port = free_port();
+        let base = format!("http://127.0.0.1:{port}");
+        let server = ServerGuard(
+            hermetic(BIN)
+                .args([
+                    "serve",
+                    "--transport",
+                    "http",
+                    "--bind",
+                    &format!("127.0.0.1:{port}"),
+                    "--workspace",
+                    WORKSPACE,
+                    "--project",
+                    PROJECT,
+                    "--no-watcher",
+                ])
+                .current_dir(&cwd)
+                .env("AI_MEMORY_DATA_DIR", data_dir.path())
+                .env("AI_MEMORY_HOME", home.path())
+                .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+                .env("RUST_LOG", "off")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn serve"),
+        );
+
         let client = reqwest::Client::new();
-        let (server, base) = start_serve(&client, &data_dir.path().join("serve.log"), |port| {
-            let mut cmd = hermetic(BIN);
-            cmd.args([
-                "serve",
-                "--transport",
-                "http",
-                "--bind",
-                &format!("127.0.0.1:{port}"),
-                "--workspace",
-                WORKSPACE,
-                "--project",
-                PROJECT,
-                "--no-watcher",
-            ])
-            .env("AI_MEMORY_DATA_DIR", data_dir.path())
-            .env("AI_MEMORY_HOME", home.path())
-            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
-            cmd.current_dir(&cwd);
-            cmd
-        })
-        .await;
+
+        // Wait for the server to accept connections.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if client
+                .get(format!("{base}/mcp"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "server never became reachable");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
 
         // Phase 1 — the store is empty before backfill.
         assert_eq!(
