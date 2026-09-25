@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Inert per-project-authorization schema and the `authorize_project` choke
+  point (first slice of #708). A new `project_grants` table
+  (`(workspace, project, user) -> read|write`) and a `projects.access_mode`
+  column (`open` | `restricted`, default `open`) are added additively — every
+  existing project stays `open`, so there is no behaviour change. The typed
+  `authorize_project` gate (consulted by `ScopeResolver` read/write resolution
+  and, as defense in depth, by the writer actor) short-circuits `open`
+  projects and single-user/loopback deployments to ALLOW, and degrades to open
+  when grants cannot be read (never a lockout). A `restricted` project with
+  zero grants still admits root and the creator. Because nothing sets
+  `restricted` yet, this is a pure pass-through; enforcing `restricted` across
+  the unscoped-read and raw-id bypass classes plus the root-only management
+  surface (setting `restricted`, issuing grants) follow in a later slice. (#708)
 - Native `ai-memory upgrade` for GitHub-release installs (Linux/macOS
   tarballs and Windows x86_64 zip): downloads the matching release archive,
   verifies the `.sha256` sidecar, replaces the on-disk binary (and a sibling

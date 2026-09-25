@@ -9017,6 +9017,50 @@ impl ReaderPool {
         self.with_conn(move |conn| crate::maintenance::last_success(conn, job))
             .await
     }
+
+    /// Resolve the per-project authorization state (#708) from the read pool.
+    ///
+    /// An `open` project short-circuits without a grant lookup; a `restricted`
+    /// project whose grants cannot be read degrades to `open` (never fail
+    /// closed). See [`crate::project_authz`].
+    pub async fn resolve_project_authz(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        principal: crate::ProjectPrincipal,
+        distinguishes_operators: bool,
+    ) -> StoreResult<crate::ProjectAuthz> {
+        self.with_conn(move |conn| {
+            crate::project_authz::resolve_project_authz(
+                conn,
+                workspace_id,
+                project_id,
+                &principal,
+                distinguishes_operators,
+            )
+        })
+        .await
+    }
+
+    /// The per-project authorization choke point (#708), evaluated on the read
+    /// pool: resolve the project's access state and decide `need`.
+    ///
+    /// Returns `Ok(Ok(()))` when the caller is admitted, `Ok(Err(Forbidden))`
+    /// when a restricted project refuses them, and `Err(_)` only on an
+    /// infrastructure failure.
+    pub async fn authorize_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        principal: crate::ProjectPrincipal,
+        distinguishes_operators: bool,
+        need: crate::ProjectAccess,
+    ) -> StoreResult<Result<(), ai_memory_core::AuthzError>> {
+        let ctx = self
+            .resolve_project_authz(workspace_id, project_id, principal, distinguishes_operators)
+            .await?;
+        Ok(ctx.authorize(need))
+    }
 }
 
 /// Build the bounded history query and its optional owner binding.

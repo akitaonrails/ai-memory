@@ -1,8 +1,20 @@
 # Design proposal: per-project authorization for multi-user servers (#708)
 
-**Status: proposal for review — not implemented.** This is the design pass promised
-on #708 before any code lands. It changes a security boundary, so it is deliberately
-separated from implementation.
+**Implementation status.** Slice 2 has landed: the inert V67 schema
+(`project_grants` + `projects.access_mode`, default `open`) and the
+`authorize_project` choke point (`ai-memory-store/src/project_authz.rs`),
+wired into `ScopeResolver` read/write resolution and the writer actor. It is
+always-allow (no project is `restricted` yet), so there is no behaviour change.
+**Slice 3 is pending** and is what makes `restricted` safe end-to-end: closing
+the two bypass classes below (unscoped/global reads filtered before `LIMIT`;
+raw-id entry points resolving through `authorize_project`), the root-only
+management surface (setting `restricted`, issuing grants), and a
+`projects.created_by` source for the creator check. Sections below are the
+original design pass, retained as the spec.
+
+**Original status: proposal for review — not implemented.** This was the design
+pass promised on #708 before any code lands. It changes a security boundary, so
+it is deliberately separated from implementation.
 
 ## Problem
 
