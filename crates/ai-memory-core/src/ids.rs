@@ -93,6 +93,20 @@ id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review ru
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
 id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");
 
+impl SessionId {
+    /// Resolve a harness-native session id to the `SessionId` the store keys
+    /// on: a UUID native id is used as-is (canonicalized); any other string
+    /// (Codex, OpenCode, ...) is hashed to a deterministic UUID v5. The hook
+    /// router and any offline tool that matches transcripts by native id
+    /// (e.g. `ai-memory repair-backfill-timestamps`) must agree on this one
+    /// rule to end up with the same key.
+    #[must_use]
+    pub fn from_native(raw: &str) -> Self {
+        raw.parse::<Self>()
+            .unwrap_or_else(|_| Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
+    }
+}
+
 /// Relative path of a page within the wiki tree.
 ///
 /// Always uses `/` as the separator (POSIX-style), normalised on construction.
@@ -443,6 +457,28 @@ mod tests {
     fn page_path_rejects_dot_segments() {
         assert!(PagePath::new("a/./b").is_err());
         assert!(PagePath::new("a/../b").is_err());
+    }
+
+    /// A UUID native id round-trips as-is; a non-UUID native id (Codex,
+    /// OpenCode) hashes to a deterministic UUID v5, so hook capture and any
+    /// offline tool matching transcripts by native id agree on one key.
+    #[test]
+    fn session_id_from_native_hashes_non_uuid_ids_and_passes_uuids_through() {
+        let uuid_native = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(SessionId::from_native(uuid_native).to_string(), uuid_native);
+
+        let non_uuid_native = "codex-native-id-123";
+        let expected = SessionId(Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            non_uuid_native.as_bytes(),
+        ));
+        assert_eq!(SessionId::from_native(non_uuid_native), expected);
+        // Deterministic: repeated calls (and hence repeated hook deliveries,
+        // or a repeated repair run) must resolve to the same id.
+        assert_eq!(
+            SessionId::from_native(non_uuid_native),
+            SessionId::from_native(non_uuid_native)
+        );
     }
 
     #[test]

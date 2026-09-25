@@ -42,6 +42,11 @@ pub enum Command {
     /// mid-project doesn't start amnesiac. No-op once the store has any
     /// sessions unless `--force`.
     Backfill(BackfillArgs),
+    /// Correct `sessions.started_at`/`ended_at` for sessions that `backfill`
+    /// already imported before it carried the transcript's own event times,
+    /// by re-reading the local transcripts and matching them by session id.
+    /// Dry-run by default; `--confirm` applies.
+    RepairBackfillTimestamps(RepairBackfillTimestampsArgs),
     /// Launch an agent in an opt-in, cross-harness managed workstream.
     /// Native arguments are forwarded except exact wrapper flags such as
     /// `--yolo` and `--fresh`.
@@ -1414,6 +1419,33 @@ pub struct BackfillArgs {
     /// been attempted for this checkout. Not for interactive use.
     #[arg(long, hide = true)]
     pub auto: bool,
+}
+
+/// Arguments for `repair-backfill-timestamps`.
+///
+/// A thin client like every other lifecycle command: it reads the local
+/// transcripts (read-only, reusing `backfill`'s own discovery) to compute
+/// candidate `started_at`/`ended_at` values, then posts them to
+/// `POST /admin/repair-session-times`, which validates each one against the
+/// scope and the backfill bug's own signature, and applies (or, without
+/// `--confirm`, only reports) the change.
+#[derive(Debug, Args)]
+pub struct RepairBackfillTimestampsArgs {
+    /// Workspace name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Apply the computed times. Without this flag the command only reports
+    /// what would change (sessions repaired/skipped, by reason, plus the
+    /// before/after date range) — the server runs the write inside a
+    /// rolled-back transaction, so this is a real dry run, not an estimate.
+    #[arg(long)]
+    pub confirm: bool,
+    /// Emit the server's report(s) as JSON instead of the human summary.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `doctor`.

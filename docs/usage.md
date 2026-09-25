@@ -459,6 +459,23 @@ The session, its observations, handoffs, consolidation jobs and its
 [`docs/lifecycle-ops.md`](lifecycle-ops.md#move-session) for the page modes,
 guards, and what stays behind.
 
+## Repair backfilled session timestamps
+
+A `backfill` run from before it carried the transcript's own event time dates
+every imported session at import time, flattening the whole imported history
+onto one day. Re-reading the local transcripts corrects it:
+
+```bash
+ai-memory repair-backfill-timestamps --project my-app            # dry run
+ai-memory repair-backfill-timestamps --project my-app --confirm  # apply
+```
+
+It matches transcripts to sessions by id, never touches `observations` or
+pages, never assigns an end time to a still-open session, and never proposes
+a time in the future; see
+[`docs/lifecycle-ops.md`](lifecycle-ops.md#repair-backfill-timestamps) for the
+validation rules and the exact request/response shape.
+
 ## Project consolidation preferences
 
 Create `_prompts/consolidation.md` in a project's wiki when its compiled pages

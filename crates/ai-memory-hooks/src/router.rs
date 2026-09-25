@@ -30,7 +30,6 @@ use axum::routing::{get, post};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::capture_policy::{
     CaptureConfig, CaptureDisposition, CapturePolicy, CaptureProtocol, CaptureSource, PolicyState,
@@ -1349,7 +1348,7 @@ async fn fetch_and_accept_handoff(
         .session_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .map(resolve_native_session_id);
+        .map(SessionId::from_native);
     let receiving_session = if handoff.is_some() {
         match accepting_session {
             Some(id) => Some(NewSession {
@@ -3069,19 +3068,12 @@ fn parse_session_owner(owner: Option<String>) -> anyhow::Result<Option<IdentityK
 
 fn resolve_session_id(env: &HookEnvelope) -> anyhow::Result<SessionId> {
     if let Some(raw) = &env.session_id {
-        return Ok(resolve_native_session_id(raw));
+        return Ok(SessionId::from_native(raw));
     }
     if matches!(env.event, HookEvent::SessionStart) {
         return Ok(SessionId::new());
     }
     anyhow::bail!("hook payload missing session_id and event is not session-start")
-}
-
-fn resolve_native_session_id(raw: &str) -> SessionId {
-    // Accept either a UUID (canonical) or any string, hashing the latter to a
-    // deterministic UUID v5 so hook POSTs and startup GETs share one key.
-    SessionId::from_str(raw)
-        .unwrap_or_else(|_| SessionId(Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes())))
 }
 
 /// A session is substantive iff it logged at least one `UserPrompt`,
@@ -10401,7 +10393,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             accepted.lifecycle.accepted_by_session,
-            Some(resolve_native_session_id(empty_sid))
+            Some(SessionId::from_native(empty_sid))
         );
 
         for event in ["session-start", "session-end"] {
@@ -13245,7 +13237,7 @@ mod tests {
         .await
         .unwrap();
 
-        let session_id = resolve_native_session_id(session);
+        let session_id = SessionId::from_native(session);
         let summary = state
             .reader
             .session_summary_scoped(

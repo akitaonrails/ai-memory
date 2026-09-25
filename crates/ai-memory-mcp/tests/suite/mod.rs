@@ -15,6 +15,7 @@ mod admin_provider_error_logging;
 mod admin_purge;
 mod admin_read_page;
 mod admin_rename;
+mod admin_repair_session_times;
 mod admin_status_search;
 mod admin_write_page;
 mod agent_messages_briefing;

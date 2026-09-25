@@ -68,6 +68,7 @@ pub mod rename_project;
 pub mod rename_workstream;
 pub mod render_shared;
 pub mod reorg;
+pub mod repair_backfill_timestamps;
 pub mod reset;
 pub mod restore;
 pub mod restore_page;
