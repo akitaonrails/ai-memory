@@ -97,6 +97,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (not bare JSON 401), forms call existing `POST /auth/login` /
   `/auth/password` / `/auth/logout`, and `--web-ui-dir` custom SPAs stay
   unchanged. (#811)
+- `[consolidation] input_token_safety_margin` (float, default `0.8`, validated
+  to `(0.0, 1.0]`) scales the approximate char-count input budget. The
+  `max_input_tokens` budget uses a flat chars-per-token heuristic that
+  under-budgets denser corpora — pt-BR text and source code tokenize at fewer
+  chars per token than English and could overshoot a provider's real input
+  limit by ~40%. The default tightens the common case modestly while leaving
+  such corpora headroom; lower it further for a mostly non-English or code
+  corpus. `max_input_tokens` is now documented as an approximate heuristic in
+  the config reference. (#884)
 - `docs/jev-reranker-adapter.md` documents a stdlib-only adapter
   (`docs/examples/jev-reranker-adapter/jev_rerank_shim.py`) that serves the
   `AI_MEMORY_RERANKER=llm` request leg from a Jev `/v1/systemone` judge
@@ -153,6 +162,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanup; an explicit `session.moved` rebinds the live session to its new
   directory so its later end lands there. Checked against OpenCode 2.0.14. (#865)
 
+### Changed
+- Quieted the default server log: the reconciliation-pass summary that fired
+  every 30 s regardless of activity dropped from `info` to `debug`, and the
+  default log filter now pins the external `rmcp` MCP SDK to `warn` (its
+  per-request lifecycle logging at `info` was the other half of a near-empty
+  server's log). Both are restorable through `log_level` (e.g.
+  `"info,rmcp=info"` or `"debug"`) or `RUST_LOG`; the `tracing_appender=warn`
+  feedback-loop guard stays non-overridable. (#894)
+
 ### Fixed
 - Native `ai-memory upgrade` no longer refuses every Linux install by probing
   the running executable for write (Linux `ETXTBSY`); it only requires the
@@ -180,6 +198,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the new query/document prefixes above) embedded the search query on the
   document side instead of the query side. Indexed writes are unchanged;
   only the query-side helper moves onto the query task. (#859, #861)
+- A manual `memory_consolidate` now reconciles the session's durable
+  consolidation job row. The MCP handler wrote the page directly through the
+  consolidator without touching `session_consolidation_jobs`, so a session
+  whose automatic SessionEnd job had reached the terminal `failed` state (that
+  the worker never re-claims) kept showing `failed` even though the operator
+  had just consolidated it. After a successful, non-dry consolidate the handler
+  flips a `failed`/`pending`/`superseded` row for the session to `completed`; a
+  live `running` lease is never touched, so a concurrent automatic worker
+  attempt is left to settle its own row. (#890)
+- Tool-family labels no longer leak into automatic handoffs and session-page
+  titles, and the file-activity handoff warning fires again. Every closed-tool
+  agent stores a call's title as `tool file` / `tool non-file` / … (a partition
+  of the calls, not a tool name); these were surfacing verbatim as `Tools used:
+  tool file, tool non-file` in handoffs and, for a session whose only non-prompt
+  observation was such a call, as the page title. The same spelling meant the
+  "session ended without a normal stop while working with files" heuristic —
+  which only matched the bare `file` spelling of the minority reserved-protocol
+  path — never fired for a real session. A shared recognizer now maps both
+  spellings, drops the labels from the handoff tool list and the title fallback,
+  and drives the file-activity warning from either. (#895)
+- Generated rule slugs (`_rules/<slug>.md`) now fold Latin diacritics to ASCII
+  instead of turning each accented letter into a hyphen: `estável` slugs as
+  `estavel` (was `est-vel`) and `retenção` as `retencao` (was `reten-o`). Long
+  titles are also truncated at a word boundary (the last hyphen inside the
+  60-char budget) rather than mid-word. Uses the icu_normalizer NFD
+  decomposition ai-memory-core already depends on; no new dependency. (#886)
+- Multi-page consolidation now stores page paths with a `.md` extension.
+  The LLM returns a bare path for a non-rule page (`decisions/smart-model-luna`),
+  and the shared path sanitizer passed it through verbatim, so the page landed
+  extensionless and read back as a non-portable wiki path. The sanitizer now
+  appends `.md` to the filename component when it is missing (idempotent,
+  case-insensitive), fixing the non-rule consolidation, bootstrap, and
+  auto-improve front doors at once. (#885)
+- `ai-memory run`'s auto-wire no longer overwrites an installed session-aware
+  Claude Code MCP bridge with the static HTTP registration. The auto-wire
+  sentinel is keyed by client version, so the MCP step re-ran on every upgrade
+  and replaced the `ai-memory` entry wholesale; a user who had run `install-mcp
+  --client claude-code --session-aware` lost the bridge on the next `ai-memory
+  run` after an upgrade, silently disabling `[auto_scope] per_session` for their
+  MCP calls. Auto-wire now detects an existing session-aware bridge and keeps
+  it. (#888)
+- After a managed launch, `ai-memory run` imported the newest native session
+  in the checkout even when a hook in the launched harness had linked the
+  run's own session, so a concurrent launch in the same checkout could hand it
+  another transcript. The server now records when a session is linked during
+  a run (schema migration V67, adding `managed_runs.native_session_linked_at`)
+  and reports it in the run status, and the launcher imports that session
+  when this checkout's store holds it (a process the child starts inherits
+  the run id; OpenCode is checked by the session's recorded directory). An
+  older server reports no link and keeps the previous behavior. (#820)
+- On Windows, OpenCode 1 and 2 sessions are found again from their checkout:
+  OpenCode records a session's directory with forward slashes
+  (`C:/Users/me/repo`), so matching only the backslash checkout path found
+  none. `ai-memory doctor` reported `0 local` for OpenCode while it captured
+  sessions there, and `ai-memory run` / `show` could neither discover nor list
+  a native OpenCode session to resume. (#882)
+- Grok Build CLI hooks capture on Windows again. Grok evaluates
+  `~/.grok/hooks/*.json` commands with PowerShell, as Codex does (#515), so
+  the double-quoted executable path in command position parsed as a string
+  expression and every hook exited 1 with a ParserError: sessions ran with
+  the hook installed and nothing was captured. The Windows command now
+  carries PowerShell's `&` call operator for Grok too; re-run
+  `ai-memory install-hooks --agent grok --apply` to rewrite an existing
+  install. (#887)
 - The Linux/macOS Docker wrapper now keeps its native host client in
   `${XDG_DATA_HOME:-~/.local/share}/ai-memory/native-runner` instead of
   `~/.cache/ai-memory/native-runner`. `ai-memory run` auto-wires hooks whose
@@ -320,6 +402,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   events written in the same millisecond, and a host that tears its capture
   state down cancels still-pending deliveries after the drain budget instead
   of waiting out each request's timeout. (#865)
+- Shell hooks on macOS no longer corrupt non-ASCII characters in the query
+  string. `/bin/sh` there is bash 3.2, which sign-extends bytes >= 0x80, so
+  `ai_memory_url_encode` sent `é` as `%FFFFFFFFFFFFFFC3%FFFFFFFFFFFFFFA9`
+  instead of `%C3%A9`. An accented cwd reached the server as a different
+  path, and Cursor events and the session-start handoff lookup both use the
+  query `cwd`. (#877)
 
 ## [2.4.0] - 2026-09-21
 

@@ -17,7 +17,8 @@ use ai_memory_workstream::{
     discover_native_session, export_transcript, has_native_session_selector, inspect_repository,
     kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
     kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
-    list_native_sessions, native_session_exists, wait_for_transcript_flush,
+    list_native_sessions, native_session_exists, native_session_in_checkout,
+    wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -658,10 +659,29 @@ async fn resolve_native_session_after_run(
     if let Some(native_session_id) = &plan.expected_session_id {
         return Ok(Some(native_session_id.clone()));
     }
+    // A session linked under this run's id was reported by this run's child,
+    // which a concurrent launch in the same checkout cannot do; discovery
+    // only sees the newest session there. A descendant process inherits the
+    // id too, so the session must also be this checkout's.
+    let linked = server_status
+        .filter(|status| status.native_session_linked)
+        .and_then(|status| status.native_session_id.as_deref());
+    if let Some(linked) = linked
+        && native_session_in_checkout(harness, home, cwd, plan.session_dir.as_deref(), linked)
+            .unwrap_or(false)
+    {
+        return Ok(Some(linked.to_string()));
+    }
     let discovered =
         discover_native_session(harness, home, cwd, plan.session_dir.as_deref(), started_at)
             .await?;
-    Ok(discovered.or_else(|| server_status.and_then(|status| status.native_session_id.clone())))
+    // A linked session set aside above belongs to another checkout, so it is
+    // no fallback either.
+    Ok(discovered.or_else(|| {
+        server_status
+            .and_then(|status| status.native_session_id.clone())
+            .filter(|reported| Some(reported.as_str()) != linked)
+    }))
 }
 
 async fn list_auto_sessions(home: &Path, cwd: &Path) -> Result<Vec<AutoSessionCandidate>> {
@@ -2509,6 +2529,91 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("--fresh cannot be combined"));
+    }
+
+    /// A session linked during the run was reported by this run's child, so
+    /// it wins over a newer session another launch made in the same checkout,
+    /// even when it repeats the session the run was prepared with. A child's
+    /// own descendants inherit the run id, so a linked session this checkout
+    /// does not hold is set aside. Without a link, discovery still decides.
+    #[tokio::test]
+    async fn a_session_linked_during_the_run_wins_over_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let session_root = temp.path().join(".codex/sessions/2026/01/01");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&session_root).unwrap();
+        let started_at = SystemTime::now();
+        let rollout = |name: &str, id: &str, cwd: &Path| {
+            std::fs::write(
+                session_root.join(format!("rollout-{name}.jsonl")),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type": "session_meta",
+                        "payload": {"id": id, "cwd": cwd}
+                    })
+                ),
+            )
+            .unwrap();
+        };
+        rollout("prepared", "prepared", &cwd);
+        rollout("nested", "nested", &temp.path().join("other-checkout"));
+        rollout("concurrent", "concurrent-newer", &cwd);
+        let plan = build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
+        let status = |linked: bool, native: &str| ManagedRunStatus {
+            run_id: ManagedRunId::new(),
+            workstream_id: WorkstreamId::new(),
+            agent: AgentKind::Codex,
+            native_session_id: Some(native.to_string()),
+            native_session_linked: linked,
+            context_delivered: true,
+            state: "active".to_string(),
+        };
+        for (linked, native, expected) in [
+            (true, "prepared", Some("prepared")),
+            (false, "prepared", Some("concurrent-newer")),
+            (true, "nested", Some("concurrent-newer")),
+        ] {
+            let status = status(linked, native);
+            assert_eq!(
+                resolve_native_session_after_run(
+                    &plan,
+                    ManagedHarness::Codex,
+                    temp.path(),
+                    &cwd,
+                    started_at,
+                    Some(&status),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                expected,
+                "linked={linked} native={native}"
+            );
+        }
+        // With nothing to discover here, the other checkout's session is not
+        // taken as a fallback either; an unlinked report still is.
+        let empty = temp.path().join("empty-checkout");
+        std::fs::create_dir_all(&empty).unwrap();
+        for (linked, expected) in [(true, None), (false, Some("nested"))] {
+            let status = status(linked, "nested");
+            assert_eq!(
+                resolve_native_session_after_run(
+                    &plan,
+                    ManagedHarness::Codex,
+                    temp.path(),
+                    &empty,
+                    started_at,
+                    Some(&status),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                expected,
+                "linked={linked}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@ use ai_memory_core::{
     NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId,
     owner_stamp,
 };
-use ai_memory_store::Store;
+use ai_memory_store::{PrepareWorkstreamRun, Store, WorkstreamSelection};
 
 fn operator(name: &str) -> String {
     IdentityKey::User(name.into()).storage_key()
@@ -730,5 +730,73 @@ async fn startup_claim_rechecks_the_source_and_sweeps_only_quiet_open_batons() {
         state(busy).await,
         HandoffState::Open,
         "a session in use keeps its baton even when it is older"
+    );
+}
+
+/// Two workstreams launched at once in one checkout each get a managed run.
+/// A session one run's child links marks that run only: the other run's
+/// status must neither report it nor count as linked, or its launcher would
+/// import the other launch's transcript.
+#[tokio::test]
+async fn a_session_linked_by_one_managed_run_is_not_another_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let prepare = |name: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "repo".into(),
+        worktree_fingerprint: "worktree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New(name.into()),
+        lease_owner: format!("launcher-{name}"),
+    };
+    let alpha = store
+        .writer
+        .prepare_workstream_run(prepare("alpha"))
+        .await
+        .unwrap();
+    let beta = store
+        .writer
+        .prepare_workstream_run(prepare("beta"))
+        .await
+        .unwrap();
+    assert_ne!(alpha.workstream_id, beta.workstream_id);
+    let status = async |run| {
+        let status = store.reader.managed_run_status(run).await.unwrap().unwrap();
+        (status.native_session_id, status.native_session_linked)
+    };
+
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(beta.run_id, AgentKind::Codex, "native-beta")
+            .await
+            .unwrap()
+    );
+    assert_eq!(status(alpha.run_id).await, (None, false));
+    assert_eq!(
+        status(beta.run_id).await,
+        (Some("native-beta".into()), true)
+    );
+
+    // Control: alpha's own link marks alpha, and leaves beta as it was.
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(alpha.run_id, AgentKind::Codex, "native-alpha")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        status(alpha.run_id).await,
+        (Some("native-alpha".into()), true)
+    );
+    assert_eq!(
+        status(beta.run_id).await,
+        (Some("native-beta".into()), true)
     );
 }

@@ -217,6 +217,10 @@ pub(crate) enum WriteCmd {
         job: SessionConsolidationJob,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    ReconcileSessionConsolidationCompleted {
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
@@ -1207,6 +1211,22 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ReleaseSessionConsolidation { job, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Reconcile a session's durable consolidation job row to `completed` after
+    /// a manual `memory_consolidate` produced the page out-of-band. Never
+    /// touches a `running` lease. Returns the number of rows updated.
+    pub async fn reconcile_session_consolidation_completed(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReconcileSessionConsolidationCompleted {
+            session_id,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -2986,6 +3006,13 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::ReleaseSessionConsolidation { job, reply } => {
                 let result = crate::session_consolidation::release(&mut conn, &job);
                 send_or_warn(reply, result, "release_session_consolidation");
+            }
+            WriteCmd::ReconcileSessionConsolidationCompleted { session_id, reply } => {
+                let result =
+                    crate::session_consolidation::reconcile_session_consolidation_completed(
+                        &mut conn, session_id,
+                    );
+                send_or_warn(reply, result, "reconcile_session_consolidation_completed");
             }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);

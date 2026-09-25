@@ -352,6 +352,10 @@ assert_eq "url_encode escapes plus"       "a%2Bb"  "$(ai_memory_url_encode "a+b"
 assert_eq "url_encode escapes Windows cwd" "C%3A%5Cdev%5Cmyproject" \
     "$(ai_memory_url_encode 'C:\dev\myproject')"
 assert_eq "url_encode encodes UTF-8 per byte" "r%C3%A9po" "$(ai_memory_url_encode 'répo')"
+# macOS /bin/sh is bash 3.2, which sign-extends bytes >= 0x80 in `printf "'c"`.
+assert_eq "url_encode encodes an accented macOS path" \
+    "%2FUsers%2Fme%2F%C3%81rea%20de%20Trabalho" \
+    "$(ai_memory_url_encode '/Users/me/Área de Trabalho')"
 
 # --- offline spool ----------------------------------------------------
 # The spool dir follows the data dir, which the harness pins inside $TMP.

@@ -3261,7 +3261,14 @@ fn build_auto_handoff(
                     prompts.push(text.to_string());
                 }
             }
-            ObservationKind::PostToolUse | ObservationKind::PreToolUse if !obs.title.is_empty() => {
+            // Skip `tool <family>` / bare-`<family>` labels: a family is a
+            // partition of the calls, not a name for a tool, so "Tools used:
+            // tool file, tool non-file" tells the receiver nothing. Only a
+            // harness's own tool name is worth listing.
+            ObservationKind::PostToolUse | ObservationKind::PreToolUse
+                if !obs.title.is_empty()
+                    && crate::payload::tool_family_from_title(&obs.title).is_none() =>
+            {
                 tools.insert(obs.title.as_str());
             }
             _ => {}
@@ -3373,10 +3380,12 @@ fn derive_open_questions(
     // abnormally while working in the tree.
     //
     // The signal is the tool *family*, not the tool name. A PostToolUse
-    // observation's title is `canonical_tool_name(tool_family)`, which is
-    // only ever "file" / "search-list" / "non-file" / "unknown" — the
-    // reserved protocol deliberately carries no raw tool names. Matching
-    // "edit"/"write"/"patch" against that title can never succeed.
+    // observation's title carries the family in one of two spellings: the
+    // majority path (every closed-tool agent) writes `safe_tool_title`'s
+    // `"tool file"` / `"tool non-file"` / …, while the reserved-protocol
+    // path writes the bare `canonical_tool_name` form `"file"` / …. Both
+    // must match here, and `tool_family_from_title` recognises both; a raw
+    // tool name ("edit"/"write"/"patch") is neither and correctly does not.
     //
     // That same closed schema means read and write are indistinguishable:
     // `ToolFamily::File` covers both, and `ToolOutcome` is only
@@ -3384,7 +3393,8 @@ fn derive_open_questions(
     // made — only that the session touched files and then ended without a
     // normal Stop, which is worth telling the receiver either way.
     if let Some(tool) = last_tool {
-        let touched_files = tool.title == canonical_tool_name(ToolFamily::File);
+        let touched_files =
+            crate::payload::tool_family_from_title(&tool.title) == Some(ToolFamily::File);
         if touched_files && last_stop.is_none() {
             return vec![
                 "Session ended without a normal stop while working with files".into(),
@@ -13783,6 +13793,29 @@ mod tests {
         assert!(q[1].contains("working tree"), "got: {q:?}");
     }
 
+    /// The same file-activity heuristic, but for the *majority* spelling: every
+    /// closed-tool agent stores `safe_tool_title`'s `"tool file"`, not the bare
+    /// `canonical_tool_name` `"file"` of the reserved-protocol path. Before
+    /// #895 this spelling never matched, so the heuristic was dead for almost
+    /// every real session.
+    #[test]
+    fn open_questions_detects_abnormal_exit_after_prefixed_file_activity() {
+        let obs = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: unknown",
+            ),
+            // No Stop observation — session ended mid-task.
+        ];
+        let last = Some("fix the bug".to_string());
+        let q = derive_open_questions(&obs, &last);
+        assert_eq!(q.len(), 2, "got: {q:?}");
+        assert!(q[0].contains("without a normal stop"), "got: {q:?}");
+        assert!(q[1].contains("working tree"), "got: {q:?}");
+    }
+
     /// Guard against the regression this heuristic already had once: only
     /// titles the ingest path can actually produce may drive it, so a raw
     /// tool name must NOT trigger the file branch.
@@ -13800,6 +13833,66 @@ mod tests {
                  drive the file heuristic; got: {q:?}"
             );
         }
+    }
+
+    /// An automatic handoff built only from closed-tool observations (whose
+    /// titles are `safe_tool_title`'s `"tool file"` / `"tool non-file"` family
+    /// labels) must NOT emit a `Tools used:` line: a family is a partition of
+    /// the calls, not a name for a tool, so the label leaks nothing useful into
+    /// the handoff. A real tool name still produces the line (#895).
+    #[test]
+    fn auto_handoff_omits_tool_family_labels_from_tools_used() {
+        use ai_memory_core::{ProjectId, WorkspaceId};
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: unknown",
+            ),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file",
+                "tool_family: non-file\noutcome: success",
+            ),
+        ];
+        let handoff = build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            &observations,
+            None,
+        );
+        assert!(
+            handoff
+                .next_steps
+                .iter()
+                .all(|s| !s.starts_with("Tools used:")),
+            "family labels must not surface as a Tools used line; got: {:?}",
+            handoff.next_steps
+        );
+
+        // Control: a real harness tool name still produces the line.
+        let with_real_tool = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(ObservationKind::PostToolUse, "Edit", "edited main.rs"),
+        ];
+        let handoff = build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            &with_real_tool,
+            None,
+        );
+        assert!(
+            handoff.next_steps.iter().any(|s| s == "Tools used: Edit"),
+            "a real tool name must still be listed; got: {:?}",
+            handoff.next_steps
+        );
     }
 
     /// A search/list tool is file-adjacent but not file activity; it must

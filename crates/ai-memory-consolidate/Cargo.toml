@@ -16,6 +16,9 @@ ai-memory-core.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true
 ai-memory-llm.workspace = true
+# NFD diacritic folding for rule slugs (#886); the same crate/version
+# ai-memory-core already uses for `portable_page_key`, no new dependency.
+icu_normalizer.workspace = true
 git2.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

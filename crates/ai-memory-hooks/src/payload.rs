@@ -660,6 +660,23 @@ pub(crate) fn is_safe_tool_title(title: &str) -> bool {
     })
 }
 
+/// Map a stored observation title back to the [`ToolFamily`] it was derived
+/// from, recognising **both** spellings this crate emits for a family label:
+/// the bare `canonical_tool_name` form the reserved-protocol path writes
+/// ("file" / "search-list" / "non-file" / "unknown") and the `"tool "`-prefixed
+/// [`safe_tool_title`] form every closed-tool agent writes ("tool file", …).
+///
+/// Returns `None` for a harness's own raw tool name ("edit", "bash", "Read"),
+/// which is never one of these labels. That distinction is load-bearing: it is
+/// what keeps the family labels out of handoffs, titles, and the file-activity
+/// heuristic while a real tool name still flows through. Shares the serde
+/// representation with [`safe_tool_title`] and [`is_safe_tool_title`], so a new
+/// `ToolFamily` variant is recognised here without a second edit.
+pub(crate) fn tool_family_from_title(title: &str) -> Option<ToolFamily> {
+    let family = title.strip_prefix("tool ").unwrap_or(title);
+    serde_json::from_value::<ToolFamily>(serde_json::Value::String(family.to_owned())).ok()
+}
+
 fn safe_tool_body(
     event: HookEvent,
     metadata: Option<&ToolObservationMetadata>,
