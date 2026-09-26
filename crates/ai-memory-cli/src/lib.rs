@@ -130,6 +130,9 @@ pub async fn run() -> Result<()> {
         Command::Serve(args) => commands::serve::run(&config, args).await,
         Command::Reset(args) => commands::reset::run(&config, args),
         Command::Compact(args) => commands::compact::run(&config, args).await,
+        Command::ReclaimLedgerVersions(args) => {
+            commands::reclaim_ledger_versions::run(&config, args).await
+        }
         Command::Backup(args) => commands::backup::run(&config, args).await,
         Command::ExportOkf(args) => commands::export_okf::run(&config, args).await,
         Command::Restore(args) => commands::restore::run(&config, args),

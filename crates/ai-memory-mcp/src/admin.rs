@@ -28,6 +28,8 @@
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/compact`        — reclaim free pages; deletes nothing.
+//! - `POST /admin/reclaim-ledger-versions` — drop the superseded ledger
+//!   versions the pre-#660 indexer left behind, and nothing else.
 //! - `POST /admin/delete-workspace` — delete a workspace and its projects
 //!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
 //! - `POST /admin/merge-workspace` — fold every project of one workspace into
@@ -683,6 +685,10 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/move-session", post(handle_move_session))
         .route("/admin/delete-workspace", post(handle_delete_workspace))
         .route("/admin/compact", post(handle_compact))
+        .route(
+            "/admin/reclaim-ledger-versions",
+            post(handle_reclaim_ledger_versions),
+        )
         .route("/admin/rename-workspace", post(handle_rename_workspace))
         .route("/admin/merge-workspace", post(handle_merge_workspace))
         .route("/admin/write-page", post(handle_write_page))
@@ -4524,6 +4530,98 @@ async fn handle_compact(
                 bytes_before: summary.bytes_before,
                 bytes_after: summary.bytes_after,
                 bytes_reclaimed: summary.bytes_reclaimed(),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// JSON request body for `POST /admin/reclaim-ledger-versions`.
+#[derive(Deserialize)]
+struct ReclaimLedgerVersionsRequest {
+    /// Mandatory for a run that deletes. This one removes rows, and unlike
+    /// `compact` it is not reversible by re-running anything: the bytes are
+    /// only in the markdown the ledger mirrors, and only if the file on disk
+    /// still holds them.
+    confirm: bool,
+    /// Report what would go without deleting it. A dry run changes nothing,
+    /// so it needs no `confirm` — that is the whole point of it.
+    #[serde(default)]
+    dry_run: bool,
+    /// Also drop each ledger's live row, not just its superseded versions.
+    #[serde(default)]
+    drop_latest: bool,
+    /// Rebuild the FTS index and `VACUUM` afterwards to return the bytes.
+    #[serde(default)]
+    compact: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/reclaim-ledger-versions`.
+#[derive(Debug, Serialize)]
+pub struct ReclaimLedgerVersionsReport {
+    /// Ledger `(workspace, project, path)` coordinates holding residue.
+    pub ledger_paths: u64,
+    /// `pages` rows selected — removed, unless the run was a dry run.
+    pub pages_deleted: u64,
+    /// Bytes of page body those rows carried. Logical payload, not freed
+    /// bytes: the file only shrinks when `compact` was set.
+    pub bytes_deleted: u64,
+    /// Bytes returned to the filesystem. Zero unless `compact` was set.
+    pub bytes_reclaimed: u64,
+    /// Whether each ledger's live row went too.
+    pub dropped_latest: bool,
+    /// Database size in bytes before the delete.
+    pub bytes_before: u64,
+    /// Database size in bytes afterwards.
+    pub bytes_after: u64,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran).
+    pub compacted: bool,
+}
+
+/// `POST /admin/reclaim-ledger-versions` — delete the superseded versions of
+/// the raw hook event ledger, and nothing else. The online counterpart of the
+/// cleanup #660's fix left no command for.
+async fn handle_reclaim_ledger_versions(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<ReclaimLedgerVersionsRequest>,
+) -> impl IntoResponse {
+    if !req.dry_run && !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reclaim-ledger-versions deletes page rows; \
+                          run it without --confirm first to see what it would \
+                          remove, then pass confirm: true"
+            })),
+        );
+    }
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+    match state
+        .writer
+        .reclaim_ledger_versions(req.dry_run, req.drop_latest, compaction)
+        .await
+    {
+        Ok(summary) => {
+            let report = ReclaimLedgerVersionsReport {
+                ledger_paths: summary.ledger_paths,
+                pages_deleted: summary.pages_deleted,
+                bytes_deleted: summary.bytes_deleted,
+                bytes_reclaimed: summary.bytes_reclaimed(),
+                dropped_latest: summary.dropped_latest,
+                bytes_before: summary.bytes_before,
+                bytes_after: summary.bytes_after,
+                compacted: summary.compacted,
             };
             (
                 StatusCode::OK,

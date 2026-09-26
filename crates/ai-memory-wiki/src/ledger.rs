@@ -6,79 +6,60 @@
 //! reserved-looking filename is only a ledger when its content opens with a
 //! hook log entry, never on filename alone (an ordinary page can be named
 //! `log-2026-09.md`).
+//!
+//! The predicates themselves live in [`ai_memory_core::log_ledger`], because
+//! the store's `reclaim-ledger-versions` has to answer the same question from
+//! a `pages.body` it already holds, with no filesystem access. This module is
+//! only the file-reading half of that contract.
 
 use std::path::Path;
 
 use ai_memory_core::PagePath;
 
 /// `log.md` / `log-YYYY-MM.md` are the raw per-project event ledger the hooks
-/// append to (see `ai-memory-hooks::log::log_filename_for`): `## [ts] ...`
-/// entries, never YAML frontmatter.
+/// append to (see `ai-memory-hooks::log::log_filename_for`).
 pub(crate) fn is_log_ledger_filename(page_path: &PagePath) -> bool {
-    let s = page_path.as_str();
-    s == "log.md" || is_rotated_log_filename(s)
+    ai_memory_core::log_ledger::is_log_ledger_path(page_path.as_str())
 }
 
 pub(crate) fn is_rotated_log_filename(s: &str) -> bool {
-    let Some(stem) = s.strip_prefix("log-").and_then(|v| v.strip_suffix(".md")) else {
-        return false;
-    };
-    let bytes = stem.as_bytes();
-    bytes.len() == "YYYY-MM".len()
-        && bytes[4] == b'-'
-        && bytes[..4].iter().all(|b| b.is_ascii_digit())
-        && bytes[5..].iter().all(|b| b.is_ascii_digit())
+    ai_memory_core::log_ledger::is_rotated_log_ledger_path(s)
 }
 
 /// Cheap check for the raw hook event ledger shape. A reserved-looking
 /// filename is only a ledger when its first body line is a hook log entry
 /// (`## [ts] ...`).
 ///
-/// The body may sit under a YAML frontmatter block: the OKF v0.2 migration
-/// conforms every `.md` under `wiki/`, ledgers included, so a migrated store
-/// has `type: Note` stamped on top of each `log-YYYY-MM.md`. Stopping at the
-/// fence would classify those ledgers as ordinary pages, and each hook
-/// `append_event` would then supersede a multi-megabyte page row.
+/// Reads only [`GATE_PREFIX_BYTES`] and defers the decision to
+/// [`ai_memory_core::log_ledger::body_opens_with_log_ledger`], so the file and
+/// the in-memory answer cannot drift apart. The bound is also what keeps a
+/// pathological file (a lone opening fence in a multi-gigabyte log) from a
+/// full scan.
 pub(crate) fn opens_with_log_ledger(abs: &Path) -> bool {
-    use std::io::{BufRead, BufReader};
-    let Ok(file) = std::fs::File::open(abs) else {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(abs) else {
         return false;
     };
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return false;
-    }
-    if line.trim_end() != "---" {
-        return line.starts_with("## [");
-    }
-    // Walk past the frontmatter block. The bound keeps a pathological file
-    // (a lone opening fence in a multi-gigabyte log) from a full scan.
-    let mut closed = false;
-    for _ in 0..MAX_FRONTMATTER_LINES {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return false,
-            Ok(_) => {}
+    let mut prefix = vec![0u8; ai_memory_core::log_ledger::GATE_PREFIX_BYTES];
+    let read = match file.read(&mut prefix) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    // A file that filled the buffer may have been cut mid-line; a shorter read
+    // is the whole file, last line and all.
+    if read == prefix.len() {
+        match prefix.iter().rposition(|b| *b == b'\n') {
+            Some(last) => prefix.truncate(last + 1),
+            None => prefix.clear(),
         }
-        if line.trim_end() == "---" {
-            closed = true;
-            break;
-        }
+    } else {
+        prefix.truncate(read);
     }
-    if !closed {
-        return false;
-    }
-    // First non-blank line after the fence decides.
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return false,
-            Ok(_) => {}
-        }
-        if !line.trim().is_empty() {
-            return line.starts_with("## [");
-        }
+    match std::str::from_utf8(&prefix) {
+        Ok(text) => ai_memory_core::log_ledger::body_opens_with_log_ledger(text),
+        // A ledger entry is ASCII, so invalid UTF-8 this early means the file
+        // is not one.
+        Err(_) => false,
     }
 }
 
@@ -97,7 +78,84 @@ pub fn is_rotated_event_ledger(abs: &Path) -> bool {
         && opens_with_log_ledger(abs)
 }
 
-/// Upper bound on frontmatter lines scanned by [`opens_with_log_ledger`].
-/// Conformant OKF frontmatter is a handful of keys; this is slack, not a
-/// format limit.
-pub(crate) const MAX_FRONTMATTER_LINES: usize = 64;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write `body` to a fresh file in a throwaway dir and hand back the path.
+    fn temp_file(dir: &tempfile::TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        path
+    }
+
+    /// The file reader and the in-memory predicate must answer identically:
+    /// the store's `reclaim-ledger-versions` decides from a `pages.body` and
+    /// the indexer decides from this file, and the two surfaces have to agree
+    /// about which paths are ledgers.
+    #[test]
+    fn the_file_and_the_body_answer_the_same_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: &[(&str, &str)] = &[
+            ("bare.md", "## [2026-09-25T10:00:00Z] tool call\n"),
+            (
+                "conformed.md",
+                "---\ntype: Note\ntitle: Log 2026-09\n---\n\n## [2026-09-25T10:00:00Z] tool call\n",
+            ),
+            ("prose.md", "# Log 2026-09\n\nA hand-written page.\n"),
+            ("frontmatter-only.md", "---\ntype: Note\ntitle: Log\n---\n"),
+            ("unterminated.md", "---\ntype: Note\n"),
+            ("empty.md", ""),
+            ("blank-first.md", "\n## [2026-09-25T10:00:00Z] tool call\n"),
+            (
+                "no-trailing-newline.md",
+                "## [2026-09-25T10:00:00Z] tool call",
+            ),
+        ];
+        for (name, body) in cases {
+            let path = temp_file(&dir, name, body);
+            assert_eq!(
+                opens_with_log_ledger(&path),
+                ai_memory_core::log_ledger::body_opens_with_log_ledger(body),
+                "file and body disagree for {name}",
+            );
+        }
+    }
+
+    /// A body longer than the gate prefix must still be classified from its
+    /// first meaningful line, not read whole.
+    #[test]
+    fn a_ledger_longer_than_the_gate_prefix_is_still_a_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let filler = "## [2026-09-25T10:00:00Z] tool Bash: cargo test\n".repeat(4000);
+        assert!(filler.len() > ai_memory_core::log_ledger::GATE_PREFIX_BYTES);
+        let path = temp_file(&dir, "long.md", &filler);
+        assert!(opens_with_log_ledger(&path));
+    }
+
+    /// A prefix cut mid-line must not answer for a line it only half read.
+    #[test]
+    fn a_prefix_cut_mid_line_does_not_decide() {
+        let dir = tempfile::tempdir().unwrap();
+        // Push the deciding line past the prefix, with a huge frontmatter
+        // value so the cut lands inside it.
+        let mut body = String::from("---\ntitle: ");
+        body.push_str(&"x".repeat(ai_memory_core::log_ledger::GATE_PREFIX_BYTES));
+        body.push_str("\n---\n\n## [2026-09-25T10:00:00Z] tool call\n");
+        let path = temp_file(&dir, "cut.md", &body);
+        assert!(
+            !opens_with_log_ledger(&path),
+            "an unread deciding line is not a ledger"
+        );
+    }
+
+    /// A missing file is not a ledger, and neither reader may panic on it.
+    #[test]
+    fn a_missing_file_is_not_a_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!opens_with_log_ledger(&dir.path().join("absent.md")));
+        assert!(!is_rotated_event_ledger(&dir.path().join("absent.md")));
+    }
+}

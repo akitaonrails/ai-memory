@@ -96,6 +96,23 @@ pub enum Command {
     /// database, so every write blocks until it finishes and it needs free
     /// disk space of roughly the database's own size.
     Compact(CompactArgs),
+    /// Drop the superseded ledger versions the pre-2.1.1 indexer left behind.
+    ///
+    /// #660 stopped the indexer from rewriting the whole `log-YYYY-MM.md` row
+    /// on every hook append. The fix stopped new rows; it did not remove the
+    /// ones already written, and no other command reaches them — `compact`
+    /// deletes nothing, `forget-sweep` only hard-deletes decay tombstones, and
+    /// `reindex` loses the DB-only state. One reported store held 6,539
+    /// versions of 101 live pages.
+    ///
+    /// Only paths whose *content* is a hook event ledger are considered, so a
+    /// real page a human happened to name `log-2026-09.md` keeps its whole
+    /// version chain. Each dropped version is a byte prefix of the one after
+    /// it, so nothing the file on disk does not already hold is lost.
+    ///
+    /// Prints what it would remove and changes nothing unless `--confirm` is
+    /// passed. See also `ai-memory status` for the reclaimable figure.
+    ReclaimLedgerVersions(ReclaimLedgerVersionsArgs),
     /// Snapshot wiki/, db/, and config.toml into a gzipped tarball.
     Backup(BackupArgs),
     /// Export one project's wiki as an OKF v0.2 bundle tarball.
@@ -1036,6 +1053,34 @@ pub struct CompactArgs {
     /// nothing — but because it blocks every write for as long as it runs.
     #[arg(long)]
     pub confirm: bool,
+}
+
+/// Arguments for `reclaim-ledger-versions`.
+#[derive(Debug, Args)]
+pub struct ReclaimLedgerVersionsArgs {
+    /// Actually delete. Without this the command reports what it would remove
+    /// — the ledger paths, the row count and the bytes — and changes nothing.
+    #[arg(long)]
+    pub confirm: bool,
+    /// Also drop each ledger's *live* row, not just its superseded versions.
+    ///
+    /// Since #660 the indexer skips ledgers, so each ledger's live row is also
+    /// left over from before the fix. It is kept by default: it is the
+    /// version the file on disk corresponds to, and dropping it is the
+    /// operator's call. Drop it only once the ledger file itself has been
+    /// removed, or the next hook append starts a fresh chain.
+    #[arg(long)]
+    pub drop_latest: bool,
+    /// Rebuild the FTS index and VACUUM afterwards, returning the freed bytes
+    /// to the filesystem.
+    ///
+    /// Without this the reclaim is a logical delete — the rows are gone and
+    /// nothing can reach them, but their bytes stay in free pages of the
+    /// database file until it is next rewritten. `VACUUM` rewrites the whole
+    /// file under an exclusive lock and needs free disk of roughly the
+    /// database's own size, so it is opt-in.
+    #[arg(long)]
+    pub compact: bool,
 }
 
 /// Arguments for `purge-project`.
