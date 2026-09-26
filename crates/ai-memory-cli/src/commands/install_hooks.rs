@@ -606,6 +606,14 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),
+            AgentChoice::Hermes => {
+                // Nothing to write or stage: the block invokes the native
+                // `hook` subcommand, and `~/.hermes/config.yaml` is a YAML file
+                // the operator also edits (and Hermes itself gates hooks behind
+                // an acceptance prompt). The render step below prints the
+                // ready-to-paste block.
+                Ok(())
+            }
             AgentChoice::Devin => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -748,6 +756,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
         }
         AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Zcode => render_zcode(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::Hermes => render_hermes(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Devin => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
@@ -959,6 +968,10 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Grok => grok_hooks_path().ok()?,
             AgentChoice::Zero => zero_hooks_path().ok()?,
             AgentChoice::Zcode => zcode_config_path().ok()?,
+            // Hermes' hook config is `~/.hermes/config.yaml`, which ai-memory
+            // never writes, so there is no install-owned file to recover a
+            // baked project strategy from.
+            AgentChoice::Hermes => return None,
             AgentChoice::Devin => devin_hooks_path().ok()?,
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
             AgentChoice::KiroCli => return None,
@@ -1351,6 +1364,9 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // no `McpClient::Zcode` whose config the installer could scrape a
         // server URL or token from.
         AgentChoice::Zcode => None,
+        // No first-party Hermes MCP installer ships yet, so there is no config
+        // file to infer a server URL or token from.
+        AgentChoice::Hermes => None,
     }
 }
 
@@ -5587,6 +5603,63 @@ fn render_zcode(
     Ok(())
 }
 
+/// `install-hooks --agent hermes`: print the ready-to-paste `hooks:` block for
+/// `~/.hermes/config.yaml`.
+///
+/// ai-memory deliberately does not write that file. It is YAML the operator
+/// also edits (comments, other hooks) and would have to be spliced, and Hermes
+/// gates user hooks behind its own acceptance prompt (`hooks_auto_accept`
+/// asks before registering one), so entries appearing silently would fight
+/// both. There is nothing to stage either: the block invokes the native `hook`
+/// subcommand, not a `.sh` bundle.
+fn render_hermes(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    print!(
+        "{}",
+        render_hermes_output(server_url, auth_token, data_dir, project_strategy)
+    );
+    Ok(())
+}
+
+fn render_hermes_output(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> String {
+    let block = super::render_shared::build_hermes_hooks_yaml(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let mut out = String::new();
+    out.push_str("# Hermes Agent hooks config — merge the `hooks:` block below\n");
+    out.push_str("# into ~/.hermes/config.yaml and let Hermes accept it when it\n");
+    out.push_str("# prompts (or set `hooks_auto_accept: true`). ai-memory does not\n");
+    out.push_str("# write that file: it is YAML you also edit, and it would have to\n");
+    out.push_str("# be spliced.\n");
+    out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
+    if auth_token.is_some() {
+        out.push_str("# Auth: this snippet embeds the token in each hook command —\n");
+        out.push_str("#       treat ~/.hermes/config.yaml as sensitive (chmod 600).\n");
+    }
+    out.push_str("# NOTE: only the two tool events are wired — that is what gives\n");
+    out.push_str("#       Hermes tool observations. Session lifecycle (prompts,\n");
+    out.push_str("#       session-end, the automatic handoff) is handled by the\n");
+    out.push_str("#       ai-memory memory-provider plugin, so nothing is duplicated.\n");
+    out.push_str("# NOTE: each `command` is a bare argv line. Hermes splits it with\n");
+    out.push_str("#       shlex.split and runs it without a shell, so the generated\n");
+    out.push_str("#       command invokes the ai-memory binary directly.\n");
+    out.push('\n');
+    out.push_str(&block);
+    out
+}
+
 fn render_devin(
     hooks_dir: &Path,
     server_url: &str,
@@ -6925,6 +6998,28 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(out.contains("hooks:\n"));
         // No token was passed, so none of the auth caution lines render.
         assert!(!out.contains("AI_MEMORY_AUTH_TOKEN embedded"));
+    }
+
+    /// Hermes' output must state the manual paste step (ai-memory does not write
+    /// `~/.hermes/config.yaml`) and must not advertise a staged bundle or a
+    /// session-end hook — the memory-provider plugin owns session lifecycle.
+    #[test]
+    fn render_hermes_output_states_manual_paste_and_plugin_owned_lifecycle() {
+        let out = render_hermes_output("http://127.0.0.1:49374", None, Path::new("/data"), None);
+        assert!(out.contains("~/.hermes/config.yaml"));
+        assert!(out.contains("ai-memory does not"));
+        assert!(out.contains("hooks:\n"));
+        assert!(out.contains("pre_tool_call"));
+        assert!(out.contains("post_tool_call"));
+        assert!(out.contains("--agent hermes"));
+        assert!(out.contains("without a shell"));
+        assert!(out.contains("memory-provider plugin"));
+        // Tool events only: a hook-driven session-end would double-close a
+        // session the plugin already closes.
+        assert!(!out.contains("session_end"));
+        assert!(!out.contains("session-end:"));
+        // No token was passed, so the auth caution line stays out.
+        assert!(!out.contains("chmod 600"));
     }
 
     // Issue #156: Zero hook install writes exec-form entries into Zero's

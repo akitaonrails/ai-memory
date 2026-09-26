@@ -1686,6 +1686,19 @@ pub enum AgentChoice {
     /// so close sessions with `ai-memory finalize-session --agent zcode`.
     #[value(alias = "zai")]
     Zcode,
+    /// Hermes Agent (Nous Research) — lifecycle hooks declared in the `hooks:`
+    /// block of `~/.hermes/config.yaml`. Hermes runs each `command` through
+    /// `shlex.split` with the event JSON on stdin and **no shell**, so
+    /// ai-memory's native `hook` subcommand is invoked directly (exec form,
+    /// like Zero and ZCode). ai-memory wires the two events that give Hermes
+    /// tool observations — `pre_tool_call` / `post_tool_call`, whose payload
+    /// carries `tool_name` / `tool_input`, the envelope the router already
+    /// recognises for `agent=hermes`. `~/.hermes/config.yaml` is NOT written:
+    /// it is YAML the installer would have to splice, and Hermes gates user
+    /// hooks behind its own acceptance prompt (`hooks_auto_accept`), so
+    /// `install-hooks --agent hermes` prints the ready-to-paste block.
+    #[value(alias = "hermes-agent")]
+    Hermes,
 }
 
 impl AgentChoice {
@@ -1715,6 +1728,7 @@ impl AgentChoice {
             Self::CommandCode => AgentKind::CommandCode,
             Self::Pool => AgentKind::Pool,
             Self::Zcode => AgentKind::Zcode,
+            Self::Hermes => AgentKind::Hermes,
         }
     }
 
@@ -1732,7 +1746,8 @@ impl AgentChoice {
             | Self::Omp
             | Self::Openclaw
             | Self::Zero
-            | Self::Zcode => None,
+            | Self::Zcode
+            | Self::Hermes => None,
             _ => Some(self.kind().as_str()),
         }
     }
@@ -3304,6 +3319,37 @@ mod tests {
             panic!("expected finalize-session for zcode");
         };
         assert_eq!(args.agent, ai_memory_core::AgentKind::Zcode);
+    }
+
+    /// Hermes is the second no-shell harness (after ZCode): it splits the
+    /// configured `command` into argv itself, so the generated block invokes
+    /// the native `hook` subcommand instead of a `.sh` bundle.
+    #[test]
+    fn hermes_hook_and_finalize_aliases_parse() {
+        for alias in ["hermes", "hermes-agent"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-hooks",
+                "--agent",
+                alias,
+                "--server-url",
+                "http://127.0.0.1:49374",
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse Hermes alias {alias}: {error}"));
+            let Command::InstallHooks(args) = cli.command else {
+                panic!("expected install-hooks for Hermes alias {alias}");
+            };
+            assert_eq!(args.agent, AgentChoice::Hermes);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::Hermes);
+            // Native exec-form integration: no script bundle to stage.
+            assert_eq!(args.agent.script_hook_subdir(), None);
+        }
+        let cli = Cli::try_parse_from(["ai-memory", "finalize-session", "--agent", "hermes"])
+            .expect("failed to parse finalize-session --agent hermes");
+        let Command::FinalizeSession(args) = cli.command else {
+            panic!("expected finalize-session for hermes");
+        };
+        assert_eq!(args.agent, ai_memory_core::AgentKind::Hermes);
     }
 
     #[test]

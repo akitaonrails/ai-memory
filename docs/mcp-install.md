@@ -65,19 +65,34 @@ calling `/hook` directly. For a third-party bridge that has its own
 lifecycle vocabulary, keep the core `event` query param on one of
 ai-memory's canonical events when possible:
 
-### Community-maintained Hermes Agent plugin
+### Hermes Agent
 
-ai-memory does not currently ship a first-party Hermes Agent installer,
-but a community-maintained
+ai-memory ships a first-party hook installer for Hermes Agent:
+
+```bash
+ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
+```
+
+Because Hermes splits each configured `command` with `shlex.split` and runs it
+with **no shell**, the printed block invokes the native `ai-memory hook`
+command (exec form, the same shape Zero and ZCode use); no `.sh`/`.ps1` bundle
+is staged, and there is no `--apply` that writes your config. `~/.hermes/config.yaml`
+is a YAML file you also edit, and Hermes gates user hooks behind its own
+acceptance prompt (`hooks_auto_accept`), so paste the block and let Hermes
+accept it. Two tool events are wired (`pre_tool_call`, `post_tool_call`), which
+is what gives Hermes sessions tool observations.
+
+The memory provider remains a community-maintained project: a
 [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin)
-is available. Treat it as a third-party bridge: verify the plugin's
-documented Hermes and ai-memory version matrix, install/update/uninstall
-behavior, platform coverage, and secret handling before enabling it on a
-live ai-memory server. In particular, bearer tokens and endpoint settings
-should stay in environment or local config references rather than generated
-plugin source files.
+is available, and it is what owns automatic recall, prompt capture, session-end
+and the automatic handoff for Hermes. Treat it as a third-party bridge: verify
+its documented Hermes and ai-memory version matrix, install/update/uninstall
+behavior, platform coverage, and secret handling before enabling it on a live
+ai-memory server. In particular, bearer tokens and endpoint settings should
+stay in environment or local config references rather than generated plugin
+source files.
 
-The hook router does recognize `agent=hermes` as a concrete session kind and
+The hook router recognizes `agent=hermes` as a concrete session kind and
 accepts Hermes' documented shell-hook `tool_name` / `tool_input` envelope for
 tool-family metadata and capture-exclusion enforcement. A custom bridge should
 map `on_session_start`, `post_tool_call`, and `on_session_end` to ai-memory's

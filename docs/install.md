@@ -1173,6 +1173,42 @@ ai-memory finalize-session --agent zcode --session-id <uuid>
 No first-party `install-mcp` client and no managed workstream
 (`ai-memory run zcode`) are claimed yet.
 
+### Hermes Agent (Nous Research)
+
+Hermes declares lifecycle hooks in the `hooks:` block of
+`~/.hermes/config.yaml`. `install-hooks --agent hermes` (alias `hermes-agent`)
+prints the block to paste there:
+
+```bash
+ai-memory install-hooks --agent hermes \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+Hermes splits each configured `command` with `shlex.split` and runs it with
+**no shell**, passing the event JSON on stdin — so the generated entry invokes
+the native `ai-memory hook` command directly (the same exec-form shape Zero and
+ZCode use) and there is no script bundle to stage. There is also no `--apply`
+that writes the file: `~/.hermes/config.yaml` is YAML you also edit, and Hermes
+gates user hooks behind its own acceptance prompt (`hooks_auto_accept`). Paste
+the block and let Hermes accept it.
+
+Two events are wired: `pre_tool_call` → `pre-tool-use` and `post_tool_call` →
+`post-tool-use`. Their payload carries `tool_name` / `tool_input`, which is what
+gives Hermes sessions tool observations, tool-family titles, and
+`[capture] ignore_paths` exclusion enforcement.
+
+Session lifecycle is deliberately not wired here: automatic recall, prompt
+capture, session-end and the automatic handoff for Hermes belong to the memory
+provider, the community-maintained
+[`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin).
+A second, hook-driven `session-end` would close the same session twice. Hermes
+ignores session-start hook stdout, so a pending handoff is recovered through
+MCP: `memory_handoff_list` then `memory_handoff_accept`.
+
+No first-party `install-mcp` client and no managed workstream
+(`ai-memory run hermes`) are claimed yet.
+
 ### OpenCode
 
 ```bash
