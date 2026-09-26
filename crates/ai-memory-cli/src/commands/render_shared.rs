@@ -572,6 +572,80 @@ pub(crate) const ZCODE_HOOK_TIMEOUT_MS: u64 = 10_000;
 /// (same reasoning as Kiro v2's `max_output_size`).
 pub(crate) const ZCODE_HOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
+/// Hermes Agent lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-~/.hermes/config.yaml, native `hook --event` value)`.
+///
+/// Verified against Hermes v0.21.4 (`agent/shell_hooks.py`): a configured
+/// `command` is split into argv by `shlex.split` and executed **without a
+/// shell**, with the event JSON on stdin — so the generated block invokes the
+/// native `hook` subcommand, the same shape Zero and ZCode use, and no
+/// `.sh`/`.ps1` bundle is staged. Only the two tool events are wired: their
+/// payload carries `tool_name` / `tool_input`, the envelope the router already
+/// maps for `agent=hermes`. Session lifecycle stays with the memory-provider
+/// plugin (`on_session_end`), so a hook-driven `session-end` cannot
+/// double-close a Hermes session.
+pub(crate) const HERMES_EVENTS: [(&str, &str); 2] = [
+    ("pre_tool_call", "pre-tool-use"),
+    ("post_tool_call", "post-tool-use"),
+];
+
+/// Wall-clock bound written into each Hermes hook entry. Capture POSTs are
+/// fire-and-forget, so this only bounds a hung `hook` invocation.
+pub(crate) const HERMES_HOOK_TIMEOUT_SECONDS: u64 = 20;
+
+/// The ready-to-paste `hooks:` block for `~/.hermes/config.yaml`.
+///
+/// `command:` must be a bare argv line — Hermes splits it itself, so the
+/// `KEY=value script` prefix every shell-run harness gets would be parsed as
+/// extra argv entries. The native platform already emits the argv form
+/// (`<exe> [--data-dir …] hook --event … --agent hermes --server-url …`), and
+/// the YAML single-quote keeps any POSIX quoting inside it intact. ai-memory
+/// deliberately does not write the file: it is YAML the installer would have
+/// to splice, and Hermes gates user hooks behind its own acceptance prompt.
+#[must_use]
+pub(crate) fn build_hermes_hooks_yaml(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> String {
+    build_hermes_hooks_yaml_for_platform(
+        server_url,
+        auth_token,
+        HookCommandContext::new(
+            HookCommandPlatform::for_bash_runner(),
+            "hermes",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// Platform-forced variant, so a test can pin POSIX/Windows instead of
+/// asserting whatever the machine running the suite happens to be.
+fn build_hermes_hooks_yaml_for_platform(
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> String {
+    let mut out = String::from("hooks:\n");
+    for (hermes_event, our_event) in HERMES_EVENTS {
+        // The native platforms derive the event token from the script stem, so
+        // the synthetic filename carries the ai-memory event name.
+        let command = hook_command(
+            Path::new(&format!("{our_event}.sh")),
+            server_url,
+            auth_token,
+            context,
+        );
+        out.push_str(&format!(
+            "  {hermes_event}:\n    - command: {}\n      timeout: {HERMES_HOOK_TIMEOUT_SECONDS}\n",
+            yaml_single_quote(&command)
+        ));
+    }
+    out
+}
+
 /// Devin hook payload for docker/setup-agent script snippets.
 /// Devin uses HookShape::Nested (same as Claude Code/Grok) but with
 /// DEVIN_EVENTS (PostCompaction instead of PreCompact, no subagent events).
@@ -2692,6 +2766,56 @@ check(markedButEmpty.disposition === "keep", "allowlist-marker-present-empty-cap
         assert_eq!(command, r"C:\Program Files\ai-memory\ai-memory.exe");
         assert_eq!(args[1], r"C:\Data\ai-memory");
         assert!(args.iter().all(|arg| !arg.contains(r"\\?\")));
+    }
+
+    /// The public entry point must emit a complete `hooks:` map with both tool
+    /// events, whatever platform it renders for (the suite runs on Windows too).
+    #[test]
+    fn hermes_hooks_yaml_covers_both_tool_events() {
+        let yaml = build_hermes_hooks_yaml("http://127.0.0.1:49374", None, None, None);
+        assert!(yaml.starts_with("hooks:\n"));
+        for (event, _) in HERMES_EVENTS {
+            assert!(yaml.contains(&format!("  {event}:\n")), "missing {event}");
+            assert!(
+                yaml.contains("    - command: '"),
+                "command must be a single-quoted YAML scalar"
+            );
+        }
+        assert_eq!(
+            yaml.matches(&format!("timeout: {HERMES_HOOK_TIMEOUT_SECONDS}"))
+                .count(),
+            HERMES_EVENTS.len()
+        );
+    }
+
+    /// Hermes splits `command` with `shlex.split` and runs it with no shell, so
+    /// the generated line must be bare argv: a `KEY=value` prefix would be
+    /// parsed as extra argv entries and the hook would never reach the server.
+    #[test]
+    fn hermes_hooks_yaml_invokes_the_native_command_without_a_shell() {
+        let yaml = build_hermes_hooks_yaml_for_platform(
+            "http://127.0.0.1:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::PosixNative,
+                "hermes",
+                Some(Path::new("/data")),
+                Some("repo-root"),
+            ),
+        );
+        for (_, our_event) in HERMES_EVENTS {
+            assert!(
+                yaml.contains(&format!("hook --event {our_event} --agent hermes")),
+                "missing the native command for {our_event}"
+            );
+        }
+        assert!(
+            !yaml.contains("AI_MEMORY_HOOK_URL="),
+            "an env prefix would be parsed as argv, not environment"
+        );
+        assert!(yaml.contains("--data-dir /data"));
+        assert!(yaml.contains("--server-url http://127.0.0.1:49374"));
+        assert!(yaml.contains("--project-strategy repo-root"));
     }
 
     fn exec_args(script: &str, capture_assistant: bool) -> Vec<String> {
