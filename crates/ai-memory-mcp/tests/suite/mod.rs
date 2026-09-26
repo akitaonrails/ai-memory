@@ -15,6 +15,7 @@ mod admin_phase3;
 mod admin_provider_error_logging;
 mod admin_purge;
 mod admin_read_page;
+mod admin_reclaim_ledger_versions;
 mod admin_rename;
 mod admin_status_search;
 mod admin_write_page;

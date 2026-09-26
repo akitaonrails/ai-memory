@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ai-memory reclaim-ledger-versions` drops the superseded versions of the raw
+  hook event ledger that the pre-2.1.1 indexer left behind (#660), and nothing
+  else. It reports what it would remove and changes nothing unless
+  `--confirm`; `--drop-latest` also removes each ledger's live row, and
+  `--compact` rebuilds the FTS index and `VACUUM`s to return the freed bytes.
+  A path is only a candidate when its *content* is a hook ledger, so a real
+  page named `log-2026-09.md` keeps its whole version chain, and only
+  `is_latest=0 AND superseded_at IS NULL` rows are eligible, so decay-owned
+  rows stay with `forget-sweep`. Derived FTS/entity/vector/link rows go with
+  the page through the existing cascades, and the FTS delete trigger is stood
+  down for the bulk delete and restored from its own `sqlite_master` DDL
+  afterwards, so the cleanup does not re-tokenize tens of gigabytes of ledger
+  body one row at a time. (#914)
 - The builtin web UI has a root-only `/web/pending` page to triage pending
   auto-improvement proposals. It lists the proposals of all projects, with a
   project filter and a sort, and shows the rationale and the proposed body.

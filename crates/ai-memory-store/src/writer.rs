@@ -397,6 +397,17 @@ pub(crate) enum WriteCmd {
     Compact {
         reply: oneshot::Sender<StoreResult<crate::ops::CompactSummary>>,
     },
+    /// Delete the superseded ledger page versions the pre-#660 indexer left
+    /// behind, and nothing else. See [`ops::reclaim_ledger_versions`].
+    ReclaimLedgerVersions {
+        /// Report what would go without deleting it.
+        dry_run: bool,
+        /// Also drop each ledger's live row, not just its superseded versions.
+        drop_latest: bool,
+        /// Whether to reclaim the freed bytes afterwards (`VACUUM`).
+        compaction: crate::ops::Compaction,
+        reply: oneshot::Sender<StoreResult<crate::ops::ReclaimLedgerVersionsSummary>>,
+    },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
     /// sessions/…). Refused when non-empty unless `force`.
     DeleteWorkspace {
@@ -1842,6 +1853,29 @@ impl WriterHandle {
     pub async fn compact(&self) -> StoreResult<crate::ops::CompactSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::Compact { reply: tx }).await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Delete the superseded ledger page versions the pre-#660 indexer left
+    /// behind. See [`ops::reclaim_ledger_versions`].
+    ///
+    /// # Errors
+    /// Propagates the store error from the scan, delete, FTS rebuild or
+    /// `VACUUM`, plus [`StoreError::WriterClosed`].
+    pub async fn reclaim_ledger_versions(
+        &self,
+        dry_run: bool,
+        drop_latest: bool,
+        compaction: crate::ops::Compaction,
+    ) -> StoreResult<crate::ops::ReclaimLedgerVersionsSummary> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReclaimLedgerVersions {
+            dry_run,
+            drop_latest,
+            compaction,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -3344,6 +3378,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::Compact { reply } => {
                 let result = ops::compact(&mut conn);
                 send_or_warn(reply, result, "compact");
+            }
+            WriteCmd::ReclaimLedgerVersions {
+                dry_run,
+                drop_latest,
+                compaction,
+                reply,
+            } => {
+                let result =
+                    ops::reclaim_ledger_versions(&mut conn, dry_run, drop_latest, compaction);
+                send_or_warn(reply, result, "reclaim_ledger_versions");
             }
             WriteCmd::DeleteWorkspace {
                 workspace_id,

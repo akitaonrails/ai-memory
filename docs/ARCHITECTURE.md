@@ -543,12 +543,29 @@ upgrade              auth                 user
 completions          handoffs             purge-session
 compact              api-key              export-okf
 message              doctor               backfill
+reclaim-ledger-versions                     compact
 ```
 
 Run `ai-memory --help` for the full tree.
 
 `auto-improve-report` is read-only by default; `--stage` creates one pending
 telemetry report page for audit/approval without staging learning-memory edits.
+
+`reclaim-ledger-versions` drops the superseded versions of the raw hook event
+ledger that the pre-2.1.1 indexer left behind (#660). It is a dry run unless
+`--confirm` is passed. A path is only a candidate when its *content* opens
+with a hook log entry — the same
+`ai_memory_core::log_ledger::body_opens_with_log_ledger` gate the indexer
+(#660), the OKF conformance migration (#669) and the bundle export (#748) use
+— so a real page named `log-2026-09.md` keeps its whole version chain. Only
+`is_latest=0 AND superseded_at IS NULL` rows are eligible, so rows a decay
+tombstone owns stay with `forget-sweep`. Derived FTS/entity/vector/link rows
+go with the page through the existing `ON DELETE CASCADE`s, and the FTS delete
+trigger is stood down for the bulk delete (its DDL is read back from
+`sqlite_master` and re-executed) so the cleanup does not re-tokenize tens of
+gigabytes of ledger body row by row; `pages_fts` is then rebuilt wholesale.
+`--compact` additionally `VACUUM`s to return the bytes, at the cost `compact`
+documents.
 
 ## Cross-cutting invariants
 

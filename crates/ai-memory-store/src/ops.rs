@@ -4177,6 +4177,282 @@ pub(crate) fn database_bytes(conn: &Connection) -> StoreResult<u64> {
     Ok((page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64))
 }
 
+/// Rows per `DELETE` statement. Bounded so a 50k-row cleanup does not build
+/// one enormous statement, and so a `LIMIT`-less delete never holds a
+/// statement journal entry proportional to the whole residue.
+const LEDGER_DELETE_CHUNK: usize = 256;
+
+/// SQL selecting the residue #660 left behind: superseded versions of a
+/// ledger path that no decay tombstone owns.
+///
+/// - `is_latest = 0` — only superseded versions; the live row of a ledger is
+///   what the next hook append reads, and it is dropped only on request.
+/// - `superseded_at IS NULL` — only `decay` writes that column, so this is
+///   exactly the set `forget-sweep` cannot reach. Rows a decay tombstone owns
+///   are left to the sweep that already handles them.
+/// - the path predicate is the shared ledger filename gate, narrowed to the
+///   two shapes it accepts. `[0-9]` rather than `?` so a `log-abcd-ef.md`
+///   cannot widen the candidate set. The content gate runs in Rust.
+///
+/// - `length(body)` rides along so the report can state the bytes without
+///   reading them; `substr` bounds what the gate sees to
+///   [`ai_memory_core::log_ledger::GATE_PREFIX_BYTES`], because these rows
+///   carry whole ledger bodies. A prefix too short to decide leaves the row
+///   alone rather than deleting it.
+const LEDGER_RESIDUE_SQL: &str = "\
+SELECT id, workspace_id, project_id, path, length(body), substr(body, 1, ?1) \
+  FROM pages \
+ WHERE is_latest = 0 \
+   AND superseded_at IS NULL \
+   AND (path = 'log.md' OR path GLOB 'log-[0-9][0-9][0-9][0-9]-[0-9][0-9].md')";
+
+/// What one [`reclaim_ledger_versions`] run found, and removed unless
+/// `dry_run`. The counts are identical either way, so a dry run is a real
+/// measurement of what the confirmed run would do.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReclaimLedgerVersionsSummary {
+    /// Ledger `(workspace, project, path)` coordinates holding residue.
+    pub ledger_paths: u64,
+    /// `pages` rows selected for deletion.
+    pub pages_deleted: u64,
+    /// Bytes of page body those rows carried. Logical payload, not freed
+    /// bytes: the file only shrinks when `compacted` ran.
+    pub bytes_deleted: u64,
+    /// Whether the live row of each ledger went too.
+    pub dropped_latest: bool,
+    /// Database size in bytes before the delete.
+    pub bytes_before: u64,
+    /// Database size in bytes afterwards.
+    pub bytes_after: u64,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran).
+    pub compacted: bool,
+    /// Whether the run was a dry run and changed nothing.
+    pub dry_run: bool,
+}
+
+impl ReclaimLedgerVersionsSummary {
+    /// Bytes returned to the filesystem. Zero unless `compacted`: a delete
+    /// without a `VACUUM` leaves its bytes in free pages, exactly as for any
+    /// other SQLite delete.
+    #[must_use]
+    pub fn bytes_reclaimed(&self) -> u64 {
+        if self.compacted {
+            self.bytes_before.saturating_sub(self.bytes_after)
+        } else {
+            0
+        }
+    }
+}
+
+/// Delete the superseded ledger page versions the pre-#660 indexer wrote, and
+/// nothing else.
+///
+/// # Why this exists
+///
+/// #660 (2.1.1) stopped the indexer from superseding an OKF-conformed ledger
+/// on every hook append, because each append rewrote the whole row. The fix
+/// stops new rows; the rows already written stay, and nothing removed them:
+/// `compact` deletes nothing, `forget-sweep` only hard-deletes the ancestry of
+/// decay tombstones (only `decay` writes `superseded_at`), and `reindex` loses
+/// the DB-only state an operator is trying to keep. One reported store reached
+/// 6,539 versions and 14 GB of ledger rows for 101 live pages.
+///
+/// Every one of those rows is a byte prefix of the version after it, so
+/// deleting them loses nothing the file on disk does not already hold.
+///
+/// # Scope: a path is a ledger only if its content says so
+///
+/// The filename gate alone is not enough, and getting it wrong is the
+/// expensive direction: a prose page a human named `log-2026-09.md` wears the
+/// same shape as the ledger, and deleting its version chain destroys a real
+/// page's history (invariant #16 — a divergent write supersedes, it does not
+/// destroy). So the shared content gate from
+/// [`ai_memory_core::log_ledger`] decides, and it is the same gate the
+/// indexer, the OKF migration and the bundle export use. A real page's
+/// supersession chain is never a candidate.
+///
+/// # Derived rows
+///
+/// Nothing is deleted by hand. `page_embeddings`, `links`,
+/// `cross_project_links`, `entity_page_links` and `page_feedback` all carry
+/// `ON DELETE CASCADE` from `pages`, and `PRAGMA foreign_keys` is on, so one
+/// delete takes the vector, link, entity and feedback rows with it.
+///
+/// # Why the FTS delete trigger is dropped
+///
+/// `pages_fts` is an external-content FTS5 table, so dropping the trigger
+/// would leave the deleted rows' tokens in the index. Re-issuing them through
+/// the trigger is what makes an ordinary delete work — and on these rows it
+/// means re-tokenizing tens of gigabytes of ledger body, one row at a time,
+/// which is the cost the reporter hit. So the trigger's own SQL is read from
+/// `sqlite_master`, dropped for the delete, and re-executed afterwards, and
+/// `pages_fts` is rebuilt wholesale. Reading the DDL back rather than
+/// restating it keeps this honest if the index's shape ever changes again.
+///
+/// # `drop_latest`
+///
+/// Since #660 the indexer skips ledgers, so each ledger's live row is also
+/// left over from before the fix. It is kept by default — it is the version
+/// the file on disk corresponds to, and dropping it is the operator's call,
+/// not this command's.
+///
+/// # Cost
+///
+/// The FTS rebuild is a whole-index operation and `VACUUM` (under
+/// [`Compaction::Reclaim`]) rewrites the whole file and takes an exclusive
+/// lock, exactly as [`compact`] does. `VACUUM` needs free disk of roughly the
+/// database's own size.
+///
+/// # Errors
+/// Propagates the SQL error from the scan, the delete, the rebuild or the
+/// `VACUUM`. The delete runs in one transaction, so a failure leaves both the
+/// rows and the FTS trigger as they were.
+pub fn reclaim_ledger_versions(
+    conn: &mut Connection,
+    dry_run: bool,
+    drop_latest: bool,
+    compaction: Compaction,
+) -> StoreResult<ReclaimLedgerVersionsSummary> {
+    let bytes_before = database_bytes(conn)?;
+
+    // Collect first, delete second: the content gate is per-row, and deciding
+    // it while deleting would mean re-reading rows a rollback just restored.
+    let mut doomed: Vec<PageId> = Vec::new();
+    let mut ledger_paths: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut bytes_deleted: u64 = 0;
+
+    {
+        let mut stmt = conn.prepare(LEDGER_RESIDUE_SQL)?;
+        let mut rows = stmt.query(params![
+            ai_memory_core::log_ledger::GATE_PREFIX_BYTES as i64
+        ])?;
+        while let Some(row) = rows.next()? {
+            let body_prefix: String = row.get(5)?;
+            if !ai_memory_core::log_ledger::body_opens_with_log_ledger(&body_prefix) {
+                continue;
+            }
+            let id: Vec<u8> = row.get(0)?;
+            let workspace: Vec<u8> = row.get(1)?;
+            let project: Vec<u8> = row.get(2)?;
+            let path: String = row.get(3)?;
+            let body_len: i64 = row.get(4)?;
+            ledger_paths.insert((
+                WorkspaceId::from_slice(&workspace)?.to_string(),
+                ProjectId::from_slice(&project)?.to_string(),
+                path,
+            ));
+            bytes_deleted = bytes_deleted.saturating_add(body_len.max(0) as u64);
+            doomed.push(PageId::from_slice(&id)?);
+        }
+    }
+
+    let mut summary = ReclaimLedgerVersionsSummary {
+        ledger_paths: ledger_paths.len() as u64,
+        pages_deleted: doomed.len() as u64,
+        bytes_deleted,
+        dropped_latest: false,
+        bytes_before,
+        bytes_after: bytes_before,
+        compacted: false,
+        dry_run,
+    };
+
+    if drop_latest {
+        // The live row of each ledger the gate already approved. Collected by
+        // the same gate, so a prose page wearing the ledger name is still
+        // untouched.
+        let mut stmt = conn.prepare(
+            "SELECT id, length(body), substr(body, 1, ?1), workspace_id, project_id, path \
+               FROM pages \
+              WHERE is_latest = 1 \
+                AND (path = 'log.md' OR path GLOB 'log-[0-9][0-9][0-9][0-9]-[0-9][0-9].md')",
+        )?;
+        let mut rows = stmt.query(params![
+            ai_memory_core::log_ledger::GATE_PREFIX_BYTES as i64
+        ])?;
+        let mut latest: Vec<PageId> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let body_prefix: String = row.get(2)?;
+            if !ai_memory_core::log_ledger::body_opens_with_log_ledger(&body_prefix) {
+                continue;
+            }
+            let id: Vec<u8> = row.get(0)?;
+            latest.push(PageId::from_slice(&id)?);
+            bytes_deleted = bytes_deleted.saturating_add(row.get::<_, i64>(1)?.max(0) as u64);
+        }
+        summary.pages_deleted += latest.len() as u64;
+        summary.bytes_deleted = bytes_deleted;
+        summary.dropped_latest = !latest.is_empty();
+        doomed.extend(latest);
+    }
+
+    if dry_run {
+        return Ok(summary);
+    }
+
+    if !doomed.is_empty() {
+        delete_pages_without_fts_retokenizing(conn, &doomed)?;
+    }
+
+    summary.bytes_after = database_bytes(conn)?;
+    if compaction == Compaction::Reclaim && !doomed.is_empty() {
+        // `VACUUM` cannot run inside a transaction, and it is the whole-file
+        // rewrite `compact` already documents the cost of.
+        conn.execute_batch("VACUUM;")?;
+        summary.compacted = true;
+        summary.bytes_after = database_bytes(conn)?;
+    }
+    Ok(summary)
+}
+
+/// Delete `ids` from `pages` with the FTS delete trigger stood down, then put
+/// the trigger back and rebuild `pages_fts`.
+///
+/// The trigger's DDL is read from `sqlite_master` rather than restated, so a
+/// later change to the index's shape cannot leave this dropping a trigger that
+/// no longer matches the one it recreates. The drop, the delete and the
+/// re-create share one transaction: a failure rolls back to the original
+/// trigger with the rows intact.
+fn delete_pages_without_fts_retokenizing(conn: &mut Connection, ids: &[PageId]) -> StoreResult<()> {
+    let trigger_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'pages_fts_ad'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+
+    let tx = conn.transaction()?;
+
+    if let Some(sql) = trigger_sql.as_deref() {
+        tx.execute_batch("DROP TRIGGER pages_fts_ad;")?;
+        for chunk in ids.chunks(LEDGER_DELETE_CHUNK) {
+            let mut del = tx.prepare("DELETE FROM pages WHERE id = ?1")?;
+            for id in chunk {
+                del.execute(params![id.as_bytes()])?;
+            }
+        }
+        tx.execute_batch(sql)?;
+    } else {
+        // No trigger to stand down: an ordinary delete already leaves the
+        // index consistent, so do not invent a different path for it.
+        for chunk in ids.chunks(LEDGER_DELETE_CHUNK) {
+            let mut del = tx.prepare("DELETE FROM pages WHERE id = ?1")?;
+            for id in chunk {
+                del.execute(params![id.as_bytes()])?;
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    // The rows are gone but their tokens are not: an external-content FTS5
+    // table keeps them in its segments until a rebuild. One rebuild for the
+    // whole index instead of a delete command per row.
+    conn.execute_batch("INSERT INTO pages_fts(pages_fts) VALUES('rebuild');")?;
+    Ok(())
+}
+
 /// What [`purge_session`] removed. All counts are rows actually deleted.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PurgeSessionSummary {
