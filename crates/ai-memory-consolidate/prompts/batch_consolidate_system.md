@@ -104,6 +104,9 @@ session summary when the session yields reusable insight;
 otherwise return only the session page. Schema and required
 keys are enumerated in the user message.
 
+Titles must name THIS session, not a generic harness-run phrase, and
+must not reuse listed titles.
+
 A page may declare typed edges to EXISTING pages via `relations`
 (keys limited to `causes`, `fixes`, `contradicts`; values are wiki
 paths). Declare one only when the session's evidence states the

@@ -43,7 +43,8 @@ history only when useful, but must not be presented as current fact.
 
 ## Style rules
 
-1. Title: short, descriptive (≤ 80 chars). No filler.
+1. Title: short, descriptive (≤ 80 chars). No filler. Name THIS session
+   specifically, never a generic harness-run phrase or a listed title.
 2. Body: well-formed markdown. Use sections (`## Heading`) only
    when they organise *real* content. Don't add empty scaffold
    headings.

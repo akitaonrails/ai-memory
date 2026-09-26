@@ -5,6 +5,7 @@
 //! [`Wiki::write_page`] so the supersession chain + git auto-commit
 //! kicks in automatically.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -224,12 +225,16 @@ impl Consolidator {
             .map(|md| md.body)
             .unwrap_or_default();
         let instructions = self.resolve_instructions(ws, proj, instructions).await;
+        let existing_titles = self
+            .existing_page_titles(ws, proj, &actor, session_id)
+            .await;
         let request = build_request(
             session_id,
             &observations,
             &current_body,
             instructions.as_deref(),
             self.budgets,
+            &existing_titles,
         );
         debug!(
             session = %session_id,
@@ -237,13 +242,27 @@ impl Consolidator {
             model = self.llm.model(),
             "consolidating session"
         );
-        let page: ConsolidatedPage = complete_structured_with_retry(
+        let mut page: ConsolidatedPage = complete_structured_with_retry(
             &*self.llm,
             request,
             session_id.into(),
             CONSOLIDATION_LLM_RETRY_DELAY,
         )
         .await?;
+        // Deterministic backstop for the title-uniqueness prompt rule:
+        // identical harness runs produce near-identical observations, and
+        // the LLM can still return the same generic title an existing
+        // page already carries. Disambiguate before the write so the M8
+        // duplicate-title lint never sees the collision.
+        if let Some((new_title, new_body)) = disambiguate_colliding_session_title(
+            &page.title,
+            &page.body_markdown,
+            &existing_titles,
+            session_id,
+        ) {
+            page.body_markdown = new_body;
+            page.title = new_title;
+        }
 
         let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
@@ -439,6 +458,57 @@ impl Consolidator {
         }
     }
 
+    /// Latest page titles for duplicate-title avoidance on the session
+    /// page, seen through the same owner visibility as the slot
+    /// snapshots. The session's OWN page is excluded: re-consolidation
+    /// refreshing its own previous title is correct, not a collision.
+    /// Best-effort — a store hiccup degrades to "no context" rather
+    /// than failing consolidation.
+    async fn existing_page_titles(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        actor: &ai_memory_core::ActorContext,
+        session_id: SessionId,
+    ) -> Vec<String> {
+        let own_path = format!("sessions/{session_id}.md");
+        match self
+            .reader
+            .briefing_for_project(
+                workspace_id,
+                project_id,
+                EXISTING_TITLES_QUERY_LIMIT,
+                ai_memory_core::OwnerFilter::for_actor_context(actor),
+                false,
+            )
+            .await
+        {
+            Ok(brief) => {
+                let from_briefing = brief
+                    .recent_pages
+                    .iter()
+                    .chain(brief.pinned.iter())
+                    .chain(brief.rules.iter())
+                    .chain(brief.slots.iter())
+                    .filter(|p| p.path != own_path)
+                    .map(|p| p.title.clone());
+                let from_settled = brief
+                    .settled
+                    .iter()
+                    .filter(|p| p.path != own_path)
+                    .map(|p| p.title.clone());
+                from_briefing.chain(from_settled).collect()
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "existing-title query failed; skipping duplicate-title context"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     async fn slot_snapshots(
         &self,
         workspace_id: WorkspaceId,
@@ -529,12 +599,16 @@ impl Consolidator {
         // standing preferences ride along as untrusted advisory data.
         let slots = self.slot_snapshots(ws, proj, &actor).await?;
         let instructions = self.resolve_instructions(ws, proj, instructions).await;
+        let existing_titles = self
+            .existing_page_titles(ws, proj, &actor, session_id)
+            .await;
         let request = build_batch_request_with_slots(
             session_id,
             &observations,
             &slots,
             instructions.as_deref(),
             self.budgets,
+            &existing_titles,
         );
         debug!(
             session = %session_id,
@@ -557,6 +631,9 @@ impl Consolidator {
             let (mut req, mut outcome) = build_update(ws, proj, upd, false, &actor, author_id)?;
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
+                // Deterministic backstop for the title-uniqueness prompt
+                // rule — see the matching block in `consolidate_session`.
+                disambiguate_anchor_title(&mut req, &mut outcome, &existing_titles, session_id);
             }
             req.evidence = vec![ai_memory_core::PageEvidence {
                 kind: ai_memory_core::PageEvidenceKind::Session,
@@ -918,6 +995,7 @@ pub fn build_batch_request(session_id: SessionId, observations: &[Observation]) 
         &[],
         None,
         PromptBudgets::default(),
+        &[],
     )
 }
 
@@ -927,6 +1005,7 @@ fn build_batch_request_with_slots(
     slots: &[SlotSnapshot],
     instructions: Option<&str>,
     budgets: PromptBudgets,
+    existing_titles: &[String],
 ) -> ChatRequest {
     let mut prefix = String::new();
     prefix.push_str(
@@ -1006,15 +1085,19 @@ fn build_batch_request_with_slots(
          \x20\x20\"rationale\": \"<one short sentence about why this batch>\"\n\
          }\n",
     );
+    let titles_block = render_title_uniqueness_section(existing_titles);
     let optional_budget = budgets.optional_context_budget::<ConsolidatedBatch>(
         BATCH_SYSTEM_PROMPT,
-        count_chars(&prefix).saturating_add(count_chars(&mandatory_suffix)),
+        count_chars(&prefix)
+            .saturating_add(count_chars(&mandatory_suffix))
+            .saturating_add(count_chars(&titles_block)),
     );
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let slots_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
     let mut suffix = render_slot_snapshots(slots, slots_budget);
     suffix.push_str(&mandatory_suffix);
+    suffix.push_str(&titles_block);
     suffix.push_str(&instructions_block);
 
     let observation_chars = budgets.remaining_input_chars::<ConsolidatedBatch>(
@@ -1080,6 +1163,7 @@ fn build_request(
     current_body: &str,
     instructions: Option<&str>,
     budgets: PromptBudgets,
+    existing_titles: &[String],
 ) -> ChatRequest {
     let mut prefix = String::new();
     prefix.push_str("Session id: ");
@@ -1091,7 +1175,10 @@ fn build_request(
     let instructions_block =
         render_instructions_block(instructions, optional_budget.saturating_div(2));
     let current_body_budget = optional_budget.saturating_sub(count_chars(&instructions_block));
+    let titles_block = render_title_uniqueness_section(existing_titles);
+    let current_body_budget = current_body_budget.saturating_sub(count_chars(&titles_block));
     let mut suffix = render_current_body_section(current_body, current_body_budget);
+    suffix.push_str(&titles_block);
     suffix.push_str(&instructions_block);
 
     let observation_chars = budgets.remaining_input_chars::<ConsolidatedPage>(
@@ -1520,6 +1607,138 @@ fn short_id(s: &str) -> String {
     s.chars().take(8).collect()
 }
 
+/// How many latest-page titles feed duplicate-title avoidance on the
+/// session page. Bounds both the collision guard's key set and the
+/// briefing query; older collisions fall through to the M8 lint.
+const EXISTING_TITLES_QUERY_LIMIT: usize = 200;
+
+/// How many of the queried titles ride in the prompt. The guard checks
+/// the whole queried set; the prompt only needs enough examples to steer
+/// the LLM away from the generic-title local optimum.
+const EXISTING_TITLES_PROMPT_LIMIT: usize = 15;
+
+/// Case-insensitive, whitespace-collapsed title key — the same grouping
+/// the M8 duplicate-title lint uses, so "collides here" means "the lint
+/// flags it there".
+fn title_collision_key(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Deterministic disambiguation for a session page title that collided
+/// with another latest page. The suffix carries the session's short id,
+/// unique per page, so one application always breaks the tie and
+/// re-consolidation of the same session is stable.
+fn disambiguated_session_title(title: &str, session_id: SessionId) -> String {
+    format!(
+        "{} (session {})",
+        title.trim(),
+        short_id(&session_id.to_string())
+    )
+}
+
+/// Rewrite the body's leading H1 when it echoes the pre-disambiguation
+/// title, so the rendered page does not open with the stale heading.
+/// Anything else (deeper heading, mid-body echo, prose) is left alone.
+fn retitle_leading_h1(body: &str, old: &str, new: &str) -> String {
+    let heading = format!("# {old}");
+    match body.strip_prefix(&heading) {
+        Some(after) if after.is_empty() || after.starts_with('\n') => {
+            format!("# {new}{after}")
+        }
+        _ => body.to_string(),
+    }
+}
+
+/// The bounded existing-titles list for the consolidation prompt.
+fn render_existing_titles(titles: &[String]) -> String {
+    titles
+        .iter()
+        .take(EXISTING_TITLES_PROMPT_LIMIT)
+        .map(|t| format!("- {t}\n"))
+        .collect()
+}
+
+/// Shared uniqueness block injected into both consolidation prompts.
+/// The system prompt carries the durable rule; this carries the
+/// project's actual titles, which only the caller can see. Absent
+/// when the project has no other pages — the rule has nothing to
+/// list, and the fixed prompt text would otherwise eat into the
+/// minimum observation budget.
+fn render_title_uniqueness_section(titles: &[String]) -> String {
+    if titles.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n## Existing page titles in this project\n\
+         Do not reuse any of these for a page title — a case-insensitive \
+         match counts as a reuse. The title must distinguish THIS session \
+         (goal, outcome, or target); a generic phrase that other runs of \
+         the same harness would also produce is not a title.\n{}\n",
+        render_existing_titles(titles)
+    )
+}
+
+/// Shared collision backstop for both session-page write paths.
+/// When `title` already names another latest page (case-insensitive,
+/// whitespace-collapsed — the M8 grouping), suffix the session short
+/// id and retitle a matching leading H1. `None` when the title is free.
+fn disambiguate_colliding_session_title(
+    title: &str,
+    body: &str,
+    existing_titles: &[String],
+    session_id: SessionId,
+) -> Option<(String, String)> {
+    let taken: HashSet<String> = existing_titles
+        .iter()
+        .map(|t| title_collision_key(t))
+        .collect();
+    if !taken.contains(&title_collision_key(title)) {
+        return None;
+    }
+    let new_title = disambiguated_session_title(title, session_id);
+    warn!(
+        session = %session_id,
+        old = %title,
+        new = %new_title,
+        "session page title collided with an existing page; disambiguated",
+    );
+    Some((
+        new_title.clone(),
+        retitle_leading_h1(body, title, &new_title),
+    ))
+}
+
+/// Guard for the LLM's freedom over `title` on the batch session-anchor
+/// write path. Delegates to [`disambiguate_colliding_session_title`].
+fn disambiguate_anchor_title(
+    req: &mut WritePageRequest,
+    outcome: &mut ConsolidationOutcome,
+    existing_titles: &[String],
+    session_id: SessionId,
+) {
+    let Some(current) = req
+        .frontmatter
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some((new_title, new_body)) =
+        disambiguate_colliding_session_title(&current, &req.body, existing_titles, session_id)
+    else {
+        return;
+    };
+    req.frontmatter["title"] = serde_json::Value::String(new_title.clone());
+    req.title = Some(new_title.clone());
+    req.body = new_body;
+    outcome.new_title = new_title;
+}
+
 /// System prompt for single-page consolidation. Loaded at compile
 /// time from `prompts/single_consolidate_system.md`.
 const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.md");
@@ -1557,12 +1776,302 @@ mod tests {
             "",
             None,
             PromptBudgets::default(),
+            &[],
         );
         let prompt = &request.messages[0].content;
         assert!(prompt.contains("--- observation 1/2 ---"));
         assert!(prompt.contains("id:"));
         assert!(prompt.contains("created_at:"));
         assert!(prompt.contains("importance:"));
+    }
+
+    #[test]
+    fn title_collision_key_groups_case_and_whitespace() {
+        assert_eq!(
+            title_collision_key("  Adversarial   Verification "),
+            title_collision_key("adversarial verification"),
+            "the key must group exactly like the M8 duplicate-title lint",
+        );
+        assert_ne!(
+            title_collision_key("adversarial verification"),
+            title_collision_key("adversarial verification (session 01a0d4e3)"),
+        );
+    }
+
+    #[test]
+    fn disambiguated_session_title_is_deterministic_and_session_specific() {
+        // Fixed ids, not `SessionId::new()`: v7 ids share their timestamp
+        // prefix, so two random ids minted in the same millisecond would
+        // collide on the 8-char short id and flake the distinctness check.
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let other: SessionId = "0193e7a2-0000-7000-8000-000000000002"
+            .parse()
+            .expect("fixed session id");
+        let a = disambiguated_session_title("Adversarial Verification", sid);
+        let b = disambiguated_session_title("Adversarial Verification", sid);
+        assert_eq!(a, b, "re-consolidation must keep the same title");
+        assert!(
+            a.starts_with("Adversarial Verification (session 0193e7a1)"),
+            "suffix carries the session short id: {a}",
+        );
+        assert_ne!(
+            a,
+            disambiguated_session_title("Adversarial Verification", other),
+            "different sessions disambiguate apart",
+        );
+    }
+
+    #[test]
+    fn retitle_leading_h1_only_touches_a_matching_first_heading() {
+        assert_eq!(
+            retitle_leading_h1("# Old Title\n\nbody", "Old Title", "New Title"),
+            "# New Title\n\nbody",
+        );
+        assert_eq!(
+            retitle_leading_h1("# Old Title", "Old Title", "New Title"),
+            "# New Title",
+            "heading-only body still retitles",
+        );
+        assert_eq!(
+            retitle_leading_h1("## Old Title\n", "Old Title", "New Title"),
+            "## Old Title\n",
+            "deeper headings are not the page title",
+        );
+        assert_eq!(
+            retitle_leading_h1("# Old Title Longer\n", "Old Title", "New Title"),
+            "# Old Title Longer\n",
+            "a prefix match is not the page title",
+        );
+        assert_eq!(
+            retitle_leading_h1("prose only", "Old Title", "New Title"),
+            "prose only",
+        );
+    }
+
+    #[test]
+    fn render_title_uniqueness_section_bounded_and_absent_when_empty() {
+        let titles: Vec<String> = (0..30).map(|i| format!("Title {i}")).collect();
+        let section = render_title_uniqueness_section(&titles);
+        assert!(section.contains("Title 0\n") && section.contains("Title 14\n"));
+        assert!(!section.contains("Title 15\n"), "prompt list is bounded");
+        assert!(section.contains("case-insensitive"));
+
+        // A brand-new project omits the block entirely: the durable rule
+        // lives in the system prompt, and fixed prompt text must not eat
+        // into the advertised minimum observation budget.
+        assert!(render_title_uniqueness_section(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_request_lists_existing_titles_for_uniqueness() {
+        let request = build_request(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            "",
+            None,
+            PromptBudgets::default(),
+            &["Adversarial Verification for Grok Build Harness".to_string()],
+        );
+        let prompt = &request.messages[0].content;
+        assert!(
+            prompt.contains("Adversarial Verification for Grok Build Harness"),
+            "single-page prompt carries the project's existing titles",
+        );
+        assert!(prompt.contains("Do not reuse any of these"));
+    }
+
+    #[test]
+    fn build_batch_request_lists_existing_titles_for_uniqueness() {
+        let request = build_batch_request_with_slots(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            &[],
+            None,
+            PromptBudgets::default(),
+            &["Goal Plan Writer Execution".to_string()],
+        );
+        let prompt = &request.messages[0].content;
+        assert!(
+            prompt.contains("Goal Plan Writer Execution"),
+            "batch prompt carries the project's existing titles",
+        );
+        assert!(prompt.contains("Do not reuse any of these"));
+    }
+
+    /// The observation dump is spliced between `prefix` and `suffix`. The
+    /// schema (tier/kind/JSON keys) belongs in `mandatory_suffix` so the
+    /// dump still follows `Observations:` instead of sitting after the
+    /// schema docs.
+    fn assert_batch_dump_follows_observations_header(prompt: &str) {
+        let header = prompt
+            .find("\n\nObservations:\n")
+            .expect("batch prompt starts the observation section");
+        let dump = prompt
+            .find("--- observation")
+            .expect("batch prompt projects an observation dump");
+        let schema = prompt
+            .find("## `tier` field")
+            .expect("batch prompt still carries the schema suffix");
+        assert!(
+            header < dump && dump < schema,
+            "observation dump must sit between Observations: and the schema suffix; header={header} dump={dump} schema={schema}"
+        );
+        assert!(
+            !prompt[header..dump].contains("## `tier` field"),
+            "schema must not leak into the prefix ahead of the dump"
+        );
+    }
+
+    #[test]
+    fn batch_user_message_places_observation_dump_before_schema() {
+        let request = build_batch_request_with_slots(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            &[],
+            None,
+            PromptBudgets::default(),
+            &[],
+        );
+        assert_batch_dump_follows_observations_header(&request.messages[0].content);
+    }
+
+    #[test]
+    fn build_request_omits_titles_block_when_the_project_is_empty() {
+        let single = build_request(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            "",
+            None,
+            PromptBudgets::default(),
+            &[],
+        );
+        let batch = build_batch_request_with_slots(
+            SessionId::new(),
+            &[obs_of_size(10)],
+            &[],
+            None,
+            PromptBudgets::default(),
+            &[],
+        );
+        assert!(
+            !single.messages[0].content.contains("Existing page titles"),
+            "empty title list must omit the uniqueness block from the single-page user message"
+        );
+        assert!(
+            !batch.messages[0].content.contains("Existing page titles"),
+            "empty title list must omit the uniqueness block from the batch user message"
+        );
+    }
+
+    #[test]
+    fn consolidation_system_prompts_require_session_specific_unique_titles() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(
+                prompt.contains("THIS session"),
+                "{name} prompt must require a session-specific title"
+            );
+            assert!(
+                prompt.contains("generic") && prompt.contains("harness-run"),
+                "{name} prompt must reject generic harness-run titles"
+            );
+            assert!(
+                prompt.contains("listed title"),
+                "{name} prompt must forbid reusing listed titles"
+            );
+        }
+    }
+
+    #[test]
+    fn disambiguate_colliding_session_title_rewrites_only_on_collision() {
+        let sid: SessionId = "0193e7a1-0000-7000-8000-000000000001"
+            .parse()
+            .expect("fixed session id");
+        let taken = vec!["Adversarial Verification".to_string()];
+        let (title, body) = disambiguate_colliding_session_title(
+            "Adversarial Verification",
+            "# Adversarial Verification\n\nbody",
+            &taken,
+            sid,
+        )
+        .expect("collision");
+        assert_eq!(title, "Adversarial Verification (session 0193e7a1)");
+        assert_eq!(
+            body,
+            "# Adversarial Verification (session 0193e7a1)\n\nbody"
+        );
+        assert!(
+            disambiguate_colliding_session_title(
+                "Fresh Specific Title",
+                "# Fresh Specific Title\n",
+                &taken,
+                sid,
+            )
+            .is_none(),
+            "a free title is left verbatim"
+        );
+    }
+
+    #[test]
+    fn disambiguate_anchor_title_suffixes_on_collision_only() {
+        let sid = SessionId::new();
+        let taken = vec!["Adversarial Verification".to_string()];
+
+        let mut colliding = WritePageRequest {
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            path: PagePath::new(format!("sessions/{sid}.md")).unwrap(),
+            frontmatter: serde_json::json!({"title": "Adversarial Verification"}),
+            body: "# Adversarial Verification\n\nbody".to_string(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: Some("Adversarial Verification".to_string()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::default(),
+            evidence: vec![],
+        };
+        let mut outcome = ConsolidationOutcome {
+            path: colliding.path.clone(),
+            dry_run: false,
+            new_title: "Adversarial Verification".to_string(),
+            new_body_markdown: String::new(),
+            page_id: None,
+            tags: Vec::new(),
+        };
+        disambiguate_anchor_title(&mut colliding, &mut outcome, &taken, sid);
+        let effective = colliding.frontmatter["title"].as_str().unwrap();
+        assert_ne!(effective, "Adversarial Verification");
+        assert!(effective.starts_with("Adversarial Verification (session "));
+        assert_eq!(colliding.title.as_deref(), Some(effective));
+        assert_eq!(outcome.new_title, effective);
+        assert_eq!(
+            colliding.body,
+            format!("# {effective}\n\nbody"),
+            "the leading H1 follows the disambiguated title",
+        );
+
+        // No collision, no touch — including the case-flipped variant,
+        // which the lint would also flag.
+        let mut free = WritePageRequest {
+            frontmatter: serde_json::json!({"title": "Fresh Specific Title"}),
+            body: "# Fresh Specific Title\n".to_string(),
+            title: Some("Fresh Specific Title".to_string()),
+            ..colliding
+        };
+        let before = free.frontmatter.clone();
+        let mut free_outcome = ConsolidationOutcome {
+            new_title: "Fresh Specific Title".to_string(),
+            ..outcome
+        };
+        disambiguate_anchor_title(
+            &mut free,
+            &mut free_outcome,
+            &["ADVERSarial   verification".to_string()],
+            sid,
+        );
+        assert_eq!(free.frontmatter, before, "a free title is left verbatim");
     }
 
     #[test]
@@ -1629,6 +2138,7 @@ mod tests {
             &current_body,
             None,
             PromptBudgets::default(),
+            &[],
         );
         let prompt = &request.messages[0].content;
 
@@ -1651,6 +2161,7 @@ mod tests {
             &current_body,
             None,
             PromptBudgets::default(),
+            &[],
         );
         let prompt = &request.messages[0].content;
 
@@ -1687,6 +2198,7 @@ mod tests {
             &"x".repeat(50_000),
             Some(&"preference ".repeat(500)),
             budgets,
+            &[],
         );
 
         assert!(
@@ -1708,6 +2220,7 @@ mod tests {
             &"x".repeat(50_000),
             Some(&"preference ".repeat(500)),
             budgets,
+            &[],
         );
 
         assert!(estimated_input_chars::<ConsolidatedPage>(&request) <= budgets.max_input_chars);
@@ -1722,9 +2235,15 @@ mod tests {
             MIN_CONSOLIDATION_MAX_OUTPUT_TOKENS,
         );
         let observations = vec![obs_of_size(500)];
-        let single = build_request(SessionId::new(), &observations, "", None, budgets);
-        let batch =
-            build_batch_request_with_slots(SessionId::new(), &observations, &[], None, budgets);
+        let single = build_request(SessionId::new(), &observations, "", None, budgets, &[]);
+        let batch = build_batch_request_with_slots(
+            SessionId::new(),
+            &observations,
+            &[],
+            None,
+            budgets,
+            &[],
+        );
 
         assert!(estimated_input_chars::<ConsolidatedPage>(&single) <= budgets.max_input_chars);
         let batch_chars = estimated_input_chars::<ConsolidatedBatch>(&batch);
@@ -1733,8 +2252,26 @@ mod tests {
             "minimum batch estimate {batch_chars} exceeded {} chars",
             budgets.max_input_chars
         );
-        assert!(single.messages[0].content.contains("body:\n"));
-        assert!(batch.messages[0].content.contains("body:\n"));
+
+        let single_user = &single.messages[0].content;
+        let batch_user = &batch.messages[0].content;
+        assert!(
+            single_user.contains("body:\n"),
+            "single-page floor request must project an observation body"
+        );
+        assert!(
+            batch_user.contains("body:\n"),
+            "batch floor request must project an observation body"
+        );
+        assert!(
+            !single_user.contains("no projection budget"),
+            "single-page floor request must not omit observations"
+        );
+        assert!(
+            !batch_user.contains("no projection budget"),
+            "batch floor request must not omit observations"
+        );
+        assert_batch_dump_follows_observations_header(batch_user);
     }
 
     /// The body excerpt keeps its absolute ceiling on a huge budget: past
@@ -1777,6 +2314,7 @@ mod tests {
             &slots,
             Some(&"preference ".repeat(500)),
             budgets,
+            &[],
         );
 
         let estimated = estimated_input_chars::<ConsolidatedBatch>(&request);
@@ -2430,8 +2968,14 @@ mod tests {
             slot_kind: SlotKind::Invariant,
             body: "This is stable unless a later observation contradicts it.".into(),
         }];
-        let request =
-            build_batch_request_with_slots(session_id, &[], &slots, None, PromptBudgets::default());
+        let request = build_batch_request_with_slots(
+            session_id,
+            &[],
+            &slots,
+            None,
+            PromptBudgets::default(),
+            &[],
+        );
         let prompt = &request.messages[0].content;
         assert!(prompt.contains("Current `_slots/` pages"));
         assert!(prompt.contains("_slots/project_context.md | slot_kind=invariant"));
@@ -3623,6 +4167,7 @@ mod tests {
             &[],
             Some(malicious),
             PromptBudgets::default(),
+            &[],
         );
         let prompt = &with.messages[0].content;
         assert!(prompt.contains("Project consolidation preferences (untrusted project data)"));
@@ -3645,6 +4190,7 @@ mod tests {
             &[],
             None,
             PromptBudgets::default(),
+            &[],
         );
         assert!(
             !without.messages[0]
@@ -3659,6 +4205,7 @@ mod tests {
             "",
             Some("focus on API changes"),
             PromptBudgets::default(),
+            &[],
         );
         assert!(
             single.messages[0]
