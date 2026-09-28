@@ -267,9 +267,8 @@ can be mentioned.
 
 Capture policy v1 is enforced by native `ai-memory hook` commands (including
 native POSIX/Windows hook commands) and generated OpenCode, OMP, Pi, and
-OpenClaw integrations. Shell-command matching is enforced by the native
-`ai-memory hook` commands only; the generated integrations still keep shell
-events. Local installers default to native commands where that
+OpenClaw integrations, including the lexical shell-command matching above.
+Local installers default to native commands where that
 path is supported. Legacy `.sh`/`.ps1` hooks and remote-only/Docker script
 bundles do **not** enforce it. Reinstall hooks or refresh/reinstall generated
 plugins after upgrading; existing hooks/plugins keep their prior behavior.

@@ -15,9 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lexically and drops the event when an argument, resolved from the event's
   `cwd`, matches an ignored pattern or is a glob that can reach one. Variables,
   command substitution and commands that name no path are not followed. The
-  generated OpenCode, OMP, Pi and OpenClaw integrations are unchanged. The
   marker-file reference also documents excluding large tool results that Claude
   Code saves and re-reads from `~/.claude/projects/**/tool-results/**`. (#946)
+- The generated OpenCode, OMP, Pi and OpenClaw integrations now apply the same
+  lexical shell-command `ignore_paths` matching as the native hook, so a `bash`
+  call such as `cat docs/adr/0001.md` is dropped there too instead of being
+  captured. Refresh or reinstall generated plugins to pick it up. (#948)
 - Grok Build CLI tool observations are no longer stored with an empty body.
   Grok posts Claude Code's snake_case tool fields (`tool_name` / `tool_input` /
   `tool_use_id`), but it was missing from both `closed_tool_agent` and the
