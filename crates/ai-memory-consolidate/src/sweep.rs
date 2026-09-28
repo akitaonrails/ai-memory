@@ -15,9 +15,16 @@
 //! contradiction is visible before the delete lands.
 //!
 //! Hard-delete pass cleans up tombstones older than
-//! `hard_delete_after_days` and their supersession ancestry. A page recreated
-//! at the same path is a separate live chain and is preserved. Ordinary
-//! supersession rows are safe because only decay writes `superseded_at`.
+//! `hard_delete_after_days` and their supersession ancestry. Ordinary
+//! supersession rows are safe because only a tombstone (decay eviction, or
+//! the watcher's opt-in reconcile-delete safety net, #929 — the two are
+//! deliberately indistinguishable here) writes `superseded_at`. A page
+//! rewritten at a tombstoned path re-links onto that chain via `supersedes`
+//! and clears the old row's `superseded_at` (`ops::upsert_page_in_tx`'s
+//! resurrection path), so the old version becomes an ordinary, protected
+//! chain member instead of an orphan this pass would otherwise hard-delete —
+//! this is what keeps a reconcile tombstone's false positive from being
+//! permanently destroyed once the file reappears.
 //!
 //! Observation prune pass (opt-in, disabled unless
 //! `ObservationRetention::days > 0`) deletes raw observations older than the

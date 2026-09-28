@@ -1174,13 +1174,48 @@ pub(crate) fn upsert_page_in_tx(
             existing,
         });
     }
+    // Tombstone resurrection (#929). A tombstone is any `is_latest = 0` row
+    // with `superseded_at` set — decay eviction and the reconcile-delete
+    // safety net both mark one this way, and they are deliberately
+    // indistinguishable here (docs/okf.md): both are "the store believes
+    // this path has no file", and both deserve the same resurrection
+    // behavior if a fresh write proves that belief wrong.
+    //
+    // Without this, a fresh write at a tombstoned path started a brand-new,
+    // disconnected chain (`supersedes = NULL`), leaving the OLD chain an
+    // unreachable orphan. For a reconcile tombstone that "no chain has a
+    // successor" is exactly what made it eligible for
+    // `hard_delete_decayed_page_chain`'s recursive walk — so a false
+    // positive that self-healed (the file came back) still got permanently
+    // hard-deleted ~`hard_delete_after_days` later, contradicting the
+    // safety net's own "never destroys anything" premise.
+    //
+    // The fix re-links the new version onto the tombstoned chain via
+    // `supersedes`, exactly like an ordinary edit supersedes the page it
+    // replaces, and clears the old row's `superseded_at`. That second step
+    // is what actually protects it: `decay_tombstones_before` and
+    // `hard_delete_decayed_page_chain` both key their eligibility on
+    // `superseded_at IS NOT NULL` — an ordinary supersession-chain member
+    // never sets it, which is the existing mechanism that keeps normal
+    // history off the aged-tombstone sweep. Clearing it here puts the
+    // resurrected row under that exact same protection, rather than
+    // inventing a new one. `valid_to` is left as the tombstone wrote it
+    // (the instant the page actually went missing), not bumped to `now`.
+    let tombstone = most_recent_tombstone_at_path(tx, page)?;
+    if let Some(tombstone_id) = &tombstone {
+        tx.execute(
+            "UPDATE pages SET superseded_at = NULL WHERE id = ?1",
+            params![tombstone_id],
+        )?;
+    }
     let frontmatter_str = stamped_frontmatter(conformed, now)?;
     let new_id = PageId::new();
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at, valid_from, compacted_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14, ?13, ?15)",
+          frontmatter_json, is_latest, supersedes, pinned, author_id, created_at, updated_at, \
+          expires_at, valid_from, compacted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -1192,6 +1227,7 @@ pub(crate) fn upsert_page_in_tx(
             page.body,
             body_sha256.as_slice(),
             frontmatter_str,
+            tombstone,
             i64::from(page.pinned),
             page.author_id.map(|id| id.as_bytes().to_vec()),
             now,
@@ -1205,7 +1241,11 @@ pub(crate) fn upsert_page_in_tx(
     insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
     audit(
         tx,
-        "create_page",
+        if tombstone.is_some() {
+            "resurrect_tombstoned_page"
+        } else {
+            "create_page"
+        },
         Some(page.workspace_id.as_bytes()),
         Some(page.project_id.as_bytes()),
         Some(new_id.as_bytes()),
@@ -1215,6 +1255,32 @@ pub(crate) fn upsert_page_in_tx(
         now,
     )?;
     Ok(new_id)
+}
+
+/// The most recently tombstoned row at `page`'s path, if any: the newest
+/// `is_latest = 0` version with `superseded_at` set (decay eviction or the
+/// reconcile-delete safety net — see the resurrection comment in
+/// [`upsert_page_in_tx`]). At most one row can match at a time in practice
+/// (resurrecting one clears its `superseded_at`), but the ordering makes the
+/// choice well-defined even if that invariant is ever violated.
+fn most_recent_tombstone_at_path(
+    tx: &rusqlite::Transaction<'_>,
+    page: &NewPage,
+) -> StoreResult<Option<Vec<u8>>> {
+    Ok(tx
+        .query_row(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+               AND is_latest = 0 AND superseded_at IS NOT NULL \
+             ORDER BY superseded_at DESC LIMIT 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?)
 }
 
 /// The live page this create would share a file with on a case-folding or
@@ -2472,6 +2538,82 @@ pub fn soft_delete_for_decay_if_latest(
             Some(expected_latest_id.as_bytes()),
             // Decay is a scheduled/admin system operation rather than a
             // user-attributable page edit.
+            None,
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(affected != 0)
+}
+
+/// Tombstone the expected latest page whose on-disk file the watcher's
+/// reconcile pass found missing on two consecutive passes (see #929 — an
+/// opt-in safety net, `[maintenance] reconcile_tombstones_deleted_pages`).
+///
+/// Same shape as [`soft_delete_for_decay_if_latest`]: the full identity +
+/// latest-id check runs in the same transaction as the write, so a page
+/// rewritten after the caller last observed it is left untouched. Sets
+/// `is_latest = 0` + `superseded_at`/`valid_to`, exactly like decay eviction.
+/// The caller (`Wiki::tombstone_missing_page_if_latest`) does not dispatch
+/// the admission/mirror webhook chain (this is a background safety net
+/// reacting to an already-vanished file, not a user-initiated delete) and
+/// never touches the filesystem (there is nothing to touch — the file is
+/// already gone).
+///
+/// The precise durability guarantee (this tombstone is NOT exempt from the
+/// aged-tombstone hard-delete sweep — it uses the exact same
+/// `hard_delete_after_days`, tier/pin-agnostic path decay eviction does,
+/// [`decay_tombstones_before`], [`hard_delete_decayed_page_chain`]): a
+/// reconcile tombstone is never itself destroyed while its chain has no
+/// successor. If the file comes back, `upsert_page_in_tx`'s resurrection
+/// path re-links the new version onto this tombstoned chain via
+/// `supersedes` and clears `superseded_at`, so the false positive's history
+/// becomes an ordinary, protected supersession-chain member — nothing is
+/// left orphaned for the sweep to destroy. Only a chain that is genuinely
+/// never rewritten again is eventually hard-deleted, same as any other aged
+/// decay tombstone.
+pub fn soft_delete_for_reconcile_if_latest(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    expected_latest_id: PageId,
+) -> StoreResult<bool> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let affected = tx.execute(
+        "UPDATE pages \
+         SET is_latest = 0, superseded_at = ?1, valid_to = ?1 \
+         WHERE id = ?2 \
+           AND workspace_id = ?3 \
+           AND project_id = ?4 \
+           AND path = ?5 \
+           AND is_latest = 1",
+        params![
+            now,
+            expected_latest_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            path.as_str(),
+        ],
+    )?;
+    if affected != 0 {
+        // Same entity-timeline closure as decay eviction (issue #656): an
+        // open window on a tombstoned page must not resurrect retired
+        // knowledge under `as_of`.
+        tx.execute(
+            "UPDATE entity_page_links SET superseded_at = ?1 \
+             WHERE page_id = ?2 AND superseded_at IS NULL",
+            params![now, expected_latest_id.as_bytes()],
+        )?;
+        audit(
+            &tx,
+            "soft_delete_for_reconcile",
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
+            Some(expected_latest_id.as_bytes()),
+            // Background reconcile safety net, not a user-attributable edit —
+            // same convention as decay's `None` author.
             None,
             now,
         )?;
@@ -7670,6 +7812,139 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(supersedes.is_some(), "new row must link to its predecessor");
+    }
+
+    /// B1 (#929 review): a page whose file disappears, gets reconcile-
+    /// tombstoned, and then reappears must NOT start a brand-new,
+    /// disconnected chain. Before this fix `upsert_page_in_tx`'s "no
+    /// existing `is_latest = 1` row" branch always inserted with
+    /// `supersedes = NULL`, leaving the tombstoned chain an orphan that
+    /// `hard_delete_decayed_page_chain` would permanently destroy once
+    /// `hard_delete_after_days` passed — even though the "deletion" was a
+    /// false positive that had already self-healed. Exercises the exact
+    /// mechanism end to end: tombstone -> file returns (a fresh
+    /// `upsert_page`) -> hard-delete sweep with a cutoff equivalent to
+    /// `hard_delete_after_days = 0` -> the prior (tombstoned) version must
+    /// still exist and be reachable via the chain.
+    #[test]
+    fn reconcile_tombstone_resurrects_instead_of_orphaning_on_recreate() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let path = PagePath::new("concepts/flaky.md").unwrap();
+        let original_id =
+            upsert_page(&mut conn, &page(ws, proj, path.as_str(), "v1 body")).unwrap();
+
+        // The file vanishes and the watcher's reconcile-delete safety net
+        // tombstones it (mirrors `Wiki::tombstone_missing_page_if_latest`).
+        assert!(
+            soft_delete_for_reconcile_if_latest(&mut conn, ws, proj, &path, original_id).unwrap(),
+            "precondition: the tombstone must take"
+        );
+        let tombstoned_superseded_at: Option<i64> = conn
+            .query_row(
+                "SELECT superseded_at FROM pages WHERE id = ?1",
+                params![original_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            tombstoned_superseded_at.is_some(),
+            "precondition: the tombstone sets superseded_at"
+        );
+
+        // The false positive self-heals: the file comes back and gets
+        // reindexed, which is a fresh `upsert_page` call at the same path.
+        let resurrected_id = upsert_page(
+            &mut conn,
+            &page(ws, proj, path.as_str(), "v1 body, but back"),
+        )
+        .unwrap();
+        assert_ne!(original_id, resurrected_id);
+
+        // The new version must re-link onto the tombstoned chain...
+        let supersedes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT supersedes FROM pages WHERE id = ?1",
+                params![resurrected_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            supersedes.as_deref(),
+            Some(&original_id.as_bytes()[..]),
+            "the resurrected version must supersede the tombstoned chain, not start fresh"
+        );
+        // ...and the old row must no longer look like an eligible tombstone:
+        // clearing `superseded_at` is what actually protects it, since
+        // `hard_delete_decayed_page_chain`'s root query does not care who
+        // points at a row via `supersedes`, only whether that row itself
+        // still has `superseded_at IS NOT NULL`.
+        let cleared_superseded_at: Option<i64> = conn
+            .query_row(
+                "SELECT superseded_at FROM pages WHERE id = ?1",
+                params![original_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cleared_superseded_at, None,
+            "resurrection must clear the old row's superseded_at"
+        );
+
+        // Simulate the forget sweep's hard-delete pass with
+        // `hard_delete_after_days = 0` (an immediate cutoff: `now`).
+        let cutoff_now = jiff::Timestamp::now().as_microsecond();
+        let candidates = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
+                     AND path = ?3 AND is_latest = 0 AND superseded_at IS NOT NULL \
+                     AND superseded_at <= ?4",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(
+                    params![ws.as_bytes(), proj.as_bytes(), path.as_str(), cutoff_now],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert!(
+            candidates.is_empty(),
+            "a resurrected chain's old version must not even be a hard-delete candidate: {candidates:?}"
+        );
+        let deleted = hard_delete_decayed_page_chain(
+            &mut conn,
+            ws,
+            proj,
+            &path,
+            original_id,
+            Some(resurrected_id),
+            cutoff_now,
+        )
+        .unwrap();
+        assert_eq!(
+            deleted, 0,
+            "the sweep must refuse to delete a chain member that is no longer a tombstone root"
+        );
+
+        // The prior version is still there and reachable via the chain.
+        let still_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE id = ?1",
+                params![original_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_exists, 1, "the tombstoned version must survive");
+        let reachable_via_chain: Vec<u8> = conn
+            .query_row(
+                "SELECT supersedes FROM pages WHERE id = ?1",
+                params![resurrected_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reachable_via_chain, original_id.as_bytes());
     }
 
     /// Idempotency: re-upserting the same body should NOT create a

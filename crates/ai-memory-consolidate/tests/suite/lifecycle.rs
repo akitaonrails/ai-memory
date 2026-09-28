@@ -1045,7 +1045,18 @@ async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
     .await
     .unwrap();
     assert!(cleanup.evicted.is_empty());
-    assert_eq!(cleanup.hard_deleted, 2);
+    // #929 (B1 review fix): `reindex_page`'s upsert now resurrects a tombstoned
+    // chain instead of starting a disconnected one — see
+    // `ops::upsert_page_in_tx`'s resurrection path and
+    // `ops::reconcile_tombstone_resurrects_instead_of_orphaning_on_recreate`.
+    // The recreated file re-links onto `second` via `supersedes` and clears
+    // `second`'s `superseded_at`, which is what actually protects the old
+    // chain from `hard_delete_decayed_page_chain`: that function's root query
+    // requires `superseded_at IS NOT NULL`, and a resurrected row no longer
+    // has it set — exactly the same protection ordinary supersession-chain
+    // members already had. So this cleanup pass no longer has any tombstone
+    // root left to walk from, and hard-deletes nothing.
+    assert_eq!(cleanup.hard_deleted, 0);
     assert!(wiki.abs_path(ws, proj, &path).exists());
     let recreated = store
         .reader
@@ -1070,7 +1081,35 @@ async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(old_rows, 0);
+    assert_eq!(
+        old_rows, 2,
+        "the old chain must survive, resurrected rather than deleted"
+    );
+    let supersedes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT supersedes FROM pages WHERE id = ?1",
+            params![recreated.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        supersedes.as_deref(),
+        Some(&second.as_bytes()[..]),
+        "the recreated version must supersede the tombstoned chain"
+    );
+    let second_superseded_at: Option<i64> = conn
+        .query_row(
+            "SELECT superseded_at FROM pages WHERE id = ?1",
+            params![second.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        second_superseded_at, None,
+        "resurrection must clear the old tombstone's superseded_at"
+    );
+    drop(conn);
+
     assert!(
         store
             .reader
@@ -1081,6 +1120,25 @@ async fn hard_delete_preserves_a_page_recreated_at_the_same_path() {
             .any(|hit| hit.id == recreated),
         "the recreated page and its FTS entry must survive old-chain cleanup"
     );
+
+    // A further cleanup pass must not find anything to hard-delete either:
+    // the resurrected chain no longer has a tombstone root at all.
+    let second_pass = run_sweep(
+        &store.reader,
+        &store.writer,
+        Some(&wiki),
+        ws,
+        proj,
+        &DecayParams {
+            cold_threshold: 0.0,
+            hard_delete_after_days: 0,
+            ..DecayParams::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_pass.hard_deleted, 0);
 }
 
 fn ws_dir_for(tmp: &TempDir, ws: WorkspaceId, proj: ProjectId) -> std::path::PathBuf {

@@ -1041,7 +1041,13 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         // Reader attached unconditionally: admission name-resolution uses it
         // when a chain is configured, and the startup scope-manifest backfill
         // (below) always needs it to enumerate scopes.
-        .with_store_reader(store.reader.clone());
+        .with_store_reader(store.reader.clone())
+        // `[maintenance] reconcile_tombstones_deleted_pages` (#929), read once
+        // by `Config::load` above and threaded through here — the one place
+        // this flag is consulted outside `Config`, per invariant #1.
+        .with_reconcile_tombstones_deleted_pages(
+            config.maintenance.reconcile_tombstones_deleted_pages,
+        );
     // Attach the admission webhook chain (operator-configured via
     // `[[admission_webhooks]]` in config.toml or `AI_MEMORY_ADMISSION_WEBHOOKS__N__*`
     // env vars). Empty config = no chain attached, zero overhead. The store
@@ -3553,6 +3559,7 @@ mod tests {
                 forget_sweep_interval_secs: 1,
                 lint_interval_secs: 1,
                 embedding_backfill_interval_secs: 1,
+                reconcile_tombstones_deleted_pages: false,
             },
             AutoImproveSettings::default(),
             store.reader.clone(),
@@ -3589,12 +3596,14 @@ mod tests {
                 forget_sweep_interval_secs: 0,
                 lint_interval_secs: 60,
                 embedding_backfill_interval_secs: 0,
+                reconcile_tombstones_deleted_pages: false,
             },
             MaintenanceSettings {
                 enabled: true,
                 forget_sweep_interval_secs: 60,
                 lint_interval_secs: 0,
                 embedding_backfill_interval_secs: 0,
+                reconcile_tombstones_deleted_pages: false,
             },
         ] {
             let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;

@@ -2124,6 +2124,26 @@ or overdue job runs once after a bounded startup delay. Failed runs are not
 recorded as successful and retry after that bounded delay. Embedding backfill
 remains opt-in and keeps its interval-only behavior (no startup catch-up).
 
+`reconcile_tombstones_deleted_pages` (default `false`, also under
+`[maintenance]`) is a separate, experimental opt-in: it lets the watcher's
+own 30s reconcile pass (not the scheduled jobs above) tombstone an
+OKF-imported content page (session summary pages are excluded — see
+`docs/okf.md`) whose file has disappeared from disk, after it has been
+missing on two consecutive passes and survived a circuit breaker that
+refuses to act when more than `max(3, 50%)` of a scope's candidate pages
+look missing at once, or when a walk finds nothing at all. The tombstone is
+soft (`is_latest = 0` + `superseded_at`, the same shape decay eviction uses)
+and is picked up by the same aged-tombstone hard-delete sweep — it is not
+exempt from it. What actually protects it: a reconcile tombstone is never
+itself destroyed while its chain has no successor; if the file returns, the
+new version re-links to the tombstoned chain instead of starting fresh, so
+nothing is orphaned for that sweep to destroy. It never runs the blocking
+admission gate (nothing can refuse it), but does fire-and-forget any
+non-blocking observer/mirror webhook. With it off (the default), reconcile's
+behavior is unchanged: a deleted file still requires `ai-memory delete-page`.
+See
+`docs/okf.md` for the full design.
+
 ---
 
 ## Bootstrap mid-project

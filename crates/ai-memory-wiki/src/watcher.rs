@@ -28,11 +28,12 @@
 //! External writes drive store updates; internal writes drive disk +
 //! store updates via [`Wiki::write_page`].
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use ai_memory_core::{PagePath, ProjectId, WorkspaceId};
+use ai_memory_core::{PageId, PagePath, ProjectId, WorkspaceId};
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
 use tokio::sync::mpsc;
@@ -159,6 +160,13 @@ async fn run_loop(
     let mut consecutive_failures: u32 = 0;
     const DEGRADED_AFTER: u32 = 5;
 
+    // Reconcile-delete safety net (#929, opt-in — see `MissingStreaks`):
+    // per-`(workspace, project, path)` count of consecutive passes a
+    // candidate page's file has looked missing. Lives here, not on `Wiki`,
+    // for the same reason `consecutive_failures` does: it is this task's own
+    // pass-to-pass memory, not shared server state.
+    let mut missing_streaks: MissingStreaks = HashMap::new();
+
     loop {
         tokio::select! {
             biased;
@@ -170,7 +178,7 @@ async fn run_loop(
                 handle_event(&wiki, event).await;
             }
             _ = tick.tick() => {
-                match reconcile(&wiki).await {
+                match reconcile(&wiki, &mut missing_streaks).await {
                     Ok(_) => {
                         if consecutive_failures > 0 {
                             tracing::info!(
@@ -368,15 +376,258 @@ pub(crate) struct ReconcileStats {
     /// Session pages left on disk by a purge whose file cleanup failed, and
     /// deliberately not re-indexed (#701).
     pub skipped_purged_sessions: usize,
+    /// Pages tombstoned by the reconcile-delete safety net (#929) after their
+    /// file was missing on two consecutive passes. Always `0` unless
+    /// `[maintenance] reconcile_tombstones_deleted_pages` is enabled.
+    pub tombstoned_missing: usize,
+    /// Scopes where the reconcile-delete circuit breaker tripped this pass
+    /// (design item #4) — too many candidates looked missing at once, so
+    /// nothing in that scope was tombstoned or counted toward a streak.
+    pub circuit_broken_scopes: usize,
 }
 
-async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
+/// Per-`(workspace, project, path)` streak of consecutive reconcile passes a
+/// candidate page's file has looked missing, plus the [`PageId`] last
+/// observed missing (so a path superseded by a new version between passes
+/// restarts its streak rather than crediting the old version's absence to
+/// the new one). Design item #5 requires two consecutive passes before a
+/// tombstone is even attempted; this is that memory, owned by the watcher's
+/// `run_loop` across ticks the same way `consecutive_failures` is.
+type MissingStreaks = HashMap<(WorkspaceId, ProjectId, PagePath), (PageId, u32)>;
+
+/// Reconcile-delete circuit breaker (design item #4): absolute floor. Even a
+/// scope where every one of a handful of candidates looks "missing" must
+/// clear this many before the breaker can trip — a two- or three-page
+/// project isn't permanently blocked from ever tombstoning a real deletion
+/// just because 100% of a tiny candidate set matches.
+const RECONCILE_DELETE_BREAKER_MIN_CANDIDATES: usize = 3;
+
+/// Reconcile-delete circuit breaker (design item #4): fraction floor, applied
+/// alongside the absolute floor above. Half (or more) of a scope's candidate
+/// pages vanishing inside one 30s reconcile window is far more likely a
+/// walk/mount problem — an unmounted volume, a git checkout mid-walk, a
+/// project directory being renamed — than that many genuine deletions
+/// landing in the same pass, so the pass is treated as suspect and nothing
+/// in that scope is tombstoned this round.
+const RECONCILE_DELETE_BREAKER_FRACTION: f64 = 0.5;
+
+/// The missing-candidate count strictly above which the circuit breaker
+/// trips, for a scope with `total_candidates` walk-eligible pages tracked
+/// before the walk ran this pass.
+fn reconcile_delete_breaker_threshold(total_candidates: usize) -> usize {
+    #[allow(clippy::cast_precision_loss)]
+    let total = total_candidates as f64;
+    let fraction_floor = (total * RECONCILE_DELETE_BREAKER_FRACTION).ceil();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let fraction_floor = fraction_floor as usize;
+    fraction_floor.max(RECONCILE_DELETE_BREAKER_MIN_CANDIDATES)
+}
+
+/// Whether `path` is a shape [`walk_markdown`] could ever have returned,
+/// applied to a DB row instead of a filesystem entry (design item #1).
+///
+/// `bootstrap.md`, `_meta.md`, and `_pending/` sidecars are indexed rows the
+/// walk structurally never returns, so their absence from a walk's page list
+/// proves nothing about whether their file still exists — without this
+/// filter every one of them would look "missing" on every single pass.
+///
+/// More conservative than the walk's own ledger check
+/// ([`is_reserved_page_file`]), which reads a candidate ledger file's first
+/// line to tell a real hook ledger from an ordinary page that merely happens
+/// to be named `log.md`. Here the file is gone by definition — there is
+/// nothing left to read — so any `log.md` / `log-YYYY-MM.md`-shaped path is
+/// excluded from candidacy unconditionally, erring toward never tombstoning
+/// rather than guessing.
+///
+/// `sessions/<id>.md` pages are excluded too, for an unrelated reason (#929
+/// review, B2): a same-workspace `move-session` re-home updates the store
+/// row's `(workspace_id, project_id)` but deliberately does not move the
+/// file (the wiki layer skips that on purpose — see `Wiki::move_session_page`
+/// and its callers), so a session summary page can have a perfectly correct,
+/// live DB row with no file at its *new* scope. That is a separate,
+/// pre-existing bug in `move-session`'s file relocation, not fixed here —
+/// but this mechanism would otherwise read that gap as "the file was
+/// deleted" and tombstone a real, live page. This safety net is meant for
+/// OKF-imported content pages (concepts, decisions, gotchas — the paths
+/// #929's own repro used), never session-summary pages, so the whole shape
+/// is excluded until `move-session` is fixed to relocate the file too
+/// (tracked as a follow-up).
+fn could_have_been_walked(path: &PagePath) -> bool {
+    if is_pending_path(path) {
+        return false;
+    }
+    if is_manifest_filename(path) || path.as_str() == "bootstrap.md" {
+        return false;
+    }
+    if crate::wiki::session_id_for_page(path).is_some() {
+        return false;
+    }
+    if crate::ledger::is_log_ledger_filename(path) {
+        return false;
+    }
+    true
+}
+
+/// The reconcile-delete safety net (#929, design items #1–#6) for one
+/// project scope, run after that scope's walk has completed. No-op unless
+/// `[maintenance] reconcile_tombstones_deleted_pages` is enabled.
+///
+/// `pre_walk_snapshot` must have been taken from the store *before*
+/// `walked`'s walk started (design item #2) — that ordering is what makes a
+/// page written via the API mid-walk safe: it is either absent from the
+/// snapshot (never a candidate) or present in `walked` (found on disk), and
+/// either way it can never look like a deletion.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_missing_pages(
+    wiki: &Wiki,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    pre_walk_snapshot: &[(PageId, PagePath)],
+    walked: &HashSet<PagePath>,
+    walk_partial: bool,
+    streaks: &mut MissingStreaks,
+    stats: &mut ReconcileStats,
+) {
+    if pre_walk_snapshot.is_empty() {
+        return;
+    }
+
+    // A page found on disk this pass can never contribute to a future
+    // tombstone from an earlier streak — clear it regardless of what happens
+    // to the rest of this scope below. This runs even on a partial walk
+    // (S1, #929 review): only ABSENCE evidence from a partial walk is
+    // suspect (design item #3, below) — presence evidence a partial walk DID
+    // manage to observe is exactly as trustworthy as any other pass's, and
+    // losing it would needlessly re-arm a streak the page had already
+    // cleared.
+    for (_, path) in pre_walk_snapshot.iter().filter(|(_, p)| walked.contains(p)) {
+        streaks.remove(&(ws, proj, path.clone()));
+    }
+
+    if walk_partial {
+        // Design item #3: a `NotFound` anywhere in this scope's walk (a
+        // vanished subdirectory, or the whole project directory) means some
+        // branch of the tree was unreadable rather than every page under it
+        // having actually been deleted one by one. Skip NEW missing-page
+        // evidence for this pass — streaks for pages already missing before
+        // this pass are left exactly as they were (neither incremented nor
+        // cleared), so a later, complete pass still needs its own two
+        // consecutive observations before anything is tombstoned.
+        debug!(
+            workspace = %ws,
+            project = %proj,
+            "reconcile-delete: partial walk this pass (a directory was unreadable); not \
+             treating this scope's absent pages as new deletion evidence",
+        );
+        return;
+    }
+
+    let missing: Vec<&(PageId, PagePath)> = pre_walk_snapshot
+        .iter()
+        .filter(|(_, p)| !walked.contains(p))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+
+    // Design item #4: circuit breaker. A suspect pass makes zero progress
+    // toward the two-pass threshold for any of its candidates — not just
+    // "don't tombstone yet", but "don't count this pass at all" — so a
+    // walk/mount blip can never contribute half of the two observations a
+    // real deletion needs.
+    //
+    // S3 (#929 review): an empty `walked` set with a non-empty snapshot is
+    // ALWAYS suspect, regardless of the `max(3, 50%)` math below — that
+    // fraction still has a floor of `RECONCILE_DELETE_BREAKER_MIN_CANDIDATES`,
+    // so a scope with only one or two tracked candidates could have every
+    // single one look missing without ever tripping the percentage breaker.
+    // "the walk found NOTHING at all" is exactly the "directory exists but
+    // came back empty" mount-failure signature (an unmounted volume, a
+    // bind-mount that briefly resolves to an empty stub) that the threshold
+    // alone would miss for a small scope.
+    let threshold = reconcile_delete_breaker_threshold(pre_walk_snapshot.len());
+    let empty_walk_is_suspect = walked.is_empty();
+    if missing.len() > threshold || empty_walk_is_suspect {
+        tracing::warn!(
+            workspace = %ws,
+            project = %proj,
+            missing = missing.len(),
+            total_candidates = pre_walk_snapshot.len(),
+            threshold,
+            empty_walk = empty_walk_is_suspect,
+            "reconcile-delete: circuit breaker tripped — treating this as a walk/mount \
+             problem rather than that many genuine deletions in one pass; nothing in this \
+             scope is tombstoned or counted toward a streak this round",
+        );
+        stats.circuit_broken_scopes += 1;
+        return;
+    }
+
+    for (id, path) in missing {
+        let key = (ws, proj, path.clone());
+        let streak = streaks.entry(key.clone()).or_insert((*id, 0));
+        if streak.0 != *id {
+            // A different page version now occupies this path than the one
+            // whose absence started this streak (e.g. recreated then
+            // rewritten between passes) — restart rather than credit the old
+            // version's absence to the new one.
+            *streak = (*id, 0);
+        }
+        streak.1 += 1;
+        if streak.1 < 2 {
+            continue;
+        }
+        // Missing on two consecutive passes: attempt the tombstone. Whatever
+        // the outcome, drop the streak — a page still missing after this
+        // starts a fresh streak next pass rather than retrying every tick.
+        streaks.remove(&key);
+        match wiki
+            .tombstone_missing_page_if_latest(ws, proj, path, *id)
+            .await
+        {
+            Ok(true) => {
+                stats.tombstoned_missing += 1;
+                tracing::info!(
+                    workspace = %ws,
+                    project = %proj,
+                    path = %path,
+                    "reconcile-delete: tombstoned a page whose file was missing on two \
+                     consecutive reconcile passes",
+                );
+            }
+            Ok(false) => {
+                debug!(
+                    workspace = %ws,
+                    project = %proj,
+                    path = %path,
+                    "reconcile-delete: tombstone candidate skipped (page changed, or its file \
+                     reappeared before the final recheck)",
+                );
+            }
+            Err(e) => {
+                warn!(
+                    workspace = %ws,
+                    project = %proj,
+                    path = %path,
+                    error = %e,
+                    "reconcile-delete: tombstone attempt failed",
+                );
+            }
+        }
+    }
+}
+
+async fn reconcile(
+    wiki: &Wiki,
+    missing_streaks: &mut MissingStreaks,
+) -> WikiResult<ReconcileStats> {
     let root = wiki.root().to_path_buf();
     // Walk all per-project subdirectories: <ws_uuid>/<proj_uuid>/
     let project_dirs = tokio::task::spawn_blocking(move || walk_project_dirs(&root))
         .await
         .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
 
+    let tombstones_enabled = wiki.reconcile_tombstones_deleted_pages();
     let mut stats = ReconcileStats::default();
     for (ws, proj, proj_root) in project_dirs {
         // The directory name parses as a valid UUID pair, but that does not
@@ -401,14 +652,45 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
             stats.skipped_orphans += 1;
             continue;
         }
-        let pages = tokio::task::spawn_blocking(move || walk_markdown(&proj_root))
-            .await
-            .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
+
+        // Design item #2: snapshot the store's `is_latest = 1` pages for this
+        // scope BEFORE the walk runs, not after — see `reconcile_missing_pages`.
+        // Filtered to paths the walk could ever return, so reserved/pending
+        // rows are never candidates (design item #1). A snapshot failure
+        // disables the safety net for this scope this pass only; it never
+        // blocks the ordinary reindex below.
+        let pre_walk_snapshot = if tombstones_enabled {
+            match wiki.latest_page_ids(ws, proj).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter(|(_, p)| could_have_been_walked(p))
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    warn!(
+                        workspace = %ws,
+                        project = %proj,
+                        error = %e,
+                        "reconcile-delete: candidate snapshot failed; skipping this scope's \
+                         missing-page check this pass",
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let (pages, walk_partial) =
+            tokio::task::spawn_blocking(move || walk_markdown_partial(&proj_root))
+                .await
+                .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
         // Once per directory, not once per page: a project accumulates one
         // tombstone per purge, and the set is only consulted for the
         // `sessions/<id>.md` paths that a session purge could have left behind.
         let purged = wiki.purged_sessions(ws, proj).await?;
+        let mut walked: HashSet<PagePath> = HashSet::with_capacity(pages.len());
         for path in pages {
+            walked.insert(path.clone());
             if crate::wiki::is_purged_session_page(&path, &purged) {
                 debug!(
                     path = %path,
@@ -423,6 +705,20 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
                 stats.indexed += 1;
             }
         }
+
+        if tombstones_enabled {
+            reconcile_missing_pages(
+                wiki,
+                ws,
+                proj,
+                &pre_walk_snapshot,
+                &walked,
+                walk_partial,
+                missing_streaks,
+                &mut stats,
+            )
+            .await;
+        }
     }
     // debug!, not info!: this fires every RECONCILE_INTERVAL regardless of
     // activity, so at info it is ~half the default server log (#894). Its
@@ -432,6 +728,8 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
         indexed = stats.indexed,
         skipped_orphans = stats.skipped_orphans,
         skipped_purged_sessions = stats.skipped_purged_sessions,
+        tombstoned_missing = stats.tombstoned_missing,
+        circuit_broken_scopes = stats.circuit_broken_scopes,
         "reconciliation pass complete",
     );
     Ok(stats)
@@ -532,12 +830,31 @@ fn extract_project_dir_ids(
 }
 
 pub(crate) fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
+    walk_markdown_partial(root).map(|(pages, _partial)| pages)
+}
+
+/// Like [`walk_markdown`], but also reports whether any directory in the
+/// tree — including `root` itself — could not be read because it no longer
+/// exists.
+///
+/// A `true` second element means the walk is **partial**: some branch
+/// vanished mid-walk (a git checkout, a bind-mount hiccup, a concurrent
+/// project move) rather than every page under it having actually been
+/// deleted one at a time. The reconcile-delete safety net (#929 design item
+/// #3) relies on this to tell those two situations apart — treating a
+/// partial walk's absent pages as deletion evidence would tombstone pages
+/// that are still there, just temporarily unreadable.
+pub(crate) fn walk_markdown_partial(root: &Path) -> WikiResult<(Vec<PagePath>, bool)> {
     let mut out = Vec::new();
+    let mut partial = false;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let read = match std::fs::read_dir(&dir) {
             Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                partial = true;
+                continue;
+            }
             Err(e) => return Err(WikiError::Io(e)),
         };
         for entry in read {
@@ -575,7 +892,7 @@ pub(crate) fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
             }
         }
     }
-    Ok(out)
+    Ok((out, partial))
 }
 
 pub(crate) fn is_pending_path(page_path: &PagePath) -> bool {
@@ -770,7 +1087,7 @@ mod tests {
             "precondition: the purge made the page unsearchable",
         );
 
-        let stats = reconcile(&wiki).await.unwrap();
+        let stats = reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
         assert_eq!(
             stats.skipped_orphans, 0,
             "a session purge leaves the project row, so the orphan guard passes",
@@ -1004,7 +1321,7 @@ mod tests {
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
         // Hit reconcile manually instead of waiting 30s.
-        reconcile(&wiki).await.unwrap();
+        reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
 
         let hits = store
             .reader
@@ -1040,7 +1357,7 @@ mod tests {
         std::fs::write(orphan_dir.join("index.md"), "seeded shell\n").unwrap();
         std::fs::write(orphan_dir.join("stale.md"), "orphantoken content\n").unwrap();
 
-        let stats = reconcile(&wiki).await.unwrap();
+        let stats = reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
 
         assert_eq!(
             stats.skipped_orphans, 1,
@@ -1193,7 +1510,7 @@ mod tests {
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
         // Trigger the reconciliation pass directly.
-        reconcile(&wiki).await.unwrap();
+        reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
 
         // Only `real.md` should land in the index.
         let hits = store
@@ -1306,7 +1623,7 @@ mod tests {
         .unwrap();
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
-        reconcile(&wiki).await.unwrap();
+        reconcile(&wiki, &mut MissingStreaks::new()).await.unwrap();
 
         let page_hits = store
             .reader
@@ -1504,6 +1821,709 @@ mod tests {
         assert_eq!(
             id1, id2,
             "unchanged content must short-circuit to the same id"
+        );
+    }
+
+    // --- #929: reconcile-delete safety net (opt-in tombstone-on-missing-file) ---
+
+    fn proj_dir(tmp: &TempDir, ws: WorkspaceId, proj: ProjectId) -> std::path::PathBuf {
+        tmp.path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string())
+    }
+
+    /// `setup()` with the reconcile-delete safety net opted in. Kept separate
+    /// from `setup()` so every other watcher test keeps exercising the
+    /// default-off path unchanged.
+    async fn setup_reconcile_delete() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId) {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        (
+            tmp,
+            store,
+            wiki.with_reconcile_tombstones_deleted_pages(true),
+            ws,
+            proj,
+        )
+    }
+
+    /// Write `body` at `path` under the project directory and index it,
+    /// returning the resulting `PageId`.
+    async fn write_and_index(
+        wiki: &Wiki,
+        tmp: &TempDir,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        path: &str,
+        body: &str,
+    ) -> PageId {
+        let dir = proj_dir(tmp, ws, proj);
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, body).unwrap();
+        wiki.reindex_page(ws, proj, PagePath::new(path).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// With the feature at its default (off), a page whose file disappears is
+    /// never tombstoned, no matter how many reconcile passes run — reconcile's
+    /// behavior is unchanged from before this feature existed (#929).
+    #[tokio::test]
+    async fn reconcile_delete_disabled_by_default_never_tombstones_a_missing_page() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let path = PagePath::new("gone.md").unwrap();
+        let id = write_and_index(&wiki, &tmp, ws, proj, path.as_str(), "here for now").await;
+        std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
+
+        let mut streaks = MissingStreaks::new();
+        for _ in 0..5 {
+            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            assert_eq!(stats.tombstoned_missing, 0);
+        }
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(id),
+            "deletions still require `ai-memory delete-page` when the feature is off",
+        );
+    }
+
+    /// The core happy path, and the two-pass bite-check: the first pass a
+    /// page's file is found missing must NOT tombstone it (streak = 1); only
+    /// the second CONSECUTIVE pass does (design item #5).
+    #[tokio::test]
+    async fn reconcile_delete_tombstones_only_after_two_consecutive_missing_passes() {
+        let (tmp, store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let path = PagePath::new("gone.md").unwrap();
+        let id = write_and_index(&wiki, &tmp, ws, proj, path.as_str(), "here for now").await;
+        // A control page that stays present the whole test, so the scope's
+        // walk is never literally empty (S3, #929 review: an empty walk with
+        // a non-empty snapshot is its own, unconditional breaker trip).
+        write_and_index(&wiki, &tmp, ws, proj, "control.md", "always here").await;
+
+        let mut streaks = MissingStreaks::new();
+        let baseline = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(baseline.tombstoned_missing, 0);
+
+        std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
+
+        let first_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(
+            first_miss.tombstoned_missing, 0,
+            "one missing pass must not be enough"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(id),
+            "still latest after only one missing pass",
+        );
+
+        let second_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(
+            second_miss.tombstoned_missing, 1,
+            "two consecutive missing passes must tombstone"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+        );
+    }
+
+    /// `could_have_been_walked` (design item #1, plus the B2 sessions
+    /// exclusion) is the path-only filter applied to the DB-side candidate
+    /// snapshot, mirroring the walk's own skip rules. `_pending/` sidecars
+    /// can never even reach it as a candidate — `reindex_page` itself
+    /// refuses to index one (see `refusing to index pending proposal
+    /// sidecar` in `wiki.rs`) — so this unit test is the only way to
+    /// exercise that branch directly.
+    #[test]
+    fn could_have_been_walked_excludes_every_reserved_shape() {
+        let session_path = format!("sessions/{}.md", ai_memory_core::SessionId::new());
+        for excluded in [
+            "_pending",
+            "_pending/draft.md",
+            "_pending/review-bot/notes.md",
+            "bootstrap.md",
+            "_meta.md",
+            "notes/_meta.md",
+            "log.md",
+            "log-2024-01.md",
+            session_path.as_str(),
+        ] {
+            assert!(
+                !could_have_been_walked(&PagePath::new(excluded).unwrap()),
+                "{excluded} must never be a reconcile-delete candidate",
+            );
+        }
+        // "sessions/abc.md" does NOT parse as a `SessionId` (not a UUID), so
+        // it is an ordinary page shape, not a session summary — proving the
+        // exclusion is keyed on `session_id_for_page`, not merely the
+        // `sessions/` prefix.
+        for included in ["notes/plan.md", "sessions/abc.md", "log-review.md"] {
+            assert!(
+                could_have_been_walked(&PagePath::new(included).unwrap()),
+                "{included} is an ordinary page and must remain a candidate",
+            );
+        }
+    }
+
+    /// Reserved/indexed-but-unwalked paths (design item #1) are never
+    /// candidates, even across many consecutive passes with their files gone:
+    /// `bootstrap.md` and a legacy ledger row (`log.md`-shaped). Unlike the
+    /// walk, `reindex_page` does not itself refuse these two paths, so they
+    /// can be indexed rows exactly the way an older store or a direct API
+    /// write could leave them.
+    #[tokio::test]
+    async fn reconcile_delete_reserved_paths_are_never_candidates() {
+        let (tmp, store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let paths = ["bootstrap.md", "log.md"];
+        let mut ids = Vec::new();
+        for p in paths {
+            let id = write_and_index(&wiki, &tmp, ws, proj, p, "reserved-shaped content").await;
+            ids.push((PagePath::new(p).unwrap(), id));
+            std::fs::remove_file(proj_dir(&tmp, ws, proj).join(p)).unwrap();
+        }
+
+        let mut streaks = MissingStreaks::new();
+        for _ in 0..5 {
+            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            assert_eq!(stats.tombstoned_missing, 0);
+        }
+        for (path, id) in ids {
+            assert_eq!(
+                store
+                    .reader
+                    .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                    .await
+                    .unwrap(),
+                Some(id),
+                "{path} must never be treated as deletion evidence",
+            );
+        }
+    }
+
+    /// An atomic-save pattern (delete-then-recreate) must survive: if the
+    /// file is back by the very next pass, the streak clears and nothing is
+    /// ever tombstoned — the two-pass requirement plus this reappearance
+    /// check is what makes that safe beyond the existing debounce window.
+    #[tokio::test]
+    async fn reconcile_delete_atomic_save_pattern_survives() {
+        let (tmp, store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let path = PagePath::new("flaky.md").unwrap();
+        let id1 = write_and_index(&wiki, &tmp, ws, proj, path.as_str(), "v1").await;
+        // Control page (S3, #929 review): without it, the scope's walk goes
+        // fully empty the moment `flaky.md` is missing, and the survival this
+        // test checks for would be explained by the empty-walk breaker
+        // tripping rather than by the streak/reappearance mechanism it's
+        // actually meant to exercise.
+        write_and_index(&wiki, &tmp, ws, proj, "control.md", "always here").await;
+
+        let mut streaks = MissingStreaks::new();
+        reconcile(&wiki, &mut streaks).await.unwrap();
+
+        // Pass N: file momentarily missing (streak = 1).
+        std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
+        let miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(miss.tombstoned_missing, 0);
+
+        // Recreated before the next pass — the "atomic save" completing.
+        let id2 = write_and_index(&wiki, &tmp, ws, proj, path.as_str(), "v2").await;
+        assert_ne!(id1, id2, "a content change mints a new version");
+        let recovered = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(recovered.tombstoned_missing, 0);
+
+        // One more pass with the file still present must not retroactively
+        // tombstone anything either — the streak was cleared, not merely paused.
+        let stable = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(stable.tombstoned_missing, 0);
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(id2),
+        );
+    }
+
+    /// S4 (#929 review): the test above recreates the file with DIFFERENT
+    /// content, so it never actually proves the streak was CLEARED by the
+    /// SAME page reappearing — a new `PageId` alone (via the `streak.0 !=
+    /// *id` restart in `reconcile_missing_pages`) would make that test pass
+    /// even if the "found in `walked`" clearing loop were deleted entirely.
+    /// This test forces the identical-content path: missing (streak = 1) ->
+    /// present again with the SAME body (so `upsert_page`'s content
+    /// short-circuit returns the SAME id, exercising the presence-clears-
+    /// streak branch specifically) -> missing again (must restart at
+    /// streak = 1, not continue to 2) -> not tombstoned; a further pass
+    /// still missing then reaches streak = 2 and IS tombstoned — proving two
+    /// FRESH consecutive misses were required, not two misses ever observed.
+    #[tokio::test]
+    async fn reconcile_delete_streak_clears_on_identical_content_reappearance() {
+        let (tmp, store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let path = PagePath::new("flaky-identical.md").unwrap();
+        let id = write_and_index(&wiki, &tmp, ws, proj, path.as_str(), "same body always").await;
+        // Control page (S3, #929 review — see the other test's comment).
+        write_and_index(&wiki, &tmp, ws, proj, "control.md", "always here").await;
+
+        let mut streaks = MissingStreaks::new();
+        reconcile(&wiki, &mut streaks).await.unwrap();
+
+        // Miss #1.
+        std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
+        let first_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(first_miss.tombstoned_missing, 0, "streak = 1, not enough");
+
+        // Reappears with IDENTICAL content: `upsert_page`'s sha256
+        // short-circuit returns the SAME id, so this exercises "found in
+        // `walked`" clearing a streak, not the `streak.0 != *id` restart.
+        let same_id =
+            write_and_index(&wiki, &tmp, ws, proj, path.as_str(), "same body always").await;
+        assert_eq!(
+            same_id, id,
+            "precondition: identical content must not mint a new id"
+        );
+        let recovered = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(recovered.tombstoned_missing, 0);
+
+        // Missing again: this must be a FRESH streak (= 1), not a
+        // continuation (which would already be 2 and tombstone here).
+        std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
+        let second_streak_first_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(
+            second_streak_first_miss.tombstoned_missing, 0,
+            "the streak must have restarted at 1, not continued to 2"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(id),
+            "still latest after only one fresh missing pass"
+        );
+
+        // Still missing, second FRESH consecutive pass: now it tombstones.
+        let second_streak_second_miss = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(second_streak_second_miss.tombstoned_missing, 1);
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+        );
+    }
+
+    /// Circuit breaker (design item #4): when most of a scope's candidates
+    /// look missing in one pass, nothing is tombstoned and a `warn` fires —
+    /// that shape is far more likely a walk/mount problem than genuine mass
+    /// deletion. Bite-check: with the breaker removed, this test fails
+    /// (verified manually while writing it, then restored).
+    #[tokio::test]
+    async fn reconcile_delete_circuit_breaker_blocks_when_most_candidates_vanish() {
+        let (tmp, store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let p = format!("bulk/{i}.md");
+            let id = write_and_index(&wiki, &tmp, ws, proj, &p, "bulk content").await;
+            ids.push((PagePath::new(p).unwrap(), id));
+        }
+
+        let mut streaks = MissingStreaks::new();
+        reconcile(&wiki, &mut streaks).await.unwrap();
+
+        // 60% vanish in one pass.
+        for (path, _) in ids.iter().take(6) {
+            std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
+        }
+        for pass in 0..3 {
+            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            assert_eq!(
+                stats.tombstoned_missing, 0,
+                "pass {pass}: the breaker must block every one of the 6 missing pages"
+            );
+            assert_eq!(stats.circuit_broken_scopes, 1, "pass {pass}");
+        }
+        for (path, id) in &ids {
+            assert_eq!(
+                store
+                    .reader
+                    .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                    .await
+                    .unwrap(),
+                Some(*id),
+                "{path} must survive a tripped breaker",
+            );
+        }
+    }
+
+    /// Control for the breaker test: a small fraction missing (well under
+    /// `max(3, 50%)`) proceeds normally and tombstones after two consecutive
+    /// passes, exactly like the non-bulk case.
+    #[tokio::test]
+    async fn reconcile_delete_circuit_breaker_does_not_block_a_small_fraction() {
+        let (tmp, store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let p = format!("bulk/{i}.md");
+            let id = write_and_index(&wiki, &tmp, ws, proj, &p, "bulk content").await;
+            ids.push((PagePath::new(p).unwrap(), id));
+        }
+
+        let mut streaks = MissingStreaks::new();
+        reconcile(&wiki, &mut streaks).await.unwrap();
+
+        // 10% vanish: well under the breaker threshold (max(3, 50%) = 5 of 10).
+        let (missing_path, _missing_id) = ids[0].clone();
+        std::fs::remove_file(proj_dir(&tmp, ws, proj).join(missing_path.as_str())).unwrap();
+
+        let first = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(first.circuit_broken_scopes, 0);
+        assert_eq!(first.tombstoned_missing, 0, "first missing pass");
+
+        let second = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(second.circuit_broken_scopes, 0);
+        assert_eq!(
+            second.tombstoned_missing, 1,
+            "second consecutive missing pass"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, missing_path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+        );
+        for (path, id) in ids.iter().skip(1) {
+            assert_eq!(
+                store
+                    .reader
+                    .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                    .await
+                    .unwrap(),
+                Some(*id),
+                "{path} was never missing",
+            );
+        }
+    }
+
+    /// S3 (#929 review): an empty (but NOT partial/`NotFound`) walk is always
+    /// suspect, even for a scope too small to ever trip the `max(3, 50%)`
+    /// math — 2 candidates, both missing, is only 100% but the absolute
+    /// floor of 3 never trips. This is the "directory exists but came back
+    /// empty" mount-failure signature (an unmounted volume, a bind-mount
+    /// briefly resolving to an empty stub): the walk succeeds (no
+    /// `NotFound`, so `walk_partial` is false) but finds nothing at all.
+    #[tokio::test]
+    async fn reconcile_delete_circuit_breaker_trips_on_empty_walk_even_for_a_small_scope() {
+        let (tmp, store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let p = format!("small/{i}.md");
+            let id = write_and_index(&wiki, &tmp, ws, proj, &p, "small scope content").await;
+            ids.push((PagePath::new(p).unwrap(), id));
+        }
+
+        let mut streaks = MissingStreaks::new();
+        reconcile(&wiki, &mut streaks).await.unwrap();
+
+        // Both files vanish, but the directory itself stays put — an
+        // ordinary (non-partial) walk that simply finds nothing.
+        for (path, _) in &ids {
+            std::fs::remove_file(proj_dir(&tmp, ws, proj).join(path.as_str())).unwrap();
+        }
+        for pass in 0..3 {
+            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            assert_eq!(
+                stats.tombstoned_missing, 0,
+                "pass {pass}: an empty walk must never be treated as evidence, however small \
+                 the scope"
+            );
+            assert_eq!(stats.circuit_broken_scopes, 1, "pass {pass}");
+        }
+        for (path, id) in &ids {
+            assert_eq!(
+                store
+                    .reader
+                    .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                    .await
+                    .unwrap(),
+                Some(*id),
+                "{path} must survive an empty-walk breaker trip",
+            );
+        }
+    }
+
+    /// Partial walk (design item #3): the whole project directory vanishing
+    /// mid-pass (a git checkout, a bind-mount hiccup) must not be treated as
+    /// every page under it having been deleted. Restoring the directory lets
+    /// the very next pass proceed normally — the reappear-after-restore case.
+    #[tokio::test]
+    async fn reconcile_delete_partial_walk_skips_a_scope_whose_project_directory_vanished() {
+        let (tmp, store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let path = PagePath::new("survivor.md").unwrap();
+        let id = write_and_index(&wiki, &tmp, ws, proj, path.as_str(), "still around").await;
+
+        let dir = proj_dir(&tmp, ws, proj);
+        let mut streaks = MissingStreaks::new();
+        reconcile(&wiki, &mut streaks).await.unwrap();
+
+        // Simulate the whole project directory vanishing mid-walk (walk_partial
+        // becomes true because `walk_markdown_partial`'s own root read fails).
+        std::fs::remove_dir_all(&dir).unwrap();
+        for pass in 0..3 {
+            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            assert_eq!(
+                stats.tombstoned_missing, 0,
+                "pass {pass}: a partial walk must never produce deletion evidence"
+            );
+        }
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(id),
+            "the page must survive many passes of a vanished project directory",
+        );
+
+        // Restore: the directory and file come back, and reconcile resumes
+        // ordinary behavior instead of carrying over any partial-pass state.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(path.as_str()), "still around").unwrap();
+        let restored = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(restored.tombstoned_missing, 0);
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(id),
+        );
+    }
+
+    /// S1 (#929 review): a partial walk's ABSENCE evidence is suspect, but
+    /// its PRESENCE evidence is not — a page the walk actually found, even
+    /// during a partial pass, must still clear an earlier streak. Otherwise
+    /// a page that legitimately reappeared could be tombstoned later purely
+    /// because an unrelated directory's `NotFound` earlier suppressed the
+    /// clearing that presence should have triggered.
+    ///
+    /// Calls `reconcile_missing_pages` directly rather than orchestrating a
+    /// real partial walk through the filesystem: a subdirectory deleted
+    /// *before* `reconcile()` runs is never even listed by `read_dir`, so it
+    /// produces no `NotFound` at all (that's only reachable via a genuine
+    /// race — the directory vanishing *during* the walk, mid-traversal,
+    /// which a single-threaded test cannot deterministically force). Driving
+    /// the function directly exercises the exact contract instead.
+    #[tokio::test]
+    async fn reconcile_delete_partial_walk_still_clears_streaks_for_pages_it_did_find() {
+        let (tmp, _store, wiki, ws, proj) = setup_reconcile_delete().await;
+        let path = PagePath::new("flaky.md").unwrap();
+        let id = write_and_index(&wiki, &tmp, ws, proj, path.as_str(), "here").await;
+
+        // Seed a pre-existing streak of 1, as if an earlier complete pass had
+        // already observed this exact page missing once.
+        let mut streaks = MissingStreaks::new();
+        streaks.insert((ws, proj, path.clone()), (id, 1));
+
+        let snapshot = vec![(id, path.clone())];
+        let mut walked: HashSet<PagePath> = HashSet::new();
+        walked.insert(path.clone());
+        let mut stats = ReconcileStats::default();
+
+        // This pass is partial (some unrelated directory vanished elsewhere
+        // in the scope), but it DID find this exact page present.
+        reconcile_missing_pages(
+            &wiki,
+            ws,
+            proj,
+            &snapshot,
+            &walked,
+            true,
+            &mut streaks,
+            &mut stats,
+        )
+        .await;
+
+        assert!(
+            !streaks.contains_key(&(ws, proj, path.clone())),
+            "presence evidence from a partial walk must still clear the streak"
+        );
+        assert_eq!(stats.tombstoned_missing, 0);
+
+        // Bite-check performed manually while writing this test: hoisting
+        // the clearing loop back inside the `if walk_partial { return; }`
+        // branch (the pre-S1 shape) makes this assertion fail, since the
+        // seeded streak survives untouched.
+    }
+
+    /// Cross-project isolation (the same adversarial shape #929's rejected
+    /// prior attempt was tested against): two projects with a page at the
+    /// same relative path, only one of which loses its file, must not let
+    /// one project's missing-page streak or tombstone affect the other's.
+    #[tokio::test]
+    async fn reconcile_delete_cross_project_isolation() {
+        let (tmp, store, wiki, ws, proj_a) = setup_reconcile_delete().await;
+        let proj_b = store
+            .writer
+            .get_or_create_project(ws, "scratch-b", None)
+            .await
+            .unwrap();
+        let path = PagePath::new("shared/name.md").unwrap();
+        let _id_a = write_and_index(&wiki, &tmp, ws, proj_a, path.as_str(), "project a").await;
+        let id_b = write_and_index(&wiki, &tmp, ws, proj_b, path.as_str(), "project b").await;
+        // Control page in proj_a (S3, #929 review): keeps that scope's walk
+        // from being literally empty once `shared/name.md` goes missing,
+        // which would otherwise trip the unconditional empty-walk breaker.
+        write_and_index(&wiki, &tmp, ws, proj_a, "control.md", "always here").await;
+
+        let mut streaks = MissingStreaks::new();
+        reconcile(&wiki, &mut streaks).await.unwrap();
+        std::fs::remove_file(proj_dir(&tmp, ws, proj_a).join(path.as_str())).unwrap();
+
+        reconcile(&wiki, &mut streaks).await.unwrap();
+        let final_stats = reconcile(&wiki, &mut streaks).await.unwrap();
+        assert_eq!(final_stats.tombstoned_missing, 1);
+
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj_a, path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+            "project A's page was tombstoned",
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj_b, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(id_b),
+            "project B's identically-pathed page must survive untouched",
+        );
+    }
+
+    /// B2 (#929 review): a same-workspace `move-session` re-home can leave a
+    /// session page's DB row live in the destination project with no file
+    /// there. Reproduced end to end through the real bug, not a synthetic
+    /// row edit: the session's own record already says it lives in
+    /// `proj_b` (so `Wiki::move_session_page(from=(ws,proj_b),
+    /// to=(ws,proj_b), ...)` sees `from == to` and skips the file step
+    /// entirely — see its doc comment), while its `sessions/<id>.md` page
+    /// is a straggler still sitting in `proj_a`. `ops::move_session`'s
+    /// page re-stamp is keyed purely on path + "not already in the target
+    /// scope", not on `from`, so it sweeps that straggler page into
+    /// `proj_b` regardless — leaving a live, correct row at `proj_b` with
+    /// no file there, ever. This is a separate, pre-existing bug in
+    /// `move-session`'s file relocation (not fixed here); this test only
+    /// proves the reconcile-delete safety net's `sessions/*.md` exclusion
+    /// keeps it from destroying that page.
+    #[tokio::test]
+    async fn reconcile_delete_never_tombstones_a_session_page_orphaned_by_move_session() {
+        let (tmp, store, wiki, ws, proj_a) = setup_reconcile_delete().await;
+        let proj_b = store
+            .writer
+            .get_or_create_project(ws, "scratch-b", None)
+            .await
+            .unwrap();
+        let sid = ai_memory_core::SessionId::new();
+        // The session's own record already lives in proj_b.
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj_b,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        // Its page is a straggler, still in proj_a.
+        let page_path = format!("sessions/{sid}.md");
+        let page_id = write_and_index(&wiki, &tmp, ws, proj_a, &page_path, "session summary").await;
+        // A control page that actually lives in proj_b, so proj_b's on-disk
+        // directory exists and its walk is complete (not partial) — without
+        // this, an absent proj_b directory would make the walk itself hit
+        // `NotFound` and get skipped by the PARTIAL-walk guard (design item
+        // #3) instead of by the sessions exclusion this test means to
+        // isolate. Confirmed by disabling the sessions exclusion locally
+        // while writing this test: without a proj_b control page the test
+        // still passed for the wrong reason (partial walk), and only
+        // failed as expected once this control page made the walk complete.
+        write_and_index(&wiki, &tmp, ws, proj_b, "control.md", "always here").await;
+
+        // The from==to re-home: the wiki sees no scope change and skips the
+        // file step, but the store still sweeps the straggler page into
+        // proj_b (see `ops::move_session`'s `rehome` branch).
+        let outcome = wiki
+            .move_session_page(
+                sid,
+                (ws, proj_b),
+                (ws, proj_b),
+                ai_memory_store::PagesMode::Move,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.summary.page_versions_moved, 1,
+            "precondition: the page re-stamp must have actually run"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj_b, page_path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(page_id),
+            "precondition: the page row now lives in proj_b",
+        );
+        assert!(
+            !proj_dir(&tmp, ws, proj_b).join(&page_path).exists(),
+            "precondition: proj_b has no file for it — the pre-existing move-session bug",
+        );
+
+        let mut streaks = MissingStreaks::new();
+        for pass in 0..3 {
+            let stats = reconcile(&wiki, &mut streaks).await.unwrap();
+            assert_eq!(
+                stats.tombstoned_missing, 0,
+                "pass {pass}: a session page must never be reconcile-delete candidate"
+            );
+        }
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj_b, page_path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(page_id),
+            "the orphaned-by-move-session page must survive untouched",
         );
     }
 }

@@ -1138,6 +1138,32 @@ pub struct MaintenanceSettings {
     /// Interval for embedding backfill. `0` disables this job.
     /// Defaults to off because it may call a paid provider.
     pub embedding_backfill_interval_secs: u64,
+    /// Opt-in reconcile-delete safety net (#929). When `true`, the watcher's
+    /// 30s reconcile pass tombstones (`is_latest = 0` + `superseded_at`, never
+    /// a filesystem touch or a BLOCKING admission dispatch) an OKF-imported
+    /// content page (session summary pages are excluded — a same-workspace
+    /// `move-session` re-home can leave one with a correct row and no file, a
+    /// separate pre-existing bug) whose file has been missing on two
+    /// consecutive passes, after a circuit breaker that refuses to act on a
+    /// scope where more than `max(3, 50%)` of its candidate pages look
+    /// missing at once, or where a non-partial walk finds nothing at all
+    /// (see `ai_memory_wiki::watcher::reconcile_delete_breaker_threshold`) —
+    /// either shape is far more likely a walk/mount problem (an unmounted
+    /// volume, a git checkout mid-walk) than genuine deletions.
+    ///
+    /// The tombstone is NOT exempt from the aged-tombstone hard-delete sweep
+    /// (`hard_delete_after_days`) — the actual guarantee is narrower: a
+    /// reconcile tombstone is never itself destroyed while its chain has no
+    /// successor. If the file returns, the new version re-links to the
+    /// tombstoned chain (`ops::upsert_page_in_tx`'s resurrection path)
+    /// instead of starting fresh, so nothing is orphaned for that sweep to
+    /// destroy.
+    ///
+    /// Defaults to `false`: with this off, reconcile's behavior is
+    /// byte-identical to before this feature existed — deletions still
+    /// require `ai-memory delete-page`, and nothing new is logged. Doc:
+    /// `docs/okf.md`, `docs/install.md`.
+    pub reconcile_tombstones_deleted_pages: bool,
 }
 
 impl Default for MaintenanceSettings {
@@ -1147,6 +1173,7 @@ impl Default for MaintenanceSettings {
             forget_sweep_interval_secs: 86_400,
             lint_interval_secs: 86_400,
             embedding_backfill_interval_secs: 0,
+            reconcile_tombstones_deleted_pages: false,
         }
     }
 }

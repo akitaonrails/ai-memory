@@ -143,6 +143,57 @@ so any later rewrite of an affected page (a restore, a hand edit, a
   `stale_after` that differs from `expires_at` was not derived by
   ai-memory and is left alone.
 
+## Reconcile-delete safety net (opt-in, #929)
+
+The watcher's 30s reconcile pass only ever reindexes create/modify events by
+default — a page whose file disappears from disk stays indexed until
+`ai-memory delete-page` removes it explicitly. `[maintenance]
+reconcile_tombstones_deleted_pages` (default `false`) opts into a background
+safety net that closes that gap, designed to be safe even though it adds an
+automatic mutation to a background loop:
+
+- A page's file must be observed missing on **two consecutive** reconcile
+  passes (not one) before anything happens, and the check is re-verified
+  against the live filesystem immediately before acting.
+- Only pages the walk could ever have returned are eligible — `bootstrap.md`,
+  `_meta.md`, and `_pending/` sidecars are never candidates, and a project
+  whose walk hit `NotFound` (a vanished subdirectory, a whole project
+  directory gone mid-pass) contributes no "missing" evidence for that pass.
+  `sessions/*.md` pages are excluded too, for an unrelated reason: a
+  same-workspace `move-session` re-home can leave a correct DB row with no
+  file at its new scope (a separate, pre-existing bug in `move-session`'s
+  file relocation — tracked as a follow-up, not fixed here). This mechanism
+  is meant for OKF-imported content pages only.
+- A circuit breaker refuses to act on a whole scope when more than `max(3,
+  50%)` of its candidate pages look missing in one pass, OR when a
+  non-partial walk finds nothing at all in a scope that has candidates — the
+  latter catches the "directory exists but came back empty" mount-failure
+  signature for scopes too small to ever trip the percentage math. Either
+  shape is far more likely a walk/mount problem (an unmounted volume, a git
+  checkout mid-walk) than genuine mass deletion, and is logged at `warn`.
+- The action itself is a soft tombstone (`is_latest = 0` + `superseded_at`),
+  the same row shape decay eviction already uses, and is picked up by the
+  exact same aged-tombstone hard-delete sweep decay eviction uses
+  (`hard_delete_after_days`, tier/pin-agnostic) — it is NOT exempt from that
+  sweep. The precise guarantee: **a reconcile tombstone is never itself
+  destroyed while its chain has no successor; if the file returns, the new
+  version re-links to the tombstoned chain instead of starting fresh, so
+  nothing is orphaned for the 180-day sweep to destroy.** Concretely, a fresh
+  write at a tombstoned path (`upsert_page_in_tx`) supersedes the tombstoned
+  row via `supersedes` and clears its `superseded_at`, turning it into an
+  ordinary, protected supersession-chain member — the same mechanism that
+  already keeps normal edit history off that sweep. It also never dispatches
+  the BLOCKING admission gate (nothing gets to refuse it — this is a
+  background safety net reacting to an already-vanished file, not a
+  user-initiated delete) and never touches the filesystem (there is nothing
+  to write; the file is already gone); it DOES fire-and-forget any
+  non-blocking observer/mirror webhook on success, so a mirror learns about
+  the tombstone instead of silently diverging. `restore-page` and the page's
+  version history remain intact.
+- With the flag off (the default), behavior is byte-identical to before this
+  feature existed: nothing new is logged, and reconcile never mutates the
+  store.
+
 ## Tests (each with a control that must fail on a broken build)
 
 - Round-trip: page → OKF file on disk → parsed back identical.
@@ -161,8 +212,8 @@ so any later rewrite of an affected page (a restore, a hand edit, a
   directory and letting the watcher (or `reindex`) ingest them IS the
   import path. Overwriting an already-imported concept file gets its new
   version embedded the same way a brand-new file does — no manual
-  `ai-memory embed` needed. Deleting one does not yet remove it from the
-  index: the watcher only reconciles create/modify events, so a deleted
-  concept file still needs an explicit `ai-memory delete-page` (tracked in
-  #929).
+  `ai-memory embed` needed. Deleting one does not remove it from the index by
+  default: the watcher only reconciles create/modify events, so a deleted
+  concept file needs an explicit `ai-memory delete-page` unless the opt-in
+  safety net below is enabled (#929).
 - Retrieval regression: LongMemEval baseline re-run; no material drop.

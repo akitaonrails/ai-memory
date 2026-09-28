@@ -4094,12 +4094,53 @@ impl ReaderPool {
         .await
     }
 
+    /// Return `(PageId, PagePath)` for every `is_latest = 1` page under a
+    /// scope, cheaper than [`decay_candidates`](Self::decay_candidates) when
+    /// only identity is needed. Used by the watcher's reconcile-delete
+    /// safety net (#929) to snapshot the store's view of "pages that should
+    /// have a file on disk" before walking the tree, so a page written via
+    /// the API mid-walk is never mistaken for one the walk simply hasn't
+    /// reached yet.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_page_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<(PageId, PagePath)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, path FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, path) = row?;
+                out.push((PageId::from_slice(&id)?, PagePath::new(path)?));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Return decay tombstones old enough for permanent cleanup.
     ///
-    /// `superseded_at` is written only by the forget-sweep eviction path, so
-    /// it is the tombstone discriminator regardless of whether a rewritten
-    /// page head also has a `supersedes` ancestor. The caller still routes
-    /// each result through the wiki layer before deleting its version chain.
+    /// `superseded_at` is written by the forget-sweep eviction path AND by
+    /// the watcher's opt-in reconcile-delete safety net (#929) — the two are
+    /// deliberately indistinguishable here (docs/okf.md), so it remains the
+    /// tombstone discriminator regardless of whether a rewritten page head
+    /// also has a `supersedes` ancestor. A tombstone whose path was rewritten
+    /// after it was marked (the false-positive self-healing, or an ordinary
+    /// decay-then-recreate) has its `superseded_at` cleared by
+    /// `ops::upsert_page_in_tx`'s resurrection path and so drops out of this
+    /// query — only a chain with no successor ever reaches here. The caller
+    /// still routes each result through the wiki layer before deleting its
+    /// version chain.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
