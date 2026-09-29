@@ -51,6 +51,7 @@ Recommended defaults:
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
 | `opencode` | `claude-sonnet-4-6` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
 | `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
+| `openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1` | no default (recommended: `anthropic/claude-haiku-4.5`) | Hosted access to a large model catalogue through one key. See [OpenRouter](#openrouter) below and the empirical comparison in [`llm-provider-comparison.md`](llm-provider-comparison.md). |
 
 `openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
 the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
@@ -107,6 +108,151 @@ export AI_MEMORY_LLM_PROVIDER=opencode
 export AI_MEMORY_LLM_MODEL=mimo-v2.5
 ai-memory llm-test --provider opencode --model mimo-v2.5 --prompt "Reply with OK"
 ```
+
+<a id="openrouter"></a>
+[OpenRouter](https://openrouter.ai) is used through the generic `openai-compat`
+provider — the same wiring as Atlas Cloud, OrcaRouter, Ollama, vLLM, and LM
+Studio. There is no dedicated `openrouter` provider name, and setting
+`AI_MEMORY_LLM_PROVIDER=openrouter` fails at startup with
+`AI_MEMORY_LLM_PROVIDER=openrouter is not one of anthropic|openai|gemini|openai-compat|...`.
+Select it by pointing the compat base URL at OpenRouter and supplying its
+`sk-or-v1-...` key through `LLM_API_KEY`:
+
+A minimal working env-file (drop into `~/.config/ai-memory/openrouter.env`
+or the Docker `--env-file` argument):
+
+```env
+LLM_API_KEY=sk-or-v1-...
+
+AI_MEMORY_LLM_PROVIDER=openai-compat
+AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
+AI_MEMORY_LLM_MODEL=deepseek/deepseek-v4-flash
+AI_MEMORY_LLM_COMPAT_STRICT=true
+```
+
+Then verify:
+
+```bash
+ai-memory llm-test --provider openai-compat \
+    --model deepseek/deepseek-v4-flash --prompt "Reply with OK"
+```
+
+`AI_MEMORY_LLM_COMPAT_STRICT=true` sends OpenAI-style
+`response_format=json_schema` for every structured call. Modern hosted
+gateways honour it; some model backends (DeepSeek among them) otherwise wrap
+their JSON output in markdown fences that ai-memory's tolerant parser has to
+strip, which occasionally drops a field. Setting it to `true` at the
+env-file level is safer for consolidation reliability. Turn it off
+(`AI_MEMORY_LLM_COMPAT_STRICT=false`) only for a specific model backend that
+explicitly rejects the schema-constrained shape.
+
+The `docker/.env.production.example` file in the repo ships with an OpenRouter
+setup pre-filled (with `moonshotai/kimi-k2.6` as the sample model — see the
+gotchas below for why reasoning models are ineligible). Model ids follow
+OpenRouter's `provider/model` convention. There is no built-in default:
+`AI_MEMORY_LLM_MODEL` is required, as it is for every `openai-compat` endpoint.
+
+### Choosing a model
+
+For LLM selection guidance, see
+[`llm-provider-comparison.md`](llm-provider-comparison.md) — the project
+maintains its own A/B testing there on consolidation quality, latency, and
+cost. That comparison uses English consolidation fixtures and covers the
+recommended default (`anthropic/claude-haiku-4.5`), the cheaper alternative
+(`openai/gpt-5.4-mini`), and the reasoning-model ineligibility note; the
+OpenRouter subsection here defers to it rather than duplicating rankings.
+
+For workloads dominated by non-English content, community reports suggest
+that a higher-recall multilingual embedder (for example `baai/bge-m3` via
+the `openai-compat` embedder) noticeably improves retrieval quality
+relative to the built-in English-only local embedder. Configuration is in
+the embedding paragraph below.
+
+ai-memory automatically layers OpenRouter's app-attribution headers
+(`HTTP-Referer` and `X-Title`) whenever the base URL points at
+`openrouter.ai`, so ai-memory traffic is credited on OpenRouter's app
+leaderboard. `AI_MEMORY_LLM_HEADERS=HTTP-Referer=https://example.com,X-Title=my-app`
+overrides them per operator. `AI_MEMORY_LLM_REASONING_EFFORT` is honoured on
+this path: OpenRouter hosts receive `reasoning: { effort, exclude: true }`.
+
+OpenRouter's LLM/completions API is what ai-memory uses above. It does **not**
+reliably expose an OpenAI-compatible `/v1/embeddings` endpoint — historically it
+has not — so do not assume an OpenRouter base URL works for the embedder. If a
+given deployment of OpenRouter does offer an embeddings endpoint, verify it
+answers the standard `/v1/embeddings` shape (`curl` the endpoint directly)
+before relying on it. When it does, configure the embedder through the
+openai-compat path — not the openai path, which has an OpenAI-specific key
+precedence chain:
+
+```bash
+export AI_MEMORY_EMBEDDING_PROVIDER=openai-compat
+export AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1
+export AI_MEMORY_EMBEDDING_MODEL=baai/bge-m3
+export AI_MEMORY_EMBEDDING_DIM=1024
+# LLM_API_KEY is reused automatically when EMBEDDING_API_KEY is unset on
+# the openai-compat embedder path; no second key is required.
+```
+
+`AI_MEMORY_EMBEDDING_DIM` is mandatory for openai-compat embeddings and must
+match the model. For English-only content the built-in local
+sentence-transformer (`AI_MEMORY_EMBEDDING_PROVIDER=local`, see
+[`local-embeddings.md`](local-embeddings.md)) is a valid alternative that
+avoids hosted egress; for non-English content, a multilingual hosted model
+(`baai/bge-m3`, `intfloat/multilingual-e5-large`, or similar) served by any
+provider that exposes a real `/v1/embeddings` endpoint is the practical choice.
+The two endpoints are still independent, so setting `AI_MEMORY_LLM_BASE_URL`
+alone does not redirect embeddings — set `AI_MEMORY_EMBEDDING_BASE_URL` too.
+
+### Security and gotchas
+
+- **Bind address vs. port publish.** When running inside a container, the
+  process-level bind (`--bind 0.0.0.0:49374` or similar) does not decide
+  who can reach the port — that is decided by the container's publish
+  spec. `-p 127.0.0.1:49374:49374` restricts to loopback on the host;
+  `-p 49374:49374` publishes on every host interface. If the port is
+  ever reachable beyond loopback, generate a bearer token first:
+  ```bash
+  ai-memory generate-auth-token
+  export AI_MEMORY_AUTH_TOKEN=<token>
+  export AI_MEMORY_ALLOWED_HOSTS=<host,host,...>
+  ```
+  The server logs a loud startup warning about non-loopback exposure
+  without a token; treat it as blocking. `AI_MEMORY_ALLOWED_HOSTS`
+  guards against DNS-rebinding. TLS termination is expected to sit in
+  front of the process — see [`docs/https-via-proxy.md`](https-via-proxy.md).
+- **Secret hygiene.** The env file that holds `LLM_API_KEY` (and any
+  provider-specific key you set) should be `chmod 600` and outside any
+  directory a version-control tool sees. If you back up
+  `~/.config/ai-memory/` (see [`docs/backup.md`](backup.md)), exclude
+  the env file — the sample script and mirror `.gitignore` shipped
+  there already exclude `*.env` by default.
+- **Cheap models can drift.** LLM consolidation writes durable wiki
+  pages, so a model that occasionally fabricates a `kind: decision`
+  page for a session that made no decision leaves a page in the wiki
+  that ai-memory will treat as first-class evidence on subsequent
+  reads. This is a known cost of running a smaller / cheaper model on
+  the consolidation prompt. Spot-check
+  `<data_dir>/wiki/<workspace>/<project>/decisions/` during the first
+  week on a new model for pages you do not recognize; if any appear,
+  either raise the provider tier for consolidation only (keep the
+  cheaper model for retrieval reranking) or unset
+  `AI_MEMORY_LLM_PROVIDER` to fall back to the deterministic
+  rule-based path.
+- **`:free`-suffix models draw from a shared quota.** Any model id
+  ending in `:free` on OpenRouter is served from a pool shared across
+  all users of the free tier, not the caller's paid budget. When that
+  pool is exhausted, requests fail with an upstream-shared-pool
+  rate-limit error. Fine for evaluation, unreliable for production;
+  prefer a model listed with multiple upstream providers on its
+  OpenRouter page.
+- **Reasoning-mode models are ineligible for consolidation.**
+  Consolidation and lint use a strict-JSON output contract; reasoning
+  models route most of their token budget through internal reasoning
+  and either stall past the 300 s per-request ceiling or return empty
+  strings. `docs/install.md#llm-provider-tiers` has the standing "what
+  we don't recommend" note listing the pattern; the same applies to
+  any OpenRouter model flagged as a reasoning/thinking variant. Prefer
+  a non-reasoning peer for `AI_MEMORY_LLM_MODEL`.
 
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run

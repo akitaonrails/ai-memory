@@ -448,6 +448,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution and human login.** Four-rung bearer ladder, password sessions, `ai-memory user` / `api-key` walkthrough, brownfield migration. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS and when you don't, with copy-paste Caddy / nginx / Cloudflare Tunnel templates and the "secure when you're not" failure modes. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix, per-project disk layout, checkpoint page recovery, and operator workflows. |
+| [`docs/backup.md`](docs/backup.md) | Backing up the wiki + data dir to a remote git repository: what to include, what to exclude, scheduled push pattern, restore, and security posture. Companion to `docs/lifecycle-ops.md` (which covers the on-box `ai-memory backup` snapshot). |
 | [`docs/llm-providers.md`](docs/llm-providers.md) | Provider configuration for consolidation and embeddings. |
 | [`docs/security.md`](docs/security.md) | The full security model. |
 | [`docs/support-matrix.md`](docs/support-matrix.md) | The full agent/platform matrix with notes. |

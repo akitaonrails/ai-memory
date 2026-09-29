@@ -1269,11 +1269,14 @@ pub struct BootstrapArgs {
     /// Maximum total tokens of source text sent to the LLM in one
     /// run. When the collected sources exceed this, lower-priority
     /// inputs (older git commits, then code module headers, then
-    /// docs) are dropped first. Default is 150K — comfortably under
-    /// Haiku/Sonnet 4.5's 200K context (leaves room for the ~64K
-    /// output budget) — so the model sees as much of your project
-    /// as possible. Lower it explicitly only if you're cost-
-    /// sensitive or running against a smaller-context provider.
+    /// docs) are dropped first. Default is 150K, so the model sees as
+    /// much of your project as possible; with chunking on (the
+    /// default), each call carries at most `--chunk-input-tokens` of
+    /// it plus up to 16K output tokens. Lower it if you're
+    /// cost-sensitive. With `--chunk-input-tokens 0`, this whole
+    /// budget goes into one call that also asks for up to 64K output
+    /// tokens, so budget + 64K must fit the model's context window
+    /// (the 150K default does not fit a 200K window).
     #[arg(long, default_value_t = 150_000)]
     pub max_input_tokens: usize,
     /// Max estimated input tokens per LLM call. When pruned sources exceed

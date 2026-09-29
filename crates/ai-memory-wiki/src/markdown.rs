@@ -131,7 +131,9 @@ type LinkKey = (Option<String>, Option<String>, String);
 /// Supports `[[wiki links]]`, `[[wiki links|labels]]`, cross-project
 /// `[[project:path]]` / `[[workspace/project:path]]` wikilinks, and
 /// ordinary markdown links such as `[label](../decisions/foo.md#anchor)`.
-/// External URLs, anchors, images, and non-markdown assets are ignored.
+/// External URLs, anchors, images, and non-markdown assets are ignored, and
+/// so is anything inside a fenced block or an inline code span, which the
+/// page shows as code rather than as a link.
 /// Returned values are normalised to wiki-root-relative [`LinkTarget`]s.
 #[must_use]
 pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<LinkTarget> {
@@ -147,8 +149,9 @@ pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<LinkTarget> {
         if in_fence {
             continue;
         }
-        extract_wikilinks(line, page_path, &mut out);
-        extract_markdown_links(line, page_path, &mut out);
+        let line = blank_inline_code(line);
+        extract_wikilinks(&line, page_path, &mut out);
+        extract_markdown_links(&line, page_path, &mut out);
     }
 
     out.into_iter()
@@ -161,6 +164,58 @@ pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<LinkTarget> {
             })
         })
         .collect()
+}
+
+/// `line` with each inline code span, backticks included, replaced by
+/// spaces. The web renderer shows `` `[[notes/x]]` `` as code, so indexing
+/// it minted a backlink the source page never offers and, for a
+/// `[[project:path]]` example, a broken-link lint finding. Blanking rather
+/// than cutting keeps a link whose label is code (`` [`foo`](foo.md) ``)
+/// intact. A run of backticks opens a span only a run of the same length
+/// closes (CommonMark 6.1); with no closer on the line it is literal text.
+/// A span that continues onto the next line is not seen, as the line-based
+/// fence check above does not see an indented code block either.
+fn blank_inline_code(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains('`') {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let bytes = line.as_bytes();
+    let run_at = |i: usize| bytes[i..].iter().take_while(|&&b| b == b'`').count();
+    let mut out = String::with_capacity(line.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let open = run_at(i);
+        let mut j = i + open;
+        let close = loop {
+            if j >= bytes.len() {
+                break None;
+            }
+            if bytes[j] == b'`' {
+                let run = run_at(j);
+                if run == open {
+                    break Some(j + run);
+                }
+                j += run;
+            } else {
+                j += 1;
+            }
+        };
+        let Some(end) = close else {
+            i += open;
+            continue;
+        };
+        out.push_str(&line[copied..i]);
+        out.extend(std::iter::repeat_n(' ', line[i..end].chars().count()));
+        copied = end;
+        i = end;
+    }
+    out.push_str(&line[copied..]);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Body wikilinks plus typed `relations:` frontmatter edges — the full
@@ -738,5 +793,29 @@ mod tests {
         let links = extract_links(body, &path);
         let paths: Vec<&str> = links.iter().map(|l| l.path.as_str()).collect();
         assert_eq!(paths, vec!["notes/kept.md"]);
+    }
+
+    #[test]
+    fn extract_links_ignores_inline_code_spans() {
+        // The web page renders all of these code spans as code, so a link
+        // written inside one is not a link a reader can follow.
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "Write `[[notes/syntax]]` or `[[other-project:notes/x]]` to link.\n\
+                    A ``[[notes/double]] `nested` `` span, and `[label](md-link.md)`.\n\
+                    See [`the flow`](flow.md) and [[notes/kept]].\n\
+                    A lone ` backtick hides nothing: [[notes/after-tick]].\n";
+        let links = extract_links(body, &path);
+        let targets: Vec<(Option<&str>, &str)> = links
+            .iter()
+            .map(|l| (l.project.as_deref(), l.path.as_str()))
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                (None, "notes/after-tick.md"),
+                (None, "notes/flow.md"),
+                (None, "notes/kept.md"),
+            ]
+        );
     }
 }

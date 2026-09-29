@@ -52,6 +52,20 @@ use crate::path_sanitize::slugify_page_path;
 /// only used to decide which sources to drop.
 const CHARS_PER_TOKEN: usize = 4;
 
+/// Share of a token budget that bootstrap fills, by its own estimate.
+///
+/// [`CHARS_PER_TOKEN`] undercounts denser text: non-English prose and source
+/// code measured about 40% above a bytes ÷ 4 estimate on real tokenizers
+/// (#884). Filling only 80% of `--max-input-tokens` and `--chunk-input-tokens`
+/// keeps a bundle the estimate calls a fit inside the provider's window,
+/// the same default consolidation uses for this undercount.
+const ESTIMATE_BUDGET_PERCENT: usize = 80;
+
+/// `budget` shrunk by [`ESTIMATE_BUDGET_PERCENT`].
+const fn with_estimate_margin(budget: usize) -> usize {
+    budget.saturating_mul(ESTIMATE_BUDGET_PERCENT) / 100
+}
+
 /// Errors returned from [`Bootstrap::run`].
 #[derive(Debug, Error)]
 pub enum BootstrapError {
@@ -516,7 +530,8 @@ impl Bootstrap {
             let mut prior: Vec<String> = pages_by_path.keys().cloned().collect();
             prior.sort_unstable();
             let prior_refs: Vec<&str> = prior.iter().map(String::as_str).collect();
-            let request = build_chunk_request(chunk, idx + 1, llm_chunks, &prior_refs);
+            let request =
+                build_chunk_request(chunk, idx + 1, llm_chunks, chunk_budget, &prior_refs);
             info!(
                 chunk = idx + 1,
                 total = llm_chunks,
@@ -547,14 +562,7 @@ impl Bootstrap {
         }
 
         let merged_pages: Vec<BootstrapPage> = pages_by_path.into_values().collect();
-        let rationale = if rationales.len() == 1 {
-            rationales.pop().unwrap_or_default()
-        } else {
-            format!(
-                "Processed in {llm_chunks} LLM chunks.\n\n{}",
-                rationales.join("\n\n---\n\n")
-            )
-        };
+        let rationale = merge_chunk_rationales(rationales, llm_chunks);
 
         // ---- write pages ------------------------------------------
         let now = Timestamp::now();
@@ -1198,8 +1206,9 @@ pub fn prune_sources_to_budget(
     mut sources: Vec<BootstrapSource>,
     budget: usize,
 ) -> (Vec<BootstrapSource>, usize, usize) {
-    // Reserve ~1k tokens for the prompt scaffolding itself.
-    let usable = budget.saturating_sub(1_000);
+    // Leave headroom for the estimate's undercount, then reserve ~1k tokens
+    // for the prompt scaffolding itself.
+    let usable = with_estimate_margin(budget).saturating_sub(1_000);
     // Order: highest drop_priority FIRST → drop those when over budget.
     sources.sort_by_key(|s| std::cmp::Reverse(s.kind.drop_priority()));
     let total_count = sources.len();
@@ -1298,10 +1307,11 @@ fn chunk_sources_greedy(sources: Vec<BootstrapSource>, usable: usize) -> Vec<Vec
 
 fn usable_chunk_tokens(chunk_budget: usize) -> usize {
     const PROMPT_RESERVE: usize = 1_000;
-    if chunk_budget > PROMPT_RESERVE {
-        chunk_budget - PROMPT_RESERVE
+    let budget = with_estimate_margin(chunk_budget);
+    if budget > PROMPT_RESERVE {
+        budget - PROMPT_RESERVE
     } else {
-        chunk_budget
+        budget
     }
 }
 
@@ -1351,6 +1361,7 @@ fn build_chunk_request(
     sources: &[BootstrapSource],
     chunk_index: usize,
     chunk_total: usize,
+    chunk_budget: usize,
     prior_paths: &[&str],
 ) -> ChatRequest {
     let mut buf = String::with_capacity(8_192);
@@ -1384,12 +1395,7 @@ fn build_chunk_request(
         buf.push_str(&src.text);
         buf.push_str("\n\n");
     }
-    let max_tokens = if chunk_total > 1 {
-        // Each chunk targets a smaller page batch; keeps Cursor bridge responses bounded.
-        16_000
-    } else {
-        64_000
-    };
+    let max_tokens = bootstrap_chunk_max_tokens(chunk_budget);
     ChatRequest {
         system: Some(SYSTEM_PROMPT.into()),
         messages: vec![ChatMessage {
@@ -1399,6 +1405,41 @@ fn build_chunk_request(
         max_tokens,
         temperature: Some(0.2),
     }
+}
+
+/// Output cap for one bootstrap LLM call.
+///
+/// With chunking on (the default), every call is a chunk that fits
+/// `chunk_budget`, including the only chunk of a small repo, so every call
+/// gets the chunk cap: it keeps Cursor bridge responses bounded and, with the
+/// default 24K chunk budget, fits a 64K-context model. Keying the cap on the
+/// chunk count instead sent a small repo's single chunk 64K output tokens,
+/// which no 64K-context model can accept. Only an operator who disables
+/// chunking (`chunk_budget == 0`, one call with the whole pruned bundle) gets
+/// the large cap.
+const fn bootstrap_chunk_max_tokens(chunk_budget: usize) -> u32 {
+    if chunk_budget == 0 { 64_000 } else { 16_000 }
+}
+
+/// Manifest rationale from the per-chunk ones. `rationale` is
+/// `#[serde(default)]` and the Anthropic `tool_use` schema does not enforce
+/// required fields, so a chunk can return an empty one; joining those left
+/// bare `---` separators in `bootstrap.md`.
+fn merge_chunk_rationales(rationales: Vec<String>, llm_chunks: usize) -> String {
+    const NONE_RETURNED: &str = "_No chunk returned a rationale._";
+    let mut kept: Vec<String> = rationales
+        .into_iter()
+        .filter(|rationale| !rationale.trim().is_empty())
+        .collect();
+    if llm_chunks <= 1 {
+        return kept.pop().unwrap_or_else(|| NONE_RETURNED.to_string());
+    }
+    let body = if kept.is_empty() {
+        NONE_RETURNED.to_string()
+    } else {
+        kept.join("\n\n---\n\n")
+    };
+    format!("Processed in {llm_chunks} LLM chunks.\n\n{body}")
 }
 
 /// Highest `decisions/NNNN-…` serial seen in `prior_paths`, or 0.
@@ -1768,6 +1809,37 @@ mod tests {
         assert_eq!(kept.len(), 2);
     }
 
+    /// A bundle the bytes ÷ 4 estimate puts just under the budget can exceed
+    /// it on a real tokenizer (#884 measured ~1.4x on pt-BR text with code),
+    /// so bootstrap fills only 80% of each budget by its own estimate.
+    /// Control: a bundle well inside the margin keeps one chunk and every
+    /// source.
+    #[test]
+    fn budgets_leave_headroom_for_the_estimate_undercount() {
+        let near_limit = |tokens: usize| BootstrapSource {
+            kind: SourceKind::DocFile,
+            label: "docs/guia.md".into(),
+            text: "x".repeat(tokens * CHARS_PER_TOKEN - 32),
+        };
+        // 22K estimated tokens fit the old 23K usable chunk; with the margin
+        // (24K × 0.8 − 1K = 18.2K) they must be split.
+        let chunks = plan_bootstrap_chunks(vec![near_limit(22_000)], DEFAULT_CHUNK_INPUT_TOKENS);
+        assert!(chunks.len() > 1, "a near-limit chunk must be split");
+        for chunk in &chunks {
+            let t: usize = chunk.iter().map(BootstrapSource::estimated_tokens).sum();
+            assert!(t <= 18_200, "each chunk stays inside the margin; got {t}");
+        }
+        // The prune budget gets the same margin: 145K estimated tokens fit
+        // the old 149K usable prune but not 150K × 0.8 − 1K = 119K.
+        let (kept, dropped, _) = prune_sources_to_budget(vec![near_limit(145_000)], 150_000);
+        assert_eq!((kept.len(), dropped), (0, 1));
+
+        let small = plan_bootstrap_chunks(vec![near_limit(10_000)], DEFAULT_CHUNK_INPUT_TOKENS);
+        assert_eq!(small.len(), 1);
+        let (kept, dropped, _) = prune_sources_to_budget(vec![near_limit(100_000)], 150_000);
+        assert_eq!((kept.len(), dropped), (1, 0));
+    }
+
     #[test]
     fn plan_chunks_single_when_under_budget() {
         let s = BootstrapSource {
@@ -1777,6 +1849,24 @@ mod tests {
         };
         let chunks = plan_bootstrap_chunks(vec![s], DEFAULT_CHUNK_INPUT_TOKENS);
         assert_eq!(chunks.len(), 1);
+    }
+
+    /// A repo small enough for one chunk, under default chunking, must get the
+    /// chunk output cap: asking for 64K output tokens made every call fail on
+    /// a 64K-context model. Control: disabling chunking keeps the one-shot cap.
+    #[test]
+    fn a_small_repos_only_chunk_gets_the_chunk_output_cap() {
+        let s = BootstrapSource {
+            kind: SourceKind::Readme,
+            label: "README".into(),
+            text: "hello".into(),
+        };
+        let chunks = plan_bootstrap_chunks(vec![s], DEFAULT_CHUNK_INPUT_TOKENS);
+        assert_eq!(chunks.len(), 1);
+        let chunked = build_chunk_request(&chunks[0], 1, 1, DEFAULT_CHUNK_INPUT_TOKENS, &[]);
+        assert_eq!(chunked.max_tokens, 16_000);
+        let one_shot = build_chunk_request(&chunks[0], 1, 1, 0, &[]);
+        assert_eq!(one_shot.max_tokens, 64_000);
     }
 
     #[test]
@@ -1900,6 +1990,28 @@ mod tests {
     fn effective_chunk_budget_clamps_to_max() {
         assert_eq!(effective_chunk_budget(50_000, 24_000), 24_000);
         assert_eq!(effective_chunk_budget(0, 24_000), 0);
+    }
+
+    /// Chunks that return no rationale must not leave bare separators in
+    /// the manifest. Control: the rationales that were returned all survive.
+    #[test]
+    fn manifest_rationale_skips_chunks_that_returned_none() {
+        let merged = merge_chunk_rationales(
+            vec!["Covered the README.".into(), String::new(), "  \n".into()],
+            3,
+        );
+        assert_eq!(merged, "Processed in 3 LLM chunks.\n\nCovered the README.");
+
+        let both = merge_chunk_rationales(vec!["First.".into(), "Second.".into()], 2);
+        assert_eq!(
+            both,
+            "Processed in 2 LLM chunks.\n\nFirst.\n\n---\n\nSecond."
+        );
+
+        let none = merge_chunk_rationales(vec![String::new(), String::new()], 2);
+        assert!(!none.contains("---"));
+        assert!(none.contains("No chunk returned a rationale"));
+        assert_eq!(merge_chunk_rationales(vec!["Only.".into()], 1), "Only.");
     }
 
     #[test]

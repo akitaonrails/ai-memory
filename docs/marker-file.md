@@ -194,7 +194,8 @@ enforcement point, so allowlist mode does not gate them.
 ## Capture exclusions
 
 Use the exact per-repository shape `[capture]` plus `ignore_paths = [...]`
-below to keep recognized file-tool activity under matching paths out of capture:
+below to keep recognized file-tool and shell-tool activity under matching paths
+out of capture:
 
 ```toml
 [capture]
@@ -231,15 +232,42 @@ logs, or server storage. With an active policy, recognized search/list tools are
 dropped conservatively; missing or malformed recognized file candidates, an
 unsupported recognized schema, or an invalid policy become **metadata-only**.
 That form contains only bounded routing/tool/decision metadata, never paths,
-patterns, arguments, output, errors, titles, or nested payload. Known non-file
-and unknown tools retain current behavior. Excluding content before transport
+patterns, arguments, output, errors, titles, or nested payload. Unknown tools
+retain current behavior.
+
+Recognized shell tools (`Bash`, `shell`, `exec`, `execute_bash`, `terminal`, …)
+have no path field, so the command line is split into words lexically, the way
+a POSIX shell quotes and separates them, without expanding or running anything.
+A command given as an argument vector keeps each element as one word (a path
+with spaces stays whole, up to 256 characters) and also splits each element on
+its own, so a `bash -lc "<script>"` script is read like any command line. Each
+argument that is not a flag, plus the value of a `--flag=value` or
+`NAME=value` word, is resolved like a file-tool path: from the tool's own
+`workdir` argument when it has one, otherwise from the event's `cwd`. If
+one matches a pattern, the whole event is **dropped**, exactly like a matching
+file read. An argument containing `*` or `?` also matches when its glob can
+reach a pattern's directory: `cat docs/*/0001.md` is dropped under
+`docs/adr/**`, `cat *.md` at the repository root is not. A command that exceeds
+the match budget is dropped. Variables, command substitution, `cd` state, and
+commands that name no path at all (`rg TODO`, `git diff`) are not followed, so
+their output is still captured. An invalid policy makes a shell command
+**metadata-only**, like a file tool, because a broken marker cannot prove its
+arguments miss every ignored path; this holds even when the command cannot be
+read. An older server drops that metadata-only shell event, so upgrade the
+server before the clients. Excluding content before transport
 matters because it cannot then reach observations/FTS, session pages, handoffs,
 reviewer requests, proposals, or logs.
 
 This is a lexical capture boundary, **not complete DLP**. It does not resolve
-symlinks, junctions, bind mounts, or Windows 8.3 aliases. Shell commands and
-free-form patches are not parsed; prompts, assistant text, notifications, and
-quoted content are not path-attributable. Add each relevant visible alias
+symlinks, junctions, bind mounts, or Windows 8.3 aliases. Shell commands are
+matched only lexically (above), and free-form patches are not parsed; prompts,
+assistant text, notifications, and quoted content are not path-attributable.
+A copy of a file's content under another path is not linked back to it either:
+Claude Code saves a large tool result to
+`~/.claude/projects/<project>/<session>/tool-results/<id>.txt` and reads it back
+with its file tool, and that read no longer matches the original path. Add
+`"~/.claude/projects/**/tool-results/**"` to `ignore_paths` to exclude those
+re-reads too (for every file, not only the ignored ones). Add each relevant visible alias
 explicitly, and do not rely on this feature to detect every way private content
 can be mentioned.
 
@@ -247,7 +275,8 @@ can be mentioned.
 
 Capture policy v1 is enforced by native `ai-memory hook` commands (including
 native POSIX/Windows hook commands) and generated OpenCode, OMP, Pi, and
-OpenClaw integrations. Local installers default to native commands where that
+OpenClaw integrations, including the lexical shell-command matching above.
+Local installers default to native commands where that
 path is supported. Legacy `.sh`/`.ps1` hooks and remote-only/Docker script
 bundles do **not** enforce it. Reinstall hooks or refresh/reinstall generated
 plugins after upgrading; existing hooks/plugins keep their prior behavior.

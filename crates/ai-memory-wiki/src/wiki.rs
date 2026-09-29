@@ -93,6 +93,16 @@ enum PageStoreRemoval {
     },
 }
 
+/// Body + optional L0 abstract text a caller of `reindex_page_locked` should
+/// embed once it is safe to do so (i.e. after releasing whatever lock it
+/// took to call in). Captured before `upsert_page` moves `md.body` /
+/// `md.frontmatter`, and only constructed when the reindex actually produced
+/// a new page version worth embedding.
+struct PendingEmbed {
+    body: String,
+    abstract_text: Option<String>,
+}
+
 /// What [`Wiki::move_session_page`] did with the on-disk
 /// `sessions/<session_id>.md` file of the moved session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1006,10 +1016,18 @@ impl Wiki {
             .await?;
         let abs = self.abs_path(workspace_id, project_id, path);
         if current_latest.is_none() && abs.try_exists()? {
-            current_latest = Some(
-                self.reindex_page_locked(workspace_id, project_id, path.clone())
-                    .await?,
-            );
+            // Deliberately drops any `PendingEmbed`: this whole function runs
+            // under the exclusive write lock (`_guard` above, held until
+            // return), and embedding must never happen while that lock is
+            // held (#929) — it can block on the configured provider for an
+            // unbounded time, stalling every other wiki write meanwhile. The
+            // resurrected page's embedding (if any) is recovered later by
+            // `ai-memory embed` / the scheduled backfill, same as any other
+            // gap in `page_embeddings`.
+            let (id, _pending_embed) = self
+                .reindex_page_locked(workspace_id, project_id, path.clone())
+                .await?;
+            current_latest = Some(id);
         }
 
         self.writer
@@ -1539,20 +1557,43 @@ impl Wiki {
                 "refusing to index pending proposal sidecar",
             ));
         }
-        let _guard = self.mutation_lock.read().await;
-        self.ensure_project_workspace(workspace_id, project_id)
-            .await?;
-
-        self.reindex_page_locked(workspace_id, project_id, path)
-            .await
+        // Scoped so the mutation guard is dropped before the embed call
+        // below — same shape as `write_page` (#607/#929): embedding calls
+        // out to the configured provider, and holding the guard across that
+        // would block every other write in the wiki for its duration.
+        let (id, pending_embed) = {
+            let _guard = self.mutation_lock.read().await;
+            self.ensure_project_workspace(workspace_id, project_id)
+                .await?;
+            self.reindex_page_locked(workspace_id, project_id, path)
+                .await?
+        };
+        // A failed `store_embedding` here is caught and recorded inside
+        // `embed_page_version` (`record_embed_failure`), not retried by the
+        // watcher; `ai-memory embed` (manual) or the scheduled backfill tick
+        // is what recovers it.
+        if let Some(pending) = pending_embed {
+            self.embed_page_version(id, &pending.body, pending.abstract_text.as_deref())
+                .await?;
+        }
+        Ok(id)
     }
 
+    /// Reindex `path` from disk into the store, returning the resulting page
+    /// id and — when the reindex produced a new version worth embedding —
+    /// the inputs for that embed. Embedding itself is deferred to the
+    /// caller, which must not call [`Wiki::embed_page_version`] while
+    /// holding a lock this function was called under: it may block on the
+    /// configured embedder for an arbitrary amount of time, and this path
+    /// has two very different callers with two different locking needs
+    /// (`reindex_page`'s brief read guard; `hard_delete_decay_tombstone`'s
+    /// long-lived write guard, which must never embed at all — see there).
     async fn reindex_page_locked(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         path: PagePath,
-    ) -> WikiResult<PageId> {
+    ) -> WikiResult<(PageId, Option<PendingEmbed>)> {
         let abs = self.abs_path(workspace_id, project_id, &path);
         if std::fs::symlink_metadata(&abs)?.file_type().is_symlink() {
             return Err(WikiError::Io(std::io::Error::other(format!(
@@ -1566,6 +1607,39 @@ impl Wiki {
         // Markdown is the source of truth: preserve explicit tier/pinned
         // metadata on reindex instead of forcing every page back to semantic.
         let meta = derive_index_metadata(&path, &md.frontmatter)?;
+
+        // The watcher's own writes never go through `write_page` (it must
+        // never touch disk — see `crate::watcher`'s module docs), so this is
+        // the only place that can embed a page an external editor created or
+        // rewrote. Resolve the pre-upsert latest id (when an embedder and a
+        // store reader are both available) so a no-op reindex — the
+        // reconcile pass walks every page every 30s — never re-embeds a
+        // stable tree; only a genuine new/rewritten version, recognised by
+        // `upsert_page` minting a fresh id, does.
+        //
+        // Fails CLOSED, unlike most of this crate's reconcile-adjacent
+        // lookups: without a reader there is no cheap way to tell "new
+        // version" from "unchanged", and guessing wrong the open way (embed
+        // unconditionally) would re-embed the entire tree every
+        // `RECONCILE_INTERVAL` for as long as no reader is attached, which
+        // is worse than the rare bare `Wiki::new` fixture simply not getting
+        // watcher-driven embeddings. Skipped up front when no embedder is
+        // configured too, so the zero-LLM default path (invariant #13)
+        // never pays for the extra lookup.
+        let previous_id_and_body = match (&self.embedder, &self.store_reader) {
+            (Some(_), Some(reader)) => {
+                let previous_id = reader
+                    .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+                    .await?;
+                Some((
+                    previous_id,
+                    md.body.clone(),
+                    frontmatter_abstract(&md.frontmatter).map(str::to_owned),
+                ))
+            }
+            _ => None,
+        };
+
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -1584,7 +1658,14 @@ impl Wiki {
                 evidence: Vec::new(),
             })
             .await?;
-        Ok(id)
+
+        let pending_embed = previous_id_and_body.and_then(|(previous_id, body, abstract_text)| {
+            (previous_id != Some(id)).then_some(PendingEmbed {
+                body,
+                abstract_text,
+            })
+        });
+        Ok((id, pending_embed))
     }
 
     /// Read a `_meta.md` scope-manifest's frontmatter from `dir`.
@@ -2244,69 +2325,8 @@ impl Wiki {
         // tool reply still happens "indexes commit in the same
         // transaction" (basic-memory #763 lesson): no fire-and-forget
         // background embedding.
-        if let Some(embedder) = &self.embedder {
-            match embedder.embed_document(&final_body).await {
-                Ok(vec) => {
-                    let bytes = f32_vec_to_bytes(&vec);
-                    self.writer
-                        .store_embedding(
-                            page_id,
-                            bytes,
-                            embedder.provider().to_string(),
-                            embedder.model().to_string(),
-                            embedder.dim(),
-                        )
-                        .await?;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %page_id, "embedding failed; page indexed without it");
-                    // The warning alone dies with the container. Record it so
-                    // the page is attributable later (#528); best-effort,
-                    // because failing to note a failure must not fail the
-                    // write that already succeeded.
-                    let _ = self
-                        .writer
-                        .record_embed_failure(
-                            page_id,
-                            ai_memory_store::EmbedOutcome::Failed,
-                            Some(e.to_string()),
-                        )
-                        .await;
-                }
-            }
-            // L0 abstract: the frontmatter `abstract:` line is embedded on
-            // its own so the opt-in abstract stream can rank on the sharp
-            // one-line summary. A page rewritten without the key has its
-            // stale abstract row removed, mirroring the body row's
-            // replace-on-write semantics.
-            match abstract_text.as_deref() {
-                Some(abstract_text) => match embedder.embed_document(abstract_text).await {
-                    Ok(vec) => {
-                        self.writer
-                            .store_abstract_embeddings(vec![ai_memory_store::EmbeddingWrite {
-                                page_id,
-                                vector_bytes: f32_vec_to_bytes(&vec),
-                                provider: embedder.provider().to_string(),
-                                model: embedder.model().to_string(),
-                                dim: embedder.dim(),
-                            }])
-                            .await?;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, path = %page_id, "abstract embedding failed; page indexed without it");
-                        let _ = self
-                            .writer
-                            .record_embed_failure(
-                                page_id,
-                                ai_memory_store::EmbedOutcome::Failed,
-                                Some(e.to_string()),
-                            )
-                            .await;
-                    }
-                },
-                None => self.writer.delete_abstract_embedding(page_id).await?,
-            }
-        }
+        self.embed_page_version(page_id, &final_body, abstract_text.as_deref())
+            .await?;
 
         // Non-blocking webhooks fire-and-forget only after the page has landed
         // on disk and the DB/index write has succeeded. They observe the final
@@ -2320,6 +2340,100 @@ impl Wiki {
             );
         }
         Ok(page_id)
+    }
+
+    /// Embed `body` (and its L0 `abstract:` line, if present) into
+    /// `page_id`'s vectors, when an embedder is configured.
+    ///
+    /// Shared by [`Wiki::write_page`] (every version written through the
+    /// API) and [`Wiki::reindex_page_locked`] (external file writes and
+    /// rewrites picked up by the watcher), so a page version becomes
+    /// hybrid-searchable through the same mechanism regardless of which path
+    /// produced it. Before this was pulled out, only `write_page` embedded —
+    /// a watcher-driven rewrite got a new page id (the supersession chain
+    /// worked) but no embedding until a manual `ai-memory embed` (issue
+    /// #929): hybrid search silently fell back to FTS-only ranking for
+    /// every rewritten page.
+    ///
+    /// Best-effort: an embedder failure is logged and recorded via
+    /// `record_embed_failure` but never propagated, so a working page write
+    /// is never undone by an embedding hiccup.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] only for a store error while persisting a
+    /// successfully computed vector; provider/embedder failures are caught
+    /// and recorded instead.
+    async fn embed_page_version(
+        &self,
+        page_id: PageId,
+        body: &str,
+        abstract_text: Option<&str>,
+    ) -> WikiResult<()> {
+        let Some(embedder) = &self.embedder else {
+            return Ok(());
+        };
+        match embedder.embed_document(body).await {
+            Ok(vec) => {
+                let bytes = f32_vec_to_bytes(&vec);
+                self.writer
+                    .store_embedding(
+                        page_id,
+                        bytes,
+                        embedder.provider().to_string(),
+                        embedder.model().to_string(),
+                        embedder.dim(),
+                    )
+                    .await?;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %page_id, "embedding failed; page indexed without it");
+                // The warning alone dies with the container. Record it so
+                // the page is attributable later (#528); best-effort,
+                // because failing to note a failure must not fail the
+                // write that already succeeded.
+                let _ = self
+                    .writer
+                    .record_embed_failure(
+                        page_id,
+                        ai_memory_store::EmbedOutcome::Failed,
+                        Some(e.to_string()),
+                    )
+                    .await;
+            }
+        }
+        // L0 abstract: the frontmatter `abstract:` line is embedded on
+        // its own so the opt-in abstract stream can rank on the sharp
+        // one-line summary. A page rewritten without the key has its
+        // stale abstract row removed, mirroring the body row's
+        // replace-on-write semantics.
+        match abstract_text {
+            Some(abstract_text) => match embedder.embed_document(abstract_text).await {
+                Ok(vec) => {
+                    self.writer
+                        .store_abstract_embeddings(vec![ai_memory_store::EmbeddingWrite {
+                            page_id,
+                            vector_bytes: f32_vec_to_bytes(&vec),
+                            provider: embedder.provider().to_string(),
+                            model: embedder.model().to_string(),
+                            dim: embedder.dim(),
+                        }])
+                        .await?;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %page_id, "abstract embedding failed; page indexed without it");
+                    let _ = self
+                        .writer
+                        .record_embed_failure(
+                            page_id,
+                            ai_memory_store::EmbedOutcome::Failed,
+                            Some(e.to_string()),
+                        )
+                        .await;
+                }
+            },
+            None => self.writer.delete_abstract_embedding(page_id).await?,
+        }
+        Ok(())
     }
 }
 
@@ -2906,6 +3020,41 @@ mod tests {
                 .ends_with('Z')
         );
         assert!(ai_memory_core::okf::is_conformant(&parsed.frontmatter));
+    }
+
+    /// A `[[project:path]]` written as inline code is an example, not a
+    /// dependency: the page shows it as code. Indexing it made lint report a
+    /// broken cross-project link on a page that has none.
+    #[tokio::test]
+    async fn a_cross_project_link_in_inline_code_is_not_a_dangling_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/linking.md",
+            "Link across projects with `[[other-project:notes/example]]`.\n\
+             This page depends on [[other-project:notes/real]].\n",
+            serde_json::json!({"title": "Linking"}),
+        ))
+        .await
+        .unwrap();
+
+        let dangling = store
+            .reader
+            .dangling_cross_project_links(ws, proj)
+            .await
+            .unwrap();
+        let paths: Vec<&str> = dangling.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["notes/real.md"]);
     }
 
     /// OKF requires every timestamp to carry an explicit UTC offset, while
@@ -4248,6 +4397,72 @@ mod tests {
                 .len(),
             1,
             "cleanup failure must leave the tombstone for a safe retry"
+        );
+    }
+
+    /// #929: the reindex `hard_delete_decay_tombstone` performs when a
+    /// decayed page's file survived and was rewritten externally must NOT
+    /// embed the resurrected version. That whole function runs under the
+    /// exclusive write lock (`mutation_lock.write()`, held for the entire
+    /// call), and embedding can block on the configured provider for an
+    /// unbounded time — doing it there would stall every other wiki write
+    /// for as long as the provider call takes.
+    #[tokio::test]
+    async fn decay_cleanup_reindex_does_not_embed_under_the_exclusive_lock() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let embedder: Arc<dyn ai_memory_llm::Embedder> =
+            Arc::new(ai_memory_llm::SyntheticEmbedder::new(32));
+        let wiki = wiki.with_embedder(embedder);
+
+        let path = PagePath::new("sessions/decay-embed.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "original decayed body",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            wiki.evict_page_if_latest(ws, proj, &path, page_id, None)
+                .await
+                .unwrap(),
+            "precondition: the page is tombstoned by decay"
+        );
+
+        // The file survives the tombstone (`evict_page_if_latest` never
+        // touches disk) and is rewritten externally before the cleanup
+        // runs, so `hard_delete_decay_tombstone` must reindex it fresh
+        // rather than reuse the tombstoned version.
+        std::fs::write(wiki.abs_path(ws, proj, &path), "resurrected body content\n").unwrap();
+
+        wiki.hard_delete_decay_tombstone(ws, proj, &path, page_id, i64::MAX)
+            .await
+            .unwrap();
+
+        let resurrected_id = store
+            .reader
+            .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+            .await
+            .unwrap()
+            .expect("the resurrected version must be indexed");
+        assert_ne!(
+            resurrected_id, page_id,
+            "the rewrite must have produced a new version, not reused the tombstone"
+        );
+
+        let embedded = store
+            .reader
+            .embedded_page_ids(ws, proj, "synthetic".into(), "bag-of-words-v1".into(), 32)
+            .await
+            .unwrap();
+        assert!(
+            !embedded.contains(&resurrected_id),
+            "reindexing inside hard_delete_decay_tombstone must not embed \
+             while the exclusive lock is held"
         );
     }
 

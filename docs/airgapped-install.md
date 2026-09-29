@@ -59,7 +59,9 @@ runtime or other native library to source separately.
 
 - **git remote sync**, if you use it to push the wiki repository somewhere,
   is your own channel to secure (`SECURITY.md`, "Remote sync security" —
-  out of scope for ai-memory itself).
+  out of scope for ai-memory itself). [`docs/backup.md`](backup.md) has a
+  worked example of the rsync + `git push` pattern with the appropriate
+  secret and derived-state exclusions.
 - **Update/patch delivery** in an air-gapped environment is manual: pull a
   new release and checksum on a connected machine, then transfer it in,
   the same as the initial install.

@@ -698,6 +698,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::Pi
             | AgentKind::Omp
             | AgentKind::AntigravityCli
+            | AgentKind::Grok
             | AgentKind::Hermes
             | AgentKind::Pool
             | AgentKind::Zcode
@@ -2328,6 +2329,35 @@ mod tests {
         assert!(
             body.contains("MARKER_OBJ_456"),
             "object tool_response should be serialized into the body: {body:?}"
+        );
+    }
+
+    /// Grok Build CLI posts a `PostToolUse` with Claude Code's snake_case
+    /// aliases (`tool_name` / `tool_input` / `tool_use_id`). It was absent from
+    /// both `closed_tool_agent` and the `tool_observation_metadata` match, so
+    /// every Grok tool observation was stored with an empty body (#931).
+    #[test]
+    fn grok_post_tool_excerpt_captures_tool_response() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("grok".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_use_id": "call_grok_1",
+                "tool_response": {"stdout": "MARKER_GROK_931"},
+            }),
+        );
+        let body = env
+            .body_excerpt
+            .expect("grok post-tool body should not be empty");
+        assert!(
+            body.contains("MARKER_GROK_931"),
+            "grok tool_response should be serialized into the body: {body:?}"
         );
     }
 

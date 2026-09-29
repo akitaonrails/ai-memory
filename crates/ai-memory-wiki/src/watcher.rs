@@ -14,6 +14,16 @@
 //!    overflow, hidden-dir globs, etc.). Hidden-directory paths are
 //!    explicitly NOT skipped (#798 lesson).
 //!
+//! Deletions are not reconciled (see #929): the watcher only handles
+//! create/modify events, so a page whose file disappears stays indexed until
+//! `ai-memory delete-page` removes it explicitly.
+//!
+//! A reindexed page version — new file or rewrite alike — is embedded the
+//! same way `write_page` embeds one, via `Wiki::embed_page_version` (#929):
+//! before, only pages written through the API got embeddings, and a
+//! watcher-driven rewrite's new version silently had none until a manual
+//! `ai-memory embed`.
+//!
 //! The watcher never *writes* to disk — that loop would be unbounded.
 //! External writes drive store updates; internal writes drive disk +
 //! store updates via [`Wiki::write_page`].
@@ -619,6 +629,7 @@ fn page_path_relative_to(root: &Path, abs: &Path) -> Option<PagePath> {
 mod tests {
     use super::*;
     use ai_memory_store::Store;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[cfg(windows)]
@@ -652,7 +663,15 @@ mod tests {
             .get_or_create_project(ws, "scratch", None)
             .await
             .unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        // Every production wiki the watcher actually clones carries a store
+        // reader (`serve.rs` attaches one before the embedder or the
+        // watcher) — attached here too so tests exercise the same
+        // reader-dependent path `reindex_page` uses to decide whether a
+        // reindexed page is eligible for embedding (#929), not the fail-closed
+        // no-reader fallback.
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
         (tmp, store, wiki, ws, proj)
     }
 
@@ -1404,5 +1423,87 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.is_empty(), "direct symlink event must not be indexed");
+    }
+
+    // --- #929: watcher-driven rewrites get embedded ---
+
+    /// A page rewritten through the watcher's `reindex_page` path (an
+    /// external editor overwriting an already-imported file) must get its
+    /// new version embedded the same way a brand-new file does — without a
+    /// manual `ai-memory embed`. Before the fix, only `Wiki::write_page`
+    /// (the API path) embedded; `reindex_page_locked` upserted the new
+    /// version and stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_embeds_a_rewritten_page_without_manual_embed() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let embedder: Arc<dyn ai_memory_llm::Embedder> =
+            Arc::new(ai_memory_llm::SyntheticEmbedder::new(32));
+        let wiki = wiki.with_embedder(embedder);
+
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let target = proj_dir.join("rewrite.md");
+        std::fs::write(&target, "alpha bravo original\n").unwrap();
+
+        let path = PagePath::new("rewrite.md").unwrap();
+        let id1 = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        let embedded = store
+            .reader
+            .embedded_page_ids(ws, proj, "synthetic".into(), "bag-of-words-v1".into(), 32)
+            .await
+            .unwrap();
+        assert!(
+            embedded.contains(&id1),
+            "a new file indexed by the watcher must be embedded"
+        );
+
+        // Rewrite: same path, new body. `upsert_page` supersedes (mints a
+        // new id) rather than short-circuiting, because the body changed.
+        std::fs::write(&target, "charlie delta rewritten\n").unwrap();
+        let id2 = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        assert_ne!(id1, id2, "a body change must supersede, not short-circuit");
+
+        let embedded = store
+            .reader
+            .embedded_page_ids(ws, proj, "synthetic".into(), "bag-of-words-v1".into(), 32)
+            .await
+            .unwrap();
+        assert!(
+            embedded.contains(&id2),
+            "the rewritten version must be embedded without a manual `ai-memory embed`"
+        );
+    }
+
+    /// A no-op reindex (unchanged content, which is what every 30s
+    /// reconcile pass does for a stable tree) must NOT re-embed. Otherwise
+    /// every configured embedder would pay for the whole wiki's embedding
+    /// cost every `RECONCILE_INTERVAL`, forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_does_not_reembed_an_unchanged_page() {
+        let (tmp, _store, wiki, ws, proj) = setup().await;
+        let embedder: Arc<dyn ai_memory_llm::Embedder> =
+            Arc::new(ai_memory_llm::SyntheticEmbedder::new(32));
+        let wiki = wiki.with_embedder(embedder);
+
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let target = proj_dir.join("stable.md");
+        std::fs::write(&target, "stabletoken unchanged\n").unwrap();
+
+        let path = PagePath::new("stable.md").unwrap();
+        let id1 = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        let id2 = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        assert_eq!(
+            id1, id2,
+            "unchanged content must short-circuit to the same id"
+        );
     }
 }

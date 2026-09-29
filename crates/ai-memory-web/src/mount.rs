@@ -127,7 +127,9 @@ fn inject_into_head(html: &str, snippet: &str) -> String {
             out.push_str(&html[pos..]);
             return out;
         }
-        cursor += 1;
+        // Step a whole character: slicing `html[cursor..]` inside a
+        // multi-byte one (a UTF-8 BOM, an accented attribute value) panics.
+        cursor += html[cursor..].chars().next().map_or(1, char::len_utf8);
     }
     format!("{snippet}{html}")
 }
@@ -250,6 +252,21 @@ mod web_base_tests {
         let html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
         let out = inject_base_href(html, "/wiki/web/");
         assert!(out.contains("<head><base href=\"/wiki/web/\"><meta"));
+    }
+
+    /// The scan walks the page byte by byte, and slicing inside a multi-byte
+    /// character panics. A custom SPA `index.html` saved with a UTF-8 BOM,
+    /// or with any non-ASCII text before `<head>`, took `serve
+    /// --web-ui-dir` down at startup.
+    #[test]
+    fn inject_base_href_steps_over_non_ascii_before_head() {
+        let bom = "\u{feff}<!doctype html><html><head><meta charset=\"utf-8\"></head></html>";
+        let out = inject_base_href(bom, "/w/");
+        assert!(out.starts_with('\u{feff}'), "the BOM stays where it was");
+        assert!(out.contains("<head><base href=\"/w/\"><meta"));
+
+        let accent = "<html data-app=\"Mémoire\"><head></head></html>";
+        assert!(inject_base_href(accent, "/w/").contains("<head><base href=\"/w/\"></head>"));
     }
 
     #[test]
@@ -1038,6 +1055,51 @@ mod tests {
             .unwrap();
         let js = std::str::from_utf8(&body).unwrap();
         assert_eq!(js, "console.log('asset');");
+    }
+
+    /// `serve --web-ui-dir` mounts the SPA at startup, so an `index.html`
+    /// saved with a UTF-8 BOM (Notepad's "UTF-8 with BOM", Visual Studio's
+    /// "UTF-8 with signature") panicked the server before it listened.
+    #[tokio::test]
+    async fn custom_spa_index_with_a_bom_mounts_and_is_injected() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "\u{feff}<!doctype html><html><head><title>spa</title></head><body>shell</body></html>",
+        )
+        .unwrap();
+
+        let base_href = web_base_href("", "/web");
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                web_ui_dir: Some(ui.path()),
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: &base_href,
+                base_path: "",
+            },
+        )
+        .unwrap();
+        let resp = router
+            .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains(r#"<base href="/web/"><title>spa</title>"#),
+            "the base href belongs in the head: {html}"
+        );
     }
 
     /// Regression for the prod 404: with `base_path=""` (host root) the custom

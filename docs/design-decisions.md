@@ -125,7 +125,9 @@ patterns and candidates never leave the client, but shell/patch text, aliases,
 and non-path-attributable bodies remain outside its scope. The authoritative
 grammar, limits, supported integrations, and `--check-capture` affordance are
 in [the marker-file reference](marker-file.md#capture-exclusions). It adds no
-MCP tool and needs no DB migration; new-client/old-server is safe, while old
+MCP tool and needs no DB migration. New-client/old-server is safe for file
+tools, but under an invalid marker a new client also sends shell calls as
+metadata-only, which an older server drops; upgrade the server first. Old
 clients retain their previous capture behavior.
 
 ## 7. Memory model (temporal)

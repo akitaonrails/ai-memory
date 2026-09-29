@@ -101,11 +101,24 @@ them directly — ai-memory is a conduit, not a party to that relationship.
 
 ## Deletion / retention
 
-There is no built-in retention-expiry policy; data persists until removed.
-Deletion is filesystem-level: removing the data directory removes everything
-in it. For scoped deletion, a per-project purge operation exists and is
-isolation-safe — it cannot delete files or rows belonging to a different
-`(workspace_id, project_id)` (`SECURITY.md`, "Per-project isolation").
+Most data persists until removed, but two mechanisms expire some of it without
+operator action, both on by default:
+
+- **Decay eviction of cold episodic pages.** The daily forget sweep
+  (`[maintenance] forget_sweep_interval_secs`, default 86400) tombstones
+  episodic pages whose relevance score falls below `[decay] cold_threshold`
+  (default 0.20, with an ~80-day survival floor) and hard-deletes those
+  tombstones after `[decay] hard_delete_after_days` (default 180). Semantic,
+  procedural and pinned pages are exempt, and raw observations are kept
+  (`observation_retention_days = 0`).
+- **TTL pages.** A page written with `expires_at` is hidden after its expiry
+  and hard-deleted by the next forget sweep; a TTL outranks `pinned`.
+
+Everything else persists until removed. Deletion is filesystem-level: removing
+the data directory removes everything in it. For scoped deletion, a per-project
+purge operation exists and is isolation-safe — it cannot delete files or rows
+belonging to a different `(workspace_id, project_id)` (`SECURITY.md`,
+"Per-project isolation").
 
 ## Network exposure (if you run the server non-loopback)
 

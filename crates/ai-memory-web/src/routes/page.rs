@@ -41,10 +41,11 @@ pub(crate) async fn handler(
         Err(_) => return not_found_response(),
     };
 
-    // Drop the leading H1 — the template already renders the title
-    // in its header, so leaving it in the body duplicates it.
+    // Drop a leading H1 that repeats the title — the template already
+    // renders the title in its header, so leaving it in the body
+    // duplicates it.
     let body_html = markdown::render(
-        markdown::strip_leading_h1(&markdown_doc.body),
+        markdown::strip_leading_h1(&markdown_doc.body, &meta.title),
         &workspace,
         &project,
     );

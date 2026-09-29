@@ -75,6 +75,19 @@ jobs:
       # block that fails to compile (e.g. an indented shell example rustdoc
       # reads as Rust) shipped unnoticed. Run them explicitly.
       - run: cargo test --workspace --doc
+      # The capture policy every generated OpenCode/OMP/Pi/OpenClaw plugin
+      # embeds is TypeScript; only Node can execute it against the shared
+      # capture-policy fixture. The test is ignored locally, where Node is not
+      # a build requirement.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          node-version: "24"
+      - name: Generated capture-policy TypeScript runtime evidence
+        if: matrix.os == 'ubuntu-latest'
+        # `--workspace` reuses the test binaries built above instead of
+        # re-resolving features for one package.
+        run: cargo test --workspace --lib -- --ignored --exact commands::render_shared::tests::generated_capture_policy_v1_node_runtime_evidence
       - name: Vendored tailwind.css is current
         if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- crates/ai-memory-web/static/tailwind.css

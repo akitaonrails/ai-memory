@@ -189,25 +189,38 @@ async fn page_handler(
         .read_page(meta.workspace_id, meta.project_id, &page_path)
         .map_err(|_| not_found("page file not found"))?;
 
-    // ETag is computed over the markdown body PLUS the resolved author
-    // identity (P1.7). Author change without body change (e.g. operator
-    // rotates a token then user A re-writes a previously-anonymous page)
-    // must invalidate the cached response. SHA-256 over a stable
-    // concatenation: body || "\n--\n" || username || "\n" || email.
-    // The "\n--\n" separator prevents `body=foo, user=bar` from hashing
-    // the same as `body=foobar, user=` if either ever happened to slide
-    // empty.
-    let mut hasher = Sha256::new();
-    hasher.update(markdown.body.as_bytes());
-    if let Some(author) = meta.author.as_ref() {
-        hasher.update(b"\n--\n");
-        hasher.update(author.username.as_bytes());
-        hasher.update(b"\n");
-        if let Some(email) = author.email.as_deref() {
-            hasher.update(email.as_bytes());
-        }
-    }
-    let digest = hasher.finalize();
+    let links = state
+        .reader
+        .page_links(meta.workspace_id, meta.project_id, meta.path.clone())
+        .await
+        .map_err(internal_error)?;
+
+    let page = ApiPage {
+        backlinks: links.backlinks,
+        body_markdown: markdown.body,
+        created_at: meta.created_at,
+        frontmatter: markdown.frontmatter,
+        kind: meta.kind,
+        links: links.links,
+        path: meta.path,
+        pinned: meta.pinned,
+        project: meta.project_name,
+        supersedes: meta.supersedes,
+        tier: meta.tier,
+        title: meta.title,
+        updated_at: meta.updated_at,
+        workspace: meta.workspace_name,
+        author: meta.author,
+    };
+    let json = serde_json::to_vec(&page).map_err(internal_error)?;
+
+    // The ETag is a SHA-256 of the JSON this route returns, so it changes
+    // whenever any of it does. It used to cover only the markdown body and
+    // the author (P1.7), but pinning a page, re-tiering or retitling it in
+    // frontmatter, and another page linking to it all change the response
+    // while the body stays byte-identical, and a client revalidating with
+    // the old tag was told 304 and kept the stale page.
+    let digest = Sha256::digest(&json);
     let etag_hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
@@ -217,7 +230,7 @@ async fn page_handler(
     let etag_header = HeaderValue::from_str(&etag_value).expect("sha256 hex is always valid ASCII");
 
     // If-None-Match: if the client sends back the exact ETag we issued,
-    // return 304 with no body (no re-serialisation needed).
+    // return 304 with no body.
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -234,31 +247,15 @@ async fn page_handler(
         return Ok(resp);
     }
 
-    let links = state
-        .reader
-        .page_links(meta.workspace_id, meta.project_id, meta.path.clone())
-        .await
-        .map_err(internal_error)?;
-
     let mut resp = with_cache(
-        Json(ApiPage {
-            backlinks: links.backlinks,
-            body_markdown: markdown.body,
-            created_at: meta.created_at,
-            frontmatter: markdown.frontmatter,
-            kind: meta.kind,
-            links: links.links,
-            path: meta.path,
-            pinned: meta.pinned,
-            project: meta.project_name,
-            supersedes: meta.supersedes,
-            tier: meta.tier,
-            title: meta.title,
-            updated_at: meta.updated_at,
-            workspace: meta.workspace_name,
-            author: meta.author,
-        })
-        .into_response(),
+        (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            json,
+        )
+            .into_response(),
         PAGE_CACHE_MAX_AGE,
     );
     resp.headers_mut().insert(header::ETAG, etag_header);

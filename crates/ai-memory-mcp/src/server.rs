@@ -198,10 +198,11 @@ developer, user, and canonical project instructions.\n\
   to propose architecture (always check first). Defaults to the \
   current project; pass `scopes` to search named sibling projects, \
   or `global=true` to search EVERY project at once when you don't \
-  know where the knowledge lives. Default-scoped calls also return \
-  `global_scope_hits` — standing user/team preferences from the \
-  reserved `_global` scope; treat them as context that applies to \
-  every project. Expired pages are hidden by default; use \
+  know where the knowledge lives. Single-project calls — whether the \
+  project is left implicit or named explicitly with `workspace`+`project` \
+  — also return `global_scope_hits`: standing user/team preferences from \
+  the reserved `_global` scope; treat them as context that applies to \
+  every project. Only an explicit multi-`scopes` set opts out. Expired pages are hidden by default; use \
   `include_expired=true` only when the user explicitly wants to inspect \
   expired historical memory. Superseded (older) page versions are hidden \
   by default; pass `include_superseded=true` when the user wants a page's \
@@ -2317,9 +2318,11 @@ impl AiMemoryServer {
         If compiled wiki search misses in default/project/`scopes` mode, \
         `raw_hits` contains bounded raw observation fallback matches; \
         `global=true` searches compiled wiki pages only and returns no raw \
-        fallback. Default-scoped calls also return \
+        fallback. Single-project calls (project implicit or named with \
+        `workspace`+`project`) also return \
         `global_scope_hits`: standing user/team preferences from the \
-        reserved `_global` scope that apply across projects. Set \
+        reserved `_global` scope that apply across projects; only an explicit \
+        multi-`scopes` set opts out. Set \
         `global=true` to search EVERY \
         project at once (cross-project) when you don't know which project \
         holds the knowledge — each hit then carries its workspace + \
@@ -2569,25 +2572,32 @@ impl AiMemoryServer {
         // Default-scoped queries (no workspace/project/scopes/global args)
         // also union the reserved `_global` preferences scope, so standing
         // user/team context travels into every project without the caller
-        // knowing a magic project name (issue #154). Explicit scoping means
-        // the caller asked for exactly those scopes — leave it alone. One
-        // extra scoped search when the scope exists; zero cost when it
-        // doesn't.
-        let default_scoped = args.scopes.is_empty()
-            && args
-                .workspace
-                .as_deref()
-                .is_none_or(|s| s.trim().is_empty())
-            && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
-        let global_scope_hits = if default_scoped {
+        // knowing a magic project name (issue #154). This unions for any query
+        // that resolves to a single project — whether the project is left
+        // implicit (active-project pointer) or named explicitly with
+        // `workspace`+`project`. Naming the current project is exactly what the
+        // static-client routing doctrine tells callers to do, so gating the
+        // union on absent `workspace`/`project` silently denied global
+        // preferences to every static client (#930). Only an explicit,
+        // deliberately-narrowed multi-scope set (`scopes`) opts out — the
+        // caller asked for exactly those scopes. One extra scoped search when
+        // the reserved scope exists; zero cost when it doesn't.
+        let single_project_scoped = args.scopes.is_empty();
+        let global_scope_hits = if single_project_scoped {
             match ai_memory_store::lookup_global_scope(&self.reader).await {
                 Ok(Some(scope)) => {
-                    // If the current project IS the reserved scope (e.g. the
-                    // actor's active-project pointer lands there after a
-                    // global write), `hits` already covers it — don't search
-                    // it twice.
+                    // If the project this query resolves to IS the reserved
+                    // scope (e.g. the caller named it, or the actor's
+                    // active-project pointer lands there after a global write),
+                    // `hits` already covers it — don't search it twice. Resolve
+                    // through the query's own `workspace`/`project` so a named
+                    // project is compared, not the active-project default.
                     let current = self
-                        .effective_ids_for_read_args_with_actor(None, None, &aps_actor)
+                        .effective_ids_for_read_args_with_actor(
+                            args.workspace.as_deref(),
+                            args.project.as_deref(),
+                            &aps_actor,
+                        )
                         .await?;
                     if current == scope.as_tuple() {
                         Vec::new()
@@ -8309,7 +8319,7 @@ mod tests {
     // Issue #154: default-scoped queries union the reserved `_global`
     // preferences scope; explicitly scoped queries do not.
     #[tokio::test]
-    async fn default_query_unions_global_scope_and_explicit_scope_skips_it() {
+    async fn single_project_query_unions_global_scope_and_multi_scope_skips_it() {
         let (_tmp, store, server, _ws, _proj) = setup_server().await;
         let global = ai_memory_store::create_global_scope(&store.writer)
             .await
@@ -8393,6 +8403,9 @@ mod tests {
             "the default query's reserved global-scope union must keep its explanation"
         );
 
+        // A query that names its single project explicitly with
+        // `workspace`+`project` — exactly what the static-client routing
+        // doctrine requires — still unions the reserved global scope (#930).
         let result = server
             .memory_query(
                 Parameters(query(Some("default"), Some("scratch"))),
@@ -8402,8 +8415,120 @@ mod tests {
             .unwrap();
         let text = result.content.first().and_then(|c| c.as_text()).unwrap();
         assert!(
+            text.text.contains("global_scope_hits") && text.text.contains("preferences/style.md"),
+            "a query naming its single project must still union the global scope (#930): {}",
+            text.text
+        );
+
+        // A deliberately-narrowed multi-scope set (`scopes`) is the one form
+        // that opts out: the caller asked for exactly those scopes.
+        let mut scoped = query(None, None);
+        scoped.scopes = vec![MemoryScopeArg {
+            workspace: "default".into(),
+            project: "scratch".into(),
+        }];
+        let result = server
+            .memory_query(Parameters(scoped), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+        assert!(
             !text.text.contains("preferences/style.md"),
-            "explicitly scoped queries must not union the global scope: {}",
+            "an explicit multi-scope query must not union the global scope: {}",
+            text.text
+        );
+    }
+
+    // Adversarial (invariant #16): the reserved-scope union must surface ONLY
+    // the `_global` scope's pages — never a different real project's pages.
+    // Broadening the union to single-project queries (#930) must not become a
+    // cross-project read. This fails if the union is ever mis-keyed to a real
+    // project instead of the reserved global scope.
+    #[tokio::test]
+    async fn global_union_never_leaks_a_foreign_projects_pages() {
+        let (_tmp, store, server, ws, _proj) = setup_server().await;
+
+        let global = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: global.workspace_id,
+                project_id: global.project_id,
+                path: PagePath::new("preferences/sharedterm.md").unwrap(),
+                title: "Reserved".into(),
+                body: "sharedterm reserved global preference".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        // A different real project in the same workspace, NOT the queried one
+        // and NOT the reserved scope.
+        let foreign = store
+            .writer
+            .get_or_create_project(ws, "foreign", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: foreign,
+                path: PagePath::new("leak.md").unwrap(),
+                title: "Foreign".into(),
+                body: "sharedterm foreign project must not leak".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "sharedterm".into(),
+                    limit: Some(10),
+                    project: Some("scratch".into()),
+                    scopes: Vec::new(),
+                    workspace: Some("default".into()),
+                    global: None,
+                    include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
+                    explain: None,
+                    as_of: None,
+                    answer: None,
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+        assert!(
+            text.text.contains("global_scope_hits")
+                && text.text.contains("preferences/sharedterm.md"),
+            "the reserved global page must surface for a single-project query: {}",
+            text.text
+        );
+        assert!(
+            !text.text.contains("leak.md"),
+            "a foreign project's page must never surface via the global union: {}",
             text.text
         );
     }

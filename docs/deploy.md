@@ -236,6 +236,11 @@ scp "$SERVER:$DEPLOY_DIR/data/snapshot-$(date +%F).tar.gz" ./backups/
 The `ai-memory backup` command uses SQLite's online backup API so
 writes during the snapshot are coherent.
 
+For a remote-first backup pattern (rsync the data dir into a git mirror on a
+schedule, push to a private repository, paired with a tarball for the DB
+and models), see [`docs/backup.md`](backup.md) and the worked example under
+[`docs/examples/backup/`](examples/backup/README.md).
+
 ## Sharing one server between people or harnesses
 
 A deployed server is the supported way to share a project — between teammates,

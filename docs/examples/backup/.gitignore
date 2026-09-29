@@ -1,0 +1,35 @@
+# Suggested .gitignore for a mirror repository that receives ai-memory
+# snapshots. Copy this file into the root of your `$REPO_DIR` before the
+# first `git add`.
+#
+# Rules of thumb:
+#   - Keep the wiki (markdown source of truth) and any per-project _rules /
+#     _prompts pages, since those are irreplaceable.
+#   - Keep raw/ if you want the untouched observation ledger, drop it if you
+#     want a small repository.
+#   - Never commit derived state (db/) or downloaded weights (models/), and
+#     never commit secrets.
+
+# Secrets — belt and braces alongside the rsync SECRET_EXCLUDES list.
+config/*.env
+config/**/*.env
+config/auth.json
+config/**/auth.json
+config/.secrets
+config/**/.secrets
+
+# Server pidfile.
+data/.serve.lock
+
+# Derived SQLite index (rebuildable via `ai-memory reindex`).
+data/db/
+
+# Local embedder weights (redownloadable on next boot; sha256-pinned).
+data/models/
+
+# Rotated tracing output.
+data/logs/
+
+# Any local scratch produced by the snapshot script itself.
+*.tmp
+*.swp

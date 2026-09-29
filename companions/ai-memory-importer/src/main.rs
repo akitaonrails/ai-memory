@@ -1089,11 +1089,23 @@ struct ParsedMarkdown {
     pinned: bool,
 }
 
+/// Split an OMC page into frontmatter fields and body. The fence is found
+/// the way `ai_memory_wiki::markdown::parse` finds it: past a leading UTF-8
+/// BOM, and with either LF or CRLF fence lines, since a wiki checked out on
+/// Windows with `core.autocrlf=true` has CRLF throughout. Missing it dropped
+/// kind, tier, tags and pin, and imported the YAML block as body text.
 fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
     let mut out = ParsedMarkdown::default();
-    let body = if let Some(rest) = input.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---\n") {
-            let yaml = &rest[..end];
+    let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+    let (rest, newline) = if let Some(rest) = input.strip_prefix("---\r\n") {
+        (Some(rest), "\r\n")
+    } else {
+        (input.strip_prefix("---\n"), "\n")
+    };
+    let close = format!("\n---{newline}");
+    let body = if let Some(rest) = rest {
+        if let Some(end) = rest.find(&close) {
+            let yaml = rest[..end].trim_end_matches('\r');
             let value: serde_yaml::Value =
                 serde_yaml::from_str(yaml).context("parse YAML frontmatter")?;
             if let Some(map) = value.as_mapping() {
@@ -1103,7 +1115,7 @@ fn parse_markdown(input: &str) -> Result<ParsedMarkdown> {
                 out.pinned = yaml_bool(map, "pinned").unwrap_or(false);
                 out.tags = yaml_tags(map);
             }
-            rest[end + "\n---\n".len()..].to_owned()
+            rest[end + close.len()..].to_owned()
         } else {
             input.to_owned()
         }
@@ -1452,6 +1464,30 @@ mod tests {
         assert_eq!(parsed.tags, vec!["a", "b"]);
         assert!(parsed.pinned);
         assert_eq!(parsed.body, "# Body\ntext");
+    }
+
+    /// A wiki checked out on Windows with `core.autocrlf=true`, or saved
+    /// there by an editor, has CRLF line endings; one saved as "UTF-8 with
+    /// BOM" opens with U+FEFF. Either used to miss the fence, so kind, tier,
+    /// tags and pin were dropped and the YAML block was imported as body.
+    #[test]
+    fn parses_omc_frontmatter_with_crlf_or_a_bom() {
+        let crlf = "---\r\ntitle: T\r\nkind: rule\r\ntier: procedural\r\ntags: [a, b]\r\npinned: true\r\n---\r\n# Body\r\ntext";
+        let parsed = parse_markdown(crlf).unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("T"));
+        assert_eq!(parsed.kind.as_deref(), Some("rule"));
+        assert_eq!(parsed.tier.as_deref(), Some("procedural"));
+        assert_eq!(parsed.tags, vec!["a", "b"]);
+        assert!(parsed.pinned);
+        assert_eq!(
+            parsed.body, "# Body\r\ntext",
+            "the body keeps its line endings"
+        );
+
+        let bom = parse_markdown("\u{feff}---\ntier: procedural\n---\n# Body\ntext").unwrap();
+        assert_eq!(bom.tier.as_deref(), Some("procedural"));
+        assert_eq!(bom.title.as_deref(), Some("Body"));
+        assert_eq!(bom.body, "# Body\ntext");
     }
 
     #[test]

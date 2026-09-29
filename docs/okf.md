@@ -159,5 +159,10 @@ so any later rewrite of an affected page (a restore, a hand edit, a
   the export). Import has no dedicated command by design: the format is
   native, so unpacking a bundle's concept files into a project's wiki
   directory and letting the watcher (or `reindex`) ingest them IS the
-  import path.
+  import path. Overwriting an already-imported concept file gets its new
+  version embedded the same way a brand-new file does — no manual
+  `ai-memory embed` needed. Deleting one does not yet remove it from the
+  index: the watcher only reconciles create/modify events, so a deleted
+  concept file still needs an explicit `ai-memory delete-page` (tracked in
+  #929).
 - Retrieval regression: LongMemEval baseline re-run; no material drop.

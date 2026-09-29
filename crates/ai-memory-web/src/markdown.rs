@@ -6,6 +6,8 @@
 //! prompts, hooks, or LLM output), so raw HTML is escaped and unsafe
 //! link schemes are neutralised.
 
+use std::ops::Range;
+
 use ai_memory_core::PagePath;
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
@@ -23,13 +25,6 @@ use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 /// literal text.
 #[must_use]
 pub fn render(body: &str, workspace: &str, project: &str) -> String {
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_TABLES);
-    opts.insert(Options::ENABLE_FOOTNOTES);
-    opts.insert(Options::ENABLE_STRIKETHROUGH);
-    opts.insert(Options::ENABLE_TASKLISTS);
-    opts.insert(Options::ENABLE_SMART_PUNCTUATION);
-
     // Rewrite `[[wikilinks]]` into ordinary markdown links BEFORE parsing.
     // pulldown-cmark consumes `[...]` as reference-link syntax, so the brackets
     // never survive as a single text node — preprocessing the source is the
@@ -38,10 +33,23 @@ pub fn render(body: &str, workspace: &str, project: &str) -> String {
     let body = preprocess_wikilinks(body, workspace, project);
 
     let parser =
-        Parser::new_ext(&body, opts).map(|event| sanitize_event(event, workspace, project));
+        Parser::new_ext(&body, options()).map(|event| sanitize_event(event, workspace, project));
     let mut out = String::with_capacity(body.len() + body.len() / 4);
     html::push_html(&mut out, parser);
     out
+}
+
+/// The GFM-ish parser options the page renders with. The wikilink
+/// preprocessor parses with the same ones, so it skips exactly the code
+/// the renderer will show as code.
+fn options() -> Options {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+    opts
 }
 
 /// Rewrite a relative in-wiki link target (a page like `concepts/foo.md`
@@ -91,68 +99,47 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
 }
 
 /// Convert `[[target]]` / `[[target|label]]` spans into `[label](href)`
-/// markdown links, skipping fenced code blocks, inline-code spans, and
-/// 4-space-indented code blocks. Targets that aren't internal pages
-/// (external schemes, traversal, empty) are left as literal `[[…]]`.
+/// markdown links, skipping code: fenced and indented code blocks and
+/// inline-code spans. Targets that aren't internal pages (external
+/// schemes, traversal, empty) are left as literal `[[…]]`.
+///
+/// What counts as code is what the renderer's own parser reads as code,
+/// not a guess from indentation: four spaces open a code block only where
+/// CommonMark says they do, so a nested list item or a paragraph's
+/// continuation line indented four spaces is text, and its wikilink is
+/// rewritten like any other (the engine's link extractor indexes it).
 fn preprocess_wikilinks(body: &str, workspace: &str, project: &str) -> String {
     let mut out = String::with_capacity(body.len() + 64);
-    // None when outside a fence; Some(char) carrying the opener glyph
-    // (`'`' ` for ```` ``` ````, `'~'` for `~~~`) when inside one. The
-    // CommonMark rule is that a fence closes only with the *same* glyph,
-    // so opening with `~~~` ignores a `` ``` `` line in between and
-    // vice versa.
-    let mut fence: Option<char> = None;
-    for line in body.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let leading_indent = line.len() - trimmed.len();
-        if let Some(kind) = fence_glyph(trimmed) {
-            match fence {
-                None => fence = Some(kind),
-                Some(open) if open == kind => fence = None,
-                _ => {} // Mismatched glyph inside a fenced block — literal text.
-            }
-            out.push_str(line);
-            continue;
-        }
-        if fence.is_some() {
-            out.push_str(line);
-            continue;
-        }
-        // 4-space-indented (or tab-indented) lines are CommonMark code
-        // blocks. A wikilink inside one must stay literal so it ends up
-        // inside the rendered `<pre><code>…</code></pre>`. Blank-only
-        // indented lines are pass-through (paragraph continuation).
-        if !trimmed.is_empty() && (leading_indent >= 4 || line.starts_with('\t')) {
-            out.push_str(line);
-            continue;
-        }
-        // Split on backticks: even segments are outside inline code, odd ones
-        // are inside it (left verbatim). Unbalanced backticks degrade safely.
-        for (i, seg) in line.split('`').enumerate() {
-            if i > 0 {
-                out.push('`');
-            }
-            if i % 2 == 0 {
-                rewrite_wikilinks_in_text(seg, workspace, project, &mut out);
-            } else {
-                out.push_str(seg);
-            }
-        }
+    let mut pos = 0;
+    for code in code_ranges(body) {
+        rewrite_wikilinks_in_lines(&body[pos..code.start], workspace, project, &mut out);
+        out.push_str(&body[code.clone()]);
+        pos = code.end;
     }
+    rewrite_wikilinks_in_lines(&body[pos..], workspace, project, &mut out);
     out
 }
 
-/// If `trimmed` opens or closes a CommonMark code fence, return its
-/// opener glyph (`` ` `` or `~`). CommonMark requires at least three
-/// of the same glyph; we accept the lenient "starts with three" rule
-/// to mirror the pulldown-cmark parser's behaviour for our preprocessor.
-fn fence_glyph(trimmed: &str) -> Option<char> {
-    if trimmed.starts_with("```") {
-        Some('`')
-    } else if trimmed.starts_with("~~~") {
-        Some('~')
-    } else {
-        None
+/// Byte ranges of the code in `body` (fenced and indented code blocks,
+/// inline-code spans) as the renderer's parser reads it, in document
+/// order and without overlap.
+fn code_ranges(body: &str) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for (event, range) in Parser::new_ext(body, options()).into_offset_iter() {
+        if matches!(event, Event::Start(Tag::CodeBlock(_)) | Event::Code(_))
+            && ranges.last().is_none_or(|last| range.start >= last.end)
+        {
+            ranges.push(range);
+        }
+    }
+    ranges
+}
+
+/// Rewrite the wikilinks of a run of non-code text one line at a time, so
+/// an unterminated `[[` never pairs with a `]]` on a later line.
+fn rewrite_wikilinks_in_lines(text: &str, workspace: &str, project: &str, out: &mut String) {
+    for line in text.split_inclusive('\n') {
+        rewrite_wikilinks_in_text(line, workspace, project, out);
     }
 }
 
@@ -400,20 +387,26 @@ fn escape_html(input: &str) -> String {
     out
 }
 
-/// Drop the leading H1 from a markdown body if present. Static-site
-/// convention: the first H1 IS the page title, and the page template
-/// already renders the title in its header — leaving it in the body
-/// duplicates it on screen. No-op when the body doesn't start with
-/// an H1 (handles `# Title`, both ATX `# Title` and setext
-/// `Title\n=====` forms).
+/// Drop the leading H1 from a markdown body when it repeats `title`.
+/// Static-site convention: the first H1 IS the page title, and the page
+/// template already renders the title in its header — leaving it in the
+/// body duplicates it on screen. An H1 that reads differently is not a
+/// duplicate: a frontmatter `title:` outranks the H1, and a setext H1 never
+/// names the page at all, so dropping one of those hid the only place the
+/// page said it. No-op when the body doesn't start with that H1 (handles
+/// both ATX `# Title` and setext `Title\n=====` forms).
 #[must_use]
-pub fn strip_leading_h1(body: &str) -> &str {
+pub fn strip_leading_h1<'a>(body: &'a str, title: &str) -> &'a str {
+    let title = title.trim();
     // Skip any leading blank lines.
     let trimmed = body.trim_start_matches(['\n', '\r']);
     // ATX form: `# Title` (one `#`, NOT `## …`).
     if let Some(rest) = trimmed.strip_prefix("# ") {
-        let after_line = rest.find('\n').map_or("", |nl| &rest[nl + 1..]);
-        return after_line.trim_start_matches(['\n', '\r']);
+        let (heading, after_line) = rest.split_once('\n').unwrap_or((rest, ""));
+        if heading.trim() == title {
+            return after_line.trim_start_matches(['\n', '\r']);
+        }
+        return body;
     }
     // Setext form: `Title\n====…` (1+ equals signs). Look ahead.
     if let Some((first_line, after_first)) = trimmed.split_once('\n')
@@ -421,6 +414,7 @@ pub fn strip_leading_h1(body: &str) -> &str {
         && let Some((second_line, after_second)) = after_first.split_once('\n')
         && !second_line.is_empty()
         && second_line.chars().all(|c| c == '=')
+        && first_line.trim() == title
     {
         return after_second.trim_start_matches(['\n', '\r']);
     }
@@ -540,38 +534,53 @@ mod tests {
 
     #[test]
     fn strip_atx_h1_drops_first_heading() {
-        let out = strip_leading_h1("# Title\n\nbody text\n");
+        let out = strip_leading_h1("# Title\n\nbody text\n", "Title");
         assert_eq!(out, "body text\n");
     }
 
     #[test]
     fn strip_atx_h1_tolerates_leading_blank_lines() {
-        let out = strip_leading_h1("\n\n# Title\n\nbody\n");
+        let out = strip_leading_h1("\n\n# Title\n\nbody\n", "Title");
         assert_eq!(out, "body\n");
     }
 
     #[test]
     fn strip_atx_h1_leaves_h2_alone() {
-        let out = strip_leading_h1("## Subhead\n\nbody\n");
+        let out = strip_leading_h1("## Subhead\n\nbody\n", "Subhead");
         assert_eq!(out, "## Subhead\n\nbody\n");
     }
 
     #[test]
     fn strip_atx_h1_leaves_body_without_title_alone() {
-        let out = strip_leading_h1("just a paragraph\n");
+        let out = strip_leading_h1("just a paragraph\n", "Title");
         assert_eq!(out, "just a paragraph\n");
     }
 
     #[test]
+    fn strip_atx_h1_keeps_a_heading_that_is_not_the_title() {
+        let body = "# Token refresh\n\nbody\n";
+        assert_eq!(strip_leading_h1(body, "Auth decisions"), body);
+        // A heading-only body that repeats the title leaves nothing.
+        assert_eq!(strip_leading_h1("# Title", "Title"), "");
+        assert_eq!(strip_leading_h1("# Title\r\n\r\nbody", "Title"), "body");
+    }
+
+    #[test]
     fn strip_setext_h1_drops_first_heading() {
-        let out = strip_leading_h1("Title\n=====\n\nbody\n");
+        let out = strip_leading_h1("Title\n=====\n\nbody\n", "Title");
         assert_eq!(out, "body\n");
+    }
+
+    #[test]
+    fn strip_setext_h1_keeps_a_heading_that_is_not_the_title() {
+        let body = "Cache warmup\n============\n\nbody\n";
+        assert_eq!(strip_leading_h1(body, "setext"), body);
     }
 
     #[test]
     fn strip_does_not_eat_setext_h2() {
         // `----` underlines are H2, not H1. Leave them alone.
-        let out = strip_leading_h1("Title\n----\n\nbody\n");
+        let out = strip_leading_h1("Title\n----\n\nbody\n", "Title");
         assert_eq!(out, "Title\n----\n\nbody\n");
     }
 
@@ -681,6 +690,43 @@ mod tests {
             !html.contains(r#"href="w/default/scratch/p/notes/foo.md""#),
             "must NOT linkify inside indented code: {html}"
         );
+    }
+
+    /// Four spaces of indent make a code block only where CommonMark says
+    /// so. A nested list item written with four spaces, and a paragraph's
+    /// continuation line, are text: the engine's link extractor indexes the
+    /// wikilink on them, so the page has to render it as a link too.
+    #[test]
+    fn wikilink_on_an_indented_line_that_is_not_code_is_linkified() {
+        let nested = render(
+            "- Decisions:\n    - see [[decisions/auth]]\n",
+            "default",
+            "scratch",
+        );
+        assert!(
+            nested.contains(r#"href="w/default/scratch/p/decisions/auth.md""#),
+            "nested list item: {nested}"
+        );
+        assert!(!nested.contains("<pre>"), "not a code block: {nested}");
+
+        let continued = render(
+            "The flow is described\n    in [[notes/flow]] and nowhere else.\n",
+            "default",
+            "scratch",
+        );
+        assert!(
+            continued.contains(r#"href="w/default/scratch/p/notes/flow.md""#),
+            "paragraph continuation: {continued}"
+        );
+
+        // Indented code inside a list item is still code, and stays literal.
+        let code = render(
+            "- step\n\n        run [[notes/foo]]\n",
+            "default",
+            "scratch",
+        );
+        assert!(code.contains("[[notes/foo]]"), "list code literal: {code}");
+        assert!(!code.contains("<a href"), "list code not linkified: {code}");
     }
 
     /// A label that contains `(` or `)` must not let the next `)` close

@@ -1,0 +1,22 @@
+[Unit]
+Description=ai-memory snapshot + push to remote git
+Documentation=file://%h/.local/share/ai-memory/docs/backup.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Point ExecStart at wherever you dropped ai-memory-snapshot.sh — this path
+# is only a sample. Adjust the environment overrides if the defaults in the
+# script do not match your install.
+ExecStart=%h/.local/bin/ai-memory-snapshot.sh
+# Environment=REPO_DIR=%h/ai-memory-backup
+# Environment=DATA_SRC=%h/.local/share/ai-memory
+# Environment=CFG_SRC=%h/.config/ai-memory
+# Environment=TARBALL_DIR=%h/backups/ai-memory
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=default.target
