@@ -546,6 +546,7 @@ wiki browser and JSON APIs stay behind the route class above.
 ```
 init                 status               run
 show                 continue             resume
+list-projects
 workstreams          rename-workstream    workstream-search
 audit-contamination  search               read-page
 write-page           delete-page          serve

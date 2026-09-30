@@ -33,6 +33,11 @@ pub enum Command {
     Init(InitArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
+    /// List every workspace/project pair the server knows about (plain,
+    /// scriptable output — the read-only equivalent of hitting
+    /// `GET /api/v1/projects` directly, which was previously the only way to
+    /// see this from outside an interactive `show` session).
+    ListProjects(ListProjectsArgs),
     /// Check capture coverage: compare local harness session stores for this
     /// project against what the server captured, and warn when a harness ran
     /// here recently but has no captured sessions (its hook is likely missing).
@@ -1683,6 +1688,17 @@ pub struct InitArgs {
 #[derive(Debug, Args)]
 pub struct StatusArgs {
     /// Emit the report as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `list-projects`.
+#[derive(Debug, Args)]
+pub struct ListProjectsArgs {
+    /// Only list projects in this workspace. Omit to list every workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Emit JSON instead of a plain table.
     #[arg(long)]
     pub json: bool,
 }

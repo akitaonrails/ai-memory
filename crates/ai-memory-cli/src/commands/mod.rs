@@ -53,6 +53,7 @@ pub mod install_mcp;
 pub mod install_skills;
 pub mod lint;
 pub mod llm_test;
+pub mod list_projects;
 pub mod mcp_bridge;
 pub mod message;
 pub mod move_project;
