@@ -90,16 +90,17 @@ pub fn read_capture_config_verbose(marker: &Path) -> Result<CaptureConfig, Strin
     }
     let ignore_paths = match table.get("ignore_paths") {
         None => Vec::new(),
-        Some(item) => item
-            .as_array()
-            .ok_or_else(|| "`[capture].ignore_paths` must be an array".to_owned())?
-            .iter()
-            .map(|value| {
-                value.as_str().map(str::to_owned).ok_or_else(|| {
-                    "`[capture].ignore_paths` must contain only strings".to_owned()
+        Some(item) => {
+            item.as_array()
+                .ok_or_else(|| "`[capture].ignore_paths` must be an array".to_owned())?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        "`[capture].ignore_paths` must contain only strings".to_owned()
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, _>>()?
+        }
     };
     Ok(CaptureConfig { ignore_paths })
 }
