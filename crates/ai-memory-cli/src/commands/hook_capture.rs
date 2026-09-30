@@ -45,34 +45,78 @@ pub fn capture_policy(cwd: &str) -> CapturePolicy {
 }
 
 fn read_capture_config(marker: &Path) -> Result<CaptureConfig, ()> {
+    read_capture_config_verbose(marker).map_err(|_reason| ())
+}
+
+/// Same parse as [`read_capture_config`], but keeps the failure reason
+/// instead of collapsing it to `()`.
+///
+/// The hot hook path only needs "did this work", so it discards the reason
+/// (and fails closed either way — see `CaptureSource::Invalid` in
+/// `capture_policy`). Diagnostics (`ai-memory doctor`) need the reason,
+/// because a malformed `[capture]` table today disables that repository's
+/// `ignore_paths` secret-redaction rule with **no signal anywhere** that it
+/// happened — the sibling root-level `project`/`workspace` keys are read by a
+/// separate, more forgiving line parser (see `marker::parse_toml_key`) and
+/// keep working even when `[capture]` itself is broken, so the marker can
+/// look like it is doing its job while silently doing half of it.
+pub fn read_capture_config_verbose(marker: &Path) -> Result<CaptureConfig, String> {
     let mut bytes = Vec::with_capacity(MAX_MARKER_BYTES + 1);
     std::fs::File::open(marker)
-        .map_err(|_| ())?
+        .map_err(|e| format!("could not open marker file: {e}"))?
         .take((MAX_MARKER_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| ())?;
+        .map_err(|e| format!("could not read marker file: {e}"))?;
     if bytes.len() > MAX_MARKER_BYTES {
-        return Err(());
+        return Err(format!(
+            "marker file is larger than the {MAX_MARKER_BYTES}-byte capture-config limit"
+        ));
     }
-    let text = String::from_utf8(bytes).map_err(|_| ())?;
-    let document = text.parse::<toml_edit::DocumentMut>().map_err(|_| ())?;
+    let text =
+        String::from_utf8(bytes).map_err(|e| format!("marker file is not valid UTF-8: {e}"))?;
+    let document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("invalid TOML: {e}"))?;
     let Some(capture) = document.get("capture") else {
         return Ok(CaptureConfig::default());
     };
-    let table = capture.as_table().ok_or(())?;
-    if table.iter().any(|(key, _)| key != "ignore_paths") {
-        return Err(());
+    let table = capture
+        .as_table()
+        .ok_or_else(|| "`[capture]` must be a table".to_owned())?;
+    if let Some((key, _)) = table.iter().find(|(key, _)| *key != "ignore_paths") {
+        return Err(format!(
+            "`[capture]` has an unsupported key `{key}` (only `ignore_paths` is allowed)"
+        ));
     }
     let ignore_paths = match table.get("ignore_paths") {
         None => Vec::new(),
         Some(item) => item
             .as_array()
-            .ok_or(())?
+            .ok_or_else(|| "`[capture].ignore_paths` must be an array".to_owned())?
             .iter()
-            .map(|value| value.as_str().map(str::to_owned).ok_or(()))
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    "`[capture].ignore_paths` must contain only strings".to_owned()
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?,
     };
     Ok(CaptureConfig { ignore_paths })
+}
+
+/// Diagnostic for `ai-memory doctor`: does the nearest `.ai-memory.toml`'s
+/// `[capture]` section actually parse?
+///
+/// Returns `None` when there is no marker (nothing to check) or it parsed
+/// fine. Returns `Some((marker_path, reason))` when a marker exists but its
+/// `[capture]` table is malformed — the case that today fails closed with no
+/// warning anywhere.
+pub fn capture_config_problem(cwd: &str) -> Option<(PathBuf, String)> {
+    let marker = find_marker(cwd)?;
+    match read_capture_config_verbose(&marker) {
+        Ok(_) => None,
+        Err(reason) => Some((marker, reason)),
+    }
 }
 
 /// First top-level `cwd` string in the payload (parity with
@@ -1366,5 +1410,66 @@ drop_subagent_captures = "true"
         let qs = marker_query_suffix(tmp.path().to_str().unwrap(), Some("repo-root"));
         assert!(qs.contains("&project=pinned"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+    }
+
+    #[test]
+    fn capture_config_problem_is_none_without_a_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(capture_config_problem(tmp.path().to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn capture_config_problem_is_none_for_a_well_formed_capture_table() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "project = \"ok\"\n\n[capture]\nignore_paths = [\"**/.env\"]\n",
+        )
+        .unwrap();
+        assert!(capture_config_problem(tmp.path().to_str().unwrap()).is_none());
+    }
+
+    /// The exact failure mode this diagnostic exists for: a dropped `#` turns
+    /// a wrapped comment into a stray token right after a `[capture]` header,
+    /// which is invalid TOML — found for real in a project's own marker.
+    #[test]
+    fn capture_config_problem_reports_the_dropped_comment_marker_regression() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        std::fs::write(
+            &marker,
+            "project = \"aw-senai-sgw\"\n\n\
+             [capture] abaixo para la, senao a exclusao de segredos deixa de valer\n\
+             project_strategy = \"repo-root\"\n\n\
+             [capture]\nignore_paths = [\"**/.env\"]\n",
+        )
+        .unwrap();
+        let (reported_marker, reason) =
+            capture_config_problem(tmp.path().to_str().unwrap()).expect("malformed TOML");
+        assert_eq!(reported_marker, marker);
+        assert!(reason.contains("invalid TOML"), "{reason}");
+    }
+
+    #[test]
+    fn capture_config_problem_reports_an_unsupported_capture_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nallowlist = [\"**\"]\n",
+        )
+        .unwrap();
+        let (_, reason) =
+            capture_config_problem(tmp.path().to_str().unwrap()).expect("unsupported key");
+        assert!(reason.contains("allowlist"), "{reason}");
+    }
+
+    #[test]
+    fn read_capture_config_and_verbose_agree_on_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        std::fs::write(&marker, "[capture]\nignore_paths = [\"**/*.pem\"]\n").unwrap();
+        let terse = read_capture_config(&marker).expect("valid marker parses");
+        let verbose = read_capture_config_verbose(&marker).expect("valid marker parses");
+        assert_eq!(terse.ignore_paths, verbose.ignore_paths);
     }
 }

@@ -116,6 +116,16 @@ struct DoctorReport {
     rows: Vec<CoverageRow>,
     /// The agent kinds (kebab form) flagged as uncaptured, for quick scripting.
     uncaptured: Vec<String>,
+    /// Set when the nearest `.ai-memory.toml`'s `[capture]` table is
+    /// malformed. That silently disables `ignore_paths` for this repository
+    /// with no other signal, so `doctor` is the one place that surfaces it.
+    marker_capture_problem: Option<MarkerCaptureProblem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MarkerCaptureProblem {
+    marker_path: String,
+    reason: String,
 }
 
 /// Fold the raw per-harness local scans and the server's captured counts into
@@ -290,6 +300,15 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         .map(|r| r.agent.clone())
         .collect();
 
+    let marker_capture_problem = cwd.to_str().and_then(|cwd| {
+        super::hook_capture::capture_config_problem(cwd).map(|(marker_path, reason)| {
+            MarkerCaptureProblem {
+                marker_path: marker_path.display().to_string(),
+                reason,
+            }
+        })
+    });
+
     let report = DoctorReport {
         workspace,
         project,
@@ -297,6 +316,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         since_days: args.since_days,
         rows,
         uncaptured,
+        marker_capture_problem,
     };
 
     if args.json {
@@ -316,6 +336,15 @@ fn render_human(report: &DoctorReport) {
         println!("  recent window: all on-disk sessions\n");
     } else {
         println!("  recent window: last {} days\n", report.since_days);
+    }
+
+    if let Some(problem) = &report.marker_capture_problem {
+        println!(
+            "⚠ {} has an invalid `[capture]` section: {}\n  \
+             Its `ignore_paths` secret-redaction rule is NOT applying — fix the TOML and re-run \
+             `ai-memory doctor` to confirm.\n",
+            problem.marker_path, problem.reason
+        );
     }
 
     if report.rows.is_empty() {
