@@ -288,12 +288,13 @@ pub struct RunArgs {
     /// equivalent dangerous-mode option.
     #[arg(long)]
     pub yolo: bool,
-    /// Claude-only: additionally silence the residual `--dangerously-skip-permissions`
-    /// prompts (rm timeout/confirmation, PowerShell rm deny) and force
-    /// `bypassPermissions` via `--settings`. No-op for every other harness
-    /// (a one-line note is printed instead of being silently ignored).
-    /// Off by default; overrides `[claude_true_yolo]` in config.toml when
-    /// passed. Best paired with ai-jail — see
+    /// Everything `--yolo` does, plus — for Claude — forcing
+    /// `bypassPermissions` via `--settings` over any settings `defaultMode`.
+    /// Claude still honors your own explicit `ask` rules in every mode. For
+    /// every other harness it is interchangeable with `--yolo`; passing both
+    /// is redundant but fine. Off by default; `[claude_true_yolo]` in
+    /// config.toml applies the same Claude extra to an explicit `--yolo`
+    /// launch. Best paired with ai-jail — see
     /// `docs/design-yolo-safety-ai-jail.md`.
     #[arg(long = "true-yolo")]
     pub true_yolo: bool,

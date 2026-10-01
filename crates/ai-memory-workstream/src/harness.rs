@@ -469,33 +469,22 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
 }
 
 /// Opt-in Claude-only "true yolo": on top of [`apply_yolo`]'s
-/// `--dangerously-skip-permissions`, silence the residual prompts Claude Code
-/// still shows (a 2-minute `rm` timeout/confirmation, and the PowerShell `rm`
-/// deny) and force `bypassPermissions` on the argv so CLI-flag precedence
-/// beats a user's own settings.json `defaultMode`. Does not widen a user's
-/// own `deny`/`ask` rules (those union across levels) — see
+/// `--dangerously-skip-permissions`, force `bypassPermissions` through
+/// `--settings`, whose CLI-flag precedence beats a `defaultMode` in the user's
+/// or project's settings.json. Claude Code still enforces explicit `ask` and
+/// `deny` rules and its own command-safety checks in every permission mode
+/// (documented: "Actions no mode auto-approves"), and `--settings` permission
+/// arrays union with the other scopes rather than replacing them — so this
+/// cannot silence an `ask` rule; the user removes those. See
 /// `docs/design-yolo-safety-ai-jail.md` §4. A no-op for every harness other
-/// than [`ManagedHarness::Claude`]; callers print their own one-line note
-/// when that happens (documented, not silently ignored).
-pub fn apply_claude_true_yolo(
-    harness: ManagedHarness,
-    env: &mut Vec<(String, String)>,
-    args: &mut Vec<OsString>,
-) {
+/// than [`ManagedHarness::Claude`].
+pub fn apply_claude_true_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
     if harness != ManagedHarness::Claude {
         return;
     }
-    let mut set = |name: &str, value: &str| {
-        env.retain(|(key, _)| key != name);
-        env.push((name.to_string(), value.to_string()));
-    };
-    set("CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT", "1");
-    set("CLAUDE_CODE_DISABLE_SUBSTITUTION_RM_PROMPT", "1");
-    // A no-op off Windows; harmless to set everywhere.
-    set("CLAUDE_CODE_DISABLE_POWERSHELL_CMD_RM_DENY", "1");
     args.push(OsString::from("--settings"));
     args.push(OsString::from(
-        r#"{"permissions":{"defaultMode":"bypassPermissions","ask":[]}}"#,
+        r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
     ));
 }
 
@@ -1573,45 +1562,27 @@ mod tests {
     }
 
     #[test]
-    fn apply_claude_true_yolo_sets_env_and_settings_for_claude() {
-        let mut env = vec![("EXISTING".to_string(), "kept".to_string())];
+    fn apply_claude_true_yolo_forces_bypass_permissions_for_claude() {
         let mut args = vec![OsString::from("--model"), OsString::from("opus")];
-        apply_claude_true_yolo(ManagedHarness::Claude, &mut env, &mut args);
-        assert_eq!(
-            env,
-            vec![
-                ("EXISTING".to_string(), "kept".to_string()),
-                (
-                    "CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT".to_string(),
-                    "1".to_string()
-                ),
-                (
-                    "CLAUDE_CODE_DISABLE_SUBSTITUTION_RM_PROMPT".to_string(),
-                    "1".to_string()
-                ),
-                (
-                    "CLAUDE_CODE_DISABLE_POWERSHELL_CMD_RM_DENY".to_string(),
-                    "1".to_string()
-                ),
-            ]
-        );
+        apply_claude_true_yolo(ManagedHarness::Claude, &mut args);
         assert_eq!(
             strings(&args),
             [
                 "--model",
                 "opus",
                 "--settings",
-                r#"{"permissions":{"defaultMode":"bypassPermissions","ask":[]}}"#,
+                r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
             ]
         );
+        // `--settings` permission arrays union with the other scopes, so an
+        // empty `ask` would only suggest a protection it cannot provide.
+        assert!(!strings(&args).iter().any(|arg| arg.contains("\"ask\"")));
     }
 
     #[test]
     fn apply_claude_true_yolo_is_noop_for_other_harnesses() {
-        let mut env = Vec::new();
         let mut args = vec![OsString::from("--yolo")];
-        apply_claude_true_yolo(ManagedHarness::Codex, &mut env, &mut args);
-        assert!(env.is_empty());
+        apply_claude_true_yolo(ManagedHarness::Codex, &mut args);
         assert_eq!(strings(&args), ["--yolo"]);
     }
 

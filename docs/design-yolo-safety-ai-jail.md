@@ -3,9 +3,8 @@
 Status: accepted (release/2.5). Tracks the 2.5 feature that makes
 `ai-memory run … --yolo` warn before it disarms an agent's safety prompts,
 offers to run the session inside [ai-jail](https://github.com/akitaonrails/ai-jail)
-when it is installed, and adds an opt-in "true yolo" for Claude Code that
-silences the residual permission pauses `--dangerously-skip-permissions`
-leaves behind.
+when it is usable, and adds an opt-in "true yolo" that implies `--yolo` and,
+for Claude Code, also forces `bypassPermissions` over a settings `defaultMode`.
 
 ## Motivation
 
@@ -19,8 +18,11 @@ every tool call with no confirmation. Three gaps:
    agent, but nothing connects the two — the user must remember to type
    `ai-jail ai-memory run …` themselves.
 3. **Claude still pauses.** Even with `--dangerously-skip-permissions`, Claude
-   Code still prompts on `permissions.ask`/`deny` rules and on critical-path
-   `rm` (a 2-minute timeout prompt), so an "unattended" yolo run stalls.
+   Code still prompts on explicit `permissions.ask` rules and on its own
+   command-safety checks (e.g. "Contains brace with quote character (expansion
+   obfuscation)"), so an "unattended" yolo run can stall. Anthropic documents
+   these under "Actions no mode auto-approves": no permission mode — including
+   `bypassPermissions` — skips them.
 
 ## Non-goals
 
@@ -53,8 +55,17 @@ scripts, hooks, and CI keep working unchanged.
 
 ### 2. ai-jail detect + offer (Linux/macOS)
 
-If `ai-jail` is on `PATH` (`command -v ai-jail`, fallback `~/.local/bin/ai-jail`)
-and we are not already jailed, the prompt gains a second question:
+The offer appears only when accepting it can actually work
+(`usable_ai_jail`): on Linux or macOS, with the ai-jail binary on `PATH`
+(fallback `~/.local/bin/ai-jail`) **and** its sandbox backend on `PATH`
+(`bwrap` on Linux, `sandbox-exec` on macOS). It never appears on Windows, where
+ai-jail is unsupported, even if a file named `ai-jail` happens to be on `PATH`.
+When ai-jail is not usable there is no question at all — the run proceeds
+directly after the §1 warning. The re-exec runs the exact path this check
+resolved, never a bare `ai-jail` re-looked-up through `PATH` (which missed a
+`~/.local/bin`-only install after the user had already accepted).
+
+When usable and we are not already jailed, the prompt gains a second question:
 
 ```
 ai-jail is installed. Re-run this session inside it? [Y/n]
@@ -68,8 +79,18 @@ ai-jail --network --agent-state <state> \
         --env AI_MEMORY_SERVER_URL --env AI_MEMORY_HOOK_URL \
         --env ANTHROPIC_API_KEY --env CLAUDE_CODE_OAUTH_TOKEN \
         --env CLAUDE_CONFIG_DIR --env … \
-        <current_exe> run <harness> … --yolo
+        -- <current_exe> run <harness> … --yolo
 ```
+
+- **`--` before the wrapped command.** ai-jail refuses one of its own flags
+  appearing after the command, because it cannot tell whether
+  `ai-jail cmd --network` means the sandbox or the child. `ai-memory run`
+  shares flag names with ai-jail (`--env`, …), so without the separator a
+  forwarded `run claude --env GH_TOKEN=…` aborted the launch. After `--`
+  ai-jail passes everything to the wrapped command verbatim — from ai-jail
+  2.4.2; earlier releases' guard ignores `--` (despite its error text
+  suggesting it), so a colliding forwarded flag still fails there. ai-memory
+  emits the separator regardless, as the documented contract.
 
 - **Re-exec**, not a nested spawn: `std::env::current_exe()` + the original
   `args_os()`. ai-jail forwards the wrapped argv verbatim and already parses
@@ -120,24 +141,40 @@ skipped and the run proceeds directly — a user who typed
 
 ### 4. Claude "true yolo" (opt-in, all OSes; recommended only under ai-jail)
 
-`--dangerously-skip-permissions` alone still pauses. Opt-in
-`[run] claude_true_yolo` (config) / `--true-yolo` (flag) additionally, **for
-the Claude harness only**:
+Opt-in `[run] claude_true_yolo` (config) / `--true-yolo` (flag) additionally,
+**for the Claude harness only**, injects
+`--settings '{"permissions":{"defaultMode":"bypassPermissions"}}'` on the
+Claude argv. CLI-flag precedence sits above user and project settings, so a
+`defaultMode` there (e.g. `auto` or `acceptEdits`) cannot narrow the run.
 
-- Sets `CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT=1`,
-  `CLAUDE_CODE_DISABLE_SUBSTITUTION_RM_PROMPT=1`, and
-  `CLAUDE_CODE_DISABLE_POWERSHELL_CMD_RM_DENY=1` in the child env (the last is a
-  no-op off Windows; harmless to set everywhere). These remove the residual
-  `rm` prompts.
-- Injects `--settings '{"permissions":{"defaultMode":"bypassPermissions","ask":[]}}'`
-  on the Claude argv (CLI-flag precedence sits above user settings). This does
-  not remove a user's own `deny`/`ask` rules (those union across levels), so
-  true-yolo is documented as "best paired with a clean sandbox," i.e. ai-jail.
+What it deliberately does **not** claim to do, verified against Claude Code
+2.1.280 and its documentation:
 
-Off by default. When enabled without ai-jail (and interactive), the warning
-text says so. Only applies to `ManagedHarness::Claude`; a no-op for other
-harnesses (documented, not silently ignored — a one-line note if `--true-yolo`
-is passed with a non-Claude harness).
+- It cannot silence an explicit `ask` rule. Claude Code enforces `ask` and
+  `deny` rules in every permission mode, and `--settings` permission arrays
+  *union* with the user/project/local scopes instead of replacing them, so an
+  empty `ask` array there is a no-op (earlier releases injected one). To run
+  without those pauses, remove the `ask` rules from your own settings; `deny`
+  rules never pause — they block — so keeping them costs no interruptions.
+- It cannot skip Claude Code's built-in command-safety checks.
+- Earlier releases also set three `CLAUDE_CODE_DISABLE_*RM*` environment
+  variables. Claude Code reads none of them (they are absent from its binary
+  and its env-var reference), so they were removed rather than left implying a
+  protection that never existed.
+
+True-yolo is documented as "best paired with a clean sandbox," i.e. ai-jail.
+
+Off by default. **`--true-yolo` is a superset of `--yolo`**: it implies
+`--yolo` (the §1 warning, the §2 offer, and each harness's dangerous-mode
+mapping) and adds the Claude extras above, so passing both is redundant but
+harmless. For every non-Claude harness it is simply interchangeable with
+`--yolo`. Like `--yolo`, it is recognized anywhere after `run` — including
+after native arguments (`run claude --model opus --true-yolo`), where clap
+leaves it in the native argv — and never forwarded to the harness as an
+unknown flag.
+The `claude_true_yolo` config key only upgrades a launch that is already
+`--yolo`/`--true-yolo`; on its own it never turns an ordinary run into a
+permission-bypassing one without the warning.
 
 ## OS support matrix
 
@@ -152,7 +189,7 @@ is passed with a non-Claude harness).
 ## Code shape
 
 - `ai-memory-workstream/src/jail.rs` (new): pure, OS-aware, dependency-injected
-  detection + command construction — `ai_jail_installed(lookup)`,
+  detection + command construction — `usable_ai_jail(os, lookup)`,
   `inside_ai_jail(env, hostname)`, `build_ai_jail_invocation(exe, args, env_names)`.
   Pure functions so the OS branches and the argv/env assembly are unit-tested
   without a sandbox.

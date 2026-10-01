@@ -175,10 +175,13 @@ ai-memory run --yolo claude
   `Enter`/`y`/`yes` proceeds (the default); `n`/`no` aborts before anything
   launches.
 - **The ai-jail offer.** If [ai-jail](https://github.com/akitaonrails/ai-jail)
-  is on `PATH` (or `~/.local/bin/ai-jail`) and you are not already inside it,
-  a second question offers to re-run the session inside it. Accepting
-  re-execs the original command under `ai-jail --network --agent-state
-  --env <NAME>...`, forwarding only the credential/config
+  is usable — on Linux/macOS, installed on `PATH` (or `~/.local/bin/ai-jail`),
+  with its sandbox backend present (`bwrap` on Linux, `sandbox-exec` on
+  macOS) — and you are not already inside it, a second question offers to
+  re-run the session inside it. When it is not usable (or on Windows) there is
+  no second question; the run just proceeds. Accepting re-execs the original
+  command under `ai-jail --network --agent-state --env <NAME>... --`,
+  forwarding only the credential/config
   environment variables that are already set (server/hook URL,
   `CLAUDE_CONFIG_DIR`, provider API keys, etc.) — `--network` keeps the
   loopback ai-memory server reachable while still sandboxing the filesystem.
@@ -188,12 +191,23 @@ ai-memory run --yolo claude
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with
   `(jail) `); it fails open (shows the warning) when undetectable, never
   open to skipping it silently.
-- **Claude "true yolo".** `--dangerously-skip-permissions` alone still pauses
-  Claude Code on `permissions.ask`/`deny` rules and on a 2-minute `rm`
-  confirmation. Opt in with `--true-yolo` (or `claude_true_yolo = true` in
-  `config.toml` / `AI_MEMORY_CLAUDE_TRUE_YOLO=true`) to also silence those —
-  Claude-only, off by default, and best paired with ai-jail since it does not
-  widen your own `deny`/`ask` rules.
+- **Claude "true yolo".** `--true-yolo` includes everything `--yolo` does
+  (`ai-memory run claude --true-yolo` is enough; adding `--yolo` too is
+  harmless) and, for Claude, also forces `bypassPermissions` over any
+  `defaultMode` in your settings. For other harnesses it is the same as
+  `--yolo`. `claude_true_yolo = true` in `config.toml` /
+  `AI_MEMORY_CLAUDE_TRUE_YOLO=true` applies the Claude extra to every `--yolo`
+  launch, never to a run without it.
+  **It cannot remove your own `ask` rules**: Claude Code honors explicit
+  `permissions.ask` rules (and its built-in command-safety checks) in every
+  mode, so a rule like `Bash(docker run *)` in `~/.claude/settings.json` still
+  pauses the run. For a pause-free sandbox, drop those `ask` entries — `deny`
+  rules block without pausing, so they can stay. Best paired with ai-jail.
+- **Passing extra env, e.g. a GitHub token.** `ai-memory run claude --yolo
+  --env GH_TOKEN="$(gh auth token)"` forwards it into the jailed agent (needs
+  ai-jail 2.4.2 or later when you accept the jail offer). This
+  hands a sandboxed agent your token, so only do it for work you'd trust it
+  with; it is deliberately never forwarded automatically.
 
 See [`design-yolo-safety-ai-jail.md`](design-yolo-safety-ai-jail.md) for the
 full contract.

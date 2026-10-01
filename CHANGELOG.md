@@ -26,6 +26,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stopped hook replays and ignored end events from advancing the last-persistence
   timestamp when they wrote nothing. (#1010)
 
+## [2.5.1] - 2026-10-01
+
+### Fixed
+- Fixed `ai-memory run --yolo`'s ai-jail re-exec aborting when the wrapped
+  command carried a flag that ai-jail also defines: `run claude --yolo --env
+  GH_TOKEN=…` failed with "flag --env after command would be passed to the
+  child". The invocation now separates ai-jail's sandbox flags from the
+  wrapped command with `--`; forwarding such a flag also needs ai-jail 2.4.2 or
+  later, whose guard honors the separator.
+- Fixed the `--yolo` ai-jail offer appearing when accepting it could not
+  work. It is now shown only on Linux/macOS when both ai-jail and its sandbox
+  backend (`bwrap` / `sandbox-exec`) are present — never on Windows, even with a
+  file named `ai-jail` on `PATH` — and otherwise the run proceeds without the
+  question. The re-exec runs the exact binary that was found, so a
+  `~/.local/bin`-only ai-jail no longer fails to exec after the user accepted.
+- Fixed `--true-yolo`. It now implies `--yolo` (the warning, the ai-jail
+  offer, and each harness's dangerous mode), so passing it alone no longer
+  bypassed Claude's permissions with no warning; it is interchangeable with
+  `--yolo` for non-Claude harnesses instead of printing "ignoring it"; and it is
+  recognized after native arguments (`run claude --model opus --true-yolo`)
+  instead of being passed to Claude as an unknown option. The `claude_true_yolo`
+  config key now
+  only upgrades an explicit `--yolo`/`--true-yolo` launch, as documented,
+  rather than applying `bypassPermissions` to every managed Claude run.
+- Fixed relaunching right after an interrupted `ai-memory run` failing with
+  "workstream is already active: owned by … until …" when the previous
+  launcher could not release its lease (killed, terminal closed, or an
+  ai-jail sandbox torn down). An interactive launch now names the holder and
+  waits for that lease to lapse (at most one ~90-second lease; Ctrl-C aborts),
+  then starts by itself. A holder that renews the lease meanwhile is reported
+  as a launcher still running — never displaced — and non-interactive launches
+  keep the short retry window.
+- Fixed `--true-yolo` claiming protections it never provided. It set three
+  `CLAUDE_CODE_DISABLE_*RM*` environment variables that Claude Code does not
+  read, and passed an empty `permissions.ask` array that cannot clear `ask`
+  rules from other settings scopes (Claude Code unions them). Both were
+  removed; true-yolo now forces only `bypassPermissions`, and the docs state
+  that Claude still honors your own `ask` rules and command-safety checks in
+  every mode.
+
 ### Security
 - Fixed GHSA-vh98: a capture-exclusion candidate or shell argument spelled
   with a leading `//` (e.g. `//repo/secret/token.txt`) self-classified as a
@@ -7556,7 +7596,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.5.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.5.1...HEAD
+[2.5.1]: https://github.com/akitaonrails/ai-memory/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/akitaonrails/ai-memory/compare/v2.4.2...v2.5.0
 [2.4.2]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/akitaonrails/ai-memory/compare/v2.4.0...v2.4.1

@@ -415,11 +415,13 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
         // the queue.
         let confirmed: Vec<(String, &str)> = accepted
             .iter()
-            .map(|idx| {
-                (
-                    batch.items[*idx].ingest_key.clone(),
-                    ack::acknowledged_outcome(&parsed, *idx),
-                )
+            .filter_map(|idx| {
+                batch.items.get(*idx).map(|item| {
+                    (
+                        item.ingest_key.clone(),
+                        ack::acknowledged_outcome(&parsed, *idx),
+                    )
+                })
             })
             .collect();
         delivered += queue.confirm(&confirmed, crate::now_ms())?;

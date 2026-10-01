@@ -127,7 +127,7 @@ struct JsonOutput {
 
 /// Pick a local checkout and harness, then delegate to managed `run`.
 pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
-    if args.json && (args.yolo || args.fresh || !args.native_args.is_empty()) {
+    if args.json && (args.yolo || args.true_yolo || args.fresh || !args.native_args.is_empty()) {
         bail!("--json only lists launch options; do not combine it with launch arguments");
     }
     let root = std::env::current_dir()

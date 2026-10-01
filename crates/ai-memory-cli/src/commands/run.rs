@@ -13,15 +13,14 @@ use ai_memory_core::{
 };
 use ai_memory_workstream::{
     AmbiguousNativeSession, ExportedTranscript, FORWARDED_ENV_NAMES, LaunchMode, LaunchPlan,
-    LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_on_path,
-    allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
-    build_launch_plan, build_launch_plan_with_env, crush_global_config_path,
-    discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
-    inspect_repository, kiro_explicit_session_id, kiro_harness_from_source_cursor,
-    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
-    kiro_v3_resume_uses_default_store, list_native_sessions, native_session_exists,
-    native_session_in_checkout, omp_profile_flag, omp_profile_flag_env, store_override_vars,
-    wait_for_transcript_flush,
+    LaunchRoots, ManagedHarness, NativeSessionCandidate, allows_native_session_adoption,
+    apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation, build_launch_plan,
+    build_launch_plan_with_env, crush_global_config_path, discover_native_session,
+    export_transcript, has_native_session_selector, inside_ai_jail_here, inspect_repository,
+    kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
+    kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
+    list_native_sessions, native_session_exists, native_session_in_checkout, omp_profile_flag,
+    omp_profile_flag_env, store_override_vars, usable_ai_jail_here, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -38,6 +37,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PREPARE_BUSY_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const PREPARE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+/// Most an interactive launch waits for another launcher's lease to lapse: one
+/// full server lease (90s) plus slack. A longer wait would mean the owner kept
+/// renewing — a live launcher, which waiting cannot resolve.
+const HELD_LEASE_MAX_WAIT: Duration = Duration::from_secs(100);
+/// Margin past the reported expiry, so the retry lands after the server's clock
+/// considers the lease lapsed.
+const HELD_LEASE_EXPIRY_SLACK: Duration = Duration::from_secs(1);
 const IMPORT_BATCH_EVENTS: usize = 400;
 const IMPORT_BATCH_BYTES: usize = 1024 * 1024;
 const ADOPTION_CANDIDATE_LIMIT: usize = 8;
@@ -115,12 +121,18 @@ pub(super) async fn run_from_with_wiring(
     let automatic_harness = args.harness.is_none();
     let mut native_args = args.native_args;
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
+    let trailing_true_yolo = remove_wrapper_true_yolo(&mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
-    let yolo_requested = args.yolo || trailing_yolo;
+    let yolo_modes = yolo_modes(
+        args.yolo || trailing_yolo,
+        args.true_yolo || trailing_true_yolo,
+        config.claude_true_yolo,
+    );
+    let yolo_requested = yolo_modes.yolo;
     let force_fresh = args.fresh || trailing_fresh;
     let no_autowire = args.no_autowire || trailing_no_autowire;
-    let mut run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
+    let run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
         .context("resolving --env/--env-file for the managed run")?;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
@@ -172,7 +184,8 @@ pub(super) async fn run_from_with_wiring(
     };
     let interrupted_before_spawn = CancellationToken::new();
     let interrupt_task = tokio::spawn(capture_interrupts(interrupted_before_spawn.clone()));
-    let prepared = prepare_managed_run(&endpoint, &prepare)
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    let prepared = prepare_managed_run(&endpoint, &prepare, interactive, &interrupted_before_spawn)
         .await
         .context("opening managed workstream; the agent was not started");
     let prepared = match prepared {
@@ -383,18 +396,12 @@ pub(super) async fn run_from_with_wiring(
         }
         apply_yolo(harness, &mut plan.args);
     }
-    // Claude-only "true yolo": opt-in, independent of `--yolo` (see
-    // `docs/design-yolo-safety-ai-jail.md` §4). Applied to the same
-    // env/args the child command is built from below.
-    if args.true_yolo || config.claude_true_yolo {
-        if harness == ManagedHarness::Claude {
-            apply_claude_true_yolo(harness, &mut run_env, &mut plan.args);
-        } else if args.true_yolo {
-            eprintln!(
-                "ai-memory: --true-yolo only affects the Claude harness; ignoring it for {}",
-                harness.as_str()
-            );
-        }
+    // Claude's extra "true yolo" bypass (`docs/design-yolo-safety-ai-jail.md`
+    // §4), applied to the same env/args the child command is built from below.
+    // Every other harness already got the plain `--yolo` mapping above, which
+    // is all `--true-yolo` means for them.
+    if yolo_modes.claude_true_yolo && harness == ManagedHarness::Claude {
+        apply_claude_true_yolo(harness, &mut plan.args);
     }
     let remove_kiro_home = if harness == ManagedHarness::KiroV3
         && let Some(native_session_id) = plan.expected_session_id.as_deref()
@@ -909,7 +916,11 @@ async fn confirm_yolo_and_maybe_reexec(
     if interrupted.is_cancelled() {
         return Err(anyhow!("managed run interrupted before the agent started"));
     }
-    let ai_jail_available = ai_jail_on_path();
+    // Resolved once: `None` (Windows, ai-jail absent, or its sandbox backend
+    // absent) suppresses the offer entirely, and `Some` is the exact binary
+    // the re-exec runs.
+    let ai_jail = usable_ai_jail_here();
+    let ai_jail_available = ai_jail.is_some();
     let confirmation = tokio::task::spawn_blocking(move || {
         let stdin = io::stdin();
         let mut stderr = io::stderr();
@@ -921,9 +932,9 @@ async fn confirm_yolo_and_maybe_reexec(
     if !confirmation.proceed {
         return Err(anyhow!("aborted: --yolo not confirmed"));
     }
-    if !confirmation.jail {
+    let (true, Some(ai_jail)) = (confirmation.jail, ai_jail) else {
         return Ok(());
-    }
+    };
     // The re-exec replaces this process (or, off Unix, this process exits
     // once the child does), so its own prepared lease must be released here
     // rather than left to the 90s orphan timeout — the jailed re-run opens
@@ -941,25 +952,26 @@ async fn confirm_yolo_and_maybe_reexec(
     // state survives ai-jail's ephemeral private home (ai-jail derives the
     // per-harness state location from the wrapped `run <harness>` it parses).
     let jail_args = build_ai_jail_invocation(&exe, &forwarded, &present, true);
-    reexec_under_ai_jail(&jail_args)
+    reexec_under_ai_jail(&ai_jail, &jail_args)
 }
 
-/// Replace this process with `ai-jail <jail_args>` on Unix (never returns on
-/// success); elsewhere, spawn it, wait, and exit with its status (also never
-/// returns).
+/// Replace this process with `<ai_jail> <jail_args>` on Unix (never returns
+/// on success); elsewhere, spawn it, wait, and exit with its status (also
+/// never returns). `ai_jail` is the path [`usable_ai_jail_here`] resolved,
+/// never a bare name re-resolved through `PATH`.
 #[cfg(unix)]
-fn reexec_under_ai_jail(jail_args: &[OsString]) -> Result<()> {
+fn reexec_under_ai_jail(ai_jail: &Path, jail_args: &[OsString]) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
-    let error = std::process::Command::new("ai-jail").args(jail_args).exec();
-    Err(anyhow!("{error}")).context("re-executing under ai-jail")
+    let error = std::process::Command::new(ai_jail).args(jail_args).exec();
+    Err(anyhow!("{error}")).with_context(|| format!("re-executing under {}", ai_jail.display()))
 }
 
 #[cfg(not(unix))]
-fn reexec_under_ai_jail(jail_args: &[OsString]) -> Result<()> {
-    let status = std::process::Command::new("ai-jail")
+fn reexec_under_ai_jail(ai_jail: &Path, jail_args: &[OsString]) -> Result<()> {
+    let status = std::process::Command::new(ai_jail)
         .args(jail_args)
         .status()
-        .context("spawning ai-jail")?;
+        .with_context(|| format!("spawning {}", ai_jail.display()))?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -1189,6 +1201,37 @@ fn remove_wrapper_yolo(args: &mut Vec<OsString>) -> bool {
     let before = args.len();
     args.retain(|arg| arg != OsStr::new("--yolo"));
     args.len() != before
+}
+
+fn remove_wrapper_true_yolo(args: &mut Vec<OsString>) -> bool {
+    let before = args.len();
+    args.retain(|arg| arg != OsStr::new("--true-yolo"));
+    args.len() != before
+}
+
+/// The effective permission modes for a launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct YoloModes {
+    /// Map the harness's dangerous-mode option, with the `--yolo` warning and
+    /// ai-jail offer.
+    yolo: bool,
+    /// Additionally apply Claude's `bypassPermissions` + residual-prompt
+    /// silencing (only acted on for the Claude harness).
+    claude_true_yolo: bool,
+}
+
+/// `--true-yolo` is a superset of `--yolo`: it requests yolo on every harness
+/// (where, outside Claude, it is simply interchangeable with `--yolo`) plus the
+/// Claude-only bypass, so passing both is redundant but harmless. The
+/// `claude_true_yolo` config key only upgrades a launch that is already yolo —
+/// it never turns an ordinary run into a permission-bypassing one without the
+/// `--yolo` warning.
+fn yolo_modes(yolo_flag: bool, true_yolo_flag: bool, config_true_yolo: bool) -> YoloModes {
+    let yolo = yolo_flag || true_yolo_flag;
+    YoloModes {
+        yolo,
+        claude_true_yolo: yolo && (true_yolo_flag || config_true_yolo),
+    }
 }
 
 fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
@@ -1859,14 +1902,119 @@ async fn finish_with_retry(
 async fn prepare_managed_run(
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
+    interactive: bool,
+    interrupted: &CancellationToken,
 ) -> Result<PrepareManagedRunResponse> {
-    prepare_managed_run_with_retry(
+    let result = prepare_managed_run_with_retry(
         endpoint,
         request,
         PREPARE_BUSY_RETRY_WINDOW,
         PREPARE_BUSY_RETRY_INTERVAL,
+        true,
+    )
+    .await;
+    match result {
+        // Scripts, hooks, and CI keep the short window: they must never hang
+        // silently for up to a full lease.
+        Err(error) if interactive => {
+            wait_out_held_lease(
+                endpoint,
+                request,
+                error,
+                interrupted,
+                HELD_LEASE_EXPIRY_SLACK,
+                PREPARE_BUSY_RETRY_WINDOW,
+            )
+            .await
+        }
+        other => other,
+    }
+}
+
+/// After the quick retry window, an interactive launch waits out a lease left
+/// behind by a launcher that could not release it (killed, terminal closed,
+/// sandbox torn down) instead of failing: the 409 names the lease's expiry, so
+/// wait for it to lapse and retry. A lease renewed meanwhile belongs to a
+/// launcher that is still running; that is reported, never waited on or taken
+/// over (the server's busy check stays the only arbiter of ownership).
+async fn wait_out_held_lease(
+    endpoint: &ServerEndpoint,
+    request: &PrepareManagedRunRequest,
+    error: anyhow::Error,
+    interrupted: &CancellationToken,
+    slack: Duration,
+    retry_window: Duration,
+) -> Result<PrepareManagedRunResponse> {
+    let Some(held) = held_lease(&error) else {
+        return Err(error);
+    };
+    let Some(wait) = held_lease_wait(held.expires, jiff::Timestamp::now(), slack) else {
+        return Err(error);
+    };
+    eprintln!(
+        "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
+         without releasing it. Waiting {}s for that lease to lapse (Ctrl-C to abort; \
+         `--new <name>` starts a separate workstream).",
+        held.owner,
+        held.expires,
+        wait.as_secs_f64().ceil()
+    );
+    tokio::select! {
+        biased;
+        () = interrupted.cancelled() => {
+            return Err(error.context("interrupted while waiting for the workstream lease to lapse"));
+        }
+        () = tokio::time::sleep(wait) => {}
+    }
+    match prepare_managed_run_with_retry(
+        endpoint,
+        request,
+        retry_window,
+        PREPARE_BUSY_RETRY_INTERVAL,
+        false,
     )
     .await
+    {
+        Err(retry) if held_lease(&retry).is_some() => Err(retry.context(
+            "the workstream is still held: its owner renewed the lease, so another launcher \
+             is running there; stop it, or pass `--new <name>` for a separate workstream",
+        )),
+        other => other,
+    }
+}
+
+/// The owner and expiry a busy `POST /workstream/runs` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldLease {
+    owner: String,
+    expires: jiff::Timestamp,
+}
+
+/// Parse the store's `workstream is already active: owned by <owner> until
+/// <rfc3339>` message. `None` for any other shape (e.g. an older server).
+fn parse_held_lease(message: &str) -> Option<HeldLease> {
+    let rest = message.strip_prefix("workstream is already active: owned by ")?;
+    let (owner, until) = rest.rsplit_once(" until ")?;
+    Some(HeldLease {
+        owner: owner.to_string(),
+        expires: until.trim().parse().ok()?,
+    })
+}
+
+fn held_lease(error: &anyhow::Error) -> Option<HeldLease> {
+    parse_held_lease(&active_workstream_conflict_message(error)?)
+}
+
+/// How long to wait for a held lease to lapse, or `None` when it expires
+/// further out than [`HELD_LEASE_MAX_WAIT`] (a renewing, live owner — or a
+/// badly skewed clock). An already-lapsed lease waits only the slack.
+fn held_lease_wait(
+    expires: jiff::Timestamp,
+    now: jiff::Timestamp,
+    slack: Duration,
+) -> Option<Duration> {
+    let remaining = Duration::try_from(expires.duration_since(now)).unwrap_or(Duration::ZERO);
+    (remaining <= HELD_LEASE_MAX_WAIT).then(|| remaining + slack)
 }
 
 async fn prepare_managed_run_with_retry(
@@ -1874,9 +2022,10 @@ async fn prepare_managed_run_with_retry(
     request: &PrepareManagedRunRequest,
     retry_window: Duration,
     retry_interval: Duration,
+    announce_wait: bool,
 ) -> Result<PrepareManagedRunResponse> {
     let deadline = tokio::time::Instant::now() + retry_window;
-    let mut reported_wait = false;
+    let mut reported_wait = !announce_wait;
     loop {
         match post_json(endpoint, "/workstream/runs", request).await {
             Ok(response) => return Ok(response),
@@ -1898,16 +2047,20 @@ async fn prepare_managed_run_with_retry(
 }
 
 fn is_active_workstream_conflict(error: &anyhow::Error) -> bool {
-    let Some(response) = error.downcast_ref::<ServerResponseError>() else {
-        return false;
-    };
+    active_workstream_conflict_message(error).is_some()
+}
+
+fn active_workstream_conflict_message(error: &anyhow::Error) -> Option<String> {
+    let response = error.downcast_ref::<ServerResponseError>()?;
     if response.status() != reqwest::StatusCode::CONFLICT {
-        return false;
+        return None;
     }
     serde_json::from_str::<serde_json::Value>(response.body())
-        .ok()
-        .and_then(|body| body.get("error")?.as_str().map(str::to_owned))
-        .is_some_and(|message| message.starts_with("workstream is already active:"))
+        .ok()?
+        .get("error")?
+        .as_str()
+        .filter(|message| message.starts_with("workstream is already active:"))
+        .map(str::to_owned)
 }
 
 async fn post_empty_with_retry(endpoint: &ServerEndpoint, path: &str, label: &str) -> Result<()> {
@@ -2436,12 +2589,209 @@ mod tests {
             // path stays a few milliseconds.
             Duration::from_secs(5),
             Duration::from_millis(1),
+            true,
         )
         .await
         .unwrap();
 
         assert_eq!(prepared.workstream_name, "default");
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[test]
+    fn held_lease_parses_the_store_busy_message() {
+        let held = parse_held_lease(
+            "workstream is already active: owned by ai-sandbox:2 until 2026-10-01T04:28:44.647329Z",
+        )
+        .expect("current store format parses");
+        assert_eq!(held.owner, "ai-sandbox:2");
+        assert_eq!(
+            held.expires,
+            "2026-10-01T04:28:44.647329Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+        );
+        // An older server's message carries no expiry: nothing to wait on.
+        assert_eq!(
+            parse_held_lease("workstream is already active: owned by workstation:42"),
+            None
+        );
+        assert_eq!(parse_held_lease("some other conflict"), None);
+    }
+
+    #[test]
+    fn held_lease_wait_is_bounded_by_one_lease() {
+        let now = "2026-10-01T04:00:00Z".parse::<jiff::Timestamp>().unwrap();
+        let at = |secs: i64| now + jiff::SignedDuration::from_secs(secs);
+        let slack = Duration::from_secs(1);
+        assert_eq!(
+            held_lease_wait(at(30), now, slack),
+            Some(Duration::from_secs(31))
+        );
+        // Already lapsed: retry right after the slack.
+        assert_eq!(held_lease_wait(at(-5), now, slack), Some(slack));
+        // Further out than one lease means a renewing (live) owner.
+        assert_eq!(held_lease_wait(at(600), now, slack), None);
+    }
+
+    fn held_lease_server(
+        conflicts: usize,
+        lease: Duration,
+    ) -> (Router, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) < conflicts {
+                        let until = jiff::Timestamp::now()
+                            + jiff::SignedDuration::try_from(lease).unwrap();
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": format!(
+                                    "workstream is already active: owned by ai-sandbox:2 until {until}"
+                                )
+                            })),
+                        )
+                            .into_response();
+                    }
+                    axum::Json(PrepareManagedRunResponse {
+                        workstream_id: WorkstreamId::new(),
+                        workstream_name: "default".into(),
+                        run_id: ManagedRunId::new(),
+                        resolved_agent: Some(AgentKind::ClaudeCode),
+                        native_session_id: None,
+                        source_cursor: None,
+                        sync_after: 0,
+                        sync_through: 0,
+                        may_adopt_existing_session: false,
+                    })
+                    .into_response()
+                }
+            }),
+        );
+        (app, attempts)
+    }
+
+    fn held_lease_request() -> PrepareManagedRunRequest {
+        PrepareManagedRunRequest {
+            workspace: "default".into(),
+            project: "project".into(),
+            cwd: "/tmp/project".into(),
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            agent: AgentKind::ClaudeCode,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            workstream: None,
+            new_workstream: None,
+            lease_owner: "workstation:43".into(),
+        }
+    }
+
+    async fn serve(app: Router) -> (ServerEndpoint, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ServerEndpoint::from_pair(Some(format!("http://{address}")), None),
+            server,
+        )
+    }
+
+    /// The Ctrl-C-then-relaunch case: a lease left behind by a launcher that
+    /// could not release it is waited out, then the launch proceeds by itself.
+    #[tokio::test]
+    async fn interactive_launch_waits_out_a_lapsing_lease_then_proceeds() {
+        let (app, attempts) = held_lease_server(1, Duration::from_millis(300));
+        let (endpoint, server) = serve(app).await;
+        let request = held_lease_request();
+        let first =
+            post_json::<_, PrepareManagedRunResponse>(&endpoint, "/workstream/runs", &request)
+                .await
+                .expect_err("the first attempt sees the held lease");
+        let started = std::time::Instant::now();
+        let prepared = wait_out_held_lease(
+            &endpoint,
+            &request,
+            first,
+            &CancellationToken::new(),
+            Duration::ZERO,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("proceeds once the lease lapsed");
+        assert_eq!(prepared.workstream_name, "default");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "it waited for the expiry"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    /// Adversarial: a live owner keeps renewing. The waiter must report it, not
+    /// loop forever and never take the lease.
+    #[tokio::test]
+    async fn a_renewed_lease_is_reported_as_a_live_owner_not_taken_over() {
+        let (app, _) = held_lease_server(usize::MAX, Duration::from_millis(150));
+        let (endpoint, server) = serve(app).await;
+        let request = held_lease_request();
+        let first =
+            post_json::<_, PrepareManagedRunResponse>(&endpoint, "/workstream/runs", &request)
+                .await
+                .expect_err("held");
+        let error = wait_out_held_lease(
+            &endpoint,
+            &request,
+            first,
+            &CancellationToken::new(),
+            Duration::ZERO,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("a renewing owner is never displaced");
+        assert!(
+            format!("{error:#}").contains("renewed the lease"),
+            "{error:#}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_aborts_the_held_lease_wait_immediately() {
+        let (app, attempts) = held_lease_server(1, Duration::from_secs(60));
+        let (endpoint, server) = serve(app).await;
+        let request = held_lease_request();
+        let first =
+            post_json::<_, PrepareManagedRunResponse>(&endpoint, "/workstream/runs", &request)
+                .await
+                .expect_err("held");
+        let interrupted = CancellationToken::new();
+        interrupted.cancel();
+        let started = std::time::Instant::now();
+        let error = wait_out_held_lease(
+            &endpoint,
+            &request,
+            first,
+            &interrupted,
+            Duration::ZERO,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("interrupted");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(format!("{error:#}").contains("interrupted"), "{error:#}");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no retry after Ctrl-C"
+        );
         server.abort();
     }
 
@@ -2792,6 +3142,105 @@ mod tests {
             .to_vec();
         assert!(remove_wrapper_yolo(&mut args));
         assert_eq!(args, ["resume", "native-id"].map(OsString::from));
+    }
+
+    /// Right after the harness, clap parses the wrapper flags itself; once a
+    /// native argument starts, trailing_var_arg swallows everything after it
+    /// into `native_args`. `--yolo` was stripped from there, but a swallowed
+    /// `--true-yolo` was forwarded to Claude as an unknown option and the
+    /// bypass never applied. Both positions must yield the wrapper flag.
+    #[test]
+    fn true_yolo_is_a_wrapper_flag_in_either_position() {
+        let parse = |argv: &[&str]| {
+            let CliCommand::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("expected run command");
+            };
+            args
+        };
+
+        let direct = parse(&[
+            "ai-memory",
+            "run",
+            "claude",
+            "--yolo",
+            "--true-yolo",
+            "--model",
+            "opus",
+        ]);
+        assert!(direct.yolo && direct.true_yolo);
+        assert_eq!(direct.native_args, ["--model", "opus"].map(OsString::from));
+
+        let swallowed = parse(&[
+            "ai-memory",
+            "run",
+            "claude",
+            "--model",
+            "opus",
+            "--true-yolo",
+        ]);
+        assert!(
+            !swallowed.true_yolo,
+            "clap leaves it in the native argv here"
+        );
+        let mut native = swallowed.native_args;
+        assert!(remove_wrapper_true_yolo(&mut native));
+        assert_eq!(native, ["--model", "opus"].map(OsString::from));
+    }
+
+    #[test]
+    fn true_yolo_flag_implies_yolo_on_every_harness() {
+        assert_eq!(
+            yolo_modes(false, true, false),
+            YoloModes {
+                yolo: true,
+                claude_true_yolo: true
+            },
+            "--true-yolo alone must still warn/offer ai-jail and map the harness's yolo"
+        );
+        // Both together are redundant, never an error or a different result.
+        assert_eq!(
+            yolo_modes(true, true, false),
+            yolo_modes(false, true, false)
+        );
+    }
+
+    #[test]
+    fn plain_yolo_does_not_bypass_claude_permissions_by_itself() {
+        assert_eq!(
+            yolo_modes(true, false, false),
+            YoloModes {
+                yolo: true,
+                claude_true_yolo: false
+            }
+        );
+        assert_eq!(
+            yolo_modes(false, false, false),
+            YoloModes {
+                yolo: false,
+                claude_true_yolo: false
+            }
+        );
+    }
+
+    /// The config key upgrades a yolo launch, but alone must never turn an
+    /// ordinary managed run into a `bypassPermissions` one with no `--yolo`
+    /// warning (it previously did).
+    #[test]
+    fn claude_true_yolo_config_only_upgrades_a_yolo_launch() {
+        assert_eq!(
+            yolo_modes(false, false, true),
+            YoloModes {
+                yolo: false,
+                claude_true_yolo: false
+            }
+        );
+        assert_eq!(
+            yolo_modes(true, false, true),
+            YoloModes {
+                yolo: true,
+                claude_true_yolo: true
+            }
+        );
     }
 
     #[test]

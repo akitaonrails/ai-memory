@@ -407,15 +407,14 @@ pub struct Config {
     /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
     pub run_autowire: bool,
     /// Off by default. When true, a Claude `ai-memory run --yolo` additionally
-    /// applies [`apply_claude_true_yolo`](ai_memory_workstream::apply_claude_true_yolo):
-    /// it disables the residual `rm`-prompt env vars and injects
-    /// `--settings` forcing `bypassPermissions`, so Claude Code stops
-    /// pausing even under `--dangerously-skip-permissions`. No-op for every
-    /// other harness. Best paired with ai-jail (see
-    /// `docs/design-yolo-safety-ai-jail.md`), since it does not widen a
-    /// user's own `deny`/`ask` rules. Set with `AI_MEMORY_CLAUDE_TRUE_YOLO=true`
-    /// or `claude_true_yolo = true` in config.toml; overridden per launch by
-    /// `ai-memory run --true-yolo`.
+    /// applies [`apply_claude_true_yolo`](ai_memory_workstream::apply_claude_true_yolo),
+    /// injecting `--settings` that forces `bypassPermissions` over any
+    /// settings `defaultMode`. It never turns a launch without `--yolo` into a
+    /// bypassing one, and it cannot silence the user's own `ask` rules, which
+    /// Claude Code enforces in every mode. No-op for every other harness. Best
+    /// paired with ai-jail (see `docs/design-yolo-safety-ai-jail.md`). Set with
+    /// `AI_MEMORY_CLAUDE_TRUE_YOLO=true` or `claude_true_yolo = true` in
+    /// config.toml; `ai-memory run --true-yolo` requests it per launch.
     pub claude_true_yolo: bool,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"

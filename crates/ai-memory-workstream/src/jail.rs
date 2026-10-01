@@ -28,32 +28,52 @@ pub const FORWARDED_ENV_NAMES: &[&str] = &[
     "OPENROUTER_API_KEY",
 ];
 
-/// Whether `ai-jail` resolves through a `which`-style lookup. `lookup` is
-/// injected so the resolution logic (PATH, `~/.local/bin`) is exercised by
-/// [`ai_jail_on_path`] while this stays a pure predicate for tests.
+/// The ai-jail binary the `--yolo` offer may re-exec under, or `None` when
+/// the offer must not be shown at all (docs/design-yolo-safety-ai-jail.md §2).
+///
+/// The offer is only made when accepting it can succeed: ai-jail does not
+/// support Windows, and on Linux/macOS it cannot start without its sandbox
+/// backend (`bwrap` / `sandbox-exec`). Accepting an offer that then fails
+/// would cancel the already-prepared managed run for nothing. The returned
+/// path is the one to exec, so the re-exec can never resolve a different —
+/// or missing — binary than the one this check found. `lookup` is injected
+/// so every OS branch is unit-tested without a real `PATH`.
 #[must_use]
-pub fn ai_jail_installed(lookup: impl Fn(&str) -> Option<PathBuf>) -> bool {
-    lookup("ai-jail").is_some()
+pub fn usable_ai_jail(os: JailOs, lookup: impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
+    let backend = match os {
+        JailOs::Linux => "bwrap",
+        JailOs::MacOs => "sandbox-exec",
+        JailOs::Windows => return None,
+    };
+    lookup(backend)?;
+    lookup("ai-jail")
 }
 
-/// Real `ai-jail` lookup: `PATH`, falling back to `~/.local/bin/ai-jail`
-/// (ai-jail's own documented install location when it is not on `PATH`).
+/// [`usable_ai_jail`] for this host: the backend on `PATH`, and ai-jail on
+/// `PATH` falling back to `~/.local/bin/ai-jail` (ai-jail's own documented
+/// install location when that directory is not on `PATH`).
 #[must_use]
-pub fn ai_jail_on_path() -> bool {
-    ai_jail_installed(resolve_ai_jail)
+pub fn usable_ai_jail_here() -> Option<PathBuf> {
+    usable_ai_jail(current_jail_os(), |name| match find_on_path(name) {
+        Some(path) => Some(path),
+        None if name == "ai-jail" => home_local_bin_ai_jail(),
+        None => None,
+    })
 }
 
-fn resolve_ai_jail(name: &str) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn home_local_bin_ai_jail() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let candidate = PathBuf::from(home).join(".local").join("bin").join(name);
+    let candidate = PathBuf::from(home)
+        .join(".local")
+        .join("bin")
+        .join("ai-jail");
     is_executable_file(&candidate).then_some(candidate)
 }
 
@@ -156,8 +176,15 @@ fn read_linux_hostname() -> Option<String> {
 
 /// Build the argument vector for `ai-jail` (excluding the `ai-jail` program
 /// name itself): `--network`, an optional bare `--agent-state` toggle, one
-/// `--env NAME` per already-filtered present name, then the wrapped
-/// executable and its forwarded arguments in order.
+/// `--env NAME` per already-filtered present name, a `--` separator, then the
+/// wrapped executable and its forwarded arguments in order.
+///
+/// The `--` is required, not cosmetic. ai-jail refuses one of its own flags
+/// appearing after the command (it cannot tell whether
+/// `ai-jail cmd --network` means the sandbox or the child), and `ai-memory
+/// run` shares flag names with ai-jail — a forwarded `run claude --env
+/// GH_TOKEN=…` was rejected outright. After `--`, ai-jail passes everything
+/// to the wrapped command verbatim.
 ///
 /// `--agent-state` is a boolean toggle in ai-jail (`--agent-state` /
 /// `--no-agent-state`), not a valued flag — it persists the harness's own
@@ -181,6 +208,7 @@ pub fn build_ai_jail_invocation(
         argv.push(OsString::from("--env"));
         argv.push(OsString::from(*name));
     }
+    argv.push(OsString::from("--"));
     argv.push(exe.as_os_str().to_os_string());
     argv.extend(forwarded_args.iter().cloned());
     argv
@@ -197,16 +225,75 @@ mod tests {
     }
 
     #[test]
-    fn ai_jail_installed_true_when_lookup_resolves() {
-        assert!(ai_jail_installed(|name| {
-            assert_eq!(name, "ai-jail");
-            Some(PathBuf::from("/usr/bin/ai-jail"))
-        }));
+    fn usable_ai_jail_returns_the_resolved_binary_with_its_backend() {
+        let found = |names: &'static [&'static str]| {
+            move |name: &str| {
+                names
+                    .contains(&name)
+                    .then(|| PathBuf::from(format!("/opt/bin/{name}")))
+            }
+        };
+        assert_eq!(
+            usable_ai_jail(JailOs::Linux, found(&["ai-jail", "bwrap"])),
+            Some(PathBuf::from("/opt/bin/ai-jail"))
+        );
+        assert_eq!(
+            usable_ai_jail(JailOs::MacOs, found(&["ai-jail", "sandbox-exec"])),
+            Some(PathBuf::from("/opt/bin/ai-jail"))
+        );
     }
 
     #[test]
-    fn ai_jail_installed_false_when_lookup_misses() {
-        assert!(!ai_jail_installed(|_| None));
+    fn usable_ai_jail_is_none_when_ai_jail_is_missing() {
+        assert_eq!(
+            usable_ai_jail(JailOs::Linux, |name| {
+                (name == "bwrap").then(|| PathBuf::from("/usr/bin/bwrap"))
+            }),
+            None
+        );
+    }
+
+    /// ai-jail present but its sandbox backend absent: accepting the offer
+    /// would cancel the prepared run and then fail, so it is not offered.
+    #[test]
+    fn usable_ai_jail_is_none_without_the_os_sandbox_backend() {
+        let only_ai_jail =
+            |name: &str| (name == "ai-jail").then(|| PathBuf::from("/usr/bin/ai-jail"));
+        assert_eq!(usable_ai_jail(JailOs::Linux, only_ai_jail), None);
+        assert_eq!(usable_ai_jail(JailOs::MacOs, only_ai_jail), None);
+        // The other OS's backend does not count.
+        let linux_backend_on_macos = |name: &str| {
+            matches!(name, "ai-jail" | "bwrap").then(|| PathBuf::from(format!("/usr/bin/{name}")))
+        };
+        assert_eq!(usable_ai_jail(JailOs::MacOs, linux_backend_on_macos), None);
+    }
+
+    /// ai-jail is unsupported on Windows: even a file named `ai-jail` on PATH
+    /// (a Git-Bash or WSL shim) must not produce the offer, and the lookup is
+    /// never consulted.
+    #[test]
+    fn usable_ai_jail_is_never_offered_on_windows() {
+        assert_eq!(
+            usable_ai_jail(JailOs::Windows, |name| {
+                panic!("Windows must not look up {name}")
+            }),
+            None
+        );
+    }
+
+    /// The returned path is the exec target, so a binary found only through
+    /// the `~/.local/bin` fallback is exec'd from there rather than re-resolved
+    /// through `PATH` (where it would not be found).
+    #[test]
+    fn usable_ai_jail_returns_the_exact_lookup_path_to_exec() {
+        let fallback = PathBuf::from("/home/dev/.local/bin/ai-jail");
+        let expected = fallback.clone();
+        let found = usable_ai_jail(JailOs::Linux, move |name| match name {
+            "bwrap" => Some(PathBuf::from("/usr/bin/bwrap")),
+            "ai-jail" => Some(fallback.clone()),
+            _ => None,
+        });
+        assert_eq!(found, Some(expected));
     }
 
     #[test]
@@ -273,6 +360,7 @@ mod tests {
                 "AI_MEMORY_SERVER_URL",
                 "--env",
                 "ANTHROPIC_API_KEY",
+                "--",
                 "/usr/local/bin/ai-memory",
                 "run",
                 "claude",
@@ -285,7 +373,10 @@ mod tests {
     fn build_ai_jail_invocation_omits_agent_state_when_none() {
         let exe = Path::new("/usr/local/bin/ai-memory");
         let argv = build_ai_jail_invocation(exe, &[], &[], false);
-        assert_eq!(strings(&argv), ["--network", "/usr/local/bin/ai-memory"]);
+        assert_eq!(
+            strings(&argv),
+            ["--network", "--", "/usr/local/bin/ai-memory"]
+        );
     }
 
     #[test]
@@ -294,7 +385,49 @@ mod tests {
         let argv = build_ai_jail_invocation(exe, &[], &["CLAUDE_CONFIG_DIR"], false);
         assert_eq!(
             strings(&argv),
-            ["--network", "--env", "CLAUDE_CONFIG_DIR", "/bin/ai-memory"]
+            [
+                "--network",
+                "--env",
+                "CLAUDE_CONFIG_DIR",
+                "--",
+                "/bin/ai-memory"
+            ]
         );
+    }
+
+    /// Regression: forwarded `run` flags that share a name with ai-jail's own
+    /// (`--env`, `--network`) must land after the `--` separator, where ai-jail
+    /// passes them to the wrapped command instead of rejecting them.
+    #[test]
+    fn build_ai_jail_invocation_places_colliding_child_flags_after_separator() {
+        let exe = Path::new("/bin/ai-memory");
+        let forwarded = [
+            "run",
+            "claude",
+            "--yolo",
+            "--env",
+            "GH_TOKEN=placeholder",
+            "--network",
+        ]
+        .map(OsString::from);
+        let argv = strings(&build_ai_jail_invocation(exe, &forwarded, &[], true));
+        let separator = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("separator present");
+        assert_eq!(argv[separator + 1], "/bin/ai-memory");
+        assert_eq!(
+            &argv[separator + 2..],
+            [
+                "run",
+                "claude",
+                "--yolo",
+                "--env",
+                "GH_TOKEN=placeholder",
+                "--network"
+            ]
+        );
+        // Before the separator, only ai-memory's own sandbox flags appear.
+        assert_eq!(&argv[..separator], ["--network", "--agent-state"]);
     }
 }
