@@ -46,15 +46,10 @@ pub struct GitAdapter {
 /// (tree cache included) survives them. `Index` itself is not `Send`.
 struct Open {
     repo: Repository,
-    commits_since_index_write: u32,
     /// HEAD as this adapter last left it; moved by another writer, the
     /// kept index is re-read and the next commit walks.
     head: Option<git2::Oid>,
 }
-
-/// The index file is written after a walk and every this many
-/// path-scoped commits.
-const INDEX_WRITE_EVERY: u32 = 50;
 
 #[derive(Debug, Default)]
 struct Written {
@@ -230,11 +225,7 @@ impl GitAdapter {
         let mut slot = self.commit_lock.lock().unwrap_or_else(|e| e.into_inner());
         if slot.is_none() {
             let repo = Repository::open(&self.root).map_err(CommitGit2Error::Open)?;
-            *slot = Some(Open {
-                repo,
-                commits_since_index_write: 0,
-                head: None,
-            });
+            *slot = Some(Open { repo, head: None });
         }
         let open = slot.as_mut().expect("opened above");
         let head_now = open.repo.head().ok().and_then(|h| h.target());
@@ -332,11 +323,7 @@ impl GitAdapter {
         message: &str,
         staging: &Staging,
     ) -> Result<Option<git2::Oid>, CommitGit2Error> {
-        let Open {
-            repo,
-            commits_since_index_write,
-            ..
-        } = open;
+        let Open { repo, .. } = open;
         let mut index = repo.index().map_err(CommitGit2Error::Other)?;
         // Stage through libgit2's stat cache: an entry whose size and mtime
         // are unchanged keeps its cached blob OID and is not re-read, so a
@@ -356,19 +343,18 @@ impl GitAdapter {
                 stage_paths(&self.root, &mut index, paths).map_err(CommitGit2Error::Other)?
             }
         };
-        // The index file is the stat cache across restarts; serializing it
-        // costs the size of the tree, so not per commit.
-        let write_index = match staging {
-            Staging::Everything => true,
-            Staging::Paths(_) => {
-                *commits_since_index_write += 1;
-                *commits_since_index_write >= INDEX_WRITE_EVERY
-            }
-        };
-        if write_index {
-            index.write().map_err(CommitGit2Error::Other)?;
-            *commits_since_index_write = 0;
-        }
+        // The on-disk index is this repository's public state: any other
+        // process (a plain `git status`, a teammate's editor) reads it, not
+        // libgit2's in-memory copy. `write_tree`/`commit` below advance HEAD
+        // from the in-memory index regardless, so deferring this write ever
+        // let a successful checkpoint leave the disk index at an older tree
+        // than HEAD -- reported externally as a false `MM` (harness-issue
+        // #983, reproduced on native Windows). Serializing costs the size of
+        // the tracked tree, so it is not free, but a checkpoint that reports
+        // success must leave every on-disk view consistent; a `Staging::Everything`
+        // walk already paid this cost unconditionally, so this only removes
+        // the up-to-49-commit gap that existed for the path-scoped branch.
+        index.write().map_err(CommitGit2Error::Other)?;
         debug!(
             touched,
             walked = matches!(staging, Staging::Everything),
@@ -1357,30 +1343,66 @@ mod tests {
         assert!(head_blob(&adapter, "d/y.md").is_none());
     }
 
+    /// What a fresh, independent `git2::Repository` handle sees -- the same
+    /// thing a separate `git status` process would see. Used to prove a
+    /// checkpoint left the on-disk index consistent with `HEAD`, rather than
+    /// trusting the adapter's own kept, possibly-stale-on-disk-only view.
+    fn disk_index_matches_head_and_is_clean(root: &Path) -> bool {
+        let repo = Repository::open(root).unwrap();
+        let Some(head_oid) = repo.head().ok().and_then(|h| h.target()) else {
+            return false;
+        };
+        let head_tree = repo.find_commit(head_oid).unwrap().tree_id();
+        let disk_tree = repo.index().unwrap().write_tree().unwrap();
+        disk_tree == head_tree && repo.statuses(None).unwrap().is_empty()
+    }
+
+    /// harness-issue #983: a path-scoped commit deferred the on-disk index
+    /// write for up to 49 more commits, so a successful checkpoint could
+    /// report a new `HEAD` while a separate `git status` still saw the old
+    /// tree (`MM`). The index must now be written every time, before either
+    /// the no-op comparison or a real commit returns.
     #[test]
-    fn the_index_file_is_written_after_a_walk_and_every_fifty_commits() {
+    fn a_path_scoped_commit_persists_the_disk_index_immediately() {
         let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
-        let index_file = root.join(".git/index");
-        let after_walk = std::fs::read(&index_file).unwrap();
-        for i in 1..=INDEX_WRITE_EVERY {
-            let rel = format!("n-{i}.md");
-            write(&root, &rel, "n");
-            adapter.mark_written(Path::new(&rel));
-            assert!(adapter.commit_all(&rel).unwrap().is_some());
-            let now = std::fs::read(&index_file).unwrap();
-            if i < INDEX_WRITE_EVERY {
-                assert_eq!(now, after_walk, "commit {i} wrote the index file");
-            } else {
-                assert_ne!(now, after_walk, "commit {i} did not write the index file");
-            }
-        }
-        let before_walk = std::fs::read(&index_file).unwrap();
-        write(&root, "b.md", "b");
-        adapter.mark_written(Path::new("b.md"));
-        adapter.age_last_walk();
-        assert!(adapter.commit_all("sweep").unwrap().is_some());
-        assert_ne!(std::fs::read(&index_file).unwrap(), before_walk);
-        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b"));
+        write(&root, "a.md", "a2");
+        adapter.mark_written(Path::new("a.md"));
+        assert!(adapter.commit_all("a2").unwrap().is_some());
+
+        assert!(
+            disk_index_matches_head_and_is_clean(&root),
+            "disk index lagged behind HEAD after one path-scoped commit"
+        );
+    }
+
+    /// The no-op path is exactly where the old code returned success without
+    /// ever reaching the (gated) index write: a stale on-disk index from
+    /// before the fix must still be resynchronized before `Ok(None)`.
+    #[test]
+    fn a_path_scoped_no_op_resynchronizes_a_stale_disk_index() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "a")]);
+        let index_path = root.join(".git/index");
+        let stale_index = std::fs::read(&index_path).unwrap();
+
+        write(&root, "a.md", "a2");
+        adapter.mark_written(Path::new("a.md"));
+        assert!(adapter.commit_all("a2").unwrap().is_some());
+
+        // Simulate the pre-fix world: the disk index still names the tree
+        // from before this commit, even though HEAD and the working tree
+        // already moved on. The adapter's own kept index is untouched by
+        // this -- it never re-reads the disk file behind its own back.
+        std::fs::write(&index_path, &stale_index).unwrap();
+
+        // Nothing changed since the last commit, so this call takes the
+        // no-op path -- exactly the path that must still flush the index.
+        adapter.mark_written(Path::new("a.md"));
+        assert_eq!(adapter.commit_all("no-op").unwrap(), None);
+
+        assert!(
+            disk_index_matches_head_and_is_clean(&root),
+            "a no-op checkpoint left the disk index stale"
+        );
     }
 
     #[test]
