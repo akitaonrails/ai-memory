@@ -1,7 +1,6 @@
 # Design proposal: offer, don't claim, at session start (#959)
 
-**Status: accepted design (maintainer review folded in, 2026-10-01). Option 1
-is implemented on `release/2.6`; options 2 and 3 remain follow-up work.** The
+**Status: accepted design (maintainer review folded in, 2026-10-01). Options 1, 2, and 3 are implemented on `release/2.6`.** The
 maintainer marked #959 design-first: it touches the single-claim contract (invariant #16 — a handoff
 is claimed exactly once by two independent `state='open'` guards) in several
 places at once, so this is the design pass requested before any code lands.

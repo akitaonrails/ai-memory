@@ -269,7 +269,8 @@ context, answer from it instead of claiming another handoff.\n\
   when leaving a handoff for a named sibling workspace/project. \
   Handoffs belong to their creator by default; pass \
   `shared=true` only when the user explicitly wants any operator in the \
-  project to receive it.\n\
+  project to receive it. Pass `to_agent` (e.g. 'codex', 'claude-code') \
+  to direct the handoff to a specific agent harness.\n\
 - `memory_handoff_cancel` — when you realize you mistakenly called \
   `memory_handoff_begin`, or the user explicitly asks to discard a \
   pending handoff. Requires the exact `handoff_id` from the begin call \
@@ -1202,6 +1203,12 @@ struct HandoffBeginArgs {
     /// project up next.
     #[serde(default)]
     shared: Option<bool>,
+    /// Optional target agent CLI for which this handoff is intended (e.g. `codex`,
+    /// `claude-code`, `gemini-cli`). When set, other agents will ignore this
+    /// handoff during startup offer and implicit accept, allowing direct
+    /// baton passing across different agent harnesses.
+    #[serde(default)]
+    to_agent: Option<String>,
     /// Project to scope the handoff to. Session-aware clients may omit it for
     /// the current project. Static MCP clients must pass it together with
     /// `workspace` for every project-scoped call. When set to a name that
@@ -4504,6 +4511,8 @@ impl AiMemoryServer {
         By default the handoff BELONGS TO YOU: on a server shared by several \
         operators, a teammate's session will not consume it. Pass \
         `shared: true` to hand the baton to whoever opens the project next. \
+        Pass `to_agent` (e.g. `\"codex\"`, `\"claude-code\"`) to direct the \
+        handoff to a specific agent harness; other agents will ignore it. \
         `cwd` is recorded for reference; it does not restrict who receives a \
         handoff created here."
     )]
@@ -4554,6 +4563,17 @@ impl AiMemoryServer {
             "handoff files_touched",
         );
         let creator = crate::actor::actor_from_parts(&parts);
+        let from_agent = creator
+            .agent
+            .as_deref()
+            .map(AgentKind::from_wire)
+            .unwrap_or(AgentKind::Other);
+        let to_agent = args
+            .to_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(AgentKind::from_wire);
         let owner_user = if args.shared.unwrap_or(false) {
             None
         } else {
@@ -4567,8 +4587,8 @@ impl AiMemoryServer {
             workspace_id: ws,
             project_id: proj,
             from_session_id: None,
-            from_agent: AgentKind::Other,
-            to_agent: None,
+            from_agent,
+            to_agent,
             cwd: args.cwd.map(std::path::PathBuf::from),
             summary: cap_text_with_marker(
                 &s.scrub(&args.summary),
@@ -4711,9 +4731,9 @@ impl AiMemoryServer {
                 Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        let actor_user = crate::actor::actor_from_parts(&parts)
-            .identity_key()
-            .map(|key| key.storage_key());
+        let caller = crate::actor::actor_from_parts(&parts);
+        let caller_agent = caller.agent.as_deref().map(AgentKind::from_wire);
+        let actor_user = caller.identity_key().map(|key| key.storage_key());
         let owner_filter = if args.any_owner.unwrap_or(false) {
             // Reading another operator's baton consumes it and hands over text
             // synthesised from their prompts, so this opt-out is an operator
@@ -4746,7 +4766,13 @@ impl AiMemoryServer {
                 .filter(|h| h.lifecycle.state == HandoffState::Open)
         } else {
             self.reader
-                .latest_open_handoff(ws, proj, receiving_cwd.clone(), owner_filter.clone())
+                .latest_open_handoff_for_agent(
+                    ws,
+                    proj,
+                    receiving_cwd.clone(),
+                    owner_filter.clone(),
+                    caller_agent,
+                )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
@@ -4781,7 +4807,7 @@ impl AiMemoryServer {
                         handoff_id: h.scope.id,
                         workspace_id: ws,
                         project_id: proj,
-                        accepting_agent: AgentKind::Other,
+                        accepting_agent: caller_agent.unwrap_or(AgentKind::Other),
                         accepting_session: None,
                         accepting_user: actor_user.clone(),
                         owner_filter: owner_filter.clone(),
@@ -13427,9 +13453,10 @@ mod tests {
                     next_steps: vec![],
                     files_touched: vec![],
                     cwd: Some(r"C:\GIT\ai-memory".into()),
+                    shared: None,
+                    to_agent: None,
                     project: None,
                     workspace: None,
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13471,9 +13498,10 @@ mod tests {
                     next_steps: vec!["finish supersession path".into()],
                     files_touched: vec!["crates/ai-memory-store/src/writer.rs".into()],
                     cwd: Some("/tmp/aim".into()),
+                    shared: None,
+                    to_agent: None,
                     project: None,
                     workspace: None,
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13551,9 +13579,10 @@ mod tests {
                     next_steps: vec![],
                     files_touched: vec![],
                     cwd: Some("/tmp/aim-wire".into()),
+                    shared: None,
+                    to_agent: None,
                     project: None,
                     workspace: None,
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13628,9 +13657,10 @@ mod tests {
                     next_steps: vec!["n".repeat(HANDOFF_ITEM_MAX_CHARS + 20)],
                     files_touched: vec!["f".repeat(HANDOFF_FILE_MAX_CHARS + 20)],
                     cwd: Some("/tmp/aim".into()),
+                    shared: None,
+                    to_agent: None,
                     project: None,
                     workspace: None,
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13675,9 +13705,10 @@ mod tests {
                     next_steps: vec![],
                     files_touched: vec![],
                     cwd: Some("/tmp/aim".into()),
+                    shared: None,
+                    to_agent: None,
                     project: None,
                     workspace: None,
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13737,9 +13768,10 @@ mod tests {
                     next_steps: vec![],
                     files_touched: vec![],
                     cwd: None,
+                    shared: None,
+                    to_agent: None,
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13818,9 +13850,10 @@ mod tests {
                     next_steps: vec!["claim by id".into()],
                     files_touched: vec!["crates/ai-memory-mcp/src/server.rs".into()],
                     cwd: None,
+                    shared: None,
+                    to_agent: None,
                     project: None,
                     workspace: None,
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13926,9 +13959,10 @@ mod tests {
                     next_steps: vec![],
                     files_touched: vec![],
                     cwd: None,
+                    shared: None,
+                    to_agent: None,
                     project: None,
                     workspace: None,
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -13942,9 +13976,10 @@ mod tests {
                     next_steps: vec![],
                     files_touched: vec![],
                     cwd: None,
+                    shared: None,
+                    to_agent: None,
                     project: None,
                     workspace: None,
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -14157,9 +14192,10 @@ mod tests {
                     next_steps: vec![],
                     files_touched: vec![],
                     cwd: Some("/tmp/aim".into()),
+                    shared: None,
+                    to_agent: None,
                     project: None,
                     workspace: None,
-                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

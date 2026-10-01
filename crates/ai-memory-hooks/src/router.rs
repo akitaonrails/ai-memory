@@ -1480,6 +1480,7 @@ async fn fetch_and_accept_handoff_at(
             query.cwd.clone(),
             owner_filter.clone(),
             busy_since,
+            Some(agent),
         )
         .await?;
     let handoff_md = handoff.as_ref().map(render_handoff_markdown);
@@ -1664,8 +1665,12 @@ fn render_handoff_notice(h: &Handoff, now: jiff::Timestamp) -> String {
         .saturating_sub(h.lifecycle.created_at.as_millisecond())
         .max(0)
         / 1_000;
+    let target_clause = match &h.origin.to_agent {
+        Some(agent) => format!(" for `{}`", agent.as_str()),
+        None => String::new(),
+    };
     format!(
-        "📬 ai-memory: a pending handoff `{id}` from `{from}`, left {age} ago. \
+        "📬 ai-memory: a pending handoff `{id}` from `{from}`{target_clause}, left {age} ago. \
          To pick it up, call `memory_handoff_accept` with handoff_id `{id}`.",
         id = h.scope.id,
         from = h.origin.from_agent.as_str(),
@@ -4223,6 +4228,49 @@ mod tests {
             notice.contains(&id.to_string()),
             "accept instructions must name this exact id"
         );
+    }
+
+    #[test]
+    fn handoff_notice_includes_target_agent_when_present() {
+        let id = ai_memory_core::HandoffId::new();
+        let created_at = jiff::Timestamp::UNIX_EPOCH;
+        let handoff = Handoff {
+            scope: ai_memory_core::HandoffScope {
+                id,
+                workspace_id: WorkspaceId::new(),
+                project_id: ProjectId::new(),
+            },
+            origin: ai_memory_core::HandoffOrigin {
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: Some(AgentKind::Codex),
+                cwd: None,
+                owner_user: None,
+            },
+            content: ai_memory_core::HandoffContent {
+                summary: "hostile instruction in body".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+            },
+            lifecycle: ai_memory_core::HandoffLifecycle {
+                state: ai_memory_core::HandoffState::Open,
+                created_at,
+                accepted_by: None,
+                accepted_at: None,
+                accepted_by_session: None,
+                accepted_by_user: None,
+            },
+        };
+        let now = created_at
+            .checked_add(jiff::SignedDuration::from_hours(1))
+            .unwrap();
+        let notice = render_handoff_notice(&handoff, now);
+
+        assert!(!notice.contains("hostile instruction"));
+        assert!(notice.contains(&id.to_string()));
+        assert!(notice.contains("claude-code"));
+        assert!(notice.contains("for `codex`"));
     }
 
     /// Drop `count` pending messages into the state project's inbox, sent from a
@@ -11939,6 +11987,93 @@ mod tests {
         assert!(
             !open_handoff_exists(&state).await,
             "the explicit accept control must consume the offered baton",
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_handoff_is_offered_or_delivered_only_to_matching_agent() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.claim_handoff_on_session_start = false;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let handoff_id = state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: Some(AgentKind::Codex),
+                cwd: None,
+                summary: "TARGETED-FOR-CODEX".to_string(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+
+        let state = Arc::new(state);
+
+        // 1. A session started by Claude Code must NOT receive the handoff notice or claim the baton.
+        let claude_query = HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(cwd.clone()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            ..Default::default()
+        };
+        let (status, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(claude_query),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.is_empty(),
+            "mismatched agent must receive no handoff notice or markdown: {body}",
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "mismatched agent must leave the targeted handoff open",
+        );
+
+        // 2. A session started by Codex DOES receive the offer notice targeting it.
+        let codex_query = HandoffQuery {
+            agent: Some("codex".into()),
+            cwd: Some(cwd),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            ..Default::default()
+        };
+        let (status, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(codex_query),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains(&handoff_id.to_string()),
+            "matching agent must receive the handoff notice with exact id: {body}",
+        );
+        assert!(
+            body.contains("for `codex`"),
+            "notice must state the intended target agent: {body}",
         );
     }
 

@@ -454,3 +454,161 @@ async fn consumed_by_hook_is_reported_only_to_the_session_that_claimed_it() {
         "claimed",
     );
 }
+
+#[tokio::test]
+async fn targeted_handoff_filters_mismatched_agent_and_accept_by_id_bypasses() {
+    use ai_memory_core::{AgentKind, HandoffId};
+    use std::str::FromStr;
+
+    let h = harness(None, true).await;
+
+    let claude_headers = [
+        ("authorization", "Bearer the-proxy-token"),
+        ("x-memory-actor-user", "alice"),
+        ("x-memory-actor-agent", "claude-code"),
+    ];
+    let codex_headers = [
+        ("authorization", "Bearer the-proxy-token"),
+        ("x-memory-actor-user", "alice"),
+        ("x-memory-actor-agent", "codex"),
+    ];
+
+    // Alice as claude-code creates a handoff targeted to codex.
+    let targeted_res = call(
+        &h.http,
+        "memory_handoff_begin",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "summary": "baton targeted to codex",
+            "to_agent": "codex",
+        }),
+        &claude_headers,
+    )
+    .await;
+    let targeted_id_str = targeted_res["handoff_id"]
+        .as_str()
+        .expect("handoff_id")
+        .to_string();
+    let targeted_id = HandoffId::from_str(&targeted_id_str).unwrap();
+
+    // Verify metadata stored in db: from_agent is claude-code, to_agent is codex.
+    let stored = h
+        .store
+        .reader
+        .handoff_by_id(targeted_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.origin.from_agent, AgentKind::ClaudeCode);
+    assert_eq!(stored.origin.to_agent, Some(AgentKind::Codex));
+
+    // Claude Code calling implicit accept: filtered out, none pending.
+    let claude_accept = call(
+        &h.http,
+        "memory_handoff_accept",
+        json!({ "workspace": "default", "project": "scratch" }),
+        &claude_headers,
+    )
+    .await;
+    assert!(
+        claude_accept["handoff"].is_null(),
+        "claude-code must not claim a handoff targeted to codex"
+    );
+    assert_eq!(claude_accept["status"].as_str(), Some("none_pending"));
+
+    // Now create a second, untargeted handoff.
+    let untargeted_res = call(
+        &h.http,
+        "memory_handoff_begin",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "summary": "general baton for anyone",
+        }),
+        &claude_headers,
+    )
+    .await;
+    let untargeted_id_str = untargeted_res["handoff_id"]
+        .as_str()
+        .expect("handoff_id")
+        .to_string();
+
+    // Claude Code calling implicit accept now: skips the targeted handoff and claims the untargeted one!
+    let claude_accept_general = call(
+        &h.http,
+        "memory_handoff_accept",
+        json!({ "workspace": "default", "project": "scratch" }),
+        &claude_headers,
+    )
+    .await;
+    assert_eq!(
+        claude_accept_general["status"].as_str(),
+        Some("claimed"),
+        "claude-code must fall through to the untargeted handoff"
+    );
+    assert_eq!(
+        claude_accept_general["handoff"]["id"].as_str(),
+        Some(untargeted_id_str.as_str())
+    );
+
+    // Explicit claim by exact handoff_id: Claude Code claims the targeted handoff by id.
+    // Exact-id claims bypass targeting per design.
+    let claude_accept_targeted_by_id = call(
+        &h.http,
+        "memory_handoff_accept",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "handoff_id": targeted_id_str,
+        }),
+        &claude_headers,
+    )
+    .await;
+    assert_eq!(
+        claude_accept_targeted_by_id["status"].as_str(),
+        Some("claimed"),
+        "exact-id claim must bypass targeting"
+    );
+    assert_eq!(
+        claude_accept_targeted_by_id["handoff"]["id"].as_str(),
+        Some(targeted_id_str.as_str())
+    );
+
+    // Verify targeted claim by matching agent:
+    // Create another handoff targeted to codex.
+    let targeted2_res = call(
+        &h.http,
+        "memory_handoff_begin",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "summary": "second baton for codex",
+            "to_agent": "codex",
+        }),
+        &claude_headers,
+    )
+    .await;
+    let targeted2_id_str = targeted2_res["handoff_id"]
+        .as_str()
+        .expect("handoff_id")
+        .to_string();
+
+    // Codex calling implicit accept: claims the targeted handoff directly!
+    let codex_accept = call(
+        &h.http,
+        "memory_handoff_accept",
+        json!({ "workspace": "default", "project": "scratch" }),
+        &codex_headers,
+    )
+    .await;
+    assert_eq!(
+        codex_accept["status"].as_str(),
+        Some("claimed"),
+        "matching target agent must claim the targeted handoff"
+    );
+    assert_eq!(
+        codex_accept["handoff"]["id"].as_str(),
+        Some(targeted2_id_str.as_str())
+    );
+}

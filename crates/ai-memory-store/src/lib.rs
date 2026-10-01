@@ -82,7 +82,8 @@ pub use reader::{
     RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
     RrfContributions, ScopeRow, SearchExplain, SessionConsolidationSummary, SessionDependentRows,
     SessionEndDisposition, SessionSummary, SettledPage, StatusCounts, StorageStatus,
-    StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    StoredEmbedding, StoredPageBody, TargetFilter, WorkspaceScopeRow, WorkspaceSummary,
+    f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{

@@ -918,6 +918,19 @@ pub enum SessionEndDisposition {
     ReEndWithNewWork,
 }
 
+/// Agent targeting filter applied when selecting an open handoff candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetFilter {
+    /// No agent targeting filter is applied: any open handoff (targeted or
+    /// untargeted) is eligible. Used by [`ReaderPool::latest_open_handoff`] for
+    /// general inspection, API routes, and web overviews.
+    Any,
+    /// Filtered for a specific session: handoffs with `to_agent = Some(target)`
+    /// are eligible only if `session_agent == Some(target)`. Untargeted handoffs
+    /// (`to_agent = None`) remain eligible for any session.
+    ForSession(Option<AgentKind>),
+}
+
 /// The latest version of a page's stored content, used as a DB-backed
 /// fallback when the on-disk markdown read fails (index/disk skew). The
 /// markdown file is the source of truth, but the store keeps a faithful copy
@@ -5862,13 +5875,45 @@ impl ReaderPool {
         cwd_filter: Option<String>,
         owner_filter: OwnerFilter,
     ) -> StoreResult<Option<Handoff>> {
-        self.open_handoff_for(workspace_id, project_id, cwd_filter, owner_filter, None)
-            .await
+        self.open_handoff_for(
+            workspace_id,
+            project_id,
+            cwd_filter,
+            owner_filter,
+            None,
+            TargetFilter::Any,
+        )
+        .await
+    }
+
+    /// [`Self::latest_open_handoff`] matching only handoffs that are untargeted
+    /// or targeted to `session_agent`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_open_handoff_for_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cwd_filter: Option<String>,
+        owner_filter: OwnerFilter,
+        session_agent: Option<AgentKind>,
+    ) -> StoreResult<Option<Handoff>> {
+        self.open_handoff_for(
+            workspace_id,
+            project_id,
+            cwd_filter,
+            owner_filter,
+            None,
+            TargetFilter::ForSession(session_agent),
+        )
+        .await
     }
 
     /// [`Self::latest_open_handoff`] for automatic delivery to a starting
     /// session: the baton of a session that is still open and captured
-    /// anything after `busy_since` is not a candidate.
+    /// anything after `busy_since` is not a candidate, and a handoff targeted
+    /// via `to_agent` is delivered only to a matching `session_agent`.
     ///
     /// A turn checkpoint publishes a live session's baton, and nothing tells
     /// a closed terminal apart from a parallel session still at work in the
@@ -5887,6 +5932,7 @@ impl ReaderPool {
         cwd_filter: Option<String>,
         owner_filter: OwnerFilter,
         busy_since: Timestamp,
+        session_agent: Option<AgentKind>,
     ) -> StoreResult<Option<Handoff>> {
         self.open_handoff_for(
             workspace_id,
@@ -5894,6 +5940,7 @@ impl ReaderPool {
             cwd_filter,
             owner_filter,
             Some(busy_since.as_microsecond()),
+            TargetFilter::ForSession(session_agent),
         )
         .await
     }
@@ -5905,6 +5952,7 @@ impl ReaderPool {
         cwd_filter: Option<String>,
         owner_filter: OwnerFilter,
         busy_since: Option<i64>,
+        target_filter: TargetFilter,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
             // Ownership belongs in the query, not just in
@@ -5944,7 +5992,7 @@ impl ReaderPool {
             let mut selected: Option<Handoff> = None;
             for r in rows {
                 let handoff = r??;
-                if is_handoff_candidate(&handoff, cwd_filter.as_deref(), &owner_filter)
+                if is_handoff_candidate(&handoff, cwd_filter.as_deref(), &owner_filter, target_filter)
                     && selected
                         .as_ref()
                         .is_none_or(|current| prefer_handoff(&handoff, current).is_gt())
@@ -10405,8 +10453,13 @@ fn handoff_owner_sql(filter: &OwnerFilter, param_index: usize) -> (String, Optio
     }
 }
 
-fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>, owner_filter: &OwnerFilter) -> bool {
-    // Ownership is checked FIRST, before the manual short-circuit below.
+fn is_handoff_candidate(
+    h: &Handoff,
+    cwd_filter: Option<&str>,
+    owner_filter: &OwnerFilter,
+    target_filter: TargetFilter,
+) -> bool {
+    // Ownership is checked FIRST, before the targeting and manual short-circuit below.
     // Order matters: a manual handoff is project-wide by cwd, so checking the
     // owner afterwards would let one operator's `memory_handoff_begin` be
     // claimed by the next session to start, whoever it belongs to — the exact
@@ -10414,6 +10467,18 @@ fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>, owner_filter: &Ow
     // (every pre-V39 row, and anything written without an actor) stay visible
     // to everyone, which preserves single-operator behaviour untouched.
     if !owner_filter.admits(h.origin.owner_user.as_deref()) {
+        return false;
+    }
+    // Targeting is checked SECOND, before the manual short-circuit below.
+    // Order matters: a manual handoff is project-wide by cwd, so checking targeting
+    // before the manual short-circuit ensures that a manual handoff targeted to a
+    // specific agent (e.g. `to_agent = Some(Codex)`) is not consumed by an unrelated
+    // agent (e.g. Claude Code) starting next (#959).
+    // An untargeted handoff (`to_agent = None`) matches any session agent.
+    if let TargetFilter::ForSession(session_agent) = target_filter
+        && let Some(target) = h.origin.to_agent
+        && session_agent != Some(target)
+    {
         return false;
     }
     // Manual handoffs (memory_handoff_begin always sets from_session_id = None)
@@ -10492,7 +10557,26 @@ fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
 fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Option<Handoff> {
     candidates
         .into_iter()
-        .filter(|h| is_handoff_candidate(h, cwd_filter, &OwnerFilter::Any))
+        .filter(|h| is_handoff_candidate(h, cwd_filter, &OwnerFilter::Any, TargetFilter::Any))
+        .max_by(prefer_handoff)
+}
+
+#[cfg(test)]
+fn select_open_handoff_for_agent(
+    candidates: Vec<Handoff>,
+    cwd_filter: Option<&str>,
+    session_agent: Option<AgentKind>,
+) -> Option<Handoff> {
+    candidates
+        .into_iter()
+        .filter(|h| {
+            is_handoff_candidate(
+                h,
+                cwd_filter,
+                &OwnerFilter::Any,
+                TargetFilter::ForSession(session_agent),
+            )
+        })
         .max_by(prefer_handoff)
 }
 
@@ -11235,6 +11319,71 @@ mod tests {
             handoff("MAN", None, true, 2),
         ];
         assert_eq!(pick(c, None), "MAN");
+    }
+
+    fn handoff_with_target(
+        summary: &str,
+        cwd: Option<&str>,
+        manual: bool,
+        t: i64,
+        to_agent: Option<AgentKind>,
+    ) -> Handoff {
+        let mut h = handoff(summary, cwd, manual, t);
+        h.origin.to_agent = to_agent;
+        h
+    }
+
+    fn pick_for_agent(
+        candidates: Vec<Handoff>,
+        cwd: Option<&str>,
+        agent: Option<AgentKind>,
+    ) -> String {
+        super::select_open_handoff_for_agent(candidates, cwd, agent)
+            .map_or_else(|| "—".to_string(), |h| h.content.summary)
+    }
+
+    #[test]
+    fn handoff_targeting_filters_candidates_and_falls_through() {
+        let c = vec![
+            handoff_with_target("targeted-codex", None, true, 2, Some(AgentKind::Codex)),
+            handoff("untargeted-older", None, true, 1),
+        ];
+        // Codex sees the newer handoff targeted specifically to it.
+        assert_eq!(
+            pick_for_agent(c.clone(), None, Some(AgentKind::Codex)),
+            "targeted-codex"
+        );
+        // Claude Code falls through to the older untargeted handoff.
+        assert_eq!(
+            pick_for_agent(c.clone(), None, Some(AgentKind::ClaudeCode)),
+            "untargeted-older"
+        );
+        // An unspecified caller also falls through to the untargeted handoff.
+        assert_eq!(pick_for_agent(c, None, None), "untargeted-older");
+    }
+
+    #[test]
+    fn handoff_targeting_excludes_mismatched_manual_and_auto() {
+        let c = vec![
+            handoff_with_target("targeted-codex-man", None, true, 2, Some(AgentKind::Codex)),
+            handoff_with_target(
+                "targeted-codex-auto",
+                Some("/repo"),
+                false,
+                1,
+                Some(AgentKind::Codex),
+            ),
+        ];
+        // Claude Code must not receive either, even though the manual one is project-wide.
+        assert_eq!(
+            pick_for_agent(c.clone(), Some("/repo"), Some(AgentKind::ClaudeCode)),
+            "—"
+        );
+        // Codex receives the manual handoff.
+        assert_eq!(
+            pick_for_agent(c, Some("/repo"), Some(AgentKind::Codex)),
+            "targeted-codex-man"
+        );
     }
 
     #[tokio::test]

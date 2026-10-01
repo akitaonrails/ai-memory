@@ -12,7 +12,7 @@ Use this skill for single-use cross-session handoffs. Handoffs are for the next 
 
 - `memory_handoff_list` is the read-only inspect path: it returns open handoffs without claiming or expiring them. Use it when no SessionStart handoff block is in context (Grok, Zero, and other no-stdout / MCP-only clients), when the user asks what is pending, or when you need an exact id.
 - `memory_handoff_accept` consumes one open handoff. Prefer listing first when no prepended block is visible, then pass the listed `handoff_id` to claim that exact row. Omitting `handoff_id` claims the latest eligible open handoff. Use this when the user asks where we left off and no already-fetched handoff block is visible.
-- `memory_handoff_begin` creates a terse next-session handoff only when the user is wrapping up, ending the session, or explicitly asks to save context for the next session.
+- `memory_handoff_begin` creates a terse next-session handoff only when the user is wrapping up, ending the session, or explicitly asks to save context for the next session. Pass `to_agent` (e.g. `codex`, `claude-code`) when the baton is intended for a specific agent harness.
 - `memory_handoff_cancel` expires a mistaken pending handoff by exact handoff id from begin or list.
 
 ## Single-use handoff behavior
@@ -28,6 +28,8 @@ Create a handoff only at session end or when the user explicitly asks to save co
 Lifecycle hooks already capture routine prompts and tool calls, so do not manually write a handoff just to record normal progress.
 
 On a shared server, a handoff belongs to the operator who created it. Set `shared: true` only when the user explicitly wants any operator in the project to receive the baton; do not infer sharing from ordinary collaboration prose.
+
+To direct a handoff to a specific agent harness (e.g. leaving context from Claude Code specifically for Codex), pass `to_agent: "<agent-name>"`. Other agents will ignore targeted handoffs during session startup and implicit accept, while explicit claim by `handoff_id` remains available across harnesses.
 
 ## Canceling a handoff
 

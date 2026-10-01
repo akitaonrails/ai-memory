@@ -1072,3 +1072,54 @@ async fn a_session_start_claim_is_confirmed_only_to_its_own_live_session() {
         "an ended session must not be told the baton is in its context",
     );
 }
+
+/// A handoff targeted to a specific agent kind via `to_agent` is delivered only
+/// to sessions started by that agent, even when it is a manual handoff with
+/// `from_session_id = None`. A mismatched session falls through to eligible
+/// untargeted handoffs (#959).
+#[tokio::test]
+async fn targeting_is_checked_before_the_manual_short_circuit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let untargeted_older = handoff(ws, proj, "untargeted older manual", Some("alice"));
+    store.writer.insert_handoff(untargeted_older).await.unwrap();
+
+    let mut targeted_newer = handoff(ws, proj, "targeted to codex", Some("alice"));
+    targeted_newer.to_agent = Some(AgentKind::Codex);
+    store.writer.insert_handoff(targeted_newer).await.unwrap();
+
+    // Claude Code asking via startup_handoff must not see the newer handoff targeted to Codex;
+    // it falls through to the untargeted one.
+    let claude_pickup = store
+        .reader
+        .startup_handoff(
+            ws,
+            proj,
+            None,
+            filter_for("alice"),
+            jiff::Timestamp::MIN,
+            Some(AgentKind::ClaudeCode),
+        )
+        .await
+        .unwrap()
+        .expect("untargeted handoff exists");
+    assert_eq!(claude_pickup.content.summary, "untargeted older manual");
+
+    // Codex asking via startup_handoff sees the newer handoff targeted to it.
+    let codex_pickup = store
+        .reader
+        .startup_handoff(
+            ws,
+            proj,
+            None,
+            filter_for("alice"),
+            jiff::Timestamp::MIN,
+            Some(AgentKind::Codex),
+        )
+        .await
+        .unwrap()
+        .expect("targeted handoff exists");
+    assert_eq!(codex_pickup.content.summary, "targeted to codex");
+}

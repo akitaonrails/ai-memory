@@ -104,6 +104,21 @@ This is server-wide — every operator on the server gets the same behavior.
 Restart the server after changing `config.toml`; configuration is loaded once
 at startup. The default (`true`) is unchanged for every existing install.
 
+### Targeting a handoff to a specific agent
+
+When switching between different agent harnesses (for example, wrapping up in Claude Code and leaving a baton specifically for Codex), pass `to_agent` to `memory_handoff_begin`:
+
+```json
+{
+  "summary": "Finish writer actor integration tests",
+  "to_agent": "codex"
+}
+```
+
+When `to_agent` is set:
+- Other agent CLIs starting in the project ignore the handoff during startup offer and implicit accept, letting it fall through to untargeted handoffs or remain open until the target agent starts.
+- An explicit claim with an exact `handoff_id` (`memory_handoff_accept` passing `handoff_id`) bypasses targeting, so an operator can always intentionally pick up a baton across harnesses.
+
 ## Compaction recovery
 
 When Claude Code or Codex compact their working context, the

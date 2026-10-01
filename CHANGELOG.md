@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `to_agent` targeting for cross-session handoffs (`HandoffBeginArgs` and
+  `memory_handoff_begin`). When set, `is_handoff_candidate` excludes the handoff
+  from sessions running a different agent CLI, preventing unrelated agent harnesses
+  from inadvertently consuming batons meant for a specific follow-up harness during
+  session startup and implicit accept. Explicit acceptance via `memory_handoff_accept`
+  with an exact `handoff_id` bypasses targeting so operators can deliberately claim
+  batons across harnesses. Completes Part 3 of the accepted design in #959.
 - Added explicit MCP behavior annotations (title, read-only, destructive,
   idempotent, and open-world hints) to all 23 tools. Reordered the MCP server
   instructions so scope selection, untrusted-memory handling, deliberate
