@@ -169,6 +169,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             no_autowire: false,
             env: Vec::new(),
             env_file: None,
+            preset: None,
             harness,
             native_args: Vec::new(),
         },

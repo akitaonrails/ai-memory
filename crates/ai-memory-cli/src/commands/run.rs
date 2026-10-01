@@ -139,7 +139,8 @@ pub(super) async fn run_from_with_wiring(
     let force_fresh = args.fresh || trailing_fresh;
     let force_unlock = args.force_unlock || trailing_force_unlock;
     let no_autowire = args.no_autowire || trailing_no_autowire;
-    let run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
+    let preset_env = run_preset_env(config, args.preset.as_deref())?;
+    let run_env = resolve_run_env(&preset_env, args.env_file.as_deref(), &args.env)
         .context("resolving --env/--env-file for the managed run")?;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
@@ -1633,15 +1634,63 @@ fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
-/// Merge `--env-file` lines with `--env` entries into the final key/value
-/// list applied to the spawned harness, preserving file order but letting a
-/// `--env` entry override a same-key `--env-file` line. Values are taken
-/// literally; neither source is expanded or interpreted.
+/// The `[run.presets.<name>.env]` entries `--preset` selects, validated
+/// like `--env` pairs. Resolved before anything is wired or spawned, so a
+/// typo'd name cannot launch the harness against the default account.
+fn run_preset_env(config: &Config, name: Option<&str>) -> Result<Vec<(String, String)>> {
+    let Some(name) = name else {
+        return Ok(Vec::new());
+    };
+    let Some(preset) = config.run.presets.get(name) else {
+        let known = config
+            .run
+            .presets
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if !known.is_empty() {
+            return Err(anyhow!(
+                "unknown run preset `{name}`; defined presets: {}",
+                known.join(", ")
+            ));
+        }
+        let file = config.config_path.as_deref().map_or_else(
+            || "config.toml".to_string(),
+            |path| path.display().to_string(),
+        );
+        return Err(anyhow!(
+            "unknown run preset `{name}`; none are defined. Add to {file}:\n\n  \
+             [run.presets.{name}.env]\n  CLAUDE_CONFIG_DIR = \"/absolute/path\""
+        ));
+    };
+    preset
+        .env
+        .iter()
+        .map(|(key, value)| {
+            if key.is_empty() || key.contains('=') {
+                return Err(anyhow!(
+                    "run preset `{name}`: invalid variable name `{key}`"
+                ));
+            }
+            Ok((key.clone(), value.clone()))
+        })
+        .collect()
+}
+
+/// Merge the selected preset, then `--env-file` lines, then `--env` entries
+/// into the final key/value list applied to the spawned harness. Each later
+/// source overrides a same-key entry from an earlier one while keeping its
+/// first position. Values are taken literally; no source is expanded or
+/// interpreted.
 fn resolve_run_env(
+    preset_env: &[(String, String)],
     env_file: Option<&Path>,
     env_args: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
     let mut merged: Vec<(String, String)> = Vec::new();
+    for (key, value) in preset_env {
+        upsert_env(&mut merged, key.clone(), value.clone());
+    }
     if let Some(path) = env_file {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading --env-file {}", path.display()))?;
@@ -4060,7 +4109,7 @@ mod tests {
         std::fs::write(&path, "# a comment\n\n  \nFOO=from-file\nBAR=keep\n").unwrap();
 
         let cli_pairs = vec![("FOO".to_string(), "from-cli".to_string())];
-        let merged = resolve_run_env(Some(&path), &cli_pairs).unwrap();
+        let merged = resolve_run_env(&[], Some(&path), &cli_pairs).unwrap();
 
         assert_eq!(
             merged,
@@ -4074,7 +4123,7 @@ mod tests {
     #[test]
     fn resolve_run_env_without_a_file_returns_only_cli_pairs() {
         let cli_pairs = vec![("A".to_string(), "1".to_string())];
-        let merged = resolve_run_env(None, &cli_pairs).unwrap();
+        let merged = resolve_run_env(&[], None, &cli_pairs).unwrap();
         assert_eq!(merged, vec![("A".to_string(), "1".to_string())]);
     }
 
@@ -4083,11 +4132,112 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.env");
         std::fs::write(&path, "NOVALUE\n").unwrap();
-        let error = resolve_run_env(Some(&path), &[]).unwrap_err();
+        let error = resolve_run_env(&[], Some(&path), &[]).unwrap_err();
         assert!(
             error.to_string().contains("expected KEY=VALUE"),
             "unexpected error: {error}"
         );
+    }
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn config_with_presets(presets: &[(&str, &[(&str, &str)])]) -> Config {
+        let mut config = Config::default();
+        for (name, env) in presets {
+            config.run.presets.insert(
+                name.to_string(),
+                crate::config::RunPreset {
+                    env: env
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                },
+            );
+        }
+        config
+    }
+
+    #[test]
+    fn resolve_run_env_layers_the_preset_under_env_file_and_cli_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.env");
+        std::fs::write(&path, "FILE=from-file\nSHARED=from-file\n").unwrap();
+
+        let preset = pairs(&[
+            ("PRESET", "from-preset"),
+            ("SHARED", "from-preset"),
+            ("CLI", "from-preset"),
+        ]);
+        let cli_pairs = pairs(&[("CLI", "from-cli")]);
+        let merged = resolve_run_env(&preset, Some(&path), &cli_pairs).unwrap();
+        assert_eq!(
+            merged,
+            pairs(&[
+                ("PRESET", "from-preset"),
+                ("SHARED", "from-file"),
+                ("CLI", "from-cli"),
+                ("FILE", "from-file"),
+            ]),
+            "a preset entry survives only where neither --env-file nor --env names its key"
+        );
+    }
+
+    #[test]
+    fn run_preset_env_returns_the_selected_preset_only() {
+        let config = config_with_presets(&[
+            ("work", &[("CLAUDE_CONFIG_DIR", "/accounts/work")]),
+            ("personal", &[("CLAUDE_CONFIG_DIR", "/accounts/personal")]),
+        ]);
+        assert_eq!(
+            run_preset_env(&config, Some("work")).unwrap(),
+            pairs(&[("CLAUDE_CONFIG_DIR", "/accounts/work")])
+        );
+        assert!(run_preset_env(&config, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_run_preset_is_rejected_with_the_defined_names() {
+        let config = config_with_presets(&[("work", &[]), ("personal", &[])]);
+        let error = run_preset_env(&config, Some("wrok"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown run preset `wrok`") && error.contains("personal, work"),
+            "unexpected error: {error}"
+        );
+
+        let config = Config {
+            config_path: Some(PathBuf::from("/data/config.toml")),
+            ..Config::default()
+        };
+        let error = run_preset_env(&config, Some("work"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("none are defined. Add to /data/config.toml:")
+                && error
+                    .contains("[run.presets.work.env]\n  CLAUDE_CONFIG_DIR = \"/absolute/path\""),
+            "the hint must name the loaded file and a paste-ready table: {error}"
+        );
+    }
+
+    #[test]
+    fn a_run_preset_variable_name_must_be_a_usable_key() {
+        for key in ["", "A=B"] {
+            let config = config_with_presets(&[("work", &[(key, "value")])]);
+            let error = run_preset_env(&config, Some("work"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("invalid variable name"),
+                "`{key}` must be rejected: {error}"
+            );
+        }
     }
 
     #[test]
@@ -4198,6 +4348,7 @@ mod tests {
             no_autowire: true,
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
             env_file: Some(env_file.clone()),
+            preset: None,
             harness: Some(RunHarnessChoice::Claude),
             native_args: vec![OsString::from("--version")],
         };
@@ -4687,6 +4838,7 @@ mod tests {
             no_autowire: false,
             env: Vec::new(),
             env_file: None,
+            preset: None,
             harness: Some(RunHarnessChoice::Claude),
             native_args: vec![OsString::from("--version")],
         };
@@ -4843,6 +4995,7 @@ mod tests {
             no_autowire: false,
             env,
             env_file: None,
+            preset: None,
             harness: Some(harness),
             native_args: native_args.iter().map(OsString::from).collect(),
         }
@@ -4902,6 +5055,128 @@ mod tests {
             "MCP missing in {}",
             mcp.display()
         );
+
+        server.abort();
+    }
+
+    /// Two accounts of one harness on one machine: each `--preset` must reach
+    /// the child and auto-wire its own config home. The autowire sentinel is
+    /// keyed by install target, so the second preset is not skipped as
+    /// "already wired" by the first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_run_preset_launches_and_autowires_its_own_config_home() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "CLAUDE_CONFIG_DIR");
+        let work_home = data.path().join("claude-work");
+        let personal_home = data.path().join("claude-personal");
+        for dir in [&work_home, &personal_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut config = launch_config(home.path(), data.path(), address);
+        for (name, dir) in [("work", &work_home), ("personal", &personal_home)] {
+            config.run.presets.insert(
+                name.to_string(),
+                crate::config::RunPreset {
+                    env: [("CLAUDE_CONFIG_DIR".to_string(), dir.display().to_string())].into(),
+                },
+            );
+        }
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            confine_to: Some(data.path().to_path_buf()),
+            ..WireOverrides::default()
+        };
+
+        for (name, dir) in [("work", &work_home), ("personal", &personal_home)] {
+            let mut args = run_args(
+                RunHarnessChoice::Claude,
+                script.clone(),
+                vec![],
+                &["--version"],
+            );
+            args.preset = Some(name.to_string());
+            let exit = run_from_with_wiring(&config, args, repo.path(), &overrides)
+                .await
+                .unwrap_or_else(|error| panic!("preset {name} run fails: {error:#}"));
+            assert_eq!(exit, 0);
+            assert_eq!(
+                std::fs::read_to_string(&captured).unwrap(),
+                dir.display().to_string(),
+                "preset {name} must reach the spawned child"
+            );
+            let settings = dir.join("settings.json");
+            assert!(
+                std::fs::read_to_string(&settings).is_ok_and(|s| s.contains("ai-memory")),
+                "preset {name}: hooks missing in {}",
+                settings.display()
+            );
+            let mcp = dir.join(".claude.json");
+            assert!(
+                std::fs::read_to_string(&mcp).is_ok_and(|s| s.contains("ai-memory")),
+                "preset {name}: MCP missing in {}",
+                mcp.display()
+            );
+        }
+
+        server.abort();
+    }
+
+    /// A mistyped preset must not quietly launch the default account: it
+    /// fails before auto-wire touches any config home and before the child
+    /// runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unknown_run_preset_fails_before_wiring_or_spawning() {
+        use crate::commands::run_autowire::WireOverrides;
+
+        let (address, server) = mock_workstream_server(None).await;
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, captured) = capture_env_script(repo.path(), "CLAUDE_CONFIG_DIR");
+        let claude_home = data.path().join("claude-work");
+        std::fs::create_dir_all(&claude_home).unwrap();
+
+        let mut config = launch_config(home.path(), data.path(), address);
+        config.run.presets.insert(
+            "work".to_string(),
+            crate::config::RunPreset {
+                env: [(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    claude_home.display().to_string(),
+                )]
+                .into(),
+            },
+        );
+        let overrides = WireOverrides {
+            hooks_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks")),
+            confine_to: Some(data.path().to_path_buf()),
+            ..WireOverrides::default()
+        };
+        let mut args = run_args(RunHarnessChoice::Claude, script, vec![], &["--version"]);
+        args.preset = Some("wrok".to_string());
+
+        let error = run_from_with_wiring(&config, args, repo.path(), &overrides)
+            .await
+            .expect_err("an unknown preset must fail the launch");
+        assert!(
+            format!("{error:#}").contains("unknown run preset `wrok`"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!captured.exists(), "the harness must not have been spawned");
+        assert_eq!(
+            std::fs::read_dir(data.path()).unwrap().count(),
+            1,
+            "nothing but the pre-created config home may exist in the data dir"
+        );
+        assert_eq!(std::fs::read_dir(&claude_home).unwrap().count(), 0);
 
         server.abort();
     }

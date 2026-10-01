@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added named launch presets for `ai-memory run`. A
+  `[run.presets.<name>.env]` table in `config.toml` is selected with
+  `ai-memory run --preset <name> <harness>`, so a per-account
+  `CLAUDE_CONFIG_DIR` or `CODEX_HOME` no longer has to be repeated with
+  `--env` on every launch. Preset entries have the same reach as `--env`
+  (spawned harness, native-session resolution, first-launch auto-wire) and
+  are layered under `--env-file` and `--env`. An unknown preset name fails
+  before anything is wired or launched. The flag is not `--profile`, which
+  OMP and Codex already take natively. (#1031)
+
 ### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)

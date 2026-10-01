@@ -290,6 +290,11 @@ pub struct Config {
     /// derived from the process environment at load.
     #[serde(skip)]
     pub home_dir: Option<String>,
+    /// The `config.toml` path [`Config::load`] read (or would have read, when
+    /// absent), so a message can tell the operator which file to edit. Not a
+    /// config.toml key.
+    #[serde(skip)]
+    pub config_path: Option<PathBuf>,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
     pub log_level: String,
     /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`,
@@ -568,6 +573,8 @@ pub struct Config {
     /// Default `follow-cwd` preserves the historical per-event resolution;
     /// `sticky` keeps the session's project. See [`RoutingSettings`].
     pub routing: RoutingSettings,
+    /// `[run]` — presets for `ai-memory run`. See [`RunSettings`].
+    pub run: RunSettings,
     /// Env-backed alias for hook ingest tokens per second per source.
     pub hook_rate_per_sec: f64,
     /// Env-backed alias for hook ingest burst tokens per source.
@@ -934,6 +941,29 @@ pub struct RoutingSettings {
     pub mid_session: ai_memory_core::MidSessionRouting,
 }
 
+/// `[run]` section of `config.toml`: presets for `ai-memory run`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunSettings {
+    /// Named launch presets, selected with `ai-memory run --preset <name>`.
+    /// Set under `[run.presets.<name>.env]` in `config.toml`; the env
+    /// override is not useful here because figment lowercases env-derived
+    /// keys, and variable names are case-sensitive.
+    pub presets: std::collections::BTreeMap<String, RunPreset>,
+}
+
+/// One `[run.presets.<name>]` entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunPreset {
+    /// Variables layered onto the launch environment ahead of `--env-file`
+    /// and `--env`, with the same reach (spawned harness, native-session
+    /// resolution, first-launch auto-wire). Values are taken literally, so
+    /// paths should be absolute: a per-account `CLAUDE_CONFIG_DIR` or
+    /// `CODEX_HOME` is the main use.
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -944,6 +974,7 @@ impl Default for Config {
             release_base_url: None,
             base_path: String::new(),
             home_dir: None,
+            config_path: None,
             log_level: "info".into(),
             llm_provider: None,
             llm_model: None,
@@ -983,6 +1014,7 @@ impl Default for Config {
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
             routing: RoutingSettings::default(),
+            run: RunSettings::default(),
             hook_rate_per_sec: 0.0,
             hook_rate_burst: 0.0,
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
@@ -1649,6 +1681,7 @@ impl Config {
             )
         })?;
 
+        config.config_path = Some(resolved_config_path.clone());
         if let Some(token) = runtime_env.auth_token.clone() {
             config.auth.bearer_token = Some(token);
         }
@@ -3026,6 +3059,43 @@ mod tests {
         assert_eq!(
             cfg.search.fts.stopwords(),
             ai_memory_store::FtsStopwords::default()
+        );
+    }
+
+    /// Variable names are case-sensitive, so a preset's env keys must reach
+    /// the launch exactly as written in config.toml.
+    #[test]
+    fn run_presets_parse_from_config_toml_with_their_key_case() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[run.presets.work.env]\nCLAUDE_CONFIG_DIR = \"/Users/me/.claude-work\"\n\n\
+             [run.presets.personal.env]\nCODEX_HOME = \"/Users/me/.codex-personal\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            cfg.run.presets["work"]
+                .env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Some("/Users/me/.claude-work")
+        );
+        assert_eq!(
+            cfg.run.presets["personal"]
+                .env
+                .get("CODEX_HOME")
+                .map(String::as_str),
+            Some("/Users/me/.codex-personal")
+        );
+        assert!(
+            Config::load(None, Some(tmp.path().join("other")))
+                .unwrap()
+                .run
+                .presets
+                .is_empty(),
+            "no `[run]` table means no presets"
         );
     }
 

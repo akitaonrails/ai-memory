@@ -698,6 +698,13 @@ release_base_url = ""              # override the GitHub releases base URL that 
                                    # For hermetic tests / mirrors, not day-to-day installs.
                                    # Env: AI_MEMORY_RELEASE_BASE_URL.
 
+[run.presets.work.env]             # named `ai-memory run --preset work <harness>` env
+CLAUDE_CONFIG_DIR = "/home/me/.claude-work"  # preset (#922): same reach as `--env`,
+                                   # layered under `--env-file` and `--env`. Values are
+                                   # literal (use absolute paths); an unknown name fails
+                                   # before auto-wire or launch. TOML only: figment
+                                   # lowercases env-derived keys.
+
 [maintenance]                      # scheduled server jobs (run outside hook latency)
 enabled = true                     # master switch for the scheduled jobs below
 forget_sweep_interval_secs = 86400 # retention forget sweep; 0 disables. Cadence persists

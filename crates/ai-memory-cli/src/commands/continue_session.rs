@@ -80,6 +80,7 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 no_autowire: false,
                 env: Vec::new(),
                 env_file: None,
+                preset: None,
                 // Bare mode: `run` resolves the harness that owns the newest
                 // usable session for this workstream.
                 harness: None,

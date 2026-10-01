@@ -89,7 +89,7 @@ file, and the current checkout remain authoritative.
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh] [--force-unlock]
-              [--env KEY=VALUE]... [--env-file PATH]
+              [--env KEY=VALUE]... [--env-file PATH] [--preset NAME]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
@@ -472,6 +472,28 @@ variable into the invoking shell first. A later `--env` overrides a same-key
 expand `$HOME` on the command line and write absolute paths in an
 `--env-file`. Manual `install-hooks` / `install-mcp` do not take `--env`; they
 read their own environment.
+
+To stop repeating those flags, save them once as a named preset in
+`config.toml` and select it with `--preset` (also wrapper-owned, so it precedes
+the harness name):
+
+```toml
+[run.presets.work.env]
+CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
+```
+
+```bash
+ai-memory run --preset work claude
+```
+
+A preset's entries reach the same places as `--env`. They are layered under
+`--env-file` and `--env`, so either one still overrides a same-key preset entry
+for a single launch. Values are literal, so write absolute paths.
+
+An unknown preset name fails before anything is wired or launched, rather than
+starting the harness against its default account. The flag is `--preset`, not
+`--profile`, because OMP and Codex both take a native `--profile` that must keep
+reaching them.
 
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native

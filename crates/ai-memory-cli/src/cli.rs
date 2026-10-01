@@ -352,6 +352,13 @@ pub struct RunArgs {
     /// `--env`) before `--env` entries, which override a same-key line here.
     #[arg(long = "env-file", value_name = "PATH")]
     pub env_file: Option<PathBuf>,
+    /// Apply the named `[run.presets.<name>.env]` preset from config.toml,
+    /// e.g. one account's `CLAUDE_CONFIG_DIR`. Same reach as `--env`, layered
+    /// under `--env-file` and `--env`, which override a same-key preset
+    /// entry. Wrapper-owned, so it must precede `harness`; an unknown name
+    /// fails before anything is wired or launched.
+    #[arg(long, value_name = "NAME")]
+    pub preset: Option<String>,
     /// Agent harness to launch. When omitted, continue the newest managed or
     /// checkout-local session among the auto-detected harnesses. Any value
     /// starting with `claude` (e.g. `claude-corp`, `claude-personal`) also
@@ -3670,6 +3677,36 @@ mod tests {
             error.to_string().contains("expected one of"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn run_preset_flag_selects_a_wrapper_preset() {
+        let cli = Cli::try_parse_from(["ai-memory", "run", "--preset", "work", "claude"]).unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(args.preset.as_deref(), Some("work"));
+        assert!(args.native_args.is_empty());
+    }
+
+    /// The flag is `--preset`, not `--profile`: clap binds a known wrapper
+    /// flag even after the harness, and OMP and Codex both take a native
+    /// `--profile` that must keep reaching them.
+    #[test]
+    fn a_native_profile_flag_still_reaches_the_harness() {
+        for harness in ["omp", "codex"] {
+            let cli = Cli::try_parse_from(["ai-memory", "run", harness, "--profile", "work"])
+                .unwrap_or_else(|error| panic!("run {harness} --profile: {error}"));
+            let Command::Run(args) = cli.command else {
+                panic!("expected run");
+            };
+            assert_eq!(args.preset, None, "{harness}");
+            assert_eq!(
+                args.native_args,
+                ["--profile", "work"].map(OsString::from),
+                "{harness}'s own --profile must be forwarded"
+            );
+        }
     }
 
     #[test]

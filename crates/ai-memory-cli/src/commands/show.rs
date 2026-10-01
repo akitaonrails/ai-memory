@@ -233,6 +233,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             no_autowire: false,
             env: Vec::new(),
             env_file: None,
+            preset: None,
             harness: Some(harness),
             native_args: args.native_args,
         },
