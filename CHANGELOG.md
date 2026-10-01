@@ -10,21 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added per-event hook acknowledgements and ingestion counters, plus persisted
   receipt outcomes in the lifecycle relay. Relay queues upgrade atomically
-  from schema 1 to 2.
+  from schema 1 to 2. (#1010)
 - Added machine identity at `/identity`, local scope and policy inspection for
-  producers, and capture-source diagnostics in `doctor`.
+  producers, and capture-source diagnostics in `doctor`. (#1010)
 - Added scoped consolidation state to session summaries and opt-in cursor
   pagination for recently updated pages. The MCP observation reader also
   includes consolidation state in its session summary. Documented generic MCP writes,
-  queries and handoffs in `docs/programmatic-memory.md`.
+  queries and handoffs in `docs/programmatic-memory.md`. (#1010)
 
 ### Changed
 - Changed `doctor` capture guidance for native hooks and external producers.
-  Identity failures leave capture coverage available.
+  Identity failures leave capture coverage available. (#1010)
 
 ### Fixed
 - Stopped hook replays and ignored end events from advancing the last-persistence
-  timestamp when they wrote nothing.
+  timestamp when they wrote nothing. (#1010)
 
 ### Security
 - Fixed GHSA-vh98: a capture-exclusion candidate or shell argument spelled
