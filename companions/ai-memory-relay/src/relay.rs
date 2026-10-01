@@ -228,6 +228,7 @@ pub fn status(dir: &Path) -> Result<Report> {
         "max_attempts": stats.max_attempts,
         "receipts": stats.receipts,
         "known_sessions": stats.known_sessions,
+        "receipt_outcomes": stats.receipt_outcomes,
         "limits": {
             "pending_items": queue::MAX_PENDING_ITEMS,
             "pending_bytes": queue::MAX_PENDING_BYTES,
@@ -281,6 +282,7 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
     let started = Instant::now();
     let mut deferred: HashSet<(String, String)> = HashSet::new();
     let mut delivered = 0usize;
+    let mut outcomes = ack::outcome_counts();
     let mut batches = 0usize;
     let mut blocked_sessions = 0usize;
     let mut failure: Option<String> = None;
@@ -411,12 +413,21 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
 
         // Only now, after the whole response was validated, does anything leave
         // the queue.
-        let confirmed: Vec<String> = accepted
+        let confirmed: Vec<(String, &str)> = accepted
             .iter()
-            .filter_map(|idx| batch.items.get(*idx))
-            .map(|item| item.ingest_key.clone())
+            .map(|idx| {
+                (
+                    batch.items[*idx].ingest_key.clone(),
+                    ack::acknowledged_outcome(&parsed, *idx),
+                )
+            })
             .collect();
         delivered += queue.confirm(&confirmed, crate::now_ms())?;
+        for (_, outcome) in &confirmed {
+            if let Some(count) = outcomes.get_mut(*outcome) {
+                *count += 1;
+            }
+        }
 
         if let Some(failed_index) = parsed.failed_index
             && let Some(item) = batch.items.get(failed_index)
@@ -447,6 +458,10 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
         "acknowledged {delivered} event(s) in {batches} batch(es); {} still pending across {} session(s)",
         stats.pending_items, stats.pending_sessions
     )];
+    summary.push(format!(
+        "acknowledged_outcomes: {}",
+        serde_json::to_string(&outcomes)?
+    ));
     if backed_off {
         summary.push(
             "server answered 429: the acknowledged items were applied and the flush stopped. \

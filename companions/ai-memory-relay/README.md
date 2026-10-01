@@ -213,3 +213,30 @@ lost response, distinct event identities and 15 concurrent sessions. It also
 checks handoff delivery with native capture suppressed, rejected authentication
 and acknowledged session collisions. Temporary data and logs are retained, and
 the test prints their directory.
+Receipt assertions cover stored events, lost-response replays and collision drops.
+
+## Receipt outcomes and queue compatibility
+
+Batch ACKs may include `results: [{index, outcome}]`. When present, results must
+match every acknowledged index exactly, ascending and without duplicates.
+The complete ACK, including legacy prefix and failure fields, is validated before
+any item is released. Missing entries, extra indices or non-string outcomes retain
+the entire batch. An absent results field from an older server maps acknowledged
+events to `unknown`; future outcome strings also map to `unknown`.
+
+Receipts persist `stored`, `replayed`, `resumed`, `ignored_end`,
+`dropped_policy`, `dropped_subagent`, `dropped_unauthorized`,
+`dropped_collision` or `unknown`. All acknowledged outcomes release events,
+including drops. Flush reports `acknowledged_outcomes` for that invocation.
+Status adds `receipt_outcomes`, with all nine fixed keys, including zero counts,
+for receipts within the retained 30-day window measured from first attempt.
+These are bounded delivery counts, not lifetime observation totals.
+
+Opening a version 1 queue upgrades it to version 2 in one IMMEDIATE transaction,
+adding nullable receipt outcomes and updating schema metadata together. Pending
+order, binding, hashes, pins and existing receipt metadata survive; old NULL
+outcomes count as `unknown`. Concurrent opens recheck the version under the write
+lock. An interrupted migration rolls back and can be retried on reopen.
+Unknown schemas are refused. Older relay binaries refuse version 2 queues:
+downgrading requires restoring a pre-upgrade backup while all queue users are
+stopped. Do not recreate a queue to bypass its delivery history.

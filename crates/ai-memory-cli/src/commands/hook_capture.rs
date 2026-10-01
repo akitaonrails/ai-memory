@@ -251,24 +251,135 @@ pub fn marker_requests_briefing(cwd: &str) -> bool {
         .is_some_and(|value| is_truthy(&value))
 }
 
+/// Host-side routing hints sent with native lifecycle events.
+/// Missing names are left to the server; this inspection creates no scope.
+#[derive(Debug, serde::Serialize)]
+pub struct HookScope {
+    #[serde(serialize_with = "serialize_scope_hint")]
+    workspace: Option<String>,
+    #[serde(serialize_with = "serialize_scope_hint")]
+    project: Option<String>,
+    project_src: Option<&'static str>,
+    #[serde(serialize_with = "serialize_scope_hint")]
+    project_strategy: Option<String>,
+    #[serde(serialize_with = "serialize_scope_hint")]
+    identity: Option<String>,
+    identity_src: Option<&'static str>,
+    server_may_remap: bool,
+}
+
+const MAX_SCOPE_HINT_BYTES: usize = 512;
+
+fn serialize_scope_hint<S: serde::Serializer>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(
+        &value
+            .as_deref()
+            .filter(|value| value.len() <= MAX_SCOPE_HINT_BYTES),
+        serializer,
+    )
+}
+
+impl HookScope {
+    /// Whether all routing hints fit the bounded inspection response.
+    #[must_use]
+    pub fn is_inspectable(&self) -> bool {
+        [
+            &self.workspace,
+            &self.project,
+            &self.project_strategy,
+            &self.identity,
+        ]
+        .into_iter()
+        .all(|value| {
+            value
+                .as_ref()
+                .is_none_or(|value| value.len() <= MAX_SCOPE_HINT_BYTES)
+        })
+    }
+
+    /// Whether only one name was explicitly declared in the marker.
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        (self.workspace.is_some() || self.project_src == Some("marker")) && !self.is_explicit()
+    }
+
+    /// Whether both names were resolved on the host.
+    #[must_use]
+    pub fn is_explicit(&self) -> bool {
+        self.workspace
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+            && self
+                .project
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty())
+    }
+}
+
+/// Inspect the same marker, worktree and repository identity as hook routing.
+#[must_use]
+pub fn hook_scope(cwd: &str, default_strategy: Option<&str>) -> HookScope {
+    let marker = find_settings_marker(cwd);
+    hook_scope_from_marker(cwd, default_strategy, marker.as_deref())
+}
+
+fn hook_scope_from_marker(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    marker: Option<&Path>,
+) -> HookScope {
+    let mut workspace = None;
+    let mut project = None;
+    let mut strategy = None;
+    let mut explicit_identity = None;
+    if let Some(marker) = marker {
+        workspace = parse_toml_key(marker, "workspace");
+        project = parse_toml_key(marker, "project");
+        strategy = parse_toml_key(marker, "project_strategy");
+        explicit_identity = parse_toml_key(marker, "identity");
+    }
+    let mut project_src = project.as_ref().map(|_| "marker");
+    let identity = repository_identity(cwd, explicit_identity.as_deref(), project.as_deref());
+    if strategy.is_none() {
+        strategy = default_strategy.map(str::to_owned);
+    }
+    if project.is_none() && matches!(strategy.as_deref(), Some("repo-root" | "repo_root")) {
+        project = repo_root_project(cwd);
+        project_src = project.as_ref().map(|_| "repo-root");
+    }
+    let (identity, identity_src) = match identity {
+        Some(identity) => (Some(identity.identity), Some(identity.source.as_str())),
+        None => (None, None),
+    };
+    let server_may_remap = project_src != Some("marker") || identity.is_some();
+    HookScope {
+        workspace,
+        project,
+        project_src,
+        project_strategy: strategy,
+        identity,
+        identity_src,
+        server_may_remap,
+    }
+}
+
 fn marker_query_suffix_impl(
     cwd: &str,
     default_strategy: Option<&str>,
     include_briefing: bool,
 ) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
-    let (mut workspace, mut project, mut strategy, mut drop_subagent, mut default_global) =
-        (None, None, None, None, None);
+    let marker = find_settings_marker(cwd);
+    let scope = hook_scope_from_marker(cwd, default_strategy, marker.as_deref());
+    let (mut drop_subagent, mut default_global) = (None, None);
     let (mut briefing, mut briefing_budget) = (None, None);
-    let mut explicit_identity = None;
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
-    if let Some(marker) = find_settings_marker(cwd) {
-        workspace = parse_toml_key(&marker, "workspace");
-        project = parse_toml_key(&marker, "project");
-        explicit_identity = parse_toml_key(&marker, "identity");
-        strategy = parse_toml_key(&marker, "project_strategy");
+    if let Some(marker) = marker {
         drop_subagent = parse_toml_key(&marker, "drop_subagent_captures");
         // `[recall] default_global = true` (or top-level; quoted or bare) —
         // a meta-repo opts every default-scoped read into a global search.
@@ -279,38 +390,23 @@ fn marker_query_suffix_impl(
         briefing = parse_toml_flag(&marker, "inject_on_session_start");
         briefing_budget = parse_toml_flag(&marker, "max_chars");
     }
-    // Provenance of `project`, forwarded as `project_src` so the server can
-    // tell a deliberate marker rescope from a host-derived repo-root name.
-    // Only the latter may yield to session-sticky attribution (#394).
-    let mut project_src = project.as_ref().map(|_| "marker");
-    // Resolved before repo-root can fill `project` below: a repo-root name is
-    // an inference, while the chain's `manifest` rung means a name somebody
-    // wrote in the marker.
-    let identity = repository_identity(cwd, explicit_identity.as_deref(), project.as_deref());
-    if strategy.is_none() {
-        strategy = default_strategy.map(str::to_owned);
-    }
-    if project.is_none() && matches!(strategy.as_deref(), Some("repo-root" | "repo_root")) {
-        project = repo_root_project(cwd);
-        project_src = project.as_ref().map(|_| "repo-root");
-    }
-    if let Some(val) = workspace {
+    if let Some(val) = scope.workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
     }
-    if let Some(val) = project {
+    if let Some(val) = scope.project {
         qs.push_str(&format!("&project={}", url_encode(&val)));
     }
-    if let Some(val) = project_src {
+    if let Some(val) = scope.project_src {
         qs.push_str(&format!("&project_src={val}"));
     }
-    if let Some(val) = strategy {
+    if let Some(val) = scope.project_strategy {
         qs.push_str(&format!("&project_strategy={}", url_encode(&val)));
     }
-    if let Some(identity) = identity {
+    if let (Some(identity), Some(source)) = (scope.identity, scope.identity_src) {
         qs.push_str(&format!(
             "&identity={}&identity_src={}",
-            url_encode(&identity.identity),
-            identity.source.as_str()
+            url_encode(&identity),
+            source
         ));
     }
     // Per-project `drop_subagent_captures` opt-in: forward the marker's value as
@@ -954,6 +1050,11 @@ mod tests {
             "{qs}"
         );
         assert!(!qs.contains("s3cret"), "{qs}");
+        let scope =
+            serde_json::to_value(hook_scope(origin_only.path().to_str().unwrap(), None)).unwrap();
+        assert_eq!(scope["identity"], "git.example.test/fork/api");
+        assert_eq!(scope["identity_src"], "git_remote");
+        assert!(!scope.to_string().contains("s3cret"));
     }
 
     /// A declared `project` outranks the remote and routes by name, so nothing
@@ -1176,7 +1277,7 @@ drop_subagent_captures = "true"
         if !std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["worktree", "add", "-q"])
+            .args(["worktree", "add", "-q", "-b", "feat/worktree-inspection"])
             .arg(&wt)
             .status()
             .unwrap()
@@ -1194,6 +1295,13 @@ drop_subagent_captures = "true"
         assert!(qs.contains("&workspace=oss"), "{qs}");
         assert!(qs.contains("&project=acme-api"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+        let scope = hook_scope(wt.to_str().unwrap(), None);
+        assert!(scope.is_explicit());
+        let scope = serde_json::to_value(scope).unwrap();
+        assert_eq!(scope["workspace"], "oss");
+        assert_eq!(scope["project"], "acme-api");
+        assert_eq!(scope["project_src"], "repo-root");
+        assert_eq!(scope["server_may_remap"], true);
     }
 
     // ── install-time default strategy (#128), no marker required ──────

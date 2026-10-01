@@ -26,7 +26,7 @@ pub const MAX_RECEIPTS: i64 = 200_000;
 /// Session-to-agent pins retained at once, enforced the same way.
 pub const MAX_SESSION_PINS: i64 = 50_000;
 
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
 const IDENTITY: &str = "ai-memory-relay-queue";
 
 const SCHEMA: &str = "
@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS receipt(
     ingest_key       TEXT PRIMARY KEY,
     body_sha256      TEXT NOT NULL,
     first_attempt_ms INTEGER NOT NULL,
-    delivered_at_ms  INTEGER NOT NULL
+    delivered_at_ms  INTEGER NOT NULL,
+    outcome          TEXT
 );
 CREATE INDEX IF NOT EXISTS receipt_first_attempt ON receipt(first_attempt_ms);
 CREATE TABLE IF NOT EXISTS session_agent(
@@ -144,6 +145,8 @@ pub struct Stats {
     pub max_attempts: i64,
     pub receipts: i64,
     pub known_sessions: i64,
+    /// Outcomes within the retained first-attempt window, with fixed keys.
+    pub receipt_outcomes: std::collections::BTreeMap<String, i64>,
 }
 
 /// The companion's queue database.
@@ -181,21 +184,34 @@ impl Queue {
         let mut conn = Connection::open(&path)
             .with_context(|| format!("open relay queue at {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(10))?;
-        let state = classify(&conn, &path)?;
+        classify(&conn, &path)?;
+        // Recheck under the write lock: another opener may have initialized or
+        // migrated since the read-only preflight.
+        {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            match classify(&tx, &path)? {
+                DbState::Fresh => {
+                    tx.execute_batch(SCHEMA)?;
+                    tx.execute(
+                        "INSERT INTO meta(key, value) VALUES('identity', ?1), ('schema_version', ?2)",
+                        params![IDENTITY, SCHEMA_VERSION],
+                    )?;
+                }
+                DbState::V1 => {
+                    tx.execute_batch("ALTER TABLE receipt ADD COLUMN outcome TEXT;")?;
+                    tx.execute(
+                        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                        params![SCHEMA_VERSION],
+                    )?;
+                }
+                DbState::Ready => {}
+            }
+            tx.commit()?;
+        }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;\nPRAGMA synchronous=FULL;\nPRAGMA foreign_keys=ON;",
         )
         .with_context(|| format!("configure relay queue at {}", path.display()))?;
-        if state != DbState::Ready {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(SCHEMA)
-                .with_context(|| format!("initialize relay queue schema at {}", path.display()))?;
-            tx.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('identity', ?1), ('schema_version', ?2)",
-                params![IDENTITY, SCHEMA_VERSION],
-            )?;
-            tx.commit()?;
-        }
         Ok(Self { conn, path })
     }
 
@@ -508,7 +524,7 @@ impl Queue {
     /// An acknowledgement means delivered *or* deliberately dropped by server
     /// policy (a capture-protocol drop, a subagent drop, a session-collision
     /// drop). It never promises an observation was written.
-    pub fn confirm(&mut self, keys: &[String], now_ms: i64) -> Result<usize> {
+    pub fn confirm(&mut self, keys: &[(String, &str)], now_ms: i64) -> Result<usize> {
         if keys.is_empty() {
             return Ok(0);
         }
@@ -516,7 +532,7 @@ impl Queue {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut moved = 0;
-        for key in keys {
+        for (key, outcome) in keys {
             let row: Option<(String, Option<i64>, i64)> = tx
                 .query_row(
                     "SELECT body_sha256, first_attempt_ms, first_seen_ms
@@ -529,14 +545,16 @@ impl Queue {
                 continue;
             };
             tx.execute(
-                "INSERT INTO receipt(ingest_key, body_sha256, first_attempt_ms, delivered_at_ms)
-                 VALUES(?1, ?2, ?3, ?4)
-                 ON CONFLICT(ingest_key) DO UPDATE SET delivered_at_ms = excluded.delivered_at_ms",
+                "INSERT INTO receipt(ingest_key, body_sha256, first_attempt_ms, delivered_at_ms, outcome)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(ingest_key) DO UPDATE SET delivered_at_ms = excluded.delivered_at_ms,
+                     outcome = excluded.outcome",
                 params![
                     key,
                     body_sha256,
                     first_attempt_ms.unwrap_or(first_seen_ms),
-                    now_ms
+                    now_ms,
+                    crate::ack::outcome(outcome)
                 ],
             )?;
             tx.execute("DELETE FROM pending WHERE ingest_key = ?1", params![key])?;
@@ -612,6 +630,19 @@ impl Queue {
         let known_sessions: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM session_agent", [], |r| r.get(0))?;
+        let mut receipt_outcomes = crate::ack::outcome_counts();
+        let mut stmt = self.conn.prepare(
+            "SELECT outcome, COUNT(*) FROM receipt WHERE first_attempt_ms >= ?1 GROUP BY outcome",
+        )?;
+        for row in stmt.query_map(params![cutoff], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (value, count) = row?;
+            let key = crate::ack::outcome(value.as_deref().unwrap_or("unknown"));
+            if let Some(total) = receipt_outcomes.get_mut(key) {
+                *total += count;
+            }
+        }
         Ok(Stats {
             pending_items,
             pending_bytes,
@@ -626,6 +657,7 @@ impl Queue {
             max_attempts,
             receipts,
             known_sessions,
+            receipt_outcomes,
         })
     }
 }
@@ -659,6 +691,8 @@ enum DbState {
     Fresh,
     /// A relay queue of this exact schema version.
     Ready,
+    /// Version one is upgraded transactionally.
+    V1,
 }
 
 /// Classify an existing file before touching it. Never mutates.
@@ -697,6 +731,7 @@ fn classify(conn: &Connection, path: &Path) -> Result<DbState> {
         meta.get("identity").map(String::as_str),
         meta.get("schema_version").map(String::as_str),
     ) {
+        (Some(IDENTITY), Some("1")) => Ok(DbState::V1),
         (Some(IDENTITY), Some(SCHEMA_VERSION)) => Ok(DbState::Ready),
         (Some(IDENTITY), Some(other)) => Err(refuse(format!(
             "schema version {other} but this build speaks {SCHEMA_VERSION}"

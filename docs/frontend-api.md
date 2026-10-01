@@ -29,7 +29,7 @@
   Bearer fails closed rather than falling back. Before human auth activates,
   deprecated Basic/cookie compatibility is evaluated for GET requests; after
   activation, Basic and unknown schemes do not suppress a valid web session.
-- `/mcp`, hooks, handoffs, and workstream routes are machine-only. A web-session
+- `/mcp`, `/identity`, hooks, handoffs, and workstream routes are machine-only. A web-session
   cookie cannot authenticate them.
 - A disallowed `Host` header receives `403 Forbidden` before auth evaluation
   (DNS-rebinding guard).
@@ -68,6 +68,11 @@ deprecated GET-only browser compatibility may accept the root bearer through
 HTTP Basic and an HttpOnly `ai_memory_auth` cookie. Human activation disables
 that path immediately. See [`docs/users.md`](users.md) for bootstrap, password
 rotation, recovery, roles, session expiry, and API-key lifecycle.
+
+Machine clients can call `GET /identity` even with the web UI disabled. It
+returns only the authenticated caller's identity and the server version. See
+the [programmatic memory guide](programmatic-memory.md) for its response and
+MCP write, query and handoff examples.
 
 ## 3. Error model
 
@@ -261,20 +266,42 @@ Every reader surface uses the same `kind` contract. An explicit frontmatter
 `rule`, `slot`, `session`, `decision`, `gotcha`, `concept`, `procedure`, and
 `note`, respectively. Other paths fall back to `fact`.
 
-**Response:** `{ "pages": [BriefingPage, …] }`
+**Legacy response:** an array of `PageSummary` objects.
 
 ```json
-{
-  "pages": [
+[
     {
       "path": "sessions/2026-05-28.md",
       "title": "Session 2026-05-28",
       "kind": "session",
+      "tier": "episodic",
       "updated_at": "2026-05-28T14:02:11.123Z"
     }
-  ]
-}
+]
 ```
+
+Supply `updated_since` (RFC 3339) or `cursor` to opt into incremental paging:
+
+```http
+GET /api/v1/workspaces/{workspace}/projects/{project}/recent?updated_since=2026-09-30T00%3A00%3A00Z&limit=20
+```
+
+```json
+{"pages": [], "next_cursor": null}
+```
+
+The cutoff is exclusive (`updated_at > updated_since`). Results are ordered
+by `(updated_at, path)` ascending and fetched with a bounded SQL query. Pass
+`next_cursor` unchanged to continue; an optional cutoff must match the cursor's
+cutoff. Cursors are opaque, limited to 8192 characters, and bound to the
+workspace and project. Invalid, foreign-scope or conflicting cursors return
+400. Every page is authorized again; these responses use
+`Cache-Control: private, no-store`.
+
+Incremental results omit superseded and expired pages, including expired pinned
+pages. They provide no snapshot or deletion feed: concurrent changes can appear
+on a later page, and deleted or expired pages are absent. Calls without either
+parameter retain the legacy array, descending order and cache behavior.
 
 ### 4.7 Briefing (structured snapshot)
 
@@ -484,11 +511,18 @@ an unnamed caller sees unattributed ones only. Never cached (`no-store`).
       "started_at": "2026-08-16T09:12:03.412Z",
       "ended_at": "2026-08-16T10:47:55.001Z",
       "observation_count": 143,
-      "actor_user": null
+      "actor_user": null,
+      "consolidation": {"state": "completed", "attempts": 1}
     }
   ]
 }
 ```
+
+`consolidation` is `null` when no job exists for that session in the requested
+project. Otherwise it contains the latest generation's state (`pending`,
+`running`, `completed`, `failed` or `superseded`) and attempt count. Jobs are
+selected in the same scope and batch query as the owner-filtered sessions;
+internal errors are omitted. This describes the job, not every page's freshness.
 
 ### 4.12 Session observations
 
@@ -524,7 +558,8 @@ historical text. Never cached (`no-store`). Same payload as the MCP tool
     "started_at": "2026-08-16T09:12:03.412Z",
     "ended_at": "2026-08-16T10:47:55.001Z",
     "observation_count": 143,
-    "actor_user": null
+    "actor_user": null,
+    "consolidation": null
   },
   "observations": [
     {

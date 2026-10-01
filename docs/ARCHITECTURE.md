@@ -72,6 +72,11 @@ from hook paths.
    wiki commit, durable provider job, and pending key without appending another
    observation. `log.md` gets an appended
    `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
+   Inline `/hook/batch` ACKs include a bounded outcome per acknowledged index.
+   Process-lifetime ingest counters separate storage, replay, recovery, ignored
+   endings and deliberate drops. `last_persisted_ms` advances only after a new
+   durable write or terminal effect, so retries and no-op endings cannot make
+   an idle pipeline look active.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
    `Handoff` row for the next agent. One SQLite transaction inserts that
@@ -249,6 +254,12 @@ handoff/briefing delivery and MCP. The producer uses `extension`/`source_event`
 for provenance and stable, namespaced `ingest_key` values for retries. See the
 [external capture contract](external-lifecycle.md) for batching, identity and
 the limits of this cooperative process-scoped mode.
+
+Tools can also use MCP directly without lifecycle capture to write pages, query
+knowledge and claim handoffs. `GET /identity` reports the current machine caller
+even with the web UI disabled. With `--enable-web`, session summaries include
+the latest scoped consolidation job, and incremental `recent` pages use bounded
+keyset queries. See [programmatic memory](programmatic-memory.md).
 
 Lifecycle bodies have content limits independent of the 10 MiB HTTP request
 limit. User prompts and post-compaction summaries are capped UTF-8-safely at

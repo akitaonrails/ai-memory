@@ -29,9 +29,9 @@ use crate::server_profiles::{self, ProfileName, Rejection, ResolvedServer};
 use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
-    build_client, canonical_context, capture_policy, extract_cwd, get_handoff, marker_query_suffix,
-    marker_query_suffix_without_briefing, marker_requests_briefing, resolve_cwd_with_fallbacks,
-    url_encode,
+    build_client, canonical_context, capture_policy, extract_cwd, get_handoff, hook_scope,
+    marker_query_suffix, marker_query_suffix_without_briefing, marker_requests_briefing,
+    resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -597,13 +597,13 @@ where
     // fires before every model call; invocation zero is the only startup
     // boundary. Fail closed when the documented counter is absent so a later
     // invocation can never consume a handoff intended for the next session.
-    if !should_process_hook_event(agent_kind, hook_event, &json)
-        || is_redundant_cursor_copy(
+    let event_admits_capture = should_process_hook_event(agent_kind, hook_event, &json)
+        && !is_redundant_cursor_copy(
             agent_kind,
             &json,
             super::install_hooks::cursor_native_hooks_installed,
-        )
-    {
+        );
+    if !event_admits_capture && !args.check_capture {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
@@ -665,10 +665,34 @@ where
     let admits_capture = repository_admits_capture(capture_mode, marker_present);
     if args.check_capture {
         let protocol = decision.as_ref().map(|decision| decision.protocol());
+        let scope = policy_cwd.as_deref().map(|cwd| {
+            hook_scope(
+                cwd,
+                args.project_strategy
+                    .and_then(crate::cli::ProjectStrategyArg::baked),
+            )
+        });
+        let scope_resolution = match scope.as_ref() {
+            None => "unavailable",
+            Some(scope) if !scope.is_inspectable() => "unavailable",
+            Some(scope) if scope.is_partial() => "partial",
+            Some(scope) if scope.is_explicit() => "explicit",
+            Some(_) => "server-derived",
+        };
+        let policy_admits_capture = admits_capture
+            && event_admits_capture
+            && !matches!(route, HookRoute::Rejected { .. })
+            && scope_resolution != "partial"
+            && scope_resolution != "unavailable"
+            && protocol.is_none_or(|p| p.disposition() != CaptureDisposition::Drop);
         let mut output = serde_json::json!({
             "capture_mode": capture_mode,
             "marker_present": marker_present,
             "admits_capture": admits_capture && !external_capture,
+            "policy_admits_capture": policy_admits_capture,
+            "event_admits_capture": event_admits_capture,
+            "scope": scope,
+            "scope_resolution": scope_resolution,
             "version": protocol.map_or(1, |protocol| protocol.version()),
             "policy_state": protocol.map_or(PolicyState::Inactive, |protocol| protocol.policy_state()),
             "tool_family": protocol.map_or(ai_memory_hooks::ToolFamily::Unknown, |protocol| protocol.tool_family()),
@@ -2585,10 +2609,14 @@ mod tests {
                 "admits_capture",
                 "capture_mode",
                 "disposition",
+                "event_admits_capture",
                 "extraction_state",
                 "marker_present",
                 "path_count",
+                "policy_admits_capture",
                 "policy_state",
+                "scope",
+                "scope_resolution",
                 "server_profile",
                 "server_resolution",
                 "tool_family",
@@ -2597,6 +2625,123 @@ mod tests {
         );
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
         assert!(!String::from_utf8(stdout).unwrap().contains("SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn check_capture_refuses_partial_scope_and_excluded_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let marker = tmp.path().join(".ai-memory.toml");
+        for (declaration, path, admits, resolution) in [
+            ("workspace = \"team\"\n", "public.txt", false, "partial"),
+            (
+                "workspace = \"team\"\nproject = \"app\"\n",
+                "secret/token.txt",
+                false,
+                "explicit",
+            ),
+            (
+                "workspace = \"team\"\nproject = \"app\"\n",
+                "public.txt",
+                true,
+                "explicit",
+            ),
+        ] {
+            std::fs::write(
+                &marker,
+                format!("{declaration}[capture]\nignore_paths = [\"secret/**\"]\n"),
+            )
+            .unwrap();
+            let mut args = devin_hook_args("post-tool-use");
+            args.check_capture = true;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()), args,
+                serde_json::json!({"cwd":tmp.path(), "tool_name":"Edit", "tool_input":{"path":path,"content":"PRIVATE_CONTENT_SENTINEL"}}).to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("inspection must not spawn")),
+            ).await.unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(report["policy_admits_capture"], admits, "{report}");
+            assert_eq!(report["scope_resolution"], resolution);
+            assert_eq!(report["scope"]["workspace"], "team");
+            let printed = String::from_utf8(stdout).unwrap();
+            assert!(!printed.contains("PRIVATE_CONTENT_SENTINEL"));
+            assert!(!printed.contains("token.txt"));
+            assert!(!data_dir.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn check_capture_bounds_marker_hints_and_refuses_oversized_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        for (workspace, identity, admits) in [
+            ("x".repeat(513), "app".to_owned(), false),
+            ("team".to_owned(), "y".repeat(513), false),
+            ("team".to_owned(), "y".repeat(512), true),
+        ] {
+            std::fs::write(
+                tmp.path().join(".ai-memory.toml"),
+                format!(
+                    "workspace = \"{workspace}\"\nproject = \"app\"\nidentity = \"{identity}\"\n"
+                ),
+            )
+            .unwrap();
+            let mut args = devin_hook_args("post-tool-use");
+            args.check_capture = true;
+            let mut stdout = Vec::new();
+            run_with_payload(
+                Some(data_dir.clone()), args,
+                serde_json::json!({"cwd":tmp.path(), "tool_name":"Edit", "tool_input":{"path":"public.txt"}}).to_string(),
+                &mut stdout,
+                |_, _| Err(std::io::Error::other("inspection must not spawn")),
+            ).await.unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            assert_eq!(report["policy_admits_capture"], admits, "{report}");
+            assert_eq!(
+                report["scope_resolution"],
+                if admits { "explicit" } else { "unavailable" }
+            );
+            assert_eq!(report["scope"]["project"], "app");
+            let printed = String::from_utf8(stdout).unwrap();
+            for (field, value) in [("workspace", &workspace), ("identity", &identity)] {
+                if value.len() > 512 {
+                    assert!(report["scope"][field].is_null(), "{report}");
+                    assert!(!printed.contains(value));
+                } else {
+                    assert_eq!(report["scope"][field], value.as_str());
+                }
+            }
+            assert!(!data_dir.exists());
+            // Inspection bounds do not change the native routing contract.
+            let suffix = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+            assert!(suffix.contains(&workspace));
+            assert!(suffix.contains(&format!("&identity={identity}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn check_capture_reports_rejected_lifecycle_without_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut args = devin_hook_args("session-start");
+        args.agent = "antigravity-cli".into();
+        args.check_capture = true;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            serde_json::json!({"cwd":tmp.path(),"invocationNum":4}).to_string(),
+            &mut stdout,
+            |_, _| Err(std::io::Error::other("inspection must not spawn")),
+        )
+        .await
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(report["event_admits_capture"], false);
+        assert_eq!(report["policy_admits_capture"], false);
+        assert!(!data_dir.exists());
     }
 
     #[tokio::test]
@@ -3156,6 +3301,7 @@ mod tests {
             let stdout = run_prompt(&data_dir, args, cwd).await;
             let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
             assert_eq!(output["server_resolution"], resolution, "{}", cwd.display());
+            assert_eq!(output["policy_admits_capture"], resolution == "marker");
             let printed = String::from_utf8(stdout).unwrap();
             for secret in ["tok-", "https://", &*tmp.path().to_string_lossy()] {
                 assert!(!printed.contains(secret), "{printed}");

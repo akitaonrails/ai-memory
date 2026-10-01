@@ -93,6 +93,11 @@ fn external_devin_end_still_clears_native_identity() {
 #[test]
 fn capture_inspection_reports_external_ownership_without_side_effects() {
     let tmp = tempfile::tempdir().unwrap().keep();
+    std::fs::write(
+        tmp.join(".ai-memory.toml"),
+        "workspace = \"demo\"\nproject = \"app\"\n",
+    )
+    .unwrap();
     let output = hook(
         tmp.as_path(),
         "claude-code",
@@ -103,6 +108,11 @@ fn capture_inspection_reports_external_ownership_without_side_effects() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["external_capture"], true);
     assert_eq!(report["admits_capture"], false);
+    assert_eq!(report["policy_admits_capture"], true);
+    assert_eq!(report["scope"]["workspace"], "demo");
+    assert_eq!(report["scope"]["project"], "app");
+    assert_eq!(report["scope_resolution"], "explicit");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("orchestrator-a"));
     assert!(!tmp.as_path().join("data").exists());
 }
 

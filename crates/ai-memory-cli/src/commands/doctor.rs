@@ -77,6 +77,7 @@ pub(crate) struct CoverageRow {
     /// True when the harness ran here recently but captured nothing — the
     /// high-confidence "hook is missing" signal.
     uncaptured: bool,
+    mixed_capture_sessions: Option<u64>,
 }
 
 impl CoverageRow {
@@ -104,6 +105,27 @@ struct ByAgentResponse {
 struct AgentCount {
     agent: String,
     sessions: u64,
+    #[serde(default)]
+    mixed_capture_sessions: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OperatorIdentity {
+    version: String,
+    level: String,
+    operator: Option<String>,
+    distinguishes_operators: bool,
+}
+
+async fn read_identity(ep: &ServerEndpoint) -> Option<OperatorIdentity> {
+    match get_json::<OperatorIdentity>(ep, "/identity", &[]).await {
+        Ok(identity) => Some(identity),
+        Err(error) if super::is_scope_not_found(&error) => None,
+        Err(_) => {
+            eprintln!("Machine identity is unavailable; showing capture coverage only.");
+            None
+        }
+    }
 }
 
 /// The full report, also the JSON output shape.
@@ -116,6 +138,8 @@ struct DoctorReport {
     rows: Vec<CoverageRow>,
     /// The agent kinds (kebab form) flagged as uncaptured, for quick scripting.
     uncaptured: Vec<String>,
+    capture_owner_active: bool,
+    identity: Option<OperatorIdentity>,
 }
 
 /// Fold the raw per-harness local scans and the server's captured counts into
@@ -157,6 +181,7 @@ pub(crate) fn build_rows(
                 local_recent,
                 captured,
                 uncaptured,
+                mixed_capture_sessions: None,
             }
         })
         .filter(|row| row.local_total > 0 || row.captured > 0)
@@ -256,7 +281,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         super::run::native_home(config).context("locating the local harness session stores")?;
 
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
-    let captured: BTreeMap<String, u64> = match get_json::<ByAgentResponse>(
+    let captured = match get_json::<ByAgentResponse>(
         &ep,
         "/admin/sessions/by-agent",
         &[
@@ -266,15 +291,11 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     )
     .await
     {
-        Ok(response) => response
-            .by_agent
-            .into_iter()
-            .map(|c| (c.agent, c.sessions))
-            .collect(),
+        Ok(response) => response.by_agent,
         // A project that has never been captured into does not exist
         // server-side yet (404) — that is "nothing captured", not an error, so
         // every local harness correctly reads as uncaptured.
-        Err(error) if super::is_scope_not_found(&error) => BTreeMap::new(),
+        Err(error) if super::is_scope_not_found(&error) => Vec::new(),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("asking the server for captured session counts for {workspace}/{project}")
@@ -282,8 +303,20 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         }
     };
 
+    let identity = read_identity(&ep).await;
+
     let local = scan_local(&home, &cwd, args.since_days).await;
-    let rows = build_rows(&local, &captured);
+    let counts = captured
+        .iter()
+        .map(|count| (count.agent.clone(), count.sessions))
+        .collect();
+    let mut rows = build_rows(&local, &counts);
+    for row in &mut rows {
+        row.mixed_capture_sessions = captured
+            .iter()
+            .find(|count| count.agent == row.agent)
+            .and_then(|count| count.mixed_capture_sessions);
+    }
     let uncaptured: Vec<String> = rows
         .iter()
         .filter(|r| r.uncaptured)
@@ -297,6 +330,8 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         since_days: args.since_days,
         rows,
         uncaptured,
+        capture_owner_active: config.runtime_env.capture_owner_active(),
+        identity,
     };
 
     if args.json {
@@ -312,6 +347,22 @@ fn render_human(report: &DoctorReport) {
         "Capture coverage for {}/{} (server {})",
         report.workspace, report.project, report.server
     );
+    if let Some(identity) = &report.identity {
+        println!(
+            "  identity: {} ({}, server {})",
+            identity.operator.as_deref().unwrap_or("anonymous"),
+            identity.level,
+            identity.version
+        );
+    } else {
+        println!("  identity: unavailable");
+    }
+    if report.capture_owner_active {
+        println!(
+            "  AI_MEMORY_CAPTURE_OWNER is active: native capture is suppressed in this process.\n  \
+             Confirm the external producer is delivering events."
+        );
+    }
     if report.since_days == 0 {
         println!("  recent window: all on-disk sessions\n");
     } else {
@@ -330,10 +381,22 @@ fn render_human(report: &DoctorReport) {
             row.agent, row.local_total, row.local_recent, row.captured
         );
         if row.uncaptured {
+            if report.capture_owner_active {
+                println!(
+                    "      No captured session: check the external producer and repository policy."
+                );
+            } else {
+                println!(
+                    "      Ran here but nothing was captured; install its hook:\n        \
+                     ai-memory install-hooks --agent {} --apply",
+                    row.agent
+                );
+            }
+        }
+        if let Some(count) = row.mixed_capture_sessions.filter(|count| *count > 0) {
             println!(
-                "      └ ran here but nothing was captured — install its hook:\n        \
-                 ai-memory install-hooks --agent {} --apply",
-                row.agent
+                "      {count} session(s) contain events from multiple capture sources.\n      \
+                 Backfill can also mix source metadata; this does not prove duplicate capture."
             );
         }
     }
@@ -343,7 +406,7 @@ fn render_human(report: &DoctorReport) {
     } else {
         println!(
             "\n⚠ {} harness(es) ran here recently with no captured sessions: {}.\n  \
-             Install the hook(s) above, then re-run `ai-memory doctor` to confirm.",
+             Check the capture path above, then re-run `ai-memory doctor`.",
             report.uncaptured.len(),
             report.uncaptured.join(", ")
         );
@@ -353,6 +416,55 @@ fn render_human(report: &DoctorReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn identity_diagnostics_degrade_on_server_and_decode_errors() {
+        for (status, body, available) in [
+            (500, "unavailable", false),
+            (403, "forbidden", false),
+            (200, "<html>legacy SPA</html>", false),
+            (404, "missing", false),
+            (
+                200,
+                r#"{"version":"2.5.0","level":"anonymous","operator":null,"distinguishes_operators":false}"#,
+                true,
+            ),
+        ] {
+            let app = axum::Router::new().route(
+                "/identity",
+                axum::routing::get(move || async move {
+                    (axum::http::StatusCode::from_u16(status).unwrap(), body)
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ep = ServerEndpoint::from_pair(
+                Some(format!("http://{}", listener.local_addr().unwrap())),
+                None,
+            );
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            assert_eq!(
+                read_identity(&ep).await.is_some(),
+                available,
+                "status {status}"
+            );
+            task.abort();
+        }
+    }
+
+    #[test]
+    fn an_older_server_leaves_provenance_unknown() {
+        let legacy: ByAgentResponse =
+            serde_json::from_str(r#"{"by_agent":[{"agent":"codex","sessions":2}]}"#).unwrap();
+        assert_eq!(legacy.by_agent[0].sessions, 2);
+        assert_eq!(legacy.by_agent[0].mixed_capture_sessions, None);
+        let current: ByAgentResponse = serde_json::from_str(
+            r#"{"by_agent":[{"agent":"codex","sessions":2,"mixed_capture_sessions":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(current.by_agent[0].mixed_capture_sessions, Some(1));
+    }
 
     fn scan(agent: AgentKind, total: usize, recent: usize) -> LocalScan {
         LocalScan {

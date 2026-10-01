@@ -432,6 +432,23 @@ prints only bounded decision metadata (protocol version, policy state, tool
 family, path count, disposition, and extraction state), never paths, patterns,
 or payload content:
 
+The same inspection also reports sanitized `scope` hints (`workspace`, `project`,
+`project_src`, `project_strategy`, `identity`, `identity_src`,
+`server_may_remap`) and `scope_resolution`. These are local hints, not a
+server lookup: inspection creates no project and may report server-derived
+coordinates that the server later remaps. Partial marker scope fails closed.
+`event_admits_capture` reports lifecycle eligibility. External producers use
+`policy_admits_capture`, which also checks exclusions and server-profile
+resolution while ignoring `AI_MEMORY_CAPTURE_OWNER`. The existing
+`admits_capture` field still reports native capture admission. Each scope hint
+is limited to 512 bytes. Oversized names are omitted (`null`), report
+`scope_resolution: "unavailable"` and refuse producer admission; native
+routing remains unchanged.
+The native hook can derive a project for a marker that declares only
+`workspace`. Producer preflight is stricter: declare both names, or provide
+`repo-root` so both resolve locally. An absent cwd also returns unavailable
+scope and refuses producer admission.
+
 ```bash
 printf '%s\n' '{"session_id":"demo","cwd":"/example/workspace","tool_name":"Edit","tool_input":{"path":"docs/example.md"}}' \
   | ai-memory hook --event post-tool-use --agent claude-code \

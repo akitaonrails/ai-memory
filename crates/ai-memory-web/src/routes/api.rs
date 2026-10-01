@@ -452,21 +452,187 @@ async fn search_scopes(
     Ok(hits)
 }
 
+#[derive(Deserialize)]
+struct RecentQuery {
+    #[serde(default = "default_limit")]
+    limit: usize,
+    updated_since: Option<String>,
+    cursor: Option<String>,
+}
+
+// Versioned hex-encoded JSON is opaque to callers and bounded before decoding.
+// Scope ids are checked after normal authorization, never used to resolve scope.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecentCursor {
+    v: u8,
+    workspace: WorkspaceId,
+    project: ProjectId,
+    since: String,
+    updated_at: String,
+    path: String,
+}
+
+fn recent_instant(value: &str) -> ApiParseResult<jiff::Timestamp> {
+    let bytes = value.as_bytes();
+    let invalid = || ApiFailure::bad_request("invalid RFC3339 timestamp");
+    if bytes.len() < 20
+        || bytes.len() > 64
+        || !value.is_ascii()
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || ![0..4, 5..7, 8..10, 11..13, 14..16, 17..19]
+            .into_iter()
+            .all(|range| bytes[range].iter().all(u8::is_ascii_digit))
+    {
+        return Err(invalid());
+    }
+    let mut rest = &value[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || digits > 9 {
+            return Err(invalid());
+        }
+        rest = &fraction[digits..];
+    }
+    if rest != "Z" && rest != "z" {
+        let zone = rest.as_bytes();
+        if zone.len() != 6
+            || !matches!(zone[0], b'+' | b'-')
+            || zone[3] != b':'
+            || !zone[1..3].iter().chain(&zone[4..6]).all(u8::is_ascii_digit)
+        {
+            return Err(invalid());
+        }
+    }
+    value.parse::<jiff::Timestamp>().map_err(|_| invalid())
+}
+
+fn encode_recent_cursor(cursor: &RecentCursor) -> ApiParseResult<String> {
+    let bytes = serde_json::to_vec(cursor).map_err(|_| ApiFailure {
+        message: "internal server error".into(),
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
+    let raw = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    decode_recent_cursor(&raw)?;
+    Ok(raw)
+}
+
+fn decode_recent_cursor(raw: &str) -> ApiParseResult<RecentCursor> {
+    if raw.len() > 8192 || !raw.len().is_multiple_of(2) || raw.is_empty() {
+        return Err(ApiFailure::bad_request("invalid recent cursor"));
+    }
+    let bytes = raw
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).map_err(|_| ())?;
+            u8::from_str_radix(pair, 16).map_err(|_| ())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ApiFailure::bad_request("invalid recent cursor"))?;
+    let cursor: RecentCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| ApiFailure::bad_request("invalid recent cursor"))?;
+    if cursor.v != 1 || cursor.path.len() > 2048 || PagePath::new(&cursor.path).is_err() {
+        return Err(ApiFailure::bad_request("invalid recent cursor"));
+    }
+    Ok(cursor)
+}
+
 async fn recent_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
-    Query(query): Query<LimitQuery>,
+    Query(query): Query<RecentQuery>,
 ) -> Result<Response, Response> {
-    let _ = lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
+    let (workspace_id, project_id) =
+        lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
+    let limit = query.limit.clamp(1, 100);
+    if query.updated_since.is_none() && query.cursor.is_none() {
+        let mut pages = state
+            .reader
+            .list_pages(&workspace, &project)
+            .await
+            .map_err(internal_error)?;
+        pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        pages.truncate(limit);
+        return Ok(with_cache(Json(pages).into_response(), LIST_CACHE_MAX_AGE));
+    }
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_recent_cursor)
+        .transpose()
+        .map_err(ApiFailure::into_response)?;
+    let (since, after) = if let Some(cursor) = cursor {
+        if cursor.workspace != workspace_id || cursor.project != project_id {
+            return Err(
+                ApiFailure::bad_request("recent cursor does not match scope").into_response(),
+            );
+        }
+        let since = recent_instant(&cursor.since).map_err(ApiFailure::into_response)?;
+        let after = recent_instant(&cursor.updated_at).map_err(ApiFailure::into_response)?;
+        if after <= since
+            || query
+                .updated_since
+                .as_deref()
+                .map(recent_instant)
+                .transpose()
+                .map_err(ApiFailure::into_response)?
+                .is_some_and(|bound| bound != since)
+        {
+            return Err(ApiFailure::bad_request("conflicting recent cursor bounds").into_response());
+        }
+        (since, Some((after.as_microsecond(), cursor.path)))
+    } else {
+        (
+            recent_instant(query.updated_since.as_deref().unwrap_or_default())
+                .map_err(ApiFailure::into_response)?,
+            None,
+        )
+    };
+    // SQL timestamps have microsecond precision. Flooring a submicrosecond
+    // cutoff retains exactly the rows strictly later than the supplied instant.
     let mut pages = state
         .reader
-        .list_pages(&workspace, &project)
+        .incremental_pages(
+            workspace_id,
+            project_id,
+            i64::try_from(since.as_nanosecond().div_euclid(1000)).map_err(internal_error)?,
+            after,
+            limit,
+        )
         .await
         .map_err(internal_error)?;
-    pages.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    pages.truncate(query.limit.clamp(1, 100));
-    Ok(with_cache(Json(pages).into_response(), LIST_CACHE_MAX_AGE))
+    let has_more = pages.len() > limit;
+    pages.truncate(limit);
+    let next_cursor = if has_more {
+        pages
+            .last()
+            .map(|page| {
+                encode_recent_cursor(&RecentCursor {
+                    v: 1,
+                    workspace: workspace_id,
+                    project: project_id,
+                    since: since.to_string(),
+                    updated_at: page.updated_at.clone(),
+                    path: page.path.clone(),
+                })
+            })
+            .transpose()
+            .map_err(ApiFailure::into_response)?
+    } else {
+        None
+    };
+    Ok(with_no_store(
+        Json(serde_json::json!({ "pages": pages, "next_cursor": next_cursor })).into_response(),
+    ))
 }
 
 async fn briefing_handler(
@@ -1477,6 +1643,44 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recent_cursor_validates_rfc3339_and_bounded_payload() {
+        for value in [
+            "2026-09-30T10:00:00Z",
+            "2026-09-30T10:00:00.123456789-03:00",
+            "1969-12-31T23:59:59.999999999Z",
+        ] {
+            assert!(super::recent_instant(value).is_ok(), "{value}");
+        }
+        for value in [
+            "2026-09-30",
+            "2026-09-30 10:00:00Z",
+            "2026-09-30T10:00:00",
+            "2026-09-30T10:00:00Z[UTC]",
+            "2026-09-30T10:00:00+0300",
+            "2026-09-30T10:00:00.1234567890Z",
+        ] {
+            assert!(super::recent_instant(value).is_err(), "{value}");
+        }
+        let cursor = super::RecentCursor {
+            v: 1,
+            workspace: super::WorkspaceId::new(),
+            project: super::ProjectId::new(),
+            since: "2000-01-01T00:00:00Z".into(),
+            updated_at: "2026-09-30T10:00:00Z".into(),
+            path: "page.md".into(),
+        };
+        let raw = super::encode_recent_cursor(&cursor).unwrap();
+        assert_eq!(super::decode_recent_cursor(&raw).unwrap().path, "page.md");
+        let invalid = super::RecentCursor {
+            path: "../page.md".into(),
+            ..cursor
+        };
+        assert!(super::encode_recent_cursor(&invalid).is_err());
+        assert!(super::decode_recent_cursor(&"a".repeat(8194)).is_err());
+        assert!(super::decode_recent_cursor("7b7d").is_err());
+    }
+
     use super::{internal_error, serves_handoff_body};
     use ai_memory_core::{AuthLevel, OwnerFilter};
     use axum::{Extension, body::to_bytes};

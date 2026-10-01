@@ -16,6 +16,13 @@ a derived SQLite index for search. Everything is **scoped per project**
 LLM at all (capture + full-text search + rule-based summaries); adding a provider
 enables consolidation and auto-improvement.
 
+## Recipe: use ai-memory as your tool's memory
+
+Call the existing MCP tools to save pages, query knowledge and pass a handoff
+between executions. Native hooks are optional. The [programmatic memory guide](programmatic-memory.md)
+includes complete HTTP requests, scope rules and machine authentication.
+If your tool also hosts a harness, follow its optional lifecycle-capture section.
+
 ## Everyday tasks (through your agent, over MCP)
 
 You mostly just talk to your agent; it calls the right tool. Common ones:

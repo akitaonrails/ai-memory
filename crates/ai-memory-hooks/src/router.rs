@@ -639,7 +639,7 @@ async fn handle_hook(
     // Any gate failure leaves an empty Stop with the same 202 "queued" response.
     crate::assistant_capture::apply_assistant_backstop(&mut env, state.capture_assistant_enabled);
     let Some(env) = inspect_capture_envelope(env) else {
-        state.ingest_metrics.record_dropped_by_policy();
+        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "capture policy dropped");
     };
     // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
@@ -662,7 +662,7 @@ async fn handle_hook(
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     if should_drop_subagent(&state, &env, viewer).await {
-        state.ingest_metrics.record_dropped_by_policy();
+        HookProcessingOutcome::DroppedSubagent.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "subagent capture dropped");
     }
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
@@ -684,8 +684,7 @@ async fn handle_hook(
     state.ingest_metrics.record_accepted();
     tokio::spawn(async move {
         let _permit = permit;
-        let metrics = state.ingest_metrics.clone();
-        let persisted = process_envelope(
+        let _ = process_envelope(
             state,
             env,
             actor,
@@ -694,15 +693,6 @@ async fn handle_hook(
             viewer,
         )
         .await;
-        // Stamped only when `process_envelope` actually cleared the writer.
-        // This is the signal an operator uses to tell "hooks are arriving but
-        // nothing is landing" from "nothing is arriving" — the two look
-        // identical from the accepted count alone — so a failed write must
-        // NOT advance it, or a store that is rejecting every event still
-        // reads as a healthy writer in `ai-memory status`.
-        if persisted {
-            metrics.record_persisted(now_unix_ms());
-        }
     });
     (StatusCode::ACCEPTED, "queued")
 }
@@ -721,15 +711,72 @@ pub struct HookBatchItem {
     pub body: serde_json::Value,
 }
 
+/// Final processing classification for an acknowledged hook delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookProcessingOutcome {
+    /// A new observation was stored.
+    Stored,
+    /// A completed keyed delivery was repeated.
+    Replayed,
+    /// `ResumePending` retried downstream effects, without promising new writes.
+    /// An `AlreadyEnded` recovery also uses this when a wiki commit or a new
+    /// consolidation job was produced.
+    Resumed,
+    /// Missing/scoped-invalid ends and already-ended deliveries with no
+    /// recovered wiki commit or new consolidation job.
+    IgnoredEnd,
+    /// Capture policy discarded the delivery.
+    DroppedPolicy,
+    /// Subagent capture was disabled.
+    DroppedSubagent,
+    /// The caller lacked project write access.
+    DroppedUnauthorized,
+    /// Session identity or ownership conflicted.
+    DroppedCollision,
+}
+
+impl HookProcessingOutcome {
+    fn record(self, metrics: &ai_memory_core::IngestMetrics) {
+        match self {
+            Self::Stored => metrics.record_stored(),
+            Self::Replayed => metrics.record_replayed(),
+            Self::Resumed => metrics.record_resumed(),
+            Self::IgnoredEnd => metrics.record_ignored_end(),
+            Self::DroppedPolicy => {
+                metrics.record_dropped_policy();
+                metrics.record_dropped_by_policy();
+            }
+            Self::DroppedSubagent => {
+                metrics.record_dropped_subagent();
+                metrics.record_dropped_by_policy();
+            }
+            Self::DroppedUnauthorized => metrics.record_dropped_unauthorized(),
+            Self::DroppedCollision => metrics.record_dropped_collision(),
+        }
+    }
+}
+
+/// Processing result for one acknowledged batch index.
+#[derive(Debug, Serialize)]
+pub struct HookBatchResult {
+    /// Original zero-based request index.
+    pub index: usize,
+    /// Terminal processing outcome.
+    pub outcome: HookProcessingOutcome,
+}
+
 /// Response to `POST /hook/batch`: legacy clients read the contiguous leading
 /// prefix in `accepted`; newer clients prefer `accepted_indices` when present to
 /// retain only non-contiguous items skipped by per-source rate limiting.
 #[derive(Debug, Serialize)]
 pub struct HookBatchAck {
-    /// Contiguous leading prefix committed, oldest-first. Kept for old spool
+    /// Contiguous leading prefix acknowledged, oldest-first. Kept for old spool
     /// drains and as a safe lower bound when `accepted_indices` is absent.
     pub accepted: usize,
-    /// Non-contiguous item indexes committed by a server new enough to keep
+    /// Results only for acknowledged request indices.
+    pub results: Vec<HookBatchResult>,
+    /// Non-contiguous item indexes acknowledged by a server new enough to keep
     /// scanning past per-source rate-limited items. Omitted when it is exactly
     /// the legacy accepted prefix so older clients keep working.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -741,9 +788,15 @@ pub struct HookBatchAck {
 }
 
 impl HookBatchAck {
+    fn with_results(mut self, results: Vec<HookBatchResult>) -> Self {
+        self.results = results;
+        self
+    }
+
     fn prefix(accepted: usize) -> Self {
         Self {
             accepted,
+            results: Vec::new(),
             accepted_indices: None,
             failed_index: None,
         }
@@ -779,6 +832,7 @@ impl HookBatchAck {
             .all(|(pos, idx)| pos == idx);
         Self {
             accepted: legacy_prefix,
+            results: Vec::new(),
             accepted_indices: if contiguous && !(include_empty_indices && indices.is_empty()) {
                 None
             } else {
@@ -826,6 +880,7 @@ async fn handle_hook_batch(
     let skip_webhooks = admission_skips(level_ext, &headers);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     let mut accepted_indices = Vec::new();
+    let mut results = Vec::new();
     let total_items = items.len();
     for (idx, mut item) in items.into_iter().enumerate() {
         // Same unconditional assistant-message backstop as `handle_hook`, applied
@@ -841,7 +896,11 @@ async fn handle_hook_batch(
             // A protocol-directed drop is committed from the spool's point of
             // view, but intentionally spends neither ingress capacity nor a
             // source-rate token.
-            state.ingest_metrics.record_dropped_by_policy();
+            HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedPolicy,
+            });
             accepted_indices.push(idx);
             continue;
         };
@@ -849,7 +908,11 @@ async fn handle_hook_batch(
         // as committed so the client clears it from its spool, but do not store
         // it. Keeps the contiguous-prefix ack contract intact.
         if should_drop_subagent(&state, &env, viewer).await {
-            state.ingest_metrics.record_dropped_by_policy();
+            HookProcessingOutcome::DroppedSubagent.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedSubagent,
+            });
             accepted_indices.push(idx);
             continue;
         }
@@ -867,7 +930,7 @@ async fn handle_hook_batch(
             );
             return (
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(HookBatchAck::indexed(accepted_indices)),
+                Json(HookBatchAck::indexed(accepted_indices).with_results(results)),
             );
         };
         let rate_key = ingest_rate_key(&env, actor_storage_key.as_deref());
@@ -885,7 +948,7 @@ async fn handle_hook_batch(
         let _permit = permit;
         state.ingest_metrics.record_accepted();
         let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
-        if let Err(e) = process_authorized(
+        let outcome = match process_authorized(
             &state,
             env,
             actor.clone(),
@@ -895,44 +958,39 @@ async fn handle_hook_batch(
         )
         .await
         {
-            if e.downcast_ref::<CaptureNotAuthorized>().is_some() {
-                // Counted as accepted so the client DROPS it. The item can
-                // never be stored, so leaving it spooled would retry it until
-                // its attempt budget ran out and stall every item behind it.
-                // Same treatment a capture-policy drop already gets.
-                state.ingest_metrics.record_dropped_unauthorized();
+            Ok(outcome) => outcome,
+            Err(e) if e.downcast_ref::<CaptureNotAuthorized>().is_some() => {
                 warn!("hook batch capture dropped: author may not write this project");
-                accepted_indices.push(idx);
-                continue;
+                HookProcessingOutcome::DroppedUnauthorized
             }
-            if matches!(
-                e.downcast_ref::<StoreError>(),
-                Some(StoreError::SessionCollision)
-            ) {
-                warn!(
-                    session = ?session,
-                    agent = %agent.as_str(),
-                    event = ?event,
-                    reason = SESSION_COLLISION_REASON,
-                    "hook batch session collision/recovery rejection dropped"
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<StoreError>(),
+                    Some(StoreError::SessionCollision)
+                ) =>
+            {
+                warn!(session = ?session, agent = %agent.as_str(), event = ?event, reason = SESSION_COLLISION_REASON, "hook batch session collision dropped");
+                HookProcessingOutcome::DroppedCollision
+            }
+            Err(e) => {
+                state.ingest_metrics.record_failed();
+                warn!(error = %e, accepted = accepted_indices.len(), "hook batch item failed; stopping (fail-fast)");
+                return (
+                    StatusCode::OK,
+                    Json(HookBatchAck::indexed_failed(accepted_indices, idx).with_results(results)),
                 );
-                accepted_indices.push(idx);
-                continue;
             }
-            warn!(error = %e, accepted = accepted_indices.len(), "hook batch item failed; stopping (fail-fast)");
-            return (
-                StatusCode::OK,
-                Json(HookBatchAck::indexed_failed(accepted_indices, idx)),
-            );
-        }
-        // Stamped per item, for the same reason `handle_hook` stamps after
-        // `process_envelope`: this is the point the event cleared the writer.
-        state.ingest_metrics.record_persisted(now_unix_ms());
+        };
+        outcome.record(&state.ingest_metrics);
+        results.push(HookBatchResult {
+            index: idx,
+            outcome,
+        });
         accepted_indices.push(idx);
     }
     (
         StatusCode::OK,
-        Json(HookBatchAck::indexed_full_scan(accepted_indices)),
+        Json(HookBatchAck::indexed_full_scan(accepted_indices).with_results(results)),
     )
 }
 
@@ -2638,10 +2696,7 @@ fn sticky_cwd_admits(
 const SESSION_COLLISION_REASON: &str =
     "session id belongs to another owner or agent, or all-owners recovery was refused";
 
-/// Returns `true` when the event cleared the writer, so the caller can stamp
-/// the ingest "last write" metric. A rejected or failed event returns `false`:
-/// nothing was persisted, and pretending otherwise hides exactly the outage
-/// the metric exists to expose.
+/// Process an asynchronous delivery with the same classification as batch ingress.
 async fn process_envelope(
     state: Arc<HookState>,
     env: HookEnvelope,
@@ -2649,19 +2704,20 @@ async fn process_envelope(
     level: ai_memory_core::AuthLevel,
     skip_webhooks: Vec<String>,
     viewer: Option<ai_memory_core::UserId>,
-) -> bool {
+) -> Option<HookProcessingOutcome> {
     let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
-    if let Err(e) = process_authorized(&state, env, actor, level, skip_webhooks, viewer).await {
-        if e.downcast_ref::<CaptureNotAuthorized>().is_some() {
-            // Counted separately from a policy drop so an operator can tell
-            // "my configuration is discarding these" from "somebody has been
-            // working all day and none of it is being kept".
-            state.ingest_metrics.record_dropped_unauthorized();
+    let outcome = match process_authorized(&state, env, actor, level, skip_webhooks, viewer).await {
+        Ok(outcome) => outcome,
+        Err(e) if e.downcast_ref::<CaptureNotAuthorized>().is_some() => {
             warn!("capture dropped: author may not write this project");
-        } else if matches!(
-            e.downcast_ref::<StoreError>(),
-            Some(StoreError::SessionCollision)
-        ) {
+            HookProcessingOutcome::DroppedUnauthorized
+        }
+        Err(e)
+            if matches!(
+                e.downcast_ref::<StoreError>(),
+                Some(StoreError::SessionCollision)
+            ) =>
+        {
             warn!(
                 session = ?session,
                 agent = %agent.as_str(),
@@ -2669,12 +2725,16 @@ async fn process_envelope(
                 reason = SESSION_COLLISION_REASON,
                 "hook session collision dropped"
             );
-        } else {
-            warn!(error = %e, "hook processing failed");
+            HookProcessingOutcome::DroppedCollision
         }
-        return false;
-    }
-    true
+        Err(e) => {
+            state.ingest_metrics.record_failed();
+            warn!(error = %e, "hook processing failed");
+            return None;
+        }
+    };
+    outcome.record(&state.ingest_metrics);
+    Some(outcome)
 }
 
 async fn enqueue_session_end_consolidation(
@@ -2682,28 +2742,31 @@ async fn enqueue_session_end_consolidation(
     session_id: SessionId,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     if !state.consolidate_on_session_end || state.consolidator.is_none() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(notify) = state.session_consolidation_notify.as_ref() else {
         warn!(
             session = %session_id,
             "SessionEnd LLM consolidation enabled without a queue worker"
         );
-        return Ok(());
+        return Ok(false);
     };
     let inserted = state
         .writer
         .enqueue_session_consolidation(workspace_id, project_id, session_id)
         .await?;
+    if inserted {
+        state.ingest_metrics.record_persisted(now_unix_ms());
+    }
     notify.notify_one();
     debug!(
         session = %session_id,
         inserted,
         "SessionEnd LLM consolidation queued"
     );
-    Ok(())
+    Ok(inserted)
 }
 
 /// Only events that begin or actively advance work may move the legacy
@@ -2763,7 +2826,7 @@ async fn process(
         {
             Ok(())
         }
-        result => result,
+        result => result.map(|_| ()),
     }
 }
 
@@ -2776,7 +2839,7 @@ async fn process_authorized(
     // Empty for every caller with no HTTP request behind it.
     skip_webhooks: Vec<String>,
     viewer: Option<ai_memory_core::UserId>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HookProcessingOutcome> {
     let session_id = resolve_session_id(&env)?;
     // An OpenCode `session.moved` relocation, forwarded by the plugin as a
     // SessionStart naming the directory the session left. Admission rebinds
@@ -3059,7 +3122,7 @@ async fn process_authorized(
     let (admitted, ingest) = match admission {
         HookSessionAdmission::InvalidMissingEnd => {
             info!(session = %session_id, "ignoring missing SessionEnd");
-            return Ok(());
+            return Ok(HookProcessingOutcome::IgnoredEnd);
         }
         HookSessionAdmission::InvalidScopedEnd => {
             info!(
@@ -3067,18 +3130,23 @@ async fn process_authorized(
                 agent = %env.agent.as_str(),
                 "ignoring SessionEnd naming a different scope than its session"
             );
-            return Ok(());
+            return Ok(HookProcessingOutcome::IgnoredEnd);
         }
         HookSessionAdmission::AlreadyEnded { session } => {
             let commit_msg = format!("repair session {}", short_id(&session_id.to_string()));
+            let mut recovered = false;
             match state.wiki.commit_all(&commit_msg) {
-                Ok(Some(oid)) => debug!(commit = %oid, "wiki recovery auto-commit"),
+                Ok(Some(oid)) => {
+                    recovered = true;
+                    state.ingest_metrics.record_persisted(now_unix_ms());
+                    debug!(commit = %oid, "wiki recovery auto-commit");
+                }
                 Ok(None) => debug!("wiki clean during SessionEnd recovery"),
                 Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
             }
             let observations = state.reader.observations_for_session(session_id).await?;
             if !is_ephemeral_session(&observations) {
-                enqueue_session_end_consolidation(
+                recovered |= enqueue_session_end_consolidation(
                     state,
                     session_id,
                     session.workspace_id(),
@@ -3092,15 +3160,25 @@ async fn process_authorized(
                     .complete_observation_ingest_if_claimed(session.project_id(), key)
                     .await?;
             }
-            return Ok(());
+            return Ok(if recovered {
+                HookProcessingOutcome::Resumed
+            } else {
+                HookProcessingOutcome::IgnoredEnd
+            });
         }
         HookSessionAdmission::Observation { session, ingest }
         | HookSessionAdmission::EndOpen { session, ingest }
         | HookSessionAdmission::ReEnd { session, ingest } => (session, ingest),
     };
     if ingest == IngestObservationOutcome::AlreadyComplete {
-        return Ok(());
+        return Ok(HookProcessingOutcome::Replayed);
     }
+    let outcome = if matches!(ingest, IngestObservationOutcome::Inserted(_)) {
+        state.ingest_metrics.record_persisted(now_unix_ms());
+        HookProcessingOutcome::Stored
+    } else {
+        HookProcessingOutcome::Resumed
+    };
     if ingest == IngestObservationOutcome::ResumePending {
         debug!("resuming incomplete keyed hook event");
     }
@@ -3209,16 +3287,17 @@ async fn process_authorized(
             if let Some(key) = ingest_key {
                 state.writer.complete_observation_ingest(proj, key).await?;
             }
-            return Ok(());
+            return Ok(outcome);
         }
         let (page_ws, page_proj) = checkpoint_scope.unwrap_or((ws, proj));
         if is_ephemeral_session(&observations) {
-            let outcome = state
+            let lifecycle_outcome = state
                 .writer
                 .end_admitted_lifecycle_only_session(admitted.clone(), env.occurred_at_micros())
                 .await?;
-            match outcome {
+            match lifecycle_outcome {
                 ai_memory_store::LifecycleOnlyEndOutcome::Ended { reopened_handoff } => {
+                    state.ingest_metrics.record_persisted(now_unix_ms());
                     let commit_msg = format!(
                         "lifecycle-only session {}",
                         short_id(&session_id.to_string()),
@@ -3236,7 +3315,7 @@ async fn process_authorized(
                     if let Some(key) = ingest_key {
                         state.writer.complete_observation_ingest(proj, key).await?;
                     }
-                    return Ok(());
+                    return Ok(outcome);
                 }
                 ai_memory_store::LifecycleOnlyEndOutcome::Substantive => {
                     observations = state.reader.observations_for_session(session_id).await?;
@@ -3257,6 +3336,10 @@ async fn process_authorized(
             admitted.agent_kind(),
             &observations,
         );
+        let previous_page_id = state
+            .reader
+            .latest_page_id_by_ids(page_ws, page_proj, new_page.path.as_str().to_owned())
+            .await?;
         let page_id = state
             .wiki
             .write_page(ai_memory_wiki::WritePageRequest {
@@ -3280,6 +3363,9 @@ async fn process_authorized(
                 evidence: Vec::new(),
             })
             .await?;
+        if previous_page_id != Some(page_id) {
+            state.ingest_metrics.record_persisted(now_unix_ms());
+        }
         // The baton follows the SESSION's owner, so it reaches the person who
         // was working, not whoever flushed the event. Run through the ownership
         // gate again because even an attributed session remains shared on a
@@ -3382,6 +3468,11 @@ async fn process_authorized(
                 }
             }
         };
+        // An admitted open/re-end transition committed even when its summary
+        // page was already present from an interrupted delivery.
+        if !turn_checkpoint {
+            state.ingest_metrics.record_persisted(now_unix_ms());
+        }
         if handoff_id.is_some()
             && let Some(ctx) = &admission_ctx
         {
@@ -3439,7 +3530,7 @@ async fn process_authorized(
         state.writer.complete_observation_ingest(proj, key).await?;
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 /// Parse the persisted owner without turning corrupt owned data into shared
@@ -3786,6 +3877,14 @@ async fn consolidate_or_synth(
     checkpoint_label: &str,
     actor: ai_memory_core::ActorContext,
 ) -> anyhow::Result<()> {
+    let previous_page_id = state
+        .reader
+        .latest_page_id_by_ids(
+            workspace_id,
+            project_id,
+            format!("sessions/{session_id}.md"),
+        )
+        .await?;
     let fallback_from_llm = state.consolidator.is_some();
     if let Some(c) = state.consolidator.as_ref() {
         let result = c
@@ -3798,6 +3897,10 @@ async fn consolidate_or_synth(
             .await;
         match result {
             Ok(outcome) => {
+                if outcome.page_id.is_some() && outcome.page_id != previous_page_id {
+                    state.ingest_metrics.record_persisted(now_unix_ms());
+                }
+
                 debug!(
                     session = %session_id,
                     path = %outcome.path,
@@ -3846,7 +3949,7 @@ async fn consolidate_or_synth(
         agent_kind,
         &observations,
     );
-    state
+    let page_id = state
         .wiki
         .write_page(ai_memory_wiki::WritePageRequest {
             workspace_id: new_page.workspace_id,
@@ -3867,6 +3970,10 @@ async fn consolidate_or_synth(
             evidence: Vec::new(),
         })
         .await?;
+    if previous_page_id != Some(page_id) {
+        state.ingest_metrics.record_persisted(now_unix_ms());
+    }
+
     let _ = state
         .wiki
         .commit_all(&format!(
@@ -4284,6 +4391,7 @@ mod tests {
             }),
         }];
         let before = state.ingest_metrics.snapshot().dropped_unauthorized;
+        state.ingest_metrics.record_persisted(123);
         let response = handle_hook_batch(
             State(Arc::new(state.clone())),
             None,
@@ -4299,6 +4407,11 @@ mod tests {
             .await
             .unwrap();
         let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            ack["results"],
+            serde_json::json!([{ "index": 0, "outcome": "dropped_unauthorized" }])
+        );
+        assert_eq!(state.ingest_metrics.snapshot().last_persisted_ms, Some(123));
         assert_eq!(
             ack["accepted"], 1,
             "the client must be told to drop it, or it will re-send it forever: {ack}"
@@ -4627,6 +4740,7 @@ mod tests {
             viewer,
         )
         .await
+        .map(|_| ())
     }
 
     /// A user holding `role` on the capture fixture's repository.
@@ -6036,6 +6150,181 @@ mod tests {
     /// observation commit resumes and completes its downstream processing.
     /// Fresh keys and keyless older clients keep landing normally.
     #[tokio::test]
+    async fn checkpoint_noop_keeps_page_version_and_last_write() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let env = session_envelope("user-prompt-submit", "checkpoint-noop", "/tmp/scratch");
+        let sid = resolve_session_id(&env).unwrap();
+        process(&state, env, None, Vec::new()).await.unwrap();
+        let (ws, proj, _) = state.reader.find_session_scope(sid).await.unwrap().unwrap();
+        consolidate_or_synth(
+            &state,
+            sid,
+            ws,
+            proj,
+            AgentKind::ClaudeCode,
+            "test",
+            ai_memory_core::ActorContext::anonymous(),
+        )
+        .await
+        .unwrap();
+        let before = state.reader.status_counts().await.unwrap();
+        assert_eq!(before.pages_all, 1);
+        state.ingest_metrics.record_persisted(123);
+        consolidate_or_synth(
+            &state,
+            sid,
+            ws,
+            proj,
+            AgentKind::ClaudeCode,
+            "test",
+            ai_memory_core::ActorContext::anonymous(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.reader.status_counts().await.unwrap().pages_all,
+            before.pages_all
+        );
+        assert_eq!(state.ingest_metrics.snapshot().last_persisted_ms, Some(123));
+    }
+
+    #[tokio::test]
+    async fn async_processing_classifies_replay_and_missing_end_without_new_writes() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let mut env = session_envelope("user-prompt-submit", "async-outcomes", "/tmp/scratch");
+        env.ingest_key = Some("async-prompt".into());
+        assert_eq!(
+            process_envelope(
+                state.clone(),
+                env.clone(),
+                None,
+                ai_memory_core::AuthLevel::Anonymous,
+                Vec::new(),
+                None
+            )
+            .await,
+            Some(HookProcessingOutcome::Stored)
+        );
+        let count = state.reader.status_counts().await.unwrap().observations;
+        state.ingest_metrics.record_persisted(123);
+        assert_eq!(
+            process_envelope(
+                state.clone(),
+                env,
+                None,
+                ai_memory_core::AuthLevel::Anonymous,
+                Vec::new(),
+                None
+            )
+            .await,
+            Some(HookProcessingOutcome::Replayed)
+        );
+        let missing = session_envelope("session-end", "async-missing-end", "/tmp/scratch");
+        assert_eq!(
+            process_envelope(
+                state.clone(),
+                missing,
+                None,
+                ai_memory_core::AuthLevel::Anonymous,
+                Vec::new(),
+                None
+            )
+            .await,
+            Some(HookProcessingOutcome::IgnoredEnd)
+        );
+        assert_eq!(
+            state.reader.status_counts().await.unwrap().observations,
+            count
+        );
+        let metrics = state.ingest_metrics.snapshot();
+        assert_eq!(
+            (metrics.stored, metrics.replayed, metrics.ignored_end),
+            (1, 1, 1)
+        );
+        assert_eq!(metrics.last_persisted_ms, Some(123));
+    }
+
+    #[tokio::test]
+    async fn empty_batch_has_explicit_empty_results_without_effects() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(Vec::new()),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["results"], serde_json::json!([]));
+        assert_eq!(ack["accepted"], 0);
+        assert_eq!(state.reader.status_counts().await.unwrap().observations, 0);
+        assert_eq!(state.ingest_metrics.snapshot().last_persisted_ms, None);
+    }
+
+    #[tokio::test]
+    async fn batch_results_preserve_replay_and_end_noop_storage() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let send = |event: &str, sid: &str, key: &str| {
+            let state = state.clone();
+            let item = HookBatchItem {
+                url: format!("http://h/hook?event={event}&agent=claude-code&ingest_key={key}"),
+                body: serde_json::json!({"session_id": sid, "prompt": "legitimate work"}),
+            };
+            async move {
+                let response = handle_hook_batch(
+                    State(state),
+                    None,
+                    None,
+                    None,
+                    HeaderMap::new(),
+                    Json(vec![item]),
+                )
+                .await
+                .into_response();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        let missing = send("session-end", "absent", "missing-end").await;
+        assert_eq!(missing["results"][0]["outcome"], "ignored_end");
+        assert_eq!(state.reader.status_counts().await.unwrap().observations, 0);
+        assert_eq!(state.ingest_metrics.snapshot().last_persisted_ms, None);
+        let first = send("user-prompt-submit", "results-session", "prompt-1").await;
+        assert_eq!(first["results"][0]["outcome"], "stored");
+        let before = state.reader.status_counts().await.unwrap();
+        state.ingest_metrics.record_persisted(123);
+        let retry = send("user-prompt-submit", "results-session", "prompt-1").await;
+        assert_eq!(retry["results"][0]["outcome"], "replayed");
+        assert_eq!(
+            state.reader.status_counts().await.unwrap().observations,
+            before.observations
+        );
+        assert_eq!(state.ingest_metrics.snapshot().last_persisted_ms, Some(123));
+        let end = send("session-end", "results-session", "end-1").await;
+        assert_eq!(end["results"][0]["outcome"], "stored");
+        let ended = state.reader.status_counts().await.unwrap();
+        state.ingest_metrics.record_persisted(456);
+        let retry = send("session-end", "results-session", "end-1").await;
+        assert_eq!(retry["results"][0]["outcome"], "ignored_end");
+        let after = state.reader.status_counts().await.unwrap();
+        assert_eq!(after.observations, ended.observations);
+        assert_eq!(after.pages_all, ended.pages_all);
+        assert_eq!(state.ingest_metrics.snapshot().last_persisted_ms, Some(456));
+    }
+
+    #[tokio::test]
     async fn replayed_ingest_key_does_not_duplicate_observation() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
@@ -6095,14 +6384,19 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(pending, IngestObservationOutcome::Inserted(_)));
-        process(
+        state.ingest_metrics.record_persisted(123);
+        let outcome = process_authorized(
             &state,
             fire("user-prompt-submit", Some("entry-pending")),
             None,
+            ai_memory_core::AuthLevel::Anonymous,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
+        assert_eq!(outcome, HookProcessingOutcome::Resumed);
+        assert_eq!(state.ingest_metrics.snapshot().last_persisted_ms, Some(123));
         let completed = state
             .writer
             .insert_observation_ingest(pending_obs(), "entry-pending".into())
@@ -6644,6 +6938,8 @@ mod tests {
 
         let snap = metrics.snapshot();
         assert_eq!(snap.dropped_by_policy, 2, "accept-but-drop is still a drop");
+        assert_eq!((snap.dropped_policy, snap.dropped_subagent), (1, 1));
+        assert_eq!(snap.last_persisted_ms, None);
         assert_eq!(
             snap.accepted, 0,
             "a dropped item spends no ingress capacity"
@@ -7008,6 +7304,10 @@ mod tests {
             .await
             .unwrap();
         let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["results"],
+            serde_json::json!([{ "index": 0, "outcome": "dropped_subagent" }, { "index": 1, "outcome": "stored" }])
+        );
         // Accept-but-drop: BOTH are acked so the client clears its spool…
         assert_eq!(
             ack["accepted"], 2,
@@ -7340,6 +7640,12 @@ mod tests {
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["results"], serde_json::json!([]));
+        assert_eq!(ack["accepted"], 0);
     }
 
     #[tokio::test]
@@ -7374,6 +7680,10 @@ mod tests {
             .await
             .unwrap();
         let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["results"],
+            serde_json::json!([{ "index": 1, "outcome": "stored" }])
+        );
         assert_eq!(ack["accepted"], 0);
         assert_eq!(ack["accepted_indices"], serde_json::json!([1]));
     }
@@ -7386,8 +7696,9 @@ mod tests {
         assert!(limiter.try_take("u:\ns:flooder", std::time::Instant::now()));
         state.ingest_rate = Arc::new(tokio::sync::Mutex::new(limiter));
 
+        let state = Arc::new(state);
         let response = handle_hook_batch(
-            State(Arc::new(state)),
+            State(state.clone()),
             None,
             None,
             None,
@@ -7398,8 +7709,16 @@ mod tests {
                     body: serde_json::json!({ "session_id": "flooder" }),
                 },
                 HookBatchItem {
+                    url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "accepted-before-failure" }),
+                },
+                HookBatchItem {
                     url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
                     body: serde_json::json!({ "prompt": "missing session fails" }),
+                },
+                HookBatchItem {
+                    url: "http://h/hook?event=session-start&agent=claude-code".into(),
+                    body: serde_json::json!({ "session_id": "unprocessed-after-failure" }),
                 },
             ]),
         )
@@ -7410,9 +7729,24 @@ mod tests {
             .await
             .unwrap();
         let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["results"],
+            serde_json::json!([{ "index": 1, "outcome": "stored" }])
+        );
         assert_eq!(ack["accepted"], 0);
-        assert_eq!(ack["accepted_indices"], serde_json::json!([]));
-        assert_eq!(ack["failed_index"], 1);
+        assert_eq!(ack["accepted_indices"], serde_json::json!([1]));
+        assert_eq!(ack["failed_index"], 2);
+        assert_eq!(state.reader.status_counts().await.unwrap().observations, 1);
+        let metrics = state.ingest_metrics.snapshot();
+        assert_eq!(
+            (
+                metrics.accepted,
+                metrics.stored,
+                metrics.failed,
+                metrics.shed_rate_limited
+            ),
+            (2, 1, 1, 1)
+        );
     }
 
     #[tokio::test]
@@ -9053,6 +9387,10 @@ mod tests {
             .await
             .unwrap();
         let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["results"],
+            serde_json::json!([{ "index": 0, "outcome": "dropped_collision" }, { "index": 1, "outcome": "stored" }])
+        );
         assert_eq!(ack["accepted"], 2, "both contiguous entries are cleared");
         assert!(ack.get("accepted_indices").is_none() || ack["accepted_indices"].is_null());
         assert!(ack.get("failed_index").is_none() || ack["failed_index"].is_null());
@@ -11656,7 +11994,9 @@ mod tests {
             },
             serde_json::json!({ "session_id": sid.to_string(), "cwd": "/tmp/target" }),
         );
-        process(&state, env, None, Vec::new()).await.unwrap();
+        process(&state, env.clone(), None, Vec::new())
+            .await
+            .unwrap();
 
         let pages = state
             .reader
@@ -11682,6 +12022,49 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "already-ended synthetic SessionEnd must not create a handoff"
+        );
+
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "pending-log-write", "/tmp/scratch"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        state.ingest_metrics.record_persisted(123);
+        let outcome = process_authorized(
+            &state,
+            env.clone(),
+            None,
+            ai_memory_core::AuthLevel::Anonymous,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, HookProcessingOutcome::Resumed);
+        assert_ne!(
+            state.ingest_metrics.snapshot().last_persisted_ms,
+            Some(123),
+            "a new recovery commit must advance persistence"
+        );
+        state.ingest_metrics.record_persisted(123);
+        let outcome = process_authorized(
+            &state,
+            env,
+            None,
+            ai_memory_core::AuthLevel::Anonymous,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, HookProcessingOutcome::IgnoredEnd);
+        assert_eq!(
+            state.ingest_metrics.snapshot().last_persisted_ms,
+            Some(123),
+            "a clean replay writes nothing"
         );
     }
 
@@ -11845,14 +12228,36 @@ mod tests {
             .await
             .unwrap();
 
-        process(
+        state.ingest_metrics.record_persisted(123);
+        let recovered = process_authorized(
             &state,
             fire("session-end", Some("entry-recovery")),
             None,
+            ai_memory_core::AuthLevel::Anonymous,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
+        assert_eq!(recovered, HookProcessingOutcome::Resumed);
+        assert_ne!(
+            state.ingest_metrics.snapshot().last_persisted_ms,
+            Some(123),
+            "a newly enqueued durable job is a real write"
+        );
+        state.ingest_metrics.record_persisted(456);
+        let repeated = process_authorized(
+            &state,
+            fire("session-end", Some("entry-recovery")),
+            None,
+            ai_memory_core::AuthLevel::Anonymous,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated, HookProcessingOutcome::IgnoredEnd);
+        assert_eq!(state.ingest_metrics.snapshot().last_persisted_ms, Some(456));
         let now = Timestamp::now().as_microsecond();
         let job = state
             .writer
@@ -15048,6 +15453,10 @@ mod tests {
             .await
             .unwrap();
         let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["results"],
+            serde_json::json!([{ "index": 0, "outcome": "stored" }, { "index": 1, "outcome": "dropped_policy" }, { "index": 2, "outcome": "stored" }])
+        );
         assert_eq!(ack["accepted"], 3);
         let sid = resolve_session_id(&HookEnvelope::from_query_and_body(
             HookQuery {
