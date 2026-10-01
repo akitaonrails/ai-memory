@@ -1,3 +1,3 @@
 . "$PSScriptRoot\..\lib\ai-memory-hook.ps1"
-Invoke-AiMemoryHook -Event "session-start" -Agent "command-code" -FetchHandoff
+Invoke-AiMemoryHook -Event "session-start" -Agent "command-code" -FetchHandoff -BriefingOncePerSession
 exit 0

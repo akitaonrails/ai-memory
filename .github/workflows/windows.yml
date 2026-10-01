@@ -174,3 +174,6 @@ jobs:
       - name: hook bundle (Git Bash)
         shell: bash
         run: sh tests/hooks/test_lib.sh
+      - name: session-start briefing delivery (Git Bash)
+        shell: bash
+        run: sh tests/hooks/test_session_start_briefing.sh

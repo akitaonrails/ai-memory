@@ -278,6 +278,7 @@ jobs:
       - name: awk in use
         run: awk --version 2>&1 | head -n 1 || true
       - run: sh tests/hooks/test_lib.sh
+      - run: sh tests/hooks/test_session_start_briefing.sh
 
   # `bin/release` copies `## [Unreleased]` into the new version section
   # verbatim, so a repeated `### ` heading there ships release notes with the
