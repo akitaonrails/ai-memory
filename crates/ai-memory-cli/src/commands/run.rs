@@ -18,14 +18,15 @@ use ai_memory_workstream::{
     allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
     build_launch_plan, build_launch_plan_with_env, crush_global_config_path,
     discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
-    inspect_repository, jail_checklist, jail_toggle, kiro_explicit_session_id,
-    kiro_harness_from_source_cursor, kiro_selects_non_default_engine, kiro_selects_v2_engine,
-    kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
-    marked_choices, native_session_exists, native_session_in_checkout, omp_profile_flag,
-    omp_profile_flag_env, parse_jail_toggles, store_override_vars, usable_ai_jail_here,
-    wait_for_transcript_flush,
+    inspect_repository, is_interactive_session_invocation, jail_checklist, jail_toggle,
+    kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
+    kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
+    list_native_sessions, marked_choices, native_session_exists, native_session_in_checkout,
+    omp_profile_flag, omp_profile_flag_env, parse_jail_toggles, store_override_vars,
+    usable_ai_jail_here, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
+use clap::ValueEnum as _;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -90,7 +91,7 @@ impl HeartbeatHealth {
 /// Run one native harness and return its exact process exit code.
 pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let cwd = std::env::current_dir().context("getting managed run working directory")?;
-    run_from(config, args, &cwd).await
+    run_with_exit_prompt(config, args, &cwd).await
 }
 
 /// Run one native harness from an explicit checkout without changing the
@@ -119,6 +120,198 @@ pub(super) async fn run_from_with_wiring(
     cwd: &Path,
     wire_overrides: &super::run_autowire::WireOverrides,
 ) -> Result<i32> {
+    run_once_with_wiring(config, args, cwd, wire_overrides)
+        .await
+        .map(|outcome| outcome.exit_code)
+}
+
+#[derive(Debug)]
+struct RunOutcome {
+    exit_code: i32,
+    harness: ManagedHarness,
+    interactive_session: bool,
+    mode: LaunchMode,
+    workstream_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterRunAction {
+    Switch(RunHarnessChoice),
+    Rerun,
+    Quit,
+}
+
+async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
+    let interactive_terminal =
+        io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal();
+    let custom_executable = args.executable.is_some();
+    let mut next_args = args;
+    preserve_trailing_run_options(&mut next_args);
+
+    loop {
+        let outcome = run_once_with_wiring(
+            config,
+            next_args.clone(),
+            cwd,
+            &super::run_autowire::WireOverrides::default(),
+        )
+        .await?;
+        if !should_offer_after_run(&outcome, interactive_terminal, custom_executable) {
+            return Ok(outcome.exit_code);
+        }
+
+        let available = available_switch_harnesses(outcome.harness);
+        let action = {
+            let stdin = io::stdin();
+            let stderr = io::stderr();
+            choose_after_run(
+                outcome.harness,
+                &outcome.workstream_name,
+                &available,
+                &mut stdin.lock(),
+                &mut stderr.lock(),
+            )
+        };
+        let action = match action {
+            Ok(action) => action,
+            Err(error) => {
+                eprintln!("ai-memory: could not read the post-run choice ({error}); exiting");
+                return Ok(outcome.exit_code);
+            }
+        };
+        if !apply_after_run_action(&mut next_args, &outcome, action) {
+            return Ok(outcome.exit_code);
+        }
+    }
+}
+
+fn should_offer_after_run(
+    outcome: &RunOutcome,
+    interactive_terminal: bool,
+    custom_executable: bool,
+) -> bool {
+    outcome.exit_code == 0
+        && outcome.mode == LaunchMode::Session
+        && outcome.interactive_session
+        && interactive_terminal
+        && !custom_executable
+}
+
+fn preserve_trailing_run_options(args: &mut RunArgs) {
+    args.yolo |= remove_wrapper_yolo(&mut args.native_args);
+    args.true_yolo |= remove_wrapper_true_yolo(&mut args.native_args);
+    args.no_autowire |= remove_wrapper_no_autowire(&mut args.native_args);
+    let trailing_jail = remove_wrapper_jail(&mut args.native_args);
+    if trailing_jail.jail.is_some() {
+        args.jail = trailing_jail.jail;
+    }
+    args.no_jail |= trailing_jail.no_jail;
+}
+
+fn available_switch_harnesses(current: ManagedHarness) -> Vec<RunHarnessChoice> {
+    RunHarnessChoice::value_variants()
+        .iter()
+        .copied()
+        .filter(|choice| {
+            managed_harness(*choice).agent_kind() != current.agent_kind()
+                && harness_available(*choice)
+        })
+        .collect()
+}
+
+fn choose_after_run(
+    current: ManagedHarness,
+    workstream_name: &str,
+    available: &[RunHarnessChoice],
+    input: &mut impl io::BufRead,
+    output: &mut impl io::Write,
+) -> io::Result<AfterRunAction> {
+    writeln!(
+        output,
+        "ai-memory: {} exited successfully in workstream '{}'.",
+        current.as_str(),
+        workstream_name
+    )?;
+    for (index, choice) in available.iter().enumerate() {
+        writeln!(
+            output,
+            "  {}) switch to {}",
+            index + 1,
+            managed_harness(*choice).as_str()
+        )?;
+    }
+    writeln!(output, "  r) run {} again", current.as_str())?;
+    writeln!(output, "  q) quit (default)")?;
+
+    loop {
+        write!(output, "Select [q]: ")?;
+        output.flush()?;
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            return Ok(AfterRunAction::Quit);
+        }
+        let choice = line.trim();
+        if choice.is_empty() || choice.eq_ignore_ascii_case("q") || choice == "0" {
+            return Ok(AfterRunAction::Quit);
+        }
+        if choice.eq_ignore_ascii_case("r") {
+            return Ok(AfterRunAction::Rerun);
+        }
+        if let Ok(index) = choice.parse::<usize>()
+            && let Some(harness) = index.checked_sub(1).and_then(|i| available.get(i))
+        {
+            return Ok(AfterRunAction::Switch(*harness));
+        }
+        writeln!(output, "Choose a listed number, r, or q.")?;
+    }
+}
+
+fn apply_after_run_action(
+    args: &mut RunArgs,
+    outcome: &RunOutcome,
+    action: AfterRunAction,
+) -> bool {
+    let choice = match action {
+        AfterRunAction::Quit => return false,
+        AfterRunAction::Switch(choice) => choice,
+        AfterRunAction::Rerun => run_harness_choice(outcome.harness),
+    };
+    args.harness = Some(choice);
+    args.native_args =
+        if action == AfterRunAction::Rerun && outcome.harness == ManagedHarness::KiroV3 {
+            vec![OsString::from("--v3")]
+        } else {
+            Vec::new()
+        };
+    args.workstream = Some(outcome.workstream_name.clone());
+    args.new_workstream = None;
+    args.fresh = false;
+    true
+}
+
+const fn run_harness_choice(harness: ManagedHarness) -> RunHarnessChoice {
+    match harness {
+        ManagedHarness::Claude => RunHarnessChoice::Claude,
+        ManagedHarness::Codex => RunHarnessChoice::Codex,
+        ManagedHarness::OpenCode => RunHarnessChoice::OpenCode,
+        ManagedHarness::OpenCode2 => RunHarnessChoice::OpenCode2,
+        ManagedHarness::Pi => RunHarnessChoice::Pi,
+        ManagedHarness::Crush => RunHarnessChoice::Crush,
+        ManagedHarness::Omp => RunHarnessChoice::Omp,
+        ManagedHarness::Kimi => RunHarnessChoice::Kimi,
+        ManagedHarness::CommandCode => RunHarnessChoice::CommandCode,
+        ManagedHarness::Kiro | ManagedHarness::KiroV3 => RunHarnessChoice::Kiro,
+        ManagedHarness::Grok => RunHarnessChoice::Grok,
+        ManagedHarness::Antigravity => RunHarnessChoice::Antigravity,
+    }
+}
+
+async fn run_once_with_wiring(
+    config: &Config,
+    args: RunArgs,
+    cwd: &Path,
+    wire_overrides: &super::run_autowire::WireOverrides,
+) -> Result<RunOutcome> {
     let repository = inspect_repository(cwd)?;
     let home = native_home(config).context("locating native harness session storage")?;
     let automatic_harness = args.harness.is_none();
@@ -126,6 +319,7 @@ pub(super) async fn run_from_with_wiring(
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
     let trailing_true_yolo = remove_wrapper_true_yolo(&mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
+    let trailing_force_unlock = remove_wrapper_force_unlock(&mut native_args);
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
     let trailing_jail = remove_wrapper_jail(&mut native_args);
     let jail_request = jail_request(args.jail, args.no_jail, trailing_jail)?;
@@ -136,9 +330,21 @@ pub(super) async fn run_from_with_wiring(
     );
     let yolo_requested = yolo_modes.yolo;
     let force_fresh = args.fresh || trailing_fresh;
+    let force_unlock = args.force_unlock || trailing_force_unlock;
     let no_autowire = args.no_autowire || trailing_no_autowire;
-    let run_env = resolve_run_env(args.env_file.as_deref(), &args.env)
-        .context("resolving --env/--env-file for the managed run")?;
+    let profile = args
+        .profile
+        .as_deref()
+        .map(|name| {
+            config
+                .run
+                .profiles
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown run profile {name:?}"))
+        })
+        .transpose()?;
+    let run_env = resolve_run_env(profile, args.env_file.as_deref(), &args.env)
+        .context("resolving --profile/--env-file/--env for the managed run")?;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
             "native harness arguments require an explicit harness; try `ai-memory run codex ...`"
@@ -226,6 +432,7 @@ pub(super) async fn run_from_with_wiring(
         available_agents: unique_auto_agents(&auto_candidates),
         workstream: args.workstream,
         new_workstream: args.new_workstream,
+        force_unlock,
         lease_owner: lease_owner(),
     };
     let interrupted_before_spawn = CancellationToken::new();
@@ -330,6 +537,7 @@ pub(super) async fn run_from_with_wiring(
         &repository.cwd,
         &run_env,
     ));
+    let interactive_session = is_interactive_session_invocation(harness, &native_args);
     if let Some(orphaned_session) = orphaned_session {
         eprintln!(
             "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
@@ -763,7 +971,13 @@ pub(super) async fn run_from_with_wiring(
             ),
         }
     }
-    Ok(exit_code)
+    Ok(RunOutcome {
+        exit_code,
+        harness,
+        interactive_session,
+        mode: plan.mode,
+        workstream_name: prepared.workstream_name,
+    })
 }
 
 /// How long finalizing may hold up the harness's exit code.
@@ -1624,6 +1838,12 @@ fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
+fn remove_wrapper_force_unlock(args: &mut Vec<OsString>) -> bool {
+    let before = args.len();
+    args.retain(|arg| arg != OsStr::new("--force-unlock"));
+    args.len() != before
+}
+
 fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
     let before = args.len();
     args.retain(|arg| arg != OsStr::new("--no-autowire"));
@@ -1635,10 +1855,16 @@ fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
 /// `--env` entry override a same-key `--env-file` line. Values are taken
 /// literally; neither source is expanded or interpreted.
 fn resolve_run_env(
+    profile: Option<&crate::config::RunProfile>,
     env_file: Option<&Path>,
     env_args: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
     let mut merged: Vec<(String, String)> = Vec::new();
+    if let Some(profile) = profile {
+        for (key, value) in &profile.env {
+            upsert_env(&mut merged, key.clone(), value.clone());
+        }
+    }
     if let Some(path) = env_file {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading --env-file {}", path.display()))?;
@@ -2289,6 +2515,15 @@ async fn prepare_managed_run(
     interactive: bool,
     interrupted: &CancellationToken,
 ) -> Result<PrepareManagedRunResponse> {
+    if request.force_unlock {
+        return match post_json(endpoint, "/workstream/runs", request).await {
+            Err(error) if is_active_workstream_conflict(&error) => Err(error.context(
+                "--force-unlock was refused: the active lease belongs to another operator, or \
+                 the server does not support forced lease recovery",
+            )),
+            other => other,
+        };
+    }
     let result = prepare_managed_run_with_retry(
         endpoint,
         request,
@@ -2648,7 +2883,7 @@ mod tests {
     }
 
     fn parse_run(argv: &[&str]) -> RunArgs {
-        let CliCommand::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+        let CliCommand::Run(args) = crate::cli::try_parse_from(argv).unwrap().command else {
             panic!("expected run command");
         };
         args
@@ -2960,6 +3195,164 @@ mod tests {
         );
         let printed = String::from_utf8(output).unwrap();
         assert!(printed.contains("ai-jail is installed. Re-run this session inside it? [Y/n]"));
+    }
+
+    fn run_args_for_after_run_test() -> RunArgs {
+        RunArgs {
+            workspace: Some("work".into()),
+            project: Some("repo".into()),
+            workstream: None,
+            new_workstream: Some("initial".into()),
+            executable: None,
+            yolo: true,
+            true_yolo: true,
+            jail: None,
+            no_jail: true,
+            fresh: true,
+            force_unlock: false,
+            no_autowire: true,
+            no_handoff: false,
+            profile: Some("work".into()),
+            env: vec![("MODEL_HOME".into(), "custom".into())],
+            env_file: None,
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: vec![OsString::from("--model"), OsString::from("opus")],
+        }
+    }
+
+    #[test]
+    fn post_run_choice_defaults_to_quit_and_lists_same_workstream_actions() {
+        let mut input = Cursor::new(b"\n");
+        let mut output = Vec::new();
+        let action = choose_after_run(
+            ManagedHarness::Claude,
+            "research",
+            &[RunHarnessChoice::Codex],
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(action, AfterRunAction::Quit);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("workstream 'research'"));
+        assert!(output.contains("1) switch to codex"));
+        assert!(output.contains("r) run claude again"));
+        assert!(output.contains("q) quit (default)"));
+    }
+
+    #[test]
+    fn post_run_choice_selects_an_installed_harness_by_number() {
+        let mut input = Cursor::new(b"1\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            choose_after_run(
+                ManagedHarness::Claude,
+                "research",
+                &[RunHarnessChoice::Codex],
+                &mut input,
+                &mut output,
+            )
+            .unwrap(),
+            AfterRunAction::Switch(RunHarnessChoice::Codex)
+        );
+    }
+
+    #[test]
+    fn trailing_wrapper_options_survive_the_post_run_menu() {
+        let mut args = run_args_for_after_run_test();
+        args.yolo = false;
+        args.true_yolo = false;
+        args.jail = None;
+        args.no_jail = false;
+        args.no_autowire = false;
+        args.native_args.extend([
+            OsString::from("--yolo"),
+            OsString::from("--true-yolo"),
+            OsString::from("--jail=github,no-mise"),
+            OsString::from("--no-autowire"),
+        ]);
+
+        preserve_trailing_run_options(&mut args);
+        assert!(args.yolo);
+        assert!(args.true_yolo);
+        assert_eq!(args.jail.as_deref(), Some("github,no-mise"));
+        assert!(!args.no_jail);
+        assert!(args.no_autowire);
+        assert_eq!(
+            args.native_args,
+            [OsString::from("--model"), OsString::from("opus")]
+        );
+    }
+
+    #[test]
+    fn post_run_actions_reuse_the_workstream_without_replaying_native_args() {
+        let mut args = run_args_for_after_run_test();
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::Claude,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "research".into(),
+        };
+
+        assert!(apply_after_run_action(
+            &mut args,
+            &outcome,
+            AfterRunAction::Switch(RunHarnessChoice::Codex)
+        ));
+        assert_eq!(args.harness, Some(RunHarnessChoice::Codex));
+        assert_eq!(args.workstream.as_deref(), Some("research"));
+        assert_eq!(args.new_workstream, None);
+        assert!(!args.fresh);
+        assert!(args.native_args.is_empty());
+        assert!(args.yolo);
+        assert!(args.true_yolo);
+        assert!(args.no_jail);
+        assert!(args.no_autowire);
+        assert_eq!(args.env, [("MODEL_HOME".into(), "custom".into())]);
+    }
+
+    #[test]
+    fn rerunning_kiro_v3_keeps_its_engine_without_replaying_user_args() {
+        let mut args = run_args_for_after_run_test();
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::KiroV3,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "research".into(),
+        };
+
+        assert!(apply_after_run_action(
+            &mut args,
+            &outcome,
+            AfterRunAction::Rerun
+        ));
+        assert_eq!(args.harness, Some(RunHarnessChoice::Kiro));
+        assert_eq!(args.native_args, [OsString::from("--v3")]);
+        assert_eq!(args.workstream.as_deref(), Some("research"));
+    }
+
+    #[test]
+    fn post_run_prompt_requires_clean_interactive_managed_session_without_custom_binary() {
+        let outcome = RunOutcome {
+            exit_code: 0,
+            harness: ManagedHarness::Claude,
+            interactive_session: true,
+            mode: LaunchMode::Session,
+            workstream_name: "research".into(),
+        };
+        assert!(should_offer_after_run(&outcome, true, false));
+        assert!(!should_offer_after_run(&outcome, false, false));
+        assert!(!should_offer_after_run(&outcome, true, true));
+
+        let mut failed = outcome;
+        failed.exit_code = 1;
+        assert!(!should_offer_after_run(&failed, true, false));
+        failed.exit_code = 0;
+        failed.mode = LaunchMode::Passthrough;
+        assert!(!should_offer_after_run(&failed, true, false));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3290,6 +3683,7 @@ mod tests {
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
+            force_unlock: false,
             lease_owner: "workstation:43".into(),
         };
 
@@ -3408,6 +3802,7 @@ mod tests {
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
+            force_unlock: false,
             lease_owner: "workstation:43".into(),
         }
     }
@@ -3476,6 +3871,27 @@ mod tests {
         .expect_err("a renewing owner is never displaced");
         assert!(
             format!("{error:#}").contains("renewed the lease"),
+            "{error:#}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn force_unlock_asks_once_instead_of_waiting_out_the_lease() {
+        let (app, attempts) = held_lease_server(usize::MAX, Duration::from_secs(60));
+        let (endpoint, server) = serve(app).await;
+        let mut request = held_lease_request();
+        request.force_unlock = true;
+        let started = std::time::Instant::now();
+
+        let error = prepare_managed_run(&endpoint, &request, true, &CancellationToken::new())
+            .await
+            .expect_err("a server that refuses the takeover must fail immediately");
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            format!("{error:#}").contains("--force-unlock was refused"),
             "{error:#}"
         );
         server.abort();
@@ -3976,6 +4392,30 @@ mod tests {
     }
 
     #[test]
+    fn force_unlock_is_a_wrapper_flag_before_or_after_the_harness() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--force-unlock",
+            "codex",
+            "--model",
+            "gpt-5",
+        ])
+        .unwrap();
+        let CliCommand::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.force_unlock);
+        assert_eq!(args.native_args, ["--model", "gpt-5"].map(OsString::from));
+
+        let mut trailing = ["--model", "gpt-5", "--force-unlock"]
+            .map(OsString::from)
+            .to_vec();
+        assert!(remove_wrapper_force_unlock(&mut trailing));
+        assert_eq!(trailing, ["--model", "gpt-5"].map(OsString::from));
+    }
+
+    #[test]
     fn wrapper_no_autowire_parses_before_or_after_the_harness() {
         // Before the harness: clap binds it as the wrapper flag.
         let cli = Cli::try_parse_from(["ai-memory", "run", "--no-autowire", "kimi"]).unwrap();
@@ -3995,27 +4435,94 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_env_merges_file_then_overrides_with_cli_pairs() {
+    fn resolve_run_env_merges_profile_file_then_cli_pairs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vars.env");
         std::fs::write(&path, "# a comment\n\n  \nFOO=from-file\nBAR=keep\n").unwrap();
 
+        let profile = crate::config::RunProfile {
+            env: [
+                ("FOO".to_string(), "from-profile".to_string()),
+                ("PROFILE_ONLY".to_string(), "present".to_string()),
+            ]
+            .into(),
+        };
         let cli_pairs = vec![("FOO".to_string(), "from-cli".to_string())];
-        let merged = resolve_run_env(Some(&path), &cli_pairs).unwrap();
+        let merged = resolve_run_env(Some(&profile), Some(&path), &cli_pairs).unwrap();
 
         assert_eq!(
             merged,
             vec![
                 ("FOO".to_string(), "from-cli".to_string()),
+                ("PROFILE_ONLY".to_string(), "present".to_string()),
                 ("BAR".to_string(), "keep".to_string()),
             ]
         );
     }
 
     #[test]
+    fn wrapper_profile_parses_before_harness_without_stealing_native_profile() {
+        let wrapper = parse_run(&[
+            "ai-memory",
+            "run",
+            "--profile",
+            "work",
+            "claude",
+            "--model",
+            "opus",
+        ]);
+        assert_eq!(wrapper.profile.as_deref(), Some("work"));
+        assert_eq!(wrapper.native_args, ["--model", "opus"].map(OsString::from));
+
+        let native = parse_run(&["ai-memory", "run", "omp", "--profile", "omp-work"]);
+        assert_eq!(native.profile, None);
+        assert_eq!(
+            native.native_args,
+            ["--profile", "omp-work"].map(OsString::from)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_run_profile_fails_before_server_or_child_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::load(None, Some(tmp.path().join("data"))).unwrap();
+        config.server_url = "http://127.0.0.1:1".into();
+        let args = RunArgs {
+            workspace: None,
+            project: None,
+            workstream: None,
+            new_workstream: None,
+            executable: Some(PathBuf::from("definitely-not-a-harness")),
+            yolo: false,
+            true_yolo: false,
+            jail: None,
+            no_jail: true,
+            fresh: false,
+            force_unlock: false,
+            no_autowire: true,
+            no_handoff: false,
+            profile: Some("missing".into()),
+            env: Vec::new(),
+            env_file: None,
+            harness: Some(RunHarnessChoice::Claude),
+            native_args: Vec::new(),
+        };
+
+        let error = run_from_with_wiring(
+            &config,
+            args,
+            tmp.path(),
+            &super::super::run_autowire::WireOverrides::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unknown run profile \"missing\"");
+    }
+
+    #[test]
     fn resolve_run_env_without_a_file_returns_only_cli_pairs() {
         let cli_pairs = vec![("A".to_string(), "1".to_string())];
-        let merged = resolve_run_env(None, &cli_pairs).unwrap();
+        let merged = resolve_run_env(None, None, &cli_pairs).unwrap();
         assert_eq!(merged, vec![("A".to_string(), "1".to_string())]);
     }
 
@@ -4024,7 +4531,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.env");
         std::fs::write(&path, "NOVALUE\n").unwrap();
-        let error = resolve_run_env(Some(&path), &[]).unwrap_err();
+        let error = resolve_run_env(None, Some(&path), &[]).unwrap_err();
         assert!(
             error.to_string().contains("expected KEY=VALUE"),
             "unexpected error: {error}"
@@ -4104,7 +4611,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf 'FOO=%s\\nCLAUDE_CONFIG_DIR=%s\\n' \"$FOO\" \"$CLAUDE_CONFIG_DIR\" > {}\nexit 0\n",
+                "#!/bin/sh\nprintf 'FOO=%s\\nPROFILE_ONLY=%s\\nCLAUDE_CONFIG_DIR=%s\\n' \"$FOO\" \"$PROFILE_ONLY\" \"$CLAUDE_CONFIG_DIR\" > {}\nexit 0\n",
                 captured.display()
             ),
         )
@@ -4123,6 +4630,17 @@ mod tests {
         config.home_dir = Some(home.path().to_string_lossy().into_owned());
         config.server_url = format!("http://{address}");
         config.run_autowire = false;
+        config.run.profiles.insert(
+            "work".into(),
+            crate::config::RunProfile {
+                env: [
+                    ("FOO".into(), "from-profile".into()),
+                    ("PROFILE_ONLY".into(), "from-profile".into()),
+                    ("CLAUDE_CONFIG_DIR".into(), "/from/profile".into()),
+                ]
+                .into(),
+            },
+        );
 
         let args = RunArgs {
             workspace: Some("ws".into()),
@@ -4135,8 +4653,10 @@ mod tests {
             jail: None,
             no_jail: false,
             fresh: false,
+            force_unlock: false,
             no_autowire: true,
             no_handoff: false,
+            profile: Some("work".into()),
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
             env_file: Some(env_file.clone()),
             harness: Some(RunHarnessChoice::Claude),
@@ -4152,7 +4672,11 @@ mod tests {
         let captured_env = std::fs::read_to_string(&captured).unwrap();
         assert!(
             captured_env.contains("FOO=from-file"),
-            "an --env-file entry not overridden by --env must reach the spawned child: {captured_env}"
+            "--env-file must override the profile and reach the spawned child: {captured_env}"
+        );
+        assert!(
+            captured_env.contains("PROFILE_ONLY=from-profile"),
+            "a profile-only entry must reach the spawned child: {captured_env}"
         );
         assert!(
             captured_env.contains("CLAUDE_CONFIG_DIR=/from/cli"),
@@ -4624,8 +5148,10 @@ mod tests {
             jail: None,
             no_jail: false,
             fresh: false,
+            force_unlock: false,
             no_autowire: false,
             no_handoff: false,
+            profile: None,
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
@@ -4780,8 +5306,10 @@ mod tests {
             jail: None,
             no_jail: false,
             fresh: false,
+            force_unlock: false,
             no_autowire: false,
             no_handoff: false,
+            profile: None,
             env,
             env_file: None,
             harness: Some(harness),

@@ -104,7 +104,7 @@ jobs:
           mkdir -p "dist/$artifact/docs"
           cp README.md LICENSE "dist/$artifact/"
           cp docs/install.md "dist/$artifact/docs/install.md"
-          tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
+          COPYFILE_DISABLE=1 tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
           sha256sum "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -163,7 +163,7 @@ jobs:
           cp README.md LICENSE "dist/$artifact/"
           cp docs/install.md "dist/$artifact/docs/install.md"
           cp docs/macos.md "dist/$artifact/docs/macos.md"
-          tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
+          COPYFILE_DISABLE=1 tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
           shasum -a 256 "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
 
       - name: Smoke test release tarball

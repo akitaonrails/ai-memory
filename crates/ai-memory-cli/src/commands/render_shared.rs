@@ -19,7 +19,7 @@
 //! lives here is only the *data* both consume.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -483,9 +483,7 @@ pub(crate) fn build_zero_hooks_config(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "ai-memory".to_string());
+    let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
     let hooks: Vec<serde_json::Value> = ZERO_EVENTS
         .iter()
         .map(|(zero_event, our_event)| {
@@ -571,9 +569,7 @@ pub(crate) fn build_zcode_hooks_config(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "ai-memory".to_string());
+    let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
     let mut events = serde_json::Map::new();
     for (zcode_event, our_event) in ZCODE_EVENTS {
         let mut args: Vec<String> = Vec::new();
@@ -1582,6 +1578,58 @@ pub(crate) fn local_hook_policy_v1_supported() -> bool {
     )
 }
 
+/// Fallback when no usable executable path can be embedded: the bare command
+/// name, resolved through `PATH` when each hook runs.
+#[cfg(not(windows))]
+const FALLBACK_HOOK_EXE: &str = "ai-memory";
+#[cfg(windows)]
+const FALLBACK_HOOK_EXE: &str = "ai-memory.exe";
+
+/// Strip the ` (deleted)` marker the Linux kernel appends to the
+/// `/proc/<pid>/exe` readlink once the executable's inode has been unlinked or
+/// replaced (Rust std passes the marker through verbatim —
+/// rust-lang/rust#40284). A real executable may itself use that suffix, so
+/// callers must prefer the unmodified path when it still exists.
+fn strip_deleted_suffix(exe: PathBuf) -> PathBuf {
+    match exe.to_str() {
+        Some(text) => text
+            .strip_suffix(" (deleted)")
+            .map(PathBuf::from)
+            .unwrap_or(exe),
+        None => exe,
+    }
+}
+
+/// The executable path to embed in a rendered hook command, given what
+/// `current_exe()` produced.
+///
+/// The classic corrupting sequence is `ai-memory upgrade`: it replaces its own
+/// binary and then re-renders the staged hook configs from the same, now
+/// exe-deleted process, so `current_exe()` comes back as `<path> (deleted)`.
+/// Stripping the marker yields the path that now holds the freshly installed
+/// binary. A missing file or a failed resolution falls back to
+/// [`FALLBACK_HOOK_EXE`] instead of baking a dead absolute path into every
+/// hook command.
+fn embedded_exe_from(raw: Option<PathBuf>) -> PathBuf {
+    let Some(exe) = raw else {
+        return PathBuf::from(FALLBACK_HOOK_EXE);
+    };
+    if exe.is_file() {
+        return exe;
+    }
+    let stripped = strip_deleted_suffix(exe);
+    if stripped.is_file() {
+        stripped
+    } else {
+        PathBuf::from(FALLBACK_HOOK_EXE)
+    }
+}
+
+/// [`embedded_exe_from`] over this process's own executable.
+pub(crate) fn hook_embedded_exe_path() -> PathBuf {
+    embedded_exe_from(std::env::current_exe().ok())
+}
+
 fn hook_command(
     script: &Path,
     server_url: &str,
@@ -1651,9 +1699,7 @@ fn hook_command(
             // out; double quotes + the native Windows path work in cmd.exe and
             // Git Bash. The event name is a fixed slug with no shell
             // metacharacters, so it is left unquoted.
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "ai-memory".to_string());
+            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
             let event = script
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1697,9 +1743,7 @@ fn hook_command(
             // gets the local spool + OIDC fallback, instead of the `.sh` script
             // that POSTs via curl. Mirrors `WindowsNative` but with POSIX
             // single-quote quoting. The event name is the script stem.
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "ai-memory".to_string());
+            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
             let event = script
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1738,7 +1782,7 @@ fn windows_native_exec_spec(
     auth_token: Option<&str>,
     context: HookCommandContext<'_>,
 ) -> HookHandlerSpec {
-    let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("ai-memory.exe").to_path_buf());
+    let exe = hook_embedded_exe_path();
     windows_native_exec_spec_with_exe(&exe, script, server_url, auth_token, context)
 }
 
@@ -2209,6 +2253,63 @@ mod tests {
     use std::process::Command;
     #[cfg(windows)]
     use std::process::Stdio;
+
+    #[test]
+    fn strip_deleted_suffix_removes_only_the_trailing_kernel_marker() {
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/opt/ai-memory/bin/ai-memory (deleted)")),
+            PathBuf::from("/opt/ai-memory/bin/ai-memory")
+        );
+        // A marker mid-path is a legitimate directory name, not the kernel's
+        // artifact; only the trailing suffix reads as one.
+        let mid = PathBuf::from("/opt/dir (deleted)/ai-memory");
+        assert_eq!(strip_deleted_suffix(mid.clone()), mid);
+        let clean = PathBuf::from("/opt/ai-memory/bin/ai-memory");
+        assert_eq!(strip_deleted_suffix(clean.clone()), clean);
+    }
+
+    #[test]
+    fn embedded_exe_strips_the_marker_when_the_stripped_path_exists() {
+        // The exact corruption window of `ai-memory upgrade`: the process is
+        // still executing the old inode after the rename-over replace, so
+        // `current_exe()` carries the marker while the stripped path already
+        // holds the freshly installed binary.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("ai-memory");
+        fs::write(&exe, b"binary").expect("write exe");
+        let deleted = PathBuf::from(format!("{} (deleted)", exe.display()));
+        assert_eq!(embedded_exe_from(Some(deleted)), exe);
+    }
+
+    #[test]
+    fn embedded_exe_preserves_a_real_file_whose_name_has_the_marker_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let literal = dir.path().join("ai-memory (deleted)");
+        let stripped = dir.path().join("ai-memory");
+        fs::write(&literal, b"literal binary").expect("write literal exe");
+        fs::write(&stripped, b"decoy binary").expect("write stripped decoy");
+
+        assert_eq!(embedded_exe_from(Some(literal.clone())), literal);
+    }
+
+    #[test]
+    fn embedded_exe_falls_back_when_the_resolved_path_is_missing() {
+        // A failed resolution or a dead path must not bake a broken absolute
+        // path into hook commands; the bare name resolves through PATH when
+        // each hook runs.
+        assert_eq!(embedded_exe_from(None), PathBuf::from(FALLBACK_HOOK_EXE));
+        assert_eq!(
+            embedded_exe_from(Some(PathBuf::from("/nonexistent/ai-memory (deleted)"))),
+            PathBuf::from(FALLBACK_HOOK_EXE)
+        );
+    }
+
+    #[test]
+    fn hook_embedded_exe_path_names_an_existing_file_without_marker() {
+        let exe = hook_embedded_exe_path();
+        assert!(exe.is_file(), "{} should exist", exe.display());
+        assert!(!exe.to_string_lossy().ends_with(" (deleted)"));
+    }
 
     fn decode_powershell_encoded_command(command: &str) -> String {
         let (_, encoded) = command

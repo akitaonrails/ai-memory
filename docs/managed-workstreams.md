@@ -32,6 +32,37 @@ accounts by alias, put a same-named script or shim earlier on `PATH` instead
 (or pass `--executable PATH`, which also resolves a bare name through
 `PATH`), so the resolved `claude` process actually is the one you meant.
 
+**Named launch profiles.** Persist repeated per-account environment overrides
+in the same `config.toml` the client loads:
+
+```toml
+[run.profiles.work.env]
+CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
+ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+```
+
+```bash
+ai-memory run --profile work claude --model opus
+```
+
+Profiles are env-only by design; executable paths, native arguments, `--yolo`,
+and auto-wire choices stay explicit on the command line. The child inherits
+the normal process environment, then profile values override it,
+`--env-file` overrides the profile, and repeated `--env` entries win last.
+The resolved values also drive native-session discovery and auto-wire, so all
+three use the same account/config home. An unknown or invalid profile fails
+before ai-memory takes a workstream lease or starts a harness. Profile names
+use up to 64 ASCII letters, digits, `.`, `_`, or `-`; each profile may contain
+up to 128 environment entries. Because values are literal and may include
+credentials, protect `config.toml` like any other local secret-bearing config.
+
+`--profile` is wrapper-owned only before the harness name. A later flag remains
+native argv, which keeps OMP's own profile selector unambiguous:
+
+```bash
+ai-memory run --profile work omp --profile omp-work
+```
+
 **Multiple Claude accounts (e.g. Corporate and Personal).** Any harness name
 starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
 and always selects the Claude harness — the exact spelling never changes
@@ -73,10 +104,23 @@ ai-memory run kiro --v3
 ai-memory run
 ```
 
+After an interactive managed session exits successfully, `ai-memory run` offers
+the installed harnesses, a way to run the current harness again, and quit.
+Choosing another harness keeps the same workstream selected, so its saved
+context remains available to the next run. The prompt defaults to quit. It
+appears only when stdin, stdout, and stderr are terminals, the managed launch
+was a session, and `--executable` was not used; utility commands, failed or
+interrupted exits, and non-interactive launches do not prompt. A switch or
+re-run does not replay the previous harness's native arguments, which may be
+specific to that CLI; wrapper settings such as `--workspace`, `--project`,
+`--yolo` / `--true-yolo`, ai-jail controls, `--no-autowire`, `--env`, and
+`--env-file` remain in effect. The initial `--fresh` choice applies only to the
+first launch.
+
 Everything after the harness name is native argv except the wrapper-owned exact
-flags `--yolo` and `--fresh`. No `--` separator is needed, and ai-memory does
-not maintain a second copy of each harness's option schema. Other wrapper
-options come first:
+flags `--yolo`, `--fresh`, and `--force-unlock`. No `--` separator is needed,
+and ai-memory does not maintain a second copy of each harness's option schema.
+Other wrapper options come first:
 
 Portable events, handoffs, and project briefs are injected as explicitly
 delimited, untrusted historical data. Instruction-like text inside stored
@@ -88,7 +132,8 @@ file, and the current checkout remain authoritative.
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
-              [--yolo] [--fresh] [--env KEY=VALUE]... [--env-file PATH]
+              [--yolo] [--fresh] [--force-unlock] [--profile NAME]
+              [--env KEY=VALUE]... [--env-file PATH]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
@@ -500,17 +545,23 @@ protocol](managed-harness-contributions.md), including read-only extraction,
 pre-turn context delivery, migration invariants, deterministic tests, and an
 opt-in real-harness acceptance pass.
 
-### Known issue: Codex's shared daemon and stale run ids (#987)
+### Codex shared-daemon recovery (#987)
 
 Recent Codex releases run sessions through a shared background app-server
 daemon (`codex agents` lists it). The daemon keeps the environment it started
 with, and the lifecycle hooks it launches inherit that environment — including
-the `AI_MEMORY_RUN_ID` of whichever managed run auto-started it. A later
-`ai-memory run codex` then reports that finished run, gets no continuity
-context, and the server logs `managed SessionStart has no active run`.
+the `AI_MEMORY_RUN_ID` of whichever managed run auto-started it. When a later
+managed Codex SessionStart reports that finished id, ai-memory ignores it as
+authority and searches only the request's already-resolved repository, exact
+checkout cwd, and operator bucket. The server adopts a replacement only when
+exactly one live, undelivered Codex run is waiting there, and it selects plus
+links that run in one writer transaction. Multiple candidates, an active id
+whose scope, checkout, or owner does not match, and a run already linked by
+another session all fail closed.
 
-Until the server-side fix lands, launch managed Codex sessions without the
-daemon. Native arguments after the harness are forwarded to Codex:
+Ordinary managed Codex launches therefore work with the shared daemon. For
+diagnosis, or when an intentionally concurrent pair of named workstreams makes
+recovery ambiguous, native arguments after the harness are still forwarded:
 
 ```bash
 ai-memory run codex --no-daemon
@@ -518,8 +569,8 @@ ai-memory run codex --no-daemon
 
 `--no-daemon` makes that one session run without the shared background server
 even if one is already running; it is available on Codex's interactive and
-`resume` commands (checked on Codex 0.156). Sessions started without it keep
-the daemon behavior described above.
+`resume` commands (checked on Codex 0.156). It remains a useful isolation
+switch, not a requirement for normal workstream continuity.
 
 ## Installation and recovery
 
@@ -685,6 +736,8 @@ immediately. A new launch retries an active-workstream conflict briefly so a
 previous launcher can finish; if another harness is genuinely still running,
 the conflict remains and concurrent writers are still rejected.
 
+### Lease recovery
+
 A launcher that dies without releasing its lease — killed, its terminal
 closed, or a sandbox such as ai-jail torn down — leaves the workstream held
 until that lease lapses. An interactive relaunch (stdin and stderr are
@@ -698,6 +751,25 @@ another run off. Non-interactive launches (scripts, hooks, CI) keep the short
 retry window and fail fast rather than hanging. Terminal
 interrupts continue to reach the child while the parent stays alive to finish
 or cancel the run.
+
+When you know the prior launcher is gone and do not want to wait for the lease,
+force-expire it explicitly:
+
+```bash
+ai-memory run --force-unlock codex
+# The exact wrapper flag is also accepted after the harness name.
+ai-memory run codex --force-unlock
+```
+
+The replacement is atomic and limited to the same durable authenticated
+operator; in single-user or otherwise unattributed operation, both runs must be
+unattributed. A different operator's active run is still refused. The command
+expires the managed lease only — it does not signal or kill a native process.
+If the previous launcher is actually alive, its later heartbeats and finish are
+rejected, and its final transcript tail may not be imported. Use
+`--force-unlock` only after verifying that launcher has stopped. Older servers
+do not honor the request and return a refusal, so upgrade the server as well as
+the client before relying on this recovery path.
 
 Before the child starts, `Ctrl+C` at the native-session chooser cancels the
 acquired run and exits without requiring Enter or adopting the selected session.

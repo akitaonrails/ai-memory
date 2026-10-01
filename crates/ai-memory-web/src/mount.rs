@@ -295,6 +295,9 @@ mod web_base_tests {
 /// [`split_web_routers`] below clippy's `too_many_arguments` threshold
 /// without hiding the call shape.
 pub struct WebMountSpec<'a> {
+    /// Mount `/api/v1` even when the browser UI is disabled. The browser UI
+    /// always implies the API for backward compatibility.
+    pub enable_api: bool,
     /// Operator-supplied custom SPA directory (`--web-ui-dir`). `None`
     /// mounts the built-in server-rendered wiki browser instead.
     pub web_ui_dir: Option<&'a Path>,
@@ -337,7 +340,7 @@ pub fn split_web_routers(
     wiki: Wiki,
     spec: WebMountSpec<'_>,
 ) -> Result<SplitWebRouters> {
-    if !enable_web {
+    if !enable_web && !spec.enable_api {
         return Ok(SplitWebRouters {
             public: axum::Router::new(),
             protected: axum::Router::new(),
@@ -346,6 +349,13 @@ pub fn split_web_routers(
     }
     let api = build_api_router(&reader, &wiki, spec.cors_origins);
     let protected_api = axum::Router::new().nest("/api/v1", api);
+    if !enable_web {
+        return Ok(SplitWebRouters {
+            public: axum::Router::new(),
+            protected: protected_api,
+            html_auth: None,
+        });
+    }
     let slug = normalize_prefix(spec.web_slug);
     let mount = if slug.is_empty() { "/" } else { slug.as_str() };
     if let Some(dir) = spec.web_ui_dir {
@@ -673,6 +683,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &[],
                 web_slug,
@@ -1074,6 +1085,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
@@ -1151,6 +1163,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
@@ -1200,6 +1213,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
@@ -1259,6 +1273,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/",
@@ -1347,6 +1362,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
                 web_slug: "/web",
@@ -1403,6 +1419,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
                 web_slug: "/web",
@@ -1448,6 +1465,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &cors_origins,
                 web_slug: "/web",

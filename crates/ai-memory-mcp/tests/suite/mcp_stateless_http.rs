@@ -16,6 +16,7 @@
 
 use ai_memory_mcp::AiMemoryServer;
 use ai_memory_store::Store;
+use ai_memory_wiki::Wiki;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -68,6 +69,7 @@ async fn make_router_with_dialect(
         .await
         .unwrap();
     let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+        .with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap())
         .with_strip_root_combinators(strip_root_combinators)
         .with_gemini_safe_schemas(gemini_safe_schemas);
     let svc = StreamableHttpService::new(
@@ -89,7 +91,7 @@ fn post(body: &'static str) -> Request<Body> {
 }
 
 /// [`post`] against an explicit URI (tests carrying `?flavor=moonshot`).
-fn post_to(uri: &str, body: &'static str) -> Request<Body> {
+fn post_to(uri: &str, body: impl Into<Body>) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
@@ -99,7 +101,7 @@ fn post_to(uri: &str, body: &'static str) -> Request<Body> {
         .header("host", "localhost")
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
-        .body(Body::from(body))
+        .body(body.into())
         .unwrap()
 }
 
@@ -163,6 +165,235 @@ async fn stateless_initialize_returns_json_result() {
         body.contains("serverInfo") || body.contains("protocolVersion"),
         "initialize result should carry server info: {body}"
     );
+}
+
+async fn rpc(router: &Router, token: &str, body: serde_json::Value) -> serde_json::Value {
+    let mut request = post_to("/mcp", body.to_string());
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_str(&body_string(response).await).unwrap()
+}
+
+async fn generic_tool(
+    router: &Router,
+    token: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let reply = rpc(
+        router,
+        token,
+        serde_json::json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":name,"arguments":arguments},
+        }),
+    )
+    .await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_ne!(reply["result"]["isError"], true, "{reply}");
+    let text = reply["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str(&text).unwrap()
+}
+
+/// The public guide's direct-memory sequence works for a static machine
+/// client with a user key, without native hooks or a transport session.
+#[tokio::test]
+async fn generic_machine_client_writes_queries_and_claims_a_handoff() {
+    use ai_memory_core::{ApiCredentialId, NewUser, UserRole};
+    use ai_memory_mcp::auth::{AuthState, require_bearer};
+    use ai_memory_store::{TokenPepper, api_key_preview, generate_api_key, hash_token};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    let tmp = TempDir::new().unwrap();
+    let (router, store) = make_router(&tmp, false).await;
+    let user_id = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "example-client".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let pepper = TokenPepper::new("generic-client-test-pepper");
+    let token = generate_api_key().unwrap();
+    store
+        .writer
+        .create_api_credential(
+            ApiCredentialId::new(),
+            user_id,
+            "generic-client".into(),
+            hash_token(&token, &pepper),
+            Some(api_key_preview(&token)),
+        )
+        .await
+        .unwrap();
+    let auth = AuthState::new(Some("generic-client-root-control".into())).with_multiuser(
+        pepper,
+        store.reader.clone(),
+        store.writer.clone(),
+    );
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        Arc::new(auth),
+        require_bearer,
+    ));
+    let initialized = rpc(
+        &router,
+        &token,
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{},
+              "clientInfo":{"name":"example-client","version":"1.0"}},
+        }),
+    )
+    .await;
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "ai-memory");
+    let tools = rpc(
+        &router,
+        &token,
+        json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/list","params":{},
+        }),
+    )
+    .await;
+    for name in [
+        "memory_write_page",
+        "memory_query",
+        "memory_handoff_begin",
+        "memory_handoff_accept",
+    ] {
+        assert!(
+            tools["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name)
+        );
+    }
+
+    let written = generic_tool(
+        &router,
+        &token,
+        "memory_write_page",
+        json!({
+            "workspace":"demo","project":"app","path":"notes/retries.md",
+            "body":"# Retry policy\nKeep the same event ID when retrying delivery.",
+        }),
+    )
+    .await;
+    assert_eq!(written["path"], "notes/retries.md");
+    assert!(written["page_id"].is_string());
+    let queried = generic_tool(
+        &router,
+        &token,
+        "memory_query",
+        json!({
+            "workspace":"demo","project":"app","query":"retry policy",
+        }),
+    )
+    .await;
+    assert_eq!(queried["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(queried["hits"][0]["path"], "notes/retries.md");
+
+    // A same-named project in another workspace must never become the target.
+    generic_tool(
+        &router,
+        &token,
+        "memory_write_page",
+        json!({
+            "workspace":"other-team","project":"app","path":"notes/foreign.md",
+            "body":"# Foreign project\nForeign workspace control.",
+        }),
+    )
+    .await;
+    let foreign = generic_tool(
+        &router,
+        &token,
+        "memory_query",
+        json!({
+            "workspace":"other-team","project":"app","query":"retry policy",
+        }),
+    )
+    .await;
+    assert_eq!(foreign["hits"], json!([]));
+    let partial = rpc(
+        &router,
+        &token,
+        json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"memory_write_page","arguments":{
+                "workspace":"demo","path":"notes/partial.md","body":"Must be refused",
+            }},
+        }),
+    )
+    .await;
+    assert!(
+        partial.get("error").is_some() || partial["result"]["isError"] == true,
+        "{partial}"
+    );
+
+    let pending = generic_tool(
+        &router,
+        &token,
+        "memory_handoff_begin",
+        json!({
+            "workspace":"demo","project":"app",
+            "summary":"The retry policy was saved. Add the delivery test next.",
+            "next_steps":["Add a retry regression test."],
+        }),
+    )
+    .await;
+    let handoff_id = pending["handoff_id"].as_str().unwrap();
+    let foreign_claim = generic_tool(
+        &router,
+        &token,
+        "memory_handoff_accept",
+        json!({
+            "workspace":"other-team","project":"app","handoff_id":handoff_id,
+        }),
+    )
+    .await;
+    assert_eq!(foreign_claim["handoff"], serde_json::Value::Null);
+    let claimed = generic_tool(
+        &router,
+        &token,
+        "memory_handoff_accept",
+        json!({
+            "workspace":"demo","project":"app","handoff_id":handoff_id,
+        }),
+    )
+    .await;
+    assert_eq!(claimed["status"], "claimed");
+    assert_eq!(
+        claimed["handoff"]["summary"],
+        "The retry policy was saved. Add the delivery test next."
+    );
+    let repeated = generic_tool(
+        &router,
+        &token,
+        "memory_handoff_accept",
+        json!({
+            "workspace":"demo","project":"app","handoff_id":handoff_id,
+        }),
+    )
+    .await;
+    assert_eq!(repeated["status"], "none_pending");
+    assert_eq!(repeated["handoff"], serde_json::Value::Null);
 }
 
 /// Contrast / guard: with `--http-stateful` (session mode), the same

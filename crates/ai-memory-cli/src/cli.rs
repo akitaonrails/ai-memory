@@ -6,6 +6,88 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 
+/// Parse the process argv while making the documented `run` boundary real:
+/// once the harness positional appears, every later token is native argv.
+///
+/// Clap normally keeps recognizing known wrapper flags after a positional,
+/// even with `trailing_var_arg`. That would steal OMP's native `--profile`
+/// as the launch-profile selector. Inserting clap's ordinary `--` delimiter
+/// after the harness keeps the public no-delimiter UX and makes all existing
+/// wrapper-after-harness recovery (`--yolo`, `--fresh`, etc.) explicit in the
+/// run command rather than dependent on clap's option-name knowledge.
+pub(crate) fn parse_process() -> Cli {
+    try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+}
+
+pub(crate) fn try_parse_from<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let mut args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    delimit_run_native_args(&mut args);
+    Cli::try_parse_from(args)
+}
+
+fn delimit_run_native_args(args: &mut Vec<OsString>) {
+    let mut index = 1;
+    let run_index = loop {
+        let Some(raw) = args.get(index).and_then(|arg| arg.to_str()) else {
+            return;
+        };
+        if matches!(raw, "--data-dir" | "--config") {
+            index += 2;
+            continue;
+        }
+        if raw.starts_with("--data-dir=") || raw.starts_with("--config=") {
+            index += 1;
+            continue;
+        }
+        if raw == "run" {
+            break index;
+        }
+        return;
+    };
+
+    index = run_index + 1;
+    while index < args.len() {
+        let Some(raw) = args[index].to_str() else {
+            return;
+        };
+        if raw == "--" {
+            return;
+        }
+        let key = raw.split_once('=').map_or(raw, |(key, _)| key);
+        let takes_separate_value = matches!(
+            key,
+            "--workspace"
+                | "--project"
+                | "--workstream"
+                | "--new"
+                | "--executable"
+                | "--profile"
+                | "--env"
+                | "--env-file"
+                | "--data-dir"
+                | "--config"
+        ) && !raw.contains('=');
+        if takes_separate_value {
+            index += 2;
+            continue;
+        }
+        if raw.starts_with('-') {
+            index += 1;
+            continue;
+        }
+
+        // No trailing tokens means there is nothing for clap to steal.
+        if index + 1 < args.len() {
+            args.insert(index + 1, OsString::from("--"));
+        }
+        return;
+    }
+}
+
 /// Top-level CLI for the `ai-memory` binary.
 #[derive(Debug, Parser)]
 #[command(name = "ai-memory", version, about, long_about = None)]
@@ -33,6 +115,11 @@ pub enum Command {
     Init(InitArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
+    /// List every workspace/project pair the server knows about (plain,
+    /// scriptable output — the read-only equivalent of hitting
+    /// `GET /api/v1/projects` directly, which was previously the only way to
+    /// see this from outside an interactive `show` session).
+    ListProjects(ListProjectsArgs),
     /// Check capture coverage: compare local harness session stores for this
     /// project against what the server captured, and warn when a harness ran
     /// here recently but has no captured sessions (its hook is likely missing).
@@ -49,7 +136,7 @@ pub enum Command {
     RepairBackfillTimestamps(RepairBackfillTimestampsArgs),
     /// Launch an agent in an opt-in, cross-harness managed workstream.
     /// Native arguments are forwarded except exact wrapper flags such as
-    /// `--yolo` and `--fresh`.
+    /// `--yolo`, `--fresh`, and `--force-unlock`.
     Run(RunArgs),
     /// Pick a local project and installed harness, then launch from that
     /// checkout. Removes the `cd` step `run` requires.
@@ -120,10 +207,16 @@ pub enum Command {
     ReclaimLedgerVersions(ReclaimLedgerVersionsArgs),
     /// Snapshot wiki/, db/, and config.toml into a gzipped tarball.
     Backup(BackupArgs),
+    /// Snapshot AI agent configurations, skills, and plugins into a portable archive.
+    #[command(name = "backup-agents")]
+    BackupAgents(BackupAgentsArgs),
     /// Export one project's wiki as an OKF v0.2 bundle tarball.
     ExportOkf(ExportOkfArgs),
     /// Restore a backup tarball into the data directory.
     Restore(RestoreArgs),
+    /// Restore AI agent configurations, skills, and plugins from an archive.
+    #[command(name = "restore-agents")]
+    RestoreAgents(RestoreAgentsArgs),
     /// Rebuild the SQLite index from the wiki/ markdown (the "DB is
     /// rebuildable from files" guarantee). Recreates workspaces/projects from
     /// each scope's `_meta.md` manifest and reindexes every page. Run with the
@@ -265,7 +358,7 @@ pub enum Command {
 
 /// Arguments for `run`. Wrapper-owned flags must precede `harness`; the
 /// trailing native argv is deliberately opaque to clap.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 #[command(trailing_var_arg = true)]
 pub struct RunArgs {
     /// Workspace containing the managed workstream. Defaults to the nearest
@@ -326,6 +419,12 @@ pub struct RunArgs {
     /// resuming or adopting an existing harness session.
     #[arg(long)]
     pub fresh: bool,
+    /// Force-expire the selected workstream's active lease before launching.
+    /// Use only when the previous launcher is gone: its later heartbeat or
+    /// finish will be refused. The server permits takeover only for the same
+    /// authenticated operator (or the single-user, unattributed owner).
+    #[arg(long)]
+    pub force_unlock: bool,
     /// Skip the one-time auto-install of this harness's ai-memory hooks + MCP.
     /// Auto-wire is on by default so a managed launch captures without a manual
     /// `install-hooks`/`install-mcp` step; pass this (or set
@@ -341,6 +440,11 @@ pub struct RunArgs {
     /// server-wide default.
     #[arg(long)]
     pub no_handoff: bool,
+    /// Apply a named env-only launch profile from
+    /// `[run.profiles.<name>.env]` in config.toml. Must precede `harness`;
+    /// a later `--env-file` or `--env` entry wins on the same key.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
     /// Extra environment variable for the spawned harness, `KEY=VALUE`.
     /// Repeatable; wrapper-owned like `--yolo`/`--executable`, so it must
     /// precede `harness`. Reaches the spawned process, ai-memory's own
@@ -367,7 +471,7 @@ pub struct RunArgs {
 }
 
 /// Harnesses supported by managed workstreams.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum RunHarnessChoice {
     /// Anthropic Claude Code (`claude`). Any `claude*`-prefixed name (e.g.
     /// `claude-corp`, `claude-personal`) also selects this harness — see
@@ -1721,6 +1825,17 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
+/// Arguments for `list-projects`.
+#[derive(Debug, Args)]
+pub struct ListProjectsArgs {
+    /// Only list projects in this workspace. Omit to list every workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Emit JSON instead of a plain table.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `backfill`.
 #[derive(Debug, Args)]
 pub struct BackfillArgs {
@@ -1902,6 +2017,39 @@ pub struct BackupArgs {
     pub to: PathBuf,
 }
 
+/// Scope of assets to collect for `backup-agents`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AgentBackupScope {
+    /// Global user assets only.
+    Global,
+    /// Project assets only.
+    Project,
+    /// Both global and project assets.
+    Both,
+}
+
+/// Arguments for `backup-agents`.
+#[derive(Debug, Args)]
+pub struct BackupAgentsArgs {
+    /// Destination tarball (`.tar.gz`).
+    #[arg(long, short = 'o')]
+    pub to: PathBuf,
+    /// Comma-separated list of agent names to include (e.g. `claude,codex,antigravity`). Defaults to all detected.
+    #[arg(long, value_delimiter = ',')]
+    pub agents: Option<Vec<String>>,
+    /// Scope of assets to collect: `global`, `project`, or `both`.
+    #[arg(long, default_value = "both")]
+    pub scope: AgentBackupScope,
+    /// Skip MCP-config redaction; other assets are always copied verbatim.
+    /// Every archive is written with mode 0600 on Unix because instructions
+    /// and plugins may also contain secrets.
+    #[arg(long)]
+    pub include_secrets: bool,
+    /// Preview assets that would be backed up without creating an archive.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Arguments for `export-okf`.
 #[derive(Debug, Args)]
 pub struct ExportOkfArgs {
@@ -1923,6 +2071,26 @@ pub struct RestoreArgs {
     #[arg(long, short = 'i')]
     pub from: PathBuf,
     /// Overwrite an existing non-empty data dir.
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// Arguments for `restore-agents`.
+#[derive(Debug, Args)]
+pub struct RestoreAgentsArgs {
+    /// Source archive (`.tar.gz`).
+    #[arg(long, short = 'i')]
+    pub from: PathBuf,
+    /// Optional comma-separated list of agents to restore. Defaults to all present in archive.
+    #[arg(long, value_delimiter = ',')]
+    pub agents: Option<Vec<String>>,
+    /// Scope of assets to restore: `global`, `project`, or `both`.
+    #[arg(long, default_value = "both")]
+    pub scope: AgentBackupScope,
+    /// Actually write restored files to disk (default is dry-run inspection).
+    #[arg(long)]
+    pub apply: bool,
+    /// Overwrite existing target files even if they differ.
     #[arg(long)]
     pub force: bool,
 }
@@ -2894,13 +3062,19 @@ pub struct ServeArgs {
     /// is public so it can render password login; `/api/v1` and the built-in
     /// server-rendered wiki remain protected by a web session or machine
     /// Bearer.
-    #[arg(long)]
+    #[arg(long, env = "AI_MEMORY_ENABLE_WEB")]
     pub enable_web: bool,
+    /// Mount only the read-only `/api/v1` JSON API. Off by default.
+    ///
+    /// `--enable-web` implies this API as before. Use this flag for
+    /// non-browser companions that must not expose the web UI.
+    #[arg(long, env = "AI_MEMORY_ENABLE_API")]
+    pub enable_api: bool,
     /// Serve this static directory at /web instead of the built-in UI.
     ///
     /// The read-only /api/v1 frontend API is still mounted when
     /// --enable-web is set.
-    #[arg(long)]
+    #[arg(long, env = "AI_MEMORY_WEB_UI_DIR")]
     pub web_ui_dir: Option<PathBuf>,
     /// Base path the whole HTTP surface is served under. Empty (default)
     /// keeps every route at the host root — byte-identical to previous
@@ -2977,6 +3151,18 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn serve_api_only_flag_does_not_enable_the_web_ui() {
+        let parsed =
+            Cli::try_parse_from(["ai-memory", "serve", "--transport", "http", "--enable-api"])
+                .expect("api-only serve args parse");
+        let Command::Serve(args) = parsed.command else {
+            panic!("expected serve command");
+        };
+        assert!(args.enable_api);
+        assert!(!args.enable_web);
+    }
 
     /// The management surface uses the design's spelling (#708):
     /// `user grant --user … --workspace … --project … --level …`, `user revoke`,

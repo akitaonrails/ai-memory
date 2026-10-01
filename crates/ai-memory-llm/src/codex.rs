@@ -451,7 +451,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use secrecy::ExposeSecret as _;
     use serde_json::json;
     use wiremock::matchers::{method, path as request_path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};

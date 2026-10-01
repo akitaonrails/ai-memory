@@ -6,6 +6,7 @@
 //! guard read `process.env` while the rest of the codebase used
 //! `getMergedEnv()`, masking the bug for weeks).
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -406,6 +407,11 @@ pub struct Config {
     /// per harness and config home. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
     /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
     pub run_autowire: bool,
+    /// Named, env-only presets for `ai-memory run --profile NAME`.
+    /// Profiles deliberately do not carry executable paths, native argv, or
+    /// permission-bypass flags. Configure them under `[run.profiles.<name>.env]`.
+    #[serde(default)]
+    pub run: RunSettings,
     /// Off by default. When true, a Claude `ai-memory run --yolo` additionally
     /// applies [`apply_claude_true_yolo`](ai_memory_workstream::apply_claude_true_yolo),
     /// injecting `--settings` that forces `bypassPermissions` over any
@@ -548,6 +554,9 @@ pub struct Config {
     /// Both approve validated proposals by default unless `require_approval` is
     /// set. The SessionEnd trigger stays off by default.
     pub auto_improve: AutoImproveSettings,
+    /// Session-start handoff delivery (design: #959). Default keeps today's
+    /// automatic-claim behavior unchanged.
+    pub handoff: HandoffSettings,
     /// Privacy-strip tuning. Built-in patterns always run; this section
     /// lets the operator extend or punch holes in them.
     pub sanitize: ai_memory_core::SanitizeConfig,
@@ -631,6 +640,7 @@ pub struct RuntimeEnv {
     scope_cwd: Option<String>,
     ignore_marker: bool,
     project_strategy: Option<String>,
+    capture_owner_active: bool,
     claude_code_session_id: Option<String>,
     anthropic_api_key: Option<SecretString>,
     anthropic_oauth_token: Option<SecretString>,
@@ -673,6 +683,8 @@ impl RuntimeEnv {
             // --project-strategy` bakes into the generated hook commands.
             // Consulted only when a marker does not pin one.
             project_strategy: env_string("AI_MEMORY_PROJECT_STRATEGY"),
+            capture_owner_active: env_string("AI_MEMORY_CAPTURE_OWNER")
+                .is_some_and(|value| !value.trim().is_empty()),
             claude_code_session_id: env_string("CLAUDE_CODE_SESSION_ID"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
             // CLAUDE_CODE_OAUTH_TOKEN is what `claude setup-token` writes;
@@ -729,6 +741,12 @@ impl RuntimeEnv {
     #[must_use]
     pub fn project_strategy(&self) -> Option<&str> {
         self.project_strategy.as_deref()
+    }
+
+    /// Whether this invocation delegates native capture to an external producer.
+    #[must_use]
+    pub fn capture_owner_active(&self) -> bool {
+        self.capture_owner_active
     }
 
     /// Claude Code lifecycle session id inherited by an stdio MCP subprocess.
@@ -959,6 +977,7 @@ impl Default for Config {
             capture_assistant: false,
             backfill_on_start: true,
             run_autowire: true,
+            run: RunSettings::default(),
             claude_true_yolo: false,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
@@ -979,6 +998,7 @@ impl Default for Config {
             slots: SlotSettings::default(),
             consolidation: ConsolidationSettings::default(),
             auto_improve: AutoImproveSettings::default(),
+            handoff: HandoffSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             auto_scope: AutoScopeSettings::default(),
@@ -991,6 +1011,68 @@ impl Default for Config {
             runtime_env: RuntimeEnv::default(),
         }
     }
+}
+
+/// `[run]` settings for the managed harness launcher.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunSettings {
+    /// Persisted env-only launch profiles, selected with `run --profile`.
+    pub profiles: BTreeMap<String, RunProfile>,
+}
+
+/// One named managed-launch preset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunProfile {
+    /// Environment overrides applied before `--env-file` and `--env`.
+    pub env: BTreeMap<String, String>,
+}
+
+fn validate_run_profiles(run: &RunSettings) -> Result<()> {
+    const MAX_PROFILES: usize = 128;
+    const MAX_PROFILE_NAME: usize = 64;
+    const MAX_ENV_PER_PROFILE: usize = 128;
+    const MAX_ENV_KEY: usize = 256;
+    const MAX_ENV_VALUE: usize = 64 * 1024;
+
+    if run.profiles.len() > MAX_PROFILES {
+        anyhow::bail!("run.profiles may contain at most {MAX_PROFILES} profiles");
+    }
+    for (name, profile) in &run.profiles {
+        if name.is_empty()
+            || name.len() > MAX_PROFILE_NAME
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            anyhow::bail!(
+                "invalid run profile name {name:?}; use 1-{MAX_PROFILE_NAME} ASCII letters, digits, '.', '_' or '-'"
+            );
+        }
+        if profile.env.len() > MAX_ENV_PER_PROFILE {
+            anyhow::bail!(
+                "run profile {name:?} may contain at most {MAX_ENV_PER_PROFILE} environment entries"
+            );
+        }
+        let mut folded = HashSet::with_capacity(profile.env.len());
+        for (key, value) in &profile.env {
+            if key.is_empty() || key.len() > MAX_ENV_KEY || key.contains(['=', '\0']) {
+                anyhow::bail!("run profile {name:?} has invalid environment key {key:?}");
+            }
+            if value.len() > MAX_ENV_VALUE || value.contains('\0') {
+                anyhow::bail!(
+                    "run profile {name:?} environment value for {key:?} is invalid or exceeds {MAX_ENV_VALUE} bytes"
+                );
+            }
+            if !folded.insert(key.to_ascii_uppercase()) {
+                anyhow::bail!(
+                    "run profile {name:?} repeats environment key {key:?} with different ASCII case"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `[consolidation]` LLM consolidation prompt sizing.
@@ -1025,6 +1107,39 @@ impl Default for ConsolidationSettings {
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
             input_token_safety_margin:
                 ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+        }
+    }
+}
+
+/// `[handoff]` session-start handoff delivery settings (design: #959).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HandoffSettings {
+    /// When `true` (default — unchanged behavior), a `SessionStart` that
+    /// finds a pending handoff claims it automatically, exactly as before
+    /// this setting existed.
+    ///
+    /// When `false`, `SessionStart` does not claim the handoff. It instead
+    /// renders a non-consuming notice naming the exact `handoff_id`, the
+    /// `from_agent`, and its age — mirroring the existing inbox notice
+    /// (`render_inbox_notice`): metadata only, never the stored summary
+    /// text, since a handoff's summary is written by whatever agent or
+    /// operator ended the prior session and a non-consuming notice cannot be
+    /// deliberately skipped the way `memory_handoff_accept` can be left
+    /// uncalled. The agent (or operator) picks it up explicitly with
+    /// `memory_handoff_accept` using that id. This fixes an unrelated next
+    /// session (or a non-interactive launch) silently consuming a baton
+    /// meant for a different session (#959).
+    ///
+    /// Server-wide: applies to every operator on this server. A per-project
+    /// override is intentionally left for a follow-up change.
+    pub claim_on_session_start: bool,
+}
+
+impl Default for HandoffSettings {
+    fn default() -> Self {
+        Self {
+            claim_on_session_start: true,
         }
     }
 }
@@ -1699,6 +1814,8 @@ impl Config {
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
         config.runtime_env = runtime_env;
+
+        validate_run_profiles(&config.run)?;
 
         if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
             anyhow::bail!(
@@ -3716,6 +3833,9 @@ mod tests {
             [auth]
             secure_cookie = true
 
+            [handoff]
+            claim_on_session_start = false
+
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
@@ -3770,6 +3890,7 @@ mod tests {
         assert_eq!(cfg.contradiction_band_min, 0.5);
         assert_eq!(cfg.contradiction_band_max, 0.8);
         assert!(cfg.auth.secure_cookie);
+        assert!(!cfg.handoff.claim_on_session_start);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
         assert!(cfg.auto_improve.scheduler.enabled);
@@ -3805,6 +3926,11 @@ mod tests {
         assert!(cfg.auto_improve.include_raw_fallback);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
+    }
+
+    #[test]
+    fn handoff_claim_on_session_start_defaults_to_true() {
+        assert!(Config::default().handoff.claim_on_session_start);
     }
 
     #[test]
@@ -4859,6 +4985,34 @@ mod tests {
     #[test]
     fn llm_provider_chain_none_when_no_llm_is_configured() {
         assert!(Config::default().llm_provider_chain().unwrap().is_none());
+    }
+
+    #[test]
+    fn run_profiles_parse_from_config_and_reject_ambiguous_names_and_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[run.profiles.work.env]\nCLAUDE_CONFIG_DIR = '/accounts/work'\nMODEL = 'opus'\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap();
+        assert_eq!(
+            config.run.profiles["work"].env["CLAUDE_CONFIG_DIR"],
+            "/accounts/work"
+        );
+
+        std::fs::write(&config_path, "[run.profiles.'bad name'.env]\nFOO = 'bar'\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap_err();
+        assert!(error.to_string().contains("invalid run profile name"));
+
+        std::fs::write(
+            &config_path,
+            "[run.profiles.work.env]\nPATH = '/one'\nPath = '/two'\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().join("data"))).unwrap_err();
+        assert!(error.to_string().contains("different ASCII case"));
     }
 
     #[test]

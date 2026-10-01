@@ -310,7 +310,12 @@ no tiers.
   "$HOME\.rustup"`.
 
 - Shell-level checks: `tests/hooks/test_lib.sh`,
-  `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`.
+  `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`,
+  `scripts/check-nix-packaging.sh` (Nix flake output).
+- `.github/workflows/nix.yml`: path-filtered PRs always run `x86_64-linux`
+  (package + NixOS module eval / sandbox-parity). `aarch64-darwin` and the
+  privileged NixOS container smoke run on schedule, `workflow_dispatch`, or
+  a PR labelled `nix` / `full-ci`.
 - CI additionally runs `cargo build --release --bin ai-memory` on
   Linux/macOS, a Docker image smoke test, `cargo audit` (with the ignores
   listed in `ci.yml`), and differential gitleaks scanning.
@@ -537,8 +542,10 @@ Additional boundary rules:
   macOS/Windows legs run on a `full-ci` PR label, nightly (windows), or
   manual dispatch — and running them is **mandatory right before a
   release**: dispatch `ci` (macOS legs) and `windows` on the exact
-  release-candidate SHA and wait for green before tagging. Never tag a
-  release whose SHA lacks a green full matrix.
+  release-candidate SHA and wait for green before tagging. Nix follows the
+  same rule: Darwin nix build and the privileged NixOS container smoke need
+  `nix` / `full-ci`, schedule, or dispatch (not every `Cargo.lock` bump).
+  Never tag a release whose SHA lacks a green full matrix.
 - **Every release updates the Homebrew tap — do not forget it.** After
   `release.yml` publishes the GitHub release and its per-target tarballs,
   update `~/Projects/homebrew-tap/Formula/ai-memory.rb`: bump `version` and

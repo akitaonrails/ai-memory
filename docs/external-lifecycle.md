@@ -4,6 +4,9 @@ An orchestrator that observes its agents can send lifecycle events to one shared
 ai-memory server through `/hook/batch`. Framework adapters belong outside core;
 the server continues to own storage, retrieval, consolidation and durable memory.
 
+For deliberate writes, queries and handoffs without lifecycle capture, start
+with the [programmatic memory guide](programmatic-memory.md).
+
 ## Choose one capture path before launching
 
 Set `AI_MEMORY_CAPTURE_OWNER` to your producer namespace in the environment of
@@ -34,7 +37,7 @@ Older installations do not understand this context.
 | Supported handoff, briefing and inbox-notice delivery | Preserved |
 | Native identity used by handoff/session-aware MCP | Preserved |
 | MCP recall and deliberate writes | Unchanged |
-| Existing repository capture policy | Unchanged; an opted-out repository stays opted out |
+| Repository capture policy | The producer checks and applies it before queueing each event |
 
 Claude Code receives context through SessionStart. Kimi Code receives it through
 UserPromptSubmit because it discards SessionStart output. The same existing
@@ -52,6 +55,22 @@ installed ai-memory integrations; it must manage finer capture ownership itself.
 `ai-memory hook --check-capture` reports `external_capture: true` and
 `admits_capture: false` when this context is active. It performs no ingestion or
 handoff delivery. The producer namespace itself is not printed or authenticated.
+
+Use `policy_admits_capture` for the external producer's preflight: it ignores
+capture ownership but checks repository policy, event eligibility, exclusions,
+scope completeness and server-profile resolution. Partial scope and a rejected
+profile return `false`. Apply `disposition`, including metadata-only stripping,
+before queueing. `scope` contains sanitized local routing hints of at most 512
+bytes each; oversized hints are omitted and preflight fails closed.
+`scope_resolution` distinguishes explicit, partial, server-derived and
+unavailable scope. `server_may_remap` warns that the server may choose different
+coordinates. Native routing values are unaffected by the inspection bound.
+
+`ai-memory doctor` reports whether this invocation delegates native capture and
+shows its authenticated machine identity. Its per-agent counts flag sessions
+with multiple capture sources (native events or distinct extensions, including
+backfill). An older server leaves those
+fields unknown; a mixed count is a diagnostic signal, not proof of duplicates.
 
 ## Reuse the public event contract
 
@@ -141,6 +160,12 @@ Use the tuple recipe when event IDs have narrower scope.
   across concurrent requests and no all-or-nothing transaction for a batch.
 - Prefer `accepted_indices` when present. Otherwise `accepted` is the contiguous
   acknowledged prefix. Preserve every unacknowledged item for retry.
+- `results` contains one `{index, outcome}` for each acknowledged index, in
+  index order, including an empty array when nothing was acknowledged. Outcomes
+  are `stored`, `replayed`, `resumed`, `ignored_end`, `dropped_policy`,
+  `dropped_subagent`, `dropped_unauthorized` and `dropped_collision`. A drop is a
+  terminal acknowledgement. Older servers omit `results`; the relay records
+  those receipts as `unknown`.
 - A rate-limited source can be skipped while other sources advance. Inspect
   acknowledgements even on HTTP 429 or a partial failure; `failed_index` identifies
   a processing failure after earlier skips. An acknowledgement can also mean a
@@ -178,8 +203,9 @@ not disable native harness transcript files or other vendors' hooks.
 Auth, owner checks, admission rules and sanitization still apply. All items in
 one batch share one authenticated identity; separate batches by operator when
 representing multiple users. `extension` is self-declared provenance and the
-capture variable grants no permissions. ai-memory has a shared single-tenant
-wiki with multi-user attribution, not per-project RBAC or producer isolation.
+capture variable grants no permissions. Project access modes and grants apply
+to DB-user tokens. Pages are shared by authorized project members; session and
+handoff ownership still applies. Producer namespaces provide provenance only.
 See [multi-user attribution](users.md).
 
 No framework adapter, workflow engine, generic plugin runtime or OpenTelemetry

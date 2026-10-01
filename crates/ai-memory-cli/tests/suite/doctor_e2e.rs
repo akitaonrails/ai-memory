@@ -144,6 +144,9 @@ mod slow {
             &base,
         ))
         .expect("doctor --json report");
+        assert_eq!(report["capture_owner_active"], false);
+        assert_eq!(report["identity"]["level"], "anonymous");
+        assert_eq!(report["identity"]["version"], env!("CARGO_PKG_VERSION"));
 
         let claude = find_row(&report, "claude-code")
             .unwrap_or_else(|| panic!("expected a claude-code row: {report}"));
@@ -282,6 +285,74 @@ mod slow {
         assert!(
             !human2.contains("install-hooks --agent claude-code --apply"),
             "a captured harness must not get an install-hooks nag: {human2}"
+        );
+
+        // Backfill uses canonical user events and its own namespace for
+        // assistant events. Mixed provenance alone does not mean duplication.
+        assert_eq!(claude2["mixed_capture_sessions"], 1);
+        let diagnostic_session = "doctor-native-external-control";
+        let native_ack: Value = client.post(format!("{base}/hook/batch"))
+            .json(&json!([{
+                "url": format!("/hook?event=user-prompt-submit&agent=claude-code&workspace={WORKSPACE}&project={PROJECT}&ingest_key=doctor-native-prompt-1"),
+                "body": {"session_id":diagnostic_session,"cwd":cwd,"prompt":"Native capture control"}
+            }]))
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(native_ack["accepted"], 1);
+        let ack: Value = client.post(format!("{base}/hook/batch"))
+            .json(&json!([{
+                "url": format!("/hook?event=user-prompt-submit&agent=claude-code&workspace={WORKSPACE}&project={PROJECT}&extension=example.runtime&source_event=user-prompt-submit&ingest_key=doctor-external-prompt-1"),
+                "body": {"session_id":diagnostic_session,"cwd":cwd,"prompt":"External capture control"}
+            }]))
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(ack["accepted"], 1);
+
+        let output = hermetic(BIN)
+            .args([
+                "doctor",
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                PROJECT,
+                "--since-days",
+                "0",
+                "--json",
+            ])
+            .env("AI_MEMORY_DATA_DIR", data_dir.path())
+            .env("AI_MEMORY_HOME", home.path())
+            .env("AI_MEMORY_SERVER_URL", &base)
+            .env("AI_MEMORY_CAPTURE_OWNER", "example.runtime")
+            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let mixed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(mixed["capture_owner_active"], true);
+        assert_eq!(
+            find_row(&mixed, "claude-code").unwrap()["mixed_capture_sessions"],
+            2
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("example.runtime"));
+
+        let human3 = run_cli(
+            &[
+                "doctor",
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                PROJECT,
+                "--since-days",
+                "0",
+            ],
+            data_dir.path(),
+            home.path(),
+            Some(&cwd),
+            &base,
+        );
+        assert!(human3.contains("multiple capture sources"), "{human3}");
+        assert!(
+            human3.contains("does not prove duplicate capture"),
+            "{human3}"
         );
 
         drop(server);

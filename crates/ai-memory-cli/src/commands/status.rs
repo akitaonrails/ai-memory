@@ -19,6 +19,21 @@ use crate::http_client::{ServerEndpoint, get_json};
 #[derive(Debug, Deserialize, Serialize)]
 struct IngestReport {
     accepted: u64,
+    #[serde(default)]
+    dropped_unauthorized: u64,
+    #[serde(default)]
+    stored: u64,
+    #[serde(default)]
+    replayed: u64,
+    #[serde(default)]
+    resumed: u64,
+    #[serde(default)]
+    ignored_end: u64,
+    #[serde(default)]
+    dropped_collision: u64,
+    #[serde(default)]
+    failed: u64,
+
     dropped_by_policy: u64,
     shed_saturated: u64,
     shed_rate_limited: u64,
@@ -346,6 +361,14 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                 ingest.dropped_by_policy
             );
             println!(
+                "    outcomes:   {} stored, {} replayed, {} resumed, {} ignored end, {} failed",
+                ingest.stored, ingest.replayed, ingest.resumed, ingest.ignored_end, ingest.failed
+            );
+            println!(
+                "    drops:      {} unauthorized, {} collision",
+                ingest.dropped_unauthorized, ingest.dropped_collision
+            );
+            println!(
                 "    shed:       {} saturated, {} rate-limited",
                 ingest.shed_saturated, ingest.shed_rate_limited
             );
@@ -481,6 +504,27 @@ fn error_detail(role: &ProviderRoleHealthSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingest_additions_default_for_older_servers_and_roundtrip() {
+        let old = serde_json::json!({"accepted": 2, "dropped_by_policy": 1, "shed_saturated": 0, "shed_rate_limited": 0, "last_persisted_ms": null});
+        let report: IngestReport = serde_json::from_value(old).unwrap();
+        let mut value = serde_json::to_value(report).unwrap();
+        for name in [
+            "stored",
+            "replayed",
+            "resumed",
+            "ignored_end",
+            "dropped_unauthorized",
+            "dropped_collision",
+            "failed",
+        ] {
+            assert_eq!(value[name], 0);
+            value[name] = serde_json::json!(7);
+        }
+        let current: IngestReport = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(current).unwrap(), value);
+    }
 
     /// #428's counters and #446's gate compose into a trap: under allowlist
     /// mode an unmarked repository never sends, so `accepted: 0` with an empty

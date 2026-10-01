@@ -1271,6 +1271,32 @@ async fn api_sessions_lists_completed_sessions_for_the_scope() {
     assert_eq!(sessions[0]["session_id"], completed.to_string());
     assert_eq!(sessions[0]["observation_count"], 1);
     assert!(sessions[0]["ended_at"].is_string());
+    assert!(
+        sessions[0]
+            .get("consolidation")
+            .is_some_and(serde_json::Value::is_null)
+    );
+
+    store
+        .writer
+        .enqueue_session_consolidation(ws, proj, completed)
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let with_job = json_body(resp).await;
+    assert_eq!(
+        with_job["sessions"][0]["consolidation"],
+        serde_json::json!({"state":"pending","attempts":0})
+    );
 
     let resp = app
         .oneshot(
@@ -1339,6 +1365,11 @@ async fn api_session_observations_pages_orders_and_caps() {
     );
     let json = json_body(resp).await;
     assert_eq!(json["session"]["session_id"], session_id.to_string());
+    assert!(
+        json["session"]
+            .get("consolidation")
+            .is_some_and(serde_json::Value::is_null)
+    );
     assert_eq!(json["total"], 3);
     assert_eq!(json["limit"], 2);
     assert_eq!(json["offset"], 0);
@@ -3777,4 +3808,251 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
     let (status, body) = get(api.clone(), "/workspaces/acme/overview", Some(alice)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(shows(&body, "secrets/rates.md"), "{body}");
+}
+
+#[tokio::test]
+async fn api_recent_incremental_paginates_over_120_pages_and_binds_cursor() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    for n in 0..125 {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, &format!("p{n:03}.md"), "Page", "body"))
+            .await
+            .unwrap();
+    }
+    let app = api_router(store.reader.clone(), wiki);
+    let base = "/workspaces/default/projects/scratch/recent";
+    let mut url = format!("{base}?updated_since=2000-01-01T00:00:00Z&limit=37");
+    let mut paths = Vec::new();
+    let mut first_cursor = None;
+    loop {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let pages = json["pages"].as_array().unwrap();
+        assert!(pages.len() <= 37);
+        paths.extend(
+            pages
+                .iter()
+                .map(|page| page["path"].as_str().unwrap().to_owned()),
+        );
+        let Some(cursor) = json["next_cursor"].as_str() else {
+            break;
+        };
+        first_cursor.get_or_insert_with(|| cursor.to_owned());
+        url = format!("{base}?cursor={cursor}&limit=37");
+    }
+    assert_eq!(paths.len(), 125);
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths.len(), 125);
+    let cursor = first_cursor.unwrap();
+    let resume = format!("{base}?cursor={cursor}&limit=37");
+    let mut replay_bodies = Vec::new();
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&resume).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        replay_bodies.push(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        replay_bodies[0], replay_bodies[1],
+        "unchanged data gives a stable continuation"
+    );
+    use base64::Engine as _;
+    let cursor_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&cursor)
+        .unwrap();
+    let cursor_json: Value = serde_json::from_slice(&cursor_bytes).unwrap();
+    for (key, value) in [
+        ("v", serde_json::json!(2)),
+        ("path", serde_json::json!("../escape.md")),
+        ("updated_at", cursor_json["since"].clone()),
+        ("since", serde_json::json!("invalid")),
+    ] {
+        let mut malformed = cursor_json.clone();
+        malformed[key] = value;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&malformed).unwrap());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}?cursor={raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    for url in [
+        format!("/workspaces/default/projects/other/recent?cursor={cursor}"),
+        format!("{base}?cursor={cursor}&updated_since=2001-01-01T00:00:00Z"),
+        format!("{base}?cursor=zz"),
+        format!("{base}?cursor={}", "a".repeat(8194)),
+        format!("{base}?updated_since=yesterday"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("{base}?limit=1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, max-age=30"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
+    use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+    use ai_memory_store::{AccessMode, GrantLevel};
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .set_new_project_mode(AccessMode::Restricted)
+        .await
+        .unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "private-memory", None)
+        .await
+        .unwrap();
+    for n in 0..2 {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, &format!("p{n}.md"), "Page", "body"))
+            .await
+            .unwrap();
+    }
+    let mut users = Vec::new();
+    for name in ["alice", "bob"] {
+        users.push(
+            store
+                .writer
+                .create_human_user(
+                    NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    store
+        .writer
+        .grant_memory(users[0], proj, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let app = api_router(store.reader.clone(), wiki);
+    let request = |uri: String, user| {
+        Request::builder()
+            .uri(uri)
+            .extension(AuthorizedViewer(user))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let base = "/workspaces/default/projects/private-memory/recent";
+    let first = app
+        .clone()
+        .oneshot(request(
+            format!("{base}?updated_since=2000-01-01T00:00:00Z&limit=1"),
+            users[0],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    let url = format!("{base}?cursor={}", json["next_cursor"].as_str().unwrap());
+    assert_eq!(
+        app.clone()
+            .oneshot(request(url.clone(), users[1]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(url.clone(), users[0]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        store
+            .writer
+            .revoke_memory(users[0], proj, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        app.oneshot(request(url, users[0])).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "a cursor cannot retain access after its user's grant is revoked"
+    );
 }

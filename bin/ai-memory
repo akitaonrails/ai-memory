@@ -31,7 +31,7 @@
 #                           likewise
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
-#   AI_MEMORY_NATIVE_BIN    native binary used for managed host commands (optional)
+#   AI_MEMORY_NATIVE_BIN    native binary used for host commands and hooks (optional)
 #   AI_MEMORY_WRAPPER_URL   wrapper release asset override (optional; its
 #                           .sha256 companion is required)
 #   AI_MEMORY_WRAPPER_SHA256_URL  wrapper checksum URL override (optional)
@@ -359,6 +359,11 @@ cmd_upgrade() {
   echo "→ pulling ${IMAGE}"
   "${DOCKER}" pull "${IMAGE}"
   rm -f "${NATIVE_RUNNER_DIR}/last-check"
+  echo "→ refreshing checksum-verified native host client"
+  native_host_binary >/dev/null || {
+    echo "ai-memory: upgrade stopped before hook refresh because the native host client could not be updated" >&2
+    return 1
+  }
 
   local found_agents=()
   if [ -d "${HOOKS_STAGE_DIR}" ]; then
@@ -466,6 +471,10 @@ native_host_binary() {
       echo "ai-memory: AI_MEMORY_NATIVE_BIN is not executable: ${AI_MEMORY_NATIVE_BIN}" >&2
       return 1
     }
+    if [ "${AI_MEMORY_NATIVE_BIN}" -ef "$0" ]; then
+      echo "ai-memory: AI_MEMORY_NATIVE_BIN points to the container wrapper itself; use the native release binary" >&2
+      return 1
+    fi
     printf '%s\n' "${AI_MEMORY_NATIVE_BIN}"
     return 0
   fi
@@ -475,8 +484,8 @@ native_host_binary() {
     Linux) os="linux" ;;
     Darwin) os="macos" ;;
     *)
-      echo "ai-memory: the container wrapper cannot provide managed host launches on this OS" >&2
-      echo "install the native release binary to use ai-memory run/show/continue/resume/workstreams/rename-workstream" >&2
+      echo "ai-memory: the container wrapper cannot provide native host commands on this OS" >&2
+      echo "install the native release binary to use managed launches or native lifecycle hooks" >&2
       return 1
       ;;
   esac
@@ -564,6 +573,19 @@ case "${1:-}" in
     NATIVE_HOST_BIN=$(native_host_binary)
     exec "${NATIVE_HOST_BIN}" "${NATIVE_HOST_COMMAND}" "$@"
     ;;
+  install-hooks)
+    # Capture exclusions and allowlist mode are client-side privacy controls.
+    # The wrapper's stable, checksum-verified host client can enforce them;
+    # the helper-container script bundle cannot. Keep explicit compatibility
+    # selections available, but never choose the weaker path by default.
+    case "${AI_MEMORY_HOOK_PLATFORM:-}" in
+      posix | windows) ;;
+      *)
+        NATIVE_HOST_BIN=$(native_host_binary)
+        exec "${NATIVE_HOST_BIN}" "$@"
+        ;;
+    esac
+    ;;
 esac
 
 # ---- normal pass-through to the binary inside a container ----------------
@@ -578,11 +600,10 @@ if [ -z "${AI_MEMORY_NO_TTY:-}" ] && [ -t 0 ] && [ -t 1 ]; then
   TTY_ARGS+=(-t)
 fi
 
-# The CLI runs INSIDE the container but renders hook config for the HOST, which
-# has no local ai-memory binary. Native installs default to `posix-native` (the
-# binary hook command); the wrapper must NOT inherit that or it would bake the
-# *container's* binary path into the host's hook config. Force the shell-script
-# platform (`posix`) unless the operator chose one explicitly.
+# Commands that still reach the helper container must never bake its binary
+# path into host config. Ordinary `install-hooks` was intercepted above and
+# uses the stable native host client; an explicit script compatibility choice
+# reaches here and remains script-based.
 export AI_MEMORY_HOOK_PLATFORM="${AI_MEMORY_HOOK_PLATFORM:-posix}"
 
 ENV_ARGS=()

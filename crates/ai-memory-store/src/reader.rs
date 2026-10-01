@@ -837,6 +837,15 @@ pub struct OpenSession {
     pub cwd: Option<String>,
 }
 
+/// Public state and attempt count for the latest scoped consolidation job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionConsolidationSummary {
+    /// Latest generation state, without provider diagnostics.
+    pub state: String,
+    /// Provider attempts spent on this generation.
+    pub attempts: u32,
+}
+
 /// One session as listed from a scope by [`ReaderPool::sessions_for_scope`]
 /// and [`ReaderPool::session_summary_scoped`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -856,6 +865,8 @@ pub struct SessionSummary {
     pub observation_count: u64,
     /// Operator the session belongs to, as stored on the `sessions` row.
     pub actor_user: Option<String>,
+    /// Latest consolidation generation in the requested scope, if present.
+    pub consolidation: Option<SessionConsolidationSummary>,
 }
 
 /// Aggregate MCP tool-call counts for one client, from
@@ -882,6 +893,8 @@ pub struct AgentSessionCount {
     pub agent: String,
     /// Sessions this agent opened in the window, ended or still open.
     pub sessions: u64,
+    /// Sessions with multiple admitted capture namespaces in this scope.
+    pub mixed_capture_sessions: u64,
 }
 
 /// How a `SessionEnd` event should treat its target session — see
@@ -3164,7 +3177,12 @@ impl ReaderPool {
                 ""
             };
             let sql = format!(
-                "SELECT agent_kind, COUNT(*) AS n FROM sessions \
+                "SELECT agent_kind, COUNT(*) AS n, \
+                 SUM((SELECT COUNT(DISTINCT CASE WHEN o.extension IS NULL \
+                     THEN 'native' ELSE 'extension:' || o.extension END) \
+                     FROM observations o WHERE o.session_id = sessions.id \
+                       AND o.workspace_id = :ws AND o.project_id = :proj) > 1) \
+                 FROM sessions \
                  WHERE workspace_id = :ws AND project_id = :proj\
                  {since_clause}{owner_clause} \
                  GROUP BY agent_kind \
@@ -3186,14 +3204,15 @@ impl ReaderPool {
             let rows = stmt.query_map(named.as_slice(), |row| {
                 let agent: String = row.get(0)?;
                 let n: i64 = row.get(1)?;
-                Ok((agent, n))
+                Ok((agent, n, row.get::<_, i64>(2)?))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (agent, n) = row?;
+                let (agent, n, mixed) = row?;
                 out.push(AgentSessionCount {
                     agent,
                     sessions: u64::try_from(n).unwrap_or(0),
+                    mixed_capture_sessions: u64::try_from(mixed).unwrap_or(0),
                 });
             }
             Ok(out)
@@ -3473,8 +3492,14 @@ impl ReaderPool {
                 "SELECT s.id, s.cwd, s.agent_kind, s.started_at, s.ended_at, s.actor_user, \
                         (SELECT COUNT(*) FROM observations o \
                          WHERE o.session_id = s.id \
-                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n \
+                           AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
+                        j.state, j.attempts \
                  FROM sessions s \
+                 LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \
+                   AND j.workspace_id = :ws AND j.project_id = :proj \
+                   AND j.generation = (SELECT MAX(latest.generation) \
+                     FROM session_consolidation_jobs latest WHERE latest.session_id = s.id \
+                       AND latest.workspace_id = :ws AND latest.project_id = :proj) \
                  WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
                  ORDER BY s.started_at DESC, s.id DESC \
                  LIMIT :limit OFFSET :offset"
@@ -3506,12 +3531,30 @@ impl ReaderPool {
                 let actor_user: Option<String> = row.get(5)?;
                 let n: i64 = row.get(6)?;
                 Ok((
-                    id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n,
+                    id_bytes,
+                    cwd,
+                    agent_kind,
+                    started_us,
+                    ended_us,
+                    actor_user,
+                    n,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<u32>>(8)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (id_bytes, cwd, agent_kind, started_us, ended_us, actor_user, n) = row?;
+                let (
+                    id_bytes,
+                    cwd,
+                    agent_kind,
+                    started_us,
+                    ended_us,
+                    actor_user,
+                    n,
+                    state,
+                    attempts,
+                ) = row?;
                 let started_at = jiff::Timestamp::from_microsecond(started_us)
                     .map(|ts| ts.to_string())
                     .unwrap_or_default();
@@ -3526,6 +3569,9 @@ impl ReaderPool {
                     ended_at,
                     observation_count: u64::try_from(n).unwrap_or(0),
                     actor_user,
+                    consolidation: state
+                        .zip(attempts)
+                        .map(|(state, attempts)| SessionConsolidationSummary { state, attempts }),
                 });
             }
             Ok(out)
@@ -8065,6 +8111,59 @@ impl ReaderPool {
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// Bounded incremental latest-page summaries, ordered by timestamp and path.
+    /// Expired pages are omitted; this is an update listing, not a deletion feed.
+    /// `since_us` is exclusive; `after` resumes strictly after a returned pair.
+    ///
+    /// # Errors
+    /// Propagates SQL and pool errors.
+    pub async fn incremental_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        since_us: i64,
+        after: Option<(i64, String)>,
+        limit: usize,
+    ) -> StoreResult<Vec<PageSummary>> {
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let (after_us, after_path) = after.unwrap_or((since_us, String::new()));
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT pg.path, pg.title, {kind_expr}, pg.tier, pg.updated_at
+                 FROM pages pg WHERE pg.workspace_id = ?1 AND pg.project_id = ?2
+                   AND pg.is_latest = 1 AND pg.updated_at > ?3
+                   AND (pg.updated_at > ?4 OR (pg.updated_at = ?4 AND pg.path > ?5))
+                   AND (pg.expires_at IS NULL OR pg.expires_at > ?6)
+                 ORDER BY pg.updated_at ASC, pg.path ASC LIMIT ?7"
+            ))?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    since_us,
+                    after_us,
+                    after_path,
+                    jiff::Timestamp::now().as_microsecond(),
+                    limit.clamp(1, 100) as i64 + 1
+                ],
+                |row| {
+                    let updated_us: i64 = row.get(4)?;
+                    Ok(PageSummary {
+                        path: row.get(0)?,
+                        title: row.get(1)?,
+                        kind: row.get(2)?,
+                        tier: row.get(3)?,
+                        updated_at: jiff::Timestamp::from_microsecond(updated_us)
+                            .map(|ts| ts.to_string())
+                            .unwrap_or_default(),
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
         .await
     }

@@ -666,6 +666,20 @@ fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
     Ok(())
 }
 
+fn mount_machine_routes(
+    machine: axum::Router,
+    reader: ai_memory_store::ReaderPool,
+    auth: Arc<AuthState>,
+) -> axum::Router {
+    machine
+        .merge(ai_memory_mcp::identity::router(
+            reader,
+            auth.actor_proxy_bearer().is_some(),
+        ))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn_with_state(auth, require_bearer))
+}
+
 /// Can a trusted proxy actually assert identities on this server?
 ///
 /// The MCP admin gates read this to know that distinct operators are in play
@@ -1341,6 +1355,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
                 capture_assistant_enabled: config.capture_assistant,
+                claim_handoff_on_session_start: config.handoff.claim_on_session_start,
                 per_user_slots: config.slots.per_user,
                 subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                     ai_memory_hooks::SubagentSessionSet::default(),
@@ -1364,6 +1379,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 reader: store.reader.clone(),
                 sanitizer: sanitizer.clone(),
                 data_dir: config.data_dir.clone(),
+                trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
             let admin = admin_router_with_sweep_tuning(
                 AdminState {
@@ -1493,15 +1509,14 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             );
             let auth_state = Arc::new(auth_state);
             let auth_enabled = auth_state.enabled();
-            let machine = axum::Router::new()
-                .nest_service("/mcp", mcp_service)
-                .merge(hooks)
-                .merge(workstreams)
-                .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-                .layer(axum::middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    require_bearer,
-                ));
+            let machine = mount_machine_routes(
+                axum::Router::new()
+                    .nest_service("/mcp", mcp_service)
+                    .merge(hooks)
+                    .merge(workstreams),
+                store.reader.clone(),
+                auth_state.clone(),
+            );
             let admin = admin
                 .layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES))
                 .layer(axum::middleware::from_fn_with_state(
@@ -1533,6 +1548,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 store.reader.clone(),
                 wiki.clone(),
                 WebMountSpec {
+                    enable_api: args.enable_api,
                     web_ui_dir: args.web_ui_dir.as_deref(),
                     cors_origins: &cors_origins,
                     web_slug: &args.web_slug,
@@ -4378,6 +4394,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_identity_remains_authenticated_with_web_disabled_and_expired_keys() {
+        use ai_memory_core::{ApiCredentialId, NewUser, UserRole};
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let web = split_web_routers(
+            false,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: false,
+                web_ui_dir: None,
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: "/web/",
+                base_path: "",
+                trusted_proxy_identity: false,
+            },
+        )
+        .unwrap();
+        let pepper = ai_memory_store::TokenPepper::new("identity-mount-test");
+        let user = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "alice".into(),
+                    name: None,
+                    email: None,
+                },
+                UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let id = ApiCredentialId::new();
+        store
+            .writer
+            .create_api_credential(
+                id,
+                user,
+                "test".into(),
+                ai_memory_store::hash_token("expired-test-token", &pepper),
+                None,
+            )
+            .await
+            .unwrap();
+        let auth = Arc::new(
+            AuthState::new(Some("root-test-token".into())).with_multiuser(
+                pepper,
+                store.reader.clone(),
+                store.writer.clone(),
+            ),
+        );
+        let app = mount_machine_routes(axum::Router::new(), store.reader.clone(), auth)
+            .merge(web.protected)
+            .merge(web.public);
+        for (token, status) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("invalid-test-token"), StatusCode::UNAUTHORIZED),
+            (Some("root-test-token"), StatusCode::OK),
+            (Some("expired-test-token"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/identity");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            assert_eq!(
+                app.clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                status
+            );
+        }
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE api_credentials SET expires_at = 1 WHERE id = ?1",
+            [id.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            app.oneshot(
+                Request::builder()
+                    .uri("/identity")
+                    .header("authorization", "Bearer expired-test-token")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn api_only_mode_keeps_data_authenticated_and_web_absent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let web = split_web_routers(
+            false,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: true,
+                web_ui_dir: None,
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: "/web/",
+                base_path: "",
+                trusted_proxy_identity: false,
+            },
+        )
+        .unwrap();
+        assert!(web.html_auth.is_none());
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = apply_host_layer(
+            web.public
+                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                    auth,
+                    require_dual_auth,
+                ))),
+            vec!["localhost".to_string()],
+        );
+
+        let unauthenticated = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::OK);
+
+        let absent_web = router
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(absent_web.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn web_routes_are_inside_auth_layer() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -4387,6 +4578,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: None,
                 cors_origins: &[],
                 web_slug: "/web",
@@ -4532,6 +4724,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
@@ -4593,6 +4786,7 @@ mod tests {
             store.reader.clone(),
             wiki,
             WebMountSpec {
+                enable_api: false,
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/",

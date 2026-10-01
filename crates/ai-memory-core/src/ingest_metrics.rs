@@ -45,7 +45,19 @@ pub struct IngestMetrics {
     shed_saturated: AtomicU64,
     /// Events shed by the per-source rate limiter (429).
     shed_rate_limited: AtomicU64,
-    /// Unix milliseconds of the last event that reached the writer, or 0
+    /// Completed hook deliveries classified as `stored`.
+    stored: AtomicU64,
+    /// Completed hook deliveries classified as `replayed`.
+    replayed: AtomicU64,
+    /// Completed hook deliveries classified as `resumed`.
+    resumed: AtomicU64,
+    /// Completed hook deliveries classified as `ignored_end`.
+    ignored_end: AtomicU64,
+    /// Completed hook deliveries classified as `dropped_collision`.
+    dropped_collision: AtomicU64,
+    /// Completed hook deliveries classified as `failed`.
+    failed: AtomicU64,
+    /// Unix milliseconds of the last newly persisted observation or effect, or 0
     /// when none has since this process started.
     last_persisted_ms: AtomicU64,
 }
@@ -71,6 +83,30 @@ impl IngestMetrics {
     pub fn record_shed_rate_limited(&self) {
         self.shed_rate_limited.fetch_add(1, Ordering::Relaxed);
     }
+    /// Record one `stored` delivery.
+    pub fn record_stored(&self) {
+        self.stored.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `replayed` delivery.
+    pub fn record_replayed(&self) {
+        self.replayed.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `resumed` delivery.
+    pub fn record_resumed(&self) {
+        self.resumed.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `ignored_end` delivery.
+    pub fn record_ignored_end(&self) {
+        self.ignored_end.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `dropped_collision` delivery.
+    pub fn record_dropped_collision(&self) {
+        self.dropped_collision.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record one `failed` delivery.
+    pub fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
+    }
     /// Stamp the moment an event reached durable storage.
     pub fn record_persisted(&self, unix_ms: u64) {
         self.last_persisted_ms.store(unix_ms, Ordering::Relaxed);
@@ -81,6 +117,13 @@ impl IngestMetrics {
     pub fn snapshot(&self) -> IngestMetricsSnapshot {
         IngestMetricsSnapshot {
             accepted: self.accepted.load(Ordering::Relaxed),
+            stored: self.stored.load(Ordering::Relaxed),
+            replayed: self.replayed.load(Ordering::Relaxed),
+            resumed: self.resumed.load(Ordering::Relaxed),
+            ignored_end: self.ignored_end.load(Ordering::Relaxed),
+            dropped_collision: self.dropped_collision.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+
             dropped_by_policy: self.dropped_by_policy.load(Ordering::Relaxed),
             dropped_unauthorized: self.dropped_unauthorized.load(Ordering::Relaxed),
             shed_saturated: self.shed_saturated.load(Ordering::Relaxed),
@@ -106,7 +149,19 @@ pub struct IngestMetricsSnapshot {
     pub shed_saturated: u64,
     /// Events shed by the per-source rate limiter.
     pub shed_rate_limited: u64,
-    /// Unix ms of the last event that reached the writer, if any.
+    /// Hook deliveries classified as `stored`.
+    pub stored: u64,
+    /// Hook deliveries classified as `replayed`.
+    pub replayed: u64,
+    /// Hook deliveries classified as `resumed`.
+    pub resumed: u64,
+    /// Hook deliveries classified as `ignored_end`.
+    pub ignored_end: u64,
+    /// Hook deliveries classified as `dropped_collision`.
+    pub dropped_collision: u64,
+    /// Hook deliveries classified as `failed`.
+    pub failed: u64,
+    /// Unix ms of the last newly persisted observation or effect, if any.
     pub last_persisted_ms: Option<u64>,
 }
 
@@ -146,6 +201,26 @@ mod tests {
         assert_eq!(s.last_persisted_ms, Some(1_700_000_000_000));
     }
 
+    #[test]
+    fn additive_outcomes_do_not_change_admission_or_last_write() {
+        let metrics = IngestMetrics::default();
+        metrics.record_stored();
+        metrics.record_replayed();
+        metrics.record_resumed();
+        metrics.record_ignored_end();
+        metrics.record_dropped_collision();
+        metrics.record_failed();
+        let s = metrics.snapshot();
+        assert_eq!(
+            (s.stored, s.replayed, s.resumed, s.ignored_end),
+            (1, 1, 1, 1)
+        );
+        assert_eq!((s.dropped_collision, s.failed), (1, 1));
+        assert_eq!(s.accepted, 0);
+        assert_eq!(s.dropped_by_policy, 0);
+        assert_eq!(s.last_persisted_ms, None);
+    }
+
     /// The shape is the privacy contract: counts and one timestamp, nothing
     /// that could carry a prompt, path, or tool payload. If a field carrying
     /// captured text is ever added, this fails loudly (#428).
@@ -161,10 +236,16 @@ mod tests {
             vec![
                 "accepted",
                 "dropped_by_policy",
+                "dropped_collision",
                 "dropped_unauthorized",
+                "failed",
+                "ignored_end",
                 "last_persisted_ms",
+                "replayed",
+                "resumed",
                 "shed_rate_limited",
-                "shed_saturated"
+                "shed_saturated",
+                "stored"
             ]
         );
         for v in value.as_object().unwrap().values() {

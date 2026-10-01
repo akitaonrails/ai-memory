@@ -7,6 +7,7 @@
 
 pub mod active_project;
 pub mod actor;
+pub mod agent_backup;
 pub mod error;
 pub mod handoff;
 pub mod ingest_metrics;
@@ -52,6 +53,10 @@ pub use actor::{
     ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey, OwnerFilter,
     SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
     skip_admission_chain_for,
+};
+pub use agent_backup::{
+    AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
+    AgentBackupManifest, HostInfo,
 };
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{

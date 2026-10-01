@@ -106,6 +106,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Area | Status |
 | --- | --- |
 | Linux | Supported |
+| NixOS module | Supported |
 | macOS | Supported |
 | Windows via WSL2 | Supported |
 | Native Windows | Experimental |
@@ -318,6 +319,14 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
+On Linux and macOS, the Docker wrapper runs `install-hooks` through its
+checksum-verified native host client. The installed hooks therefore enforce
+client-side capture controls such as `[capture] ignore_paths` and allowlist
+mode before an event reaches the spool or network. Set
+`AI_MEMORY_HOOK_PLATFORM=posix` explicitly only when you need the legacy shell
+compatibility path; the installer warns that path cannot enforce capture
+policy v1.
+
 The examples use `docker`; replace it with `podman` on a Podman host. The
 wrapper automatically uses Podman when Docker is not installed. Set
 `AI_MEMORY_DOCKER=podman` to force Podman when both engines are available.
@@ -355,8 +364,17 @@ config home.
 ```bash
 ai-memory run claude
 ai-memory run codex --yolo   # later: same workstream, different harness
+ai-memory run --profile work claude  # reusable config.toml env/account preset
 ai-memory continue           # resume the newest managed checkout
+# after a dead launcher left its lease behind (same operator only)
+ai-memory run --force-unlock codex
 ```
+
+`--force-unlock` immediately expires the selected workstream's active lease;
+use it only when you know the previous launcher is gone. It does not kill a
+native process, and it cannot evict another authenticated operator's run. See
+the [managed-workstream recovery notes](docs/managed-workstreams.md#lease-recovery)
+for the full safety contract.
 
 Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 `AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with
@@ -368,6 +386,68 @@ and only what it installed. It also clears `ai-memory run`'s auto-wire
 record, so the next managed launch wires that harness again; to keep it
 unwired, launch with `--no-autowire` or set `AI_MEMORY_RUN_AUTOWIRE=false`. Install commands are idempotent and write
 timestamped backups next to any file they touch.
+
+### NixOS
+
+This flake ships a NixOS module (`nixosModules.default`) with a
+`systemd.services.ai-memory` unit: a dedicated `ai-memory` system user
+(`nologin`, no linger) plus a hardened systemd sandbox
+(`ProtectSystem = "strict"`, empty capability sets,
+`MemoryDenyWriteExecute`, `RestrictAddressFamilies`, and the rest — see
+[`nix/systemd-sandbox.nix`](nix/systemd-sandbox.nix)). Packaged FHS units
+under `packaging/systemd/` keep their existing lighter hardening.
+The flake exports packages for `x86_64-linux`, `aarch64-linux`, and
+`aarch64-darwin`. Intel macOS remains supported by the release tarball and
+Homebrew, but not by the pinned Nixpkgs revision.
+
+```nix
+{
+  inputs.ai-memory.url = "github:akitaonrails/ai-memory";
+
+  outputs = { nixpkgs, ai-memory, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ai-memory.nixosModules.default
+        {
+          services.ai-memory = {
+            enable = true;
+            # enableWeb = true;  # off by default — the web UI is opt-in
+            # enableApi = true;  # API-only companions; no browser UI
+            settings = {
+              allowed_hosts = [ "localhost" "127.0.0.1" "::1" "homelab.example" ];
+              log_level = "info";
+            };
+            # Loopback (default): secrets optional; missing env file is tolerated.
+            # Non-loopback: set one of ageSecret, sopsSecret, or environmentFile.
+            # ageSecret = "ai-memory-env";  # config.age.secrets.<name> (agenix)
+            # sopsSecret = "ai-memory/env"; # config.sops.secrets.<name> (sops-nix)
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Declarative non-secret config lives in `services.ai-memory.settings` (a
+small typed set for common keys, plus `freeformType` for the rest of
+`config.toml`). The module renders a generated TOML file and passes
+`--config`. Top-level `bind`, `port`, and `enableWeb` win over duplicate
+settings keys. Anything in `settings` (including `llm_headers`) lands in a
+world-readable Nix store path — do not put API keys there.
+
+Secrets such as `AI_MEMORY_AUTH_TOKEN` never go in `settings` or the
+world-readable Nix store. This includes `llm_headers`, which can carry API
+credentials; set `AI_MEMORY_LLM_HEADERS` in `ageSecret`, `sopsSecret`, or
+`environmentFile` instead. These three secret sources are mutually exclusive.
+Non-loopback binds require one; loopback may omit them and tolerates a missing
+environment file (systemd `EnvironmentFile=-…`). Put TLS in front of a LAN/WAN
+bind — see [`docs/https-via-proxy.md`](docs/https-via-proxy.md).
+
+All options and defaults are in [`nix/nixos-module.nix`](nix/nixos-module.nix).
+Entirely opt-in — `nix build`, `nix run`, `nix develop`, and the CLI are
+unchanged if you don't import it.
 
 ## Everyday use
 
@@ -382,6 +462,10 @@ readable wiki pages; the next session starts with a handoff.
   months of history.
 - Start the server with `--enable-web` for a read-only browser view of
   the wiki and a JSON API under `/api/v1`.
+- Back up host-side harness configuration with
+  `ai-memory backup-agents -o agent-assets.tar.gz`; inspect a restore with
+  `ai-memory restore-agents -i agent-assets.tar.gz`, then add `--apply` only
+  after reviewing the active skills, plugins, instructions, and destinations.
 
 The full tour — search modes, entities, feedback, briefings, the web
 API — is in [`docs/usage.md`](docs/usage.md) and
@@ -465,11 +549,13 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/macos.md`](docs/macos.md) | macOS install paths: menu bar app, native release tarball, source build, Docker wrapper, launchd, and current limitations. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes, handoff-injection limits, and community bridge guidance. |
+| [`docs/programmatic-memory.md`](docs/programmatic-memory.md) | Use ai-memory from any tool: MCP write/query/handoff calls, scope rules and incremental reads. |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution and human login.** Four-rung bearer ladder, password sessions, `ai-memory user` / `api-key` walkthrough, brownfield migration. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS and when you don't, with copy-paste Caddy / nginx / Cloudflare Tunnel templates and the "secure when you're not" failure modes. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix, per-project disk layout, checkpoint page recovery, and operator workflows. |
 | [`docs/backup.md`](docs/backup.md) | Backing up the wiki + data dir to a remote git repository: what to include, what to exclude, scheduled push pattern, restore, and security posture. Companion to `docs/lifecycle-ops.md` (which covers the on-box `ai-memory backup` snapshot). |
+| [`docs/design-backup-agent-assets.md`](docs/design-backup-agent-assets.md) | Host agent-asset backup/restore: supported paths, filtering, redaction limits, archive bounds, active-content warning, and rollback behavior. |
 | [`docs/llm-providers.md`](docs/llm-providers.md) | Provider configuration for consolidation and embeddings. |
 | [`docs/security.md`](docs/security.md) | The full security model. |
 | [`docs/support-matrix.md`](docs/support-matrix.md) | The full agent/platform matrix with notes. |
@@ -488,7 +574,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for adding managed resume, transcript import, and startup context delivery to another harness. |
-| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer) and [external lifecycle relay](companions/ai-memory-relay). |
+| [`docs/companion-crates.md`](docs/companion-crates.md) | Optional companion projects: the [importer](companions/ai-memory-importer), [external lifecycle relay](companions/ai-memory-relay), and accepted team-wiki sync boundary. |
 | [`docs/external-lifecycle.md`](docs/external-lifecycle.md) | External lifecycle producers: per-execution native capture suppression, preserved handoffs, batch ingestion and stable retry identity. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 

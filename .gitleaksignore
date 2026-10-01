@@ -7,3 +7,5 @@ d8361d3c3a86f870f74841b53c568c64fe42ab1f:crates/ai-memory-core/src/sanitize.rs:g
 d8361d3c3a86f870f74841b53c568c64fe42ab1f:crates/ai-memory-core/src/sanitize.rs:generic-api-key:257
 47c9cf2e71712153e3162942a8cb28667a6be27a:crates/ai-memory-core/src/sanitize.rs:generic-api-key:631
 47c9cf2e71712153e3162942a8cb28667a6be27a:crates/ai-memory-core/src/sanitize.rs:generic-api-key:633
+9aaa7f73a33b49a4c4ce790d373c83bb24c17306:crates/ai-memory-cli/tests/suite/backup_agents.rs:github-pat:183
+9aaa7f73a33b49a4c4ce790d373c83bb24c17306:crates/ai-memory-cli/tests/suite/backup_agents.rs:github-pat:213

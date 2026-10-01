@@ -52,8 +52,8 @@ Restated from `AGENTS.md` because they bound each design below:
 - **Migrations are backup-gated (#9 / #633 ordering).** Any new column/table is
   a `V63__*.sql` refinery step behind the pre-migration archive, plus the pin
   bump at `api_credentials.rs:414` (currently `62`).
-- **MCP tool count is frozen at 19** (`server.rs:5198`, test `:5326`,
-  `AGENTS.md:504`). None of these phases needs a *new* tool — they extend
+- **MCP tool count is frozen at 23** (enforced by `MCP_TOOL_NAMES` and the
+  registered-router test in `server.rs`). None of these phases needs a *new* tool — they extend
   existing surfaces (`memory_query` explain, `memory_status`, `memory_lint`,
   the scheduler). If P2 ever warranted a dedicated tool, that is a separate
   decision with the count bump and both prompt-surface updates.

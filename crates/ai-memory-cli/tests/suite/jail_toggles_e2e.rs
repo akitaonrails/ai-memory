@@ -103,10 +103,16 @@ impl Fixture {
         fs::write(&help_file, help).unwrap();
         let jail_argv = root.join("ai-jail-argv.txt");
         let claude_ran = root.join("claude-ran.txt");
+        // `--help` feeds toggle support; `--dry-run` is the usable-ai-jail
+        // preflight (`usable_ai_jail_here`). Neither is a real re-exec, so
+        // neither may touch `jail_argv` — tests assert its absence when the
+        // wrapper stays unjailed or rejects before exec.
         write_script(
             &bin.join("ai-jail"),
             &format!(
-                "if [ \"$1\" = --help ]; then cat '{}'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                "if [ \"$1\" = --help ]; then cat '{}'; exit 0; fi\n\
+                 if [ \"$1\" = --dry-run ]; then exit 0; fi\n\
+                 printf '%s\\n' \"$@\" > '{}'\n",
                 help_file.display(),
                 jail_argv.display()
             ),

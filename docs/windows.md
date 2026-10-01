@@ -541,15 +541,15 @@ native on an i7-6700HQ). Notes:
   - `windows-bash` — `bash -c` + `.sh` through Git Bash (the previous
     default; set this to opt back in, or as a fallback for older Claude Code
     builds that do not support exec form).
-  - `posix` — POSIX `.sh`. The Linux/macOS Docker-wrapper default (the host has
-    no local binary); set it explicitly to opt a native install back into the
-    scripts.
+  - `posix` — POSIX `.sh`. An explicit Linux/macOS Docker-wrapper compatibility
+    fallback; set it to opt a native install back into the scripts.
   - `posix-native` — direct binary call on macOS / Linux (`<exe> hook
     --event …`) instead of the `.sh` script, so the hook uses the local event
     spool + OIDC-token fallback. The **default for native macOS / Linux
     Claude Code installs** (cargo / release binary), mirroring
-    `windows-native`. The Linux/macOS Docker wrapper forces `posix`, so its
-    host-rendered config keeps the `.sh` scripts.
+    `windows-native`. The Linux/macOS Docker wrapper uses its
+    checksum-verified native host client by default; set `posix` explicitly to
+    keep the `.sh` scripts.
 
   Set the env var before running `install-hooks` so the chosen platform
   is baked into the rendered hook commands.

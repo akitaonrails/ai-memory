@@ -266,6 +266,60 @@ pub async fn list_native_sessions(
     Ok(sessions)
 }
 
+/// Resolve the on-disk directory holding this harness's native "memory"
+/// store for the given checkout, when the harness has one and a session
+/// recorded for this cwd can be found.
+///
+/// Claude Code keeps a `memory/` directory as a sibling of its own session
+/// transcripts, at `<home>/.claude/projects/<project-dir>/memory/` — the
+/// native store `ai-memory doctor` warns about capturing unless a marker's
+/// `ignore_paths` excludes it (harness-issue #1003). `<project-dir>`'s name
+/// is Claude Code's own encoding of the cwd, which is **not** the same
+/// encoding on every platform (native Windows also folds `\` and `:`, not
+/// only `/`), so this never re-derives that name. Instead it reuses the same
+/// content-based match [`list_native_sessions`] uses — read each session
+/// file's own recorded `cwd` until one matches — and returns that file's
+/// parent directory, which is correct on any platform by construction.
+///
+/// Callers should pass the checkout's **repository root**, not an arbitrary
+/// subdirectory: Claude Code keys this store by repository root, so a
+/// worktree or a subdirectory shares the root's `memory/` directory. This
+/// function itself does no such resolution -- it matches whatever `cwd` it
+/// is given against recorded session cwds -- so passing a subdirectory here
+/// finds nothing even when a `memory/` store genuinely exists for the
+/// repository.
+///
+/// Harnesses with no known native-memory convention return `None`
+/// unconditionally; callers should treat that as "nothing to report", not as
+/// an error.
+#[must_use]
+pub fn native_memory_dir(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if harness != ManagedHarness::Claude {
+        return None;
+    }
+    let mut files = collect_session_files(harness, home, session_dir).ok()?;
+    files.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
+    for path in files {
+        let Ok(Some((_, recorded_cwd))) = session_header_for_cwd(harness, &path, cwd) else {
+            continue;
+        };
+        if same_path(&recorded_cwd, cwd) {
+            let memory_dir = path.parent()?.join("memory");
+            return memory_dir.is_dir().then_some(memory_dir);
+        }
+    }
+    None
+}
+
 /// Whether the native store holds `native_session_id` for this checkout.
 /// [`native_session_exists`] answers for the store; OpenCode keeps every
 /// checkout's sessions in one database, so there the recorded directory must
@@ -5937,5 +5991,90 @@ mod tests {
         assert_eq!(protobuf_field(&[0x22, 0x10, b'x'], 4), None);
         // A ten-byte varint may carry only one payload bit in its final byte.
         assert_eq!(protobuf_varint(&[0xff; 10]), None);
+    }
+
+    #[test]
+    fn native_memory_dir_finds_the_sibling_memory_directory_for_claude() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        // Claude Code's own project-directory name is irrelevant here -- the
+        // whole point of this function is to find it by content, never by
+        // guessing the encoding (which differs between POSIX and native
+        // Windows).
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": cwd})),
+        )
+        .unwrap();
+        let memory_dir = project_dir.join("memory");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(memory_dir.join("fact.md"), "hello").unwrap();
+
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            Some(memory_dir)
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_without_a_memory_subdirectory() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": cwd})),
+        )
+        .unwrap();
+
+        // A real session was found, but it never created a memory/ store.
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_when_no_session_matches_this_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        let project_dir = home.join(".claude/projects/some-encoded-name");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("session-1.jsonl"),
+            format!("{}\n", json!({"sessionId": "abc", "cwd": other})),
+        )
+        .unwrap();
+        fs::create_dir_all(project_dir.join("memory")).unwrap();
+
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Claude, &home, &cwd, None),
+            None
+        );
+    }
+
+    #[test]
+    fn native_memory_dir_is_none_for_harnesses_with_no_known_convention() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let cwd = temp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+
+        // Codex has no established native-memory convention today, so this
+        // must return None unconditionally rather than guess at a location.
+        assert_eq!(
+            native_memory_dir(ManagedHarness::Codex, &home, &cwd, None),
+            None
+        );
     }
 }

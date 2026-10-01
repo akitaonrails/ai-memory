@@ -63,6 +63,22 @@ mutation broker. Browsers should talk to the companion; the companion should tal
 to ai-memory with an operator token. That keeps CSRF, confirmation, audit, rate
 limits, and UI-specific policy outside the core server.
 
+Read-only companions can start ai-memory with `serve --enable-api` to mount
+`/api/v1` without the browser UI. `--enable-web` still implies the same API.
+Both modes use the normal machine Bearer or browser-session auth boundary;
+writes continue through MCP or authenticated admin routes.
+
+### Proposed team-wiki sync (#986)
+
+A repository-backed team-wiki sync is accepted as a companion shape, not as a
+repo-local storage mode in the core server. A contribution should preserve the
+prototype's three-way comparison and clone-local state, sync only explicitly
+allowed shared page families, default destructive changes to dry-run, report
+divergent edits without choosing a winner, and perform every import through
+the public MCP write/delete tools. It must never open the wiki directory or
+SQLite directly. The core read seam is `/api/v1` in API-only mode; the supported
+MCP page arguments are documented in [programmatic memory](programmatic-memory.md).
+
 ## `ai-memory-relay`: external lifecycle delivery
 
 [`ai-memory-relay`](../companions/ai-memory-relay) delivers events collected by

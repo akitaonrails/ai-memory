@@ -1,11 +1,16 @@
 name: nix
 
-# Builds the flake so the Nix packaging cannot rot unnoticed.
+# Builds the flake on Linux (and optionally macOS) so the Nix packaging cannot
+# rot unnoticed.
 #
-# ai-memory does not otherwise test on Nix, so without this job `flake.nix`
-# is source nobody executes: it can break through a dependency bump, a
-# toolchain change, or a new build script and stay green because no other
-# job touches it.
+# Default PR path (path-filtered): x86_64-linux package + check-nix-packaging
+# + NixOS module eval / sandbox-parity. Cheap enough to run when flake inputs
+# or Cargo.lock change.
+#
+# Expensive legs — aarch64-darwin package smoke and the privileged NixOS
+# systemd container (~14 min) — run only on schedule, workflow_dispatch, or a
+# PR labelled `nix` / `full-ci`. Per AGENTS.md CI pacing: fast per merge, full
+# matrix before release.
 #
 # Deliberately NOT run on every pull request — a full release build under
 # Nix costs far more wall-clock than the rest of the matrix combined, and
@@ -14,19 +19,28 @@ name: nix
 # demand.
 on:
   push:
-    branches: [main]
+    branches: [main, release/2.6]
     paths:
       - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'rust-toolchain.toml'
+      - 'scripts/check-nix-packaging.sh'
+      - 'scripts/test-nixos-systemd-container.sh'
       - '.github/workflows/nix.yml'
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
       - 'rust-toolchain.toml'
+      - 'scripts/check-nix-packaging.sh'
+      - 'scripts/test-nixos-systemd-container.sh'
       - '.github/workflows/nix.yml'
   schedule:
     # Mondays 05:17 UTC. Off the hour so it does not pile onto the
@@ -38,8 +52,8 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: nix build
+  build-linux:
+    name: nix build (x86_64-linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,7 +63,49 @@ jobs:
             experimental-features = nix-command flakes
       # `nix flake check` would also evaluate every output; the build is the
       # claim worth verifying, and it is the expensive half anyway.
-      - run: nix build --print-build-logs
-      # The binary is what the flake promises. Run it, so a package that
-      # builds but cannot execute still fails.
-      - run: ./result/bin/ai-memory --version
+      - run: nix build --print-build-logs '.#packages.x86_64-linux.default'
+      - run: scripts/check-nix-packaging.sh ./result
+      # Eval-only smoke tests for the NixOS module (nixosModules.default):
+      # proves the option wiring evaluates cleanly for both enable = true
+      # and enable = false on a real Linux system, without building a full
+      # NixOS system closure. See nix/nixos-module.nix and the assertions
+      # in flake.nix's checks.x86_64-linux.
+      - run: nix build --print-build-logs '.#checks.x86_64-linux.nixos-module-eval'
+      # One runtime path: packages.x86_64-linux.nixos-ai-memory-docker builds
+      # system.build.toplevel once (via the docker-image tarball) and the
+      # script imports that rootfs, starts systemd, and checks install +
+      # /healthz + dataDir restart/volume persistence.
+      #
+      # Gated like Darwin: schedule / dispatch / `nix`|`full-ci` only.
+      # Non-goals for this step (do not expand here):
+      #   - A→B package upgrade / SQLite-wiki migration matrix
+      #   - Exhaustive settings-options.nix key matrix
+      #   - Soft fake-systemd without a real unit start
+      #   - Claiming the app Docker image covers the NixOS module
+      #   - Darwin / multi-arch NixOS OCI (Linux x86_64 only by design)
+      #   - Re-asserting sandbox keys (covered by nixos-sandbox-parity)
+      - if: >-
+          github.event_name == 'schedule' ||
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'pull_request' &&
+           (contains(github.event.pull_request.labels.*.name, 'nix') ||
+            contains(github.event.pull_request.labels.*.name, 'full-ci')))
+        run: scripts/test-nixos-systemd-container.sh
+
+  build-darwin:
+    name: nix build (aarch64-darwin)
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       (contains(github.event.pull_request.labels.*.name, 'nix') ||
+        contains(github.event.pull_request.labels.*.name, 'full-ci')))
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - run: nix build --print-build-logs '.#packages.aarch64-darwin.default'
+      - run: scripts/check-nix-packaging.sh ./result

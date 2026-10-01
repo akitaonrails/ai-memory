@@ -79,6 +79,40 @@ pub struct PreparedWorkstreamRun {
     pub may_adopt_existing_session: bool,
 }
 
+/// Result of binding a SessionStart to an exact or recovered managed run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedRunSessionLink {
+    /// The supplied run was active and accepted the native session.
+    Exact(ManagedRunId),
+    /// A stale supplied id was replaced by the sole safe current candidate.
+    Adopted(ManagedRunId),
+    /// No live run matched the current repository and operator.
+    NoMatch,
+    /// More than one run matched, so choosing one would be unsafe.
+    Ambiguous,
+    /// The supplied active run disagreed with the request boundary.
+    Refused,
+}
+
+/// Exact boundary used to link or recover one managed SessionStart.
+#[derive(Debug, Clone)]
+pub struct LinkOrAdoptManagedRunSession {
+    /// Run id supplied by the child hook; it may be terminal for Codex.
+    pub supplied_run_id: ManagedRunId,
+    /// Already-resolved workspace receiving the SessionStart.
+    pub workspace_id: WorkspaceId,
+    /// Already-resolved project receiving the SessionStart.
+    pub project_id: ProjectId,
+    /// Canonical checkout cwd recorded by both launcher and hook.
+    pub cwd: String,
+    /// Harness reporting the native session.
+    pub agent: AgentKind,
+    /// Harness-native session id to bind exactly once.
+    pub native_session_id: String,
+    /// Topology-aware qualified operator identity, or shared `None`.
+    pub owner_user: Option<String>,
+}
+
 /// Store-level finish input after the raw segment has been made durable.
 #[derive(Debug, Clone)]
 pub struct FinishWorkstreamRun {
@@ -223,15 +257,34 @@ struct LinkRunRow {
     workstream: Vec<u8>,
     agent: String,
     native_session: Option<String>,
+    native_session_linked: bool,
     sync_through: i64,
     context_delivered: bool,
+}
+
+struct ManagedRunBoundaryRow {
+    state: String,
+    workspace: Vec<u8>,
+    project: Vec<u8>,
+    cwd: String,
+    agent: String,
+    owner_user: Option<String>,
 }
 
 /// Atomically select a workstream, expire stale leases, and open one run.
 pub(crate) fn prepare_run(
     conn: &mut Connection,
     input: &PrepareWorkstreamRun,
+    owner_user: Option<&str>,
+    force_unlock: bool,
 ) -> StoreResult<PreparedWorkstreamRun> {
+    if owner_user
+        .is_some_and(|owner| ai_memory_core::IdentityKey::from_storage_key(owner).is_none())
+    {
+        return Err(StoreError::InvalidState(
+            "invalid managed-run owner identity".into(),
+        ));
+    }
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     tx.execute(
@@ -241,21 +294,29 @@ pub(crate) fn prepare_run(
     )?;
 
     let (workstream_id, workstream_name) = select_workstream(&tx, input, now)?;
-    let busy: Option<(String, i64)> = tx
+    let busy: Option<(Vec<u8>, String, i64, Option<String>)> = tx
         .query_row(
-            "SELECT lease_owner, lease_expires_at FROM managed_runs \
+            "SELECT id, lease_owner, lease_expires_at, owner_user FROM managed_runs \
              WHERE workstream_id = ?1 AND state = 'active'",
             params![workstream_id.as_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    if let Some((owner, expires)) = busy {
-        return Err(StoreError::WorkstreamBusy(format!(
-            "owned by {owner} until {}",
-            Timestamp::from_microsecond(expires)
-                .map(|t| t.to_string())
-                .unwrap_or_else(|_| expires.to_string())
-        )));
+    if let Some((run_id, owner, expires, active_owner_user)) = busy {
+        if force_unlock && active_owner_user.as_deref() == owner_user {
+            tx.execute(
+                "UPDATE managed_runs SET state = 'expired', ended_at = ?1, \
+                 lease_expires_at = ?1 WHERE id = ?2 AND state = 'active'",
+                params![now, run_id],
+            )?;
+        } else {
+            return Err(StoreError::WorkstreamBusy(format!(
+                "owned by {owner} until {}",
+                Timestamp::from_microsecond(expires)
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|_| expires.to_string())
+            )));
+        }
     }
 
     let latest_sequence: i64 = tx.query_row(
@@ -295,15 +356,16 @@ pub(crate) fn prepare_run(
     let run_id = ManagedRunId::new();
     tx.execute(
         "INSERT INTO managed_runs( \
-             id, workstream_id, agent_kind, lease_owner, native_session_id, state, \
+             id, workstream_id, agent_kind, lease_owner, native_session_id, owner_user, state, \
              sync_after, sync_through, context_delivered, lease_expires_at, started_at \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, 0, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10)",
         params![
             run_id.as_bytes(),
             workstream_id.as_bytes(),
             agent.as_str(),
             input.lease_owner,
             native_session_id,
+            owner_user,
             sync_after,
             latest_sequence,
             now + LEASE_MICROS,
@@ -513,9 +575,22 @@ pub(crate) fn link_native_session(
     }
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
+    let linked = link_native_session_in_transaction(&tx, run_id, agent, native_session_id, now)?;
+    tx.commit()?;
+    Ok(linked)
+}
+
+fn link_native_session_in_transaction(
+    tx: &Transaction<'_>,
+    run_id: ManagedRunId,
+    agent: AgentKind,
+    native_session_id: &str,
+    now: i64,
+) -> StoreResult<bool> {
     let run: Option<LinkRunRow> = tx
         .query_row(
-            "SELECT workstream_id, agent_kind, native_session_id, sync_through, context_delivered \
+            "SELECT workstream_id, agent_kind, native_session_id, \
+                    native_session_linked_at IS NOT NULL, sync_through, context_delivered \
              FROM managed_runs WHERE id = ?1 AND state = 'active'",
             params![run_id.as_bytes()],
             |row| {
@@ -523,8 +598,9 @@ pub(crate) fn link_native_session(
                     workstream: row.get(0)?,
                     agent: row.get(1)?,
                     native_session: row.get(2)?,
-                    sync_through: row.get(3)?,
-                    context_delivered: row.get(4)?,
+                    native_session_linked: row.get(3)?,
+                    sync_through: row.get(4)?,
+                    context_delivered: row.get(5)?,
                 })
             },
         )
@@ -535,7 +611,7 @@ pub(crate) fn link_native_session(
     if run.agent != agent.as_str() {
         return Ok(false);
     }
-    if run.context_delivered
+    if (run.context_delivered || run.native_session_linked)
         && run
             .native_session
             .as_deref()
@@ -582,8 +658,120 @@ pub(crate) fn link_native_session(
              native_session_linked_at = ?3 WHERE id = ?4",
         params![native_session_id, initial_delivery, now, run_id.as_bytes()],
     )?;
-    tx.commit()?;
     Ok(true)
+}
+
+/// Bind a SessionStart to its exact run, or recover one stale Codex daemon id.
+///
+/// Candidate selection and linking share one writer transaction. Recovery is
+/// deliberately narrow: only a missing/terminal Codex id can be replaced, and
+/// only by the sole live, undelivered, never-linked run in the same repository
+/// and operator bucket.
+pub(crate) fn link_or_adopt_native_session(
+    conn: &mut Connection,
+    input: &LinkOrAdoptManagedRunSession,
+) -> StoreResult<ManagedRunSessionLink> {
+    if input.native_session_id.trim().is_empty()
+        || input.cwd.trim().is_empty()
+        || input
+            .owner_user
+            .as_deref()
+            .is_some_and(|owner| ai_memory_core::IdentityKey::from_storage_key(owner).is_none())
+    {
+        return Ok(ManagedRunSessionLink::Refused);
+    }
+
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let supplied: Option<ManagedRunBoundaryRow> = tx
+        .query_row(
+            "SELECT mr.state, w.workspace_id, w.project_id, w.cwd, mr.agent_kind, mr.owner_user \
+             FROM managed_runs mr JOIN workstreams w ON w.id = mr.workstream_id \
+             WHERE mr.id = ?1",
+            params![input.supplied_run_id.as_bytes()],
+            |row| {
+                Ok(ManagedRunBoundaryRow {
+                    state: row.get(0)?,
+                    workspace: row.get(1)?,
+                    project: row.get(2)?,
+                    cwd: row.get(3)?,
+                    agent: row.get(4)?,
+                    owner_user: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+
+    let selected = match supplied {
+        Some(run) if run.state == "active" => {
+            let boundary_matches = run.workspace.as_slice() == input.workspace_id.as_bytes()
+                && run.project.as_slice() == input.project_id.as_bytes()
+                && run.cwd == input.cwd
+                && run.agent == input.agent.as_str()
+                && run.owner_user == input.owner_user;
+            if !boundary_matches {
+                tx.commit()?;
+                return Ok(ManagedRunSessionLink::Refused);
+            }
+            (input.supplied_run_id, false)
+        }
+        _ if input.agent == AgentKind::Codex => {
+            let mut statement = tx.prepare(
+                "SELECT mr.id FROM managed_runs mr \
+                 JOIN workstreams w ON w.id = mr.workstream_id \
+                 WHERE w.workspace_id = ?1 AND w.project_id = ?2 AND w.cwd = ?3 \
+                   AND mr.agent_kind = ?4 AND mr.owner_user IS ?5 \
+                   AND mr.state = 'active' AND mr.lease_expires_at > ?6 \
+                   AND mr.context_delivered = 0 AND mr.native_session_linked_at IS NULL \
+                 ORDER BY mr.started_at DESC, mr.id DESC LIMIT 2",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    input.workspace_id.as_bytes(),
+                    input.project_id.as_bytes(),
+                    input.cwd.as_str(),
+                    input.agent.as_str(),
+                    input.owner_user.as_deref(),
+                    now,
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            let candidates = rows.collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            match candidates.as_slice() {
+                [only] => (ManagedRunId::from_slice(only)?, true),
+                [] => {
+                    tx.commit()?;
+                    return Ok(ManagedRunSessionLink::NoMatch);
+                }
+                _ => {
+                    tx.commit()?;
+                    return Ok(ManagedRunSessionLink::Ambiguous);
+                }
+            }
+        }
+        _ => {
+            tx.commit()?;
+            return Ok(ManagedRunSessionLink::NoMatch);
+        }
+    };
+
+    if !link_native_session_in_transaction(
+        &tx,
+        selected.0,
+        input.agent,
+        &input.native_session_id,
+        now,
+    )? {
+        tx.commit()?;
+        return Ok(ManagedRunSessionLink::Refused);
+    }
+    tx.commit()?;
+    Ok(if selected.1 {
+        ManagedRunSessionLink::Adopted(selected.0)
+    } else {
+        ManagedRunSessionLink::Exact(selected.0)
+    })
 }
 
 /// Mark the assigned synchronization packet delivered to SessionStart.

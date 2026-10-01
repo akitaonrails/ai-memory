@@ -50,12 +50,12 @@ const SKIPPED_DIRS: [&str; 8] = [
 const MAX_SCAN_ENTRIES: usize = 4096;
 const NEW_PROJECT_LABEL: &str = "+ New project";
 
-#[derive(Debug, Clone, Deserialize)]
-struct ProjectRow {
-    workspace_name: String,
-    project_name: String,
-    page_count: u64,
-    last_updated: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ProjectRow {
+    pub(crate) workspace_name: String,
+    pub(crate) project_name: String,
+    pub(crate) page_count: u64,
+    pub(crate) last_updated: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,8 +229,10 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             jail: None,
             no_jail: false,
             fresh: args.fresh,
+            force_unlock: false,
             no_autowire: false,
             no_handoff: false,
+            profile: None,
             env: Vec::new(),
             env_file: None,
             harness: Some(harness),

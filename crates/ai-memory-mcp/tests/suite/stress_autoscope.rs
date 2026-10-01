@@ -164,6 +164,7 @@ impl Harness {
             consolidate_on_session_end: false,
             session_consolidation_notify: None,
             capture_assistant_enabled: false,
+            claim_handoff_on_session_start: true,
             per_user_slots: false,
             mid_session_routing: ai_memory_core::MidSessionRouting::default(),
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),

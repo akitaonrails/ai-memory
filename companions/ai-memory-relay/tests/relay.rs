@@ -1340,3 +1340,408 @@ fn a_batch_stays_under_the_wire_budget_when_bodies_are_large() {
         );
     }
 }
+
+const V1_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS meta(
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS binding(
+    id            INTEGER PRIMARY KEY CHECK(id = 1),
+    server_url    TEXT NOT NULL,
+    producer      TEXT NOT NULL,
+    actor         TEXT NOT NULL,
+    workspace     TEXT NOT NULL,
+    project       TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending(
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ingest_key       TEXT NOT NULL UNIQUE,
+    event_id         TEXT NOT NULL,
+    agent            TEXT NOT NULL,
+    event            TEXT NOT NULL,
+    session_id       TEXT NOT NULL,
+    cwd              TEXT NOT NULL,
+    body_json        TEXT NOT NULL,
+    body_sha256      TEXT NOT NULL,
+    body_bytes       INTEGER NOT NULL,
+    first_seen_ms    INTEGER NOT NULL,
+    first_attempt_ms INTEGER,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    last_error       TEXT
+);
+CREATE INDEX IF NOT EXISTS pending_session ON pending(agent, session_id, seq);
+CREATE TABLE IF NOT EXISTS receipt(
+    ingest_key       TEXT PRIMARY KEY,
+    body_sha256      TEXT NOT NULL,
+    first_attempt_ms INTEGER NOT NULL,
+    delivered_at_ms  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS receipt_first_attempt ON receipt(first_attempt_ms);
+CREATE TABLE IF NOT EXISTS session_agent(
+    session_id   TEXT PRIMARY KEY,
+    agent        TEXT NOT NULL,
+    last_seen_ms INTEGER NOT NULL
+);
+"#;
+
+fn v1_fixture(name: &str) -> PathBuf {
+    let root = fixture(name);
+    let dir = queue_dir(&root);
+    std::fs::create_dir(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = dir.join("relay.sqlite");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(V1_SCHEMA).unwrap();
+    conn.execute_batch(
+        "INSERT INTO meta VALUES('identity','ai-memory-relay-queue'),('schema_version','1'),('extra','preserve');
+         INSERT INTO binding VALUES(1,'http://127.0.0.1:9/','example.runtime','operator-a','team','app',123);
+         INSERT INTO pending VALUES(7,'key-a','event-a','codex','session-start','session-a','/w','{}','hash-a',2,100,101,4,'retry');
+         INSERT INTO pending VALUES(11,'key-b','event-b','codex','session-end','session-a','/w','{}','hash-b',2,102,NULL,0,NULL);
+         INSERT INTO receipt VALUES('receipt-a','receipt-hash',103,104);
+         INSERT INTO session_agent VALUES('session-a','codex',105);"
+    ).unwrap();
+    drop(conn);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    dir
+}
+
+fn snapshot(conn: &rusqlite::Connection) -> Vec<String> {
+    [
+        "SELECT * FROM meta WHERE key != 'schema_version' ORDER BY key",
+        "SELECT * FROM binding",
+        "SELECT * FROM pending ORDER BY seq",
+        "SELECT ingest_key,body_sha256,first_attempt_ms,delivered_at_ms FROM receipt",
+        "SELECT * FROM session_agent",
+        "SELECT * FROM sqlite_sequence",
+    ]
+    .into_iter()
+    .map(|sql| {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let n = stmt.column_count();
+        let rows: Vec<String> = stmt
+            .query_map([], |r| {
+                Ok((0..n)
+                    .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.join("\n")
+    })
+    .collect()
+}
+
+#[test]
+fn v1_migration_preserves_every_existing_value_and_concurrent_reopens() {
+    let dir = v1_fixture("migration");
+    let before = snapshot(&rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap());
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let dir = dir.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                Queue::open(&dir).unwrap();
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let queue = Queue::open(&dir).unwrap();
+    assert_eq!(queue.stats(200).unwrap().receipt_outcomes["unknown"], 1);
+    let conn = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
+    assert_eq!(snapshot(&conn), before);
+    assert_eq!(
+        conn.query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "2"
+    );
+    assert_eq!(
+        conn.query_row("SELECT outcome FROM receipt", [], |r| r
+            .get::<_, Option<String>>(0))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn interrupted_and_failed_migrations_roll_back_and_recover() {
+    let dir = v1_fixture("rollback-migration");
+    let mut conn = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
+    let before = snapshot(&conn);
+    {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute_batch("ALTER TABLE receipt ADD COLUMN outcome TEXT; UPDATE meta SET value='2' WHERE key='schema_version';").unwrap();
+        // Dropping an uncommitted transaction models interruption.
+    }
+    assert_eq!(snapshot(&conn), before);
+    conn.execute_batch("CREATE TRIGGER refuse_migration BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT,'injected migration failure'); END;").unwrap();
+    assert!(Queue::open(&dir).is_err());
+    assert_eq!(snapshot(&conn), before);
+    assert!(conn.prepare("SELECT outcome FROM receipt").is_err());
+    conn.execute_batch("DROP TRIGGER refuse_migration;")
+        .unwrap();
+    drop(conn);
+    Queue::open(&dir).unwrap();
+}
+
+#[test]
+fn unknown_schemas_refuse_without_mutation() {
+    for version in ["3", "garbage", "0"] {
+        let dir = v1_fixture("future-schema");
+        let conn = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
+        conn.execute(
+            "UPDATE meta SET value=?1 WHERE key='schema_version'",
+            [version],
+        )
+        .unwrap();
+        drop(conn);
+        let path = dir.join("relay.sqlite");
+        let before = std::fs::read(&path).unwrap();
+        assert!(Queue::open(&dir).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn sparse_drop_ack_dequeues_and_records_outcomes() {
+    let root = fixture("sparse-outcomes");
+    let server = stub(vec![Reply::Json(429, r#"{"accepted":1,"accepted_indices":[0,2],"results":[{"index":0,"outcome":"stored"},{"index":2,"outcome":"dropped_policy"}]}"#.into())]);
+    let dir = bind(&root, &server.url());
+    let mut queue = Queue::open(&dir).unwrap();
+    queue
+        .enqueue(
+            &(0..3)
+                .map(|i| valid(&format!("e{i}"), "codex", "session-start", &format!("s{i}")))
+                .collect::<Vec<_>>(),
+            ai_memory_relay::now_ms(),
+        )
+        .unwrap();
+    drop(queue);
+    let report = flush(&dir);
+    assert!(report.failure.is_none(), "{report:?}");
+    assert_eq!(pending_count(&dir), 1);
+    let stats = Queue::open(&dir)
+        .unwrap()
+        .stats(ai_memory_relay::now_ms())
+        .unwrap();
+    assert_eq!(stats.receipt_outcomes["stored"], 1);
+    assert_eq!(stats.receipt_outcomes["dropped_policy"], 1);
+    assert!(
+        report
+            .summary
+            .iter()
+            .any(|s| s.contains("\"dropped_policy\":1"))
+    );
+}
+
+#[test]
+fn malformed_results_keep_every_item_pending() {
+    let cases = [
+        r#"{"accepted":2,"results":[]}"#,
+        r#"{"accepted":2,"results":null}"#,
+        r#"{"accepted":2,"results":[{"index":0,"outcome":"stored"},{"index":1}]}"#,
+        r#"{"accepted":2,"results":[{"index":0,"outcome":"stored"},{"index":1,"outcome":7}]}"#,
+        r#"{"accepted":2,"results":[{"index":0,"outcome":"stored"},{"index":0,"outcome":"stored"}]}"#,
+        r#"{"accepted":1,"results":[{"index":0,"outcome":"stored"},{"index":1,"outcome":"stored"}]}"#,
+        r#"{"accepted":2,"results":[{"index":1,"outcome":"stored"},{"index":0,"outcome":"stored"}]}"#,
+        r#"{"accepted":2,"results":[{"index":0,"outcome":"stored"},{"index":2,"outcome":"stored"}]}"#,
+        r#"{"accepted":2,"failed_index":1,"results":[{"index":0,"outcome":"stored"},{"index":1,"outcome":"stored"}]}"#,
+    ];
+    for body in cases {
+        let root = fixture("invalid-results");
+        let server = stub(vec![Reply::Json(200, body.into())]);
+        let dir = bind(&root, &server.url());
+        let mut queue = Queue::open(&dir).unwrap();
+        queue
+            .enqueue(
+                &[
+                    valid("a", "codex", "session-start", "a"),
+                    valid("b", "codex", "session-start", "b"),
+                ],
+                ai_memory_relay::now_ms(),
+            )
+            .unwrap();
+        drop(queue);
+        assert!(flush(&dir).failure.is_some(), "{body}");
+        assert_eq!(pending_count(&dir), 2, "{body}");
+        assert_eq!(
+            Queue::open(&dir)
+                .unwrap()
+                .stats(ai_memory_relay::now_ms())
+                .unwrap()
+                .receipts,
+            0
+        );
+    }
+}
+
+#[test]
+fn old_server_and_future_outcome_strings_are_unknown() {
+    for body in [
+        r#"{"accepted":1}"#,
+        r#"{"accepted":1,"results":[{"index":0,"outcome":"future_outcome"}]}"#,
+    ] {
+        let root = fixture("unknown-outcome");
+        let server = stub(vec![Reply::Json(200, body.into())]);
+        let dir = bind(&root, &server.url());
+        let mut queue = Queue::open(&dir).unwrap();
+        queue
+            .enqueue(
+                &[valid("a", "codex", "session-start", "a")],
+                ai_memory_relay::now_ms(),
+            )
+            .unwrap();
+        drop(queue);
+        assert!(flush(&dir).failure.is_none());
+        assert_eq!(
+            Queue::open(&dir)
+                .unwrap()
+                .stats(ai_memory_relay::now_ms())
+                .unwrap()
+                .receipt_outcomes["unknown"],
+            1
+        );
+    }
+}
+
+#[test]
+fn receipt_conflicts_preserve_first_known_outcome_and_counts_use_retained_window() {
+    let dir = v1_fixture("receipt-window");
+    let mut queue = Queue::open(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
+    conn.execute_batch("INSERT INTO receipt VALUES('key-a','hash-a',101,102,'stored');")
+        .unwrap();
+    queue.confirm(&[("key-a".into(), "replayed")], 200).unwrap();
+    let (hash, first, result): (String, i64, String) = conn
+        .query_row(
+            "SELECT body_sha256,first_attempt_ms,outcome FROM receipt WHERE ingest_key='key-a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (hash, first, result),
+        ("hash-a".into(), 101, "stored".into())
+    );
+    let now = identity::RETRY_WINDOW_MS + 102;
+    let stats = queue.stats(now).unwrap();
+    assert_eq!(stats.receipt_outcomes["stored"], 0);
+    assert_eq!(stats.receipt_outcomes["unknown"], 1);
+    queue.prune(now).unwrap();
+    assert_eq!(queue.stats(now).unwrap().receipts, 1);
+    let document: serde_json::Value =
+        serde_json::from_str(&relay::status(&dir).unwrap().summary[0]).unwrap();
+    assert_eq!(
+        document["receipt_outcomes"].as_object().unwrap().len(),
+        ack::OUTCOMES.len()
+    );
+}
+
+#[test]
+fn receipt_conflicts_promote_legacy_unknown_outcomes() {
+    for previous in [None, Some("unknown")] {
+        let dir = v1_fixture("receipt-promote");
+        let mut queue = Queue::open(&dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("relay.sqlite")).unwrap();
+        conn.execute(
+            "INSERT INTO receipt VALUES('key-a','hash-a',101,102,?1)",
+            [previous],
+        )
+        .unwrap();
+        queue.confirm(&[("key-a".into(), "stored")], 200).unwrap();
+        let actual: String = conn
+            .query_row(
+                "SELECT outcome FROM receipt WHERE ingest_key='key-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(actual, "stored");
+    }
+}
+
+#[test]
+fn every_current_outcome_is_persisted_and_flush_counts_acknowledgements() {
+    let root = fixture("all-outcomes");
+    let results: Vec<_> = ack::OUTCOMES[..8]
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| serde_json::json!({"index":index,"outcome":outcome}))
+        .collect();
+    let body = serde_json::json!({"accepted":8,"accepted_indices":(0..8).collect::<Vec<_>>(),"results":results});
+    let server = stub(vec![Reply::Json(200, body.to_string())]);
+    let dir = bind(&root, &server.url());
+    let mut queue = Queue::open(&dir).unwrap();
+    queue
+        .enqueue(
+            &(0..8)
+                .map(|i| valid(&format!("e{i}"), "codex", "session-start", &format!("s{i}")))
+                .collect::<Vec<_>>(),
+            ai_memory_relay::now_ms(),
+        )
+        .unwrap();
+    drop(queue);
+    let report = flush(&dir);
+    assert!(report.failure.is_none(), "{report:?}");
+    assert_eq!(pending_count(&dir), 0);
+    let stats = Queue::open(&dir)
+        .unwrap()
+        .stats(ai_memory_relay::now_ms())
+        .unwrap();
+    let summary = report
+        .summary
+        .iter()
+        .find_map(|s| s.strip_prefix("acknowledged_outcomes: "))
+        .unwrap();
+    let counts: serde_json::Value = serde_json::from_str(summary).unwrap();
+    for outcome in &ack::OUTCOMES[..8] {
+        assert_eq!(stats.receipt_outcomes[*outcome], 1);
+        assert_eq!(counts[*outcome], 1);
+    }
+    assert_eq!(counts["unknown"], 0);
+}
+
+#[test]
+fn results_match_sparse_partial_failure_and_empty_acks() {
+    for (body, len, expected) in [
+        (
+            r#"{"accepted":1,"accepted_indices":[0,2],"failed_index":3,"results":[{"index":0,"outcome":"replayed"},{"index":2,"outcome":"dropped_collision"}]}"#,
+            5,
+            vec![0, 2],
+        ),
+        (
+            r#"{"accepted":0,"accepted_indices":[],"results":[]}"#,
+            0,
+            vec![],
+        ),
+        (
+            r#"{"accepted":0,"accepted_indices":[],"results":[]}"#,
+            3,
+            vec![],
+        ),
+    ] {
+        let parsed: BatchAck = serde_json::from_str(body).unwrap();
+        assert_eq!(ack::validate(len, &parsed).unwrap(), expected);
+    }
+}

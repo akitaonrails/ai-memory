@@ -78,6 +78,27 @@ mod slow {
             let mut builder = tar::Builder::new(&mut tar_bytes);
             append_regular(&mut builder, "ai-memory", NEW_BINARY, 0o755);
             append_regular(&mut builder, "hooks/claude-code/new.sh", NEW_HOOK, 0o755);
+            // Match release.yml Unix layout (exact support paths) so hermetic
+            // upgrade still exercises the #1025 support-file allowlist.
+            append_dir(&mut builder, "packaging");
+            append_dir(&mut builder, "packaging/launchd");
+            append_regular(
+                &mut builder,
+                "packaging/launchd/com.github.akitaonrails.ai-memory.plist",
+                b"plist",
+                0o644,
+            );
+            append_dir(&mut builder, "docs");
+            append_regular(&mut builder, "docs/install.md", b"# install", 0o644);
+            append_dir(&mut builder, "crates");
+            append_regular(
+                &mut builder,
+                "crates/ai-memory-cli/templates/config.default.toml",
+                b"# config",
+                0o644,
+            );
+            append_regular(&mut builder, "README.md", b"# ai-memory", 0o644);
+            append_regular(&mut builder, "LICENSE", b"MIT", 0o644);
             builder.finish().expect("finish tar");
         }
         let mut gz_bytes = Vec::new();
@@ -101,9 +122,38 @@ mod slow {
             zip.start_file("hooks/claude-code/new.sh", options)
                 .expect("start hook");
             zip.write_all(NEW_HOOK).expect("write hook");
+            // Windows release.yml ships docs/crates/README/LICENSE (no
+            // packaging/); include them so zip allowlist drift is caught.
+            zip.add_directory("docs/", options).expect("docs dir");
+            zip.start_file("docs/install.md", options)
+                .expect("start docs");
+            zip.write_all(b"# install").expect("write docs");
+            zip.add_directory("crates/", options).expect("crates dir");
+            zip.start_file(
+                "crates/ai-memory-cli/templates/config.default.toml",
+                options,
+            )
+            .expect("start crates");
+            zip.write_all(b"# config").expect("write crates");
+            zip.start_file("README.md", options).expect("start readme");
+            zip.write_all(b"# ai-memory").expect("write readme");
+            zip.start_file("LICENSE", options).expect("start license");
+            zip.write_all(b"MIT").expect("write license");
             zip.finish().expect("finish zip");
         }
         cursor.into_inner()
+    }
+
+    fn append_dir(builder: &mut tar::Builder<&mut Vec<u8>>, path: &str) {
+        let mut header = Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_path(path).expect("set dir path");
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append(&header, std::io::empty())
+            .expect("append tar dir");
     }
 
     fn append_regular(
@@ -246,6 +296,101 @@ mod slow {
             "sibling hooks tree should be fully replaced"
         );
 
+        server.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_upgrade_refreshes_hooks_without_a_deleted_path_or_losing_cli_data_dir() {
+        let asset = host_asset_name().to_string();
+        let archive = Arc::new(build_release_archive());
+        let hash = format!("{:x}", Sha256::digest(archive.as_ref()));
+        let fixture = ReleaseFixture {
+            checksum_body: format!("{hash}  {asset}\n"),
+            asset,
+            archive,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind release fixture");
+        let addr = listener.local_addr().expect("fixture addr");
+        let app = Router::new()
+            .route("/releases/latest/tag", get(latest_tag))
+            .route("/releases/download/{tag}/{name}", get(download))
+            .with_state(fixture);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("fixture serve");
+        });
+
+        let prefix = tempfile::tempdir().expect("install prefix");
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let exe = install_writable_prefix(prefix.path());
+        // This case needs install-hooks to resolve its source from the staged
+        // data dir after replacement, not from the intentionally minimal
+        // sibling hooks fixture used by the replacement test above.
+        fs::remove_dir_all(prefix.path().join("bin/hooks")).expect("remove sibling hooks");
+        let hooks_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .join("hooks");
+        let settings = home.path().join(".claude/settings.json");
+
+        let mut install = hermetic(exe.to_str().expect("utf-8 exe path"));
+        install
+            .arg("--data-dir")
+            .arg(data_dir.path())
+            .args(["install-hooks", "--agent", "claude-code", "--hooks-dir"])
+            .arg(&hooks_source)
+            .arg("--apply")
+            .env("HOME", home.path());
+        let installed = tokio::process::Command::from(install)
+            .output()
+            .await
+            .expect("install initial hooks");
+        assert!(
+            installed.status.success(),
+            "initial hook install failed: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+
+        // Force proof that the post-replacement refresh actually rewrites the
+        // config. A child process that loses the CLI-only --data-dir, or a
+        // no-op refresh, leaves this exact reported corruption behind.
+        let clean = fs::read_to_string(&settings).expect("read initial settings");
+        let exe_text = exe.to_string_lossy();
+        assert!(clean.contains(exe_text.as_ref()), "missing native exe path");
+        let corrupted = clean.replace(exe_text.as_ref(), &format!("{} (deleted)", exe.display()));
+        assert_ne!(clean, corrupted, "fixture did not corrupt any hook path");
+        fs::write(&settings, corrupted).expect("plant deleted-path suffix");
+
+        let base = format!("http://{addr}/releases");
+        let mut upgrade = hermetic(exe.to_str().expect("utf-8 exe path"));
+        upgrade
+            .arg("--data-dir")
+            .arg(data_dir.path())
+            .args(["upgrade", "--version", TAG, "--force"])
+            .env("AI_MEMORY_RELEASE_BASE_URL", &base)
+            .env("HOME", home.path());
+        let output = tokio::process::Command::from(upgrade)
+            .output()
+            .await
+            .expect("spawn upgrade");
+        assert!(
+            output.status.success(),
+            "upgrade failed: stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let refreshed = fs::read_to_string(&settings).expect("read refreshed settings");
+        assert!(!refreshed.contains(" (deleted)"), "{refreshed}");
+        assert!(refreshed.contains(exe_text.as_ref()), "{refreshed}");
+        assert!(
+            refreshed.contains(&data_dir.path().to_string_lossy().into_owned()),
+            "CLI-only data dir was lost: {refreshed}"
+        );
         server.abort();
     }
 }

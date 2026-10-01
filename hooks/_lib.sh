@@ -5,6 +5,15 @@
 # cursor, gemini-cli, kimi-code, kiro-cli, antigravity-cli, opencode,
 # omp, pool) sources this same file.
 
+# Set `_amhome` to $HOME without trailing slashes ("/" stays "/"), so the
+# string patterns below treat `HOME=/home/u/` as the native walk does.
+ai_memory_home() {
+    _amhome="${HOME:-}"
+    while [ "${_amhome%/}" != "$_amhome" ] && [ -n "${_amhome%/}" ]; do
+        _amhome="${_amhome%/}"
+    done
+}
+
 # Walk up from "$1" toward $HOME (or /) looking for `.ai-memory.toml`.
 # Prints the absolute path of the first marker found, or nothing.
 # Stops at $HOME to avoid leaking declarations from a shared system
@@ -15,9 +24,10 @@ ai_memory_find_marker() {
     dir="$1"
     [ -z "$dir" ] && return 0
     boundary=""
-    if [ -n "${HOME:-}" ]; then
+    ai_memory_home
+    if [ -n "$_amhome" ]; then
         case "$dir" in
-            "$HOME"|"$HOME"/*) boundary="$HOME" ;;
+            "$_amhome"|"${_amhome%/}"/*) boundary="$_amhome" ;;
             *)
                 probe="$dir"
                 while [ -n "$probe" ] && [ "$probe" != "/" ]; do
@@ -109,9 +119,10 @@ ai_memory_server_routed() {
     _amsr_dir="${1:-${PWD:-}}"
     [ -z "$_amsr_dir" ] && return 1
     _amsr_boundary=""
-    if [ -n "${HOME:-}" ]; then
+    ai_memory_home
+    if [ -n "$_amhome" ]; then
         case "$_amsr_dir" in
-            "$HOME"|"$HOME"/*) _amsr_boundary="$HOME" ;;
+            "$_amhome"|"${_amhome%/}"/*) _amsr_boundary="$_amhome" ;;
         esac
     fi
     while [ -n "$_amsr_dir" ]; do
@@ -150,9 +161,10 @@ ai_memory_find_settings_marker() {
     dir="$1"
     [ -z "$dir" ] && return 0
     boundary=""
-    if [ -n "${HOME:-}" ]; then
+    ai_memory_home
+    if [ -n "$_amhome" ]; then
         case "$dir" in
-            "$HOME"|"$HOME"/*) boundary="$HOME" ;;
+            "$_amhome"|"${_amhome%/}"/*) boundary="$_amhome" ;;
             *)
                 probe="$dir"
                 while [ -n "$probe" ] && [ "$probe" != "/" ]; do

@@ -146,6 +146,12 @@ pub struct PrepareManagedRunRequest {
     /// Create and select a fresh named workstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_workstream: Option<String>,
+    /// Expire an active lease owned by this same operator before opening the
+    /// replacement run. This is an explicit recovery override for a launcher
+    /// that exited without releasing its lease; it never permits cross-owner
+    /// takeover.
+    #[serde(default)]
+    pub force_unlock: bool,
     /// Diagnostic owner label (host and process id), not an authorization key.
     pub lease_owner: String,
 }
@@ -398,5 +404,27 @@ mod tests {
 
         assert!(!request.automatic_harness);
         assert!(request.available_agents.is_empty());
+        assert!(!request.force_unlock);
+    }
+
+    #[test]
+    fn forced_unlock_is_explicit_on_the_wire() {
+        let request: PrepareManagedRunRequest = serde_json::from_value(serde_json::json!({
+            "workspace": "default",
+            "project": "memory",
+            "cwd": "/repo",
+            "repo_fingerprint": "repo",
+            "worktree_fingerprint": "worktree",
+            "agent": "codex",
+            "force_unlock": true,
+            "lease_owner": "host:2"
+        }))
+        .unwrap();
+
+        assert!(request.force_unlock);
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["force_unlock"],
+            serde_json::json!(true)
+        );
     }
 }

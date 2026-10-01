@@ -54,11 +54,39 @@ pub fn usable_ai_jail(os: JailOs, lookup: impl Fn(&str) -> Option<PathBuf>) -> O
 /// install location when that directory is not on `PATH`).
 #[must_use]
 pub fn usable_ai_jail_here() -> Option<PathBuf> {
-    usable_ai_jail(current_jail_os(), |name| match find_on_path(name) {
+    let candidate = usable_ai_jail(current_jail_os(), |name| match find_on_path(name) {
         Some(path) => Some(path),
+        None if name == "bwrap" => std::env::var_os("BWRAP_BIN").map(PathBuf::from),
         None if name == "ai-jail" => home_local_bin_ai_jail(),
         None => None,
-    })
+    })?;
+    preflighted_ai_jail(candidate, ai_jail_preflight)
+}
+
+fn preflighted_ai_jail(
+    candidate: PathBuf,
+    preflight: impl FnOnce(&Path) -> bool,
+) -> Option<PathBuf> {
+    preflight(&candidate).then_some(candidate)
+}
+
+/// Ask the installed ai-jail to validate its complete local launch boundary.
+/// `--dry-run` does not execute the child or write configuration, but it does
+/// apply ai-jail's own backend trust checks (including root ownership and the
+/// protected-Nix-store exception) so our offer cannot lead directly to a
+/// refusal that the shallower PATH probe missed.
+fn ai_jail_preflight(ai_jail: &Path) -> bool {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return false;
+    };
+    std::process::Command::new(ai_jail)
+        .args(["--dry-run", "--"])
+        .arg(current_exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -473,8 +501,8 @@ pub struct JailHostFacts {
     pub home: Option<PathBuf>,
     /// Whether `SSH_AUTH_SOCK` is set.
     pub ssh_agent: bool,
-    /// The repository's `origin` URL.
-    pub origin_url: Option<String>,
+    /// The URL `git push` to `origin` uses.
+    pub origin_push_url: Option<String>,
     /// Whether the cwd is a linked git worktree.
     pub linked_worktree: bool,
     /// Whether the invocation directory holds a project `.ai-jail`. ai-jail
@@ -499,7 +527,7 @@ impl JailHostFacts {
             os: current_jail_os(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             ssh_agent: std::env::var_os("SSH_AUTH_SOCK").is_some_and(|sock| !sock.is_empty()),
-            origin_url: repository.origin_url.clone(),
+            origin_push_url: repository.origin_push_url.clone(),
             linked_worktree: repository.linked_worktree,
         }
     }
@@ -512,7 +540,8 @@ impl JailHostFacts {
 }
 
 /// Whether `url` reaches its remote over SSH: `ssh://…` (and the `git+ssh`
-/// spellings) or scp-style `user@host:path`.
+/// spellings) or git's scp-style `[user@]host:path` (a `:` before any `/`),
+/// where `host` may be an `~/.ssh/config` alias. A one-letter `C:` is a drive.
 #[must_use]
 fn is_ssh_remote(url: &str) -> bool {
     let url = url.trim();
@@ -522,8 +551,10 @@ fn is_ssh_remote(url: &str) -> bool {
             "ssh" | "git+ssh" | "ssh+git"
         );
     }
-    url.split_once(':')
-        .is_some_and(|(host, _)| host.contains('@') && !host.contains('/'))
+    url.split_once(':').is_some_and(|(host, _)| {
+        let drive = host.len() == 1 && host.as_bytes()[0].is_ascii_alphabetic();
+        !host.is_empty() && !drive && !host.contains(['/', '\\'])
+    })
 }
 
 /// One visible checklist row with its smart default.
@@ -551,7 +582,7 @@ pub fn jail_checklist(facts: &JailHostFacts, support: &JailSupport) -> Vec<JailC
                 }
                 ToggleRule::Ssh => (
                     facts.home_has(".ssh") || facts.ssh_agent,
-                    facts.origin_url.as_deref().is_some_and(is_ssh_remote),
+                    facts.origin_push_url.as_deref().is_some_and(is_ssh_remote),
                 ),
                 ToggleRule::OptIn { linux_only } => {
                     (!linux_only || facts.os == JailOs::Linux, false)
@@ -869,6 +900,22 @@ mod tests {
         assert_eq!(usable_ai_jail(JailOs::MacOs, linux_backend_on_macos), None);
     }
 
+    #[test]
+    fn failed_ai_jail_preflight_suppresses_the_offer() {
+        let candidate = PathBuf::from("/opt/bin/ai-jail");
+        assert_eq!(
+            preflighted_ai_jail(candidate.clone(), |path| {
+                assert_eq!(path, candidate);
+                false
+            }),
+            None
+        );
+        assert_eq!(
+            preflighted_ai_jail(candidate.clone(), |_| true),
+            Some(candidate)
+        );
+    }
+
     /// ai-jail is unsupported on Windows: even a file named `ai-jail` on PATH
     /// (a Git-Bash or WSL shim) must not produce the offer, and the lookup is
     /// never consulted.
@@ -1096,7 +1143,7 @@ mod tests {
             os: JailOs::Linux,
             home: Some(home.to_path_buf()),
             ssh_agent: false,
-            origin_url: None,
+            origin_push_url: None,
             linked_worktree: false,
             project_config: false,
         }
@@ -1226,12 +1273,17 @@ mod tests {
             ("git@github.com:example/repo.git", true),
             ("ssh://git@example.com/repo.git", true),
             ("deploy@host.example:repo.git", true),
+            ("work-gh:example/repo.git", true),
+            ("[::1]:repo.git", true),
             ("https://github.com/example/repo.git", false),
             ("https://user@example.com/repo.git", false),
             ("/srv/git/repo.git", false),
             ("file:///srv/git/repo.git", false),
+            ("./dir:with-colon/repo.git", false),
+            ("C:/src/repo.git", false),
+            (r"C:\src\repo.git", false),
         ] {
-            facts.origin_url = Some(url.to_owned());
+            facts.origin_push_url = Some(url.to_owned());
             assert_eq!(ssh(&facts), Some(("ssh", expected)), "{url}");
         }
     }
@@ -1278,7 +1330,7 @@ mod tests {
     fn project_config_unchecks_every_smart_default_but_keeps_explicit_lists() {
         let home = tempfile::tempdir().unwrap();
         let mut facts = facts_with(home.path(), &[".config/gh", ".aws", ".ssh"]);
-        facts.origin_url = Some("git@github.com:example/repo.git".to_owned());
+        facts.origin_push_url = Some("git@github.com:example/repo.git".to_owned());
         facts.linked_worktree = true;
         let support = support_2_5_0();
         assert_eq!(
@@ -1322,7 +1374,7 @@ mod tests {
 
     fn sample_checklist(home: &Path) -> Vec<JailChecklistItem> {
         let mut facts = facts_with(home, &[".config/gh", ".aws", ".ssh"]);
-        facts.origin_url = Some("https://example.com/repo.git".to_owned());
+        facts.origin_push_url = Some("https://example.com/repo.git".to_owned());
         jail_checklist(&facts, &support_2_5_0())
     }
 

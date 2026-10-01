@@ -27,7 +27,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use ai_memory_core::AgentKind;
-use ai_memory_workstream::{ManagedHarness, build_launch_plan, list_native_sessions};
+use ai_memory_hooks::CaptureDisposition;
+use ai_memory_workstream::{
+    ManagedHarness, build_launch_plan, list_native_sessions, native_memory_dir,
+};
 
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -77,6 +80,7 @@ pub(crate) struct CoverageRow {
     /// True when the harness ran here recently but captured nothing — the
     /// high-confidence "hook is missing" signal.
     uncaptured: bool,
+    mixed_capture_sessions: Option<u64>,
 }
 
 impl CoverageRow {
@@ -104,6 +108,27 @@ struct ByAgentResponse {
 struct AgentCount {
     agent: String,
     sessions: u64,
+    #[serde(default)]
+    mixed_capture_sessions: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OperatorIdentity {
+    version: String,
+    level: String,
+    operator: Option<String>,
+    distinguishes_operators: bool,
+}
+
+async fn read_identity(ep: &ServerEndpoint) -> Option<OperatorIdentity> {
+    match get_json::<OperatorIdentity>(ep, "/identity", &[]).await {
+        Ok(identity) => Some(identity),
+        Err(error) if super::is_scope_not_found(&error) => None,
+        Err(_) => {
+            eprintln!("Machine identity is unavailable; showing capture coverage only.");
+            None
+        }
+    }
 }
 
 /// The full report, also the JSON output shape.
@@ -116,6 +141,39 @@ struct DoctorReport {
     rows: Vec<CoverageRow>,
     /// The agent kinds (kebab form) flagged as uncaptured, for quick scripting.
     uncaptured: Vec<String>,
+    /// Set when the nearest `.ai-memory.toml`'s `[capture]` section is
+    /// `PolicyState::Invalid`. This fails CLOSED (every file/shell tool event
+    /// is reduced to metadata until the marker is fixed; nothing leaks), but
+    /// with no other signal anywhere that the marker stopped working as
+    /// configured, so `doctor` is the one place that surfaces it.
+    marker_capture_problem: Option<MarkerCaptureProblem>,
+    capture_owner_active: bool,
+    identity: Option<OperatorIdentity>,
+    /// Native "memory" stores found for harnesses that keep one, and whether
+    /// the nearest marker would exclude a read of them (harness-issue
+    /// #1003). Only Claude Code's location is known today; harnesses with no
+    /// established convention are simply absent from this list.
+    native_memory: Vec<NativeMemoryReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MarkerCaptureProblem {
+    marker_path: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NativeMemoryReport {
+    agent: String,
+    path: String,
+    file_count: usize,
+    /// One of `"excluded"`, `"not excluded"`, `"marker invalid"`, or
+    /// `"metadata only"` (an active, valid policy whose extraction for this
+    /// specific probe fell back to the metadata-only disposition — kept
+    /// distinct from `"not excluded"` rather than folded into it, since the
+    /// two mean different things: the dispositions are mapped one-to-one,
+    /// never collapsed).
+    status: String,
 }
 
 /// Fold the raw per-harness local scans and the server's captured counts into
@@ -157,6 +215,7 @@ pub(crate) fn build_rows(
                 local_recent,
                 captured,
                 uncaptured,
+                mixed_capture_sessions: None,
             }
         })
         .filter(|row| row.local_total > 0 || row.captured > 0)
@@ -186,6 +245,82 @@ pub(crate) fn relocated_session_dir(harness: ManagedHarness) -> Option<PathBuf> 
     build_launch_plan(harness, None, Vec::new(), None)
         .ok()
         .and_then(|plan| plan.session_dir)
+}
+
+/// Harnesses whose native "memory" store location is known, so `doctor` can
+/// report on it (harness-issue #1003). Only Claude Code's is established
+/// today — `~/.claude/projects/<project>/memory/`, found via
+/// [`native_memory_dir`]'s content-based match rather than a guessed,
+/// platform-specific directory name. A harness left out of this list simply
+/// produces no report line, which is the documented behavior for "location
+/// unknown" rather than an error.
+const HARNESSES_WITH_KNOWN_NATIVE_MEMORY: &[ManagedHarness] = &[ManagedHarness::Claude];
+
+/// For every harness in [`HARNESSES_WITH_KNOWN_NATIVE_MEMORY`] that actually
+/// has a memory store for this checkout, report its location, how many
+/// files it holds, and whether the nearest marker would exclude a read of
+/// it.
+///
+/// `cwd` is resolved to the repository root first (worktrees and
+/// subdirectories collapse onto it): Claude Code keys its auto-memory by
+/// repository root, so [`native_memory_dir`] -- which only matches a session
+/// recorded for the exact cwd it is given -- would otherwise find nothing
+/// when `doctor` runs from a subdirectory or a linked worktree.
+///
+/// The exclusion check reuses two already-verified read-only facts rather
+/// than re-deriving anything: [`super::hook_capture::capture_config_problem`]
+/// (a broken marker is reported as `"marker invalid"`, the same diagnosis
+/// `doctor`'s other check makes) and, when the marker parses and compiles,
+/// [`ai_memory_hooks::CapturePolicy::inspect`] on a synthetic read of one
+/// file inside the store — the exact evaluation the native hook performs on
+/// a real `Read` tool call, just never sent anywhere. Every
+/// `CaptureDisposition` maps to its own distinct status string; none are
+/// folded together.
+fn native_memory_reports(home: &Path, cwd: &Path) -> Vec<NativeMemoryReport> {
+    let repo_root =
+        ai_memory_consolidate::discover_main_repo_root(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let Some(repo_root_str) = repo_root.to_str() else {
+        return Vec::new();
+    };
+    let mut reports = Vec::new();
+    for &harness in HARNESSES_WITH_KNOWN_NATIVE_MEMORY {
+        let session_dir = relocated_session_dir(harness);
+        let Some(memory_dir) = native_memory_dir(harness, home, &repo_root, session_dir.as_deref())
+        else {
+            continue;
+        };
+        let file_count = std::fs::read_dir(&memory_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_file()))
+                    .count()
+            })
+            .unwrap_or(0);
+        let status = if super::hook_capture::capture_config_problem(repo_root_str).is_some() {
+            "marker invalid"
+        } else {
+            let policy = super::hook_capture::capture_policy(repo_root_str);
+            let probe_path = memory_dir.join("probe.md");
+            let raw = serde_json::json!({
+                "tool_name": "Read",
+                "tool_input": { "file_path": probe_path.to_string_lossy() },
+            });
+            let decision = policy.inspect(harness.agent_kind(), &raw, repo_root_str);
+            match decision.protocol().disposition() {
+                CaptureDisposition::Drop => "excluded",
+                CaptureDisposition::Keep => "not excluded",
+                CaptureDisposition::MetadataOnly => "metadata only",
+            }
+        };
+        reports.push(NativeMemoryReport {
+            agent: harness.agent_kind().as_str().to_owned(),
+            path: memory_dir.display().to_string(),
+            file_count,
+            status: status.to_owned(),
+        });
+    }
+    reports
 }
 
 /// [`scan_local`] with the relocation lookup passed in. The lookup reads the
@@ -256,7 +391,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         super::run::native_home(config).context("locating the local harness session stores")?;
 
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
-    let captured: BTreeMap<String, u64> = match get_json::<ByAgentResponse>(
+    let captured = match get_json::<ByAgentResponse>(
         &ep,
         "/admin/sessions/by-agent",
         &[
@@ -266,15 +401,11 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     )
     .await
     {
-        Ok(response) => response
-            .by_agent
-            .into_iter()
-            .map(|c| (c.agent, c.sessions))
-            .collect(),
+        Ok(response) => response.by_agent,
         // A project that has never been captured into does not exist
         // server-side yet (404) — that is "nothing captured", not an error, so
         // every local harness correctly reads as uncaptured.
-        Err(error) if super::is_scope_not_found(&error) => BTreeMap::new(),
+        Err(error) if super::is_scope_not_found(&error) => Vec::new(),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("asking the server for captured session counts for {workspace}/{project}")
@@ -282,13 +413,36 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         }
     };
 
+    let identity = read_identity(&ep).await;
+
     let local = scan_local(&home, &cwd, args.since_days).await;
-    let rows = build_rows(&local, &captured);
+    let counts = captured
+        .iter()
+        .map(|count| (count.agent.clone(), count.sessions))
+        .collect();
+    let mut rows = build_rows(&local, &counts);
+    for row in &mut rows {
+        row.mixed_capture_sessions = captured
+            .iter()
+            .find(|count| count.agent == row.agent)
+            .and_then(|count| count.mixed_capture_sessions);
+    }
     let uncaptured: Vec<String> = rows
         .iter()
         .filter(|r| r.uncaptured)
         .map(|r| r.agent.clone())
         .collect();
+
+    let marker_capture_problem = cwd.to_str().and_then(|cwd| {
+        super::hook_capture::capture_config_problem(cwd).map(|(marker_path, reason)| {
+            MarkerCaptureProblem {
+                marker_path: marker_path.display().to_string(),
+                reason,
+            }
+        })
+    });
+
+    let native_memory = native_memory_reports(&home, &cwd);
 
     let report = DoctorReport {
         workspace,
@@ -297,6 +451,10 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         since_days: args.since_days,
         rows,
         uncaptured,
+        marker_capture_problem,
+        capture_owner_active: config.runtime_env.capture_owner_active(),
+        identity,
+        native_memory,
     };
 
     if args.json {
@@ -312,10 +470,45 @@ fn render_human(report: &DoctorReport) {
         "Capture coverage for {}/{} (server {})",
         report.workspace, report.project, report.server
     );
+    if let Some(identity) = &report.identity {
+        println!(
+            "  identity: {} ({}, server {})",
+            identity.operator.as_deref().unwrap_or("anonymous"),
+            identity.level,
+            identity.version
+        );
+    } else {
+        println!("  identity: unavailable");
+    }
+    if report.capture_owner_active {
+        println!(
+            "  AI_MEMORY_CAPTURE_OWNER is active: native capture is suppressed in this process.\n  \
+             Confirm the external producer is delivering events."
+        );
+    }
     if report.since_days == 0 {
         println!("  recent window: all on-disk sessions\n");
     } else {
         println!("  recent window: last {} days\n", report.since_days);
+    }
+
+    if let Some(problem) = &report.marker_capture_problem {
+        println!(
+            "⚠ {} has an invalid `[capture]` section: {}\n  \
+             It fails closed — file and shell tool content is reduced to metadata there, \
+             nothing leaks — but its `ignore_paths` exclusions are NOT applying while it stays \
+             invalid. Fix the TOML and re-run `ai-memory doctor` to confirm.\n",
+            problem.marker_path, problem.reason
+        );
+    }
+
+    if !report.native_memory.is_empty() {
+        println!(
+            "Note: a shell/PowerShell hook install (the Docker-wrapper default) does not \
+             enforce capture-policy v1 — \"excluded\" below only holds on a native hook \
+             install or a generated integration. Check the configured hook command; a dry-run \
+             `ai-memory install-hooks` reports the selected install path, not the active one.\n"
+        );
     }
 
     if report.rows.is_empty() {
@@ -330,20 +523,45 @@ fn render_human(report: &DoctorReport) {
             row.agent, row.local_total, row.local_recent, row.captured
         );
         if row.uncaptured {
+            if report.capture_owner_active {
+                println!(
+                    "      No captured session: check the external producer and repository policy."
+                );
+            } else {
+                println!(
+                    "      └ ran here but nothing was captured — install its hook:\n        \
+                     ai-memory install-hooks --agent {} --apply",
+                    row.agent
+                );
+            }
+        }
+        if let Some(count) = row.mixed_capture_sessions.filter(|count| *count > 0) {
             println!(
-                "      └ ran here but nothing was captured — install its hook:\n        \
-                 ai-memory install-hooks --agent {} --apply",
-                row.agent
+                "      {count} session(s) contain events from multiple capture sources.\n      \
+                 Backfill can also mix source metadata; this does not prove duplicate capture."
             );
+        }
+        if let Some(memory) = report.native_memory.iter().find(|m| m.agent == row.agent) {
+            println!(
+                "      native memory: {} ({} file{})",
+                memory.path,
+                memory.file_count,
+                if memory.file_count == 1 { "" } else { "s" }
+            );
+            println!("      capture: {}", memory.status);
         }
     }
 
     if report.uncaptured.is_empty() {
         println!("\n✓ Every harness that ran in this project recently is captured on the server.");
     } else {
+        let remedy = if report.capture_owner_active {
+            "Check the external producer and repository policy, then re-run `ai-memory doctor`."
+        } else {
+            "Install the hook(s) above, then re-run `ai-memory doctor` to confirm."
+        };
         println!(
-            "\n⚠ {} harness(es) ran here recently with no captured sessions: {}.\n  \
-             Install the hook(s) above, then re-run `ai-memory doctor` to confirm.",
+            "\n⚠ {} harness(es) ran here recently with no captured sessions: {}.\n  {remedy}",
             report.uncaptured.len(),
             report.uncaptured.join(", ")
         );
@@ -353,6 +571,55 @@ fn render_human(report: &DoctorReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn identity_diagnostics_degrade_on_server_and_decode_errors() {
+        for (status, body, available) in [
+            (500, "unavailable", false),
+            (403, "forbidden", false),
+            (200, "<html>legacy SPA</html>", false),
+            (404, "missing", false),
+            (
+                200,
+                r#"{"version":"2.5.0","level":"anonymous","operator":null,"distinguishes_operators":false}"#,
+                true,
+            ),
+        ] {
+            let app = axum::Router::new().route(
+                "/identity",
+                axum::routing::get(move || async move {
+                    (axum::http::StatusCode::from_u16(status).unwrap(), body)
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ep = ServerEndpoint::from_pair(
+                Some(format!("http://{}", listener.local_addr().unwrap())),
+                None,
+            );
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            assert_eq!(
+                read_identity(&ep).await.is_some(),
+                available,
+                "status {status}"
+            );
+            task.abort();
+        }
+    }
+
+    #[test]
+    fn an_older_server_leaves_provenance_unknown() {
+        let legacy: ByAgentResponse =
+            serde_json::from_str(r#"{"by_agent":[{"agent":"codex","sessions":2}]}"#).unwrap();
+        assert_eq!(legacy.by_agent[0].sessions, 2);
+        assert_eq!(legacy.by_agent[0].mixed_capture_sessions, None);
+        let current: ByAgentResponse = serde_json::from_str(
+            r#"{"by_agent":[{"agent":"codex","sessions":2,"mixed_capture_sessions":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(current.by_agent[0].mixed_capture_sessions, Some(1));
+    }
 
     fn scan(agent: AgentKind, total: usize, recent: usize) -> LocalScan {
         LocalScan {
@@ -510,5 +777,136 @@ mod tests {
         let empty_home = tempfile::tempdir().unwrap();
         let none = scan_local_with(empty_home.path(), cwd.path(), 0, |_| None).await;
         assert!(none.is_empty(), "no stores should mean no scans: {none:?}");
+    }
+
+    /// Plants a Claude Code session (for `cwd`) with a sibling `memory/`
+    /// directory under `home`, the fixture every `native_memory_reports`
+    /// test below starts from.
+    fn claude_memory_fixture(home: &Path, cwd: &Path) -> PathBuf {
+        let project_dir = home.join(".claude/projects/fixture");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("session.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "sessionId": "11111111-2222-3333-4444-555555555555",
+                    "cwd": cwd.to_string_lossy(),
+                })
+            ),
+        )
+        .unwrap();
+        let memory_dir = project_dir.join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        memory_dir
+    }
+
+    fn find_claude_report(reports: &[NativeMemoryReport]) -> &NativeMemoryReport {
+        reports
+            .iter()
+            .find(|r| r.agent == "claude-code")
+            .unwrap_or_else(|| panic!("expected a claude-code report; got {reports:?}"))
+    }
+
+    #[test]
+    fn native_memory_reports_is_not_excluded_without_a_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let memory_dir = claude_memory_fixture(home.path(), cwd.path());
+        std::fs::write(memory_dir.join("fact.md"), "x").unwrap();
+
+        let reports = native_memory_reports(home.path(), cwd.path());
+        let claude = find_claude_report(&reports);
+        assert_eq!(claude.status, "not excluded");
+        assert_eq!(claude.file_count, 1);
+    }
+
+    #[test]
+    fn native_memory_reports_is_excluded_when_the_marker_covers_it() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let memory_dir = claude_memory_fixture(home.path(), cwd.path());
+        std::fs::write(memory_dir.join("fact.md"), "x").unwrap();
+        // An absolute pattern naming the fixture's own (fake) home, so this
+        // does not depend on the real process `$HOME` the way a `~/...`
+        // pattern would inside capture_policy's own home resolution.
+        std::fs::write(
+            cwd.path().join(".ai-memory.toml"),
+            format!(
+                "[capture]\nignore_paths = [{:?}]\n",
+                format!("{}/.claude/projects/**", home.path().display())
+            ),
+        )
+        .unwrap();
+
+        let reports = native_memory_reports(home.path(), cwd.path());
+        let claude = find_claude_report(&reports);
+        assert_eq!(claude.status, "excluded");
+    }
+
+    #[test]
+    fn native_memory_reports_is_marker_invalid_for_a_broken_capture_table() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        claude_memory_fixture(home.path(), cwd.path());
+        // The exact dropped-`#` shape found in practice: a stray token right
+        // after a `[capture]` header.
+        std::fs::write(
+            cwd.path().join(".ai-memory.toml"),
+            "[capture] this used to be a comment\nignore_paths = [\"**\"]\n",
+        )
+        .unwrap();
+
+        let reports = native_memory_reports(home.path(), cwd.path());
+        let claude = find_claude_report(&reports);
+        assert_eq!(claude.status, "marker invalid");
+    }
+
+    #[test]
+    fn native_memory_reports_file_count_ignores_subdirectories() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let memory_dir = claude_memory_fixture(home.path(), cwd.path());
+        std::fs::write(memory_dir.join("fact.md"), "x").unwrap();
+        std::fs::create_dir_all(memory_dir.join("a-subdirectory")).unwrap();
+        std::fs::write(memory_dir.join("a-subdirectory/nested.md"), "y").unwrap();
+
+        let reports = native_memory_reports(home.path(), cwd.path());
+        let claude = find_claude_report(&reports);
+        assert_eq!(
+            claude.file_count, 1,
+            "the subdirectory itself must not be counted as a file"
+        );
+    }
+
+    /// The bug found in review: Claude Code keys its auto-memory by
+    /// repository root, so running `doctor` from a subdirectory (or a linked
+    /// worktree) must still resolve the root's `memory/` store, not come up
+    /// empty because the session was recorded for the root and not the
+    /// subdirectory `doctor` happened to run from.
+    #[test]
+    fn native_memory_reports_resolves_a_subdirectory_to_the_repository_root() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            // No git binary in this environment: the repo-root resolution
+            // falls back to the given cwd unchanged, so there is nothing
+            // this test can distinguish here. Skip rather than fail.
+            return;
+        }
+        let subdir = repo.path().join("sub/dir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        // The session was recorded for the repository ROOT, as Claude Code
+        // itself would record it -- not for the subdirectory.
+        let memory_dir = claude_memory_fixture(home.path(), repo.path());
+        std::fs::write(memory_dir.join("fact.md"), "x").unwrap();
+
+        let reports = native_memory_reports(home.path(), &subdir);
+        let claude = find_claude_report(&reports);
+        assert_eq!(claude.file_count, 1);
     }
 }

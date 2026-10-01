@@ -16,6 +16,13 @@ a derived SQLite index for search. Everything is **scoped per project**
 LLM at all (capture + full-text search + rule-based summaries); adding a provider
 enables consolidation and auto-improvement.
 
+## Recipe: use ai-memory as your tool's memory
+
+Call the existing MCP tools to save pages, query knowledge and pass a handoff
+between executions. Native hooks are optional. The [programmatic memory guide](programmatic-memory.md)
+includes complete HTTP requests, scope rules and machine authentication.
+If your tool also hosts a harness, follow the [external lifecycle contract](external-lifecycle.md).
+
 ## Everyday tasks (through your agent, over MCP)
 
 You mostly just talk to your agent; it calls the right tool. Common ones:
@@ -289,6 +296,7 @@ ai-memory run <harness>              # launch a harness, hooks + MCP auto-wired
 ai-memory continue                   # resume the newest managed checkout
 ai-memory workstreams                # list this checkout's managed workstreams
 ai-memory status                     # counts, paths, health
+ai-memory list-projects              # every workspace/project the server knows about
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
 ai-memory write-page …               # save a durable page
@@ -312,7 +320,13 @@ ai-memory serve                      # run the server
   every harness that has local sessions in this project and whether the server
   captured them — so a harness you rotated in without installing its hook (a
   silent gap: it keeps its own local history while capturing nothing) shows up
-  as a warning with the exact `install-hooks` command to fix it.
+  as a warning with the exact `install-hooks` command to fix it. For Claude
+  Code it also reports the detected default auto-memory directory and whether
+  the repository's capture exclusions cover it. A custom
+  `autoMemoryDirectory` is not discoverable from Claude's session transcripts
+  and is not reported. An `excluded` verdict applies only to native/generated
+  hooks; shell and PowerShell compatibility hooks do not enforce capture-policy
+  exclusions.
 - **I just installed hooks in a project I've worked in for a while**: the first
   time you open the project after installing, ai-memory imports your existing
   local session history once (bounded, sanitized on the server, only into an

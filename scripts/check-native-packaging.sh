@@ -88,13 +88,16 @@ main() {
   trap cleanup EXIT
 
   log "Checking host-launch wrapper routing"
-  local fake_docker fake_native wrapper_log
+  local fake_docker fake_compat_docker fake_native wrapper_log docker_log native_lines
   fake_docker="${TMP_ROOT}/forbidden-docker"
+  fake_compat_docker="${TMP_ROOT}/fake-compat-docker"
   fake_native="${TMP_ROOT}/fake-ai-memory"
   wrapper_log="${TMP_ROOT}/wrapper.log"
+  docker_log="${TMP_ROOT}/docker.log"
   printf '%s\n' '#!/usr/bin/env bash' 'exit 97' >"${fake_docker}"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s\n'\'' "$*" >>"${AI_MEMORY_DOCKER_TEST_LOG}"' >"${fake_compat_docker}"
   printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s\n'\'' "$*" >>"${AI_MEMORY_WRAPPER_TEST_LOG}"' >"${fake_native}"
-  chmod 0755 "${fake_docker}" "${fake_native}"
+  chmod 0755 "${fake_docker}" "${fake_compat_docker}" "${fake_native}"
   AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
     AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
     bin/ai-memory run codex --yolo
@@ -110,11 +113,29 @@ main() {
   AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
     AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
     bin/ai-memory rename-workstream --from typo-nmae --to refactor-db
+  AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
+    AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
+    bin/ai-memory install-hooks --agent claude-code --capture-mode allowlist --apply
   assert_contains "${wrapper_log}" "run codex --yolo"
   assert_contains "${wrapper_log}" "show --json --no-scan"
   assert_contains "${wrapper_log}" "continue --workspace work --yolo"
   assert_contains "${wrapper_log}" "workstreams --limit 5 --json"
   assert_contains "${wrapper_log}" "rename-workstream --from typo-nmae --to refactor-db"
+  assert_contains "${wrapper_log}" "install-hooks --agent claude-code --capture-mode allowlist --apply"
+
+  native_lines="$(wc -l <"${wrapper_log}")"
+  AI_MEMORY_DOCKER="${fake_compat_docker}" AI_MEMORY_NATIVE_BIN="${fake_native}" \
+    AI_MEMORY_HOOK_PLATFORM=posix AI_MEMORY_DOCKER_TEST_LOG="${docker_log}" \
+    AI_MEMORY_WRAPPER_TEST_LOG="${wrapper_log}" \
+    bin/ai-memory install-hooks --agent claude-code --apply
+  assert_contains "${docker_log}" "install-hooks --agent claude-code --apply"
+  test "$(wc -l <"${wrapper_log}")" = "${native_lines}" \
+    || fail "an explicit posix hook install must retain the container/script path"
+
+  if AI_MEMORY_DOCKER="${fake_docker}" AI_MEMORY_NATIVE_BIN="$(pwd)/bin/ai-memory" \
+    bin/ai-memory run codex 2>/dev/null; then
+    fail "AI_MEMORY_NATIVE_BIN pointing to the wrapper must be refused instead of recursing"
+  fi
 
   log "Creating temporary alternate root"
   mkdir -p \

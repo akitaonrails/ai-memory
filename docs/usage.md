@@ -74,6 +74,36 @@ If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_begin`. Cancelling marks the handoff expired, so the next
 session-start hook will not consume stale context.
 
+### Offering instead of claiming at session start
+
+By default, `SessionStart` claims a pending handoff automatically — the
+behavior described above. With several concurrent lines of work in the same
+project, an unrelated session (a different task, a different harness, or a
+non-interactive launch) can consume a baton meant for a specific follow-up
+session. Set `claim_on_session_start = false` under `[handoff]` in
+`config.toml` to stop that:
+
+```toml
+[handoff]
+claim_on_session_start = false
+```
+
+`SessionStart` then leaves the handoff open and renders a non-consuming
+notice instead, naming the exact `handoff_id`, the agent that left it, and
+its age — never the stored summary, open questions, or next steps (same
+security bar as the inbox notice: that content is written by whatever agent
+or operator ended the prior session, and a notice injected into the on-start
+context cannot be deliberately skipped the way leaving `memory_handoff_accept`
+uncalled can). Pick it up explicitly:
+
+```
+> memory_handoff_accept handoff_id=<the id from the notice>
+```
+
+This is server-wide — every operator on the server gets the same behavior.
+Restart the server after changing `config.toml`; configuration is loaded once
+at startup. The default (`true`) is unchanged for every existing install.
+
 ### Skipping the handoff for one launch
 
 Set `AI_MEMORY_HANDOFF=off` to skip fetching — and therefore claiming — a
@@ -82,7 +112,9 @@ behavior for any other session. Every delivery path honors it: the native
 `ai-memory hook` binary, the POSIX and PowerShell hook bundles, and the
 generated OpenCode/zcode plugin. `ai-memory run --no-handoff` sets it for the
 spawned harness. Useful for a scripted launch or a probe that should not
-consume a baton meant for a specific interactive follow-up session.
+consume a baton meant for a specific interactive follow-up session. Composes
+with `claim_on_session_start = false` above: an opted-out execution sees no
+claim and no notice either way.
 
 ## Compaction recovery
 

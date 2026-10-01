@@ -16,6 +16,175 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spawned harness. For a scripted launch or probe that should not consume a
   baton meant for a specific interactive follow-up session (design: #959,
   option 2).
+- Added explicit MCP behavior annotations (title, read-only, destructive,
+  idempotent, and open-world hints) to all 23 tools. Reordered the MCP server
+  instructions so scope selection, untrusted-memory handling, deliberate
+  cross-project broadening, capture policy, and handoff safety remain complete
+  within the first 2,048 characters used by truncating clients. The longer
+  per-tool routing reference remains available to clients that accept it.
+  (#920)
+- Added env-only named launch profiles for `ai-memory run --profile NAME` via
+  `[run.profiles.<name>.env]` in `config.toml`. Profile values feed the same
+  native-session, auto-wire, and child-process environment path as `--env`;
+  precedence is profile, then `--env-file`, then repeated `--env`. Unknown or
+  invalid profiles fail before a workstream lease or child process. (#922)
+- Added cross-project attribution for native lifecycle file-tool events whose
+  harness keeps reporting the parent session's cwd. A bounded, recognized
+  absolute target reroutes only when every path proves the same repository or
+  marker boundary; destination capture exclusions and server profiles are
+  resolved before the event is spooled. Relative, mixed-project, unsupported,
+  and arbitrary non-project paths keep the original route. (#932)
+- Added `serve --enable-api` / `AI_MEMORY_ENABLE_API=true` to mount the
+  authenticated read-only `/api/v1` surface without the browser UI. Existing
+  `--enable-web` behavior is unchanged and still includes the API. Documented
+  the acceptance and safety boundary for a repository-backed team-wiki sync
+  companion. (#986)
+- Added `[handoff].claim_on_session_start` (default `true` - unchanged
+  behavior). When set to `false`, `SessionStart` no longer claims a pending
+  handoff automatically; it renders a non-consuming notice naming the exact
+  `handoff_id`, `from_agent`, and age instead (mirroring the existing inbox
+  notice: metadata only, never the stored summary/open-questions/next-steps
+  text), and the agent or operator picks it up explicitly with
+  `memory_handoff_accept`. Fixes an unrelated next session, a different
+  harness, or a non-interactive launch silently consuming a baton meant for
+  a specific session. Server-wide for now; a per-project override is left for
+  a follow-up change. (#1030)
+- Added a default-quit prompt after a successful interactive managed run so the
+  operator can re-run the current harness or switch to another installed
+  harness in the same workstream. Utility, failed, interrupted,
+  non-interactive, and custom-`--executable` runs keep their existing exit
+  behavior. Resolves #909. (#975)
+- Added `ai-memory backup-agents` and dry-run-by-default
+  `ai-memory restore-agents` commands for host agent configurations, skills,
+  plugins, and project instructions. Archives are written atomically with
+  private Unix permissions, MCP config text is sanitized by default, and
+  restore bounds archive input, verifies manifest checksums and completeness,
+  refuses duplicate or symlink-escaping targets, and keeps overwritten files
+  as timestamped backups. Other asset types are copied verbatim and may contain
+  secrets or active instructions/code. (#962)
+- Added a NixOS module (`nix/nixos-module.nix`, exposed as
+  `nixosModules.default`) with a dedicated non-login system user and a hardened
+  NixOS systemd sandbox. A minimal typed set plus `freeformType` renders
+  declarative `config.toml`; values land in a world-readable store path, so
+  secrets (including `llm_headers`) use `ageSecret`, `sopsSecret`, or
+  `environmentFile`. Non-loopback binds require a secret source. The module
+  includes opt-in web, firewall, and resource settings plus eval and privileged
+  container checks. Flake packages are exported for x86_64 Linux, aarch64
+  Linux, and Apple Silicon macOS; Intel macOS remains available through the
+  release tarball and Homebrew rather than the pinned Nixpkgs revision. (#989)
+- Added `ai-memory doctor` reporting for Claude Code's default native
+  `memory/` store for the current repository: location, file count, and whether
+  the nearest marker's `ignore_paths` would exclude a read. Repository-root
+  resolution keeps worktrees and subdirectories on the same report, and the
+  output warns that shell/PowerShell compatibility hooks do not enforce the
+  exclusion. Resolves #1003. (#1005)
+- Added per-event outcomes to `/hook/batch` acknowledgements and process-lifetime
+  ingest counters for stored events, replays, recovery, ignored endings,
+  collisions and failures. Legacy acknowledgement fields were preserved. (#1015)
+- Added receipt outcomes and delivery counts to the companion relay. Opening a
+  schema 1 queue now upgrades it atomically to schema 2; older relay binaries
+  refuse schema 2, so downgrade requires a pre-upgrade backup with all queue
+  users stopped. Pending order and existing delivery metadata were preserved.
+  Receipts now retain their first known outcome. (#1015)
+- Added `ai-memory list-projects [--workspace] [--json]`: a plain, scriptable
+  listing of every workspace/project pair the server knows about, sorted by
+  workspace then project. Previously the only way to see this from outside
+  an interactive `show` session was to call `GET /api/v1/projects` directly.
+  (#1022)
+- Added scope and policy preflight to `ai-memory hook --check-capture`, including
+  event eligibility, sanitized routing hints and server-remapping information.
+  Partial scope, excluded events, rejected profiles and oversized hints refuse
+  capture. Inspection neither ingests events nor claims handoffs. (#1019)
+- Added the latest scoped consolidation job's state and attempt count to HTTP
+  session summaries and MCP `memory_read_session_observations`. The field is
+  `null` when no job exists; provider errors remain private and existing session
+  ownership filters are preserved. (#1018)
+- Added incremental paging to scoped HTTP `recent` reads with `updated_since`
+  and an opaque, scope-bound cursor. Queries preserve equal-time ordering,
+  exclude expired and superseded pages and recheck authorization on each
+  request. Calls without incremental arguments retain their existing array
+  response. Added a generic MCP/HTTP integration guide. (#1017)
+- Added machine-authenticated `GET /identity`, available with the web UI
+  disabled, and `ai-memory doctor` diagnostics for caller identity, external
+  capture ownership and sessions with multiple capture sources (native events
+  or distinct extensions, including backfill).
+  Mixed-source counts preserve scope, session ownership and time-window filters;
+  older servers leave unsupported fields unknown. (#1016)
+
+### Changed
+- Documented FutureInfra as an endpoint for the existing `openai-compat`
+  provider. (#1026)
+- `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-
+  filtered PRs and pushes (package smoke + NixOS module eval /
+  sandbox-parity). The `aarch64-darwin` package smoke and the privileged
+  NixOS container smoke run only on schedule, `workflow_dispatch`, or a PR
+  labelled `nix` / `full-ci`. (#989)
+
+### Fixed
+- Fixed completed retries and no-op session endings advancing
+  `last_persisted_ms` without a durable write. Recovery still advances the
+  timestamp when it commits a new page or terminal effect. (#1015)
+- Fixed interrupted launchers blocking an immediate managed-workstream restart
+  by adding explicit `ai-memory run --force-unlock` recovery. The server
+  atomically expires and replaces only a lease attributed to the same
+  authenticated operator (or another unattributed lease in single-user
+  operation), while cross-operator eviction remains refused; the command does
+  not kill a native process. (#795)
+- Fixed Unix release archives potentially carrying macOS AppleDouble sidecars
+  outside the native upgrader's strict path allowlist. Release packing now
+  disables sidecar generation, and packaging tests lock the staged top-level
+  layout to the upgrader allowlist so future release changes cannot silently
+  make official archives un-upgradable. (#1029)
+- Fixed `ai-memory upgrade` rewriting native hook commands with Linux's
+  ` (deleted)` executable-path suffix after replacing its own binary. Every
+  hook renderer now keeps a still-existing literal path, otherwise strips the
+  kernel suffix only when the resulting installed binary exists, and finally
+  falls back to the bare `ai-memory` command instead of embedding a dead path.
+  The in-process refresh continues using the already-loaded CLI/config scope.
+  (#1027)
+- Fixed native `ai-memory upgrade` rejecting every current Linux, macOS, and
+  Windows release archive when it encountered the packaging, config-template,
+  or documentation entries shipped beside the binary. The extractor now
+  validates the exact support-file layout emitted by `release.yml`, ignores
+  those non-runtime files during self-upgrade, and still extracts only the
+  binary and hooks. Archive entry-count and expanded-size caps now complement
+  the existing compressed-download limit. (#1025)
+- Fixed the recommended Linux/macOS Docker-wrapper `install-hooks` path
+  silently installing shell hooks that cannot enforce client-side capture
+  controls such as `[capture] ignore_paths` and allowlist mode. The wrapper now
+  uses its existing checksum-verified native host client for hook installation
+  and refresh, while an explicit `AI_MEMORY_HOOK_PLATFORM=posix|windows` keeps
+  the documented compatibility fallback and warning. Wrapper upgrades refresh
+  that stable native client before rewriting existing hook registrations.
+  (#1002)
+- Fixed managed Codex sessions losing their startup continuity when a shared
+  Codex app-server daemon reports a finished run's stale `AI_MEMORY_RUN_ID`.
+  SessionStart now recovers only the sole live, undelivered Codex run in the
+  already-authorized repository, checkout cwd, and operator bucket, and links
+  it atomically to the new native session. Active boundary mismatches,
+  concurrent matching runs, cross-project or cross-worktree candidates,
+  cross-operator candidates, and a second linker all fail closed instead of
+  guessing or rebinding a run. (#987)
+- `ai-memory doctor` now warns when the nearest `.ai-memory.toml`'s
+  `[capture]` section is invalid. This fails closed today — every file and
+  shell tool event is reduced to metadata until the marker is fixed, nothing
+  leaks — but nothing surfaced that it had happened, so an operator could
+  believe `ignore_paths` was excluding paths it no longer was. The check is
+  based on the same resolution state the live hook path uses (not just
+  whether the TOML parses), so it also catches a `[capture]` table that
+  parses fine but is still rejected at compile time, e.g. an unsupported glob
+  character in `ignore_paths`. (#1021)
+- Fixed the shell and PowerShell hook scripts mishandling a `$HOME` that ends
+  in a separator: the shell walks missed a marker between the checkout and
+  home, and the PowerShell walks went past home and read a marker above it.
+  Both now match the native `ai-memory hook` walk. (#1023)
+- Fixed `ai-memory run --jail` leaving the `ssh` toggle unchecked when
+  `git push` goes over SSH but `origin`'s fetch URL does not show it: an HTTPS
+  `origin` with an SSH `pushurl` or `pushInsteadOf`, or a `host:path` remote
+  using an `~/.ssh/config` alias. The interactive offer now also uses
+  ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
+  trust checks is treated as unavailable instead of producing a broken offer.
+  (#1024)
 
 ## [2.5.2] - 2026-10-01
 

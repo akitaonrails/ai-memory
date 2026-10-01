@@ -18,9 +18,9 @@ pub struct RepositoryIdentity {
     pub worktree_fingerprint: String,
     /// Current non-mutating Git checkpoint.
     pub checkpoint: WorkstreamCheckpoint,
-    /// First URL of the `origin` remote, when there is one. The ai-jail
-    /// toggles read it to decide whether `git push` needs SSH.
-    pub origin_url: Option<String>,
+    /// The URL `git push` to `origin` uses (`pushurl`, or `url` after any
+    /// `pushInsteadOf`). The ai-jail `ssh` default reads it.
+    pub origin_push_url: Option<String>,
     /// Whether the cwd is a linked worktree (its git dir differs from the
     /// repository's common dir), whose metadata ai-jail must mount writable
     /// for the agent to commit.
@@ -60,9 +60,9 @@ pub fn inspect_repository(cwd: &Path) -> Result<RepositoryIdentity> {
         repo_fingerprint: sha256(&repo_seed),
         worktree_fingerprint: sha256(&worktree_seed),
         checkpoint: checkpoint(&canonical),
-        origin_url: remotes
+        origin_push_url: git(&canonical, &["remote", "get-url", "--push", "origin"])
             .as_deref()
-            .and_then(|remotes| remotes.lines().next())
+            .and_then(|urls| urls.lines().next())
             .map(str::trim)
             .filter(|url| !url.is_empty())
             .map(str::to_owned),
@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(first.repo_fingerprint, second.repo_fingerprint);
         assert_eq!(first.worktree_fingerprint, second.worktree_fingerprint);
         assert_eq!(first.repo_fingerprint.len(), 64);
-        assert_eq!(first.origin_url, None);
+        assert_eq!(first.origin_push_url, None);
         assert!(!first.linked_worktree);
     }
 
@@ -184,7 +184,7 @@ mod tests {
     /// The ai-jail toggle defaults key off these two facts: an SSH-style
     /// `origin` pre-checks `ssh`, and only a linked worktree shows `worktree`.
     #[test]
-    fn reports_origin_url_and_linked_worktree() {
+    fn reports_origin_push_url_and_linked_worktree() {
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
         std::fs::create_dir(&main).unwrap();
@@ -206,7 +206,7 @@ mod tests {
         );
         let primary = inspect_repository(&main).unwrap();
         assert_eq!(
-            primary.origin_url.as_deref(),
+            primary.origin_push_url.as_deref(),
             Some("git@github.com:example/repo.git")
         );
         assert!(!primary.linked_worktree, "the main checkout is not linked");
@@ -225,7 +225,55 @@ mod tests {
         );
         let worktree = inspect_repository(&linked).unwrap();
         assert!(worktree.linked_worktree);
-        assert_eq!(worktree.origin_url, primary.origin_url);
+        assert_eq!(worktree.origin_push_url, primary.origin_push_url);
+    }
+
+    /// The push URL counts, not the fetch URL. The `.invalid` host keeps a
+    /// contributor's global `pushInsteadOf` out of the first case.
+    #[test]
+    fn origin_push_url_follows_push_rewrites() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        git_fixture(repo, &["init", "-q"]);
+        git_fixture(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://git.example.invalid/example/repo.git",
+            ],
+        );
+        assert_eq!(
+            inspect_repository(repo).unwrap().origin_push_url.as_deref(),
+            Some("https://git.example.invalid/example/repo.git")
+        );
+
+        git_fixture(
+            repo,
+            &[
+                "config",
+                "url.git@git.example.invalid:.pushInsteadOf",
+                "https://git.example.invalid/",
+            ],
+        );
+        assert_eq!(
+            inspect_repository(repo).unwrap().origin_push_url.as_deref(),
+            Some("git@git.example.invalid:example/repo.git")
+        );
+
+        git_fixture(
+            repo,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                "work-gh:example/repo.git",
+            ],
+        );
+        assert_eq!(
+            inspect_repository(repo).unwrap().origin_push_url.as_deref(),
+            Some("work-gh:example/repo.git")
+        );
     }
 
     #[test]

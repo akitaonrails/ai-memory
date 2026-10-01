@@ -16,8 +16,9 @@
 //! CLI fetch, the extract `TempDir` is discarded after the replace, and a
 //! cached archive would only add a stale-binary risk; **rate limit / load
 //! shedding** — n/a (single outbound GET from a user-invoked CLI command,
-//! no ingress). The 128 MiB body cap is a security limit, not a resilience
-//! decision (see [`MAX_RELEASE_DOWNLOAD_BYTES`]).
+//! no ingress). The 128 MiB body cap plus entry-count and 512 MiB expanded-size
+//! caps are security limits, not resilience decisions (see
+//! [`MAX_RELEASE_DOWNLOAD_BYTES`]).
 //!
 //! Ownership (live CLI command — kept in one module by convention):
 //! - install classification (container / package-managed / writable)
@@ -49,6 +50,12 @@ const USER_AGENT: &str = concat!("ai-memory-cli/", env!("CARGO_PKG_VERSION"));
 /// headroom while refusing multi-GB DoS if a mirror or compromised host
 /// advertises / streams an oversized payload.
 const MAX_RELEASE_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
+/// Refuse an archive whose directory contains an unreasonable number of
+/// records, even when every individual path is allowed.
+const MAX_RELEASE_ARCHIVE_ENTRIES: usize = 4_096;
+/// Limit declared expanded bytes separately from the compressed HTTP body so
+/// an otherwise valid-looking archive cannot exhaust the install disk.
+const MAX_RELEASE_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
 const HTTP_TIMEOUT_SECS: u64 = 120;
 #[cfg(unix)]
 const UNIX_EXECUTABLE_MODE: u32 = 0o755;
@@ -407,14 +414,18 @@ fn extract_release_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
     let decoder = GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
     archive.set_preserve_permissions(false);
+    let mut budget = ReleaseArchiveBudget::default();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
         let entry_type = entry.header().entry_type();
-        validate_release_tar_entry(&path, entry_type)?;
-        entry
-            .unpack_in(dest)
-            .with_context(|| format!("extracting {}", path.display()))?;
+        let action = validate_release_tar_entry(&path, entry_type)?;
+        budget.account(entry.header().size()?)?;
+        if action == ReleaseEntryAction::Extract {
+            entry
+                .unpack_in(dest)
+                .with_context(|| format!("extracting {}", path.display()))?;
+        }
     }
     Ok(())
 }
@@ -422,6 +433,7 @@ fn extract_release_tar_gz(bytes: &[u8], dest: &Path) -> Result<()> {
 fn extract_release_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     let cursor = Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor).context("opening release zip")?;
+    let mut budget = ReleaseArchiveBudget::default();
     for i in 0..archive.len() {
         let mut file = archive
             .by_index(i)
@@ -435,7 +447,11 @@ fn extract_release_zip(bytes: &[u8], dest: &Path) -> Result<()> {
                 enclosed.display()
             );
         }
-        validate_release_path(&enclosed, file.is_dir())?;
+        let action = validate_release_path(&enclosed, file.is_dir())?;
+        budget.account(file.size())?;
+        if action == ReleaseEntryAction::Ignore {
+            continue;
+        }
         let out_path = dest.join(&enclosed);
         if file.is_dir() {
             fs::create_dir_all(&out_path)
@@ -457,7 +473,10 @@ fn is_regular_file(entry_type: tar::EntryType) -> bool {
     entry_type.is_file() || entry_type == tar::EntryType::GNUSparse
 }
 
-fn validate_release_tar_entry(path: &Path, entry_type: tar::EntryType) -> Result<()> {
+fn validate_release_tar_entry(
+    path: &Path,
+    entry_type: tar::EntryType,
+) -> Result<ReleaseEntryAction> {
     if entry_type.is_symlink() || entry_type.is_hard_link() {
         bail!(
             "release archive contains unsupported link entry: {}",
@@ -473,24 +492,71 @@ fn validate_release_tar_entry(path: &Path, entry_type: tar::EntryType) -> Result
     validate_release_path(path, entry_type.is_dir())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseEntryAction {
+    Extract,
+    Ignore,
+}
+
+#[derive(Default)]
+struct ReleaseArchiveBudget {
+    entries: usize,
+    expanded_bytes: u64,
+}
+
+impl ReleaseArchiveBudget {
+    fn account(&mut self, expanded_bytes: u64) -> Result<()> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .context("release archive entry count overflow")?;
+        if self.entries > MAX_RELEASE_ARCHIVE_ENTRIES {
+            bail!("release archive contains more than {MAX_RELEASE_ARCHIVE_ENTRIES} entries");
+        }
+        self.expanded_bytes = self
+            .expanded_bytes
+            .checked_add(expanded_bytes)
+            .context("release archive expanded size overflow")?;
+        if self.expanded_bytes > MAX_RELEASE_EXPANDED_BYTES {
+            bail!("release archive expands past the {MAX_RELEASE_EXPANDED_BYTES}-byte limit");
+        }
+        Ok(())
+    }
+}
+
 /// Shared path gates for tar and zip entries (allowlist + traversal).
-fn validate_release_path(path: &Path, is_dir: bool) -> Result<()> {
+fn validate_release_path(path: &Path, is_dir: bool) -> Result<ReleaseEntryAction> {
     let normalized = normalize_release_entry_path(path)?;
     // `tar -C dist/$artifact -czf … .` (release.yml) emits `./` as the
     // archive root — empty after stripping CurDir; allow that directory only.
     if normalized.as_os_str().is_empty() {
         if is_dir {
-            return Ok(());
+            return Ok(ReleaseEntryAction::Ignore);
         }
         bail!("release archive contains unsafe path: {}", path.display());
     }
-    if !is_allowed_release_path(&normalized) {
-        bail!(
+    let key = release_path_key(&normalized);
+    let is_runtime_file = !is_dir && matches!(key.as_str(), "ai-memory" | "ai-memory.exe");
+    let is_hook_entry = (is_dir && key == HOOKS_DIR_NAME)
+        || key
+            .strip_prefix(HOOKS_DIR_NAME)
+            .is_some_and(|rest| rest.starts_with('/'));
+    let action = if is_runtime_file || is_hook_entry {
+        Some(ReleaseEntryAction::Extract)
+    } else if (is_dir && RELEASE_SUPPORT_DIRS.contains(&key.as_str()))
+        || (!is_dir && RELEASE_SUPPORT_FILES.contains(&key.as_str()))
+    {
+        Some(ReleaseEntryAction::Ignore)
+    } else {
+        None
+    };
+    match action {
+        Some(action) => Ok(action),
+        None => bail!(
             "release archive contains unexpected path: {}",
             path.display()
-        );
+        ),
     }
-    Ok(())
 }
 
 /// Drop `Component::CurDir` (release tarballs use `./ai-memory`); reject
@@ -519,21 +585,37 @@ fn release_path_key(path: &Path) -> String {
         .join("/")
 }
 
-fn is_allowed_release_path(path: &Path) -> bool {
-    let path_str = release_path_key(path);
-    // Accept both release basenames so the zip extractor can be unit-tested
-    // on Unix CI (archive root is always `ai-memory.exe` per release.yml).
-    path_str == "ai-memory"
-        || path_str == "ai-memory.exe"
-        || path_str == HOOKS_DIR_NAME
-        || path_str
-            .strip_prefix(HOOKS_DIR_NAME)
-            .is_some_and(|rest| rest.starts_with('/'))
-        || path_str == "README.md"
-        || path_str == "LICENSE"
-        || path_str.starts_with("docs/")
-        || path_str.starts_with("crates/")
-}
+/// Directory entries emitted by the Linux, macOS, and Windows release jobs.
+/// These are validated but not copied into the temporary self-upgrade tree.
+const RELEASE_SUPPORT_DIRS: &[&str] = &[
+    "crates",
+    "crates/ai-memory-cli",
+    "crates/ai-memory-cli/templates",
+    "docs",
+    "packaging",
+    "packaging/env",
+    "packaging/launchd",
+    "packaging/systemd",
+    "packaging/sysusers",
+    "packaging/tmpfiles",
+];
+
+/// Non-runtime files copied into release archives by `release.yml`. Keep this
+/// exact rather than admitting whole documentation or packaging subtrees.
+const RELEASE_SUPPORT_FILES: &[&str] = &[
+    "LICENSE",
+    "README.md",
+    "crates/ai-memory-cli/templates/config.default.toml",
+    "docs/install.md",
+    "docs/macos.md",
+    "docs/windows.md",
+    "packaging/env/ai-memory.env",
+    "packaging/launchd/com.github.akitaonrails.ai-memory.plist",
+    "packaging/systemd/ai-memory-user.service",
+    "packaging/systemd/ai-memory.service",
+    "packaging/sysusers/ai-memory.conf",
+    "packaging/tmpfiles/ai-memory.conf",
+];
 
 fn replace_file_atomic(src: &Path, dest: &Path) -> Result<()> {
     let tmp = dest.with_extension("new");
@@ -954,9 +1036,20 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_accepts_shipped_binary_basename() {
-        assert!(is_allowed_release_path(Path::new(shipped_binary_name())));
-        assert!(is_allowed_release_path(Path::new("hooks/claude-code/x.sh")));
+    fn allowlist_extracts_only_runtime_assets() -> Result<()> {
+        assert_eq!(
+            validate_release_path(Path::new(shipped_binary_name()), false)?,
+            ReleaseEntryAction::Extract
+        );
+        assert_eq!(
+            validate_release_path(Path::new("hooks/claude-code/x.sh"), false)?,
+            ReleaseEntryAction::Extract
+        );
+        assert_eq!(
+            validate_release_path(Path::new("docs/install.md"), false)?,
+            ReleaseEntryAction::Ignore
+        );
+        Ok(())
     }
 
     #[test]
@@ -1081,7 +1174,7 @@ mod tests {
     #[test]
     fn validate_rejects_path_traversal() -> Result<()> {
         match validate_release_tar_entry(Path::new("../evil"), tar::EntryType::Regular) {
-            Ok(()) => bail!("path traversal must fail"),
+            Ok(_) => bail!("path traversal must fail"),
             Err(err) => assert!(err.to_string().contains("unsafe"), "{err}"),
         }
         Ok(())
@@ -1090,7 +1183,7 @@ mod tests {
     #[test]
     fn validate_rejects_unexpected_paths() -> Result<()> {
         match validate_release_tar_entry(Path::new("etc/passwd"), tar::EntryType::Regular) {
-            Ok(()) => bail!("unexpected path must fail"),
+            Ok(_) => bail!("unexpected path must fail"),
             Err(err) => assert!(err.to_string().contains("unexpected"), "{err}"),
         }
         Ok(())
@@ -1098,8 +1191,44 @@ mod tests {
 
     #[test]
     fn validate_accepts_dot_slash_prefixed_binary() -> Result<()> {
-        validate_release_tar_entry(Path::new("./ai-memory"), tar::EntryType::Regular)?;
-        validate_release_tar_entry(Path::new("./"), tar::EntryType::Directory)?;
+        assert_eq!(
+            validate_release_tar_entry(Path::new("./ai-memory"), tar::EntryType::Regular)?,
+            ReleaseEntryAction::Extract
+        );
+        assert_eq!(
+            validate_release_tar_entry(Path::new("./"), tar::EntryType::Directory)?,
+            ReleaseEntryAction::Ignore
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn release_workflow_support_assets_are_exact_and_ignored() -> Result<()> {
+        for directory in RELEASE_SUPPORT_DIRS {
+            assert_eq!(
+                validate_release_path(Path::new(directory), true)?,
+                ReleaseEntryAction::Ignore,
+                "support directory {directory}"
+            );
+        }
+        for file in RELEASE_SUPPORT_FILES {
+            assert_eq!(
+                validate_release_path(Path::new(file), false)?,
+                ReleaseEntryAction::Ignore,
+                "support file {file}"
+            );
+        }
+
+        for near_miss in [
+            "docs/unshipped.md",
+            "packaging/launchd/extra.plist",
+            "crates/ai-memory-cli/templates/extra.toml",
+        ] {
+            match validate_release_path(Path::new(near_miss), false) {
+                Ok(_) => bail!("unshipped support path {near_miss} must fail"),
+                Err(err) => assert!(err.to_string().contains("unexpected"), "{err}"),
+            }
+        }
         Ok(())
     }
 
@@ -1109,6 +1238,29 @@ mod tests {
         fs::write(src.path().join(shipped_binary_name()), b"bin")?;
         fs::create_dir_all(src.path().join("hooks/claude-code"))?;
         fs::write(src.path().join("hooks/claude-code/x.sh"), b"#!/bin/sh")?;
+        for directory in [
+            "packaging/launchd",
+            "crates/ai-memory-cli/templates",
+            "docs",
+        ] {
+            fs::create_dir_all(src.path().join(directory))?;
+        }
+        for (path, body) in [
+            (
+                "packaging/launchd/com.github.akitaonrails.ai-memory.plist",
+                b"plist".as_slice(),
+            ),
+            (
+                "crates/ai-memory-cli/templates/config.default.toml",
+                b"config".as_slice(),
+            ),
+            ("docs/install.md", b"install".as_slice()),
+            ("docs/macos.md", b"macos".as_slice()),
+            ("README.md", b"readme".as_slice()),
+            ("LICENSE", b"license".as_slice()),
+        ] {
+            fs::write(src.path().join(path), body)?;
+        }
         let out = tempfile::tempdir()?;
         let archive = out.path().join("a.tar.gz");
         // Same invocation as .github/workflows/release.yml. COPYFILE_DISABLE
@@ -1130,6 +1282,58 @@ mod tests {
             "ai-memory-macos-aarch64.tar.gz",
         )?;
         assert!(dest.path().join(shipped_binary_name()).is_file());
+        assert!(dest.path().join("hooks/claude-code/x.sh").is_file());
+        assert!(!dest.path().join("docs/install.md").exists());
+        assert!(!dest.path().join("packaging").exists());
+        assert!(!dest.path().join("README.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn release_archive_budget_rejects_entry_count_and_expanded_size() -> Result<()> {
+        let mut count_budget = ReleaseArchiveBudget::default();
+        for _ in 0..MAX_RELEASE_ARCHIVE_ENTRIES {
+            count_budget.account(0)?;
+        }
+        match count_budget.account(0) {
+            Ok(()) => bail!("entry count past the cap must fail"),
+            Err(err) => assert!(err.to_string().contains("entries"), "{err}"),
+        }
+
+        let mut size_budget = ReleaseArchiveBudget::default();
+        size_budget.account(MAX_RELEASE_EXPANDED_BYTES)?;
+        match size_budget.account(1) {
+            Ok(()) => bail!("expanded size past the cap must fail"),
+            Err(err) => assert!(err.to_string().contains("expands past"), "{err}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tar_extract_rejects_declared_expansion_past_limit() -> Result<()> {
+        let mut header = Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_path("ai-memory")?;
+        header.set_size(MAX_RELEASE_EXPANDED_BYTES + 1);
+        header.set_mode(0o755);
+        header.set_cksum();
+
+        let mut tar_bytes = header.as_bytes().to_vec();
+        tar_bytes.extend_from_slice(&[0_u8; 1_024]);
+        let mut gz_bytes = Vec::new();
+        {
+            use flate2::Compression;
+            use flate2::write::GzEncoder;
+            let mut encoder = GzEncoder::new(&mut gz_bytes, Compression::fast());
+            encoder.write_all(&tar_bytes)?;
+            encoder.finish()?;
+        }
+        let dest = tempfile::tempdir()?;
+        match extract_release_archive(&gz_bytes, dest.path(), "ai-memory-linux-x86_64.tar.gz") {
+            Ok(()) => bail!("declared expanded size past the cap must fail"),
+            Err(err) => assert!(err.to_string().contains("expands past"), "{err:#}"),
+        }
+        assert!(!dest.path().join("ai-memory").exists());
         Ok(())
     }
 
@@ -1192,6 +1396,18 @@ mod tests {
             ("ai-memory.exe", b"win-bin"),
             ("hooks/", b""),
             ("hooks/claude-code/x.ps1", b"hook"),
+            ("crates/", b""),
+            ("crates/ai-memory-cli/", b""),
+            ("crates/ai-memory-cli/templates/", b""),
+            (
+                "crates/ai-memory-cli/templates/config.default.toml",
+                b"config",
+            ),
+            ("docs/", b""),
+            ("docs/install.md", b"install"),
+            ("docs/windows.md", b"windows"),
+            ("README.md", b"readme"),
+            ("LICENSE", b"license"),
         ])?;
         let dest = tempfile::tempdir()?;
         extract_release_archive(&bytes, dest.path(), "ai-memory-windows-x86_64.zip")?;
@@ -1200,6 +1416,9 @@ mod tests {
             fs::read(dest.path().join("hooks/claude-code/x.ps1"))?,
             b"hook"
         );
+        assert!(!dest.path().join("docs").exists());
+        assert!(!dest.path().join("crates").exists());
+        assert!(!dest.path().join("README.md").exists());
         Ok(())
     }
 

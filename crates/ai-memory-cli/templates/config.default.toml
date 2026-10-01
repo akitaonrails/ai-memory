@@ -18,6 +18,14 @@ allowed_hosts = ["localhost", "127.0.0.1", "::1"]
 # Default tracing filter (overridable by RUST_LOG).
 log_level = "info"
 
+# Optional env-only presets for managed harness launches. Select one with
+# `ai-memory run --profile work claude`. `--env-file` overrides the profile,
+# and repeated `--env` entries override both. Keep executable paths, native
+# argv, and permission-bypass choices on the command line.
+# [run.profiles.work.env]
+# CLAUDE_CONFIG_DIR = "/home/me/.claude-work"
+# ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+
 # Optional server-side hook ingest limiter for shared/remote installs. The rate
 # is tokens per second per actor/session source; 0 or unset disables it. Burst
 # defaults to the rate (minimum one token when enabled). Env equivalents:

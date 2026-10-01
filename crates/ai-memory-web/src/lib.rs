@@ -54,9 +54,9 @@ pub fn router(reader: ReaderPool, wiki: Wiki) -> Router {
 
 /// Build the read-only JSON API router for third-party web UIs.
 ///
-/// The host should `nest("/api/v1", api_router(...))` alongside `/web`
-/// so custom frontends can browse memory without reading SQLite or wiki
-/// files directly.
+/// The host should `nest("/api/v1", api_router(...))` behind its normal auth
+/// boundary, with or without `/web`, so external clients can browse memory
+/// without reading SQLite or wiki files directly.
 pub fn api_router(reader: ReaderPool, wiki: Wiki) -> Router {
     let state = Arc::new(WebState::new(reader, wiki));
     routes::build_api(state)

@@ -9278,8 +9278,8 @@ mod tests {
         assert_eq!(
             json["by_agent"],
             serde_json::json!([
-                { "agent": "claude-code", "sessions": 2 },
-                { "agent": "cursor", "sessions": 1 },
+                { "agent": "claude-code", "sessions": 2, "mixed_capture_sessions": 0 },
+                { "agent": "cursor", "sessions": 1, "mixed_capture_sessions": 0 },
             ]),
             "counts are per agent, scoped, count-desc: {json}"
         );
@@ -9306,8 +9306,8 @@ mod tests {
         assert_eq!(
             json["by_agent"],
             serde_json::json!([
-                { "agent": "claude-code", "sessions": 3 },
-                { "agent": "cursor", "sessions": 1 },
+                { "agent": "claude-code", "sessions": 3, "mixed_capture_sessions": 0 },
+                { "agent": "cursor", "sessions": 1, "mixed_capture_sessions": 0 },
             ]),
             "named callers see own plus shared sessions only: {json}"
         );
@@ -9334,9 +9334,9 @@ mod tests {
         assert_eq!(
             json["by_agent"],
             serde_json::json!([
-                { "agent": "claude-code", "sessions": 3 },
-                { "agent": "codex", "sessions": 1 },
-                { "agent": "cursor", "sessions": 1 },
+                { "agent": "claude-code", "sessions": 3, "mixed_capture_sessions": 0 },
+                { "agent": "codex", "sessions": 1, "mixed_capture_sessions": 0 },
+                { "agent": "cursor", "sessions": 1, "mixed_capture_sessions": 0 },
             ]),
             "all_owners includes every operator: {json}"
         );

@@ -9,6 +9,7 @@ mod autoscope_env;
 mod backfill_dry_run;
 mod backfill_e2e;
 mod backfill_failures;
+mod backup_agents;
 mod completions;
 mod doctor_e2e;
 mod e2e_support;

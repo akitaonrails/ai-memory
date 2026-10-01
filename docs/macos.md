@@ -37,9 +37,11 @@ normal Terminal.
   which works from the host agent.
 - Hooks are rendered for one of two platforms:
   - `posix-native` — a direct `ai-memory hook --event …` call. The default for
-    native macOS/Linux Claude Code installs (cargo / release binary); it uses
-    the local event spool + OIDC-token fallback.
-  - `posix` — `sh` runs the bundled `.sh` script. The Docker wrapper's default.
+    native macOS/Linux Claude Code installs (cargo / release binary) and the
+    Docker wrapper's checksum-verified host client; it uses the local event
+    spool + OIDC-token fallback and enforces capture policy v1.
+  - `posix` — `sh` runs the bundled `.sh` script. This is an explicit
+    compatibility fallback for the Docker wrapper.
 
   Set `AI_MEMORY_HOOK_PLATFORM` before wiring hooks to override the default.
 

@@ -497,6 +497,21 @@ pub fn allows_native_session_adoption(harness: ManagedHarness, native_args: &[Os
         && !noninteractive_invocation(harness, native_args)
 }
 
+/// Whether a successful managed run represents an interactive session where
+/// follow-up choices may be offered in the parent terminal.
+///
+/// Explicit native session selectors remain interactive; this differs from
+/// [`allows_native_session_adoption`], which also rejects them because that
+/// function controls a separate prompt for choosing an existing session.
+#[must_use]
+pub fn is_interactive_session_invocation(
+    harness: ManagedHarness,
+    native_args: &[OsString],
+) -> bool {
+    launch_mode(harness, native_args) == LaunchMode::Session
+        && !noninteractive_invocation(harness, native_args)
+}
+
 fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool {
     match harness {
         ManagedHarness::Claude => has_flag(args, &["--print", "-p"]),
@@ -1714,6 +1729,30 @@ mod tests {
         assert!(!allows_native_session_adoption(
             ManagedHarness::CommandCode,
             &[OsString::from("--print"), OsString::from("continue here")]
+        ));
+    }
+
+    #[test]
+    fn post_run_prompt_is_limited_to_interactive_session_invocations() {
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &[OsString::from("resume"), OsString::from("chosen")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &[OsString::from("exec"), OsString::from("continue here")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Claude,
+            &[OsString::from("--print"), OsString::from("continue here")]
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Pi,
+            &[OsString::from("--no-session")]
+        ));
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Claude,
+            &[OsString::from("--model"), OsString::from("opus")]
         ));
     }
 

@@ -484,6 +484,32 @@ mod tests {
         assert!(outer_marker.exists());
     }
 
+    /// A `$HOME` ending in a separator is the same boundary. The hook scripts
+    /// mirror this.
+    #[test]
+    fn a_trailing_separator_on_home_keeps_the_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("org").join("repo");
+        let plain = home.join("plain");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&plain).unwrap();
+        let org_marker = write_marker(&home.join("org"), "workspace = \"org\"\n");
+        write_marker(tmp.path(), "workspace = \"above\"\nserver = \"x\"\n");
+        let slashed = PathBuf::from(format!("{}/", home.display()));
+
+        assert_eq!(
+            find_marker_with_home(repo.to_str().unwrap(), Some(&slashed)),
+            Some(org_marker)
+        );
+        assert_eq!(
+            find_marker_with_home(plain.to_str().unwrap(), Some(&slashed)),
+            None,
+            "a marker above home must not leak in"
+        );
+        assert!(find_server_selection(plain.to_str().unwrap(), Some(&slashed)).is_none());
+    }
+
     #[test]
     fn marker_walk_outside_home_checks_only_cwd_without_a_checkout() {
         let tmp = TempDir::new().unwrap();

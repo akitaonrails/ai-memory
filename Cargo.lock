@@ -277,6 +277,7 @@ dependencies = [
  "anyhow",
  "askama",
  "axum",
+ "base64 0.22.1",
  "jiff",
  "pulldown-cmark",
  "serde",

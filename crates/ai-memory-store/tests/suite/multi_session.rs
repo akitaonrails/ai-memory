@@ -21,7 +21,10 @@ use ai_memory_core::{
     NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId,
     owner_stamp,
 };
-use ai_memory_store::{PrepareWorkstreamRun, Store, WorkstreamSelection};
+use ai_memory_store::{
+    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun, Store, StoreError,
+    WorkstreamSelection,
+};
 
 fn operator(name: &str) -> String {
     IdentityKey::User(name.into()).storage_key()
@@ -802,4 +805,312 @@ async fn a_session_linked_by_one_managed_run_is_not_another_runs() {
         status(beta.run_id).await,
         (Some("native-beta".into()), true)
     );
+}
+
+/// Stale-run recovery is a scoped, owned, single-candidate operation. The
+/// controls prove that the same candidate is usable once every boundary
+/// matches, while foreign owners/projects and a second linker cannot take it.
+#[tokio::test]
+async fn stale_codex_run_recovery_cannot_cross_project_owner_or_session_boundaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app", None)
+        .await
+        .unwrap();
+    let alice = operator("alice");
+    let bob = operator("bob");
+    let prepare = |project_id, name: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id,
+        repo_fingerprint: format!("repo-{project_id}"),
+        worktree_fingerprint: format!("worktree-{project_id}"),
+        cwd: format!("/repo/{project_id}"),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New(name.into()),
+        lease_owner: format!("launcher-{name}"),
+    };
+
+    let stale = store
+        .writer
+        .prepare_workstream_run_owned(prepare(proj, "stale"), Some(alice.clone()))
+        .await
+        .unwrap();
+    assert!(store.writer.cancel_managed_run(stale.run_id).await.unwrap());
+    let current = store
+        .writer
+        .prepare_workstream_run_owned(prepare(proj, "current"), Some(alice.clone()))
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .prepare_workstream_run_owned(prepare(other_proj, "foreign"), Some(alice.clone()))
+        .await
+        .unwrap();
+
+    let recover = |project_id, owner: Option<String>, native: &'static str| {
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: stale.run_id,
+                workspace_id: ws,
+                project_id,
+                cwd: format!("/repo/{project_id}"),
+                agent: AgentKind::Codex,
+                native_session_id: native.into(),
+                owner_user: owner,
+            })
+    };
+    assert_eq!(
+        recover(proj, Some(bob), "native-bob").await.unwrap(),
+        ManagedRunSessionLink::NoMatch,
+        "a second operator must not see Alice's candidate"
+    );
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: stale.run_id,
+                workspace_id: ws,
+                project_id: proj,
+                cwd: "/repo/a-different-worktree".into(),
+                agent: AgentKind::Codex,
+                native_session_id: "native-other-worktree".into(),
+                owner_user: Some(alice.clone()),
+            })
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::NoMatch,
+        "a run in another checkout cwd must not be adopted"
+    );
+    assert_eq!(
+        recover(other_proj, Some(alice.clone()), "native-foreign")
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Adopted(foreign.run_id),
+        "the same owner may recover only the candidate in the named project"
+    );
+    assert_eq!(
+        recover(proj, Some(alice.clone()), "native-alice")
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Adopted(current.run_id)
+    );
+    assert_eq!(
+        recover(proj, Some(alice), "native-thief").await.unwrap(),
+        ManagedRunSessionLink::NoMatch,
+        "a linked run cannot be rebound by a racing SessionStart"
+    );
+    let current_status = store
+        .reader
+        .managed_run_status(current.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current_status.native_session_id.as_deref(),
+        Some("native-alice")
+    );
+}
+
+/// Forced lease recovery is deliberately narrower than project write access:
+/// the same operator can recover their own abandoned launcher, while another
+/// operator in the same project cannot evict it. The old run becomes terminal
+/// in the same transaction that creates the replacement.
+#[tokio::test]
+async fn force_unlock_replaces_only_the_same_operators_active_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = operator("alice");
+    let bob = operator("bob");
+    let prepare = |lease_owner: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "repo".into(),
+        worktree_fingerprint: "worktree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::Current,
+        lease_owner: lease_owner.into(),
+    };
+
+    let abandoned = store
+        .writer
+        .prepare_workstream_run_owned(prepare("alice:1"), Some(alice.clone()))
+        .await
+        .unwrap();
+    let refused = store
+        .writer
+        .prepare_workstream_run_owned_with_unlock(prepare("bob:2"), Some(bob), true)
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, StoreError::WorkstreamBusy(_)));
+    assert!(
+        store
+            .writer
+            .heartbeat_managed_run(abandoned.run_id)
+            .await
+            .unwrap(),
+        "a refused cross-owner takeover must leave the original lease active"
+    );
+
+    let replacement = store
+        .writer
+        .prepare_workstream_run_owned_with_unlock(prepare("alice:3"), Some(alice.clone()), true)
+        .await
+        .unwrap();
+    assert_ne!(replacement.run_id, abandoned.run_id);
+    assert!(
+        !store
+            .writer
+            .heartbeat_managed_run(abandoned.run_id)
+            .await
+            .unwrap(),
+        "the replaced run must be terminal"
+    );
+    assert!(
+        store
+            .writer
+            .heartbeat_managed_run(replacement.run_id)
+            .await
+            .unwrap(),
+        "the replacement is the sole live control"
+    );
+
+    let solo = store
+        .writer
+        .prepare_workstream_run_owned(
+            PrepareWorkstreamRun {
+                selection: WorkstreamSelection::New("solo".into()),
+                ..prepare("solo:1")
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let solo_replacement = store
+        .writer
+        .prepare_workstream_run_owned_with_unlock(
+            PrepareWorkstreamRun {
+                selection: WorkstreamSelection::Named("solo".into()),
+                ..prepare("solo:2")
+            },
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_ne!(solo_replacement.run_id, solo.run_id);
+}
+
+/// Two launches in one repository are a real possibility when the operator
+/// uses separate named workstreams. Recovery must refuse to guess between
+/// them, and an active foreign id must not be treated as a stale trigger.
+#[tokio::test]
+async fn stale_codex_run_recovery_fails_closed_on_ambiguity_and_active_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app", None)
+        .await
+        .unwrap();
+    let owner = operator("alice");
+    let prepare = |project_id, name: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id,
+        repo_fingerprint: format!("repo-{project_id}"),
+        worktree_fingerprint: format!("worktree-{project_id}"),
+        cwd: format!("/repo/{project_id}"),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New(name.into()),
+        lease_owner: format!("launcher-{name}"),
+    };
+    let alpha = store
+        .writer
+        .prepare_workstream_run_owned(prepare(proj, "alpha"), Some(owner.clone()))
+        .await
+        .unwrap();
+    let beta = store
+        .writer
+        .prepare_workstream_run_owned(prepare(proj, "beta"), Some(owner.clone()))
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .prepare_workstream_run_owned(prepare(other_proj, "foreign"), Some(owner.clone()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: ai_memory_core::ManagedRunId::new(),
+                workspace_id: ws,
+                project_id: proj,
+                cwd: format!("/repo/{proj}"),
+                agent: AgentKind::Codex,
+                native_session_id: "native-ambiguous".into(),
+                owner_user: Some(owner.clone()),
+            })
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Ambiguous
+    );
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: alpha.run_id,
+                workspace_id: ws,
+                project_id: other_proj,
+                cwd: format!("/repo/{other_proj}"),
+                agent: AgentKind::Codex,
+                native_session_id: "native-cross-project".into(),
+                owner_user: Some(owner.clone()),
+            })
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused,
+        "an active run with a mismatched boundary must not trigger adoption"
+    );
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(LinkOrAdoptManagedRunSession {
+                supplied_run_id: foreign.run_id,
+                workspace_id: ws,
+                project_id: other_proj,
+                cwd: format!("/repo/{other_proj}"),
+                agent: AgentKind::Codex,
+                native_session_id: "native-control".into(),
+                owner_user: Some(owner),
+            })
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(foreign.run_id)
+    );
+    for run_id in [alpha.run_id, beta.run_id] {
+        assert!(
+            store
+                .reader
+                .managed_run_status(run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .is_none()
+        );
+    }
 }

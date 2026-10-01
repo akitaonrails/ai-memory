@@ -12544,6 +12544,8 @@ pub(crate) mod tests {
                 selection: crate::WorkstreamSelection::Current,
                 lease_owner: "test".into(),
             },
+            None,
+            false,
         )
         .unwrap();
 
@@ -14455,6 +14457,8 @@ pub(crate) mod tests {
                 selection: crate::workstream::WorkstreamSelection::Current,
                 lease_owner: "test".to_string(),
             },
+            None,
+            false,
         )
         .expect("opening a managed run should succeed")
     }

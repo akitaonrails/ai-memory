@@ -1,5 +1,8 @@
 # MCP install guide - additional clients
 
+For a custom tool, start with the [programmatic memory guide](programmatic-memory.md).
+It shows direct MCP writes, queries and handoffs without a native hook adapter.
+
 > All snippets below default to `http://127.0.0.1:49374` (local server). For a
 > remote server (homelab, LAN box) substitute the appropriate URL AND add an
 > `Authorization: Bearer <token>` header to the `headers` block when bearer auth
@@ -35,10 +38,14 @@ stdout (or their equivalent context-injection result); Grok and Zero must call
 Capture exclusions are separate from MCP registration. Native hook commands and
 generated OpenCode/OMP/Pi/OpenClaw integrations enforce `[capture]
 ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
-not. Reinstall/refresh an existing hook or plugin to gain it; see
+not. The Linux/macOS Docker wrapper's ordinary `install-hooks` command uses its
+checksum-verified native host client and is covered; this limitation applies to
+manual container/script extraction and explicit compatibility overrides.
+Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop, VS Code Copilot, Zed, and Muse Code are **MCP-only** here:
+Claude Desktop's ordinary Chat surface, VS Code Copilot, Zed, and Muse Code
+are **MCP-only** here:
 they expose long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
@@ -460,9 +467,11 @@ stdio shim. Requires Node.js installed on the same machine.
   `.mcpb` desktop extensions. The ai-memory CLI manages the local
   JSON-config path because it works with localhost/LAN servers and does
   not require publishing an HTTPS connector.
-- Claude Desktop exposes MCP tools but no lifecycle hooks, so automatic
-  prompt/tool capture and session-boundary handoffs are not possible
-  unless Anthropic adds a desktop hook/plugin surface.
+- Claude Desktop's ordinary Chat surface exposes MCP tools but does not run
+  plugin lifecycle hooks, so ai-memory cannot automatically capture its
+  prompts/tools or inject session-boundary handoffs. Cowork is a distinct
+  surface: Anthropic documents that Cowork plugins can run hooks, but ai-memory
+  does not yet ship a Cowork plugin or claim its event/payload semantics.
 - If the MCP indicator doesn't appear after restart, check the logs:
   `~/Library/Logs/Claude/mcp*.log` (macOS). On Windows, check
   `%APPDATA%\Claude\logs\` for an unpackaged install or the corresponding
@@ -477,6 +486,7 @@ stdio shim. Requires Node.js installed on the same machine.
   pass `--config-file` pointed at the `LocalCache` path directly.
 - Sources: <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
   <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>,
+  <https://support.claude.com/en/articles/13837440-use-plugins-in-claude>,
   <https://learn.microsoft.com/en-us/windows/msix/msix-containerization-overview>
 
 ---

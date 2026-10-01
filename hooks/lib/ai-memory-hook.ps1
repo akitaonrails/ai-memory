@@ -42,11 +42,21 @@ function Resolve-AiMemoryCwd {
     return $null
 }
 
+# $HOME (else USERPROFILE) without trailing separators, so the walks can
+# compare it to `Split-Path` output; a root such as `C:\` keeps its own.
+function Get-AiMemoryUserHome {
+    $userHome = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    if (-not $userHome) { return $userHome }
+    $trimmed = $userHome.TrimEnd([char[]]@('/', '\'))
+    if (-not $trimmed -or $trimmed.EndsWith(':')) { return $userHome }
+    return $trimmed
+}
+
 function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
     $dir = $Cwd
-    $userHome = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    $userHome = Get-AiMemoryUserHome
     $boundary = $null
     if ($userHome) {
         $userHomePrefix = $userHome.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
@@ -90,7 +100,7 @@ function Get-AiMemoryMarkerToml {
 function Test-AiMemoryServerRouted {
     param([string] $Cwd)
     $dir = if ($Cwd) { $Cwd } else { (Get-Location).Path }
-    $userHome = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    $userHome = Get-AiMemoryUserHome
     $boundary = $null
     if ($userHome) {
         $userHomePrefix = $userHome.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
