@@ -332,6 +332,15 @@ pub struct RunArgs {
     /// `AI_MEMORY_RUN_AUTOWIRE=false`) to launch without touching harness config.
     #[arg(long)]
     pub no_autowire: bool,
+    /// Skip fetching (and therefore claiming) a pending handoff for this
+    /// launch only, by setting `AI_MEMORY_HANDOFF=off` in the spawned
+    /// harness's environment. Design: #959, option 2 — for a scripted or
+    /// probing launch that should not consume a baton meant for an
+    /// interactive follow-up session. Equivalent to setting the env var
+    /// yourself; does not change `[handoff].claim_on_session_start`, the
+    /// server-wide default.
+    #[arg(long)]
+    pub no_handoff: bool,
     /// Extra environment variable for the spawned harness, `KEY=VALUE`.
     /// Repeatable; wrapper-owned like `--yolo`/`--executable`, so it must
     /// precede `harness`. Reaches the spawned process, ai-memory's own

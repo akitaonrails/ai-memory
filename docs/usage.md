@@ -74,6 +74,16 @@ If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_begin`. Cancelling marks the handoff expired, so the next
 session-start hook will not consume stale context.
 
+### Skipping the handoff for one launch
+
+Set `AI_MEMORY_HANDOFF=off` to skip fetching — and therefore claiming — a
+pending handoff for one hook invocation or managed launch, without changing
+behavior for any other session. Every delivery path honors it: the native
+`ai-memory hook` binary, the POSIX and PowerShell hook bundles, and the
+generated OpenCode/zcode plugin. `ai-memory run --no-handoff` sets it for the
+spawned harness. Useful for a scripted launch or a probe that should not
+consume a baton meant for a specific interactive follow-up session.
+
 ## Compaction recovery
 
 When Claude Code or Codex compact their working context, the

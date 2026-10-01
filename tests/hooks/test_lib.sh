@@ -782,6 +782,31 @@ done
 assert_eq "session-start bundles that fetch the handoff were found" "yes" \
     "$([ "$BRIEF_BUNDLES" -ge 9 ] && printf 'yes' || printf 'no (%s)' "$BRIEF_BUNDLES")"
 
+# --- AI_MEMORY_HANDOFF=off skips the handoff GET entirely (design: #959, option 2) ---
+# Reuses the same real-bundle + fake-curl harness as the briefing checks
+# above, but asserts no `/handoff?` request is sent at all — not merely one
+# missing query param.
+session_start_handoff_get_opted_out() {
+    rm -rf "$TMP/brief-data" "$FAKE_CURL_LOG"
+    printf '{"cwd":"%s","workspacePaths":["%s"],"invocationNum":0,"session_id":"brief-s","conversationId":"brief-s"}' "$2" "$2" \
+        | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+            AI_MEMORY_DATA_DIR="$TMP/brief-data" AI_MEMORY_HOOK_URL='http://memory.test' \
+            AI_MEMORY_HANDOFF=off \
+            sh "$(dirname "$0")/../../hooks/$1/session-start.sh" >/dev/null 2>&1
+    grep '/handoff?' "$FAKE_CURL_LOG" 2>/dev/null || true
+}
+
+OPT_OUT_BUNDLES=0
+for script in "$(dirname "$0")"/../../hooks/*/session-start.sh; do
+    grep -q 'ai_memory_get_handoff' "$script" || continue
+    bundle=$(basename "$(dirname "$script")")
+    OPT_OUT_BUNDLES=$((OPT_OUT_BUNDLES + 1))
+    GET=$(session_start_handoff_get_opted_out "$bundle" "$BRIEF_REPO")
+    assert_eq "$bundle: AI_MEMORY_HANDOFF=off sends no handoff GET" "" "$GET"
+done
+assert_eq "opt-out bundles were found" "yes" \
+    "$([ "$OPT_OUT_BUNDLES" -ge 9 ] && printf 'yes' || printf 'no (%s)' "$OPT_OUT_BUNDLES")"
+
 # The PowerShell bundle builds every session-start handoff GET in one place.
 PS_BRIEF_STATIC=$(grep -Fq 'if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {' hooks/lib/ai-memory-hook.ps1 \
     && awk '/if \(\$Event -eq "session-start" -and -not \$BriefingOncePerSession\)/ {f=1; next}

@@ -4137,6 +4137,9 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
 }}
 
 async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
+  // AI_MEMORY_HANDOFF=off (design: #959, option 2): skip the fetch - and
+  // therefore the claim it would otherwise make - for this one process.
+  if ((process.env.AI_MEMORY_HANDOFF ?? "").toLowerCase() === "off") return undefined;
   if (captureServerRouted(cwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
@@ -4877,6 +4880,9 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
 }}
 
 async function fetchHandoff(cwd: string, id: string | undefined): Promise<string | undefined> {{
+  // AI_MEMORY_HANDOFF=off (design: #959, option 2): skip the fetch - and
+  // therefore the claim it would otherwise make - for this one process.
+  if ((process.env.AI_MEMORY_HANDOFF ?? "").toLowerCase() === "off") return undefined;
   if (captureServerRouted(cwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);

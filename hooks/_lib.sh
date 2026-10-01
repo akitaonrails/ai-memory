@@ -686,8 +686,15 @@ ai_memory_post_hook() {
 # generous than POST because the result is *synchronously* fed to
 # stdout (and prepended to the agent's context), so we want to avoid
 # truncating a handoff that was almost ready.
+#
+# `AI_MEMORY_HANDOFF=off` (design: #959, option 2): skip the GET — and
+# therefore the claim it would otherwise make — for this one process.
+# A scripted launch or probe that does not want to consume a handoff
+# sets this just for itself; every caller already treats empty output
+# the same as "nothing pending", so this needs no caller-side change.
 ai_memory_get_handoff() {
     case "$1" in *"$AI_MEMORY_SERVER_ROUTED_QS"*) return 0 ;; esac
+    case "${AI_MEMORY_HANDOFF:-}" in [Oo][Ff][Ff]) return 0 ;; esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
         curl -s --max-time 1.0 "$1" \

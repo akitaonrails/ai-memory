@@ -388,6 +388,17 @@ fn env_lookup(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// `AI_MEMORY_HANDOFF=off` (design: #959, option 2): skip fetching — and
+/// therefore claiming — a pending handoff for this one hook invocation.
+/// Checked directly per-process rather than threaded through `Config`: this
+/// is a per-execution opt-out a scripted launch or probe sets just for
+/// itself (same shape as `AI_MEMORY_IGNORE_MARKER`), not a server-wide
+/// switch like `[handoff].claim_on_session_start`. Composes with that
+/// setting: an opted-out execution sees no claim and no notice either way.
+fn handoff_fetch_opted_out() -> bool {
+    env_lookup("AI_MEMORY_HANDOFF").is_some_and(|v| v.eq_ignore_ascii_case("off"))
+}
+
 fn managed_run_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
     env_lookup(MANAGED_RUN_ENV)
         .filter(|value| value.parse::<ManagedRunId>().is_ok())
@@ -868,7 +879,7 @@ where
         // consume the handoff server-side (the GET is destructive) and then
         // discard the result — silently losing it. Those agents recover the
         // handoff on demand via the MCP `memory_handoff_accept` tool.
-        if agent_kind.session_start_injects_handoff() {
+        if agent_kind.session_start_injects_handoff() && !handoff_fetch_opted_out() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
@@ -950,8 +961,15 @@ where
             "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}",
             args.agent
         );
-        let handoff =
-            get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await;
+        // `AI_MEMORY_HANDOFF=off` also skips this session's one piggybacked
+        // brief delivery: kimi has no separate request for it (see above),
+        // so there is no way to keep the brief without also making the GET
+        // that would claim the handoff.
+        let handoff = if handoff_fetch_opted_out() {
+            None
+        } else {
+            get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
+        };
         // Mark the session as briefed only AFTER the GET completed — success
         // OR error. Fail-open on purpose: with the server down, repeating
         // the brief-flagged request on every prompt would not deliver
@@ -984,7 +1002,7 @@ where
             canonical_session_id.as_deref(),
             policy_cwd.as_deref(),
         );
-        if !shown.is_file() && !payload_is_subagent(&json) {
+        if !shown.is_file() && !payload_is_subagent(&json) && !handoff_fetch_opted_out() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id

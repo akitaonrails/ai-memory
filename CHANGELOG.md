@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `AI_MEMORY_HANDOFF=off`, a per-execution opt-out that skips fetching
+  (and therefore claiming) a pending handoff for one hook invocation or
+  managed launch: the native `ai-memory hook` path, the POSIX and PowerShell
+  hook bundles, and the generated OpenCode/zcode TypeScript `fetchHandoff`
+  call sites all honor it. `ai-memory run --no-handoff` sets it for the
+  spawned harness. For a scripted launch or probe that should not consume a
+  baton meant for a specific interactive follow-up session (design: #959,
+  option 2).
+
 ## [2.5.2] - 2026-10-01
 
 ### Added

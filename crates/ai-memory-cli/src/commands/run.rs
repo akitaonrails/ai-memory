@@ -565,6 +565,12 @@ pub(super) async fn run_from_with_wiring(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    // `--no-handoff` (design: #959, option 2): same fixed-plumbing precedence
+    // as the env vars above, so it wins over a caller `--env
+    // AI_MEMORY_HANDOFF=...` collision too.
+    if args.no_handoff {
+        command.env("AI_MEMORY_HANDOFF", "off");
+    }
     // A blank home override is unset for session import, auto-wire and the
     // Crush context config; drop it from the child as well, or the harness
     // would read a blank-named directory under the checkout that nothing else
@@ -4130,6 +4136,7 @@ mod tests {
             no_jail: false,
             fresh: false,
             no_autowire: true,
+            no_handoff: false,
             env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/from/cli".to_string())],
             env_file: Some(env_file.clone()),
             harness: Some(RunHarnessChoice::Claude),
@@ -4618,6 +4625,7 @@ mod tests {
             no_jail: false,
             fresh: false,
             no_autowire: false,
+            no_handoff: false,
             env: Vec::new(),
             env_file: None,
             harness: Some(RunHarnessChoice::Claude),
@@ -4773,6 +4781,7 @@ mod tests {
             no_jail: false,
             fresh: false,
             no_autowire: false,
+            no_handoff: false,
             env,
             env_file: None,
             harness: Some(harness),

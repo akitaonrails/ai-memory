@@ -518,6 +518,16 @@ function Invoke-AiMemoryHook {
         Clear-AiMemorySessionId -Agent $Agent
     }
 
+    if ($FetchHandoff -and $env:AI_MEMORY_HANDOFF -and $env:AI_MEMORY_HANDOFF.ToLowerInvariant() -eq "off") {
+        # (design: #959, option 2) Skip the GET - and therefore the claim it
+        # would otherwise make - for this one process. Mirrors what an empty
+        # handoff response already does for each mode, so no other branch
+        # needs to change.
+        if ($AntigravityPreInvocationOutput -or $GrokPostTool) {
+            [Console]::Out.Write("{}")
+        }
+        return
+    }
     if ($FetchHandoff) {
         $NativeSessionQS = ""
         $NativeSessionId = $null
