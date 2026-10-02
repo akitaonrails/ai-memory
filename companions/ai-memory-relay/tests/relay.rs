@@ -7,7 +7,7 @@
 //! Scripted HTTP responses cover partial acknowledgements and delivery errors.
 //! The real-server test in tests/e2e/external_relay_smoke.py checks persistence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -129,17 +129,38 @@ impl Stub {
 }
 
 fn stub(replies: Vec<Reply>) -> Stub {
+    stub_with_identity(replies, vec![])
+}
+
+fn stub_with_identity(replies: Vec<Reply>, identities: Vec<Reply>) -> Stub {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let heads = Arc::new(Mutex::new(Vec::new()));
     let (b, h) = (Arc::clone(&bodies), Arc::clone(&heads));
     thread::spawn(move || {
+        let mut identities = identities.into_iter();
         for reply in replies {
-            let Ok((mut socket, _)) = listener.accept() else {
-                return;
+            let (mut socket, head, body) = loop {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return;
+                };
+                let (head, body) = read_request(&mut socket);
+                if head.starts_with("GET /identity ") {
+                    match identities.next().unwrap_or(Reply::Json(404, "{}".into())) {
+                        Reply::Json(status, payload) => respond(&mut socket, status, &payload),
+                        Reply::Redirect(location) => {
+                            let _ = write!(
+                                socket,
+                                "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            );
+                        }
+                        _ => panic!("unsupported identity fixture"),
+                    }
+                    continue;
+                }
+                break (socket, head, body);
             };
-            let (head, body) = read_request(&mut socket);
             h.lock().unwrap().push(head);
             let mut items = 0usize;
             if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
@@ -234,6 +255,210 @@ fn query_of(url: &str) -> HashMap<String, String> {
 
 fn flush(dir: &Path) -> ai_memory_relay::relay::Report {
     relay::flush(dir, &FlushOptions::default()).unwrap()
+}
+
+fn catalog(implemented: bool, enabled: bool, max_items: usize) -> Reply {
+    Reply::Json(
+        200,
+        serde_json::json!({
+            "operator": "must-not-appear-in-diagnostics",
+            "capabilities": {"schema_version": 1, "hook_batch": {
+                "implemented": implemented, "enabled": enabled, "max_items": max_items,
+            }},
+        })
+        .to_string(),
+    )
+}
+
+fn enqueue_three(dir: &Path, root: &Path) {
+    enqueue(
+        dir,
+        root,
+        "in.json",
+        serde_json::json!([
+            event("e-1", "codex", "session-start", "s-1"),
+            event("e-2", "codex", "session-start", "s-2"),
+            event("e-3", "codex", "session-start", "s-3"),
+        ]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn capability_catalog_negotiates_the_active_batch_limit() {
+    let root = fixture("catalog-limit");
+    let server = stub_with_identity(
+        vec![Reply::AcceptAll, Reply::AcceptAll, Reply::AcceptAll],
+        vec![catalog(true, true, 1)],
+    );
+    let dir = bind(&root, &server.url());
+    enqueue_three(&dir, &root);
+    let report = flush(&dir);
+    assert_eq!(report.exit_code(), 0, "{report:?}");
+    assert_eq!(
+        server
+            .bodies()
+            .iter()
+            .map(|b| b.as_array().unwrap().len())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1]
+    );
+    assert_eq!(pending_count(&dir), 0);
+    let delivered: Vec<_> = server.sent_event_ids().into_iter().flatten().collect();
+    let expected: Vec<_> = (1..=3)
+        .map(|i| {
+            valid(
+                &format!("e-{i}"),
+                "codex",
+                "session-start",
+                &format!("s-{i}"),
+            )
+            .ingest_key
+        })
+        .collect();
+    assert_eq!(delivered, expected);
+    assert_eq!(delivered.iter().collect::<HashSet<_>>().len(), 3);
+    assert!(!format!("{report:?}").contains("must-not-appear"));
+}
+
+#[test]
+fn capability_catalog_disabled_or_malformed_keeps_events_unsent() {
+    for identity in [
+        catalog(true, false, 256),
+        catalog(false, true, 256),
+        catalog(true, true, 0),
+        Reply::Json(
+            200,
+            r#"{"capabilities":{"schema_version":1,"hook_batch":"secret-server-value"}}"#.into(),
+        ),
+    ] {
+        let root = fixture("catalog-refusal");
+        let server = stub_with_identity(vec![Reply::AcceptAll], vec![identity]);
+        let dir = bind(&root, &server.url());
+        enqueue_three(&dir, &root);
+        let error = relay::flush(&dir, &FlushOptions::default()).unwrap_err();
+        assert!(!error.to_string().contains("secret-server-value"));
+        assert_eq!(pending_count(&dir), 3);
+        assert!(server.bodies().is_empty());
+    }
+}
+
+#[test]
+fn capability_catalog_old_servers_and_unknown_schema_use_bounded_fallback() {
+    for identity in [
+        Reply::Json(404, "{}".into()),
+        Reply::Json(200, r#"{"version":"old"}"#.into()),
+        Reply::Json(200, r#"{"capabilities":null}"#.into()),
+        Reply::Json(
+            200,
+            r#"{"capabilities":{"schema_version":99,"hook_batch":"unknown"}}"#.into(),
+        ),
+    ] {
+        let root = fixture("catalog-fallback");
+        let server = stub_with_identity(vec![Reply::AcceptAll], vec![identity]);
+        let dir = bind(&root, &server.url());
+        enqueue_three(&dir, &root);
+        assert_eq!(flush(&dir).exit_code(), 0);
+        assert_eq!(server.bodies()[0].as_array().unwrap().len(), 3);
+    }
+}
+
+#[test]
+fn capability_catalog_cannot_raise_the_local_batch_ceiling() {
+    let root = fixture("catalog-ceiling");
+    let server = stub_with_identity(
+        vec![Reply::AcceptAll, Reply::AcceptAll],
+        vec![catalog(true, true, 10000)],
+    );
+    let dir = bind(&root, &server.url());
+    let events: Vec<_> = (0..257)
+        .map(|i| {
+            event(
+                &format!("e-{i}"),
+                "codex",
+                "session-start",
+                &format!("s-{i}"),
+            )
+        })
+        .collect();
+    enqueue(&dir, &root, "in.json", serde_json::json!(events)).unwrap();
+    assert_eq!(flush(&dir).exit_code(), 0);
+    assert_eq!(
+        server
+            .bodies()
+            .iter()
+            .map(|b| b.as_array().unwrap().len())
+            .collect::<Vec<_>>(),
+        vec![256, 1]
+    );
+}
+
+#[test]
+fn capability_catalog_redirect_and_oversized_response_are_refused() {
+    let elsewhere = TcpListener::bind("127.0.0.1:0").unwrap();
+    elsewhere.set_nonblocking(true).unwrap();
+    for identity in [
+        Reply::Redirect(format!(
+            "http://{}/identity",
+            elsewhere.local_addr().unwrap()
+        )),
+        Reply::Json(200, "x".repeat(ai_memory_relay::http::MAX_ACK_BYTES + 1)),
+    ] {
+        let root = fixture("catalog-network-refusal");
+        let server = stub_with_identity(vec![Reply::AcceptAll], vec![identity]);
+        let dir = bind(&root, &server.url());
+        enqueue_three(&dir, &root);
+        assert!(relay::flush(&dir, &FlushOptions::default()).is_err());
+        assert_eq!(pending_count(&dir), 3);
+        assert!(server.bodies().is_empty());
+    }
+    assert!(
+        elsewhere.accept().is_err(),
+        "identity redirect was followed"
+    );
+}
+
+#[test]
+fn capability_catalog_never_authorizes_delivery_or_survives_revocation() {
+    let root = fixture("catalog-revocation");
+    let server = stub_with_identity(
+        vec![Reply::AcceptAll, Reply::AcceptAll],
+        vec![
+            catalog(true, true, 1),
+            Reply::Json(401, "secret-response".into()),
+        ],
+    );
+    let dir = bind(&root, &server.url());
+    enqueue(
+        &dir,
+        &root,
+        "first.json",
+        serde_json::json!([event("e-1", "codex", "session-start", "s-1")]),
+    )
+    .unwrap();
+    assert_eq!(flush(&dir).exit_code(), 0);
+    enqueue(
+        &dir,
+        &root,
+        "second.json",
+        serde_json::json!([event("e-2", "codex", "session-start", "s-2")]),
+    )
+    .unwrap();
+    let error = relay::flush(&dir, &FlushOptions::default()).unwrap_err();
+    assert!(!error.to_string().contains("secret-response"));
+    assert_eq!(pending_count(&dir), 1);
+    assert_eq!(server.bodies().len(), 1);
+
+    let root = fixture("catalog-post-revocation");
+    let server = stub_with_identity(
+        vec![Reply::Json(401, r#"{"accepted":3}"#.into())],
+        vec![catalog(true, true, 256)],
+    );
+    let dir = bind(&root, &server.url());
+    enqueue_three(&dir, &root);
+    let report = flush(&dir);
+    assert!(report.failure.is_some());
+    assert_eq!(pending_count(&dir), 3);
 }
 
 // ------------------------------------------------------------- ack contract

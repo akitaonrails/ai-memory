@@ -70,16 +70,34 @@ that path immediately. See [`docs/users.md`](users.md) for bootstrap, password
 rotation, recovery, roles, session expiry, and API-key lifecycle.
 
 Machine clients can call `GET /identity` with their bearer key, even when the
-web UI is disabled. It reports only the authenticated caller and server version:
+web UI is disabled. It reports the authenticated caller, server version and an
+optional capability catalog:
+
+Example for the version in development (`version` below is descriptive; the
+server returns its actual package version):
 
 ```json
-{"version":"2.5.2","level":"user","operator":"user:alice","distinguishes_operators":true}
+{"version":"development build","level":"user","operator":"user:alice","distinguishes_operators":true,"capabilities":{"schema_version":1,"hook_batch":{"implemented":true,"enabled":true,"max_items":256}}}
 ```
 
 `level` is `root`, `user` or `anonymous`; `operator` is the qualified identity
 key, or `null` on an unauthenticated single-user server. Web-session cookies
 cannot authenticate this route. Its response uses `Cache-Control: private,
 no-store`. See [users.md](users.md) for machine keys and identity types.
+
+The initial catalog covers `POST /hook/batch`. `schema_version: 1` identifies
+this catalog format; the existing `version` identifies the server release.
+`implemented` describes shipped support, while `enabled` describes server
+availability. Both are true for this always-mounted endpoint, including on a
+zero-LLM server. `max_items` is the enforced per-request item ceiling. Capture
+policy can still drop individual events.
+
+Capability metadata contains no actors, credentials or scope grants. Each
+request still passes authentication and scope authorization; a catalog read
+before key revocation grants no subsequent access. Clients must accept an absent
+or null `capabilities` field from an older server, ignore unknown catalog schema
+versions and unknown fields, and retain their bounded legacy behavior. A known
+schema with an unavailable feature or malformed required fields must refuse use.
 
 ## 3. Error model
 

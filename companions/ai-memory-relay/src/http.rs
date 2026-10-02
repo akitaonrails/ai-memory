@@ -1,4 +1,4 @@
-//! The only network surface: `POST <server>/hook/batch`.
+//! Machine capability discovery and `POST <server>/hook/batch` delivery.
 //!
 //! Per-item URLs are always constructed here from the bound destination and the
 //! queue's own fields. An input file can never steer a request anywhere.
@@ -10,6 +10,47 @@ use anyhow::{Context, Result, bail};
 use url::Url;
 
 use crate::queue::{Binding, PendingItem};
+
+#[derive(serde::Deserialize)]
+struct Catalog {
+    hook_batch: HookBatch,
+}
+
+#[derive(serde::Deserialize)]
+struct HookBatch {
+    implemented: bool,
+    enabled: bool,
+    max_items: usize,
+}
+
+fn catalog_batch_limit(body: &[u8]) -> Result<usize> {
+    let identity: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| anyhow::anyhow!("identity response is not valid JSON"))?;
+    if !identity.is_object() {
+        bail!("identity response is not an object");
+    }
+    let Some(catalog) = identity
+        .get("capabilities")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(crate::identity::MAX_BATCH_ITEMS);
+    };
+    if catalog.get("schema_version").and_then(|v| v.as_u64()) != Some(1) {
+        return Ok(crate::identity::MAX_BATCH_ITEMS);
+    }
+    let catalog: Catalog = serde_json::from_value(catalog.clone())
+        .map_err(|_| anyhow::anyhow!("invalid capability catalog schema 1"))?;
+    if !catalog.hook_batch.implemented || !catalog.hook_batch.enabled {
+        bail!("server hook_batch capability is unavailable; events stay pending");
+    }
+    if catalog.hook_batch.max_items == 0 {
+        bail!("server hook_batch max_items must be positive");
+    }
+    Ok(catalog
+        .hook_batch
+        .max_items
+        .min(crate::identity::MAX_BATCH_ITEMS))
+}
 
 /// Bearer material. Never stored on disk, never printed, never in a Debug line.
 pub struct Token(String);
@@ -149,6 +190,37 @@ impl Sender {
             base,
             token,
         })
+    }
+
+    /// Negotiate each flush afresh. The catalog describes support, never grants.
+    /// Old servers and unknown catalog schemas retain the local batch ceiling.
+    pub fn batch_limit(&self) -> Result<usize> {
+        let mut request = self
+            .client
+            .get(format!("{}/identity", self.base))
+            .timeout(Duration::from_secs(10));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token.expose());
+        }
+        let response = request
+            .send()
+            .map_err(|e| anyhow::anyhow!("identity transport failure: {}", transport_class(&e)))?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(crate::identity::MAX_BATCH_ITEMS);
+        }
+        if status != 200 {
+            bail!("HTTP {status} from /identity; events stay pending");
+        }
+        let mut body = Vec::new();
+        response
+            .take(MAX_ACK_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| anyhow::anyhow!("identity response read failure"))?;
+        if body.len() > MAX_ACK_BYTES {
+            bail!("identity response exceeded {MAX_ACK_BYTES} bytes");
+        }
+        catalog_batch_limit(&body)
     }
 
     /// POST one batch under an explicit timeout.

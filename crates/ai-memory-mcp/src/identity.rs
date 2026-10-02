@@ -36,6 +36,21 @@ struct IdentityResponse {
     level: &'static str,
     operator: Option<String>,
     distinguishes_operators: bool,
+    capabilities: Option<CapabilityCatalog>,
+}
+
+/// Support metadata only: auth and scope policy are checked on every request.
+#[derive(Serialize)]
+struct CapabilityCatalog {
+    schema_version: u32,
+    hook_batch: HookBatchCapability,
+}
+
+#[derive(Serialize)]
+struct HookBatchCapability {
+    implemented: bool,
+    enabled: bool,
+    max_items: usize,
 }
 
 async fn identity(
@@ -60,6 +75,14 @@ async fn identity(
         },
         operator: actor.identity_key().map(|key| key.storage_key()),
         distinguishes_operators,
+        capabilities: Some(CapabilityCatalog {
+            schema_version: 1,
+            hook_batch: HookBatchCapability {
+                implemented: true,
+                enabled: true,
+                max_items: ai_memory_hooks::router::MAX_HOOK_BATCH_ITEMS,
+            },
+        }),
     };
     Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(body)).into_response())
 }
@@ -150,7 +173,18 @@ mod tests {
                 ai_memory_core::IdentityKey::User(name.into()).storage_key()
             );
             assert_eq!(body["distinguishes_operators"], true);
-            assert_eq!(body.as_object().unwrap().len(), 4);
+            assert_eq!(body.as_object().unwrap().len(), 5);
+            assert_eq!(
+                body["capabilities"],
+                serde_json::json!({
+                    "schema_version": 1,
+                    "hook_batch": {
+                        "implemented": true,
+                        "enabled": true,
+                        "max_items": ai_memory_hooks::router::MAX_HOOK_BATCH_ITEMS,
+                    },
+                })
+            );
         }
         assert_eq!(
             ask(app.clone(), None).await.status(),
@@ -169,6 +203,45 @@ mod tests {
             ask(app, Some(&credentials[0].1)).await.status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_requires_authentication_after_a_successful_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let app = router(store.reader.clone(), false).layer(axum::middleware::from_fn_with_state(
+            Arc::new(AuthState::new(Some("catalog-test-token".into()))),
+            require_bearer,
+        ));
+        let response = ask(app.clone(), Some("catalog-test-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let identity: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(identity["capabilities"]["hook_batch"]["enabled"], true);
+        for token in [None, Some("invalid-token")] {
+            let mut request = Request::builder()
+                .uri("/identity")
+                .header("x-memory-actor-user", "root");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(
+                !bytes
+                    .windows(b"capabilities".len())
+                    .any(|w| w == b"capabilities")
+            );
+        }
     }
 
     #[tokio::test]

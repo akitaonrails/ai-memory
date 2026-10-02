@@ -13,6 +13,7 @@ description = "MCP server transport and tool router for ai-memory."
 
 [dependencies]
 ai-memory-core.workspace = true
+ai-memory-hooks.workspace = true
 ai-memory-consolidate.workspace = true
 ai-memory-llm.workspace = true
 ai-memory-store.workspace = true
@@ -46,7 +47,6 @@ jiff.workspace = true
 
 [dev-dependencies]
 ai-memory-core.workspace = true
-ai-memory-hooks.workspace = true
 ai-memory-store.workspace = true
 ai-memory-wiki.workspace = true
 async-trait.workspace = true

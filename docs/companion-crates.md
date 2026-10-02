@@ -91,6 +91,10 @@ The orchestrator still maps its events to the native harness payloads and sets
 session identity and derives retry keys from the producer's stable event IDs.
 Only the first pending event for each session enters a batch; that session
 advances after acknowledgement, even when other sessions are rate-limited.
+Each flush reads the optional `/identity` capability catalog and reduces its
+batch size to the advertised item limit, capped by the relay's own ceiling.
+Servers without the catalog and unknown schema versions keep the bounded legacy
+path. Authentication and scope checks still apply to every delivered batch.
 
 The package has its own workspace, tests and CLI. Its README defines queue limits,
 local data handling and recovery, with an executable test against the real

@@ -280,6 +280,12 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
     let sender = Sender::new(binding.server_url.clone(), token, CONNECT_TIMEOUT)?;
 
     let started = Instant::now();
+    let batch_limit = if options.max_batches > 0 && queue.stats(crate::now_ms())?.pending_items > 0
+    {
+        sender.batch_limit()?
+    } else {
+        MAX_BATCH_ITEMS
+    };
     let mut deferred: HashSet<(String, String)> = HashSet::new();
     let mut delivered = 0usize;
     let mut outcomes = ack::outcome_counts();
@@ -298,7 +304,7 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
         let base = binding.server_url.clone();
         let for_cost = binding.clone();
         let batch: Batch =
-            queue.select_batch(MAX_BATCH_ITEMS, MAX_BATCH_BYTES, now, &deferred, |item| {
+            queue.select_batch(batch_limit, MAX_BATCH_BYTES, now, &deferred, |item| {
                 item_cost(&base, &for_cost, item)
             })?;
         blocked_sessions = batch.blocked_sessions;
@@ -460,6 +466,7 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
         "acknowledged {delivered} event(s) in {batches} batch(es); {} still pending across {} session(s)",
         stats.pending_items, stats.pending_sessions
     )];
+    summary.push(format!("batch_items_limit: {batch_limit}"));
     summary.push(format!(
         "acknowledged_outcomes: {}",
         serde_json::to_string(&outcomes)?

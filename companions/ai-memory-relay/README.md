@@ -109,6 +109,27 @@ queue's committed enqueue order; producers must serialize events within a
 session before enqueueing them. Separate queue directories do not coordinate
 session order.
 
+Each flush first reads `GET /identity` using the same bearer key and disabled
+redirects as delivery. For capability catalog schema 1, `hook_batch` must be
+implemented and enabled; its positive `max_items` reduces the batch ceiling,
+never raises the relay's 256-item bound. The report includes `batch_items_limit`.
+The 8 MiB wire budget remains in force. This discovery request has a ten-second
+timeout and reads at most 64 KiB, with no response body or operator identity in
+diagnostics.
+
+HTTP 404, an absent or null `capabilities` field, and unknown catalog schema
+versions use the bounded legacy batch behavior. A malformed known schema,
+disabled feature, redirect, transport error or other HTTP status stops delivery
+and leaves events pending. Catalogs are neither persisted nor reused between
+flushes. Every POST still authenticates independently, so revocation after
+discovery also retains the unacknowledged batch.
+
+The server's `/identity` URL must be reachable; a legacy HTTP 404 uses the
+fallback above. Discovery HTTP 429, 403, 405 or a transport failure stops that
+flush and leaves events pending. Retry a later flush after resolving reachability,
+credentials or backpressure. HTTP 401 and 403 never trigger fallback. Discovery
+has no automatic retry; each subsequent flush makes a fresh discovery request.
+
 One process can flush a queue at a time. Other processes can enqueue during a
 flush. HTTP runs outside the SQLite write transaction. If a response is lost
 after the server commits, the event stays pending and a retry uses the same key.

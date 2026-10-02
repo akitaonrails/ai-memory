@@ -286,6 +286,10 @@ web UI. `ai-memory doctor` uses it to show caller identity and capture ownership
 its per-agent counts flag sessions with multiple capture sources (native events
 or distinct extensions, including backfill).
 The mixed-source count is computed in the same scoped, owner-filtered SQL query.
+Its optional versioned capability catalog advertises hook-batch availability
+and the enforced item limit. The relay negotiates that limit per flush; all
+requests retain the existing auth and scope checks. See
+[machine identity](frontend-api.md#2-auth-model) for the wire contract.
 
 Lifecycle bodies have content limits independent of the 10 MiB HTTP request
 limit. User prompts and post-compaction summaries are capped UTF-8-safely at
