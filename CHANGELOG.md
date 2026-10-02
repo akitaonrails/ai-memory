@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed `drop_subagent_captures` discarding entire top-level Claude Code
+  sessions launched with `--agent`. An `agent_type` alone no longer marks a
+  session as a subagent; `agent_id` and Grok's `subagentType` still do, so
+  actual subagent filtering remains enabled. (#1041)
 - Fixed interrupted launchers blocking an immediate managed-workstream restart
   by adding explicit `ai-memory run --force-unlock` recovery. The server
   atomically expires and replaces only a lease attributed to the same

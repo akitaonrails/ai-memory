@@ -167,9 +167,12 @@ for instructions the agent is expected to obey every turn.
 `drop_subagent_captures` accepts a truthy string (`"true"` / `"1"` /
 `"yes"` / `"on"`); any other value, or its absence, leaves this project's
 subagent captures stored as usual. Top-level (non-subagent) sessions are
-always stored regardless. This is per-project on purpose: there is no
-server-global switch, so opting one noisy project in never sheds subagent
-captures for the others on a shared instance.
+always stored regardless, including Claude Code sessions launched with
+`--agent`: `agent_type` alone describes the selected agent, while a non-empty
+`agent_id` identifies a subagent. Grok's `subagentType` marker still identifies
+subagent captures. This is per-project on purpose: there is no server-global
+switch, so opting one noisy project in never sheds subagent captures for the
+others on a shared instance.
 
 ## Allowlist mode: the marker as an opt-in
 
