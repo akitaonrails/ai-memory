@@ -51,7 +51,7 @@ class SmokeFailure(RuntimeError):
 
 
 class DropFirstResponseProxy:
-    """Forward requests to the real server and drop responses until released."""
+    """Forward requests and drop hook-batch POST responses until released."""
 
     def __init__(self, target_port: int, timeout_seconds: float) -> None:
         self.target_port = target_port
@@ -63,7 +63,13 @@ class DropFirstResponseProxy:
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
+            def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                self._forward("GET")
+
             def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+                self._forward("POST")
+
+            def _forward(self, method: str) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length)
                 headers = {
@@ -77,11 +83,15 @@ class DropFirstResponseProxy:
                     timeout=proxy.timeout_seconds,
                 )
                 try:
-                    upstream.request("POST", self.path, body=body, headers=headers)
+                    upstream.request(method, self.path, body=body, headers=headers)
                     response = upstream.getresponse()
                     response_body = response.read()
                     with proxy.mode_lock:
-                        drop = proxy.drop_responses
+                        drop = (
+                            proxy.drop_responses
+                            and method == "POST"
+                            and self.path == "/hook/batch"
+                        )
                     if drop:
                         self.connection.shutdown(socket.SHUT_RDWR)
                         self.connection.close()
