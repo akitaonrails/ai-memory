@@ -715,6 +715,7 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
     matches!(
         agent,
         AgentKind::ClaudeCode
+            | AgentKind::CopilotCli
             | AgentKind::CommandCode
             | AgentKind::Codex
             | AgentKind::OpenCode
@@ -799,6 +800,15 @@ fn safe_tool_body(
                 // Codex's native schema has one top-level JSON response.
                 // Do not promote unrelated aliases or nested payloads to output.
                 raw.get("tool_response").and_then(value_to_text)
+            } else if agent == AgentKind::CopilotCli {
+                // Copilot CLI's PostToolUse payload keeps the text result in a
+                // documented nested field. Do not serialise tool_result as a
+                // whole because future result variants can carry opaque data.
+                raw.pointer("/tool_result/text_result_for_llm")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| extract_content(raw, &["error"]))
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -2387,6 +2397,43 @@ mod tests {
         assert!(
             body.contains("MARKER_GROK_931"),
             "grok tool_response should be serialized into the body: {body:?}"
+        );
+    }
+
+    /// GitHub Copilot CLI documents tool payloads with VS Code-compatible
+    /// snake-case fields. Capture only `text_result_for_llm`: `tool_input`
+    /// is sensitive execution input and future `tool_result` variants may be
+    /// opaque rather than text.
+    #[test]
+    fn copilot_cli_post_tool_uses_documented_result_text_without_input() {
+        let q = HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("copilot-cli".into()),
+            ..Default::default()
+        };
+        let env = HookEnvelope::from_query_and_body(
+            q,
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "copilot-session",
+                "cwd": "/tmp/proj",
+                "tool_name": "Bash",
+                "tool_input": {"command": "PRIVATE_COMMAND_MUST_NOT_APPEAR"},
+                "tool_result": {
+                    "result_type": "success",
+                    "text_result_for_llm": "COPILOT_RESULT_1040"
+                }
+            }),
+        );
+        assert_eq!(env.agent, AgentKind::CopilotCli);
+        assert_eq!(env.event, HookEvent::PostToolUse);
+        let body = env.body_excerpt.expect("Copilot post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(body.contains("COPILOT_RESULT_1040"), "{body:?}");
+        assert!(
+            !body.contains("PRIVATE_COMMAND_MUST_NOT_APPEAR"),
+            "tool input must not be copied into the durable body: {body:?}"
         );
     }
 

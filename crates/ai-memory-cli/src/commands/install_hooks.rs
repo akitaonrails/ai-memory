@@ -33,8 +33,8 @@ use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
     POOL_EVENTS, build_antigravity_payload_with_data_dir, build_claude_code_payload_with_data_dir,
-    build_devin_payload_with_data_dir, build_grok_payload_with_data_dir,
-    build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
+    build_copilot_cli_hooks_config, build_devin_payload_with_data_dir,
+    build_grok_payload_with_data_dir, build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
     build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
     kimi_code_hook_commands, local_hook_policy_v1_supported, ts_capture_policy_v1,
@@ -346,6 +346,57 @@ pub(crate) fn grok_hooks_path() -> anyhow::Result<std::path::PathBuf> {
     grok_hooks_path_in(std::env::var_os("GROK_HOME"))
 }
 
+/// `$COPILOT_HOME/hooks/ai-memory.json` when set, else
+/// `~/.copilot/hooks/ai-memory.json`. Copilot CLI loads every JSON file in
+/// that directory, so ai-memory owns a dedicated file rather than changing a
+/// user-maintained one.
+pub(crate) fn copilot_cli_hooks_path() -> anyhow::Result<std::path::PathBuf> {
+    copilot_cli_hooks_path_in(std::env::var_os("COPILOT_HOME"))
+}
+
+/// [`copilot_cli_hooks_path`] with the environment value passed in so tests
+/// can cover relocation without mutating process state.
+fn copilot_cli_hooks_path_in(
+    env_override: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir.join("hooks").join("ai-memory.json"));
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.copilot/hooks/ai-memory.json")?
+        .join(".copilot")
+        .join("hooks")
+        .join("ai-memory.json"))
+}
+
+/// The GitHub Copilot CLI repository hook file for a command launched in
+/// `cwd`. Copilot only loads `.github/hooks/*.json` from the repository root,
+/// and linked worktrees must use their own checkout root rather than the main
+/// worktree's root.
+pub(crate) fn copilot_cli_project_hooks_path(cwd: &Path) -> Result<PathBuf> {
+    let root = ai_memory_consolidate::discover_repo_root(cwd).context(
+        "could not find a git repository for the project-scoped GitHub Copilot CLI hooks",
+    )?;
+    Ok(root.join(".github").join("hooks").join("ai-memory.json"))
+}
+
+/// The Copilot CLI config file this invocation renders for or writes. An
+/// explicit `--config-file` wins; project scope targets the active checkout.
+pub(crate) fn copilot_cli_hooks_target(args: &InstallHooksArgs) -> Result<PathBuf> {
+    if let Some(path) = &args.config_file {
+        return Ok(path.clone());
+    }
+    match args.scope {
+        HookInstallScope::Global => copilot_cli_hooks_path(),
+        HookInstallScope::Project => {
+            let cwd = std::env::current_dir().context(
+                "could not resolve current directory for project-scoped GitHub Copilot CLI hooks",
+            )?;
+            copilot_cli_project_hooks_path(&cwd)
+        }
+    }
+}
+
 /// [`grok_hooks_path`] with the `GROK_HOME` value passed in.
 fn grok_hooks_path_in(
     env_override: Option<std::ffi::OsString>,
@@ -527,9 +578,15 @@ fn kiro_cli_home_join(
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
 pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
-    if args.scope == HookInstallScope::Project && args.agent != AgentChoice::ClaudeCode {
+    if args.scope == HookInstallScope::Project
+        && !matches!(
+            args.agent,
+            AgentChoice::ClaudeCode | AgentChoice::CopilotCli
+        )
+    {
         anyhow::bail!(
-            "`--scope project` is only supported for `--agent claude-code`; ai-memory writes no \
+            "`--scope project` is only supported for `--agent claude-code` and \
+             `--agent copilot-cli`; ai-memory writes no \
              project-local hook file for {}",
             args.agent.kind().as_str()
         );
@@ -573,7 +630,7 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             Err(e) if args.scope == HookInstallScope::Project => {
                 return Err(anyhow::Error::new(e).context(format!(
                     "could not persist the hook auth token under {}; refusing to embed it in the \
-                     project-local .claude/settings.local.json instead. Install with a writable \
+                     project-local hook configuration instead. Install with a writable \
                      host data dir (e.g. `AI_MEMORY_DATA_DIR=$HOME/.local/share/ai-memory` for \
                      the docker wrapper) or a native `ai-memory` binary, or use `--scope global`",
                     config.data_dir.display()
@@ -766,6 +823,9 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::CopilotCli => {
+                apply_to_copilot_cli_hooks(&server_url, auth, &config.data_dir, &args)
+            }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Hermes => {
@@ -919,6 +979,9 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
             render_grok(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+        }
+        AgentChoice::CopilotCli => {
+            render_copilot_cli(&server_url, auth, &config.data_dir, strategy, &args)
         }
         AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Zcode => render_zcode(&server_url, auth, &config.data_dir, strategy),
@@ -1128,6 +1191,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
                 .join(openclaw_plugin::ENTRYPOINT_TS),
             AgentChoice::AntigravityCli => antigravity_hooks_path().ok()?,
             AgentChoice::Grok => grok_hooks_path().ok()?,
+            AgentChoice::CopilotCli => copilot_cli_hooks_target(args).ok()?,
             AgentChoice::Zero => zero_hooks_path().ok()?,
             AgentChoice::Zcode => zcode_config_path().ok()?,
             // Hermes' hook config is `~/.hermes/config.yaml`, which ai-memory
@@ -1215,7 +1279,7 @@ fn baked_project_strategy(agent: AgentChoice, existing: &str) -> Option<ProjectS
 }
 
 fn project_strategy_from_json(value: &serde_json::Value) -> Option<ProjectStrategyArg> {
-    if is_ai_memory_hook_entry(value) {
+    if is_ai_memory_hook_entry(value) || is_ai_memory_copilot_cli_hook_entry(value) {
         if let Some(strategy) = value
             .get("command")
             .and_then(|command| command.as_str())
@@ -1532,6 +1596,9 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::AntigravityCli => Some(McpClient::AntigravityCli),
         AgentChoice::Zero => Some(McpClient::Zero),
         AgentChoice::Grok => Some(McpClient::Grok),
+        // GitHub Copilot CLI lifecycle hooks are phase 1 of #1040. Its MCP
+        // registration follows separately, so there is no config to infer.
+        AgentChoice::CopilotCli => None,
         AgentChoice::Devin => Some(McpClient::Devin),
         AgentChoice::KimiCode => Some(McpClient::KimiCode),
         // Pi bridges MCP through its generated extension, not a native
@@ -2063,6 +2130,101 @@ fn apply_to_grok_settings(
                 .context("`hooks` is present in ai-memory.json but not an object")?;
             for (event, value) in &our_hooks {
                 overlay_event_hooks(hooks, event, value);
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    Ok(())
+}
+
+/// True when a GitHub Copilot CLI `exec` handler is one ai-memory installed.
+/// The executable name alone is insufficient: a user can legitimately have an
+/// unrelated helper named `ai-memory-*`, so ownership also requires the full
+/// native hook argv signature and the Copilot-specific agent kind.
+pub(crate) fn is_ai_memory_copilot_cli_hook_entry(entry: &serde_json::Value) -> bool {
+    let Some(exec) = entry.get("exec").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(args) = entry.get("args").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let lower = exec.to_ascii_lowercase();
+    let tokens: Vec<&str> = args.iter().filter_map(serde_json::Value::as_str).collect();
+    (lower.contains("ai-memory") || lower.contains("ai_memory"))
+        && tokens.contains(&"hook")
+        && tokens.contains(&"--event")
+        && tokens.contains(&"--agent")
+        && tokens.contains(&"copilot-cli")
+        && tokens.contains(&"--server-url")
+}
+
+/// Replace ai-memory's `exec` handlers for one Copilot event while preserving
+/// unrelated handlers installed in the same JSON file.
+fn overlay_copilot_cli_event_hooks(
+    hooks: &mut serde_json::Map<String, serde_json::Value>,
+    event: &str,
+    desired: &serde_json::Value,
+) -> Result<()> {
+    let entries = hooks
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .with_context(|| {
+            format!("`hooks.{event}` is present in the Copilot CLI config but not an array")
+        })?;
+    entries.retain(|entry| !is_ai_memory_copilot_cli_hook_entry(entry));
+    let desired = desired
+        .as_array()
+        .context("internal: build_copilot_cli_hooks_config event is not an array")?;
+    entries.extend(desired.iter().cloned());
+    Ok(())
+}
+
+/// Write GitHub Copilot CLI's dedicated native-hook configuration. Copilot
+/// independently loads every `hooks/*.json` file, so the dedicated
+/// `ai-memory.json` keeps its lifecycle integration isolated from user files.
+fn apply_to_copilot_cli_hooks(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = copilot_cli_hooks_target(args)?;
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = build_copilot_cli_hooks_config(server_url, auth_token, Some(data_dir), strategy);
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .context("internal: build_copilot_cli_hooks_config did not return a hooks object")?
+        .clone();
+    let outcome = apply_atomic(&path, |existing| {
+        mutate_json(existing, |root| {
+            match root.get("version") {
+                Some(version) if version.as_u64() == Some(1) => {}
+                Some(_) => anyhow::bail!(
+                    "`version` in the Copilot CLI hook config must be the numeric value 1"
+                ),
+                None => {
+                    root.insert("version".to_string(), serde_json::Value::from(1));
+                }
+            }
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in the Copilot CLI config but not an object")?;
+            for (event, desired) in &our_hooks {
+                overlay_copilot_cli_event_hooks(hooks, event, desired)?;
             }
             Ok(())
         })
@@ -5726,6 +5888,46 @@ fn render_grok(
     println!("# NOTE: Grok ignores hook stdout on SessionStart — capture works,");
     println!("#       but handoff injection does not. Recover a prior session's");
     println!("#       handoff via the MCP `memory_handoff_accept` tool.");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
+/// Print GitHub Copilot CLI's native hook document. A preview intentionally
+/// keeps a supplied token inline so the operator can paste a complete file;
+/// `--apply` persists that token under the data directory instead and writes
+/// token-less argv, including for repository-scoped files.
+fn render_copilot_cli(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = copilot_cli_hooks_target(args)?;
+    let payload =
+        build_copilot_cli_hooks_config(server_url, auth_token, Some(data_dir), project_strategy);
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing Copilot CLI hook config")?;
+    println!(
+        "# GitHub Copilot CLI hook config — write to {}",
+        path.display()
+    );
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: this printed snippet embeds the token in each hook's args.");
+        println!("#       Treat the file as sensitive (chmod 600). `--apply` instead");
+        println!(
+            "#       persists the token under {} (0600) and omits it from args.",
+            data_dir.display()
+        );
+    }
+    if args.scope == HookInstallScope::Project {
+        println!("# NOTE: this repository file may be versioned. Do not commit a preview");
+        println!("#       that contains a bearer token; use `--apply` with a writable data dir.");
+    }
+    println!("# NOTE: MCP registration and `ai-memory run copilot` are not part of this");
+    println!("#       lifecycle-hook integration yet.");
     println!();
     println!("{serialized}");
     Ok(())
@@ -11750,6 +11952,29 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
     }
 
     #[test]
+    fn copilot_cli_paths_honour_copilot_home() {
+        let custom = if cfg!(windows) {
+            r"C:\custom\copilot"
+        } else {
+            "/custom/copilot"
+        };
+        assert_eq!(
+            copilot_cli_hooks_path_in(Some(std::ffi::OsString::from(custom))).unwrap(),
+            Path::new(custom).join("hooks/ai-memory.json")
+        );
+
+        // Empty override and unset var both fall back to ~/.copilot.
+        for env in [None, Some(std::ffi::OsString::new())] {
+            let path = copilot_cli_hooks_path_in(env).unwrap();
+            assert!(
+                path.ends_with(Path::new(".copilot").join("hooks/ai-memory.json")),
+                "default must be ~/.copilot/hooks/ai-memory.json, got {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn kiro_hooks_infer_the_managed_mcp_client() {
         assert_eq!(
             mcp_client_for_agent(AgentChoice::KiroCli),
@@ -11759,6 +11984,82 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             mcp_client_for_agent(AgentChoice::KiroCliV3),
             Some(McpClient::KiroCli)
         );
+        // Copilot CLI lifecycle hooks are phase 1 of #1040. Its MCP support
+        // is deliberately deferred, so it must not infer an unrelated config.
+        assert_eq!(mcp_client_for_agent(AgentChoice::CopilotCli), None);
+    }
+
+    #[test]
+    fn copilot_cli_apply_preserves_third_party_hooks_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks/ai-memory.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "owner": "user",
+  "hooks": {
+    "SessionStart": [
+      {"type":"command","exec":"audit-tool","args":["--start"]},
+      {"type":"command","exec":"/old/ai-memory","args":["hook","--event","session-start","--agent","copilot-cli","--server-url","http://old"]}
+    ],
+    "CustomEvent": [{"type":"command","exec":"audit-tool","args":[]}]
+  }
+}"#,
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::CopilotCli,
+            config_file: Some(path.clone()),
+            project_strategy: Some(ProjectStrategyArg::RepoRoot),
+            ..default_hook_args()
+        };
+
+        apply_to_copilot_cli_hooks("https://memory.example", None, tmp.path(), &args).unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["owner"], "user");
+        assert_eq!(root["hooks"]["CustomEvent"].as_array().unwrap().len(), 1);
+        let session_start = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 2);
+        assert_eq!(session_start[0]["exec"], "audit-tool");
+        assert!(is_ai_memory_copilot_cli_hook_entry(&session_start[1]));
+        let argv: Vec<&str> = session_start[1]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--project-strategy", "repo-root"])
+        );
+        for (event, _) in crate::commands::render_shared::COPILOT_CLI_EVENTS {
+            assert!(root["hooks"].get(event).is_some(), "missing {event}");
+        }
+
+        apply_to_copilot_cli_hooks("https://memory.example", None, tmp.path(), &args).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+    }
+
+    #[test]
+    fn copilot_cli_hook_ownership_requires_the_native_argv_signature() {
+        let owned = build_copilot_cli_hooks_config("https://memory.example", None, None, None);
+        let entry = &owned["hooks"]["SessionStart"][0];
+        assert!(is_ai_memory_copilot_cli_hook_entry(entry));
+
+        let missing_agent = serde_json::json!({
+            "type": "command",
+            "exec": "ai-memory",
+            "args": ["hook", "--event", "session-start", "--server-url", "https://memory.example"]
+        });
+        assert!(!is_ai_memory_copilot_cli_hook_entry(&missing_agent));
+        let script_runner = serde_json::json!({
+            "type": "command",
+            "bash": "./ai-memory-hook.sh"
+        });
+        assert!(!is_ai_memory_copilot_cli_hook_entry(&script_runner));
     }
 
     #[test]

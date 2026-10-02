@@ -523,6 +523,12 @@ fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_js
                 "ephemeralMessage": handoff,
             }]
         })
+    } else if agent == AgentKind::CopilotCli {
+        // Copilot CLI requires the SessionStart output envelope itself, rather
+        // than Claude Code's nested hookSpecificOutput shape.
+        serde_json::json!({
+            "additionalContext": handoff,
+        })
     } else {
         serde_json::json!({
             "hookSpecificOutput": {
@@ -3204,6 +3210,19 @@ mod tests {
         }
     }
 
+    fn copilot_cli_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "copilot-cli".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        }
+    }
+
     fn antigravity_hook_args(event: &str, server_url: &str) -> HookArgs {
         HookArgs {
             event: event.into(),
@@ -3360,6 +3379,48 @@ mod tests {
                 request.starts_with("GET /handoff?")
                     && request.contains("agent=kiro-cli")
                     && request.contains("session_id=kiro-session")
+            }),
+            "{recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn copilot_cli_session_start_prints_top_level_handoff_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "COPILOT-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            copilot_cli_hook_args("session-start", &base),
+            serde_json::json!({
+                "session_id": "copilot-session",
+                "cwd": tmp.path()
+            })
+            .to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({"additionalContext": "COPILOT-HANDOFF"})
+        );
+        assert!(
+            envelope.get("hookSpecificOutput").is_none(),
+            "Copilot reads the top-level SessionStart envelope"
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("agent=copilot-cli")
+                    && request.contains("session_id=copilot-session")
             }),
             "{recorded:?}"
         );

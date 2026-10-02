@@ -458,6 +458,132 @@ pub(crate) fn build_grok_payload(
     )
 }
 
+/// GitHub Copilot CLI lifecycle events. Copilot names hook triggers in
+/// PascalCase but serialises their payload keys in the VS Code-compatible
+/// snake_case form (`tool_name`, `tool_input`, and `tool_result`).
+///
+/// `PostToolUseFailure` uses the same internal event as `PostToolUse`: its
+/// top-level `error` field makes the capture outcome unambiguous. The two
+/// trigger entries deliberately remain distinct because Copilot invokes them
+/// on mutually exclusive completion paths.
+pub(crate) const COPILOT_CLI_EVENTS: [(&str, &str); 10] = [
+    ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "user-prompt-submit"),
+    ("PreToolUse", "pre-tool-use"),
+    ("PostToolUse", "post-tool-use"),
+    ("PostToolUseFailure", "post-tool-use"),
+    ("PreCompact", "pre-compact"),
+    ("Stop", "stop"),
+    ("SessionEnd", "session-end"),
+    ("SubagentStart", "subagent-start"),
+    ("SubagentStop", "subagent-stop"),
+];
+
+/// Copilot CLI hook config stored in one independently loaded JSON file.
+///
+/// Copilot's `exec` form invokes the native binary with the event JSON on
+/// stdin, so local installs retain the spool, token fallback, and capture
+/// policy behaviour of `ai-memory hook`. `SessionStart` gets a short but
+/// usable bound for the synchronous handoff fetch; capture-only events never
+/// wait on a durable remote write.
+pub(crate) fn build_copilot_cli_hooks_config(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
+    let mut hooks = serde_json::Map::new();
+    for (copilot_event, our_event) in COPILOT_CLI_EVENTS {
+        let mut args = Vec::new();
+        if let Some(dir) = data_dir {
+            args.push("--data-dir".to_string());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+        args.extend(
+            [
+                "hook",
+                "--event",
+                our_event,
+                "--agent",
+                "copilot-cli",
+                "--server-url",
+                server_url,
+            ]
+            .map(ToOwned::to_owned),
+        );
+        if let Some(token) = auth_token {
+            args.push("--auth-token".to_string());
+            args.push(token.to_string());
+        }
+        if let Some(strategy) = project_strategy {
+            args.push("--project-strategy".to_string());
+            args.push(strategy.to_string());
+        }
+        let timeout_secs = if copilot_event == "SessionStart" {
+            5
+        } else {
+            1
+        };
+        hooks.insert(
+            (*copilot_event).to_string(),
+            json!([{
+                "type": "command",
+                "exec": exe,
+                "args": args,
+                "timeoutSec": timeout_secs,
+            }]),
+        );
+    }
+    json!({ "version": 1, "hooks": hooks })
+}
+
+/// GitHub Copilot CLI hook config for `setup-agent`'s remote-only script
+/// bundle. Copilot accepts a platform-specific `bash` or `powershell` command
+/// in one config entry; emitting both lets the same checked-in config work
+/// across host platforms without asking a container to expose its binary to
+/// the host. Local `install-hooks --apply` should use
+/// [`build_copilot_cli_hooks_config`] instead so capture-policy, spooling, and
+/// stored-auth fallback remain available.
+pub(crate) fn build_copilot_cli_script_hooks_config(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+) -> serde_json::Value {
+    let mut hooks = serde_json::Map::new();
+    for (copilot_event, our_event) in COPILOT_CLI_EVENTS {
+        let bash_script = emit_root.join(format!("{our_event}.sh"));
+        let powershell_script = emit_root.join(format!("{our_event}.ps1"));
+        let bash = hook_command(
+            &bash_script,
+            server_url,
+            auth_token,
+            HookCommandContext::new(HookCommandPlatform::Posix, "copilot-cli", None, None),
+        );
+        let powershell = hook_command(
+            &powershell_script,
+            server_url,
+            auth_token,
+            HookCommandContext::new(HookCommandPlatform::Windows, "copilot-cli", None, None),
+        );
+        let timeout_secs = if copilot_event == "SessionStart" {
+            5
+        } else {
+            1
+        };
+        hooks.insert(
+            (*copilot_event).to_string(),
+            json!([{
+                "type": "command",
+                "bash": bash,
+                "powershell": powershell,
+                "timeoutSec": timeout_secs,
+            }]),
+        );
+    }
+    json!({ "version": 1, "hooks": hooks })
+}
+
 /// Zero's hook events → ai-memory event names (issue #156). Zero has no
 /// user-prompt or pre-compact equivalents; its `specialistStart`/`Stop`
 /// map onto the subagent events the router already tracks for Claude Code.
@@ -2718,6 +2844,113 @@ if (inheritOnly) {
         assert_eq!(hooks.len(), CLAUDE_CODE_EVENTS.len());
         for (event, _) in CLAUDE_CODE_EVENTS {
             assert!(hooks.contains_key(event), "missing event {event}");
+        }
+    }
+
+    #[test]
+    fn copilot_cli_native_hooks_use_documented_exec_schema() {
+        let data_dir = Path::new("/data/ai-memory");
+        let value = build_copilot_cli_hooks_config(
+            "https://memory.example",
+            Some("test-token"),
+            Some(data_dir),
+            Some("repo-root"),
+        );
+        assert_eq!(value["version"], 1);
+        let hooks = value["hooks"].as_object().expect("hooks object");
+        assert_eq!(hooks.len(), COPILOT_CLI_EVENTS.len());
+
+        for (trigger, event) in COPILOT_CLI_EVENTS {
+            let entry = hooks[trigger]
+                .as_array()
+                .and_then(|entries| entries.first())
+                .expect("one native handler");
+            assert_eq!(entry["type"], "command", "{trigger}");
+            assert!(
+                entry["exec"]
+                    .as_str()
+                    .is_some_and(|exec| exec.contains("ai-memory") || exec.contains("ai_memory")),
+                "{trigger}: native executable missing: {entry}"
+            );
+            assert!(
+                entry.get("bash").is_none(),
+                "{trigger}: native config has no bash"
+            );
+            assert!(
+                entry.get("powershell").is_none(),
+                "{trigger}: native config has no PowerShell"
+            );
+            let args: Vec<&str> = entry["args"]
+                .as_array()
+                .expect("native args")
+                .iter()
+                .map(|arg| arg.as_str().expect("string argv"))
+                .collect();
+            for expected in [
+                "--data-dir",
+                "/data/ai-memory",
+                "hook",
+                "--event",
+                event,
+                "--agent",
+                "copilot-cli",
+                "--server-url",
+                "https://memory.example",
+                "--auth-token",
+                "test-token",
+                "--project-strategy",
+                "repo-root",
+            ] {
+                assert!(args.contains(&expected), "{trigger}: {args:?}");
+            }
+            assert_eq!(
+                entry["timeoutSec"],
+                if trigger == "SessionStart" { 5 } else { 1 },
+                "{trigger}"
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_cli_script_hooks_cover_bash_and_powershell_without_exec() {
+        let root = PathBuf::from("/host/hooks/copilot-cli");
+        let value = build_copilot_cli_script_hooks_config(
+            &root,
+            "https://memory.example",
+            Some("test-token"),
+        );
+        assert_eq!(value["version"], 1);
+        let hooks = value["hooks"].as_object().expect("hooks object");
+        assert_eq!(hooks.len(), COPILOT_CLI_EVENTS.len());
+
+        for (trigger, event) in COPILOT_CLI_EVENTS {
+            let entry = hooks[trigger]
+                .as_array()
+                .and_then(|entries| entries.first())
+                .expect("one script handler");
+            assert_eq!(entry["type"], "command", "{trigger}");
+            assert!(
+                entry.get("exec").is_none(),
+                "{trigger}: script config has no exec"
+            );
+            let bash = entry["bash"].as_str().expect("bash command");
+            assert!(
+                bash.contains(&format!("/host/hooks/copilot-cli/{event}.sh")),
+                "{trigger}: {bash}"
+            );
+            assert!(bash.contains("copilot-cli"), "{trigger}: {bash}");
+            let powershell = entry["powershell"].as_str().expect("PowerShell command");
+            let program = decode_powershell_encoded_command(powershell).replace('\\', "/");
+            assert!(
+                program.contains(&format!("/host/hooks/copilot-cli/{event}.ps1")),
+                "{trigger}: {program}"
+            );
+            assert!(program.contains("copilot-cli"), "{trigger}: {program}");
+            assert_eq!(
+                entry["timeoutSec"],
+                if trigger == "SessionStart" { 5 } else { 1 },
+                "{trigger}"
+            );
         }
     }
 

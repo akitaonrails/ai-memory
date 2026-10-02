@@ -1635,14 +1635,15 @@ pub enum InstallSkillsScope {
     Global,
 }
 
-/// Where `install-hooks` writes Claude Code's hook configuration.
+/// Where `install-hooks` writes a hook-capable agent's configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum HookInstallScope {
-    /// The user-level settings file (`~/.claude/settings.json`, or
-    /// `$CLAUDE_CONFIG_DIR/settings.json`): hooks fire in every project.
+    /// The user-level configuration: hooks fire in every project.
     Global,
-    /// This repository's gitignored `.claude/settings.local.json`: hooks fire
-    /// only for sessions started in this checkout.
+    /// This repository's local hook configuration: hooks fire only for
+    /// sessions started in this checkout. Claude Code uses its gitignored
+    /// `.claude/settings.local.json`; GitHub Copilot CLI uses
+    /// `.github/hooks/ai-memory.json`.
     Project,
 }
 
@@ -2139,6 +2140,12 @@ pub struct ReindexArgs {}
 pub enum AgentChoice {
     /// Anthropic Claude Code.
     ClaudeCode,
+    /// GitHub Copilot CLI — lifecycle hooks in `$COPILOT_HOME/hooks/`
+    /// (default `~/.copilot/hooks/`) or `.github/hooks/` in a repository.
+    /// This is distinct from `install-mcp --client vscode-copilot`, which
+    /// configures the VS Code extension rather than the Copilot CLI.
+    #[value(name = "copilot-cli")]
+    CopilotCli,
     /// OpenAI Codex CLI.
     Codex,
     /// Cursor IDE agent — JSON-config hooks in `~/.cursor/hooks.json`.
@@ -2262,6 +2269,7 @@ impl AgentChoice {
         use ai_memory_core::AgentKind;
         match self {
             Self::ClaudeCode => AgentKind::ClaudeCode,
+            Self::CopilotCli => AgentKind::CopilotCli,
             Self::Codex => AgentKind::Codex,
             Self::Cursor => AgentKind::Cursor,
             Self::GeminiCli => AgentKind::GeminiCli,
@@ -2916,14 +2924,11 @@ pub struct InstallHooksArgs {
     /// For OpenClaw, this is the generated plugin package directory.
     #[arg(long)]
     pub config_file: Option<PathBuf>,
-    /// Where to write the hook configuration. `project` targets the
-    /// repository's `.claude/settings.local.json` (at the git root; in the
-    /// current directory outside a repository, on Windows, or when the
-    /// repository root is the home directory) so capture is opted in per
-    /// checkout instead of for every session; Claude Code reads it alongside
-    /// the user-level hooks.
-    /// Claude Code only; ignores `CLAUDE_CONFIG_DIR`. Cannot be combined
-    /// with `--config-file`, which names the target file directly.
+    /// Where to write the hook configuration. `project` opts capture in for
+    /// one checkout instead of every session: Claude Code targets the
+    /// repository's `.claude/settings.local.json`, while GitHub Copilot CLI
+    /// targets `.github/hooks/ai-memory.json`. It cannot be combined with
+    /// `--config-file`, which names the target file directly.
     #[arg(
         long,
         value_enum,
@@ -4049,6 +4054,25 @@ mod tests {
             assert_eq!(args.agent, AgentChoice::KiroCliV3);
             assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::KiroCli);
         }
+    }
+
+    #[test]
+    fn copilot_cli_hook_agent_parses_to_its_distinct_kind() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "copilot-cli",
+            "--server-url",
+            "http://127.0.0.1:49374",
+        ])
+        .expect("failed to parse install-hooks --agent copilot-cli");
+        let Command::InstallHooks(args) = cli.command else {
+            panic!("expected install-hooks for Copilot CLI");
+        };
+        assert_eq!(args.agent, AgentChoice::CopilotCli);
+        assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CopilotCli);
+        assert_eq!(args.agent.script_hook_subdir(), Some("copilot-cli"));
     }
 
     #[test]

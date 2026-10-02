@@ -16,7 +16,7 @@ page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, GitHub Copilot CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -890,9 +890,10 @@ Each agent CLI needs two things:
    Without this, the agent can still query memory but capture
    becomes manual.
 
-Claude Desktop, VS Code Copilot, and Zed are MCP-only today. The
-hook-capable clients in the [README Support Matrix](../README.md#support-matrix),
-including Pi and Zero, have lifecycle capture paths through `install-hooks`.
+Claude Desktop, VS Code Copilot, and Zed are MCP-only today. GitHub Copilot
+CLI is a separate hooks-only integration in this release. The hook-capable
+clients in the [README Support Matrix](../README.md#support-matrix), including
+Pi and Zero, have lifecycle capture paths through `install-hooks`.
 
 > **Hook install pattern.** Local supported profiles default to host-native
 > commands. Claude Code may use its supported Windows exec form (`command` =
@@ -907,6 +908,48 @@ including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 > OpenClaw, OpenCode, OMP, and Pi are different: they use generated
 > TypeScript plugin/extension files, so no shell-script extraction is
 > needed for those clients.
+
+### GitHub Copilot CLI
+
+GitHub Copilot CLI is distinct from the VS Code Copilot extension. This first
+integration phase installs lifecycle hooks only: it captures session, prompt,
+tool, compaction, and subagent events, and `SessionStart` injects a pending
+handoff through Copilot's top-level `additionalContext` response. MCP
+registration and `ai-memory run copilot` are intentionally deferred.
+
+Install native hooks for every local Copilot CLI session with:
+
+```bash
+ai-memory install-hooks --agent copilot-cli --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+The installer writes a dedicated file at `$COPILOT_HOME/hooks/ai-memory.json`,
+or `~/.copilot/hooks/ai-memory.json` when `COPILOT_HOME` is unset. Copilot CLI
+loads each JSON file in that directory, so this leaves user-managed hook files
+alone. The generated handlers use Copilot's native `exec` form to invoke
+`ai-memory hook`, which retains local spooling, capture-policy enforcement,
+and stored-auth fallback.
+
+To opt in only one repository, run from that checkout:
+
+```bash
+ai-memory install-hooks --agent copilot-cli --scope project --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+This writes `.github/hooks/ai-memory.json` at the active repository or linked
+worktree root. That directory is usually versioned. `--apply` stores the bearer
+in the host data directory and keeps it out of the JSON; if that storage is
+not writable, the installer refuses to place an inline token in the repository
+file. Do not commit a printed preview that contains a bearer token.
+
+For a Docker or remote-only host that cannot run a native `ai-memory` binary,
+use `setup-agent --agent copilot-cli`. It stages the Copilot scripts and emits
+one config document with both `bash` and `powershell` command fields. This is a
+compatibility path and does not enforce capture-policy v1.
 
 ### OpenAI Codex
 
@@ -1641,10 +1684,11 @@ so those hooks do not accept the handoff. The first `PostToolUse` prints
 `hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
 `[briefing]`). The model sees it after that tool result, not before the
 first prompt. A session with no tool call leaves the handoff for
-`memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed,
-and ZCode
-are MCP-only here, so you'll need to nudge the model to call
-`memory_query` / `memory_handoff_accept` itself.
+`memory_handoff_accept`. GitHub Copilot CLI is hooks-only in this release, so
+it captures lifecycle events and receives handoffs but has no generated MCP
+entry yet. Claude Desktop, VS Code Copilot, and Zed are MCP-only here, so
+you'll need to nudge the model to call `memory_query` / `memory_handoff_accept`
+itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
 for Zero's no-stdout SessionStart behavior. Grok delivers on the first
@@ -2288,7 +2332,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
 | `auth login oidc-device` | same developer data dir as native hooks and thin-client CLI commands | Store a per-developer OIDC device token for native hook authentication and HTTP CLI fallback auth |
 | `install-mcp --client` | `docker run --rm` | MCP-config snippet per client |
-| `install-hooks --agent [--scope project]` | `docker run --rm` | Hook-config snippet for an existing hooks dir; `--scope project` targets the checkout's `.claude/settings.local.json` (Claude Code only) |
+| `install-hooks --agent [--scope project]` | `docker run --rm` | Hook-config snippet for an existing hooks dir; `--scope project` targets Claude Code's `.claude/settings.local.json` or GitHub Copilot CLI's `.github/hooks/ai-memory.json` |
 | `setup-agent --agent --to --host-prefix` | `docker run --rm -v` | Extract bundled scripts + print config (one-shot) |
 | `install-instructions [--target] [--print] [--no-skills]` | same host environment used for the agent prompt files | Install or update the slim CLAUDE.md / AGENTS.md routing block and, by default, the managed ai-memory Agent Skills |
 | `install-skills [--scope] [--agent]` | same host environment used for the agent skill dirs | Install or update only the managed ai-memory Agent Skills |

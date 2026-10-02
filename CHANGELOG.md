@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added GitHub Copilot CLI lifecycle hooks through `install-hooks --agent
+  copilot-cli`. Native `exec` handlers are written to
+  `$COPILOT_HOME/hooks/ai-memory.json` (default
+  `~/.copilot/hooks/ai-memory.json`) or the current checkout's
+  `.github/hooks/ai-memory.json` with `--scope project`; they map Copilot's
+  PascalCase lifecycle events and `tool_name` / `tool_input` / `tool_result`
+  payload to the native capture path, while `SessionStart` emits Copilot's
+  top-level `additionalContext` handoff envelope. `setup-agent` also emits a
+  shell/PowerShell compatibility bundle. MCP registration and managed
+  `ai-memory run copilot` remain follow-up work. (#1040)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on

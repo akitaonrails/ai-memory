@@ -172,6 +172,7 @@ pub(crate) fn tool_observation_metadata(
         // (`tool_name` / `tool_input` / `tool_use_id`) on its tool hooks
         // alongside camelCase, so it shares this mapping (#931).
         AgentKind::ClaudeCode
+        | AgentKind::CopilotCli
         | AgentKind::CommandCode
         | AgentKind::Codex
         | AgentKind::Grok
@@ -218,6 +219,7 @@ pub(crate) fn tool_observation_metadata(
                     if matches!(
                         agent,
                         AgentKind::ClaudeCode
+                            | AgentKind::CopilotCli
                             | AgentKind::CommandCode
                             | AgentKind::Codex
                             | AgentKind::Grok
@@ -247,6 +249,23 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             Some(false) => ToolOutcome::Success,
             None => ToolOutcome::Unknown,
         },
+        AgentKind::CopilotCli => {
+            if raw
+                .pointer("/tool_result/result_type")
+                .and_then(Value::as_str)
+                == Some("success")
+            {
+                ToolOutcome::Success
+            } else if raw
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|error| !error.is_empty())
+            {
+                ToolOutcome::Error
+            } else {
+                ToolOutcome::Unknown
+            }
+        }
         AgentKind::KiroCli => match raw
             .get("tool_response")
             .and_then(|response| response.get("success"))
@@ -710,6 +729,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
             .and_then(Value::as_str)
             .map(|name| (name, object.get("input"))),
         AgentKind::ClaudeCode
+        | AgentKind::CopilotCli
         | AgentKind::CommandCode
         | AgentKind::Codex
         | AgentKind::Cursor
@@ -2132,6 +2152,10 @@ mod tests {
         let policy = shell_policy();
         for (agent, raw) in [
             (AgentKind::ClaudeCode, bash("cat docs/adr/x.md")),
+            (
+                AgentKind::CopilotCli,
+                json!({"tool_name": "Bash", "tool_input": {"command": "cat docs/adr/x.md"}}),
+            ),
             (
                 AgentKind::Codex,
                 json!({"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "cat docs/adr/x.md"]}}),

@@ -240,6 +240,8 @@ pub fn portable_page_key(path: &str) -> String {
 pub enum AgentKind {
     /// Anthropic Claude Code CLI.
     ClaudeCode,
+    /// GitHub Copilot CLI.
+    CopilotCli,
     /// OpenAI Codex CLI.
     Codex,
     /// OpenCode (open-source coding agent).
@@ -290,8 +292,9 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::ClaudeCode,
+        Self::CopilotCli,
         Self::Codex,
         Self::OpenCode,
         Self::Cursor,
@@ -319,6 +322,7 @@ impl AgentKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude-code",
+            Self::CopilotCli => "copilot-cli",
             Self::Codex => "codex",
             Self::OpenCode => "open-code",
             Self::Cursor => "cursor",
@@ -349,6 +353,7 @@ impl AgentKind {
     pub fn from_wire(s: &str) -> Self {
         match s {
             "claude-code" | "claude_code" | "claude" => Self::ClaudeCode,
+            "copilot-cli" | "copilot_cli" => Self::CopilotCli,
             "codex" => Self::Codex,
             "open-code" | "opencode" | "opencode2" | "opencode-v2" | "open-code2" => Self::OpenCode,
             "cursor" => Self::Cursor,
@@ -674,6 +679,24 @@ mod tests {
         );
         assert!(AgentKind::KiroCli.session_start_injects_handoff());
         assert!(!AgentKind::KiroCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_copilot_cli_round_trips_and_injects_at_session_start() {
+        assert_eq!(AgentKind::CopilotCli.as_str(), "copilot-cli");
+        for alias in ["copilot-cli", "copilot_cli"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::CopilotCli);
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CopilotCli).unwrap(),
+            "\"copilot-cli\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"copilot-cli\"").unwrap(),
+            AgentKind::CopilotCli
+        );
+        assert!(AgentKind::CopilotCli.session_start_injects_handoff());
+        assert!(!AgentKind::CopilotCli.user_prompt_injects_handoff());
     }
 
     #[test]

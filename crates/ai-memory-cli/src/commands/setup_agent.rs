@@ -41,8 +41,8 @@ use crate::commands::install_mcp;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS, KIRO_CLI_V3_EVENTS,
-    build_claude_code_payload, build_devin_payload, build_grok_payload, build_pool_settings_yaml,
-    hook_script_for_current_platform,
+    build_claude_code_payload, build_copilot_cli_script_hooks_config, build_devin_payload,
+    build_grok_payload, build_pool_settings_yaml, hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
 
@@ -149,6 +149,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
 
     match args.agent {
         AgentChoice::ClaudeCode => emit_claude_code(&emit_root, &args)?,
+        AgentChoice::CopilotCli => emit_copilot_cli(&emit_root, &args)?,
         AgentChoice::Grok => emit_grok(&emit_root, &args)?,
         AgentChoice::Devin => emit_devin(&emit_root, &args)?,
         AgentChoice::Codex => emit_other(&emit_root, agent_sub, &args, &[CODEX_PROFILE.events]),
@@ -189,6 +190,38 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
             )
         }
     }
+    Ok(())
+}
+
+/// Emit one Copilot CLI config document containing both script-runner forms.
+/// `setup-agent` is for Docker/remote-only deployments, where the host needs
+/// a shell bundle rather than an in-container native executable.
+fn emit_copilot_cli(emit_root: &Path, args: &SetupAgentArgs) -> Result<()> {
+    let payload = build_copilot_cli_script_hooks_config(
+        emit_root,
+        &args.server_url,
+        args.auth_token.as_deref(),
+    );
+    let serialized =
+        serde_json::to_string_pretty(&payload).context("serializing Copilot CLI hook config")?;
+    let config_path = crate::commands::install_hooks::copilot_cli_hooks_path()?;
+    println!("# GitHub Copilot CLI — write to {}", config_path.display());
+    println!("# Hook scripts (must be reachable from the host that runs Copilot CLI):");
+    println!("#   {}", emit_root.display());
+    println!("# AI-memory server: {}", args.server_url);
+    if args.auth_token.is_some() {
+        println!("# Auth is embedded in the shell/PowerShell commands below.");
+        println!(
+            "# Treat {} as sensitive (chmod 600).",
+            config_path.display()
+        );
+    }
+    println!("# This compatibility config includes both Copilot `bash` and `powershell`");
+    println!("# command forms. Prefer `install-hooks --agent copilot-cli --apply` on a");
+    println!("# host with the native binary for local spool and capture-policy support.");
+    println!("# MCP registration and `ai-memory run copilot` are not included yet.");
+    println!();
+    println!("{serialized}");
     Ok(())
 }
 
@@ -793,6 +826,44 @@ mod tests {
                 .any(|(event, _)| *event == "PostToolUseFailure")
         );
         assert_eq!(KIMI_CODE_EVENTS.len(), 10);
+        assert_eq!(paths.len(), 9);
+    }
+
+    #[test]
+    fn copilot_cli_manual_script_paths_cover_lifecycle_event_set() {
+        // Copilot's PostToolUseFailure shares post-tool-use.{sh,ps1}, so ten
+        // trigger registrations intentionally stage nine unique scripts.
+        let root = Path::new("/hooks/copilot-cli");
+        let paths =
+            event_script_paths(root, &[&crate::commands::render_shared::COPILOT_CLI_EVENTS]);
+        let rendered = paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for script in [
+            "session-start",
+            "session-end",
+            "user-prompt-submit",
+            "pre-tool-use",
+            "post-tool-use",
+            "pre-compact",
+            "stop",
+            "subagent-start",
+            "subagent-stop",
+        ] {
+            assert!(
+                rendered.contains(script),
+                "Copilot CLI setup-agent must list {script}; got:\n{rendered}"
+            );
+        }
+        assert!(
+            crate::commands::render_shared::COPILOT_CLI_EVENTS
+                .iter()
+                .any(|(event, _)| *event == "PostToolUseFailure")
+        );
+        assert_eq!(crate::commands::render_shared::COPILOT_CLI_EVENTS.len(), 10);
         assert_eq!(paths.len(), 9);
     }
 

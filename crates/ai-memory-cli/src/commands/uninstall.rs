@@ -48,6 +48,8 @@ enum RewriteOp {
     KiroCliV2HooksJson,
     /// Kiro CLI v3 standalone hooks with exact generated names and commands.
     KiroCliV3HooksJson,
+    /// GitHub Copilot CLI `exec` hooks in its dedicated JSON file.
+    CopilotCliHooksJson,
     /// MCP JSON config for one client shape.
     McpJson(McpClient),
     /// Codex TOML MCP config.
@@ -73,6 +75,7 @@ enum DeleteKind {
     OpenClawManifest,
     OpenClawEntrypoint,
     KiroCliV3Hooks,
+    CopilotCliHooks,
     ManagedSkill,
     AutowireSentinel,
 }
@@ -88,6 +91,7 @@ impl DeleteKind {
             Self::OpenClawManifest => "OpenClaw plugin manifest",
             Self::OpenClawEntrypoint => "OpenClaw plugin entrypoint",
             Self::KiroCliV3Hooks => "Kiro CLI v3 hook file",
+            Self::CopilotCliHooks => "GitHub Copilot CLI hook file",
             Self::ManagedSkill => "managed Agent Skill",
             Self::AutowireSentinel => "auto-wire sentinel",
         }
@@ -207,6 +211,31 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
         let project_local = install_hooks::project_claude_settings_local(&cwd);
         if !hook_files.iter().any(|(path, _)| *path == project_local) {
             hook_files.push((project_local, HookConfigShape::NestedHooksKey));
+        }
+
+        let mut copilot_paths = vec![install_hooks::copilot_cli_hooks_path()?];
+        if let Ok(project_copilot) = install_hooks::copilot_cli_project_hooks_path(&cwd) {
+            copilot_paths.push(project_copilot);
+        }
+        copilot_paths.sort();
+        copilot_paths.dedup();
+        for path in copilot_paths {
+            if !path.exists() {
+                continue;
+            }
+            if generated_file_is_ours(&path, DeleteKind::CopilotCliHooks) {
+                push_generated_delete(&mut plan, path, DeleteKind::CopilotCliHooks);
+                continue;
+            }
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let removal = strip_copilot_cli_hooks(&content)?;
+            push_rewrite(
+                &mut plan,
+                path,
+                removal.removed_events,
+                RewriteOp::CopilotCliHooksJson,
+            );
         }
         hook_files.extend([
             (
@@ -627,6 +656,9 @@ fn apply_change(
                         RewriteOp::KimiCodeHooksToml => strip_kimi_code_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV2HooksJson => strip_kiro_cli_v2_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV3HooksJson => strip_kiro_cli_v3_hooks(&out)?.new_content,
+                        RewriteOp::CopilotCliHooksJson => {
+                            strip_copilot_cli_hooks(&out)?.new_content
+                        }
                         RewriteOp::McpJson(client) => {
                             strip_mcp_json_client(&out, client, name, url)?.0
                         }
@@ -1051,6 +1083,44 @@ fn strip_kiro_cli_v3_hooks(content: &str) -> Result<HookRemoval> {
     })
 }
 
+/// Remove ai-memory's native `exec` entries from a GitHub Copilot CLI hook
+/// file. Copilot loads every file in its hooks directory, so a user can keep
+/// third-party handlers beside ai-memory's dedicated entries; remove only
+/// handlers whose executable and complete argv prove ownership.
+fn strip_copilot_cli_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(hooks) = root
+            .get_mut("hooks")
+            .and_then(|value| value.as_object_mut())
+        else {
+            return Ok(());
+        };
+        let events: Vec<String> = hooks.keys().cloned().collect();
+        for event in events {
+            let Some(entries) = hooks.get_mut(&event).and_then(|value| value.as_array_mut()) else {
+                continue;
+            };
+            let before = entries.len();
+            entries.retain(|entry| !install_hooks::is_ai_memory_copilot_cli_hook_entry(entry));
+            if entries.len() != before {
+                removed_events.push(format!("copilot-cli.{event}"));
+            }
+            if entries.is_empty() {
+                hooks.remove(&event);
+            }
+        }
+        if hooks.is_empty() {
+            root.remove("hooks");
+        }
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
+
 /// Remove ai-memory hook entries from Devin's `hooks.v1.json`, whose root
 /// object is the hook-event map. This is intentionally separate from
 /// `strip_ai_memory_hooks` so we never infer a flat shape for other agents.
@@ -1221,6 +1291,31 @@ fn generated_file_is_ours(path: &Path, kind: DeleteKind) -> bool {
                                 && hooks
                                     .iter()
                                     .all(install_hooks::is_ai_memory_kiro_v3_hook_entry)
+                        })
+            }),
+        DeleteKind::CopilotCliHooks => serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|root| {
+                root.len() == 2
+                    && root.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+                    && root
+                        .get("hooks")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|hooks| {
+                            hooks.len() == crate::commands::render_shared::COPILOT_CLI_EVENTS.len()
+                                && crate::commands::render_shared::COPILOT_CLI_EVENTS
+                                    .iter()
+                                    .all(|(event, _)| {
+                                        hooks.get(*event).is_some_and(|entries| {
+                                            entries.as_array().is_some_and(|entries| {
+                                                !entries.is_empty()
+                                                    && entries.iter().all(
+                                                        install_hooks::is_ai_memory_copilot_cli_hook_entry,
+                                                    )
+                                            })
+                                        })
+                                    })
                         })
             }),
         DeleteKind::ManagedSkill => content.contains(MANAGED_MARKER),
@@ -2460,6 +2555,69 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
         let after: serde_json::Value = serde_json::from_str(&removal.new_content).unwrap();
         assert_eq!(after["hooks"].as_array().unwrap().len(), 1);
         assert_eq!(after["hooks"][0]["name"], "audit");
+    }
+
+    #[test]
+    fn copilot_cli_uninstall_removes_only_owned_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ai-memory.json");
+        let ours = crate::commands::render_shared::build_copilot_cli_hooks_config(
+            "https://memory.example",
+            None,
+            None,
+            None,
+        );
+        std::fs::write(&path, serde_json::to_string(&ours).unwrap()).unwrap();
+        assert!(generated_file_is_ours(&path, DeleteKind::CopilotCliHooks));
+
+        let mut with_custom_owned_hook = ours.clone();
+        with_custom_owned_hook["hooks"]["CustomEvent"] =
+            with_custom_owned_hook["hooks"]["SessionStart"].clone();
+        std::fs::write(
+            &path,
+            serde_json::to_string(&with_custom_owned_hook).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !generated_file_is_ours(&path, DeleteKind::CopilotCliHooks),
+            "an unknown event must make the file shared instead of deleting it"
+        );
+
+        let mut shared = ours;
+        shared["owner"] = serde_json::json!("user");
+        shared["hooks"]["SessionStart"]
+            .as_array_mut()
+            .unwrap()
+            .insert(
+                0,
+                serde_json::json!({
+                    "type": "command",
+                    "exec": "audit-tool",
+                    "args": ["--session-start"]
+                }),
+            );
+        let removal = strip_copilot_cli_hooks(&serde_json::to_string(&shared).unwrap()).unwrap();
+        assert_eq!(removal.removed_events.len(), 10);
+        assert!(
+            removal
+                .removed_events
+                .iter()
+                .all(|event| event.starts_with("copilot-cli.")),
+            "{:?}",
+            removal.removed_events
+        );
+        let after: serde_json::Value = serde_json::from_str(&removal.new_content).unwrap();
+        assert_eq!(after["owner"], "user");
+        let session_start = after["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 1);
+        assert_eq!(session_start[0]["exec"], "audit-tool");
+        assert!(after["hooks"].get("PostToolUse").is_none());
+
+        std::fs::write(&path, serde_json::to_string(&shared).unwrap()).unwrap();
+        assert!(
+            !generated_file_is_ours(&path, DeleteKind::CopilotCliHooks),
+            "a shared file must be rewritten, never deleted"
+        );
     }
 
     /// The plan matched the flavored Kimi Code entry but apply dispatched

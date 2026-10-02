@@ -462,6 +462,10 @@ function Invoke-AiMemoryHook {
         [Parameter(Mandatory = $true)] [string] $Event,
         [Parameter(Mandatory = $true)] [string] $Agent,
         [switch] $FetchHandoff,
+        # Copilot CLI requires SessionStart output as a top-level
+        # `{ "additionalContext": ... }` envelope rather than Claude Code's
+        # nested hookSpecificOutput shape.
+        [switch] $CopilotCliSessionStartOutput,
         [switch] $AntigravityPreInvocationOutput,
         # Deliver the `[briefing]` compiled project brief on the FIRST
         # handoff fetch of a session only (kimi-code's user-prompt path:
@@ -614,6 +618,9 @@ function Invoke-AiMemoryHook {
                         }
                     }
                     [Console]::Out.Write(($Wrapped | ConvertTo-Json -Depth 5 -Compress))
+                } elseif ($CopilotCliSessionStartOutput) {
+                    $Payload = @{ additionalContext = $Response.Content }
+                    [Console]::Out.Write(($Payload | ConvertTo-Json -Depth 5 -Compress))
                 } elseif ($AntigravityPreInvocationOutput) {
                     $Payload = @{
                         injectSteps = @(@{ ephemeralMessage = $Response.Content })
@@ -622,11 +629,11 @@ function Invoke-AiMemoryHook {
                 } else {
                     [Console]::Out.Write($Response.Content)
                 }
-            } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool) {
+            } elseif ($AntigravityPreInvocationOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
                 [Console]::Out.Write("{}")
             }
         } catch {
-            if ($AntigravityPreInvocationOutput -or $GrokPostTool) {
+            if ($AntigravityPreInvocationOutput -or $GrokPostTool -or $CopilotCliSessionStartOutput) {
                 [Console]::Out.Write("{}")
             }
         }
