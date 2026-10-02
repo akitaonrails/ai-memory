@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distinguishing implemented support from enabled availability and advertising
   the enforced hook-batch item limit. The companion relay negotiated that limit
   per flush, preserved bounded fallback for older servers and unknown schemas,
-  and kept authentication and scope authorization on every request.
+  and kept authentication and scope authorization on every request. (#1058)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
