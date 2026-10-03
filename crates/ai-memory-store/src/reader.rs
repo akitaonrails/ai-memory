@@ -1744,6 +1744,8 @@ pub struct ReaderPool {
     /// after [`Self::set_fts_stopwords`] share the operator's choice.
     /// Cheap to clone (`FtsStopwords` is `Arc`-backed).
     fts_stopwords: FtsStopwords,
+    #[cfg(test)]
+    pub(crate) native_capture_read_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct Inner {
@@ -1767,6 +1769,8 @@ impl ReaderPool {
             }),
             tuning: RetrievalTuning::default(),
             fts_stopwords: FtsStopwords::default(),
+            #[cfg(test)]
+            native_capture_read_probe: None,
         })
     }
 
@@ -9918,7 +9922,7 @@ fn row_to_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<O
     ))
 }
 
-fn row_to_observation_record(
+pub(crate) fn row_to_observation_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<StoreResult<ObservationRecord>> {
     let id_bytes: Vec<u8> = row.get(0)?;

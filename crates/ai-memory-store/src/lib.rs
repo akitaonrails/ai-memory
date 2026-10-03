@@ -21,6 +21,7 @@ pub mod decay;
 mod error;
 mod fts_query;
 mod grants;
+mod internal_sources;
 mod maintenance;
 mod migrations;
 mod ops;
@@ -55,6 +56,7 @@ pub use decay::{
 };
 pub use error::{StoreError, StoreResult};
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
+pub use internal_sources::{NativeSessionRead, SourceAuthorization};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DateOnlyTtlPage,
