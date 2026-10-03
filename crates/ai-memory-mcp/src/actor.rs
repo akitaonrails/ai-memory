@@ -73,23 +73,6 @@ pub fn author_id_from_parts(parts: &Parts) -> Option<UserId> {
     parts.extensions.get::<UserId>().copied()
 }
 
-/// Ephemeral source authority from real request extensions, never raw headers.
-#[must_use]
-pub fn source_authorization(parts: &Parts) -> ai_memory_store::SourceAuthorization {
-    ai_memory_store::SourceAuthorization::from_auth(
-        parts
-            .extensions
-            .get::<AuthLevel>()
-            .copied()
-            .unwrap_or(AuthLevel::Anonymous),
-        parts
-            .extensions
-            .get::<ai_memory_core::AuthorizedViewer>()
-            .map(|viewer| viewer.user()),
-        &actor_from_parts(parts),
-    )
-}
-
 fn header_value(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(ai_memory_core::SKIP_ADMISSION_CHAIN_HEADER)

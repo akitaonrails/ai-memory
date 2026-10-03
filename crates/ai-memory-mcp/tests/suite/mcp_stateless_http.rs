@@ -788,6 +788,25 @@ mod native_session_source {
             probe: Option<Arc<dyn Fn() + Send + Sync>>,
             root_actor: ActorContext,
         ) -> Router {
+            let auth = if authenticated {
+                AuthState::new(Some(ROOT_TOKEN.into()))
+                    .with_root_actor(root_actor)
+                    .with_multiuser(
+                        self.pepper.clone(),
+                        self.store.reader.clone(),
+                        self.store.writer.clone(),
+                    )
+            } else {
+                AuthState::default()
+            };
+            self.service(probe)
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::new(auth),
+                    require_bearer,
+                ))
+        }
+
+        fn service(&self, probe: Option<Arc<dyn Fn() + Send + Sync>>) -> Router {
             let mut server = AiMemoryServer::new(
                 self.store.reader.clone(),
                 self.store.writer.clone(),
@@ -805,26 +824,7 @@ mod native_session_source {
                     .with_stateful_mode(false)
                     .with_json_response(true),
             );
-            let router = Router::new().nest_service("/mcp", service);
-            if authenticated {
-                router.layer(axum::middleware::from_fn_with_state(
-                    Arc::new(
-                        AuthState::new(Some(ROOT_TOKEN.into()))
-                            .with_root_actor(root_actor)
-                            .with_multiuser(
-                                self.pepper.clone(),
-                                self.store.reader.clone(),
-                                self.store.writer.clone(),
-                            ),
-                    ),
-                    require_bearer,
-                ))
-            } else {
-                router.layer(axum::middleware::from_fn_with_state(
-                    Arc::new(AuthState::default()),
-                    require_bearer,
-                ))
-            }
+            Router::new().nest_service("/mcp", service)
         }
 
         fn probe(&self, sql: &str) -> Arc<dyn Fn() + Send + Sync> {
@@ -949,6 +949,256 @@ mod native_session_source {
             "denial must be generic: {v}"
         );
         assert!(!v.to_string().contains("foreign body"));
+    }
+
+    async fn authority_change_after_capture(sql: &str) {
+        let h = Harness::new().await;
+        payload(
+            &wire(&h.router(true, None), Some(&h.alice_token), h.args())
+                .await
+                .0,
+        );
+        let (v, _) = wire(
+            &h.router(true, Some(h.probe(sql))),
+            Some(&h.alice_token),
+            h.args(),
+        )
+        .await;
+        unavailable(&v);
+        for private in [
+            h.sid.to_string(),
+            "missing_credentials".into(),
+            "digest".into(),
+        ] {
+            assert!(!v.to_string().contains(&private), "private diagnostic: {v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_session_source_credential_rechecks_after_capture() {
+        for sql in [
+            "UPDATE api_credentials SET revoked_at=1 WHERE user_id=(SELECT id FROM users WHERE username='alice')",
+            "UPDATE api_credentials SET expires_at=1 WHERE user_id=(SELECT id FROM users WHERE username='alice')",
+            "DELETE FROM users WHERE username='alice'",
+            "ALTER TABLE api_credentials RENAME TO missing_credentials",
+        ] {
+            authority_change_after_capture(sql).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_session_source_rotation_keeps_id_but_refuses_old_hash() {
+        authority_change_after_capture("UPDATE api_credentials SET token_hash=randomblob(32) WHERE user_id=(SELECT id FROM users WHERE username='alice')").await;
+    }
+
+    #[tokio::test]
+    async fn native_session_source_changed_user_id_is_refused() {
+        authority_change_after_capture("UPDATE users SET username='former-alice' WHERE username='alice'; UPDATE users SET username='alice' WHERE username='bob'; UPDATE api_credentials SET user_id=(SELECT id FROM users WHERE username='alice') WHERE user_id=(SELECT id FROM users WHERE username='former-alice')").await;
+    }
+
+    #[tokio::test]
+    async fn native_session_source_changed_credential_id_is_refused() {
+        authority_change_after_capture("UPDATE api_credentials SET id=randomblob(16) WHERE user_id=(SELECT id FROM users WHERE username='alice')").await;
+    }
+
+    #[tokio::test]
+    async fn native_session_source_changed_canonical_owner_is_refused() {
+        authority_change_after_capture(
+            "UPDATE users SET username='renamed' WHERE username='alice'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_session_source_requires_genuine_origin_before_capture() {
+        use ai_memory_core::AuthLevel;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let h = Harness::new().await;
+        h.share_source(); // A private owner would mask a missing HTTP-origin guard.
+        let captured = Arc::new(AtomicBool::new(false));
+        let seen = captured.clone();
+        let router = h
+            .service(Some(Arc::new(move || {
+                seen.store(true, Ordering::SeqCst);
+            })))
+            .layer(axum::middleware::from_fn(
+                |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                    req.extensions_mut().insert(AuthLevel::Root);
+                    req.extensions_mut().insert(ActorContext {
+                        user: Some("alice".into()),
+                        ..Default::default()
+                    });
+                    next.run(req).await
+                },
+            ));
+        payload(
+            &wire(&h.router(true, None), Some(ROOT_TOKEN), h.args())
+                .await
+                .0,
+        );
+        let (v, _) = wire(&router, None, h.args()).await;
+        assert!(
+            !captured.load(Ordering::SeqCst),
+            "capture reached without authenticating origin"
+        );
+        unavailable(&v);
+        assert!(!v.to_string().contains(&h.sid.to_string()));
+    }
+
+    #[tokio::test]
+    async fn native_session_source_rechecks_credential_before_capture() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let h = Harness::new().await;
+        let captured = Arc::new(AtomicBool::new(false));
+        let seen = captured.clone();
+        let revoke = h.probe("UPDATE api_credentials SET revoked_at=1 WHERE user_id=(SELECT id FROM users WHERE username='alice')");
+        let router = h
+            .service(Some(Arc::new(move || {
+                seen.store(true, Ordering::SeqCst);
+            })))
+            .layer(axum::middleware::from_fn(
+                move |req: Request<Body>, next: axum::middleware::Next| {
+                    let revoke = revoke.clone();
+                    async move {
+                        revoke();
+                        next.run(req).await
+                    }
+                },
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(AuthState::new(Some(ROOT_TOKEN.into())).with_multiuser(
+                    h.pepper.clone(),
+                    h.store.reader.clone(),
+                    h.store.writer.clone(),
+                )),
+                require_bearer,
+            ));
+        payload(
+            &wire(&h.router(true, None), Some(&h.alice_token), h.args())
+                .await
+                .0,
+        );
+        let (v, _) = wire(&router, Some(&h.alice_token), h.args()).await;
+        assert!(
+            !captured.load(Ordering::SeqCst),
+            "capture reached with inactive credential"
+        );
+        unavailable(&v);
+        assert!(!v.to_string().contains(&h.sid.to_string()));
+    }
+
+    #[tokio::test]
+    async fn native_session_source_legacy_expiry_and_human_disabled_api_control() {
+        let h = Harness::new().await;
+        let legacy_token = generate_api_key().unwrap();
+        let legacy = h
+            .store
+            .writer
+            .create_user(
+                NewUser {
+                    username: "legacy".into(),
+                    name: None,
+                    email: None,
+                },
+                hash_token(&legacy_token, &h.pepper),
+            )
+            .await
+            .unwrap();
+        Connection::open(h.store.db_path()).unwrap().execute_batch(
+            "UPDATE projects SET access_mode='open'; UPDATE sessions SET actor_user='user:legacy'",
+        ).unwrap();
+        payload(
+            &wire(&h.router(true, None), Some(&legacy_token), h.args())
+                .await
+                .0,
+        );
+        let (v, _) = wire(
+            &h.router(
+                true,
+                Some(h.probe("UPDATE users SET token_expired_at=1 WHERE username='legacy'")),
+            ),
+            Some(&legacy_token),
+            h.args(),
+        )
+        .await;
+        unavailable(&v);
+        assert!(!v.to_string().contains(&legacy.to_string()));
+        let h = Harness::new().await;
+        payload(
+            &wire(
+                &h.router(
+                    true,
+                    Some(h.probe("UPDATE users SET disabled_at=1 WHERE username='alice'")),
+                ),
+                Some(&h.alice_token),
+                h.args(),
+            )
+            .await
+            .0,
+        );
+        payload(
+            &wire(&h.router(true, None), Some(&h.alice_token), h.args())
+                .await
+                .0,
+        );
+    }
+
+    #[tokio::test]
+    async fn native_session_source_trusted_proxy_and_metadata_controls() {
+        let h = Harness::new().await;
+        h.share_source();
+        Connection::open(h.store.db_path())
+            .unwrap()
+            .execute_batch("UPDATE projects SET access_mode='open'")
+            .unwrap();
+        let router = h.service(None).layer(axum::middleware::from_fn_with_state(
+            Arc::new(
+                AuthState::new(Some(ROOT_TOKEN.into()))
+                    .with_trusted_proxy_bearer("proxy-test")
+                    .with_root_actor(ActorContext {
+                        issuer: Some("https://fixture-issuer".into()),
+                        sub: Some("root-subject".into()),
+                        ..Default::default()
+                    }),
+            ),
+            require_bearer,
+        ));
+        // This proxy authenticates Alice but supplies no DB UserId for native access.
+        unavailable(&wire(&router, Some("proxy-test"), h.args()).await.0);
+        for owned in [false, true] {
+            if owned {
+                Connection::open(h.store.db_path())
+                    .unwrap()
+                    .execute_batch("UPDATE sessions SET actor_user='user:alice'")
+                    .unwrap();
+            }
+            let request = Request::builder().method("POST").uri("/mcp")
+                .header("host", "localhost").header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("authorization", "Bearer proxy-test")
+                .header("x-memory-actor-user", "alice")
+                .header("x-memory-actor-issuer", "https://fixture-issuer")
+                .header("x-memory-actor-sub", "root-subject")
+                .body(Body::from(json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"memory_read_session_observations", "arguments":h.args()}}).to_string())).unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 4_000_000)
+                .await
+                .unwrap();
+            let value = serde_json::from_slice::<Value>(&bytes).unwrap();
+            if owned {
+                unavailable(&value);
+            } else {
+                payload(&value);
+            }
+        }
+        let h = Harness::new().await;
+        Connection::open(h.store.db_path())
+            .unwrap()
+            .execute_batch("UPDATE projects SET access_mode='open'")
+            .unwrap();
+        let (v, _) = rpc(&h.router(true, None), Some(&h.bob_token), "tools/call", json!({"name":"memory_read_session_observations", "arguments":h.args(), "_meta":{"ai.opencode/sessionID":h.sid.to_string(), "authLevel":"root", "user":"alice", "nativeAuthOrigin":"ConfiguredRoot"}})).await;
+        unavailable(&v);
+        unavailable(&wire(&h.router(false, None), None, h.args()).await.0);
     }
 
     #[tokio::test]

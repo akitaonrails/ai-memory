@@ -123,6 +123,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older servers leave unsupported fields unknown. (#1016)
 
 ### Changed
+- Rechecked native session inspection authority before capture and before reply,
+  using private HTTP authentication proofs and current API-key hash, user,
+  credential and owner checks. Authenticated HTTP bridges retain upstream
+  authority; direct stdio remains unavailable for native inspection.
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-

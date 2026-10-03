@@ -24,6 +24,7 @@ mod grants;
 mod internal_sources;
 mod maintenance;
 mod migrations;
+mod native_read_authority;
 mod ops;
 pub mod password;
 mod project_authz;
@@ -58,6 +59,7 @@ pub use error::{StoreError, StoreResult};
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use internal_sources::{NativeSessionRead, SourceAuthorization};
 pub use maintenance::MaintenanceJob;
+pub use native_read_authority::NativeReadAuthority;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DateOnlyTtlPage,
     DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
