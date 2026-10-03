@@ -18,8 +18,11 @@
 
 use std::sync::Arc;
 
-use ai_memory_core::{ActorContext, AuthLevel, IdentityKey};
-use ai_memory_store::{ReaderPool, TokenPepper, WriterHandle, hash_token};
+use ai_memory_core::{ActorContext, ApiCredentialId, AuthLevel, IdentityKey, UserId};
+use ai_memory_store::{
+    NativeReadAuthority, ReaderPool, SourceAuthorization, TOKEN_HASH_LEN, TokenPepper,
+    WriterHandle, hash_token,
+};
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::Next;
@@ -94,6 +97,86 @@ pub struct AuthState {
     /// separate because the browser transition checks persisted password /
     /// bootstrap state on every request.
     human_intended: bool,
+}
+
+// Only successful authenticators issue these proofs. No Debug or wire form.
+#[derive(Clone)]
+enum NativeAuthOrigin {
+    ConfiguredRoot,
+    TrustedProxy(ActorContext),
+    ApiKey {
+        hash: [u8; TOKEN_HASH_LEN],
+        credential: ApiCredentialId,
+        user: UserId,
+        owner: IdentityKey,
+    },
+}
+
+#[derive(Clone)]
+struct NativeRequestAuthority(Arc<dyn NativeReadAuthority>);
+
+struct BoundNativeAuthority {
+    state: Arc<AuthState>,
+    origin: NativeAuthOrigin,
+}
+
+impl NativeReadAuthority for BoundNativeAuthority {
+    fn recheck(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SourceAuthorization>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (level, user, actor) = match &self.origin {
+                NativeAuthOrigin::ConfiguredRoot => {
+                    (AuthLevel::Root, None, self.state.root_actor.clone())
+                }
+                NativeAuthOrigin::TrustedProxy(actor) => {
+                    let level = if self.state.asserts_root_identity(actor) {
+                        AuthLevel::Root
+                    } else {
+                        AuthLevel::User
+                    };
+                    (level, None, actor.clone())
+                }
+                NativeAuthOrigin::ApiKey {
+                    hash,
+                    credential,
+                    user,
+                    owner,
+                } => {
+                    let mu = self.state.multiuser.as_ref()?;
+                    let hit = mu
+                        .reader
+                        .find_active_user_by_token_hash(*hash)
+                        .await
+                        .ok()??;
+                    if hit.user.id != *user || hit.credential_id != *credential {
+                        return None;
+                    }
+                    let actor = ActorContext {
+                        user: Some(hit.user.username),
+                        name: hit.user.name,
+                        email: hit.user.email,
+                        ..ActorContext::default()
+                    };
+                    if actor.identity_key().as_ref() != Some(owner) {
+                        return None;
+                    }
+                    (AuthLevel::User, Some(*user), actor)
+                }
+            };
+            Some(SourceAuthorization::from_auth(level, user, &actor))
+        })
+    }
+}
+
+pub(crate) fn native_read_authority(
+    parts: &axum::http::request::Parts,
+) -> Option<Arc<dyn NativeReadAuthority>> {
+    parts
+        .extensions
+        .get::<NativeRequestAuthority>()
+        .map(|a| a.0.clone())
 }
 
 impl AuthState {
@@ -307,6 +390,7 @@ pub(crate) async fn authenticate_token(
     provided: &str,
     allow_proxy: bool,
 ) -> Result<BearerAuth, Response> {
+    req.extensions_mut().remove::<NativeAuthOrigin>();
     if provided.is_empty() {
         return Ok(BearerAuth::Rejected);
     }
@@ -316,6 +400,8 @@ pub(crate) async fn authenticate_token(
     {
         req.extensions_mut().insert(state.root_actor.clone());
         req.extensions_mut().insert(AuthLevel::Root);
+        req.extensions_mut()
+            .insert(NativeAuthOrigin::ConfiguredRoot);
         return Ok(BearerAuth::Authenticated);
     }
 
@@ -345,6 +431,8 @@ pub(crate) async fn authenticate_token(
             ?level,
             "identity asserted by trusted proxy"
         );
+        req.extensions_mut()
+            .insert(NativeAuthOrigin::TrustedProxy(actor.clone()));
         req.extensions_mut().insert(actor);
         req.extensions_mut().insert(level);
         return Ok(BearerAuth::Authenticated);
@@ -361,6 +449,12 @@ pub(crate) async fn authenticate_token(
                     email: hit.user.email.clone(),
                     ..ActorContext::default()
                 };
+                req.extensions_mut().insert(NativeAuthOrigin::ApiKey {
+                    hash,
+                    credential: hit.credential_id,
+                    user: hit.user.id,
+                    owner: IdentityKey::User(hit.user.username.trim().to_owned()),
+                });
                 req.extensions_mut().insert(actor);
                 req.extensions_mut().insert(hit.user.id);
                 // Every database user is subject to per-project access; an
@@ -407,8 +501,16 @@ pub async fn require_bearer(
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    req.extensions_mut().remove::<NativeRequestAuthority>();
     match authenticate_bearer(&state, &mut req).await {
-        Ok(BearerAuth::Authenticated) => next.run(req).await,
+        Ok(BearerAuth::Authenticated) => {
+            if let Some(origin) = req.extensions_mut().remove::<NativeAuthOrigin>() {
+                req.extensions_mut().insert(NativeRequestAuthority(Arc::new(
+                    BoundNativeAuthority { state, origin },
+                )));
+            }
+            next.run(req).await
+        }
         Err(resp) => resp,
         Ok(BearerAuth::Absent | BearerAuth::Rejected) if !state.enabled() => {
             // With no configured authority the wire gate is disabled. A

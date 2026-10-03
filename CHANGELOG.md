@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added opt-in exact-origin native session inspection to the existing
+  `memory_read_session_observations` MCP tool, with explicit paired scope,
+  authenticated HTTP authority, bounded transactional prefix capture and current
+  grant, owner, origin, content and purge checks before constructing the reply.
+  (#1076)
 - Added `install-hooks --agent claude-code --scope project`, which writes the
   hook configuration to the checkout's gitignored `.claude/settings.local.json`
   (where Claude Code reads it: the git root, or the launch directory on
@@ -118,6 +123,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   older servers leave unsupported fields unknown. (#1016)
 
 ### Changed
+- Rechecked native session inspection authority before capture and before reply,
+  using private HTTP authentication proofs and current API-key hash, user,
+  credential and owner checks. Authenticated HTTP bridges retain upstream
+  authority; direct stdio remains unavailable for native inspection. (#1078)
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 - `.github/workflows/nix.yml` builds the flake on `x86_64-linux` for path-

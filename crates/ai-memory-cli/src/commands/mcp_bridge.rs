@@ -363,4 +363,110 @@ mod tests {
         assert_bridge_round_trip(false).await;
         assert_bridge_round_trip(true).await;
     }
+
+    #[tokio::test]
+    async fn native_source_bridge_uses_real_http_auth_and_direct_stdio_refuses() {
+        use ai_memory_core::SessionId;
+        use ai_memory_mcp::{
+            AiMemoryServer,
+            auth::{AuthState, require_bearer},
+        };
+        use ai_memory_store::Store;
+        use rusqlite::{Connection, params};
+        use serde_json::json;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("native-bridge-ws")
+            .await
+            .unwrap();
+        let pj = store
+            .writer
+            .get_or_create_project(ws, "native-bridge-project", None)
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute("INSERT INTO sessions(id,workspace_id,project_id,agent_kind,cwd,started_at) VALUES(?1,?2,?3,'codex','/fixture',1)", params![sid.as_bytes(), ws.as_bytes(), pj.as_bytes()]).unwrap();
+        conn.execute("INSERT INTO observations(id,session_id,workspace_id,project_id,kind,title,body,importance,created_at) VALUES(randomblob(16),?1,?2,?3,'other','title','bridge private body',5,2)", params![sid.as_bytes(), ws.as_bytes(), pj.as_bytes()]).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, pj);
+        let args = json!({"workspace":"native-bridge-ws", "project":"native-bridge-project", "native_source":{"kind":"session", "id":sid.to_string()}});
+        let mut call = CallToolRequestParams::new("memory_read_session_observations");
+        call.arguments = Some(args.as_object().unwrap().clone());
+        for authenticated in [true, false] {
+            let factory = server.clone();
+            let service = StreamableHttpService::new(
+                move || Ok(factory.clone()),
+                LocalSessionManager::default().into(),
+                StreamableHttpServerConfig::default()
+                    .with_stateful_mode(false)
+                    .with_json_response(true),
+            );
+            let auth = AuthState::new(authenticated.then(|| "native-bridge-root".into()));
+            let router = Router::new().nest_service("/mcp", service).layer(
+                axum::middleware::from_fn_with_state(Arc::new(auth), require_bearer),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let http = tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            let upstream = ()
+                .serve(StreamableHttpClientTransport::from_config(
+                    upstream_config(
+                        &format!("http://{address}/mcp"),
+                        "claimed-root-session",
+                        Some("native-bridge-root"),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let bridge = SessionAwareBridge {
+                upstream: upstream.peer().clone(),
+                server_info: upstream.peer_info().map(|info| (*info).clone()).unwrap(),
+            };
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let task = tokio::spawn(async move { bridge.serve(server_io).await.unwrap() });
+            let client = ().serve(client_io).await.unwrap();
+            let downstream = task.await.unwrap();
+            let result = client.call_tool(call.clone()).await;
+            if authenticated {
+                let result = result.unwrap();
+                assert_ne!(result.is_error, Some(true));
+                assert!(
+                    serde_json::to_string(&result)
+                        .unwrap()
+                        .contains("bridge private body")
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("native source unavailable"), "{error}");
+                assert!(!error.contains("bridge private body"));
+                assert!(!error.contains(&sid.to_string()));
+            }
+            client.cancel().await.unwrap();
+            downstream.cancel().await.unwrap();
+            upstream.cancel().await.unwrap();
+            http.abort();
+        }
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move { server.serve(server_io).await.unwrap() });
+        let client = ().serve(client_io).await.unwrap();
+        let direct = task.await.unwrap();
+        let error = client.call_tool(call).await.unwrap_err().to_string();
+        assert!(error.contains("native source unavailable"), "{error}");
+        assert!(!error.contains("bridge private body"));
+        let mut legacy = CallToolRequestParams::new("memory_read_session_observations");
+        legacy.arguments = Some(json!({"workspace":"native-bridge-ws", "project":"native-bridge-project", "session_id":sid.to_string()}).as_object().unwrap().clone());
+        let control = client.call_tool(legacy).await.unwrap();
+        assert!(
+            serde_json::to_string(&control)
+                .unwrap()
+                .contains("bridge private body")
+        );
+        client.cancel().await.unwrap();
+        direct.cancel().await.unwrap();
+    }
 }

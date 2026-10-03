@@ -13,7 +13,7 @@ Use this skill for read-only ai-memory lookups, catch-up, and evaluating remembe
 - `memory_query` searches the current project's wiki for prior decisions, gotchas, procedures, rules, and session notes.
 - `memory_recent` lists the most recently updated pages when the user wants a light activity check.
 - `memory_read_page` fetches a full page body after a search hit or direct path lookup. Pass `include_related: true` (optional `related_depth`, default 1, hard cap 3) to also walk the link graph outward and return a `related` array of reachable pages, each with its hop `depth` and edge `direction` (`link`/`backlink`); default off omits it.
-- `memory_read_session_observations` reads one session's raw hook observations (prompts, tool calls, stops) in capture order, paged and body-capped, when the user asks what actually happened in a session or wants to check a compiled page against its evidence.
+- `memory_read_session_observations` reads one session's raw hook observations (prompts, tool calls, stops) in capture order, paged and body-capped, when the user asks what actually happened in a session or wants to check a compiled page against its evidence. Opt-in `native_source: {kind: "session", id: UUID}` requires an explicit nonempty scope pair and authenticated HTTP request context; plain stdio is unavailable. It excludes `session_id`, `body_max_chars`, `query`, `kinds`, nonzero `offset` and descending `order`. It returns a bounded beginning prefix (default 50, max 200) after checking current grants, owner, exact origin and captured data again; it does not attest that source text is true or complete.
 - `memory_status` reports whether ai-memory is healthy and how large the knowledge base is.
 - `memory_briefing` returns a structured read-only snapshot for agent consumption, including a bounded `pinned` list of the project's pinned standing-context pages (present only when the project has pins).
 - `memory_explore` returns a prose digest when the user asks for an open-ended catch-up.
@@ -24,6 +24,10 @@ Choose scope from the MCP client's identity support:
 
 - **Session-aware MCP clients** that forward the real lifecycle-hook session id on every request should use automatic current-project routing. Omit `workspace`, `project`, and `cwd` for the current repository; pass explicit scope only when the user names a different project.
 - **Static MCP clients** (including clients with lifecycle hooks but no bridge connecting that hook session id to MCP requests) must pass `workspace` and `project` together on every project-scoped call, including requests about this project, here, or our work. Read the exact names from the nearest `.ai-memory.toml` when it declares both. If it does not, obtain the names from the operator or server configuration; never guess them from a directory name and never rely on the server's last active project.
+
+Exception: `memory_read_session_observations` with `native_source` requires
+explicit `workspace` and `project` together for every client, including
+session-aware clients.
 
 This rule applies only to project-scoped calls. For cross-project retrieval, `global=true` must omit `workspace`, `project`, and `scopes`. For a standing preference written with `scope: "global"`, omit `workspace` and `project`.
 

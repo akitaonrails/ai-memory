@@ -587,3 +587,10 @@ MIT - see [LICENSE](LICENSE).
 This codebase is being built collaboratively with Claude Code
 (Anthropic Claude Opus 4.7) following the plan documented in
 `docs/design-decisions.md`.
+
+Optional exact-origin session inspection is available through the existing
+`memory_read_session_observations` MCP tool's `native_source` argument. It requires
+explicit `workspace` + `project` and authenticated HTTP context, checks source
+ownership and current project access, and returns a bounded unchanged prefix.
+See [exact-origin session inspection](docs/usage.md#exact-origin-session-inspection)
+for limits, legacy compatibility and snapshot timing.

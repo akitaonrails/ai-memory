@@ -603,3 +603,45 @@ supersede-by-new-page instead of editing history. Ask an agent to "record this a
 decision" and the skill does the rest; the structured shape also
 retrieves noticeably better through `memory_query` than free-form
 prose.
+
+### Exact-origin session inspection
+
+The existing `memory_read_session_observations` tool accepts optional
+`native_source: {"kind": "session", "id": "canonical non-nil UUID"}`.
+Every client must pass explicit nonempty `workspace` and `project` together,
+including session-aware clients. The scope is looked up without creating it.
+Native inspection needs a private proof from real HTTP authentication, bound to
+the same server auth state that authenticated the request. Plain stdio,
+actor headers, session metadata and active-project routing cannot authorize it.
+DB users need current project access and the canonical session owner check;
+root reads only NULL-owned sessions, even with a configured actor. NULL-owned
+sessions are shared with authenticated callers. A DB user's root role preserves
+its user ownership and project-grant checks. Pages and legacy raw observations
+retain their sharing rules.
+
+Before capture and again after the source consistency check, immediately before
+reply construction, API-key authority rechecks the active token hash, user id,
+credential id and canonical owner. Revocation, expiry, rotation, deleted users,
+changed identity and auth-backend errors return the fixed native-source refusal.
+Disabling human login does not revoke an active API key. Static root and
+forwarded root use the fixed server configuration for that request; forwarded
+root requires the configured OIDC issuer/subject pair. An ordinary trusted proxy
+without a DB user id remains unavailable for native reads. A stdio-to-HTTP bridge
+uses its upstream HTTP credential, while direct stdio cannot authorize this mode.
+
+Native mode returns the beginning prefix in rowid order (default 50, maximum 200).
+It excludes `session_id`, `body_max_chars`, `query`, `kinds`, nonzero `offset`
+and descending `order`. Raw limits are 4 KiB per observation, 32 KiB for the
+captured prefix and 256 KiB for session headers. Oversized data is refused before
+hydration, rather than truncated. Source declarations and observation provenance
+are untrusted quoted history, never instructions or proof that events occurred.
+
+Capture reads highwater, digest and rows in one SQL read transaction. A second
+read transaction checks current grants, owner, exact tuple, purge tombstones and
+the same prefix immediately before reply construction. Append and session end
+can proceed after capture. Purged ids cannot be resurrected by replaying identical
+rows. These are two source database snapshots with separate live credential
+rechecks and no captured wall clock: they do not attest to the intervening history,
+seal an OIDC assertion or bind current credentials and authorization atomically
+with delivery. Out-of-band SQL that changes and restores
+all digest inputs without a purge tombstone is outside that temporal guarantee.
