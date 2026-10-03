@@ -207,6 +207,30 @@ async fn write_slot(
         .to_string())
 }
 
+/// Where a slot delete actually TARGETED, per the tool's own response.
+async fn delete_slot(
+    router: &Router,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Result<String, String> {
+    let deleted = try_call(
+        router,
+        "memory_delete_page",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "path": path,
+        }),
+        headers,
+    )
+    .await?;
+    Ok(deleted
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or_else(|| panic!("response carries no deleted path: {deleted}"))
+        .to_string())
+}
+
 /// The slot paths this caller's own briefing lists — the read half.
 async fn brief_slots(router: &Router, headers: &[(&str, &str)]) -> Vec<String> {
     let snapshot = try_call(
@@ -410,4 +434,104 @@ async fn default_slot_config_is_unchanged() {
             "a slot vanished from an unrelated caller's brief: {bobs:?}",
         );
     }
+}
+
+/// An operator deleting the generic slot path deletes their own personal slot,
+/// not the shared project-wide slot.
+#[tokio::test]
+async fn oidc_operator_deleting_shared_slot_path_deletes_their_personal_slot() {
+    let h = harness(true).await;
+    let alice = proxied("x-memory-actor-sub", ALICE_SUB);
+
+    let landed = write_slot(&h.http, "_slots/current-focus.md", "alice only", &alice)
+        .await
+        .expect("write");
+    assert_eq!(
+        landed,
+        format!("_slots/{}/current-focus.md", sub_segment(ALICE_SUB)),
+    );
+    assert!(brief_slots(&h.http, &alice).await.contains(&landed));
+
+    let deleted = delete_slot(&h.http, "_slots/current-focus.md", &alice)
+        .await
+        .expect("delete");
+    assert_eq!(
+        deleted, landed,
+        "deleting the shared path must re-home to the operator's personal slot",
+    );
+    assert!(
+        !brief_slots(&h.http, &alice).await.contains(&landed),
+        "deleted personal slot must no longer appear in brief",
+    );
+}
+
+/// One operator must not be allowed to delete another operator's personal slot.
+#[tokio::test]
+async fn oidc_operator_cannot_delete_another_operators_personal_slot() {
+    let h = harness(true).await;
+    let alice = proxied("x-memory-actor-sub", ALICE_SUB);
+    let bob = proxied("x-memory-actor-sub", BOB_SUB);
+
+    let landed = write_slot(&h.http, "_slots/current-focus.md", "alice only", &alice)
+        .await
+        .expect("write");
+
+    let err = delete_slot(&h.http, &landed, &bob)
+        .await
+        .expect_err("Bob must not be able to delete Alice's personal slot");
+    assert!(
+        err.contains("another operator"),
+        "expected error mentioning another operator, got: {err}",
+    );
+    assert!(
+        brief_slots(&h.http, &alice).await.contains(&landed),
+        "Alice's slot must survive Bob's unauthorized delete attempt",
+    );
+}
+
+/// An operator can delete their own personal slot by its explicit namespaced path.
+#[tokio::test]
+async fn oidc_operator_can_delete_their_own_personal_slot_explicitly() {
+    let h = harness(true).await;
+    let alice = proxied("x-memory-actor-sub", ALICE_SUB);
+
+    let own = format!("_slots/{}/current-focus.md", sub_segment(ALICE_SUB));
+    write_slot(&h.http, &own, "alice only", &alice)
+        .await
+        .expect("write");
+    assert!(brief_slots(&h.http, &alice).await.contains(&own));
+
+    let deleted = delete_slot(&h.http, &own, &alice).await.expect("delete");
+    assert_eq!(deleted, own);
+    assert!(!brief_slots(&h.http, &alice).await.contains(&own));
+}
+
+/// An admin caller with root bearer can delete both shared slots and personal slots.
+#[tokio::test]
+async fn admin_can_delete_shared_and_personal_slots() {
+    let h = harness(true).await;
+    let alice = proxied("x-memory-actor-sub", ALICE_SUB);
+    let admin = [("authorization", "Bearer the-root-token")];
+
+    let alice_slot = write_slot(&h.http, "_slots/current-focus.md", "alice only", &alice)
+        .await
+        .expect("write");
+    assert!(brief_slots(&h.http, &alice).await.contains(&alice_slot));
+
+    // Admin can delete Alice's personal slot directly.
+    let deleted = delete_slot(&h.http, &alice_slot, &admin)
+        .await
+        .expect("admin delete alice slot");
+    assert_eq!(deleted, alice_slot);
+    assert!(!brief_slots(&h.http, &alice).await.contains(&alice_slot));
+
+    // Admin can also write and delete the project-wide shared slot without re-homing.
+    let shared = "_slots/current-focus.md";
+    write_slot(&h.http, shared, "shared slot body", &admin)
+        .await
+        .expect("admin write shared");
+    let deleted_shared = delete_slot(&h.http, shared, &admin)
+        .await
+        .expect("admin delete shared");
+    assert_eq!(deleted_shared, shared);
 }
