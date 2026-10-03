@@ -554,8 +554,12 @@ pub(crate) fn build_copilot_cli_script_hooks_config(
     for (copilot_event, our_event) in COPILOT_CLI_EVENTS {
         let bash_script = emit_root.join(format!("{our_event}.sh"));
         let powershell_script = emit_root.join(format!("{our_event}.ps1"));
+        // The `bash` field must keep a POSIX-compatible path even when
+        // `setup-agent` itself runs on Windows. Git Bash accepts `/c/...`,
+        // while a quoted `C:\\...` path would be parsed as escaped text.
+        let bash_path = to_git_bash_path(&bash_script.to_string_lossy());
         let bash = hook_command(
-            &bash_script,
+            Path::new(&bash_path),
             server_url,
             auth_token,
             HookCommandContext::new(HookCommandPlatform::Posix, "copilot-cli", None, None),
@@ -2913,7 +2917,21 @@ if (inheritOnly) {
 
     #[test]
     fn copilot_cli_script_hooks_cover_bash_and_powershell_without_exec() {
-        let root = PathBuf::from("/host/hooks/copilot-cli");
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\host\hooks\copilot-cli")
+        } else {
+            PathBuf::from("/host/hooks/copilot-cli")
+        };
+        let bash_root = if cfg!(windows) {
+            "/c/host/hooks/copilot-cli"
+        } else {
+            "/host/hooks/copilot-cli"
+        };
+        let powershell_root = if cfg!(windows) {
+            "C:/host/hooks/copilot-cli"
+        } else {
+            "/host/hooks/copilot-cli"
+        };
         let value = build_copilot_cli_script_hooks_config(
             &root,
             "https://memory.example",
@@ -2935,14 +2953,14 @@ if (inheritOnly) {
             );
             let bash = entry["bash"].as_str().expect("bash command");
             assert!(
-                bash.contains(&format!("/host/hooks/copilot-cli/{event}.sh")),
+                bash.contains(&format!("{bash_root}/{event}.sh")),
                 "{trigger}: {bash}"
             );
             assert!(bash.contains("copilot-cli"), "{trigger}: {bash}");
             let powershell = entry["powershell"].as_str().expect("PowerShell command");
             let program = decode_powershell_encoded_command(powershell).replace('\\', "/");
             assert!(
-                program.contains(&format!("/host/hooks/copilot-cli/{event}.ps1")),
+                program.contains(&format!("{powershell_root}/{event}.ps1")),
                 "{trigger}: {program}"
             );
             assert!(program.contains("copilot-cli"), "{trigger}: {program}");
