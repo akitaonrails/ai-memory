@@ -13,6 +13,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{PageId, PagePath, ProjectId, WorkspaceId};
 
+/// A declared internal source, never a verification receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NativeSessionEvidence {
+    /// A session anchored in the requested exact workspace/project tuple.
+    Session {
+        /// Canonical UUID string, bounded before parsing.
+        #[schemars(length(min = 36, max = 36))]
+        id: String,
+    },
+}
+
+impl NativeSessionEvidence {
+    /// Parse the closed source identifier without looking up private data.
+    ///
+    /// # Errors
+    /// Refuses oversized, noncanonical or nil identifiers.
+    pub fn session_id(&self) -> Result<crate::SessionId, crate::MemoryError> {
+        let Self::Session { id } = self;
+        if id.len() != 36 {
+            return Err(invalid_native_source());
+        }
+        let uuid = uuid::Uuid::parse_str(id).map_err(|_| invalid_native_source())?;
+        if uuid.is_nil() || uuid.to_string() != *id {
+            return Err(invalid_native_source());
+        }
+        Ok(crate::SessionId(uuid))
+    }
+}
+
+fn invalid_native_source() -> crate::MemoryError {
+    crate::MemoryError::MalformedRecord("invalid native source id".into())
+}
+
 /// Lifetime classification for a page.
 ///
 /// Adopted from agentmemory's four-tier model, simplified. See
@@ -480,6 +514,37 @@ impl FromStr for Tier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_session_source_dto_is_closed_and_canonical() {
+        let id = crate::SessionId::new().to_string();
+        let source: NativeSessionEvidence =
+            serde_json::from_value(serde_json::json!({"kind":"session","id":id})).unwrap();
+        assert_eq!(source.session_id().unwrap().to_string(), id);
+        for id in [
+            "bad".into(),
+            "00000000-0000-0000-0000-000000000000".into(),
+            "11111111-1111-1111-1111-11111111111A".into(),
+            "x".repeat(100_000),
+        ] {
+            let result = NativeSessionEvidence::Session { id: id.clone() }.session_id();
+            assert!(
+                result.is_err(),
+                "noncanonical or nil source must be refused"
+            );
+            let err = result.unwrap_err();
+            assert_eq!(err.to_string(), invalid_native_source().to_string());
+            assert!(!err.to_string().contains(&id));
+        }
+        for value in [
+            serde_json::json!({"kind":"page","id":id}),
+            serde_json::json!({"kind":"session","id":id,"authority":"root"}),
+            serde_json::json!({"kind":"session"}),
+            serde_json::json!({"kind":"session","id":1}),
+        ] {
+            assert!(serde_json::from_value::<NativeSessionEvidence>(value).is_err());
+        }
+    }
 
     #[test]
     fn tier_round_trips() {

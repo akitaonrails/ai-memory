@@ -18,6 +18,10 @@ for cross-session continuity.
   the operator or server configuration; never guess them from a directory name
   and never rely on the server's last active project.
 
+Exception: `memory_read_session_observations` with `native_source` requires
+explicit `workspace` and `project` together for every client, including
+session-aware clients.
+
 This rule applies only to project-scoped calls. For cross-project retrieval,
 `global=true` must omit `workspace`, `project`, and `scopes`. For a standing
 preference written with `scope: "global"`, omit `workspace` and `project`.

@@ -765,3 +765,323 @@ async fn mixed_capture_count_scopes_observations_and_preserves_owner_and_window(
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn native_session_source_capture_snapshot_rejects_inter_read_aba() {
+    use ai_memory_core::{AuthLevel, page::NativeSessionEvidence};
+    use ai_memory_store::SourceAuthorization;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn content_state(conn: &Connection) -> Vec<Vec<Vec<String>>> {
+        [
+            "pages",
+            "page_evidence",
+            "sessions",
+            "observations",
+            "workspaces",
+            "projects",
+            "project_grants",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |row| {
+                (0..columns)
+                    .map(|i| row.get_ref(i).map(|v| format!("{v:?}")))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        })
+        .collect()
+    }
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("snapshot-ws")
+        .await
+        .unwrap();
+    let pj = store
+        .writer
+        .get_or_create_project(ws, "snapshot-project", None)
+        .await
+        .unwrap();
+    let sid = SessionId::new();
+    let first = ai_memory_core::ObservationId::new();
+    let conn = Connection::open(store.db_path()).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "wal"
+    );
+    conn.execute("INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at) VALUES(?1,?2,?3,'codex',?4)", params![sid.as_bytes(), ws.as_bytes(), pj.as_bytes(), NOW]).unwrap();
+    for (oid, title, created) in [
+        (first, "first", NOW + 2),
+        (ai_memory_core::ObservationId::new(), "second", NOW + 1),
+    ] {
+        conn.execute("INSERT INTO observations(id,session_id,workspace_id,project_id,kind,title,body,importance,created_at) VALUES(?1,?2,?3,?4,'user-prompt',?5,'snapshot original',5,?6)", params![oid.as_bytes(), sid.as_bytes(), ws.as_bytes(), pj.as_bytes(), title, created]).unwrap();
+    }
+    let source = NativeSessionEvidence::Session {
+        id: sid.to_string(),
+    };
+    let caller = SourceAuthorization::from_auth(AuthLevel::Root, None, &ActorContext::default());
+    let before = content_state(&conn);
+    let control = store
+        .reader
+        .capture_native_session(ws, pj, source.clone(), caller.clone(), 2)
+        .await
+        .unwrap();
+    let control = store
+        .reader
+        .revalidate_native_session(control)
+        .await
+        .unwrap();
+    assert_eq!(
+        control
+            .iter()
+            .map(|row| row.title.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let observed_writes = writes.clone();
+    let path = store.db_path().to_path_buf();
+    let mut reader = store.reader.clone();
+    reader.native_capture_read_probe = Some(Arc::new(move || {
+        let writer = Connection::open(&path).unwrap();
+        assert_eq!(
+            writer
+                .execute(
+                    "UPDATE observations SET body='transient outside digest' WHERE id=?1",
+                    params![first.as_bytes()]
+                )
+                .unwrap(),
+            1
+        );
+        observed_writes.fetch_add(1, Ordering::SeqCst);
+    }));
+    let capture = reader
+        .capture_native_session(ws, pj, source.clone(), caller.clone(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "inter-read writer must actually commit"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT body FROM observations WHERE id=?1",
+            params![first.as_bytes()],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "transient outside digest"
+    );
+
+    // Restore the source before rechecking: the digest alone cannot detect this ABA.
+    assert_eq!(
+        conn.execute(
+            "UPDATE observations SET body='snapshot original' WHERE id=?1",
+            params![first.as_bytes()]
+        )
+        .unwrap(),
+        1
+    );
+    let records = reader.revalidate_native_session(capture).await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].title, "first");
+    assert_eq!(records[1].title, "second");
+    assert_eq!(
+        records[0].body, "snapshot original",
+        "capture must not hydrate an inter-read body absent from its digest"
+    );
+    assert_eq!(records[1].body, "snapshot original");
+    assert_eq!(content_state(&conn), before);
+
+    let control = store
+        .reader
+        .capture_native_session(ws, pj, source, caller, 2)
+        .await
+        .unwrap();
+    let control = store
+        .reader
+        .revalidate_native_session(control)
+        .await
+        .unwrap();
+    assert!(control.iter().all(|row| row.body == "snapshot original"));
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "probe is private to one reader handle"
+    );
+    assert_eq!(content_state(&conn), before);
+}
+
+#[tokio::test]
+async fn native_session_source_store_initial_authority_grant_and_recheck() {
+    use ai_memory_core::{AuthLevel, NewUser, UserRole, page::NativeSessionEvidence};
+    use ai_memory_store::SourceAuthorization;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    seed(store.db_path());
+    let conn = Connection::open(store.db_path()).unwrap();
+    let uid = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "alice".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let actor = ActorContext {
+        user: Some("alice".into()),
+        ..ActorContext::default()
+    };
+    let caller = SourceAuthorization::from_auth(AuthLevel::User, Some(uid), &actor);
+    let source = NativeSessionEvidence::Session {
+        id: session(10).to_string(),
+    };
+    let root = SourceAuthorization::from_auth(AuthLevel::Root, None, &ActorContext::default());
+    conn.execute("UPDATE projects SET access_mode='restricted'", [])
+        .unwrap();
+    let capture = store
+        .reader
+        .capture_native_session(ws(), proj_a(), source.clone(), root.clone(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .reader
+            .revalidate_native_session(capture)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        store
+            .reader
+            .capture_native_session(ws(), proj_a(), source.clone(), caller.clone(), 2)
+            .await
+            .is_err(),
+        "initial project grant required"
+    );
+    conn.execute("INSERT INTO project_grants(workspace_id,project_id,user_id,level,granted_at) VALUES(?1,?2,?3,'read',?4)",params![ws().as_bytes(),proj_a().as_bytes(),uid.as_bytes(),NOW]).unwrap();
+    let capture = store
+        .reader
+        .capture_native_session(ws(), proj_a(), source.clone(), caller.clone(), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .reader
+            .revalidate_native_session(capture)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    conn.execute("UPDATE projects SET access_mode='open'", [])
+        .unwrap();
+    for auth in [
+        SourceAuthorization::from_auth(AuthLevel::Anonymous, Some(uid), &actor),
+        SourceAuthorization::from_auth(AuthLevel::User, None, &actor),
+        SourceAuthorization::from_auth(AuthLevel::User, Some(uid), &ActorContext::default()),
+    ] {
+        assert!(
+            store
+                .reader
+                .capture_native_session(ws(), proj_a(), source.clone(), auth, 2)
+                .await
+                .is_err(),
+            "authority requires HTTP auth tier, viewer and canonical identity"
+        );
+    }
+    conn.execute("UPDATE projects SET access_mode='restricted'", [])
+        .unwrap();
+    let capture = store
+        .reader
+        .capture_native_session(ws(), proj_a(), source.clone(), caller, 2)
+        .await
+        .unwrap();
+    conn.execute("DELETE FROM project_grants", []).unwrap();
+    assert!(
+        store
+            .reader
+            .revalidate_native_session(capture)
+            .await
+            .is_err(),
+        "current grant required"
+    );
+    let capture = store
+        .reader
+        .capture_native_session(ws(), proj_a(), source, root, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .reader
+            .revalidate_native_session(capture)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn native_session_source_highwater_is_fixed_before_hydration() {
+    use ai_memory_core::{AuthLevel, page::NativeSessionEvidence};
+    use ai_memory_store::SourceAuthorization;
+    use std::sync::Arc;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    seed(store.db_path());
+    let path = store.db_path().to_path_buf();
+    let mut reader = store.reader.clone();
+    reader.native_capture_read_probe = Some(Arc::new(move || {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("INSERT INTO observations(id,session_id,workspace_id,project_id,kind,title,body,importance,created_at) VALUES(randomblob(16),?1,?2,?3,'session-end','append','new body',5,?4)",params![session(10).as_bytes(),ws().as_bytes(),proj_a().as_bytes(),NOW+500]).unwrap();
+        conn.execute(
+            "UPDATE sessions SET ended_at=?1 WHERE id=?2",
+            params![NOW + 500, session(10).as_bytes()],
+        )
+        .unwrap();
+    }));
+    let capture = reader
+        .capture_native_session(
+            ws(),
+            proj_a(),
+            NativeSessionEvidence::Session {
+                id: session(10).to_string(),
+            },
+            SourceAuthorization::from_auth(AuthLevel::Root, None, &ActorContext::default()),
+            2,
+        )
+        .await
+        .unwrap();
+    let rows = reader.revalidate_native_session(capture).await.unwrap();
+    assert_eq!(rows.len(), 2, "later rows cannot enter captured highwater");
+    assert_eq!(
+        rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
+        ["alpha prompt", "tool result"]
+    );
+    assert!(!rows.iter().any(|r| r.title == "append"));
+}
