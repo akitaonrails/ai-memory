@@ -135,6 +135,19 @@ pub(crate) fn sentinel_path(data_dir: &Path, cwd: &Path) -> PathBuf {
     data_dir.join("backfill-state").join(format!("{digest:x}"))
 }
 
+/// Idempotency key for one replayed item: the hex SHA-256 of the session id
+/// and a per-session discriminator. The server keeps only keys of 1–64 chars in
+/// `[A-Za-z0-9_-]` and silently drops the rest, so a raw `{sid}:{event_id}`
+/// would never dedupe a re-run.
+pub(crate) fn ingest_key(session_id: &str, discriminator: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(session_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(discriminator.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn write_sentinel(data_dir: &Path, cwd: &Path) {
     let path = sentinel_path(data_dir, cwd);
     if let Some(parent) = path.parent() {
@@ -495,7 +508,7 @@ async fn import_one(
         agent,
         "session-start",
         sid,
-        &format!("{sid}:session-start"),
+        &ingest_key(sid, "session-start"),
         None,
         serde_json::json!({ "session_id": sid, "occurred_at": resolved.earliest }),
     )?);
@@ -523,7 +536,7 @@ async fn import_one(
         agent,
         "session-end",
         sid,
-        &format!("{sid}:session-end"),
+        &ingest_key(sid, "session-end"),
         None,
         serde_json::json!({ "session_id": sid, "occurred_at": resolved.latest }),
     )?);
@@ -630,7 +643,7 @@ fn map_event(
         return None;
     }
     let role = event.role.as_deref().unwrap_or("");
-    let ingest_key = format!("{session_id}:{}", event.event_id);
+    let ingest_key = ingest_key(session_id, &event.event_id);
     match event.kind {
         WorkstreamEventKind::Message if role == "user" || role == "human" => Some(MappedEvent {
             event: "user-prompt".to_string(),
@@ -901,9 +914,38 @@ mod tests {
         assert_eq!(m.body["prompt"], "do the thing");
         assert_eq!(m.body["occurred_at"], "2026-09-10T12:00:00Z");
         assert_eq!(
-            m.ingest_key, "sid:evt-1",
+            m.ingest_key,
+            ingest_key("sid", "evt-1"),
             "ingest key is stable per source event"
         );
+    }
+
+    #[test]
+    fn ingest_keys_pass_the_server_validator_and_stay_distinct() {
+        // A real transcript event id: `native:<sha256 hex>`, too long and with a `:`.
+        let native = format!("native:{}", "a".repeat(64));
+        let mut ev = event(WorkstreamEventKind::Message, Some("user"), "hi");
+        ev.event_id = native.clone();
+        let mapped = map_event("11111111-2222-3333-4444-555555555555", &ev, None)
+            .expect("user message maps")
+            .ingest_key;
+        let start = ingest_key("sid", "session-start");
+        let end = ingest_key("sid", "session-end");
+        for key in [&mapped, &start, &end] {
+            assert!(
+                ai_memory_hooks::valid_ingest_key(key),
+                "the server must accept {key:?}"
+            );
+        }
+        assert_eq!(ingest_key("sid", &native), ingest_key("sid", &native));
+        assert_ne!(start, end, "distinct events get distinct keys");
+        assert_ne!(
+            ingest_key("sid-a", "evt-1"),
+            ingest_key("sid-b", "evt-1"),
+            "the same event id in another session gets its own key"
+        );
+        // The separator keeps `("ab", "c")` and `("a", "bc")` apart.
+        assert_ne!(ingest_key("ab", "c"), ingest_key("a", "bc"));
     }
 
     #[test]

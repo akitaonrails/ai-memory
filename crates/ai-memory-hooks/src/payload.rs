@@ -674,7 +674,7 @@ const MAX_OCCURRED_AT_FUTURE_SKEW_MICROS: i64 = 5 * 60 * 1_000_000;
 /// (1–64 ASCII alphanumerics, `-` or `_` — a UUID simple/hyphenated form
 /// fits). Anything else is treated as absent rather than rejected, so a
 /// malformed key degrades to today's at-least-once behavior instead of a 4xx.
-fn valid_ingest_key(key: &str) -> bool {
+pub fn valid_ingest_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 64
         && key

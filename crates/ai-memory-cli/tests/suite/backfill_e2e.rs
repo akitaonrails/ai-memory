@@ -298,4 +298,116 @@ mod slow {
 
         drop(server);
     }
+
+    /// Total observations in the latest completed session of the e2e project.
+    async fn latest_session_observations(client: &reqwest::Client, base: &str) -> u64 {
+        let text = call_tool(
+            client,
+            base,
+            "memory_read_session_observations",
+            json!({ "workspace": WORKSPACE, "project": PROJECT, "limit": 1 }),
+        )
+        .await;
+        let v: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("non-JSON session observations: {text}: {e}"));
+        v["total"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("missing total: {text}"))
+    }
+
+    /// `--force` bypasses the emptiness gate, so only the per-event ingest keys
+    /// stand between a re-run and a duplicated session: they must be keys the
+    /// server accepts, or every replayed observation lands twice.
+    #[tokio::test]
+    async fn forced_backfill_rerun_does_not_duplicate_observations() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let project = tempfile::tempdir().expect("project cwd");
+        let cwd = fs::canonicalize(project.path()).expect("canonicalize project cwd");
+
+        let session_id = "66666666-7777-8888-9999-000000000000";
+        let encoded = cwd.to_string_lossy().replace('/', "-");
+        let session_dir = home.path().join(".claude").join("projects").join(encoded);
+        fs::create_dir_all(&session_dir).expect("session dir");
+        write_jsonl(
+            &session_dir.join(format!("{session_id}.jsonl")),
+            &[
+                json!({ "sessionId": session_id, "cwd": cwd.to_string_lossy() }),
+                json!({
+                    "type": "user",
+                    "message": { "role": "user", "content": [{ "type": "text", "text": format!("Record the {UNIQUE} rerun.") }] },
+                }),
+                json!({
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": "Recorded." }],
+                    },
+                }),
+            ],
+        );
+
+        let client = reqwest::Client::new();
+        let (server, base) = start_serve(&client, &data_dir.path().join("serve.log"), |port| {
+            let mut cmd = hermetic(BIN);
+            cmd.args([
+                "serve",
+                "--transport",
+                "http",
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--workspace",
+                WORKSPACE,
+                "--project",
+                PROJECT,
+                "--no-watcher",
+            ])
+            .env("AI_MEMORY_DATA_DIR", data_dir.path())
+            .env("AI_MEMORY_HOME", home.path())
+            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
+            cmd.current_dir(&cwd);
+            cmd
+        })
+        .await;
+
+        let forced_backfill = || {
+            let report: Value = serde_json::from_str(&run_cli(
+                &[
+                    "backfill",
+                    "--workspace",
+                    WORKSPACE,
+                    "--project",
+                    PROJECT,
+                    "--force",
+                    "--json",
+                ],
+                data_dir.path(),
+                home.path(),
+                Some(&cwd),
+                &base,
+            ))
+            .expect("backfill --json report");
+            assert_eq!(
+                report["imported_sessions"], 1,
+                "--force must replay the planted session: {report}"
+            );
+        };
+
+        forced_backfill();
+        let first = latest_session_observations(&client, &base).await;
+        assert!(
+            first >= 4,
+            "start, prompt, reply and end must all import: {first}"
+        );
+
+        forced_backfill();
+        assert_eq!(
+            latest_session_observations(&client, &base).await,
+            first,
+            "a forced re-run must not duplicate any observation",
+        );
+        assert_eq!(session_count(&client, &base, WORKSPACE, PROJECT).await, 1);
+
+        drop(server);
+    }
 }
