@@ -35,11 +35,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use flate2::read::GzDecoder;
-use sha2::{Digest, Sha256};
 use tracing::info;
 
 use crate::cli::{AgentChoice, InstallHooksArgs, UpgradeArgs};
-use crate::commands::install_hooks;
+use crate::commands::{install_hooks, sha256_hex};
 use crate::config::Config;
 use crate::install_layout::{HOOKS_DIR_NAME, shipped_binary_name};
 
@@ -394,10 +393,6 @@ fn parse_sha256_sidecar(text: &str, expected_filename: &str) -> Result<String> {
         return Ok(hash.to_ascii_lowercase());
     }
     bail!("checksum sidecar contained no hash line");
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn extract_release_archive(bytes: &[u8], dest: &Path, asset: &str) -> Result<()> {

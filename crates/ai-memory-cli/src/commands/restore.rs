@@ -286,6 +286,8 @@ fn validate_restore_entry(path: &Path, entry_type: tar::EntryType) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::commands::sha256_hex;
 
     fn archive_with_entry(path: &str, entry_type: tar::EntryType) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -390,14 +392,6 @@ mod tests {
             err.to_string().contains("unexpected path"),
             "unexpected error for {path}: {err}"
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    fn sha256_hex(bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        format!("{:x}", hasher.finalize())
     }
 
     /// Whether the `tar` on PATH is GNU tar with sparse support, so the

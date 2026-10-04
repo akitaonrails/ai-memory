@@ -46,6 +46,7 @@ use ai_memory_workstream::{
 
 use super::doctor::{SCANNED_HARNESSES, relocated_session_dir};
 use super::run;
+use super::sha256_hex;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, post_json};
 
@@ -128,24 +129,18 @@ pub(crate) fn select_sessions(mut all: Vec<SessionRef>, max_sessions: usize) -> 
 /// worker (which inherits the hook's cwd) compute identically without resolving
 /// scope — so arbitrary paths stay path-safe.
 pub(crate) fn sentinel_path(data_dir: &Path, cwd: &Path) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(cwd.as_os_str().as_encoded_bytes());
-    let digest = hasher.finalize();
-    data_dir.join("backfill-state").join(format!("{digest:x}"))
+    data_dir
+        .join("backfill-state")
+        .join(sha256_hex(cwd.as_os_str().as_encoded_bytes()))
 }
 
 /// Idempotency key for one replayed item: the hex SHA-256 of the session id
 /// and a per-session discriminator. The server keeps only keys of 1–64 chars in
 /// `[A-Za-z0-9_-]` and silently drops the rest, so a raw `{sid}:{event_id}`
-/// would never dedupe a re-run.
+/// would never dedupe a re-run. The server forgets keys after 30 days, so a
+/// re-run past that window imports the session again.
 pub(crate) fn ingest_key(session_id: &str, discriminator: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(session_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(discriminator.as_bytes());
-    format!("{:x}", hasher.finalize())
+    sha256_hex(format!("{session_id}\0{discriminator}").as_bytes())
 }
 
 fn write_sentinel(data_dir: &Path, cwd: &Path) {
@@ -513,8 +508,10 @@ async fn import_one(
         serde_json::json!({ "session_id": sid, "occurred_at": resolved.earliest }),
     )?);
     let mut content = 0usize;
+    let mut last_event_id = "";
     for (event, occurred_at) in transcript.events.iter().zip(&resolved.per_event) {
         if let Some(mapped) = map_event(sid, event, occurred_at.as_deref()) {
+            last_event_id = &event.event_id;
             items.push(hook_item(
                 endpoint,
                 workspace,
@@ -536,13 +533,23 @@ async fn import_one(
         agent,
         "session-end",
         sid,
-        &ingest_key(sid, "session-end"),
+        &session_end_key(sid, content, last_event_id),
         None,
         serde_json::json!({ "session_id": sid, "occurred_at": resolved.latest }),
     )?);
 
     post_hook_items(endpoint, &items).await?;
     Ok(content)
+}
+
+/// The session-end key covers the content it closes: a session that grew since
+/// the last import gets a new end key, so the server re-ends it and consolidates
+/// the new events instead of acknowledging a completed key and skipping them.
+fn session_end_key(session_id: &str, content: usize, last_event_id: &str) -> String {
+    ingest_key(
+        session_id,
+        &format!("session-end\0{content}\0{last_event_id}"),
+    )
 }
 
 /// Per-event `occurred_at` resolution for one transcript, plus the session's
@@ -709,6 +716,11 @@ fn hook_item(
     source_event: Option<&str>,
     body: serde_json::Value,
 ) -> Result<HookItem> {
+    // The server treats a key it rejects as absent, which silently turns
+    // replay dedupe off; fail here instead.
+    if !ai_memory_hooks::valid_ingest_key(ingest_key) {
+        bail!("backfill built an ingest key the server would ignore: {ingest_key:?}");
+    }
     let mut url = reqwest::Url::parse(&endpoint.build_url("/hook"))
         .context("building the hook URL for backfill")?;
     {
@@ -750,7 +762,7 @@ async fn post_hook_items(endpoint: &ServerEndpoint, items: &[HookItem]) -> Resul
                 if stalled >= 5 {
                     bail!(
                         "server accepted none of a hook batch after {stalled} attempts \
-                         (rate limited or saturated); rerun to resume"
+                         (rate limited or saturated); rerun with --force to resume"
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(200 * u64::from(stalled))).await;
@@ -915,9 +927,47 @@ mod tests {
         assert_eq!(m.body["occurred_at"], "2026-09-10T12:00:00Z");
         assert_eq!(
             m.ingest_key,
-            ingest_key("sid", "evt-1"),
-            "ingest key is stable per source event"
+            sha256_hex(b"sid\0evt-1"),
+            "a source event's key is fixed, so a later export of it dedupes"
         );
+    }
+
+    #[test]
+    fn hook_item_refuses_a_key_the_server_would_drop() {
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:1".to_string()), None);
+        let item = |key: &str| {
+            hook_item(
+                &endpoint,
+                "ws",
+                "proj",
+                "claude-code",
+                "user-prompt",
+                "sid",
+                key,
+                None,
+                serde_json::json!({}),
+            )
+        };
+        assert!(item(&ingest_key("sid", "evt-1")).is_ok());
+        let err = item("sid:evt-1").expect_err("a `:` key must not be sent");
+        assert!(err.to_string().contains("ingest key"), "{err}");
+        assert!(
+            item(&"a".repeat(65)).is_err(),
+            "an over-long key must not be sent"
+        );
+    }
+
+    #[test]
+    fn session_end_key_changes_only_when_the_session_grows() {
+        let end = session_end_key("sid", 2, "evt-2");
+        assert_eq!(
+            end,
+            session_end_key("sid", 2, "evt-2"),
+            "same content re-ends once"
+        );
+        assert_ne!(end, session_end_key("sid", 3, "evt-3"), "new events re-end");
+        assert_ne!(end, session_end_key("sid", 2, "evt-3"));
+        assert_ne!(end, session_end_key("other", 2, "evt-2"));
     }
 
     #[test]
@@ -930,14 +980,13 @@ mod tests {
             .expect("user message maps")
             .ingest_key;
         let start = ingest_key("sid", "session-start");
-        let end = ingest_key("sid", "session-end");
+        let end = session_end_key("sid", 1, &native);
         for key in [&mapped, &start, &end] {
             assert!(
                 ai_memory_hooks::valid_ingest_key(key),
                 "the server must accept {key:?}"
             );
         }
-        assert_eq!(ingest_key("sid", &native), ingest_key("sid", &native));
         assert_ne!(start, end, "distinct events get distinct keys");
         assert_ne!(
             ingest_key("sid-a", "evt-1"),

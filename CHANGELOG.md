@@ -12,13 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
-- Fixed `ai-memory backfill` duplicating every imported observation when run
-  again with `--force` or resumed after a partially accepted batch. Its
+- Fixed `ai-memory backfill --force` duplicating every imported observation
+  when run again, including to resume after a partially accepted batch. Its
   per-event ingest keys (`{session}:{event}`) were longer than 64 characters or
   contained `:`, so the server silently dropped them and never deduplicated a
-  replay; each key is now a 64-character SHA-256 of the session and event.
-  Observations already duplicated stay as they are, and the first re-run after
-  upgrading still duplicates once, since the old keys were never stored. (#NNN)
+  replay; each key is now a 64-character SHA-256 of the session and event, and
+  backfill refuses to send a key the server would ignore. A session that grew
+  since its last import gets a new session-end, so its new events are still
+  consolidated. The server keeps ingest keys for 30 days, so a re-run after
+  that imports the session again. Observations already duplicated stay as they
+  are, and the first re-run after upgrading still duplicates once, since the
+  old keys were never stored. The rate-limit error now says to rerun with
+  `--force`, since a plain rerun skips the partly imported project. (#1091)
 - Fixed `memory_handoff_list` MCP tool calls being counted under writes in
   `client_activity`: the read-only inspection tool is now classified as a read
   in `tool_call_is_write`. (#1088)

@@ -329,23 +329,22 @@ mod slow {
         let encoded = cwd.to_string_lossy().replace('/', "-");
         let session_dir = home.path().join(".claude").join("projects").join(encoded);
         fs::create_dir_all(&session_dir).expect("session dir");
-        write_jsonl(
-            &session_dir.join(format!("{session_id}.jsonl")),
-            &[
-                json!({ "sessionId": session_id, "cwd": cwd.to_string_lossy() }),
-                json!({
-                    "type": "user",
-                    "message": { "role": "user", "content": [{ "type": "text", "text": format!("Record the {UNIQUE} rerun.") }] },
-                }),
-                json!({
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{ "type": "text", "text": "Recorded." }],
-                    },
-                }),
-            ],
-        );
+        let transcript = session_dir.join(format!("{session_id}.jsonl"));
+        let mut lines = vec![
+            json!({ "sessionId": session_id, "cwd": cwd.to_string_lossy() }),
+            json!({
+                "type": "user",
+                "message": { "role": "user", "content": [{ "type": "text", "text": format!("Record the {UNIQUE} rerun.") }] },
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "Recorded." }],
+                },
+            }),
+        ];
+        write_jsonl(&transcript, &lines);
 
         let client = reqwest::Client::new();
         let (server, base) = start_serve(&client, &data_dir.path().join("serve.log"), |port| {
@@ -407,6 +406,23 @@ mod slow {
             "a forced re-run must not duplicate any observation",
         );
         assert_eq!(session_count(&client, &base, WORKSPACE, PROJECT).await, 1);
+
+        // The session resumed and grew: the new reply imports, and so does a new
+        // session-end, which is what queues consolidation of that reply.
+        lines.push(json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "Recorded again after resuming." }],
+            },
+        }));
+        write_jsonl(&transcript, &lines);
+        forced_backfill();
+        assert_eq!(
+            latest_session_observations(&client, &base).await,
+            first + 2,
+            "a grown session imports its new event and re-ends exactly once",
+        );
 
         drop(server);
     }

@@ -138,6 +138,12 @@ pub(crate) fn humanize_age_secs(seconds: i64) -> String {
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
 }
 
+/// Lowercase hex SHA-256 of `bytes`.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 /// `AI_MEMORY_IGNORE_MARKER=1` skips rung 2 entirely.
 pub(crate) fn resolve_scope(
     config: &Config,
