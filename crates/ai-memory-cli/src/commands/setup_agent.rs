@@ -294,9 +294,9 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
             "opencode",
         ),
         AgentChoice::OpenCode2 => (
-            "OpenCode 2",
+            "OpenCode V2",
             "opencode2",
-            "Then restart OpenCode 2 so it loads ~/.config/opencode/plugins/ai-memory-opencode2.ts.",
+            "Then restart OpenCode so it loads ~/.config/opencode/plugins/ai-memory.ts.",
             "opencode2",
         ),
         AgentChoice::Omp => (

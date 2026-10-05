@@ -74,7 +74,7 @@ fi
 if [[ "$AGENT" == "opencode2" ]]; then
     echo "OpenCode 2 uses a generated TypeScript plugin, not shell hook scripts."
     echo "Run: ai-memory install-hooks --agent opencode2 --apply"
-    echo "Then restart OpenCode 2 so it loads ~/.config/opencode/plugins/ai-memory-opencode2.ts."
+    echo "Then restart OpenCode so it loads ~/.config/opencode/plugins/ai-memory.ts."
     exit 0
 fi
 

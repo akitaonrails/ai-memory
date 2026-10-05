@@ -16,9 +16,9 @@ pub enum ManagedHarness {
     Codex,
     /// OpenCode.
     OpenCode,
-    /// OpenCode 2.0 beta (`opencode2` binary, side-by-side with v1).
-    /// Shares v1's config dir, session store, and agent kind; only the
-    /// launched executable differs.
+    /// OpenCode V2 compatibility adapter. It shares the canonical `opencode`
+    /// executable and public agent kind with V1; only its plugin, MCP, and
+    /// transcript contracts differ.
     OpenCode2,
     /// Pi coding agent.
     Pi,
@@ -95,8 +95,7 @@ impl ManagedHarness {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::OpenCode2 => "opencode2",
+            Self::OpenCode | Self::OpenCode2 => "opencode",
             Self::Pi => "pi",
             Self::Crush => "crush",
             Self::Omp => "omp",
@@ -120,8 +119,7 @@ impl ManagedHarness {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::OpenCode2 => "opencode2",
+            Self::OpenCode | Self::OpenCode2 => "opencode",
             Self::Pi => "pi",
             Self::Crush => "crush",
             Self::Omp => "omp",
@@ -628,8 +626,7 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "db",
         ]
         .as_slice(),
-        // Beta subcommands, verified on `opencode2 v0.0.0-beta-18999`
-        // (`opencode2 --help`). `run` stays session-bearing (see
+        // V2 subcommands. `run` stays session-bearing (see
         // `noninteractive_invocation`); `mini` is the minimal interactive
         // UI and also stays session-bearing.
         ManagedHarness::OpenCode2 => [
@@ -1498,8 +1495,8 @@ fn environment_session_dir_with(
     match harness {
         ManagedHarness::Claude => value("CLAUDE_CONFIG_DIR").map(|dir| dir.join("projects")),
         ManagedHarness::Codex => value("CODEX_HOME").map(|dir| dir.join("sessions")),
-        // The beta channel keeps v1's `opencode.db` filename (other channels
-        // get `opencode-<channel>.db`), so both harnesses share one store.
+        // OpenCode V1 and V2 keep the same `opencode.db` filename, so both
+        // transcript adapters resolve the same store root.
         ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => {
             value("XDG_DATA_HOME").map(|dir| dir.join("opencode"))
         }
@@ -1718,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode2_shares_v1_session_contract_with_its_own_binary() {
+    fn opencode2_alias_uses_v2_contract_with_the_canonical_binary() {
         for name in ["opencode2", "opencode-v2", "open-code2"] {
             assert_eq!(
                 ManagedHarness::from_name(name),
@@ -1726,10 +1723,10 @@ mod tests {
             );
         }
         let beta = ManagedHarness::OpenCode2;
-        // Same store, same kind, same flags — only the executable differs,
-        // so `run opencode2` resumes v1 sessions and vice versa.
-        assert_eq!(beta.executable(), "opencode2");
-        assert_eq!(beta.as_str(), "opencode2");
+        // Both generations share one executable and public identity. The
+        // adapter difference is limited to the plugin/MCP/transcript contracts.
+        assert_eq!(beta.executable(), "opencode");
+        assert_eq!(beta.as_str(), "opencode");
         assert_eq!(beta.agent_kind(), AgentKind::OpenCode);
         assert_eq!(ManagedHarness::OpenCode.agent_kind(), AgentKind::OpenCode);
 

@@ -201,7 +201,7 @@ The mode is stored per install rather than per agent, and a later bare
 `install-hooks --apply` (including an upgrade refresh) leaves it in place.
 
 It is enforced both by native `ai-memory hook` commands and by the generated
-TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`, `openclaw`) —
+TypeScript integrations (`pi`, `omp`, version-detected `opencode`, `openclaw`) —
 each bakes the selected mode in and carries the same marker-presence gate
 before it ever POSTs. Only the raw script-fallback paths (the
 `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper, and
@@ -292,7 +292,7 @@ names the profile; no URL, path or token is printed.
 **Supported integrations.** Native `ai-memory hook` commands route profiles,
 including the session-start handoff fetch, the spooled events drained later,
 and the one-time boot backfill. The generated TypeScript integrations
-(`opencode`, `opencode2`, `omp`, `pi`, `openclaw`) do not route yet: a
+(`opencode`, `omp`, `pi`, `openclaw`) do not route yet: a
 repository whose marker selects a profile emits nothing from them and fetches
 no handoff. The script hooks (the `.sh` and `.ps1` bundles used by the
 `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper and `setup-agent`

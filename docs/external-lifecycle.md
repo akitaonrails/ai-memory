@@ -23,7 +23,7 @@ Harness
 ```
 
 Updated native hook commands, POSIX/PowerShell hook bundles, and generated
-OpenCode/OpenCode 2/OMP/Pi/OpenClaw integrations honor the variable. Reapply
+OpenCode (V1/V2)/OMP/Pi/OpenClaw integrations honor the variable. Reapply
 `install-hooks` after upgrading to refresh staged scripts or generated code.
 Older installations do not understand this context.
 

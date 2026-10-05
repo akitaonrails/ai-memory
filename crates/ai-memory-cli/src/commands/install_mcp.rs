@@ -50,12 +50,23 @@ enum JsonMcpLocation {
     RootMcpServersSnake,
 }
 
+fn resolved_opencode_client(client: McpClient) -> Result<McpClient> {
+    if client != McpClient::OpenCode {
+        return Ok(client);
+    }
+    match super::opencode_compat::detect(std::ffi::OsStr::new("opencode"))? {
+        super::opencode_compat::OpenCodeGeneration::V1 => Ok(McpClient::OpenCode),
+        super::opencode_compat::OpenCodeGeneration::V2 => Ok(McpClient::OpenCode2),
+    }
+}
+
 /// Run the `install-mcp` subcommand.
 ///
 /// # Errors
 /// Returns an error if JSON serialisation fails (should never happen
 /// for our handcrafted values).
-pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
+pub fn run(config: &Config, mut args: InstallMcpArgs) -> Result<()> {
+    args.client = resolved_opencode_client(args.client)?;
     let server_url = effective_mcp_server_url(config, &args);
     let args = InstallMcpArgs {
         server_url: Some(server_url),
@@ -187,10 +198,9 @@ pub(crate) fn mcp_config_path_with(
             .join("opencode")
             .join("opencode.json"),
         // V2 reads the same global config file (`opencode.json(c)`); its
-        // `mcp.servers` key coexists with v1's `mcp` key in one strict-JSON
-        // file, so both binaries stay wired side by side. Users who keep
-        // comments in `opencode.jsonc` should pass it via `--config-file`
-        // (`mutate_json` refuses to rewrite non-strict JSON).
+        // `mcp.servers` key coexists with V1's `mcp` key in one strict-JSON
+        // file. Users who keep comments in `opencode.jsonc` should pass it via
+        // `--config-file` (`mutate_json` refuses to rewrite non-strict JSON).
         McpClient::OpenCode2 => home()?
             .join(".config")
             .join("opencode")
@@ -929,10 +939,10 @@ fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> 
     Ok(serde_json::Value::Object(entry))
 }
 
-/// OpenCode 2.0 beta MCP entry: `type: "remote"` + `url` + optional
+/// OpenCode V2 MCP entry: `type: "remote"` + `url` + optional
 /// `headers` under `mcp.servers`. V2 has no `enabled` field (servers
 /// connect unless `disabled: true`), and header-credentialed servers
-/// must set `oauth: false` so the beta does not attempt OAuth discovery
+/// must set `oauth: false` so OpenCode does not attempt OAuth discovery
 /// against ai-memory's local endpoint
 /// (https://opencode.ai/v2/docs/mcp-servers).
 fn build_mcp_entry_opencode2(args: &InstallMcpArgs) -> Result<serde_json::Value> {
@@ -1264,13 +1274,12 @@ fn render_opencode(args: &InstallMcpArgs) -> Result<String> {
 
 fn render_opencode2(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
-        "# OpenCode 2.0 beta (`opencode2`) — merge into\n\
+        "# OpenCode V2 (`opencode2` compatibility selector) — merge into\n\
          # ~/.config/opencode/opencode.json(c) under \"mcp\" → \"servers\":\n\
          #\n\
-         # V2 nests servers under `mcp.servers` (v1 used top-level `mcp`)\n\
-         # and has no `enabled` field. Both keys coexist in the one file,\n\
-         # so v1 and the beta stay wired side by side. If your config is\n\
-         # `opencode.jsonc` with comments, re-run with\n\
+         # V2 nests servers under `mcp.servers` (V1 used top-level `mcp`)\n\
+         # and has no `enabled` field. If your config is `opencode.jsonc`\n\
+         # with comments, re-run with\n\
          # `--config-file ~/.config/opencode/opencode.jsonc`.\n\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
@@ -1660,7 +1669,7 @@ mod tests {
         assert!(root["mcp"]["servers"]["ai-memory"].is_object());
         assert!(root.get("mcpServers").is_none());
 
-        // v1 still lands under top-level `mcp`, so both stay wired.
+        // V1 still lands under top-level `mcp`.
         let mut v1 = serde_json::Map::new();
         upsert_json_mcp_entry(&mut v1, &args_with_token(McpClient::OpenCode)).unwrap();
         assert!(v1["mcp"]["ai-memory"].is_object());

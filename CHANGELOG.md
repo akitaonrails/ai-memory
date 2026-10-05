@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider. (#1026)
 
 ### Fixed
+- Fixed `ai-memory run opencode` installing an incompatible plugin after an
+  OpenCode major-version change. The canonical command now probes the installed
+  executable before launch and transparently selects the matching V1 or V2
+  plugin API, MCP schema, and transcript adapter; generated duplicate plugin
+  files are removed safely while user-owned files are refused. (#1097)
 - Fixed `memory_handoff_list` MCP tool calls being counted under writes in
   `client_activity`: the read-only inspection tool is now classified as a read
   in `tool_call_is_write`. (#1088)

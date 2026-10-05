@@ -3261,15 +3261,13 @@ fn opencode_directories(cwd: &Path) -> (String, String) {
     (native, forward)
 }
 
-/// OpenCode 2.0 beta transcript adapter.
+/// OpenCode V2 transcript adapter.
 ///
-/// The beta keeps v1's database file but replaced its tables: `session_v2`
-/// carries sessions, `session_message` carries typed messages. Shapes below
-/// were verified against beta-18999: user `{text, files}`, assistant
-/// `content[]` with `text` / `tool` / `reasoning` parts. Reasoning content
-/// is encrypted and excluded like v1's hidden reasoning; anything else
-/// unrecognized becomes a bounded loss, never a guess — the beta schema is
-/// still changing.
+/// V2 keeps V1's database file but uses `session_v2` for sessions and
+/// `session_message` for typed messages. User messages contain `{text, files}`;
+/// assistant messages contain `content[]` with `text` / `tool` / `reasoning`
+/// parts. Reasoning content is encrypted and excluded like V1's hidden
+/// reasoning; anything else unrecognized becomes a bounded loss, never a guess.
 fn export_opencode2(
     home: &Path,
     session_dir: Option<&Path>,

@@ -373,10 +373,11 @@ pub enum RunHarnessChoice {
     Claude,
     /// OpenAI Codex CLI.
     Codex,
-    /// OpenCode.
+    /// OpenCode. The installed executable is probed and the matching V1 or V2
+    /// integration is selected automatically.
     #[value(name = "opencode", alias = "open-code")]
     OpenCode,
-    /// OpenCode 2.0 beta (`opencode2` binary, side-by-side with v1).
+    /// Compatibility spelling that explicitly selects the OpenCode V2 adapter.
     #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
     OpenCode2,
     /// Pi coding agent.
@@ -1972,9 +1973,9 @@ pub enum AgentChoice {
     Cursor,
     /// Google Gemini CLI — JSON-config hooks in `~/.gemini/settings.json`.
     GeminiCli,
-    /// OpenCode (open-source coding agent) — TypeScript plugin hooks
-    /// under `~/.config/opencode/plugins/`. `--apply` writes the plugin
-    /// file directly; restart OpenCode for it to load.
+    /// OpenCode — detects the installed major version and writes its matching
+    /// TypeScript plugin under `~/.config/opencode/plugins/`. Restart OpenCode
+    /// for the plugin to load.
     ///
     /// The `opencode` (no hyphen) alias matches both the staged hook
     /// dir on disk (`~/.local/share/ai-memory/hooks/opencode/`) and
@@ -1983,11 +1984,9 @@ pub enum AgentChoice {
     /// them straight to `--agent`, which used to fail on this one.
     #[value(alias = "opencode")]
     OpenCode,
-    /// OpenCode 2.0 beta (`opencode2`, side-by-side with v1) — TypeScript
-    /// plugin hooks under `~/.config/opencode/plugins/` using the V2
-    /// `{ id, setup }` plugin shape. `--apply` writes `ai-memory-opencode2.ts`
-    /// directly; restart OpenCode 2 for it to load. Shares v1's config
-    /// dir, session store, and agent kind.
+    /// Compatibility spelling that explicitly selects OpenCode's V2
+    /// `{ id, setup }` plugin API. It writes the canonical `ai-memory.ts`
+    /// plugin and shares the normal OpenCode config, store, and agent kind.
     #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
     OpenCode2,
     /// Real Pi coding agent. The generated TypeScript extension provides
@@ -2251,15 +2250,13 @@ pub enum McpClient {
     ClaudeCode,
     /// OpenAI Codex CLI — `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`).
     Codex,
-    /// OpenCode — `opencode.json`. Accepts `opencode` (no hyphen) as
-    /// an alias for symmetry with `AgentChoice` and the on-disk
-    /// hook-staging dir name.
+    /// OpenCode — detects the installed major version and writes the matching
+    /// MCP shape to `opencode.json`. Accepts `opencode` as an alias.
     #[value(alias = "opencode")]
     OpenCode,
-    /// OpenCode 2.0 beta (`opencode2`) — `opencode.jsonc`, nested
-    /// `mcp.servers` map with `type: "remote"` + `url` + `headers`.
-    /// V2 drops v1's `enabled` field and disables OAuth discovery for
-    /// header-credentialed servers via `oauth: false`.
+    /// Compatibility spelling that explicitly selects OpenCode V2's nested
+    /// `mcp.servers` shape. V2 omits `enabled` and uses `oauth: false` for
+    /// header-credentialed servers.
     #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
     OpenCode2,
     /// Cursor IDE — `~/.cursor/mcp.json` or `.cursor/mcp.json`.

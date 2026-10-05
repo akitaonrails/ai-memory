@@ -64,9 +64,14 @@ pub(crate) fn autowire_state_dir(data_dir: &Path) -> PathBuf {
 /// own first launch.
 fn sentinel_path(data_dir: &Path, agent: AgentChoice, targets: &[String]) -> PathBuf {
     let digest = format!("{:x}", Sha256::digest(targets.join("\n").as_bytes()));
+    let integration = match agent {
+        AgentChoice::OpenCode => "open-code-v1",
+        AgentChoice::OpenCode2 => "open-code-v2",
+        _ => agent.kind().as_str(),
+    };
     let name = format!(
         "{}-{}-{}",
-        agent.kind().as_str(),
+        integration,
         env!("CARGO_PKG_VERSION"),
         &digest[..16]
     );
@@ -519,6 +524,11 @@ mod tests {
         let claude = sentinel_path(dir, AgentChoice::ClaudeCode, &targets("/a/settings.json"));
         let codex = sentinel_path(dir, AgentChoice::Codex, &targets("/a/settings.json"));
         assert_ne!(claude, codex, "different agents get distinct sentinels");
+        assert_ne!(
+            sentinel_path(dir, AgentChoice::OpenCode, &targets("/a/ai-memory.ts")),
+            sentinel_path(dir, AgentChoice::OpenCode2, &targets("/a/ai-memory.ts")),
+            "an OpenCode major-version change must force auto-wire to run again"
+        );
         assert_eq!(
             claude,
             sentinel_path(dir, AgentChoice::ClaudeCode, &targets("/a/settings.json")),
@@ -1083,7 +1093,7 @@ mod tests {
             (AgentChoice::OpenCode, install_hooks::opencode_plugin_path()),
             (
                 AgentChoice::OpenCode2,
-                install_hooks::opencode2_plugin_path(),
+                install_hooks::opencode_plugin_path(),
             ),
             (AgentChoice::Pi, install_hooks::pi_extension_path()),
             (AgentChoice::Omp, install_hooks::omp_extension_path(None)),

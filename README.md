@@ -113,8 +113,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Codex | Supported |
 | Command Code | Supported |
 | Devin CLI | Supported |
-| OpenCode | Supported |
-| OpenCode 2 (`opencode2` beta) | Supported |
+| OpenCode (V1 and V2, auto-detected) | Supported |
 | Cursor | Supported |
 | Gemini CLI | Supported |
 | Oh My Pi / OMP | Supported |
