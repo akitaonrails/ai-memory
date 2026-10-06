@@ -1,6 +1,6 @@
 //! [`AiMemoryServer`] — the MCP server skeleton + tool router.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -5491,30 +5491,43 @@ impl ServerHandler for AiMemoryServer {
 }
 
 /// Tool input-schema dialect served for one `tools/list`, ordered by
-/// strictness: each variant applies every rewrite of the one before it, plus
-/// its own. That ordering is what lets the operator's configured floor and a
-/// request's `?flavor=` marker combine with a plain `max`.
+/// strictness: the operator's configured floor and a request's `?flavor=`
+/// marker combine with a plain `max`, and the winning dialect's rewrite set
+/// applies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum SchemaDialect {
     /// The schemas `schemars` generated, verbatim.
     #[default]
     Upstream,
-    /// Root-level `anyOf`/`oneOf`/`allOf` stripped (Moonshot, Bedrock).
+    /// Root-level `anyOf`/`oneOf`/`allOf` stripped (Bedrock).
     RootCombinators,
-    /// Also collapses the nullable unions `Option<T>` produces into Google's
-    /// single-`type` plus `nullable` form (Gemini / Vertex).
+    /// [`RootCombinators`], plus every `#/$defs/*` reference inlined and the
+    /// emptied `$defs` table dropped (Moonshot). Moonshot's validator never
+    /// resolves `$ref` and fails the request with "detected infinite
+    /// recursion", so no reference may survive at any depth; nested
+    /// combinators stay inline, which Moonshot accepts.
+    FlatDefs,
+    /// [`RootCombinators`], plus the nullable-union collapses in
+    /// [`gemini_safe_schema`] (Gemini / Vertex). Deliberately *not*
+    /// [`FlatDefs`]: Vertex accepts `$defs`/`$ref`, and the schemas Gemini
+    /// CLI already ships keep them, so reference-flattening is out of
+    /// scope there.
     GeminiSafe,
 }
 
 /// Bedrock and Moonshot reject root-level
 /// `anyOf`/`oneOf`/`allOf` in tool parameter schemas with a 400 at
-/// `tools/list` time. Kimi's legacy `?flavor=moonshot` and Kiro's
-/// `?flavor=bedrock` both get schemas with those root keys stripped;
-/// nested combinators stay, and runtime validation remains unchanged.
-/// [`SchemaDialect::GeminiSafe`] strips the same root keys and additionally
-/// rewrites every subschema through [`gemini_safe_schema`].
+/// `tools/list` time. Kiro's `?flavor=bedrock` gets schemas with those root
+/// keys stripped; Moonshot's `?flavor=moonshot` gets
+/// [`SchemaDialect::FlatDefs`], which additionally inlines every `$ref` (its
+/// validator rejects references at any depth, not just combinators at the
+/// root). Runtime validation remains unchanged in both dialects.
+/// [`SchemaDialect::GeminiSafe`] strips the same root keys — and keeps
+/// `$defs`/`$ref` by design — while additionally rewriting every subschema
+/// through [`gemini_safe_schema`].
 fn restricted_schema_tool_list(tools: Vec<Tool>, dialect: SchemaDialect) -> Vec<Tool> {
     const ROOT_COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
+    let inline_defs = dialect == SchemaDialect::FlatDefs;
     let gemini_safe = dialect >= SchemaDialect::GeminiSafe;
     tools
         .into_iter()
@@ -5522,12 +5535,15 @@ fn restricted_schema_tool_list(tools: Vec<Tool>, dialect: SchemaDialect) -> Vec<
             let has_root_combinator = ROOT_COMBINATORS
                 .iter()
                 .any(|key| tool.input_schema.contains_key(*key));
-            if !has_root_combinator && !gemini_safe {
+            if !has_root_combinator && !inline_defs && !gemini_safe {
                 return tool;
             }
             let mut schema = (*tool.input_schema).clone();
             for key in ROOT_COMBINATORS {
                 schema.shift_remove(key);
+            }
+            if inline_defs {
+                inline_schema_defs(&mut schema);
             }
             if gemini_safe {
                 gemini_safe_schema(&mut schema);
@@ -5536,6 +5552,192 @@ fn restricted_schema_tool_list(tools: Vec<Tool>, dialect: SchemaDialect) -> Vec<
             tool
         })
         .collect()
+}
+
+/// Inline every local `#/$defs/*` reference and drop the emptied `$defs`
+/// table, recursively through the whole input schema.
+///
+/// Moonshot's "moonshot flavored json schema" validator never resolves
+/// `$ref`: any reference — at the root or nested five levels deep — fails
+/// the whole request with "detected infinite recursion without termination
+/// condition". Codex forwards MCP input schemas into Responses
+/// `tools.function.parameters` verbatim, so a served `$defs`/`$ref` pair
+/// 400s every model call even though the referenced subschema would be
+/// valid inline. Nested combinators themselves are fine (inline `anyOf` /
+/// `oneOf` pass), so only the references are rewritten. Sibling keys on the
+/// `$ref` object win over the definition's own, mirroring
+/// [`flatten_sibling_combinator`]'s parent-wins rule. Definitions that
+/// reference each other resolve over successive passes. References that can
+/// never finish — a missing name, or a definition whose expansion closure
+/// references itself — are left untouched, and the `$defs` table is kept
+/// whenever any `$ref` survives, so nothing dangles without its table. The
+/// table itself is never rewritten: only the live schema is walked, because
+/// the table's own interior dies with it once dropped and expanding it would
+/// only spend budget (and nest cycle copies into a kept table).
+fn inline_schema_defs(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    const PASS_BUDGET: usize = 32;
+    /// Cap on total `$ref` replacements across one schema. Every replacement
+    /// splices in one definition body, so the output is bounded by
+    /// `initial nodes + EXPANSION_BUDGET × largest def` even when a wide
+    /// acyclic fan-in (every branch of every combinator referencing the same
+    /// names) would otherwise multiply the schema on each pass. Once the
+    /// budget is spent the remaining references stay as `$ref`s and the
+    /// table is kept, exactly like a dangling name. The fixed tool schemas
+    /// inline a handful of references each; the cap is defense, not a limit
+    /// any real schema approaches.
+    const EXPANSION_BUDGET: usize = 1_000;
+
+    let Some(defs) = schema
+        .get("$defs")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+    else {
+        return;
+    };
+    let unresolvable = cyclic_def_names(&defs);
+    let table = schema.shift_remove("$defs");
+    let mut root = serde_json::Value::Object(std::mem::take(schema));
+    let mut all_resolved = false;
+    let mut budget = EXPANSION_BUDGET;
+    for _ in 0..PASS_BUDGET {
+        let (replaced, pending) = resolve_def_pass(&mut root, &defs, &unresolvable, &mut budget);
+        all_resolved = !pending;
+        if !replaced {
+            break;
+        }
+    }
+    if let serde_json::Value::Object(mut map) = root {
+        if !all_resolved && let Some(table) = table {
+            map.insert("$defs".to_string(), table);
+        }
+        *schema = map;
+    }
+}
+
+/// Definition names whose expansion closure references itself, directly or
+/// transitively. Such a definition can never inline to a `$ref`-free schema:
+/// every expansion re-introduces the very reference that pulled it in, so
+/// pass after pass would nest another copy of the body until the pass budget
+/// stops the loop with the schema mutated into deeply nested junk. They are
+/// marked once up front from a reference graph over the table (one bounded
+/// scan per definition) and every reference to one is treated exactly like a
+/// dangling name — left as a `$ref`, with the table kept because that
+/// reference survives.
+fn cyclic_def_names(defs: &serde_json::Map<String, serde_json::Value>) -> HashSet<String> {
+    let graph: HashMap<&str, Vec<&str>> = defs
+        .iter()
+        .map(|(name, definition)| (name.as_str(), referenced_def_names(definition, defs)))
+        .collect();
+    let mut cyclic = HashSet::new();
+    for name in defs.keys() {
+        // `name` is cyclic iff it is reachable from its own edges; the
+        // visited set keeps each walk linear and impossible to trap.
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = graph
+            .get(name.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        while let Some(current) = stack.pop() {
+            if current == name.as_str() {
+                cyclic.insert(name.clone());
+                break;
+            }
+            if visited.insert(current) {
+                stack.extend(graph.get(current).into_iter().flatten().copied());
+            }
+        }
+    }
+    cyclic
+}
+
+/// The `#/$defs/<name>` targets referenced anywhere inside one definition,
+/// filtered to names the table actually defines. One iterative walk per
+/// definition — the explicit stack keeps a deeply nested body from
+/// overflowing the call stack.
+fn referenced_def_names<'a>(
+    definition: &'a serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<&'a str> {
+    let mut refs = Vec::new();
+    let mut stack = vec![definition];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::Object(map) => {
+                if let Some(reference) = map.get("$ref").and_then(serde_json::Value::as_str)
+                    && let Some(name) = reference.strip_prefix("#/$defs/")
+                    && defs.contains_key(name)
+                {
+                    refs.push(name);
+                }
+                stack.extend(map.values());
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    refs
+}
+
+/// One sweep replacing every resolvable `#/$defs/*` reference. Returns
+/// whether any replacement happened and whether any local `$ref` is still
+/// present afterwards (`true` means the inlined payloads may have pulled in
+/// further references, so another sweep is due; a still-pending reference —
+/// dangling, cyclic, or past the expansion budget — keeps the `$defs` table
+/// so nothing dangles).
+fn resolve_def_pass(
+    node: &mut serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    unresolvable: &HashSet<String>,
+    budget: &mut usize,
+) -> (bool, bool) {
+    let mut replaced = false;
+    let mut pending = false;
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(reference) = map.get("$ref").and_then(serde_json::Value::as_str) {
+                let target = reference
+                    .strip_prefix("#/$defs/")
+                    .and_then(|name| defs.get(name).map(|definition| (name, definition)))
+                    .and_then(|(name, definition)| {
+                        if *budget > 0 && !unresolvable.contains(name) {
+                            definition.as_object()
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(definition) = target {
+                    let mut overlay = definition.clone();
+                    map.shift_remove("$ref");
+                    for (key, value) in std::mem::take(map) {
+                        overlay.insert(key, value);
+                    }
+                    *map = overlay;
+                    *budget -= 1;
+                    replaced = true;
+                } else {
+                    pending = true;
+                }
+            }
+            for value in map.values_mut() {
+                let (child_replaced, child_pending) =
+                    resolve_def_pass(value, defs, unresolvable, budget);
+                replaced |= child_replaced;
+                pending |= child_pending;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                let (child_replaced, child_pending) =
+                    resolve_def_pass(item, defs, unresolvable, budget);
+                replaced |= child_replaced;
+                pending |= child_pending;
+            }
+        }
+        _ => {}
+    }
+    (replaced, pending)
 }
 
 /// Rewrite one subschema — and everything below it — into the subset Google's
@@ -5666,7 +5868,8 @@ fn restricted_schema_flavor(query: &str) -> Option<SchemaDialect> {
     query
         .split('&')
         .filter_map(|pair| match pair {
-            "flavor=moonshot" | "flavor=bedrock" => Some(SchemaDialect::RootCombinators),
+            "flavor=moonshot" => Some(SchemaDialect::FlatDefs),
+            "flavor=bedrock" => Some(SchemaDialect::RootCombinators),
             "flavor=gemini" | "flavor=vertex" => Some(SchemaDialect::GeminiSafe),
             _ => None,
         })
@@ -9879,7 +10082,7 @@ mod tests {
     fn restricted_schema_flavor_matches_complete_query_pairs_only() {
         assert_eq!(
             restricted_schema_flavor("flavor=moonshot"),
-            Some(SchemaDialect::RootCombinators)
+            Some(SchemaDialect::FlatDefs)
         );
         assert_eq!(
             restricted_schema_flavor("client=kiro&flavor=bedrock&debug=false"),
@@ -9898,10 +10101,392 @@ mod tests {
             restricted_schema_flavor("flavor=gemini&flavor=moonshot"),
             Some(SchemaDialect::GeminiSafe)
         );
+        assert_eq!(
+            restricted_schema_flavor("flavor=moonshot&flavor=bedrock"),
+            Some(SchemaDialect::FlatDefs)
+        );
         assert_eq!(restricted_schema_flavor("flavor=unknown"), None);
         assert_eq!(
             restricted_schema_flavor("note=flavor=bedrock&client=kiro"),
             None
+        );
+    }
+
+    fn inlined_defs(schema: serde_json::Value) -> serde_json::Value {
+        let mut map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(schema).unwrap();
+        inline_schema_defs(&mut map);
+        serde_json::Value::Object(map)
+    }
+
+    // Codex + the Kimi coding endpoint 400s every call: the Moonshot
+    // validator never resolves `$ref`, so the `ReasoningTier` /
+    // `FeedbackKind` references must be inlined at any depth.
+    #[test]
+    fn inline_schema_defs_replaces_refs_and_drops_the_table() {
+        let out = inlined_defs(serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "ReasoningTier": {
+                    "description": "Operator-facing tier.",
+                    "oneOf": [
+                        { "type": "string", "const": "minimal" },
+                        { "type": "string", "const": "max" }
+                    ]
+                }
+            },
+            "properties": {
+                "reasoning": {
+                    "description": "Field docs.",
+                    "anyOf": [
+                        { "$ref": "#/$defs/ReasoningTier" },
+                        { "type": "null" }
+                    ]
+                },
+                "signal": { "$ref": "#/$defs/ReasoningTier" }
+            }
+        }));
+
+        assert!(
+            out.get("$defs").is_none(),
+            "the emptied table must go: {out}"
+        );
+        assert_eq!(
+            out["properties"]["reasoning"],
+            serde_json::json!({
+                "description": "Field docs.",
+                "anyOf": [
+                    {
+                        "description": "Operator-facing tier.",
+                        "oneOf": [
+                            { "type": "string", "const": "minimal" },
+                            { "type": "string", "const": "max" }
+                        ]
+                    },
+                    { "type": "null" }
+                ]
+            }),
+            "the reference inlines the definition; the sibling description and the null branch stay"
+        );
+        assert_eq!(
+            out["properties"]["signal"],
+            serde_json::json!({
+                "description": "Operator-facing tier.",
+                "oneOf": [
+                    { "type": "string", "const": "minimal" },
+                    { "type": "string", "const": "max" }
+                ]
+            }),
+            "a bare $ref becomes the definition itself"
+        );
+    }
+
+    #[test]
+    fn inline_schema_defs_resolves_chained_definitions() {
+        let out = inlined_defs(serde_json::json!({
+            "$defs": {
+                "Inner": { "type": "string", "enum": ["a", "b"] },
+                "Outer": { "type": "object", "properties": { "inner": { "$ref": "#/$defs/Inner" } } }
+            },
+            "type": "object",
+            "properties": { "outer": { "$ref": "#/$defs/Outer" } }
+        }));
+
+        assert!(
+            out.get("$defs").is_none(),
+            "chained definitions must fully resolve: {out}"
+        );
+        assert_eq!(
+            out["properties"]["outer"]["properties"]["inner"],
+            serde_json::json!({ "type": "string", "enum": ["a", "b"] })
+        );
+    }
+
+    #[test]
+    fn inline_schema_defs_keeps_the_table_when_a_reference_dangles() {
+        let out = inlined_defs(serde_json::json!({
+            "$defs": {
+                "Known": { "type": "string" }
+            },
+            "type": "object",
+            "properties": {
+                "known": { "$ref": "#/$defs/Known" },
+                "missing": { "$ref": "#/$defs/Missing" }
+            }
+        }));
+
+        assert!(
+            out.get("$defs").is_some(),
+            "an unresolvable reference must keep its table: {out}"
+        );
+        assert_eq!(
+            out["properties"]["known"],
+            serde_json::json!({ "type": "string" })
+        );
+        assert_eq!(
+            out["properties"]["missing"],
+            serde_json::json!({ "$ref": "#/$defs/Missing" })
+        );
+    }
+
+    // A definition that references itself is not dangling, but it can never
+    // inline to a `$ref`-free schema: naive re-expansion nests a copy of the
+    // body on every pass until the budget stops the loop.
+    #[test]
+    fn inline_schema_defs_treats_a_self_referential_def_as_unresolvable() {
+        let out = inlined_defs(serde_json::json!({
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": { "next": { "$ref": "#/$defs/Node" } }
+                }
+            },
+            "type": "object",
+            "properties": { "head": { "$ref": "#/$defs/Node" } }
+        }));
+
+        assert_eq!(
+            out["properties"]["head"],
+            serde_json::json!({ "$ref": "#/$defs/Node" }),
+            "a cyclic definition must be left as the reference itself, not a nested copy: {out}"
+        );
+        assert!(
+            out.get("$defs").is_some(),
+            "the surviving cyclic reference must keep its table: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_schema_defs_treats_a_mutual_cycle_as_unresolvable() {
+        let out = inlined_defs(serde_json::json!({
+            "$defs": {
+                "Parent": {
+                    "type": "object",
+                    "properties": { "child": { "$ref": "#/$defs/Child" } }
+                },
+                "Child": {
+                    "type": "object",
+                    "properties": { "parent": { "$ref": "#/$defs/Parent" } }
+                }
+            },
+            "type": "object",
+            "properties": {
+                "parent": { "$ref": "#/$defs/Parent" },
+                "child": { "$ref": "#/$defs/Child" }
+            }
+        }));
+
+        assert_eq!(
+            out["properties"]["parent"],
+            serde_json::json!({ "$ref": "#/$defs/Parent" })
+        );
+        assert_eq!(
+            out["properties"]["child"],
+            serde_json::json!({ "$ref": "#/$defs/Child" })
+        );
+        assert!(
+            out.get("$defs").is_some(),
+            "both sides of the cycle keep their table: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_schema_defs_inlines_acyclic_defs_beside_a_cycle() {
+        let out = inlined_defs(serde_json::json!({
+            "$defs": {
+                "Loop": {
+                    "type": "object",
+                    "properties": { "loop": { "$ref": "#/$defs/Loop" } }
+                },
+                "Plain": { "type": "string", "enum": ["a"] }
+            },
+            "type": "object",
+            "properties": {
+                "loop": { "$ref": "#/$defs/Loop" },
+                "plain": { "$ref": "#/$defs/Plain" }
+            }
+        }));
+
+        assert_eq!(
+            out["properties"]["plain"],
+            serde_json::json!({ "type": "string", "enum": ["a"] }),
+            "acyclic definitions must still inline beside the cycle"
+        );
+        assert_eq!(
+            out["properties"]["loop"],
+            serde_json::json!({ "$ref": "#/$defs/Loop" })
+        );
+        assert!(
+            out.get("$defs").is_some(),
+            "the remaining cyclic reference keeps the table: {out}"
+        );
+    }
+
+    // An acyclic definition whose body references a cyclic one must expand
+    // without embedding (let alone nesting) copies of the cyclic body: the
+    // inner reference survives as a plain `$ref`.
+    #[test]
+    fn inline_schema_defs_expands_a_def_referencing_a_cyclic_def_without_nesting() {
+        let out = inlined_defs(serde_json::json!({
+            "$defs": {
+                "Loop": {
+                    "type": "object",
+                    "properties": { "loop": { "$ref": "#/$defs/Loop" } }
+                },
+                "Wrapper": {
+                    "type": "object",
+                    "properties": { "cyc": { "$ref": "#/$defs/Loop" } }
+                }
+            },
+            "type": "object",
+            "properties": { "wrapped": { "$ref": "#/$defs/Wrapper" } }
+        }));
+
+        assert_eq!(
+            out["properties"]["wrapped"],
+            serde_json::json!({
+                "type": "object",
+                "properties": { "cyc": { "$ref": "#/$defs/Loop" } }
+            }),
+            "the wrapper inlines; its cyclic inner reference stays a bare $ref: {out}"
+        );
+        assert!(
+            out["properties"]["wrapped"]["properties"]["cyc"]
+                .get("properties")
+                .is_none(),
+            "no nested copy of the cyclic body may leak in"
+        );
+        assert!(out.get("$defs").is_some());
+    }
+
+    #[test]
+    fn inline_schema_defs_fully_inlines_a_deep_acyclic_chain() {
+        // A chain deeper than the 32-pass budget: every link must resolve
+        // and the table must still drop.
+        const DEPTH: usize = 48;
+        // Build defs L0..L{DEPTH-1} where L(n) references L(n+1), root -> L0.
+        let mut defs = serde_json::Map::new();
+        defs.insert(
+            format!("L{}", DEPTH - 1),
+            serde_json::json!({ "type": "string", "const": "core" }),
+        );
+        for level in (0..DEPTH - 1).rev() {
+            defs.insert(
+                format!("L{level}"),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "next": { "$ref": format!("#/$defs/L{}", level + 1) } }
+                }),
+            );
+        }
+        let mut schema = serde_json::Map::new();
+        schema.insert(
+            "properties".to_string(),
+            serde_json::json!({ "head": { "$ref": "#/$defs/L0" } }),
+        );
+        schema.insert("$defs".to_string(), serde_json::Value::Object(defs));
+
+        let out = inlined_defs(serde_json::Value::Object(schema));
+
+        assert!(
+            out.get("$defs").is_none(),
+            "a chain deeper than the pass budget must still fully inline: {out}"
+        );
+        let mut cursor = &out["properties"]["head"];
+        for _ in 0..DEPTH - 1 {
+            cursor = &cursor["properties"]["next"];
+        }
+        assert_eq!(
+            cursor,
+            &serde_json::json!({ "type": "string", "const": "core" }),
+            "the innermost link must be reached without any $ref"
+        );
+    }
+
+    // Defense for the expansion budget: a fan-in wider than the cap must
+    // terminate with the surplus references left in place and the table
+    // kept, instead of multiplying the schema without bound.
+    #[test]
+    fn inline_schema_defs_stops_at_the_expansion_budget() {
+        const WIDTH: usize = 1_001;
+        let mut properties = serde_json::Map::new();
+        for index in 0..WIDTH {
+            properties.insert(
+                format!("f{index:04}"),
+                serde_json::json!({ "$ref": "#/$defs/Plain" }),
+            );
+        }
+        let out = inlined_defs(serde_json::json!({
+            "$defs": { "Plain": { "type": "string" } },
+            "type": "object",
+            "properties": properties
+        }));
+
+        let serialized = out.to_string();
+        assert_eq!(
+            serialized.matches("\"$ref\"").count(),
+            1,
+            "exactly the over-budget reference remains: {serialized}"
+        );
+        assert!(
+            out.get("$defs").is_some(),
+            "the surviving reference keeps the table"
+        );
+        assert_eq!(
+            out["properties"]["f0000"],
+            serde_json::json!({ "type": "string" }),
+            "in-budget references still inline"
+        );
+    }
+
+    // The Bedrock dialect is a narrower patch on purpose: it must not start
+    // flattening references just because Moonshot's stricter sibling does.
+    #[test]
+    fn restricted_schema_tool_list_keeps_defs_for_root_combinator_dialect() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "$defs": { "Kind": { "type": "string", "enum": ["a"] } },
+                "properties": { "kind": { "$ref": "#/$defs/Kind" } }
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_feedback", "Feedback", schema);
+
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::RootCombinators);
+
+        assert_eq!(
+            patched[0].input_schema["properties"]["kind"],
+            serde_json::json!({ "$ref": "#/$defs/Kind" }),
+            "bedrock schemas keep their $defs/$ref pairs"
+        );
+        assert!(
+            patched[0].input_schema.get("$defs").is_some(),
+            "bedrock schemas keep the $defs table"
+        );
+    }
+
+    #[test]
+    fn restricted_schema_tool_list_inlines_defs_for_flat_dialect() {
+        let schema: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "type": "object",
+                "$defs": { "Kind": { "type": "string", "enum": ["a"] } },
+                "properties": { "kind": { "$ref": "#/$defs/Kind" } }
+            }))
+            .unwrap();
+        let tool = Tool::new("memory_feedback", "Feedback", schema);
+
+        let patched = restricted_schema_tool_list(vec![tool], SchemaDialect::FlatDefs);
+
+        let serialized =
+            serde_json::to_string(&patched[0].input_schema).expect("schema serializes");
+        assert!(
+            !serialized.contains("$ref"),
+            "moonshot schemas must not contain a single $ref: {serialized}"
+        );
+        assert_eq!(
+            patched[0].input_schema["properties"]["kind"],
+            serde_json::json!({ "type": "string", "enum": ["a"] })
         );
     }
 

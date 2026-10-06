@@ -7,6 +7,112 @@ use ai_memory_core::AgentKind;
 use anyhow::{Result, anyhow, bail};
 use uuid::Uuid;
 
+/// OpenCode's incompatible major-version contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeDialect {
+    /// OpenCode 1 plugin, MCP, and transcript contracts.
+    V1,
+    /// OpenCode 2 plugin, MCP, and transcript contracts.
+    V2,
+}
+
+impl OpenCodeDialect {
+    /// Parse an OpenCode `--version` response without guessing an unknown major.
+    pub fn parse_version_output(output: &str) -> Result<Self> {
+        let mut versions = output
+            .split_ascii_whitespace()
+            .filter_map(parse_semver_major);
+        let major = versions
+            .next()
+            .ok_or_else(|| anyhow!("OpenCode returned no strict semantic version"))?;
+        if versions.next().is_some() {
+            bail!("OpenCode returned multiple semantic versions");
+        }
+        match major {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            other => bail!(
+                "OpenCode major {other} is not supported; upgrade ai-memory before using this OpenCode version"
+            ),
+        }
+    }
+
+    /// Numeric major used in persisted compatibility keys.
+    #[must_use]
+    pub const fn major(self) -> u8 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    /// Managed harness carrying this dialect through launch and transcript IO.
+    #[must_use]
+    pub const fn harness(self) -> ManagedHarness {
+        match self {
+            Self::V1 => ManagedHarness::OpenCode,
+            Self::V2 => ManagedHarness::OpenCode2,
+        }
+    }
+}
+
+fn parse_semver_major(raw: &str) -> Option<u64> {
+    let trimmed =
+        raw.trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | ',' | ';'));
+    let token = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    let (without_build, build) = token
+        .split_once('+')
+        .map_or((token, None), |(core, build)| (core, Some(build)));
+    if without_build.contains('+')
+        || build.is_some_and(|value| !valid_semver_identifiers(value, false))
+    {
+        return None;
+    }
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    if prerelease.is_some_and(|value| !valid_semver_identifiers(value, true)) {
+        return None;
+    }
+    let mut parts = core.split('.');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let patch = parts.next()?;
+    if parts.next().is_some()
+        || !valid_semver_number(major)
+        || !valid_semver_number(minor)
+        || !valid_semver_number(patch)
+    {
+        return None;
+    }
+    major.parse().ok()
+}
+
+fn valid_semver_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn valid_semver_identifiers(value: &str, reject_leading_zero_numeric: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!reject_leading_zero_numeric
+                    || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || identifier.len() == 1
+                    || !identifier.starts_with('0'))
+        })
+}
+
 /// Harnesses with native-session and transcript adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedHarness {
@@ -16,9 +122,9 @@ pub enum ManagedHarness {
     Codex,
     /// OpenCode.
     OpenCode,
-    /// OpenCode V2 compatibility adapter. It shares the canonical `opencode`
-    /// executable and public agent kind with V1; only its plugin, MCP, and
-    /// transcript contracts differ.
+    /// OpenCode 2.0 beta (`opencode2` binary, side-by-side with v1).
+    /// Shares v1's config dir, session store, and agent kind; only the
+    /// launched executable differs.
     OpenCode2,
     /// Pi coding agent.
     Pi,
@@ -95,7 +201,8 @@ impl ManagedHarness {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::OpenCode | Self::OpenCode2 => "opencode",
+            Self::OpenCode => "opencode",
+            Self::OpenCode2 => "opencode2",
             Self::Pi => "pi",
             Self::Crush => "crush",
             Self::Omp => "omp",
@@ -119,7 +226,8 @@ impl ManagedHarness {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::OpenCode | Self::OpenCode2 => "opencode",
+            Self::OpenCode => "opencode",
+            Self::OpenCode2 => "opencode2",
             Self::Pi => "pi",
             Self::Crush => "crush",
             Self::Omp => "omp",
@@ -253,8 +361,6 @@ pub fn build_launch_plan_with_env(
     env_overrides: &[(String, String)],
     roots: Option<LaunchRoots<'_>>,
 ) -> Result<LaunchPlan> {
-    let program = executable.unwrap_or_else(|| OsString::from(harness.executable()));
-    let mut args = native_args;
     let get = |name: &str| {
         env_overrides
             .iter()
@@ -262,6 +368,27 @@ pub fn build_launch_plan_with_env(
             .map(|(_, value)| OsString::from(value))
             .or_else(|| std::env::var_os(name))
     };
+    build_launch_plan_with_env_lookup(
+        harness,
+        executable,
+        native_args,
+        linked_session_id,
+        get,
+        roots,
+    )
+}
+
+/// Build a launch plan from one caller-owned environment snapshot.
+pub fn build_launch_plan_with_env_lookup(
+    harness: ManagedHarness,
+    executable: Option<OsString>,
+    native_args: Vec<OsString>,
+    linked_session_id: Option<&str>,
+    get: impl Fn(&str) -> Option<OsString> + Copy,
+    roots: Option<LaunchRoots<'_>>,
+) -> Result<LaunchPlan> {
+    let program = executable.unwrap_or_else(|| OsString::from(harness.executable()));
+    let mut args = native_args;
     let session_dir = match harness {
         ManagedHarness::Pi | ManagedHarness::Omp => flag_path(&args, &["--session-dir"]),
         ManagedHarness::Crush => flag_path(&args, &["--data-dir", "-D"]),
@@ -626,7 +753,8 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "db",
         ]
         .as_slice(),
-        // V2 subcommands. `run` stays session-bearing (see
+        // Beta subcommands, verified on `opencode2 v0.0.0-beta-18999`
+        // (`opencode2 --help`). `run` stays session-bearing (see
         // `noninteractive_invocation`); `mini` is the minimal interactive
         // UI and also stays session-bearing.
         ManagedHarness::OpenCode2 => [
@@ -1495,8 +1623,8 @@ fn environment_session_dir_with(
     match harness {
         ManagedHarness::Claude => value("CLAUDE_CONFIG_DIR").map(|dir| dir.join("projects")),
         ManagedHarness::Codex => value("CODEX_HOME").map(|dir| dir.join("sessions")),
-        // OpenCode V1 and V2 keep the same `opencode.db` filename, so both
-        // transcript adapters resolve the same store root.
+        // The beta channel keeps v1's `opencode.db` filename (other channels
+        // get `opencode-<channel>.db`), so both harnesses share one store.
         ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => {
             value("XDG_DATA_HOME").map(|dir| dir.join("opencode"))
         }
@@ -1715,7 +1843,36 @@ mod tests {
     }
 
     #[test]
-    fn opencode2_alias_uses_v2_contract_with_the_canonical_binary() {
+    fn opencode_version_parser_accepts_strict_and_decorated_versions() {
+        for (output, expected) in [
+            ("1.18.34", OpenCodeDialect::V1),
+            ("v2.0.23", OpenCodeDialect::V2),
+            ("OpenCode v2.0.23 (build abc)", OpenCodeDialect::V2),
+            ("opencode 1.18.34-beta.1", OpenCodeDialect::V1),
+        ] {
+            assert_eq!(
+                OpenCodeDialect::parse_version_output(output).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_version_parser_rejects_malformed_and_unsupported_versions() {
+        for output in ["2", "2.0", "latest", "version 2.x", "1.2.3 2.0.0"] {
+            assert!(
+                OpenCodeDialect::parse_version_output(output).is_err(),
+                "{output}"
+            );
+        }
+        let error = OpenCodeDialect::parse_version_output("3.0.0")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("major 3 is not supported"), "{error}");
+    }
+
+    #[test]
+    fn opencode2_shares_v1_session_contract_with_its_own_binary() {
         for name in ["opencode2", "opencode-v2", "open-code2"] {
             assert_eq!(
                 ManagedHarness::from_name(name),
@@ -1723,10 +1880,10 @@ mod tests {
             );
         }
         let beta = ManagedHarness::OpenCode2;
-        // Both generations share one executable and public identity. The
-        // adapter difference is limited to the plugin/MCP/transcript contracts.
-        assert_eq!(beta.executable(), "opencode");
-        assert_eq!(beta.as_str(), "opencode");
+        // Same store, same kind, same flags — only the executable differs,
+        // so `run opencode2` resumes v1 sessions and vice versa.
+        assert_eq!(beta.executable(), "opencode2");
+        assert_eq!(beta.as_str(), "opencode2");
         assert_eq!(beta.agent_kind(), AgentKind::OpenCode);
         assert_eq!(ManagedHarness::OpenCode.agent_kind(), AgentKind::OpenCode);
 

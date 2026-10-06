@@ -58,7 +58,7 @@ pub mod message;
 pub mod move_project;
 pub mod move_session;
 pub mod openclaw_plugin;
-pub(crate) mod opencode_compat;
+pub mod opencode_dialect;
 pub mod path_util;
 pub mod pending_writes;
 pub mod project;

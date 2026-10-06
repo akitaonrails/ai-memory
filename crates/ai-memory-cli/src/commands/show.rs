@@ -143,7 +143,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
         !args.no_scan,
     )
     .await;
-    let harnesses = available_harnesses();
+    let harnesses = available_harnesses(config);
 
     if args.json {
         print_json(&endpoint, &candidates, &harnesses)?;
@@ -421,11 +421,13 @@ fn print_json(
     Ok(())
 }
 
-pub(super) fn available_harnesses() -> Vec<RunHarnessChoice> {
+pub(super) fn available_harnesses(config: &Config) -> Vec<RunHarnessChoice> {
+    let child_env = crate::commands::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+    let search = child_env.executable_search();
     RunHarnessChoice::value_variants()
         .iter()
         .copied()
-        .filter(|choice| crate::commands::run::harness_available(*choice))
+        .filter(|choice| crate::commands::run::harness_available(*choice, search))
         .collect()
 }
 

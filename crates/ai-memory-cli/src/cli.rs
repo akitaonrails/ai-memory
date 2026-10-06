@@ -373,11 +373,10 @@ pub enum RunHarnessChoice {
     Claude,
     /// OpenAI Codex CLI.
     Codex,
-    /// OpenCode. The installed executable is probed and the matching V1 or V2
-    /// integration is selected automatically.
+    /// OpenCode; probes the selected executable and uses its V1 or V2 contracts.
     #[value(name = "opencode", alias = "open-code")]
     OpenCode,
-    /// Compatibility spelling that explicitly selects the OpenCode V2 adapter.
+    /// OpenCode V2 compatibility alias; forces the V2 contracts.
     #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
     OpenCode2,
     /// Pi coding agent.
@@ -1657,12 +1656,37 @@ pub struct BootstrapArgs {
     pub resume: bool,
 }
 
+/// OpenCode artifact dialect for container-only setup where the host executable
+/// cannot be probed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OpenCodeDialectChoice {
+    /// OpenCode V1 function plugin and direct `mcp` entry.
+    V1,
+    /// OpenCode V2 `{ id, setup }` plugin and nested `mcp.servers` entry.
+    V2,
+}
+
+impl OpenCodeDialectChoice {
+    #[must_use]
+    pub const fn dialect(self) -> ai_memory_workstream::OpenCodeDialect {
+        match self {
+            Self::V1 => ai_memory_workstream::OpenCodeDialect::V1,
+            Self::V2 => ai_memory_workstream::OpenCodeDialect::V2,
+        }
+    }
+}
+
 /// Arguments for `setup-agent`.
 #[derive(Debug, Args)]
 pub struct SetupAgentArgs {
     /// Which agent's hook bundle to extract + render.
     #[arg(long, value_enum, default_value_t = AgentChoice::ClaudeCode)]
     pub agent: AgentChoice,
+    /// OpenCode artifact dialect when `--agent opencode` is used. Required
+    /// because setup-agent commonly runs in a container that cannot inspect the
+    /// host's executable. The `opencode2` aliases force V2 and reject this flag.
+    #[arg(long, value_enum)]
+    pub opencode_dialect: Option<OpenCodeDialectChoice>,
     /// Filesystem directory the hook scripts get copied into. In a
     /// docker context this is the in-container path; mount a host
     /// directory there. Example:
@@ -1973,20 +1997,14 @@ pub enum AgentChoice {
     Cursor,
     /// Google Gemini CLI — JSON-config hooks in `~/.gemini/settings.json`.
     GeminiCli,
-    /// OpenCode — detects the installed major version and writes its matching
-    /// TypeScript plugin under `~/.config/opencode/plugins/`. Restart OpenCode
-    /// for the plugin to load.
-    ///
-    /// The `opencode` (no hyphen) alias matches both the staged hook
-    /// dir on disk (`~/.local/share/ai-memory/hooks/opencode/`) and
-    /// what users commonly type. Without it, `ai-memory upgrade`'s
-    /// hook-refresh loop iterates the staged dir names and passes
-    /// them straight to `--agent`, which used to fail on this one.
+    /// OpenCode — probes `opencode --version`, then writes the compatible V1
+    /// function plugin or V2 `{ id, setup }` plugin under
+    /// `~/.config/opencode/plugins/`. Restart OpenCode for it to load.
     #[value(alias = "opencode")]
     OpenCode,
-    /// Compatibility spelling that explicitly selects OpenCode's V2
-    /// `{ id, setup }` plugin API. It writes the canonical `ai-memory.ts`
-    /// plugin and shares the normal OpenCode config, store, and agent kind.
+    /// OpenCode V2 compatibility alias; forces the V2 plugin contract and
+    /// `ai-memory-opencode2.ts` path without probing. Shares V1's config dir,
+    /// session store, and agent kind.
     #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
     OpenCode2,
     /// Real Pi coding agent. The generated TypeScript extension provides
@@ -2250,13 +2268,12 @@ pub enum McpClient {
     ClaudeCode,
     /// OpenAI Codex CLI — `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`).
     Codex,
-    /// OpenCode — detects the installed major version and writes the matching
-    /// MCP shape to `opencode.json`. Accepts `opencode` as an alias.
+    /// OpenCode — probes `opencode --version`, then writes the compatible V1
+    /// direct `mcp` entry or V2 nested `mcp.servers` entry.
     #[value(alias = "opencode")]
     OpenCode,
-    /// Compatibility spelling that explicitly selects OpenCode V2's nested
-    /// `mcp.servers` shape. V2 omits `enabled` and uses `oauth: false` for
-    /// header-credentialed servers.
+    /// OpenCode V2 compatibility alias; forces nested `mcp.servers` with
+    /// `type: "remote"`, no V1 `enabled`, and `oauth: false`.
     #[value(name = "opencode2", alias = "opencode-v2", alias = "open-code2")]
     OpenCode2,
     /// Cursor IDE — `~/.cursor/mcp.json` or `.cursor/mcp.json`.
@@ -2700,8 +2717,8 @@ pub struct InstallHooksArgs {
     pub hooks_dir: Option<PathBuf>,
     /// Server URL the hooks will POST to. Defaults to the configured
     /// `server_url` / AI_MEMORY_SERVER_URL when set, else loopback. If neither
-    /// is configured, apply-mode also reuses an existing ai-memory MCP entry
-    /// for the same agent when one is present.
+    /// is configured, apply-mode also reuses an ownership-verified ai-memory MCP
+    /// entry from either known OpenCode major-version location when present.
     // Keep this optional so effective_hook_server_url can distinguish an
     // omitted flag from an explicit URL that equals the compiled default.
     #[arg(long)]
@@ -3588,6 +3605,30 @@ mod tests {
                 panic!("expected install-mcp command for Kiro alias {alias}");
             };
             assert!(matches!(args.client, McpClient::KiroCli));
+        }
+    }
+
+    #[test]
+    fn setup_agent_opencode_dialect_parses_for_container_generation() {
+        for (value, expected) in [
+            ("v1", OpenCodeDialectChoice::V1),
+            ("v2", OpenCodeDialectChoice::V2),
+        ] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "setup-agent",
+                "--agent",
+                "opencode",
+                "--opencode-dialect",
+                value,
+                "--to",
+                "/tmp/hooks",
+            ])
+            .unwrap();
+            let Command::SetupAgent(args) = cli.command else {
+                panic!("expected setup-agent command");
+            };
+            assert_eq!(args.opencode_dialect, Some(expected));
         }
     }
 

@@ -17,7 +17,17 @@
 > --http-stateful` to restore rmcp's session mode.
 
 This page documents how to register ai-memory as an MCP server with
-agent CLIs beyond the README quick start.
+agent CLIs beyond the README quick start. For OpenCode, the generic
+`install-mcp --client opencode` command probes `opencode --version` and writes
+the matching V1 direct `mcp` or V2 nested `mcp.servers` entry. Strict semantic
+major 1 and 2 outputs are accepted; malformed, timed-out, and future-major
+probes fail rather than guessing. During a V1/V2 transition, hook and MCP
+installers reuse an ownership-verified endpoint and bearer from either known
+schema; conflicting generated entries fail for explicit resolution, and custom
+entries are preserved. The `opencode2`, `opencode-v2`, and `open-code2`
+spellings remain force-V2 compatibility aliases. A Docker
+container cannot inspect the host executable; use `setup-agent --agent opencode
+--opencode-dialect v1|v2` there to print the selected plugin and MCP artifacts.
 
 The hook-capable clients in the [README Support Matrix](../README.md#support-matrix)
 have automatic capture integrations (host-native commands for supported local
@@ -1264,9 +1274,17 @@ validation is identical in every dialect — only the advertised schema changes.
 
 | Marker | Config key | What it changes | Who needs it |
 | --- | --- | --- | --- |
-| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kimi Code (Moonshot); appended by `install-mcp` |
-| `?flavor=bedrock` | `strip_root_combinators` | Same as above | Kiro CLI (Bedrock); appended by `install-mcp` |
-| `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | The above, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
+| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus inlines every `#/$defs/*` reference and drops the emptied `$defs` table | Kimi Code (Moonshot); appended by `install-mcp` |
+| `?flavor=bedrock` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kiro CLI (Bedrock); appended by `install-mcp` |
+| `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
+
+Moonshot's validator never resolves `$ref` — any reference, at the root or
+nested, fails the request with "detected infinite recursion without termination
+condition" — while inline combinators such as the nullable union on
+`Option<T>` arguments pass. Codex forwards MCP input schemas into Responses
+`tools.function.parameters` verbatim, so it needs the Moonshot marker even
+though it is not Kimi Code. `?flavor=bedrock` and `?flavor=gemini` keep
+`$defs`/`$ref` pairs, which their upstreams resolve.
 
 `install-mcp` appends the first two itself for the clients whose upstream is
 fixed. For any other client, pass the dialect explicitly:
@@ -1393,13 +1411,13 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode (V1/V2), and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode (V1/V2) / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Codex (native `SessionEnd`, Codex CLI 0.145.0+), Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, OpenCode 2 beta, and OMP. Antigravity CLI, both Kiro CLI engines, and Command Code have no reliable true session-end event; run `ai-memory finalize-session` with the corresponding `--agent` after the final turn (also the fallback on Codex older than 0.145.0). MCP-only clients such as Swival must call `memory_handoff_begin` explicitly. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model inspects with `memory_handoff_list` then claims with `memory_handoff_accept` (`handoff_id` from the list). | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Grok Build CLI / both Kiro CLI engines / Command Code / OpenClaw / OpenCode / OpenCode 2 beta / OMP. Grok's (a) is the first `PostToolUse` `additionalContext`, not SessionStart. Zero discards SessionStart stdout; Swival is MCP-only. Use (b) for those. (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
-delivery. On V2, the plugin subscribes to the event stream and injects handoffs
-through the `context` hook instead of V1's removed
-`experimental.chat.system.transform`. Its generated plugin also sends a deduped best-effort close for any
+delivery. The OpenCode 2 beta plugin subscribes to the same event name on the
+V2 event stream and injects handoffs through the `context` hook instead of
+v1's removed `experimental.chat.system.transform`. Its generated plugin also sends a deduped best-effort close for any
 still-active sessions from `dispose` during normal plugin teardown; abrupt
 process exits can still lose that fallback, so `session.deleted` remains the
 primary close path.

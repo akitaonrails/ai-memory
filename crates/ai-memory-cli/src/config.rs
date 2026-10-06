@@ -6,6 +6,7 @@
 //! guard read `process.env` while the rest of the codebase used
 //! `getMergedEnv()`, masking the bug for weeks).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -618,6 +619,18 @@ pub struct Config {
     pub runtime_env: RuntimeEnv,
 }
 
+#[derive(Clone, Default)]
+struct CapturedProcessEnv(Vec<(OsString, OsString)>);
+
+impl std::fmt::Debug for CapturedProcessEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturedProcessEnv")
+            .field("entries", &self.0.len())
+            .finish()
+    }
+}
+
 /// Environment-only values captured once by [`Config::load`].
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeEnv {
@@ -632,6 +645,7 @@ pub struct RuntimeEnv {
     scope_cwd: Option<String>,
     ignore_marker: bool,
     project_strategy: Option<String>,
+    process_env: CapturedProcessEnv,
     claude_code_session_id: Option<String>,
     anthropic_api_key: Option<SecretString>,
     anthropic_oauth_token: Option<SecretString>,
@@ -651,6 +665,7 @@ pub struct RuntimeEnv {
 impl RuntimeEnv {
     fn from_process() -> Self {
         let platform_home = dirs::home_dir();
+        let process_env = CapturedProcessEnv(std::env::vars_os().collect());
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
             home_dir: resolve_operator_home(
@@ -674,6 +689,7 @@ impl RuntimeEnv {
             // --project-strategy` bakes into the generated hook commands.
             // Consulted only when a marker does not pin one.
             project_strategy: env_string("AI_MEMORY_PROJECT_STRATEGY"),
+            process_env,
             claude_code_session_id: env_string("CLAUDE_CODE_SESSION_ID"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
             // CLAUDE_CODE_OAUTH_TOKEN is what `claude setup-token` writes;
@@ -730,6 +746,12 @@ impl RuntimeEnv {
     #[must_use]
     pub fn project_strategy(&self) -> Option<&str> {
         self.project_strategy.as_deref()
+    }
+
+    /// Complete process environment captured by the single config-read path.
+    #[must_use]
+    pub fn process_env(&self) -> &[(OsString, OsString)] {
+        &self.process_env.0
     }
 
     /// Claude Code lifecycle session id inherited by an stdio MCP subprocess.

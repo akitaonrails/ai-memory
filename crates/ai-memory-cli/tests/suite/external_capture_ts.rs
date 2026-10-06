@@ -54,12 +54,26 @@ mod slow_generated_runtime {
     /// The plugin exactly as `install-hooks` would write it, minus the three
     /// human-facing comment lines the non-`--apply` render prints first.
     fn render_opencode_plugin(home: &Path, server_url: &str) -> String {
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let opencode = bin.join("opencode");
+            std::fs::write(&opencode, "#!/bin/sh\nprintf '1.18.34\\n'\n").unwrap();
+            let mut permissions = std::fs::metadata(&opencode).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&opencode, permissions).unwrap();
+        }
+        #[cfg(windows)]
+        std::fs::write(bin.join("opencode.cmd"), "@echo off\r\necho 1.18.34\r\n").unwrap();
         let output = hermetic(BIN)
             .args(["install-hooks", "--agent", "opencode", "--server-url"])
             .arg(server_url)
             .env("HOME", home)
             .env("USERPROFILE", home)
             .env("AI_MEMORY_HOME", home)
+            .env("PATH", bin)
             .current_dir(home)
             .output()
             .expect("render opencode plugin");

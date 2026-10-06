@@ -1,7 +1,7 @@
 # Managed cross-harness workstreams
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
-between Claude Code, Codex, version-detected OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
+between Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro
 CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
@@ -252,25 +252,33 @@ checkout themselves.
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for
 Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, and both Kiro
-CLI engines. Before committing to an OpenCode candidate, it probes the
-installed `opencode` executable and selects the matching V1 or V2 schema. It
-then resumes the newest session automatically for an empty workstream. For an established workstream, server state takes
-precedence: ai-memory resumes the most recently linked harness that still has a
-usable local session. It never chooses a newer but obsolete session from another
-harness merely because that file has a later timestamp. Kiro's v2 and v3
-candidates share one server agent identity, but the selected native engine
+CLI engines. Before scanning OpenCode sessions, it probes the exact `opencode`
+executable once and uses that resolved major for discovery, launch, auto-wire,
+and transcript import. Executable lookup, the version probe, and the child launch
+share one captured environment with `--env` / `--env-file` overlays, including
+case-insensitive `PATH`/`Path` replacement on Windows. A missing, malformed,
+timed-out, or unsupported OpenCode
+probe skips only OpenCode; discovery continues with every other available
+harness. For an empty workstream it resumes
+the newest session automatically. For an established workstream, server state
+takes precedence: ai-memory resumes the most recently linked harness that still
+has a usable local session. It never chooses a newer but obsolete session from
+another harness merely because that file has a later timestamp. Kiro's v2 and
+v3 candidates share one server agent identity, but the selected native engine
 flavor remains exact. OMP, Grok, and Antigravity remain available explicitly
-but are not in the automatic pool.
+but are not in the automatic pool. OpenCode's resolved major contributes one
+adapter to the pool, so shared V1/V2 storage never duplicates a candidate.
 
-OpenCode V2 sessions run inside a shared background service, so its plugin
+OpenCode 2 sessions run inside a shared background service, so its plugin
 cannot see a managed run's environment the way in-process plugins do. Managed
-`run opencode` legs launch with the correct resume selectors, capture through
-hooks, and import the V2 transcript — all verified live — but the ledger-delta
-acknowledgement (`context_delivered`) does not fire, because the accept path
-requires the run id on the session-start hook. The failure mode is redelivery,
-never loss: a later leg into another harness may receive the range again. Until
-OpenCode exposes per-invocation plugin context, cross-harness continuity arrives
-through the ordinary handoff loop rather than the ledger delta.
+`run opencode2` legs launch with the correct resume selectors, capture through
+hooks, and import the beta transcript — all verified live — but the
+ledger-delta acknowledgement (`context_delivered`) does not fire, because the
+accept path requires the run id on the session-start hook. The failure mode is
+redelivery, never loss: a later leg into another harness may receive the range
+again. Until the beta offers per-invocation plugin context, cross-harness
+continuity into opencode2 arrives through the ordinary handoff loop rather
+than the ledger delta.
 
 Bare mode accepts wrapper options but not harness-native arguments or
 `--executable`, because their meaning depends on the selected harness. In a new
@@ -379,7 +387,8 @@ is labelled completed evidence and must never be replayed as a pending call.
 |---|---|---|---|
 | Claude Code | generated `--session-id` | `--resume <id>` | `~/.claude/projects/**/*.jsonl` |
 | Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl` |
-| OpenCode | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only; `opencode --version` selects V1's `session` tables or V2's `session_v2`/`session_message` tables |
+| OpenCode V1 | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only; selected when the exact launch executable reports major 1 |
+| OpenCode V2 | native default creation | `--session <id>` | same `opencode.db` filename, using the `session_v2`/`session_message` tables; selected when the exact launch executable reports major 2 |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
 | Crush | native default creation | `--session <id>` | `<data dir>/crush.db` opened read-only: `options.data_directory` from Crush's JSON configs, else the closest `.crush` up to the git worktree root, else `<cwd>/.crush` |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |

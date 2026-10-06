@@ -15,6 +15,7 @@
 //! profile's `~/.omp/profiles/<name>/agent`, or `$PI_CODING_AGENT_DIR`) with
 //! the same `mcpServers` root as several other clients.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -50,27 +51,60 @@ enum JsonMcpLocation {
     RootMcpServersSnake,
 }
 
-fn resolved_opencode_client(client: McpClient) -> Result<McpClient> {
-    if client != McpClient::OpenCode {
-        return Ok(client);
-    }
-    match super::opencode_compat::detect(std::ffi::OsStr::new("opencode"))? {
-        super::opencode_compat::OpenCodeGeneration::V1 => Ok(McpClient::OpenCode),
-        super::opencode_compat::OpenCodeGeneration::V2 => Ok(McpClient::OpenCode2),
-    }
-}
-
 /// Run the `install-mcp` subcommand.
 ///
 /// # Errors
 /// Returns an error if JSON serialisation fails (should never happen
 /// for our handcrafted values).
-pub fn run(config: &Config, mut args: InstallMcpArgs) -> Result<()> {
-    args.client = resolved_opencode_client(args.client)?;
-    let server_url = effective_mcp_server_url(config, &args);
+pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
+    run_with_opencode_dialect(config, args, None)
+}
+
+pub(crate) fn run_with_opencode_dialect(
+    config: &Config,
+    mut args: InstallMcpArgs,
+    dialect: Option<ai_memory_workstream::OpenCodeDialect>,
+) -> Result<()> {
+    let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+    args.client = match (args.client, dialect) {
+        (McpClient::OpenCode, Some(ai_memory_workstream::OpenCodeDialect::V1)) => {
+            McpClient::OpenCode
+        }
+        (McpClient::OpenCode, Some(ai_memory_workstream::OpenCodeDialect::V2)) => {
+            McpClient::OpenCode2
+        }
+        (client, None) => super::opencode_dialect::resolve_client(client, &child_env)?,
+        (client, Some(_)) => client,
+    };
+    let needs_inferred_url = args.server_url.is_none() && !config.server_url_configured();
+    let needs_inferred_token = args.auth_token.is_none() && config.auth.bearer_token.is_none();
+    let inferred = if args.name == "ai-memory"
+        && matches!(args.client, McpClient::OpenCode | McpClient::OpenCode2)
+        && (needs_inferred_url || needs_inferred_token)
+    {
+        let path = resolve_config_file(&args)?;
+        fs::read_to_string(path)
+            .ok()
+            .map(|content| infer_owned_opencode_mcp_config(&content, args.client))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let server_url = if config.server_url_configured() || args.server_url.is_some() {
+        effective_mcp_server_url(config, &args)
+    } else {
+        inferred.as_ref().map_or_else(
+            || DEFAULT_MCP_URL.to_string(),
+            |entry| entry.mcp_url.clone(),
+        )
+    };
     let args = InstallMcpArgs {
         server_url: Some(server_url),
-        auth_token: args.auth_token.or_else(|| config.auth.bearer_token.clone()),
+        auth_token: args
+            .auth_token
+            .or_else(|| config.auth.bearer_token.clone())
+            .or_else(|| inferred.and_then(|entry| entry.auth_token)),
         ..args
     };
     validate_args(&args)?;
@@ -197,10 +231,10 @@ pub(crate) fn mcp_config_path_with(
             .join(".config")
             .join("opencode")
             .join("opencode.json"),
-        // V2 reads the same global config file (`opencode.json(c)`); its
-        // `mcp.servers` key coexists with V1's `mcp` key in one strict-JSON
-        // file. Users who keep comments in `opencode.jsonc` should pass it via
-        // `--config-file` (`mutate_json` refuses to rewrite non-strict JSON).
+        // V2 reads the same global config file (`opencode.json(c)`) but uses
+        // `mcp.servers`. Users who keep comments in `opencode.jsonc` should
+        // pass it via `--config-file` (`mutate_json` refuses to rewrite
+        // non-strict JSON).
         McpClient::OpenCode2 => home()?
             .join(".config")
             .join("opencode")
@@ -638,11 +672,239 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     }
 }
 
+fn migrate_opencode_mcp_entry(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    args: &InstallMcpArgs,
+) -> Result<()> {
+    if matches!(args.client, McpClient::OpenCode | McpClient::OpenCode2)
+        && opencode_selected_entry(root, args.client, &args.name)
+            .is_some_and(|entry| !opencode_mcp_entry_has_generated_shape(entry, args.client))
+    {
+        bail!(
+            "refusing to replace user-owned OpenCode MCP entry '{}' in the selected major-version location",
+            args.name
+        );
+    }
+    let alternate = match args.client {
+        McpClient::OpenCode => root
+            .get("mcp")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|mcp| mcp.get("servers"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|servers| servers.get(&args.name))
+            .cloned(),
+        McpClient::OpenCode2 => root
+            .get("mcp")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|mcp| mcp.get(&args.name))
+            .cloned(),
+        _ => None,
+    };
+    let Some(alternate) = alternate else {
+        return Ok(());
+    };
+    if opencode_mcp_entry_has_generated_shape(
+        &alternate,
+        match args.client {
+            McpClient::OpenCode => McpClient::OpenCode2,
+            McpClient::OpenCode2 => McpClient::OpenCode,
+            other => other,
+        },
+    ) && opencode_selected_entry(root, args.client, &args.name)
+        .is_some_and(|entry| !opencode_mcp_entry_has_generated_shape(entry, args.client))
+    {
+        bail!(
+            "refusing to replace a user-owned OpenCode MCP entry '{}' in the selected major-version location while migrating the generated alternate entry",
+            args.name
+        );
+    }
+    if !opencode_mcp_entry_is_owned(&alternate, args) {
+        eprintln!(
+            "[ai-memory] warning: preserving ambiguous OpenCode MCP entry '{}' in the alternate major-version location",
+            args.name
+        );
+        return Ok(());
+    }
+    let mcp = root
+        .get_mut("mcp")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("`mcp` is present but not an object")?;
+    match args.client {
+        McpClient::OpenCode => {
+            if let Some(servers) = mcp
+                .get_mut("servers")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                servers.remove(&args.name);
+                if servers.is_empty() {
+                    mcp.remove("servers");
+                }
+            }
+        }
+        McpClient::OpenCode2 => {
+            mcp.remove(&args.name);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InferredOpenCodeMcpConfig {
+    pub(crate) mcp_url: String,
+    pub(crate) auth_token: Option<String>,
+}
+
+pub(crate) fn infer_owned_opencode_mcp_config(
+    content: &str,
+    selected: McpClient,
+) -> Result<Option<InferredOpenCodeMcpConfig>> {
+    let root: serde_json::Value = match serde_json::from_str(content) {
+        Ok(root) => root,
+        Err(_) => return Ok(None),
+    };
+    let v1_entry = root.pointer("/mcp/ai-memory");
+    let v2_entry = root.pointer("/mcp/servers/ai-memory");
+    let v1 = v1_entry.and_then(|entry| inferred_owned_opencode_entry(entry, McpClient::OpenCode));
+    let v2 = v2_entry.and_then(|entry| inferred_owned_opencode_entry(entry, McpClient::OpenCode2));
+    let selected_is_user_owned = match selected {
+        McpClient::OpenCode => v1_entry.is_some() && v1.is_none(),
+        McpClient::OpenCode2 => v2_entry.is_some() && v2.is_none(),
+        _ => false,
+    };
+    let alternate_is_generated = match selected {
+        McpClient::OpenCode => v2.is_some(),
+        McpClient::OpenCode2 => v1.is_some(),
+        _ => false,
+    };
+    if selected_is_user_owned && alternate_is_generated {
+        bail!(
+            "a user-owned OpenCode MCP entry occupies the selected major-version location while a generated entry remains in the alternate location; preserved both, pass explicit --server-url and --auth-token after resolving the conflict"
+        );
+    }
+    match (v1, v2) {
+        (Some(v1), Some(v2)) if v1 != v2 => bail!(
+            "conflicting generated OpenCode MCP entries exist in the V1 and V2 locations; pass explicit --server-url and --auth-token before installing"
+        ),
+        (Some(v1), Some(_)) | (Some(v1), None) => Ok(Some(v1)),
+        (None, Some(v2)) => Ok(Some(v2)),
+        (None, None) => {
+            let selected_entry = match selected {
+                McpClient::OpenCode => root.pointer("/mcp/ai-memory"),
+                McpClient::OpenCode2 => root.pointer("/mcp/servers/ai-memory"),
+                _ => None,
+            };
+            if selected_entry.is_some() {
+                eprintln!(
+                    "[ai-memory] warning: preserving user-owned OpenCode MCP entry in the selected major-version location; pass explicit --server-url and --auth-token rather than inferring from it"
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn inferred_owned_opencode_entry(
+    entry: &serde_json::Value,
+    location: McpClient,
+) -> Option<InferredOpenCodeMcpConfig> {
+    if !opencode_mcp_entry_has_generated_shape(entry, location) {
+        return None;
+    }
+    let object = entry.as_object()?;
+    Some(InferredOpenCodeMcpConfig {
+        mcp_url: object
+            .get("url")
+            .and_then(serde_json::Value::as_str)?
+            .to_string(),
+        auth_token: object
+            .get("headers")
+            .and_then(|headers| headers.get("Authorization"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.trim().strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn opencode_selected_entry<'a>(
+    root: &'a serde_json::Map<String, serde_json::Value>,
+    client: McpClient,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    let mcp = root.get("mcp")?.as_object()?;
+    match client {
+        McpClient::OpenCode => mcp.get(name),
+        McpClient::OpenCode2 => mcp.get("servers")?.as_object()?.get(name),
+        _ => None,
+    }
+}
+
+fn opencode_generated_headers(headers: Option<&serde_json::Value>) -> bool {
+    let Some(headers) = headers else {
+        return true;
+    };
+    let Some(headers) = headers.as_object() else {
+        return false;
+    };
+    headers.len() == 1
+        && headers
+            .get("Authorization")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.starts_with("Bearer ") && value.len() > "Bearer ".len())
+}
+
+fn opencode_mcp_entry_has_generated_shape(entry: &serde_json::Value, location: McpClient) -> bool {
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    if entry.get("type").and_then(serde_json::Value::as_str) != Some("remote")
+        || entry
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return false;
+    }
+    let allowed = ["type", "url", "enabled", "oauth", "headers"];
+    if entry.keys().any(|key| !allowed.contains(&key.as_str()))
+        || !opencode_generated_headers(entry.get("headers"))
+    {
+        return false;
+    }
+    match location {
+        McpClient::OpenCode => {
+            entry.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
+                && !entry.contains_key("oauth")
+        }
+        McpClient::OpenCode2 => {
+            entry.get("oauth").and_then(serde_json::Value::as_bool) == Some(false)
+                && !entry.contains_key("enabled")
+        }
+        _ => false,
+    }
+}
+
+fn opencode_mcp_entry_is_owned(entry: &serde_json::Value, args: &InstallMcpArgs) -> bool {
+    let expected_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    entry.get("url").and_then(serde_json::Value::as_str) == Some(expected_url)
+        && opencode_mcp_entry_has_generated_shape(
+            entry,
+            match args.client {
+                McpClient::OpenCode => McpClient::OpenCode2,
+                McpClient::OpenCode2 => McpClient::OpenCode,
+                other => other,
+            },
+        )
+}
+
 fn upsert_json_mcp_entry(
     root: &mut serde_json::Map<String, serde_json::Value>,
     args: &InstallMcpArgs,
 ) -> Result<()> {
     let entry = build_json_mcp_entry(args)?;
+    migrate_opencode_mcp_entry(root, args)?;
     match json_mcp_location(args.client).context("internal: unsupported JSON MCP client")? {
         JsonMcpLocation::RootMcpServers => {
             let servers = root
@@ -939,10 +1201,10 @@ fn build_mcp_entry_opencode(args: &InstallMcpArgs) -> Result<serde_json::Value> 
     Ok(serde_json::Value::Object(entry))
 }
 
-/// OpenCode V2 MCP entry: `type: "remote"` + `url` + optional
+/// OpenCode 2.0 beta MCP entry: `type: "remote"` + `url` + optional
 /// `headers` under `mcp.servers`. V2 has no `enabled` field (servers
 /// connect unless `disabled: true`), and header-credentialed servers
-/// must set `oauth: false` so OpenCode does not attempt OAuth discovery
+/// must set `oauth: false` so the beta does not attempt OAuth discovery
 /// against ai-memory's local endpoint
 /// (https://opencode.ai/v2/docs/mcp-servers).
 fn build_mcp_entry_opencode2(args: &InstallMcpArgs) -> Result<serde_json::Value> {
@@ -1274,12 +1536,13 @@ fn render_opencode(args: &InstallMcpArgs) -> Result<String> {
 
 fn render_opencode2(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
-        "# OpenCode V2 (`opencode2` compatibility selector) — merge into\n\
+        "# OpenCode 2.0 beta (`opencode2`) — merge into\n\
          # ~/.config/opencode/opencode.json(c) under \"mcp\" → \"servers\":\n\
          #\n\
-         # V2 nests servers under `mcp.servers` (V1 used top-level `mcp`)\n\
-         # and has no `enabled` field. If your config is `opencode.jsonc`\n\
-         # with comments, re-run with\n\
+         # V2 nests servers under `mcp.servers` (V1 used direct `mcp`)\n\
+         # and has no `enabled` field. Apply mode migrates an alternate V1\n\
+         # entry only when its endpoint and generated shape prove ownership.\n\
+         # If your config is `opencode.jsonc` with comments, re-run with\n\
          # `--config-file ~/.config/opencode/opencode.jsonc`.\n\
          {snippet}\n",
         snippet = render_json_mcp_fragment(args)?,
@@ -1651,6 +1914,302 @@ mod tests {
     }
 
     #[test]
+    fn opencode_mcp_migration_moves_only_owned_alternate_shape() {
+        let args = args_with_token(McpClient::OpenCode2);
+        let mut root = json!({
+            "mcp": {
+                "ai-memory": {
+                    "type": "remote",
+                    "url": "http://127.0.0.1:49374/mcp",
+                    "enabled": true,
+                    "headers": {"Authorization": "Bearer old"}
+                },
+                "other": {"type": "remote", "url": "https://example.invalid/mcp"}
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        assert!(root["mcp"].get("ai-memory").is_none());
+        assert_eq!(root["mcp"]["other"]["url"], "https://example.invalid/mcp");
+        assert_eq!(root["mcp"]["servers"]["ai-memory"]["oauth"], json!(false));
+        let once = serde_json::to_string_pretty(&root).unwrap();
+        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        assert_eq!(serde_json::to_string_pretty(&root).unwrap(), once);
+    }
+
+    #[test]
+    fn opencode_mcp_migration_works_in_both_major_directions() {
+        let mut root = json!({
+            "mcp": {
+                "servers": {
+                    "ai-memory": {
+                        "type": "remote",
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "oauth": false
+                    }
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        upsert_json_mcp_entry(&mut root, &args_for(McpClient::OpenCode)).unwrap();
+        assert!(root["mcp"].get("servers").is_none());
+        assert_eq!(root["mcp"]["ai-memory"]["enabled"], json!(true));
+    }
+
+    #[test]
+    fn opencode_mcp_migration_preserves_custom_headers() {
+        let args = args_for(McpClient::OpenCode2);
+        let user_entry = json!({
+            "type": "remote",
+            "url": "http://127.0.0.1:49374/mcp",
+            "enabled": true,
+            "headers": {
+                "Authorization": "Bearer user-token",
+                "X-User-Route": "custom"
+            }
+        });
+        let mut root = json!({"mcp": {"ai-memory": user_entry.clone()}})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        assert_eq!(root["mcp"]["ai-memory"], user_entry);
+        assert!(root["mcp"]["servers"]["ai-memory"].is_object());
+    }
+
+    #[test]
+    fn opencode_mcp_migration_accepts_only_historical_generated_headers() {
+        for headers in [
+            None,
+            Some(json!({"Authorization": "Bearer historical-token"})),
+        ] {
+            let mut entry = serde_json::Map::from_iter([
+                ("type".to_string(), json!("remote")),
+                ("url".to_string(), json!("http://127.0.0.1:49374/mcp")),
+                ("enabled".to_string(), json!(true)),
+            ]);
+            if let Some(headers) = headers {
+                entry.insert("headers".to_string(), headers);
+            }
+            assert!(opencode_mcp_entry_is_owned(
+                &serde_json::Value::Object(entry),
+                &args_for(McpClient::OpenCode2),
+            ));
+        }
+    }
+
+    #[test]
+    fn opencode_install_reuses_owned_endpoint_and_token_across_major_transitions() {
+        for (client, initial, selected_path, removed_path, expected_url) in [
+            (
+                McpClient::OpenCode2,
+                json!({"mcp":{"ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer v1-token"}}}}),
+                "/mcp/servers/ai-memory",
+                "/mcp/ai-memory",
+                "http://v1-host:49374/mcp",
+            ),
+            (
+                McpClient::OpenCode,
+                json!({"mcp":{"servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false,"headers":{"Authorization":"Bearer v2-token"}}}}}),
+                "/mcp/ai-memory",
+                "/mcp/servers/ai-memory",
+                "http://v2-host:49374/mcp",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config_path = tmp.path().join("opencode.json");
+            fs::write(
+                &config_path,
+                serde_json::to_string_pretty(&initial).unwrap(),
+            )
+            .unwrap();
+            let config = Config::default();
+            let mut args = args_for(client);
+            args.server_url = None;
+            args.config_file = Some(config_path.clone());
+            args.apply = true;
+
+            run_with_opencode_dialect(
+                &config,
+                args,
+                Some(match client {
+                    McpClient::OpenCode => ai_memory_workstream::OpenCodeDialect::V1,
+                    McpClient::OpenCode2 => ai_memory_workstream::OpenCodeDialect::V2,
+                    _ => unreachable!(),
+                }),
+            )
+            .unwrap();
+
+            let root: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+            let entry = root.pointer(selected_path).unwrap();
+            assert_eq!(entry["url"], expected_url);
+            let expected_token = if client == McpClient::OpenCode2 {
+                "Bearer v1-token"
+            } else {
+                "Bearer v2-token"
+            };
+            assert_eq!(entry["headers"]["Authorization"], expected_token);
+            assert!(root.pointer(removed_path).is_none());
+        }
+    }
+
+    #[test]
+    fn opencode_install_refuses_conflicting_owned_transition_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("opencode.json");
+        let initial = json!({"mcp":{
+            "ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true},
+            "servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false}}
+        }});
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&initial).unwrap(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::OpenCode2);
+        args.server_url = None;
+        args.config_file = Some(config_path.clone());
+        args.apply = true;
+
+        let error = run_with_opencode_dialect(
+            &Config::default(),
+            args,
+            Some(ai_memory_workstream::OpenCodeDialect::V2),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting generated OpenCode MCP entries")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(config_path).unwrap())
+                .unwrap(),
+            initial
+        );
+    }
+
+    #[test]
+    fn opencode_install_refuses_generated_transition_over_a_user_owned_selected_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("opencode.json");
+        let initial = json!({"mcp":{
+            "ai-memory":{"type":"remote","url":"http://user-host:49374/mcp","enabled":true,"command":"user-owned"},
+            "servers":{"ai-memory":{"type":"remote","url":"http://generated-host:49374/mcp","oauth":false}}
+        }});
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&initial).unwrap(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::OpenCode);
+        args.server_url = None;
+        args.config_file = Some(config_path.clone());
+        args.apply = true;
+
+        let error = run_with_opencode_dialect(
+            &Config::default(),
+            args,
+            Some(ai_memory_workstream::OpenCodeDialect::V1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("user-owned OpenCode MCP entry"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(config_path).unwrap())
+                .unwrap(),
+            initial
+        );
+    }
+
+    #[test]
+    fn opencode_install_does_not_infer_from_a_user_owned_transition_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("opencode.json");
+        let user = json!({
+            "type":"remote",
+            "url":"http://user-host:49374/mcp",
+            "enabled":true,
+            "headers":{"Authorization":"Bearer user-token","X-User":"route"}
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({"mcp":{"ai-memory":user.clone()}})).unwrap(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::OpenCode2);
+        args.server_url = None;
+        args.config_file = Some(config_path.clone());
+        args.apply = true;
+
+        run_with_opencode_dialect(
+            &Config::default(),
+            args,
+            Some(ai_memory_workstream::OpenCodeDialect::V2),
+        )
+        .unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+        assert_eq!(root["mcp"]["ai-memory"], user);
+        assert_eq!(root["mcp"]["servers"]["ai-memory"]["url"], DEFAULT_MCP_URL);
+    }
+
+    #[test]
+    fn opencode_mcp_apply_is_byte_idempotent_after_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("opencode.json");
+        fs::write(
+            &config,
+            serde_json::to_string_pretty(&json!({
+                "mcp": {
+                    "ai-memory": {
+                        "type": "remote",
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "enabled": true
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut args = args_for(McpClient::OpenCode2);
+        args.config_file = Some(config.clone());
+        args.apply = true;
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read(&config).unwrap();
+        apply_to_config_file(&args).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), first);
+    }
+
+    #[test]
+    fn opencode_mcp_migration_preserves_ambiguous_user_entry() {
+        let args = args_for(McpClient::OpenCode2);
+        let user_entry = json!({
+            "type": "remote",
+            "url": "http://127.0.0.1:49374/mcp",
+            "enabled": true,
+            "command": "user-owned"
+        });
+        let mut root = json!({"mcp": {"ai-memory": user_entry.clone()}})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        upsert_json_mcp_entry(&mut root, &args).unwrap();
+        assert_eq!(root["mcp"]["ai-memory"], user_entry);
+        assert!(root["mcp"]["servers"]["ai-memory"].is_object());
+    }
+
+    #[test]
     fn opencode2_entry_uses_v2_servers_shape() {
         // V2 nests under `mcp.servers`, drops v1's `enabled`, and disables
         // OAuth discovery: ai-memory authenticates with a static header.
@@ -1669,7 +2228,7 @@ mod tests {
         assert!(root["mcp"]["servers"]["ai-memory"].is_object());
         assert!(root.get("mcpServers").is_none());
 
-        // V1 still lands under top-level `mcp`.
+        // v1 still lands under top-level `mcp`, so both stay wired.
         let mut v1 = serde_json::Map::new();
         upsert_json_mcp_entry(&mut v1, &args_with_token(McpClient::OpenCode)).unwrap();
         assert!(v1["mcp"]["ai-memory"].is_object());

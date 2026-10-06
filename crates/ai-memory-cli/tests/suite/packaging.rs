@@ -818,6 +818,29 @@ fn dev_loop_is_wired_consistently() {
 }
 
 #[cfg(unix)]
+#[test]
+fn hook_installer_normalizes_the_open_code_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = shell_script_command(&repo_root().join("scripts/install-hooks.sh"))
+        .args(["--agent", "open-code", "--to"])
+        .arg(tmp.path().join("hooks"))
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "installer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("install-hooks --agent opencode --apply"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("unsupported agent"), "{stdout}");
+}
+
+#[cfg(unix)]
 fn installed_hook_names(agent_arg: &str, canonical_agent: &str, hooks: &[&str]) -> Vec<String> {
     let tmp = tempfile::tempdir().unwrap();
     let bundle = tmp.path().join("bundle/hooks").join(canonical_agent);

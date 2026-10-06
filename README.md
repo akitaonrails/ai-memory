@@ -113,7 +113,8 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Codex | Supported |
 | Command Code | Supported |
 | Devin CLI | Supported |
-| OpenCode (V1 and V2, auto-detected) | Supported |
+| OpenCode (V1/V2 auto-detected) | Supported |
+| OpenCode V2 compatibility aliases (`opencode2`, `opencode-v2`, `open-code2`) | Supported |
 | Cursor | Supported |
 | Gemini CLI | Supported |
 | Oh My Pi / OMP | Supported |
@@ -343,7 +344,11 @@ writable prefix (see [`docs/windows.md`](docs/windows.md) Scenario C).
 
 Wiring another agent is the same two commands with a different name —
 `--client codex`, `--agent codex`, and so on for every row of the support
-matrix. The full per-agent guide, including Windows and remote servers, is
+matrix. OpenCode is version-detected by host-side commands; when generating its
+artifacts inside a container, use `setup-agent --agent opencode
+--opencode-dialect v1|v2 --to /tmp/unused` because the container cannot inspect
+the host executable. The `opencode2` aliases remain force-V2 compatibility
+spellings. The full per-agent guide, including Windows and remote servers, is
 [`docs/install.md`](docs/install.md).
 
 Two agents in the same project at once, or teammates on one server? That

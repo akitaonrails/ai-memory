@@ -122,7 +122,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
         );
     }
 
-    let harnesses = available_harnesses();
+    let harnesses = available_harnesses(config);
     let mut harness_indices = vec![0usize; candidates.len()];
     let mut choices = candidates
         .iter()

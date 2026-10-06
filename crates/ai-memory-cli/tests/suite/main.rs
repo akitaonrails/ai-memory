@@ -21,6 +21,7 @@ mod hook_payload;
 mod jail_toggles_e2e;
 mod marker_scope;
 mod message_e2e;
+mod opencode_dialect;
 mod packaging;
 mod removal;
 mod repo_layout;

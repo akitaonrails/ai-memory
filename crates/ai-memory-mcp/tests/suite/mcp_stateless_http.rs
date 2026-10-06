@@ -194,6 +194,11 @@ async fn stateful_tools_call_without_session_is_rejected() {
 
 /// Pull `memory_read_page`'s inputSchema from a tools/list response body.
 fn read_page_input_schema(body: &str) -> serde_json::Value {
+    input_schema_of(body, "memory_read_page")
+}
+
+/// Pull any named tool's inputSchema from a tools/list response body.
+fn input_schema_of(body: &str, name: &str) -> serde_json::Value {
     let json: serde_json::Value = serde_json::from_str(body)
         .unwrap_or_else(|e| panic!("tools/list response must be JSON, got: {body}\nerr: {e}"));
     let tools = json["result"]["tools"]
@@ -201,11 +206,9 @@ fn read_page_input_schema(body: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("missing result.tools: {body}"));
     tools
         .iter()
-        .find(|tool| tool["name"] == "memory_read_page")
-        .unwrap_or_else(|| panic!("memory_read_page missing from tools/list: {body}"))[
-        "inputSchema"
-    ]
-    .clone()
+        .find(|tool| tool["name"] == name)
+        .unwrap_or_else(|| panic!("{name} missing from tools/list: {body}"))["inputSchema"]
+        .clone()
 }
 
 /// Kimi Code's real flow: independent stateless POSTs against
@@ -383,6 +386,93 @@ async fn stateless_moonshot_flavor_keeps_nullable_unions() {
         schema["properties"]["query"]["type"],
         serde_json::json!(["string", "null"]),
         "the root-combinator dialect must leave union types alone: {schema}"
+    );
+}
+
+/// Codex forwards MCP input schemas into Responses `tools.function.parameters`
+/// verbatim, and Moonshot's validator never resolves `$ref` — every reference
+/// 400s the call with "detected infinite recursion without termination
+/// condition". `?flavor=moonshot` must therefore inline every `#/$defs/*`
+/// reference (nested combinators themselves pass, so the nullable union on
+/// `reasoning` stays).
+#[tokio::test]
+async fn stateless_moonshot_flavor_inlines_defs() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router
+        .oneshot(post_to("/mcp?flavor=moonshot", TOOLS_LIST))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    for tool_name in ["memory_query", "memory_explore", "memory_feedback"] {
+        let schema = input_schema_of(&body, tool_name);
+        assert!(
+            schema.get("$defs").is_none(),
+            "moonshot flavor must drop the $defs table from {tool_name}: {schema}"
+        );
+        assert!(
+            !serde_json::to_string(&schema)
+                .expect("schema serializes")
+                .contains("$ref"),
+            "moonshot flavor must not leave a single $ref in {tool_name}: {schema}"
+        );
+    }
+    let query = input_schema_of(&body, "memory_query");
+    assert!(
+        query["properties"]["reasoning"]["anyOf"].is_array(),
+        "the nested nullable union must survive inlining: {query}"
+    );
+}
+
+/// Kiro's Bedrock dialect is deliberately narrower than Moonshot's: it strips
+/// root combinators but keeps `$defs`/`$ref` pairs, which Bedrock resolves.
+#[tokio::test]
+async fn stateless_bedrock_flavor_keeps_defs() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router
+        .oneshot(post_to("/mcp?flavor=bedrock", TOOLS_LIST))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = input_schema_of(&body_string(resp).await, "memory_feedback");
+    assert!(
+        schema.get("$defs").is_some(),
+        "bedrock flavor must keep the $defs table: {schema}"
+    );
+    assert!(
+        serde_json::to_string(&schema)
+            .expect("schema serializes")
+            .contains("$ref"),
+        "bedrock flavor must keep $ref pairs: {schema}"
+    );
+}
+
+/// Vertex accepts `$defs`/`$ref` and Gemini CLI ships them untouched, so the
+/// Gemini dialect must keep flattening references out of scope.
+#[tokio::test]
+async fn stateless_gemini_flavor_keeps_defs() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router
+        .oneshot(post_to("/mcp?flavor=gemini", TOOLS_LIST))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let schema = input_schema_of(&body_string(resp).await, "memory_feedback");
+    assert!(
+        schema.get("$defs").is_some(),
+        "gemini flavor must keep the $defs table: {schema}"
+    );
+    assert!(
+        serde_json::to_string(&schema)
+            .expect("schema serializes")
+            .contains("$ref"),
+        "gemini flavor must keep $ref pairs: {schema}"
     );
 }
 

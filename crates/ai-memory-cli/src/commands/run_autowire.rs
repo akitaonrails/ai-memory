@@ -19,10 +19,10 @@
 //! with `run --no-autowire` or `AI_MEMORY_RUN_AUTOWIRE=false`.
 
 use std::cell::Cell;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
-use ai_memory_workstream::ManagedHarness;
+use ai_memory_workstream::{ManagedHarness, OpenCodeDialect};
 use sha2::{Digest as _, Sha256};
 
 use crate::cli::{AgentChoice, InstallHooksArgs, InstallMcpArgs, McpClient};
@@ -64,14 +64,9 @@ pub(crate) fn autowire_state_dir(data_dir: &Path) -> PathBuf {
 /// own first launch.
 fn sentinel_path(data_dir: &Path, agent: AgentChoice, targets: &[String]) -> PathBuf {
     let digest = format!("{:x}", Sha256::digest(targets.join("\n").as_bytes()));
-    let integration = match agent {
-        AgentChoice::OpenCode => "open-code-v1",
-        AgentChoice::OpenCode2 => "open-code-v2",
-        _ => agent.kind().as_str(),
-    };
     let name = format!(
         "{}-{}-{}",
-        integration,
+        agent.kind().as_str(),
         env!("CARGO_PKG_VERSION"),
         &digest[..16]
     );
@@ -139,30 +134,34 @@ fn resolve_through_links(path: &Path) -> Option<PathBuf> {
 /// transcript import agree on one config home. It also records whether any
 /// value it handed out came from `--env`.
 struct LaunchEnv<'a> {
+    effective: &'a super::run::EffectiveChildEnv,
     run_env: &'a [(String, String)],
     from_run_env: Cell<bool>,
 }
 
 impl<'a> LaunchEnv<'a> {
-    fn new(run_env: &'a [(String, String)]) -> Self {
+    fn new(effective: &'a super::run::EffectiveChildEnv, run_env: &'a [(String, String)]) -> Self {
         Self {
+            effective,
             run_env,
             from_run_env: Cell::new(false),
         }
     }
 
     fn var_os(&self, name: &str) -> Option<OsString> {
-        if let Some((_, value)) = self.run_env.iter().find(|(key, _)| key == name) {
+        if self.run_env.iter().any(|(key, _)| {
+            super::run::environment_keys_equal(OsStr::new(key), OsStr::new(name), cfg!(windows))
+        }) {
             self.from_run_env.set(true);
-            return Some(OsString::from(value));
         }
-        std::env::var_os(name)
+        self.effective.get(name).map(OsStr::to_os_string)
     }
 }
 
 /// Where this launch's auto-wire installs, resolved without touching the disk.
 struct WireTargets {
     agent: AgentChoice,
+    opencode_dialect: Option<OpenCodeDialect>,
     sentinel: PathBuf,
     hook_target: anyhow::Result<PathBuf>,
     /// Whether any relocation variable behind the hook target came from `--env`.
@@ -176,31 +175,53 @@ struct WireTargets {
     shared_extensions_dir: Option<PathBuf>,
 }
 
+#[cfg(test)]
 fn wire_targets(
     config: &Config,
     harness: ManagedHarness,
     overrides: &WireOverrides,
     run_env: &[(String, String)],
 ) -> Option<WireTargets> {
+    let effective_env = super::run::EffectiveChildEnv::with_overrides(&config.runtime_env, run_env);
+    wire_targets_with_env(config, harness, overrides, run_env, &effective_env)
+}
+
+fn wire_targets_with_env(
+    config: &Config,
+    harness: ManagedHarness,
+    overrides: &WireOverrides,
+    run_env: &[(String, String)],
+    effective_env: &super::run::EffectiveChildEnv,
+) -> Option<WireTargets> {
     let agent = agent_choice_for_harness(harness)?;
-    let hook_env = LaunchEnv::new(run_env);
+    let opencode_dialect = match harness {
+        ManagedHarness::OpenCode => Some(OpenCodeDialect::V1),
+        ManagedHarness::OpenCode2 => Some(OpenCodeDialect::V2),
+        _ => None,
+    };
+    let hook_env = LaunchEnv::new(effective_env, run_env);
     let hook_target = install_hooks::hook_config_target_with(agent, &|name| hook_env.var_os(name));
     let mcp_client = install_hooks::mcp_client_for_agent(agent);
-    let mcp_env = LaunchEnv::new(run_env);
+    let mcp_env = LaunchEnv::new(effective_env, run_env);
     let mcp_target = mcp_client
         .map(|client| install_mcp::mcp_config_path_with(client, &|name| mcp_env.var_os(name)));
     let sentinel = sentinel_path(
         &config.data_dir,
         agent,
         &[
+            opencode_dialect.map_or_else(
+                || "dialect:default".to_string(),
+                |dialect| format!("opencode-major:{}", dialect.major()),
+            ),
             target_key(overrides.hooks_config_file.as_deref(), Some(&hook_target)),
             target_key(overrides.mcp_config_file.as_deref(), mcp_target.as_ref()),
         ],
     );
     let shared_extensions_dir = match (&overrides.hooks_config_file, &hook_target) {
         (None, Ok(target)) => {
-            let launch = LaunchEnv::new(run_env);
-            let process = LaunchEnv::new(&[]);
+            let launch = LaunchEnv::new(effective_env, run_env);
+            let process_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+            let process = LaunchEnv::new(&process_env, &[]);
             install_hooks::shared_extensions_dir(agent, target, &|name| launch.var_os(name)).filter(
                 |_| {
                     install_hooks::shared_extensions_dir(agent, target, &|name| {
@@ -214,6 +235,7 @@ fn wire_targets(
     };
     Some(WireTargets {
         agent,
+        opencode_dialect,
         sentinel,
         hook_target,
         hook_relocated: hook_env.from_run_env.get(),
@@ -246,6 +268,7 @@ fn target_key(injected: Option<&Path>, resolved: Option<&anyhow::Result<PathBuf>
 /// otherwise a target is pinned only when `--env` moved it, so a launch without
 /// `--env` installs exactly where the installers pick on their own.
 struct WireInstalls {
+    opencode_dialect: Option<OpenCodeDialect>,
     /// One hook install, or one per agent config for a Kiro CLI v2 home that
     /// `--env` relocated.
     hooks: Vec<InstallHooksArgs>,
@@ -260,6 +283,7 @@ struct WireInstalls {
 fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverrides) -> WireInstalls {
     let WireTargets {
         agent,
+        opencode_dialect,
         hook_target,
         hook_relocated,
         mcp_client,
@@ -268,7 +292,8 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
         shared_extensions_dir,
         ..
     } = targets;
-    let server_url = Some(config.server_url.clone());
+    let infer_opencode_transition = opencode_dialect.is_some() && !config.server_url_configured();
+    let server_url = (!infer_opencode_transition).then(|| config.server_url.clone());
     let auth_token = config.auth.bearer_token.clone();
     let hook_install = |config_file: Option<PathBuf>| InstallHooksArgs {
         agent,
@@ -363,6 +388,7 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
             flavor: None,
         });
     WireInstalls {
+        opencode_dialect,
         hooks,
         hooks_skipped,
         mcp,
@@ -380,13 +406,26 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
 /// Production launches pass [`WireOverrides::default()`] (via
 /// [`run_from`](super::run::run_from)); the overrides exist only so the seam can
 /// be exercised without writing to the developer's real `$HOME`.
+#[cfg(test)]
 pub(crate) fn ensure_wired_with(
     config: &Config,
     harness: ManagedHarness,
     overrides: &WireOverrides,
     run_env: &[(String, String)],
 ) {
-    let Some(targets) = wire_targets(config, harness, overrides, run_env) else {
+    let effective_env = super::run::EffectiveChildEnv::with_overrides(&config.runtime_env, run_env);
+    ensure_wired_with_env(config, harness, overrides, run_env, &effective_env);
+}
+
+pub(crate) fn ensure_wired_with_env(
+    config: &Config,
+    harness: ManagedHarness,
+    overrides: &WireOverrides,
+    run_env: &[(String, String)],
+    effective_env: &super::run::EffectiveChildEnv,
+) {
+    let Some(targets) = wire_targets_with_env(config, harness, overrides, run_env, effective_env)
+    else {
         return;
     };
     if targets.sentinel.exists() {
@@ -401,7 +440,7 @@ pub(crate) fn ensure_wired_with(
         harness.as_str()
     );
 
-    let installs = wire_installs(config, targets, overrides);
+    let mut installs = wire_installs(config, targets, overrides);
     let warn_hooks = |reason: &str| {
         eprintln!(
             "ai-memory: could not auto-install {} hooks ({reason}); continuing launch. \
@@ -410,23 +449,15 @@ pub(crate) fn ensure_wired_with(
             agent.kind().as_str()
         );
     };
-    for args in installs.hooks {
-        match install_hooks::run(config, args) {
-            Ok(()) => {
-                if let Some(dir) = &installs.shared_extensions_dir {
-                    install_hooks::warn_agents_share_extensions_dir(dir);
-                }
-            }
-            Err(error) => warn_hooks(&format!("{error:#}")),
-        }
-    }
-    if let Some(reason) = &installs.hooks_skipped {
-        warn_hooks(reason);
-    }
-
+    // Install MCP first so a major-version migration has one canonical selected
+    // entry before the hook installer infers its endpoint and credential.
     // Not every hook-capable harness has an MCP client the installer can write
     // (e.g. Pi bridges MCP through its generated extension); skip those quietly.
-    let mcp_failure = match installs.mcp {
+    let mcp_config_path = installs
+        .mcp
+        .as_ref()
+        .and_then(|args| args.config_file.clone());
+    let mcp_failure = match installs.mcp.take() {
         // The sentinel is version-keyed, so this whole step re-runs on every
         // upgrade. install-mcp replaces the `ai-memory` entry wholesale, so a
         // plain re-run would overwrite a session-aware Claude Code bridge the
@@ -447,18 +478,43 @@ pub(crate) fn ensure_wired_with(
             );
             None
         }
-        Some(args) => install_mcp::run(config, args)
-            .err()
-            .map(|error| format!("{error:#}")),
+        Some(args) => {
+            install_mcp::run_with_opencode_dialect(config, args, installs.opencode_dialect)
+                .err()
+                .map(|error| format!("{error:#}"))
+        }
         None => installs.mcp_skipped,
     };
-    if let Some(reason) = mcp_failure {
+    if let Some(reason) = &mcp_failure {
         eprintln!(
             "ai-memory: could not auto-install the {} MCP server ({reason}); continuing \
              launch. Wire it manually with `ai-memory install-mcp --client {} --apply`.",
             harness.as_str(),
             agent.kind().as_str()
         );
+    }
+
+    if installs.opencode_dialect.is_some() && mcp_failure.is_some() {
+        warn_hooks("the OpenCode MCP transition failed before hook endpoint/token inference");
+    } else {
+        for args in installs.hooks {
+            match install_hooks::run_with_opencode_dialect_and_mcp_path(
+                config,
+                args,
+                installs.opencode_dialect,
+                mcp_config_path.as_deref(),
+            ) {
+                Ok(()) => {
+                    if let Some(dir) = &installs.shared_extensions_dir {
+                        install_hooks::warn_agents_share_extensions_dir(dir);
+                    }
+                }
+                Err(error) => warn_hooks(&format!("{error:#}")),
+            }
+        }
+        if let Some(reason) = &installs.hooks_skipped {
+            warn_hooks(reason);
+        }
     }
 
     // Record the attempt even on partial failure: re-applying an idempotent
@@ -518,17 +574,89 @@ mod tests {
     }
 
     #[test]
+    fn opencode_major_transition_changes_the_autowire_sentinel() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let config = test_config(home.path(), data.path());
+        let overrides = WireOverrides::default();
+        let v1 = wire_targets(&config, ManagedHarness::OpenCode, &overrides, &[]).unwrap();
+        let v2 = wire_targets(&config, ManagedHarness::OpenCode2, &overrides, &[]).unwrap();
+        assert_ne!(v1.sentinel, v2.sentinel);
+    }
+
+    #[test]
+    fn opencode_autowire_migrates_mcp_before_hooks_infer_transition_settings() {
+        let data = tempfile::tempdir().unwrap();
+        let plugin = data.path().join("plugins/ai-memory-opencode2.ts");
+        let mcp = data.path().join("opencode.json");
+        std::fs::write(
+            &mcp,
+            r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://transition-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer transition-token"}}}}"#,
+        )
+        .unwrap();
+        let config = Config {
+            data_dir: data.path().join("data"),
+            run_autowire: true,
+            ..Config::default()
+        };
+        let overrides = WireOverrides {
+            hooks_config_file: Some(plugin.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+
+        ensure_wired_with(&config, ManagedHarness::OpenCode2, &overrides, &[]);
+
+        let mcp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(mcp).unwrap()).unwrap();
+        assert!(mcp.pointer("/mcp/ai-memory").is_none());
+        assert_eq!(
+            mcp.pointer("/mcp/servers/ai-memory/url"),
+            Some(&serde_json::json!("http://transition-host:49374/mcp"))
+        );
+        assert!(
+            std::fs::read_to_string(plugin)
+                .unwrap()
+                .contains("http://transition-host:49374")
+        );
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir).as_deref(),
+            Some("transition-token")
+        );
+    }
+
+    #[test]
+    fn opencode_autowire_does_not_write_hooks_when_mcp_transition_conflicts() {
+        let data = tempfile::tempdir().unwrap();
+        let plugin = data.path().join("plugins/ai-memory-opencode2.ts");
+        let mcp = data.path().join("opencode.json");
+        let initial = r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true},"servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false}}}}"#;
+        std::fs::write(&mcp, initial).unwrap();
+        let config = Config {
+            data_dir: data.path().join("data"),
+            run_autowire: true,
+            ..Config::default()
+        };
+        let overrides = WireOverrides {
+            hooks_config_file: Some(plugin.clone()),
+            mcp_config_file: Some(mcp.clone()),
+            ..WireOverrides::default()
+        };
+
+        ensure_wired_with(&config, ManagedHarness::OpenCode2, &overrides, &[]);
+
+        assert!(!plugin.exists());
+        assert_eq!(std::fs::read_to_string(mcp).unwrap(), initial);
+        assert!(crate::config::read_hook_auth_token(&config.data_dir).is_none());
+    }
+
+    #[test]
     fn sentinel_keys_on_agent_version_and_install_targets() {
         let dir = Path::new("/data");
         let targets = |hooks: &str| vec![hooks.to_string(), "/cfg/.claude.json".to_string()];
         let claude = sentinel_path(dir, AgentChoice::ClaudeCode, &targets("/a/settings.json"));
         let codex = sentinel_path(dir, AgentChoice::Codex, &targets("/a/settings.json"));
         assert_ne!(claude, codex, "different agents get distinct sentinels");
-        assert_ne!(
-            sentinel_path(dir, AgentChoice::OpenCode, &targets("/a/ai-memory.ts")),
-            sentinel_path(dir, AgentChoice::OpenCode2, &targets("/a/ai-memory.ts")),
-            "an OpenCode major-version change must force auto-wire to run again"
-        );
         assert_eq!(
             claude,
             sentinel_path(dir, AgentChoice::ClaudeCode, &targets("/a/settings.json")),
@@ -647,12 +775,21 @@ mod tests {
     /// masks the process one, the same layering native-session resolution uses.
     #[test]
     fn launch_env_prefers_run_env_and_records_it() {
-        let process_only = LaunchEnv::new(&[]);
-        assert_eq!(process_only.var_os("PATH"), std::env::var_os("PATH"));
+        let process = crate::commands::run::EffectiveChildEnv::for_tests([("PATH", "/process")]);
+        let process_only = LaunchEnv::new(&process, &[]);
+        assert_eq!(
+            process_only.var_os("PATH"),
+            Some(OsString::from("/process"))
+        );
         assert!(!process_only.from_run_env.get());
 
         let run_env = [("PATH".to_string(), "/from-run-env".to_string())];
-        let layered = LaunchEnv::new(&run_env);
+        let effective = crate::commands::run::EffectiveChildEnv::with_overrides_for_platform(
+            process.entries(),
+            &run_env,
+            false,
+        );
+        let layered = LaunchEnv::new(&effective, &run_env);
         assert_eq!(
             layered.var_os("PATH"),
             Some(OsString::from("/from-run-env"))
@@ -660,7 +797,15 @@ mod tests {
         assert!(layered.from_run_env.get());
 
         let empty = [("PATH".to_string(), String::new())];
-        assert_eq!(LaunchEnv::new(&empty).var_os("PATH"), Some(OsString::new()));
+        let effective = crate::commands::run::EffectiveChildEnv::with_overrides_for_platform(
+            process.entries(),
+            &empty,
+            false,
+        );
+        assert_eq!(
+            LaunchEnv::new(&effective, &empty).var_os("PATH"),
+            Some(OsString::new())
+        );
     }
 
     /// A named OMP profile owns its agent dir and ignores
@@ -1093,7 +1238,7 @@ mod tests {
             (AgentChoice::OpenCode, install_hooks::opencode_plugin_path()),
             (
                 AgentChoice::OpenCode2,
-                install_hooks::opencode_plugin_path(),
+                install_hooks::opencode2_plugin_path(),
             ),
             (AgentChoice::Pi, install_hooks::pi_extension_path()),
             (AgentChoice::Omp, install_hooks::omp_extension_path(None)),
