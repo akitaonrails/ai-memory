@@ -109,6 +109,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unedited files of an earlier export in place. (#1164)
 
 ### Fixed
+- Fixed SessionEnd consolidation repeating the same expensive prompt on the
+  durable queue when the structured LLM response fails deterministically: a
+  truncated or empty response, malformed JSON, or an unexpected response
+  shape now ends the queue on the first attempt, keeping the heuristic page
+  the hook already wrote; pre-send connection and capacity (`503`) failures
+  retain the bounded backoff. (#PRNUM)
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
