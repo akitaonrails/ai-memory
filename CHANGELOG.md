@@ -114,7 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   truncated or empty response, malformed JSON, or an unexpected response
   shape now ends the queue on the first attempt, keeping the heuristic page
   the hook already wrote; pre-send connection and capacity (`503`) failures
-  retain the bounded backoff. (#PRNUM)
+  retain the bounded backoff. (#1131)
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
