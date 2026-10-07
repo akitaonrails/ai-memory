@@ -437,7 +437,19 @@ mod slow {
             let client = fixture.client.clone();
             let endpoint = format!("{}/hook/batch", fixture.base);
             tasks.spawn(async move {
-                for _ in 0..2 {
+                // A completed batch may be re-posted verbatim: committed
+                // items dedup by ingest key, which is the spool-drain
+                // behavior this test models. Under 15 concurrent sessions
+                // the server may legitimately fail-fast one item (HTTP 200,
+                // accepted < 3, failed_index set) or shed the whole batch
+                // with 429 (#1119) — retry those instead of treating them
+                // as protocol failures, bounded so a genuine fault still
+                // fails the test.
+                const MAX_BATCH_POSTS: usize = 10;
+                let mut full_acks = 0usize;
+                let mut last_status = reqwest::StatusCode::OK;
+                let mut last_ack = Value::Null;
+                for _ in 0..MAX_BATCH_POSTS {
                     let response = client
                         .post(&endpoint)
                         .bearer_auth(TOKEN)
@@ -445,10 +457,24 @@ mod slow {
                         .send()
                         .await
                         .unwrap();
-                    assert!(response.status().is_success(), "{}", response.status());
+                    last_status = response.status();
                     let ack: Value = response.json().await.unwrap();
-                    assert_eq!(ack["accepted"], 3, "{ack}");
+                    last_ack = ack.clone();
+                    if last_status.is_success() && ack["accepted"] == 3 {
+                        full_acks += 1;
+                        if full_acks == 2 {
+                            break;
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
                 }
+                assert_eq!(
+                    full_acks,
+                    2,
+                    "both completed-batch posts must be acknowledged in full; \
+                     last response {last_status}: {last_ack}"
+                );
                 sid
             });
         }
