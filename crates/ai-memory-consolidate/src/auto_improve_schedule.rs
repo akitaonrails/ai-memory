@@ -887,7 +887,8 @@ mod tests {
         // from the same summary, so this proves the warning fired carrying
         // class/status only — never the body — without a log capture.
         assert_eq!(
-            first.review_failures, [expected],
+            first.review_failures,
+            [expected],
             "the failure warning must fire with the redacted summary"
         );
         let (last_error, attempts) = claim_row(store.db_path(), ws, project, session_id);
