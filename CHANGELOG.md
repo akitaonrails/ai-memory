@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed managed-workstream event content being truncated before sanitization:
+  event content, git checkpoints, and transcript loss summaries exceeding
+  the 64 KiB cap (`MAX_EVENT_CONTENT_BYTES`) were truncated before
+  `sanitizer.scrub()` ran, allowing a secret straddling the 64 KiB boundary
+  to be split into an unmatched prefix and persisted unredacted to the
+  immutable ledger segment. Content is now scrubbed before applying the byte
+  cap, matching the #980 title-hint, #1109 feedback-reason, and #1114
+  excerpt-cap order. (#1113)
 - Fixed the hook spool charging a spooled event's retry budget while the
   server was unreachable: an endpoint-level delivery failure (connection
   refused, timeout, DNS — the existing `Unreachable` classification) no
