@@ -1086,15 +1086,13 @@ fn sanitize_events(
         if event.event_id.trim().is_empty() || event.event_id.len() > MAX_EVENT_ID_BYTES {
             return Err("invalid workstream event id".to_string());
         }
-        if event.content.len() > MAX_EVENT_CONTENT_BYTES {
-            let mut end = MAX_EVENT_CONTENT_BYTES;
-            while !event.content.is_char_boundary(end) {
-                end -= 1;
-            }
-            event.content.truncate(end);
-            event.content.push_str("\n[truncated by ai-memory]");
-        }
+        // Scrub the full content before the cap: truncating first would cut
+        // a straddling secret in half and persist an unmatchable prefix
+        // (#1113), the ordering #980 / #1109 fixed on the other ingest
+        // surfaces. `truncate_owned` appends the marker the inline
+        // truncation used to.
         event.content = sanitizer.scrub(&event.content);
+        truncate_owned(&mut event.content, MAX_EVENT_CONTENT_BYTES);
         if let Some(role) = &event.role
             && (role.len() > 32
                 || !role
@@ -1138,7 +1136,10 @@ fn append_boundary_events(
     if checkpoint.is_empty() {
         checkpoint.push_str("No Git repository checkpoint was available.");
     }
-    truncate_owned(&mut checkpoint, MAX_EVENT_CONTENT_BYTES);
+    // Scrub before the cap (#1113): a secret straddling the cutoff must be
+    // redacted whole, not cut into an unmatchable prefix.
+    let mut checkpoint_content = sanitizer.scrub(&checkpoint);
+    truncate_owned(&mut checkpoint_content, MAX_EVENT_CONTENT_BYTES);
     request.events.push(NewWorkstreamEvent {
         event_id: format!("managed-run:{run_id}:checkpoint"),
         agent,
@@ -1146,7 +1147,7 @@ fn append_boundary_events(
         source_record_id: None,
         kind: WorkstreamEventKind::Checkpoint,
         role: None,
-        content: sanitizer.scrub(&checkpoint),
+        content: checkpoint_content,
         occurred_at: None,
         metadata: serde_json::json!({ "exit_code": request.exit_code }),
     });
@@ -1155,6 +1156,8 @@ fn append_boundary_events(
         for loss in &request.losses {
             let _ = writeln!(content, "- {loss}");
         }
+        // Same scrub-before-cap order as the checkpoint event (#1113).
+        let mut content = sanitizer.scrub(&content);
         truncate_owned(&mut content, MAX_EVENT_CONTENT_BYTES);
         request.events.push(NewWorkstreamEvent {
             event_id: format!("managed-run:{run_id}:losses"),
@@ -1163,7 +1166,7 @@ fn append_boundary_events(
             source_record_id: None,
             kind: WorkstreamEventKind::Annotation,
             role: None,
-            content: sanitizer.scrub(&content),
+            content,
             occurred_at: None,
             metadata: serde_json::json!({ "loss_count": request.losses.len() }),
         });
@@ -1898,6 +1901,142 @@ mod tests {
                 .any(|hit| hit.kind == WorkstreamEventKind::Checkpoint)
         );
         assert!(!hits.iter().any(|hit| hit.event_id == "late-new-event"));
+    }
+
+    /// Regression for #1113: event, checkpoint and losses content is scrubbed
+    /// with the configured sanitizer **before** the 64 KiB cap runs, so a
+    /// secret straddling the cutoff is redacted whole in the immutable raw
+    /// segment and in search, instead of being cut into a prefix too short
+    /// for the pattern to match. Same scrub-before-cap order as #980, #1109
+    /// and the hook-body fix for #1114.
+    #[tokio::test]
+    async fn workstream_content_is_scrubbed_before_the_64kib_cap() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let mut state = test_state(&store, temp.path());
+        state.sanitizer = Sanitizer::new(&ai_memory_core::SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        use ai_memory_core::WorkstreamCheckpoint;
+
+        // Tokens appear both at the start (reaching the 16 KiB store search
+        // index) and straddling 11 bytes before the 64 KiB cap in each surface.
+        // Truncating first would leave only "SECRETZZZZZ" (under the `{20,}` floor),
+        // so the unmatched prefix would survive unredacted in the immutable
+        // raw segment. Scrubbing first redacts it whole.
+        let secret = format!("SECRET{}", "Z".repeat(30));
+        let event_content = format!(
+            "{secret} {} {secret}",
+            "x".repeat(MAX_EVENT_CONTENT_BYTES - 12 - 37)
+        );
+        let checkpoint_head = format!(
+            "{secret} {} {secret}",
+            "x".repeat(MAX_EVENT_CONTENT_BYTES - 12 - 6 - 37)
+        );
+        let loss_content = format!(
+            "{secret} {} {secret}",
+            "x".repeat(MAX_EVENT_CONTENT_BYTES - 12 - 32 - 37)
+        );
+        let response = finish_run(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            None,
+            AxumPath(run.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                native_session_id: Some("native-1".into()),
+                source_cursor: None,
+                events: vec![NewWorkstreamEvent {
+                    event_id: "event-1".into(),
+                    agent: AgentKind::Codex,
+                    native_session_id: "native-1".into(),
+                    source_record_id: None,
+                    kind: WorkstreamEventKind::ToolResult,
+                    role: Some("tool".into()),
+                    content: event_content,
+                    occurred_at: None,
+                    metadata: serde_json::json!({}),
+                }],
+                complete: true,
+                checkpoint: WorkstreamCheckpoint {
+                    head: Some(checkpoint_head),
+                    branch: None,
+                    dirty_hash: None,
+                    changed_paths: Vec::new(),
+                },
+                exit_code: None,
+                losses: vec![loss_content],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let segment_dir = temp
+            .path()
+            .join("raw/workstreams")
+            .join(run.workstream_id.to_string())
+            .join("segments");
+        let path = std::fs::read_dir(segment_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("SECRETZ"),
+            "unredacted secret fragment survived the cap: {raw:?}"
+        );
+        let marker = "\n[truncated by ai-memory]".len();
+        for line in raw.lines() {
+            let event: NewWorkstreamEvent = serde_json::from_str(line).unwrap();
+            assert!(
+                !event.content.contains("SECRETZ"),
+                "unredacted fragment in {}: {:?}",
+                event.event_id,
+                event.content
+            );
+            assert!(
+                event.content.contains("[REDACTED:"),
+                "{} carries no redaction marker: {:?}",
+                event.event_id,
+                event.content
+            );
+            assert!(
+                event.content.len() <= MAX_EVENT_CONTENT_BYTES + marker,
+                "{} exceeded the 64 KiB cap: {}",
+                event.event_id,
+                event.content.len()
+            );
+        }
+        let hits = store
+            .reader
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                10,
+                state.sanitizer.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        for hit in &hits {
+            assert!(!hit.content.contains("SECRETZ"));
+            assert!(hit.content.contains("[REDACTED:"));
+        }
     }
 
     #[tokio::test]
