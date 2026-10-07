@@ -97,6 +97,15 @@ struct ScheduledAutoImproveOutcome {
 }
 
 /// Aggregate counters for one scheduler tick across every scope.
+///
+/// The trailing record fields mirror exactly what the tick's warnings
+/// carried (each is set in the same arm that emits the warning) so the
+/// tests observe the warning contracts through typed values instead of
+/// log capture: a `warn!` callsite's cached `Interest` is computed
+/// process-wide by whichever thread first executes it, and under a
+/// single-process harness a sibling test can register the callsite with
+/// no subscriber installed, silencing every later capture (#1116).
+/// Production reads the counters only, hence the explicit allows.
 #[derive(Debug, Default)]
 pub struct ScheduledAutoImproveTickOutcome {
     /// Total scopes considered this tick.
@@ -116,6 +125,23 @@ pub struct ScheduledAutoImproveTickOutcome {
     pub parked: usize,
     /// Cross-session ("experience") passes that ran this tick.
     pub experience_runs: usize,
+    /// Redacted summaries of the review failures the tick warned about
+    /// ("scheduled auto-improve failed"), in warn order. Read by the tick
+    /// tests (compiled only under `cfg(test)`).
+    #[allow(dead_code)]
+    review_failures: Vec<String>,
+    /// Redacted summaries of the experience-pass failures the tick warned
+    /// about ("experience pass failed"), in warn order. Read by the tick
+    /// tests (compiled only under `cfg(test)`).
+    #[allow(dead_code)]
+    experience_failures: Vec<String>,
+    /// The proposals the per-session review path warned were not staged
+    /// ("scheduled auto-improve proposal was not staged"), in warn order.
+    /// The experience path counts its skips into `skipped` without a
+    /// per-proposal warning, so they appear here only through the review
+    /// path. Read by the tick tests (compiled only under `cfg(test)`).
+    #[allow(dead_code)]
+    skipped_proposals: Vec<SkippedProposal>,
 }
 
 struct ScheduledAutoImproveContext<'a> {
@@ -243,6 +269,7 @@ pub async fn run_auto_improve_scheduler_tick(
                             // anyhow chain is transparent to the provider
                             // error and would print the response body.
                             let error_summary = redacted_scheduler_error_summary(&e);
+                            outcome.experience_failures.push(error_summary.clone());
                             tracing::warn!(
                                 workspace = %scope.workspace_name,
                                 project = %scope.project_name,
@@ -323,6 +350,7 @@ pub async fn run_auto_improve_scheduler_tick(
                     // this says WHICH proposal was lost and why, so the
                     // operator can act on it without querying the store.
                     for skipped in &run.skipped {
+                        outcome.skipped_proposals.push(skipped.clone());
                         tracing::warn!(
                             workspace = %scope.workspace_name,
                             project = %scope.project_name,
@@ -376,6 +404,7 @@ pub async fn run_auto_improve_scheduler_tick(
                     if parked {
                         outcome.parked += 1;
                     }
+                    outcome.review_failures.push(error_summary.clone());
                     tracing::warn!(
                         workspace = %scope.workspace_name,
                         project = %scope.project_name,
