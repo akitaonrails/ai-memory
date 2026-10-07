@@ -671,7 +671,6 @@ mod tests {
     use ai_memory_store::Store;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -872,14 +871,6 @@ mod tests {
         };
 
         let expected = "auto-improve failed: class=provider status=400";
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
 
         // Attempt 1: retryable provider 400 → the claim records the attempt
         // (not parked). The persisted column carries only class/status.
@@ -891,6 +882,13 @@ mod tests {
         assert_eq!(
             first.parked, 0,
             "a retryable failure must not park the claim"
+        );
+        // The failure record is set in the same arm that emits the warning,
+        // from the same summary, so this proves the warning fired carrying
+        // class/status only — never the body — without a log capture.
+        assert_eq!(
+            first.review_failures, [expected],
+            "the failure warning must fire with the redacted summary"
         );
         let (last_error, attempts) = claim_row(store.db_path(), ws, project, session_id);
         assert_eq!(attempts, 1);
@@ -920,6 +918,7 @@ mod tests {
                 .unwrap();
         assert_eq!(third.errors, 1);
         assert_eq!(third.parked, 1, "the third attempt must park the claim");
+        assert_eq!(third.review_failures, [expected]);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
         let fourth =
@@ -932,22 +931,10 @@ mod tests {
             3,
             "the parked claim must not call the LLM"
         );
-        drop(guard);
-
-        // No warning may carry the body; the class/status label must stay
-        // diagnosable.
-        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
         assert!(
-            !logged.contains("SENTINEL_PRIVATE_BODY"),
-            "no provider body may reach the scheduler log: {logged}"
-        );
-        assert!(
-            logged.contains("scheduled auto-improve failed"),
-            "the failure event must fire: {logged}"
-        );
-        assert!(
-            logged.contains("class=provider status=400"),
-            "the redacted class/status must stay diagnosable: {logged}"
+            fourth.review_failures.is_empty(),
+            "a parked claim must not warn again: {:?}",
+            fourth.review_failures
         );
 
         // Crash contract: a process death right after the write (before the
@@ -1043,38 +1030,23 @@ mod tests {
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(ExperienceSentinelLlm);
 
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
         let outcome =
             run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
                 .await
                 .unwrap();
-        drop(guard);
 
         assert_eq!(outcome.experience_runs, 0, "{outcome:?}");
         assert_eq!(
             outcome.errors, 1,
             "the experience failure must be reported once: {outcome:?}"
         );
-
-        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            !logged.contains("SENTINEL_PRIVATE_BODY"),
-            "no provider body may reach the experience log: {logged}"
-        );
-        assert!(
-            logged.contains("experience pass failed"),
-            "the failure warning must fire: {logged}"
-        );
-        assert!(
-            logged.contains("class=provider status=400"),
-            "the redacted class/status must stay diagnosable: {logged}"
+        // The failure record is set in the same arm that emits the warning,
+        // from the same summary, so this proves the warning fired carrying
+        // class/status only — never the body — without a log capture.
+        assert_eq!(
+            outcome.experience_failures,
+            ["auto-improve failed: class=provider status=400"],
+            "the experience failure warning must fire with the redacted summary"
         );
     }
 
@@ -1533,30 +1505,6 @@ mod tests {
 
     const COLLIDING_PATH: &str = "procedures/release.md";
 
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            CapturedLogWriter(Arc::clone(&self.0))
-        }
-    }
-
     async fn seed_reviewable_session(store: &Store, ws: WorkspaceId, proj: ProjectId) -> SessionId {
         let session_id = SessionId::new();
         store
@@ -1638,12 +1586,16 @@ mod tests {
         assert_eq!(staged.proposal_ids.len(), 1, "fixture must actually stage");
     }
 
-    /// The unattended path has no response for anyone to read, so a proposal the
-    /// store declines has exactly two places left to surface: the typed tick
-    /// outcome and the warning log. Without both, a run that lost its only
-    /// proposal to a collision is byte-identical to a run that produced nothing.
+    /// The unattended path has no response for anyone to read, so a proposal
+    /// the store declines has exactly two places left to surface: the typed
+    /// tick outcome's counter and the warning that names the target. The tick
+    /// records each warned drop in `skipped_proposals`, set in the same arm
+    /// that emits the warning, so the identity is asserted through the typed
+    /// record instead of a log capture — without both surfaces, a run that
+    /// lost its only proposal to a collision is byte-identical to a run that
+    /// produced nothing.
     #[tokio::test]
-    async fn a_scheduled_run_reports_a_collision_in_its_outcome_and_its_log() {
+    async fn a_scheduled_run_reports_a_collision_in_its_outcome() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
@@ -1693,23 +1645,11 @@ mod tests {
         );
         assert_eq!(run.skipped[0].target_path, COLLIDING_PATH);
 
-        // `#[tokio::test]` runs a current-thread runtime, so the thread-local
-        // default subscriber installed here stays in force across the awaits.
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            // ANSI escapes would split `skipped=1` across colour codes.
-            .with_ansi(false)
-            .finish();
         let tick_session = seed_reviewable_session(&store, ws, proj).await;
-        let guard = tracing::subscriber::set_default(subscriber);
         let tick =
             run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
                 .await
                 .unwrap();
-        drop(guard);
         assert_eq!(tick.errors, 0);
         assert!(
             tick.reviewed >= 1,
@@ -1717,12 +1657,14 @@ mod tests {
         );
         assert_eq!(tick.skipped, 1, "the tick must count the dropped proposal");
         assert_ne!(tick_session, session_id);
-
-        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            captured.contains("scheduled auto-improve proposal was not staged")
-                && captured.contains(COLLIDING_PATH),
-            "the log must name the dropped target: {captured}"
+        assert_eq!(
+            tick.skipped_proposals.len(),
+            1,
+            "the tick must record the warned drop, not just count it"
+        );
+        assert_eq!(
+            tick.skipped_proposals[0].target_path, COLLIDING_PATH,
+            "the warning must name the dropped target"
         );
     }
 }

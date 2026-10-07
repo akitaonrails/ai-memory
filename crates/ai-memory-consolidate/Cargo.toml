@@ -39,7 +39,6 @@ ai-memory-test-support.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
-tracing-subscriber.workspace = true
 # Test-only: asserts the fresh operation ids are UUID v7 in the
 # gateway-compatible 36-character form (same crate + features the
 # llm crate already uses to mint them).
