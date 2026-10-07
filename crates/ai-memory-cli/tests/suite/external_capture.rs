@@ -470,8 +470,7 @@ mod slow {
                     }
                 }
                 assert_eq!(
-                    full_acks,
-                    2,
+                    full_acks, 2,
                     "both completed-batch posts must be acknowledged in full; \
                      last response {last_status}: {last_ack}"
                 );
