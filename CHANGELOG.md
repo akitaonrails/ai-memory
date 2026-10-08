@@ -15,13 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--prefer repo` or `--prefer server`; deletes are reported, not synced.
   It is a dry-run without `--apply`, refuses files without frontmatter,
   refuses to overwrite server pages whose metadata a write would clear, and
-  re-reads each page right before writing it. (#TBD)
+  re-reads each page right before writing it. (#1164)
 
 ### Changed
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
   so metadata survives a round trip. The first run after upgrading rewrites
-  unedited files of an earlier export in place. (#TBD)
+  unedited files of an earlier export in place. (#1164)
 
 ### Fixed
 - Fixed `ai-memory-wikisync` committing its per-clone export state: the
