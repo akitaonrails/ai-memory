@@ -10,7 +10,7 @@
 
 Versions: Claude Desktop 2.9939.4 (bundled Claude Code 2.1.280), Codex
 desktop 26.707.31428 (community Linux build) driving Codex CLI 0.156.0,
-Antigravity CLI (`agy`) 1.3.0, Antigravity IDE 2.5.5.
+Antigravity CLI (`agy`) 1.3.0, Antigravity IDE 2.5.5, Cursor 3.24.9.
 
 ## Codex desktop
 
@@ -142,6 +142,22 @@ for their secrets), which settles the `.mcpb` question left open in
 `install-mcp --client claude-desktop` refuses to guess a path on Linux and
 needs `--config-file ~/.config/Claude/claude_desktop_config.json`.
 
+## Cursor (added the same day; details in `cursor.md`)
+
+- The running desktop app executed the operator's `~/.claude/settings.json`
+  ai-memory `SessionStart` hook at launch, before any conversation, with
+  Cursor's payload: `conversation_id` = `session_id` = `"empty-state-draft"`,
+  `cursor_version`, `composer_mode`, `is_background_agent`, empty
+  `workspace_roots`, null `transcript_path`. Cursor's docs say Claude Code
+  hooks load by default; this confirms it for the desktop app. The server
+  relabels such a payload as `cursor`.
+- Replayed against a scratch server, that event creates one `cursor`
+  session with no `cwd` in `default/scratch`; each later launch adds another
+  `session-start` observation to the same placeholder session.
+- The empty window loaded only Cursor's built-in MCP servers, not the
+  Claude config's `ai-memory`.
+- No conversation has run yet; `cursor-agent` is not logged in.
+
 ## Still unverified
 
 | Question | What would settle it |
@@ -149,4 +165,5 @@ needs `--config-file ~/.config/Claude/claude_desktop_config.json`.
 | Does the Codex desktop app pass anything at `thread/start` that disables hooks? | One prompt in the desktop app with the trusted ai-memory hooks in place, then check the hook spool or server for a `codex` session whose rollout originator is the desktop's |
 | Does the Antigravity IDE run `.agents/hooks.json` / `~/.gemini/config/hooks.json`, with the same payload as the CLI? | One IDE prompt in a scratch workspace carrying a recorder `.agents/hooks.json` |
 | Do host hooks and MCP servers reach Cowork's VM on Linux (and on macOS/Windows)? | One Cowork task after the VM images download, then look for hook output in its transcript |
+| Cursor: the hook set and payloads of a real desktop conversation (native and Claude-format), and where its transcript lands | One prompt in the probe workspace, which carries recorder `.cursor/hooks.json` and `.claude/settings.json` files |
 | Is a per-turn Antigravity session-start acceptable, or should it be gated per conversation? | A product decision once the server-side effect of repeated session-start posts is measured |

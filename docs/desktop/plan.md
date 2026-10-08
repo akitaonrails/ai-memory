@@ -43,6 +43,9 @@ Status 2026-10-08: docs done, verification mostly done; results in
      `.agents/hooks.json`.
    - [x] Claude Desktop Code tab: hooks fire (from transcripts).
    - [ ] Claude Desktop Cowork: one task once the VM is available.
+   - [x] Cursor desktop: runs `~/.claude/settings.json` hooks by default
+     (a launch-time `sessionStart` for a draft composer was captured).
+   - [ ] Cursor desktop: one conversation in the probe workspace.
 3. Document that Claude Desktop Code-tab sessions already flow into
    ai-memory, including the scratch-workspace project naming behavior:
    **done** (`docs/mcp-install.md`, `docs/support-matrix.md`).
@@ -115,3 +118,7 @@ The research's best new target — not the RFC's `.mcpb`:
 7. Antigravity's SessionStart mapping fires on every user turn
    (`invocationNum` restarts per turn): keep, or gate per conversation?
 8. Cowork capture on Linux, where tasks run in a VM.
+9. Cursor runs the operator's Claude Code hooks by default, so a Cursor
+   session reaches ai-memory twice when Cursor's own hooks are installed
+   (the #721 de-duplication covers that) and once otherwise; the
+   launch-time `empty-state-draft` session start needs handling.
