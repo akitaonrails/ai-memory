@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `finalize-session --agent antigravity-cli` now replays the session's typed
+  prompts from `agy`'s `history.jsonl` before its synthetic session-end, so
+  live Antigravity sessions — whose hooks carry no prompt event — get a summary
+  page titled by the first prompt, a handoff with "Started/Last", and prompts
+  that `memory_query` and `memory_recent` can find. Only lines whose
+  conversation and workspace match the session are read; each prompt carries
+  the key `backfill` mints for it, so a repeated `--reopen` stores it once and a
+  prompt typed after the first finalize arrives with the next one. A checkout
+  the capture allowlist does not admit and `--all-owners` runs replay nothing,
+  and a missing `history.jsonl` only warns. (#1160)
 - `ai-memory run` accepts `copilot` (alias `copilot-cli`) and manages GitHub
   Copilot CLI as a workstream harness: a fresh session gets a generated
   `--session-id`, a returning one is resumed with `--resume=<id>`, user

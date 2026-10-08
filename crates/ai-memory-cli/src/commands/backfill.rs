@@ -663,6 +663,79 @@ async fn import_exported_transcript(
     Ok(content)
 }
 
+/// Replay only the user prompts of one session the server already knows,
+/// for harnesses whose live hooks carry no prompt event (Antigravity CLI).
+/// `finalize-session` sends these before its synthetic `session-end`, so the
+/// summary page and the automatic handoff are built with the prompts.
+///
+/// No session boundaries are sent: the caller owns the `session-end`, and a
+/// keyed one would be deduplicated on a later `--reopen`. Each prompt carries
+/// the same [`replay_ingest_key`] that `backfill` mints for that event, so
+/// repeated finalizes (and a backfill of the same session) store it once.
+/// Returns the number of prompts sent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replay_session_prompts(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    harness: ManagedHarness,
+    native_session_id: &str,
+) -> Result<usize> {
+    let transcript = export_transcript(harness, home, cwd, None, native_session_id, None)
+        .await
+        .with_context(|| format!("reading the {} transcript", harness.as_str()))?;
+    let items = prompt_hook_items(
+        endpoint,
+        workspace,
+        project,
+        harness,
+        native_session_id,
+        &transcript.events,
+    )?;
+    if !items.is_empty() {
+        post_hook_items(endpoint, &items).await?;
+    }
+    Ok(items.len())
+}
+
+/// The `user-prompt` hook items of a transcript, in transcript order, each
+/// dated at its own event time and keyed with [`replay_ingest_key`]. Every
+/// other event kind is dropped.
+fn prompt_hook_items(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    events: &[NewWorkstreamEvent],
+) -> Result<Vec<HookItem>> {
+    let agent = harness.agent_kind().as_str();
+    let resolved = resolve_occurred_at(events);
+    let mut items = Vec::new();
+    for (event, occurred_at) in events.iter().zip(&resolved.per_event) {
+        let Some(mapped) = map_event(None, native_session_id, event, occurred_at.as_deref()) else {
+            continue;
+        };
+        if mapped.event != "user-prompt" {
+            continue;
+        }
+        items.push(hook_item(
+            endpoint,
+            workspace,
+            project,
+            agent,
+            &mapped.event,
+            native_session_id,
+            &mapped.ingest_key,
+            None,
+            mapped.body,
+        )?);
+    }
+    Ok(items)
+}
+
 /// Per-event `occurred_at` resolution for one transcript, plus the session's
 /// overall boundary times.
 struct ResolvedOccurredAt {
@@ -1123,6 +1196,67 @@ mod tests {
             replay_ingest_key(Some("journal-2"), &session, "message", &event),
             "one journal interval must replay stably"
         );
+    }
+
+    #[test]
+    fn prompt_replay_keeps_only_user_prompts_with_backfill_keys() {
+        let endpoint = ServerEndpoint::for_hook_target("http://127.0.0.1:1".into(), None);
+        let with_id = |id: &str, mut e: NewWorkstreamEvent| {
+            e.event_id = id.to_string();
+            e
+        };
+        let events = [
+            with_id(
+                "p1",
+                event(WorkstreamEventKind::Message, Some("user"), "first ask"),
+            ),
+            with_id(
+                "a1",
+                event(WorkstreamEventKind::Message, Some("assistant"), "an answer"),
+            ),
+            with_id(
+                "t1",
+                event(WorkstreamEventKind::ToolCall, None, "run tests"),
+            ),
+            with_id(
+                "p2",
+                event(WorkstreamEventKind::Message, Some("user"), "second ask"),
+            ),
+        ];
+        let items = prompt_hook_items(
+            &endpoint,
+            "ws",
+            "proj",
+            ManagedHarness::Antigravity,
+            "sid",
+            &events,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 2, "only the two user prompts are replayed");
+        for (item, (id, prompt)) in items
+            .iter()
+            .zip([("p1", "first ask"), ("p2", "second ask")])
+        {
+            let url = reqwest::Url::parse(&item.url).unwrap();
+            let query = |name: &str| {
+                url.query_pairs()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.into_owned())
+            };
+            assert_eq!(query("event").as_deref(), Some("user-prompt"));
+            assert_eq!(query("agent").as_deref(), Some("antigravity-cli"));
+            assert_eq!(
+                query("extension"),
+                None,
+                "a prompt is not a backfill extension"
+            );
+            assert_eq!(
+                query("ingest_key"),
+                Some(replay_ingest_key(None, "sid", "message", id)),
+                "the key matches what backfill mints for the same event"
+            );
+            assert_eq!(item.body["prompt"], prompt);
+        }
     }
 
     #[test]

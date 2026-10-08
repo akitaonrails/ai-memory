@@ -1355,6 +1355,14 @@ fn persisted_capture_mode(data_dir: &Path) -> CaptureMode {
     }
 }
 
+/// Whether this install's capture mode admits a checkout at `cwd`: the same
+/// gate a live hook applies, for callers that replay events outside a hook
+/// (`finalize-session`).
+pub(crate) fn admits_capture_at(data_dir: &Path, cwd: &Path) -> bool {
+    let marker_present = crate::marker::find_marker(&cwd.to_string_lossy()).is_some();
+    repository_admits_capture(persisted_capture_mode(data_dir), marker_present)
+}
+
 fn is_tool_event(event: &str) -> bool {
     matches!(
         event.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
@@ -1434,6 +1442,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(CAPTURE_MODE_FILE), "\u{0}not-a-mode").unwrap();
         assert_eq!(persisted_capture_mode(tmp.path()), CaptureMode::Denylist);
+    }
+
+    #[test]
+    fn admits_capture_at_applies_the_allowlist_to_unmarked_checkouts() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        assert!(
+            admits_capture_at(data_dir.path(), checkout.path()),
+            "denylist mode (the default) admits any checkout"
+        );
+        std::fs::write(data_dir.path().join(CAPTURE_MODE_FILE), "allowlist\n").unwrap();
+        assert!(
+            !admits_capture_at(data_dir.path(), checkout.path()),
+            "allowlist mode admits no checkout without a marker"
+        );
+        std::fs::write(
+            checkout.path().join(".ai-memory.toml"),
+            "workspace = \"ws\"\nproject = \"proj\"\n",
+        )
+        .unwrap();
+        assert!(admits_capture_at(data_dir.path(), checkout.path()));
     }
 
     /// "The server is down": a loopback endpoint that accepts and immediately

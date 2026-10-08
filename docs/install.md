@@ -997,6 +997,17 @@ ai-memory finalize-session --agent antigravity-cli
 ai-memory finalize-session --agent antigravity-cli --reopen --session-id <uuid>
 ```
 
+Antigravity's hooks carry no prompt, so before the session-end
+`finalize-session` replays the session's typed prompts from `agy`'s
+`~/.gemini/antigravity-cli/history.jsonl` (only lines whose conversation and
+workspace match the session), and the summary page and handoff are built with
+them. Each prompt is keyed as `backfill` keys it, so a re-close stores it once
+and a prompt typed after the first finalize arrives with the next. A checkout
+the capture allowlist does not admit sends none, `--all-owners` replays none
+(other users' prompts are not in this machine's history), and a missing or
+unreadable `history.jsonl` only prints a warning. `agy -p` runs write no
+`history.jsonl` line, so they have no prompt to replay.
+
 ### Devin CLI
 
 Devin uses `~/.devin/config.json` for MCP servers and `~/.devin/hooks.v1.json`
