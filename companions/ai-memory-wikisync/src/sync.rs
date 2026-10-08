@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::client::{ApiClient, PageSummary};
+use crate::client::{ApiClient, ApiPage, PageSummary};
+use crate::page_file::{self, PageMeta};
 use crate::paths;
 use crate::state::{self, PageState, SyncState};
 use crate::{MAX_BODY_BYTES, MAX_PAGES};
@@ -47,8 +48,6 @@ pub enum DivergentReason {
     LocalEdit,
     /// Present on disk but never written by this tool.
     UnknownFile,
-    /// Begins with a YAML frontmatter delimiter this tool never writes.
-    LocalFrontmatter,
 }
 
 impl DivergentReason {
@@ -56,10 +55,6 @@ impl DivergentReason {
         match self {
             Self::LocalEdit => "edited locally since the last export",
             Self::UnknownFile => "exists on disk but was never written by wikisync",
-            Self::LocalFrontmatter => {
-                "edited locally since the last export (file begins with a YAML \
-                 frontmatter delimiter; wikisync never writes frontmatter)"
-            }
         }
     }
 }
@@ -166,14 +161,23 @@ pub fn classify(
             Some(_) => Classification::Write(WriteKind::Update),
         },
         (Some(_), None) => Classification::Divergent(DivergentReason::UnknownFile),
-        (Some(disk), Some(_)) => {
-            if disk.starts_with(b"---") {
-                Classification::Divergent(DivergentReason::LocalFrontmatter)
-            } else {
-                Classification::Divergent(DivergentReason::LocalEdit)
-            }
-        }
+        (Some(_), Some(_)) => Classification::Divergent(DivergentReason::LocalEdit),
     }
+}
+
+/// The file bytes for a server page: its round-trippable metadata as
+/// frontmatter, then the body verbatim. Export and sync write the same
+/// bytes, so the two never disagree about whether a file is current.
+pub fn render_page(page: &ApiPage) -> Result<String> {
+    if page.body_markdown.len() > MAX_BODY_BYTES {
+        bail!(
+            "page {} is {} bytes; refusing bodies over {MAX_BODY_BYTES} bytes",
+            page.path,
+            page.body_markdown.len()
+        );
+    }
+    let meta = PageMeta::from_server(&page.title, &page.tier, page.pinned, &page.frontmatter);
+    Ok(page_file::render(&meta, &page.body_markdown))
 }
 
 /// Bounded, printable diff summary for a divergent file: sizes, line counts
@@ -303,7 +307,7 @@ pub fn select_pages(summaries: Vec<PageSummary>, families: &[String]) -> Result<
     Ok(selected)
 }
 
-fn read_disk(dest_root: &Path, path: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_disk(dest_root: &Path, path: &str) -> Result<Option<Vec<u8>>> {
     let target = paths::secure_join(dest_root, path)?;
     match fs::read(&target) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -346,16 +350,7 @@ async fn run_batch(
         let read = client
             .read_page(&args.workspace, &args.project, &page.path, etag_hint)
             .await?;
-        let mut body = read.page.map(|api_page| api_page.body_markdown);
-        if let Some(body) = body.as_ref()
-            && body.len() > MAX_BODY_BYTES
-        {
-            bail!(
-                "page {} is {} bytes; refusing bodies over {MAX_BODY_BYTES} bytes",
-                page.path,
-                body.len()
-            );
-        }
+        let mut body = read.page.as_ref().map(render_page).transpose()?;
         let mut decision = classify(
             disk.as_deref(),
             base,
@@ -367,16 +362,7 @@ async fn run_batch(
             let refetch = client
                 .read_page(&args.workspace, &args.project, &page.path, None)
                 .await?;
-            body = refetch.page.map(|api_page| api_page.body_markdown);
-            if let Some(body) = body.as_ref()
-                && body.len() > MAX_BODY_BYTES
-            {
-                bail!(
-                    "page {} is {} bytes; refusing bodies over {MAX_BODY_BYTES} bytes",
-                    page.path,
-                    body.len()
-                );
-            }
+            body = refetch.page.as_ref().map(render_page).transpose()?;
             decision = classify(
                 disk.as_deref(),
                 base,
@@ -545,7 +531,7 @@ fn print_report(args: &RunArgs, report: &Report, mode: Mode, families: &[String]
     }
 }
 
-fn print_git_hints(args: &RunArgs) {
+pub(crate) fn print_git_hints(args: &RunArgs) {
     println!(
         "this tool never runs git; to commit the export you may run:\
          \n  git add -- {}\
@@ -560,7 +546,7 @@ fn print_git_hints(args: &RunArgs) {
 /// Validate the destination root. `Apply` creates a missing directory;
 /// dry-run modes never touch the filesystem, so for them a missing
 /// destination is simply an empty destination (validated only lexically).
-fn resolve_dest(dest: &Path, mode: Mode) -> Result<PathBuf> {
+pub(crate) fn resolve_dest(dest: &Path, mode: Mode) -> Result<PathBuf> {
     match mode {
         Mode::Apply => paths::prepare_dest(dest),
         Mode::Plan | Mode::DryRun => {
@@ -658,13 +644,6 @@ mod tests {
         assert_eq!(
             classify(Some(edited), None, Some(server)),
             Classification::Divergent(DivergentReason::UnknownFile)
-        );
-        // Frontmatter this tool never wrote reads as a local edit with a
-        // specific reason.
-        let with_fm = b"---\ntitle: forged\n---\n# page\n";
-        assert_eq!(
-            classify(Some(with_fm), Some(&base(&disk_hash, None)), Some(server)),
-            Classification::Divergent(DivergentReason::LocalFrontmatter)
         );
     }
 

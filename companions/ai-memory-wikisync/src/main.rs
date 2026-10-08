@@ -2,15 +2,16 @@
 
 use std::path::PathBuf;
 
+use ai_memory_wikisync::bidi::{self, Prefer, SyncArgs};
 use ai_memory_wikisync::client::DEFAULT_SERVER_URL;
 use ai_memory_wikisync::sync::{Mode, RunArgs, run};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
-    about = "Read-only team-wiki export companion for ai-memory (#986, slice 1)"
+    about = "Team-wiki sync companion for ai-memory (#986): export and two-way sync"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -24,6 +25,28 @@ enum Commands {
     Plan(CommonArgs),
     /// Export pages into --dest. Dry-run unless --apply is passed.
     Export(ExportArgs),
+    /// Sync both ways: repository edits go to the server through MCP,
+    /// server edits come to --dest. Dry-run unless --apply is passed.
+    Sync(SyncCliArgs),
+}
+
+#[derive(Parser, Debug, Clone)]
+struct SyncCliArgs {
+    /// Perform the writes. Without it, sync stays a dry-run.
+    #[arg(long)]
+    apply: bool,
+    /// Which side wins a page changed in the repository and on the server.
+    /// Without it, such a page is a conflict and nothing is written.
+    #[arg(long, value_enum)]
+    prefer: Option<PreferArg>,
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum PreferArg {
+    Repo,
+    Server,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -89,6 +112,18 @@ impl From<CommonArgs> for RunArgs {
     }
 }
 
+impl From<SyncCliArgs> for SyncArgs {
+    fn from(args: SyncCliArgs) -> Self {
+        Self {
+            run: RunArgs::from(args.common),
+            prefer: args.prefer.map(|prefer| match prefer {
+                PreferArg::Repo => Prefer::Repo,
+                PreferArg::Server => Prefer::Server,
+            }),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -101,6 +136,10 @@ async fn main() -> anyhow::Result<()> {
                 Mode::DryRun
             };
             run(&RunArgs::from(args), mode).await
+        }
+        Commands::Sync(args) => {
+            let apply = args.apply;
+            bidi::run(&SyncArgs::from(args), apply).await
         }
     }
 }

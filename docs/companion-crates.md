@@ -79,8 +79,9 @@ the public MCP write/delete tools. It must never open the wiki directory or
 SQLite directly. The core read seam is `/api/v1` in API-only mode; the supported
 MCP page arguments are documented in [programmatic memory](programmatic-memory.md).
 
-Slice 1 (read-only export) shipped as
-[`ai-memory-wikisync`](#ai-memory-wikisync-read-only-team-wiki-export)
+Slice 1 (read-only export) and slice 3 (two-way sync through the MCP write
+tool) ship as
+[`ai-memory-wikisync`](#ai-memory-wikisync-team-wiki-export-and-sync)
 below; the remaining slices are tracked in #986.
 
 ## `ai-memory-client`: shared private capture privacy
@@ -234,9 +235,9 @@ Re-home by kind:
 6. Only after repeated usage, consider whether ai-memory core lacks a small,
    generic API seam; do not start by patching core endpoints.
 
-## `ai-memory-wikisync`: read-only team-wiki export
+## `ai-memory-wikisync`: team-wiki export and sync
 
-Slice 1 of the accepted [team-wiki sync](#proposed-team-wiki-sync-986)
+Slices 1 and 3 of the accepted [team-wiki sync](#proposed-team-wiki-sync-986)
 shape, implemented at [`companions/ai-memory-wikisync`](../companions/ai-memory-wikisync)
 as a standalone Cargo package with its own `[workspace]` (mirroring the
 importer): it is not a member of the root workspace and is not covered by
@@ -246,21 +247,26 @@ root `cargo test --workspace`.
 
 Mirror a team's shared ai-memory pages into a project repository as
 reviewable markdown, so the wiki a team actually maintains can travel with
-the code it documents — read-only, family-scoped, and dry-run by default.
+the code it documents, and let reviewed repository edits flow back —
+family-scoped and dry-run by default.
 
 ### How it talks to ai-memory
 
 - `plan` (always dry-run) and `export` (dry-run unless `--apply`) against
   the documented read-only `/api/v1` surface: incremental `recent` listing
   with cursor paging (legacy array accepted) plus single-page reads with
-  `ETag` / `If-None-Match` revalidation. No MCP, no admin routes, no
-  writes to the server.
+  `ETag` / `If-None-Match` revalidation. No admin routes.
+- `sync` (dry-run unless `--apply`) also writes to the server, and only
+  through the public `memory_write_page` MCP tool with explicit `workspace`
+  and `project`, so sanitization, admission and attribution apply. It never
+  opens the wiki directory or SQLite.
 - `--include FAMILY` is an explicit, repeatable allowlist of top-level
   wiki directories; at least one is required and a bare `*` is refused.
 - Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` only;
   tokens are never logged or persisted.
-- Writes exactly the server's canonical projection (path, title, body)
-  with no forged attribution/generated frontmatter. All local bookkeeping
+- Each file is the server body under a fixed frontmatter of the fields a
+  write round-trips (`title`, `tags`, `pinned`, and `tier` when not the
+  default), never server-generated or attribution keys. All local bookkeeping
   lives in one state file under the destination
   (`.ai-memory-wikisync/state.json`, 0600, atomically replaced after each
   successful write batch). The directory ignores itself with a `.gitignore`
@@ -281,6 +287,15 @@ the code it documents — read-only, family-scoped, and dry-run by default.
   (tmp + rename + fsync).
 - Page bodies are untrusted data, transported verbatim and never executed
   or rendered.
+- `sync` changes one side only when the other is unchanged since the last
+  sync; a page changed on both sides is refused until `--prefer repo` or
+  `--prefer server`. Deletes are reported, never propagated (slice 4).
+- An import requires the file's frontmatter (a write clears what it omits),
+  and is refused for a server page carrying any metadata the write cannot
+  carry (`summary`, `sources`, `kind`, …), naming the keys.
+- Right before each import the server page is re-read and must still render
+  to the classified bytes. MCP has no compare-and-write, so one read-to-write
+  race window remains; that is the documented case for slice 2.
 
 ### Validation
 
@@ -293,14 +308,18 @@ cargo clippy --manifest-path companions/ai-memory-wikisync/Cargo.toml --all-targ
 Unit tests cover the path-safety matrix, the allowlist rules, state
 hash/crash behavior and local-edit refusal; integration tests run the
 full plan/export flow against a fixture axum server serving `/api/v1`
-responses (200/ETag/304/401/404 and cursor pagination).
+responses (200/ETag/304/401/404 and cursor pagination), and the sync flow
+against the same fixture's `POST /mcp` with the server's replace semantics:
+imports with metadata, creates, conflicts and `--prefer`, the
+metadata-loss refusal, the pre-write race check, delete notices, sanitizer
+rewrites and the upgrade of a slice 1 export.
 
 ### Roadmap (#986)
 
-1. This slice — read-only export into a project repository.
+1. Read-only export into a project repository (shipped).
 2. Conditional mutation seam (compare-and-write) in core, if independently
    justified.
-3. Bidirectional apply through public write tools.
+3. Bidirectional apply through public write tools (shipped as `sync`).
 4. Deletes and conflict reporting.
 5. Post-merge hook / CI integration.
 
