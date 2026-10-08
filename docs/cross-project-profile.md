@@ -112,7 +112,7 @@ ai-memory profile list                   # every entry with its scope tags
 ai-memory profile show tools/pnpm.md     # one entry
 ai-memory profile forget tools/pnpm.md   # remove one entry (stays removed until you say it again)
 ai-memory profile review                 # entries with their evidence, habits still short of the bar
-ai-memory profile rebuild                # re-read every project from the start (safe to repeat)
+ai-memory profile rebuild                # re-read every project from the start (safe to repeat; removes nothing)
 ai-memory profile apply                  # write the entries that fit this repo into its rules file
 ai-memory profile list --user alice      # an operator's private profile (share = "user")
 ai-memory profile list --workspace work  # a workspace profile (share = "workspace")
@@ -245,7 +245,14 @@ the same way, with the word lists and the newest statement.
   rewrites a page it did not write, or one whose body changed since it wrote
   it, and `profile review` lists it as edited by hand.
 - **Start over:** `ai-memory profile rebuild` re-reads every project from the
-  beginning. It does not touch entries you edited or removed.
+  beginning. It does not touch entries you edited or removed, and it never
+  removes an entry: a candidate already recorded keeps the classification it
+  was recorded with, and an entry whose evidence no longer meets the bar stays
+  as written.
+- **After upgrading:** a release that tightens what the profile learns applies
+  to sentences read from then on. Entries an earlier version admitted stay,
+  even after `profile rebuild`; list them with `ai-memory profile review` and
+  remove the ones you do not want with `ai-memory profile forget <path>`.
 
 ## Server settings
 

@@ -1339,7 +1339,7 @@ validation is identical in every dialect — only the advertised schema changes.
 
 | Marker | Config key | What it changes | Who needs it |
 | --- | --- | --- | --- |
-| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus inlines every `#/$defs/*` reference and drops the emptied `$defs` table | Kimi Code (Moonshot); appended by `install-mcp` |
+| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus inlines every `#/$defs/*` reference and drops the emptied `$defs` table | Kimi Code (Moonshot); appended by `install-mcp`. The generated Pi extension's MCP bridge always asks for it, since Pi may run on Moonshot |
 | `?flavor=bedrock` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kiro CLI (Bedrock); appended by `install-mcp` |
 | `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
 

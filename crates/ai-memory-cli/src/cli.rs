@@ -968,6 +968,10 @@ pub enum ProfileCommand {
     Review(ProfileScopeArgs),
     /// Re-read every contributing project from the start and rebuild the
     /// profile from what it finds (safe to repeat).
+    ///
+    /// It adds and updates entries and never removes one, including an entry
+    /// an earlier version admitted under rules it no longer applies: remove
+    /// those with `profile forget`.
     Rebuild,
     /// Write the profile entries that fit this repository into a managed
     /// block of its rules file, turning your usual choices into hard rules

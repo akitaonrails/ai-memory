@@ -992,6 +992,22 @@ impl<'a> ScopeResolver<'a> {
         Ok(Some(scope))
     }
 
+    /// An existing project named by both its workspace and project names.
+    async fn resolve_explicit_pair(
+        &self,
+        workspace: &str,
+        project: &str,
+        need: ProjectAccess,
+    ) -> Result<ResolvedScope, ScopeResolutionError> {
+        let workspace_id = lookup_existing_workspace(self.reader, workspace).await?;
+        self.resolve_named_in_workspace(workspace_id, workspace, project, need)
+            .await?
+            .ok_or_else(|| ScopeResolutionError::ProjectNotFoundInWorkspace {
+                workspace: workspace.to_owned(),
+                project: project.to_owned(),
+            })
+    }
+
     /// Resolve MCP-style read arguments: explicit pair if both names are
     /// provided, reject partial pair, otherwise use project-only lookup or the
     /// current-project/default fallback chain.
@@ -1060,14 +1076,23 @@ impl<'a> ScopeResolver<'a> {
             trimmed_opt(explicit_project),
         ) {
             (Some(workspace), Some(project)) => {
-                let workspace_id = lookup_existing_workspace(self.reader, workspace).await?;
-                let scope = self
-                    .resolve_named_in_workspace(workspace_id, workspace, project, need)
-                    .await?
-                    .ok_or_else(|| ScopeResolutionError::ProjectNotFoundInWorkspace {
-                        workspace: workspace.to_owned(),
-                        project: project.to_owned(),
-                    })?;
+                let exact = self.resolve_explicit_pair(workspace, project, need).await;
+                let scope = match (exact, split_slashed_project(project)) {
+                    // #1152: an agent passed a `workspace/project` label as the
+                    // project. The exact name still wins, so a project created
+                    // with a `/` before renames refused one stays reachable.
+                    (
+                        Err(
+                            error @ (ScopeResolutionError::WorkspaceNotFound { .. }
+                            | ScopeResolutionError::ProjectNotFoundInWorkspace { .. }),
+                        ),
+                        Some((label_workspace, label_project)),
+                    ) => self
+                        .resolve_explicit_pair(label_workspace, label_project, need)
+                        .await
+                        .map_err(|_| error)?,
+                    (exact, _) => exact?,
+                };
                 Ok((scope, ScopeSource::Explicit))
             }
             (Some(_), None) => Err(ScopeResolutionError::WorkspaceProjectPairRequired),
@@ -1190,6 +1215,53 @@ impl<'a> ScopeResolver<'a> {
             return Err(ScopeResolutionError::WriterRequired);
         };
         let active = self.active_project.and_then(|a| a.get_for(actor));
+        // #1152: a project name never contains `/` (renames refuse one), so a
+        // write naming one is a `workspace/project` label passed as the
+        // project. Resolve an existing project of that exact name, else the
+        // label's own pair, and never create either.
+        if let Some((label_workspace, label_project)) = split_slashed_project(project) {
+            let exact = match trimmed_opt(explicit_workspace) {
+                Some(workspace) => {
+                    self.resolve_explicit_pair(workspace, project, ProjectAccess::Write)
+                        .await
+                }
+                None => {
+                    let workspace_id = active
+                        .map(|(workspace_id, _)| workspace_id)
+                        .unwrap_or(self.default_workspace_id);
+                    self.resolve_named_in_workspace(
+                        workspace_id,
+                        "the active workspace",
+                        project,
+                        ProjectAccess::Write,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        ScopeResolutionError::ProjectNotFoundInWorkspace {
+                            workspace: "the active workspace".to_owned(),
+                            project: project.to_owned(),
+                        }
+                    })
+                }
+            };
+            let scope = match exact {
+                Err(
+                    error @ (ScopeResolutionError::WorkspaceNotFound { .. }
+                    | ScopeResolutionError::ProjectNotFoundInWorkspace { .. }),
+                ) => {
+                    let creator = self.authz.as_ref().and_then(|principal| principal.user_id);
+                    refuse_foreign_profile_name(Some(label_workspace), label_project, creator)?;
+                    self.resolve_explicit_pair(label_workspace, label_project, ProjectAccess::Write)
+                        .await
+                        .map_err(|_| error)?
+                }
+                exact => exact?,
+            };
+            return Ok(ResolvedWriteScope {
+                scope,
+                promoted_from: None,
+            });
+        }
         let workspace_id = match trimmed_opt(explicit_workspace) {
             Some(workspace) => writer.get_or_create_workspace(workspace.to_owned()).await?,
             None => active
@@ -1251,6 +1323,16 @@ fn trimmed_opt(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// The `(workspace, project)` halves of a `workspace/project` label passed
+/// as a project name (#1152): exactly one `/` with a name on each side.
+fn split_slashed_project(value: &str) -> Option<(&str, &str)> {
+    let (left, right) = value.split_once('/')?;
+    if left.is_empty() || right.is_empty() || right.contains('/') {
+        return None;
+    }
+    Some((left, right))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,6 +1360,240 @@ mod tests {
         }
         .to_string();
         assert_eq!(plain, "project 'ghost' not found in workspace 'default'");
+    }
+
+    /// Regression for #1152: a `workspace/project` label accidentally passed
+    /// as the project argument (with the workspace hardcoded to the
+    /// literal `"default"` by whatever client-side fallback constructed
+    /// the args from a marker file) must auto-split and resolve to the
+    /// (split_ws, split_proj) scope. Without the split the call falls into
+    /// `ProjectNotFoundInWorkspace` and the handoff the agent was trying
+    /// to write silently disappears, which is the user-reported class.
+    #[tokio::test]
+    async fn slashed_project_argument_splits_to_workspace_and_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let default_ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let default_scratch = store
+            .writer
+            .get_or_create_project(default_ws, "scratch", None)
+            .await
+            .unwrap();
+        // The real target: a separate workspace, with a project whose
+        // name does NOT contain a slash.
+        let myorg_ws = store.writer.get_or_create_workspace("myorg").await.unwrap();
+        let myproject = store
+            .writer
+            .get_or_create_project(myorg_ws, "myproject", None)
+            .await
+            .unwrap();
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch);
+
+        // Wrong workspace (`"default"`) + a `myorg/myproject` label jammed
+        // into the project field. With auto-split, this resolves to
+        // (myorg, myproject). Without the fix it fails with
+        // `ProjectNotFoundInWorkspace { workspace: "default",
+        // project: "myorg/myproject" }` and the user's handoff is lost.
+        let resolved = resolver
+            .resolve_existing_args(
+                Some("default"),
+                Some("myorg/myproject"),
+                &ActorKey::default(),
+                ProjectAccess::Write,
+            )
+            .await
+            .expect("slashed project argument must auto-split");
+        assert_eq!(
+            resolved.workspace_id, myorg_ws,
+            "split should land in the (myorg) workspace"
+        );
+        assert_eq!(
+            resolved.project_id, myproject,
+            "split should land in the (myproject) project"
+        );
+
+        // Control: a project name that genuinely does not split must
+        // still go through the original `ProjectNotFoundInWorkspace`
+        // path (so a typo is not silently masked).
+        let err = resolver
+            .resolve_existing_args(
+                Some("default"),
+                Some("does-not-exist"),
+                &ActorKey::default(),
+                ProjectAccess::Write,
+            )
+            .await
+            .expect_err("a non-split project miss must surface the original error");
+        assert!(
+            matches!(err, ScopeResolutionError::ProjectNotFoundInWorkspace { .. }),
+            "{err}"
+        );
+    }
+
+    /// #1152: a write never creates a project whose name carries a `/`. The
+    /// label's own pair is written to when it exists, and anything else is
+    /// refused rather than created.
+    #[tokio::test]
+    async fn a_slashed_write_resolves_its_own_pair_and_never_creates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let default_ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let scratch = store
+            .writer
+            .get_or_create_project(default_ws, "scratch", None)
+            .await
+            .unwrap();
+        let myorg_ws = store.writer.get_or_create_workspace("myorg").await.unwrap();
+        let myproject = store
+            .writer
+            .get_or_create_project(myorg_ws, "myproject", None)
+            .await
+            .unwrap();
+        let resolver =
+            ScopeResolver::new(&store.reader, default_ws, scratch).with_writer(&store.writer);
+        let actor = ActorKey::default();
+
+        for workspace in [Some("default"), None] {
+            let written = resolver
+                .resolve_write_args(workspace, Some("myorg/myproject"), &actor)
+                .await
+                .unwrap();
+            assert_eq!(
+                (written.scope.workspace_id, written.scope.project_id),
+                (myorg_ws, myproject),
+                "{workspace:?}"
+            );
+        }
+        let err = resolver
+            .resolve_write_args(Some("default"), Some("myorg/ghost"), &actor)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ScopeResolutionError::ProjectNotFoundInWorkspace { .. }),
+            "{err}"
+        );
+        for (workspace_id, name) in [
+            (default_ws, "myorg/myproject"),
+            (default_ws, "myorg/ghost"),
+            (myorg_ws, "ghost"),
+        ] {
+            assert_eq!(
+                store
+                    .reader
+                    .resolve_existing_project_name(workspace_id, name.to_owned())
+                    .await
+                    .unwrap(),
+                None,
+                "{name} must not have been created"
+            );
+        }
+    }
+
+    /// A project created with a `/` in its name before renames refused one
+    /// is still reached by that exact name, on reads and writes.
+    #[tokio::test]
+    async fn an_existing_slashed_project_wins_over_the_split() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let default_ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let legacy = store
+            .writer
+            .get_or_create_project(default_ws, "myorg/myproject", None)
+            .await
+            .unwrap();
+        let myorg_ws = store.writer.get_or_create_workspace("myorg").await.unwrap();
+        store
+            .writer
+            .get_or_create_project(myorg_ws, "myproject", None)
+            .await
+            .unwrap();
+        let resolver =
+            ScopeResolver::new(&store.reader, default_ws, legacy).with_writer(&store.writer);
+        let actor = ActorKey::default();
+
+        let read = resolver
+            .resolve_existing_args(
+                Some("default"),
+                Some("myorg/myproject"),
+                &actor,
+                ProjectAccess::Read,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.project_id, legacy);
+        let written = resolver
+            .resolve_write_args(Some("default"), Some("myorg/myproject"), &actor)
+            .await
+            .unwrap();
+        assert_eq!(written.scope.project_id, legacy);
+    }
+
+    /// The split names a pair the caller could have passed directly, so it
+    /// is authorized exactly like one: a user without a grant on the
+    /// label's project is refused on reads and writes, and nothing is
+    /// created in its place.
+    #[tokio::test]
+    async fn a_slashed_label_reaches_only_a_project_the_caller_may_use() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, project, _, bob) = guard_fixture(&store).await;
+        let other_ws = store.writer.get_or_create_workspace("other").await.unwrap();
+        let secret = store
+            .writer
+            .get_or_create_project(other_ws, "secret", None)
+            .await
+            .unwrap();
+        let actor = ActorKey::default();
+        let bob_resolver = as_user(&store, ws, project, bob);
+
+        for need in [ProjectAccess::Read, ProjectAccess::Write] {
+            let refused = bob_resolver
+                .resolve_existing_args(Some("default"), Some("other/secret"), &actor, need)
+                .await;
+            assert!(refused.is_err(), "{need:?}: {refused:?}");
+        }
+        let refused = bob_resolver
+            .resolve_write_args(Some("default"), Some("other/secret"), &actor)
+            .await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(
+            store
+                .reader
+                .resolve_existing_project_name(ws, "other/secret".to_owned())
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Control: with a grant, the same label reaches the project.
+        grant(&store, bob, secret, GrantLevel::Write).await;
+        let read = bob_resolver
+            .resolve_existing_args(
+                Some("default"),
+                Some("other/secret"),
+                &actor,
+                ProjectAccess::Write,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.project_id, secret);
+        let written = bob_resolver
+            .resolve_write_args(Some("default"), Some("other/secret"), &actor)
+            .await
+            .unwrap();
+        assert_eq!(written.scope.project_id, secret);
     }
 
     async fn user_named(store: &Store, username: &str, byte: u8) -> UserId {

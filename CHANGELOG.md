@@ -56,6 +56,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+- Fixed automatic handoffs carrying harness scaffolding as the user's
+  request: a user turn that opens with a markup block whose opening tag has
+  no attributes (for example the `<task-notification>` block Claude Code
+  delivers when a background task, agent or workflow completes) no longer
+  becomes the handoff's `Started:` / `Last:` summary, its `Continue from:`
+  line, or its `Unresolved question:` line. The handoff now uses the last
+  prompt the user actually wrote, and falls back to the no-prompt summary
+  when every prompt in the session is such a block. Prompts that only
+  contain markup later in the text, pastes with attributes such as
+  `<pasted_content id="…">`, and stored observations are unchanged. (#1158)
+- Corrected the `profile rebuild` guidance in `docs/cross-project-profile.md`
+  and the command's help: it never removes an entry, and a candidate recorded
+  by an earlier version keeps the classification it was recorded with, so
+  entries 2.6.0 admitted under the looser rules survive the upgrade and a
+  rebuild. The doc now gives the upgrade path, `profile review` then
+  `profile forget` on each entry to drop. (#1155)
+- Fixed a `workspace/project` label passed as the project failing to resolve
+  (for example `workspace: "default", project: "myorg/myproject"`): when no
+  project has that exact name, the label's own workspace and project are used,
+  under the same access checks as passing them separately. A write never
+  creates a project whose name contains `/` any more; it is refused with the
+  hint instead. (#1152, #1154)
+- Fixed every Pi turn failing with a 400 on Moonshot/Kimi models: the
+  generated Pi extension registered the MCP tools with schemas containing
+  `$ref`, which Moonshot rejects. Its bridge now requests the `?flavor=moonshot`
+  schemas, with every reference inlined, which any provider accepts. Re-run
+  `ai-memory install-hooks --agent pi --apply` to regenerate the extension.
+  (#1157)
 
 ## [2.6.1] - 2026-10-08
 

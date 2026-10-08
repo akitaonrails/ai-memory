@@ -52,9 +52,26 @@ pub fn looks_like_scaffolding(candidate: &str) -> bool {
         return true;
     }
 
-    // A markup/context block: `<ide_opened_file>…`, `<system-reminder>…`,
-    // `<user_info>…`. Requires a closing bracket so a bare comparison like
-    // "< 5ms is fine" stays prose.
+    if looks_like_markup_block(trimmed) {
+        return true;
+    }
+
+    // A decorated shell prompt echoed into the paste.
+    if trimmed.starts_with(PROMPT_DECORATION) {
+        return true;
+    }
+
+    false
+}
+
+/// `true` when `candidate` opens with a markup/context block:
+/// `<ide_opened_file>…`, `<system-reminder>…`, `<user_info>…`,
+/// `<task-notification>…`. Requires a closing bracket so a bare comparison
+/// like "< 5ms is fine" stays prose, and a bare tag name so an opening tag
+/// with attributes (`<pasted_content id="87e5">`, a user paste) stays prose.
+#[must_use]
+pub fn looks_like_markup_block(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
     if let Some(rest) = trimmed.strip_prefix('<')
         && let Some(tag) = rest.split('>').next()
         && !tag.is_empty()
@@ -66,12 +83,6 @@ pub fn looks_like_scaffolding(candidate: &str) -> bool {
     {
         return true;
     }
-
-    // A decorated shell prompt echoed into the paste.
-    if trimmed.starts_with(PROMPT_DECORATION) {
-        return true;
-    }
-
     false
 }
 

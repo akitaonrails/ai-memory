@@ -4155,7 +4155,9 @@ fn build_auto_handoff(
         match obs.kind {
             ObservationKind::UserPrompt => {
                 let text = pick_text(obs);
-                if !text.is_empty() {
+                // A harness block delivered as a user turn (`<task-notification>`)
+                // is not a request to continue from.
+                if !text.is_empty() && !ai_memory_core::looks_like_markup_block(text) {
                     prompts.push(text.to_string());
                 }
             }
@@ -4259,7 +4261,11 @@ fn derive_open_questions(
         observations.iter().rev().find(|o| o.kind == kind)
     };
 
-    let last_prompt_obs = last_of_kind(ObservationKind::UserPrompt);
+    // Harness blocks delivered as a user turn are not the user's question.
+    let last_prompt_obs = observations.iter().rev().find(|o| {
+        let text = if o.body.is_empty() { &o.title } else { &o.body };
+        o.kind == ObservationKind::UserPrompt && !ai_memory_core::looks_like_markup_block(text)
+    });
     let last_tool = last_of_kind(ObservationKind::PostToolUse);
     let last_stop = last_of_kind(ObservationKind::Stop);
     let has_session_end = observations
@@ -18176,6 +18182,177 @@ mod tests {
             handoff.next_steps.iter().any(|s| s == "Tools used: Edit"),
             "a real tool name must still be listed; got: {:?}",
             handoff.next_steps
+        );
+    }
+
+    const TASK_NOTIFICATION: &str = "<task-notification>\n<task-id>abc</task-id>\n\
+        <status>completed</status>\n<summary>Agent \"review\" completed</summary>\n\
+        </task-notification>";
+
+    fn handoff_from(
+        observations: &[ai_memory_core::Observation],
+        turn_checkpoint: bool,
+    ) -> NewHandoff {
+        use ai_memory_core::{ProjectId, WorkspaceId};
+        build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            observations,
+            None,
+            turn_checkpoint,
+        )
+    }
+
+    #[test]
+    fn auto_handoff_skips_a_trailing_task_notification_prompt() {
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "start", "map the sweep code"),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "later",
+                "fix the pinned-page sweep",
+            ),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                TASK_NOTIFICATION,
+            ),
+        ];
+        let handoff = handoff_from(&observations, false);
+        assert_eq!(
+            handoff.summary,
+            "Started: map the sweep code\n\nLast: fix the pinned-page sweep"
+        );
+        assert_eq!(
+            handoff.open_questions,
+            vec!["Continue from: fix the pinned-page sweep".to_string()]
+        );
+        assert!(!handoff.summary.contains("task-notification"));
+        assert!(
+            handoff
+                .open_questions
+                .iter()
+                .all(|q| !q.contains("task-notification"))
+        );
+    }
+
+    #[test]
+    fn auto_handoff_with_only_task_notification_prompts_uses_the_no_prompt_fallback() {
+        let observations = vec![
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                TASK_NOTIFICATION,
+            ),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                TASK_NOTIFICATION,
+            ),
+        ];
+        let handoff = handoff_from(&observations, false);
+        assert_eq!(handoff.summary, "Session ended; 2 observations recorded.");
+        assert!(
+            handoff.open_questions.is_empty(),
+            "got: {:?}",
+            handoff.open_questions
+        );
+    }
+
+    #[test]
+    fn auto_handoff_does_not_treat_a_task_notification_question_as_unresolved() {
+        let notification = "<task-notification>\n<task-id>abc</task-id>\n\
+            <status>completed</status>\n<summary>Should the docs change too?";
+        let observations = vec![
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "fix",
+                "fix the pinned-page sweep",
+            ),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                notification,
+            ),
+        ];
+        let handoff = handoff_from(&observations, false);
+        assert!(
+            handoff
+                .open_questions
+                .iter()
+                .all(|q| !q.starts_with("Unresolved question:")),
+            "got: {:?}",
+            handoff.open_questions
+        );
+    }
+
+    #[test]
+    fn turn_checkpoint_continues_from_the_real_prompt_before_a_task_notification() {
+        let observations = vec![
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "fix",
+                "fix the pinned-page sweep",
+            ),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                TASK_NOTIFICATION,
+            ),
+        ];
+        let handoff = handoff_from(&observations, true);
+        assert_eq!(
+            handoff.open_questions,
+            vec!["Continue from last request: fix the pinned-page sweep".to_string()]
+        );
+    }
+
+    #[test]
+    fn auto_handoff_keeps_a_prompt_with_markup_after_its_first_word() {
+        let observations = vec![mk_obs(
+            ObservationKind::UserPrompt,
+            "fix",
+            "fix <div> alignment",
+        )];
+        let handoff = handoff_from(&observations, false);
+        assert_eq!(handoff.summary, "Session focused on: fix <div> alignment");
+        assert_eq!(
+            handoff.open_questions,
+            vec!["Continue from: fix <div> alignment".to_string()]
+        );
+    }
+
+    #[test]
+    fn auto_handoff_keeps_a_pasted_content_prompt() {
+        let pasted = "<pasted_content id=\"5b6f\">\nEu quero inicializar um harness";
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "start", "map the sweep code"),
+            mk_obs(ObservationKind::UserPrompt, "paste", pasted),
+        ];
+        let handoff = handoff_from(&observations, false);
+        assert!(
+            handoff.summary.ends_with(&format!("Last: {pasted}")),
+            "got: {}",
+            handoff.summary
+        );
+        assert_eq!(
+            handoff.open_questions,
+            vec![format!("Continue from: {pasted}")]
+        );
+    }
+
+    #[test]
+    fn auto_handoff_keeps_a_prompt_decorated_prompt() {
+        let prompt = "\u{276f} rode o workflow de arquitetura";
+        let observations = vec![mk_obs(ObservationKind::UserPrompt, "run", prompt)];
+        let handoff = handoff_from(&observations, false);
+        assert_eq!(handoff.summary, format!("Session focused on: {prompt}"));
+        assert_eq!(
+            handoff.open_questions,
+            vec![format!("Continue from: {prompt}")]
         );
     }
 

@@ -5275,7 +5275,10 @@ fn build_pi_extension(
 fn pi_mcp_bridge_source() -> &'static str {
     r#"
 // ---- MCP bridge ------------------------------------------------------------
-const MCP_SERVER = deriveMcpServer(SERVER);
+// Pi forwards tool schemas to whichever provider it runs on, and Moonshot
+// rejects any `$ref` (#1157). The moonshot dialect inlines every reference,
+// which every provider accepts; it changes nothing but `tools/list`.
+const MCP_SERVER = `${deriveMcpServer(SERVER)}?flavor=moonshot`;
 const MCP_REQUEST_TIMEOUT_MS = 10000;
 let mcpRequestId = 0;
 
@@ -11379,7 +11382,9 @@ model = "gpt-5"
         assert!(extension.contains("postHook(\"session-end\""));
         assert!(extension.contains("fetchHandoff"));
         assert!(extension.contains("customType: \"ai-memory-handoff\""));
-        assert!(extension.contains("const MCP_SERVER = deriveMcpServer(SERVER);"));
+        assert!(
+            extension.contains("const MCP_SERVER = `${deriveMcpServer(SERVER)}?flavor=moonshot`;")
+        );
         assert!(
             extension.contains("return trimmed.endsWith(\"/mcp\") ? trimmed : `${trimmed}/mcp`;")
         );
