@@ -71,18 +71,52 @@ the empty window the app loaded only its built-in servers
 operator's `~/.claude.json`: the third-party import brought the Claude
 hooks in but, at least there, not the Claude MCP servers.
 
+## A real desktop conversation (verified 2026-10-08)
+
+Two conversations were run in the desktop app's empty window ("run ls then
+say OK"). Through the operator's Claude Code hooks, Cursor delivered:
+
+- per conversation, `sessionStart` then `beforeSubmitPrompt` (sent to the
+  Claude `UserPromptSubmit` hook), then `preToolUse`/`postToolUse` and
+  `stop` when the agent ran; no `sessionEnd` while the window stayed open;
+- Claude-compatible fields on top of Cursor's own: `session_id` (equal to
+  `conversation_id`), `prompt` and `attachments`, `tool_name` (`"Shell"`),
+  `tool_input` (`{"command": "ls", "cwd": "", "timeout": 30000}`),
+  `tool_output` (a JSON string, not Claude's `tool_response`),
+  `tool_use_id`, `duration`, and on `stop` `status`, `loop_count` and token
+  counts; `hook_event_name` keeps Cursor's names (`beforeSubmitPrompt`,
+  `preToolUse`);
+- `cwd` `""` and `workspace_roots` `[]` in an empty window, and
+  `transcript_path` only on `stop`:
+  `~/.cursor/projects/<workspace-slug>/agent-transcripts/<id>/<id>.jsonl`
+  (`empty-window` here), a JSONL of `role: user|assistant` messages with
+  `tool_use` blocks and `turn_ended` markers. A conversation the plan
+  refused (a named model on the free plan) recorded only
+  `turn_ended: error` and fired no tool or stop hook.
+
+Replayed against a scratch server, both conversations became `cursor`
+sessions in `default/scratch` (no cwd) with their prompts captured, but
+**the tool events were stored with empty bodies and the generic titles
+`pre-tool-use`/`post-tool-use`**, while this session's Claude Code tool
+events replayed to the same server got their capture-policy summaries
+(`tool non-file`). Giving the Cursor event a real `cwd` did not change it,
+and `Shell` classifies as a non-file tool, so neither is the cause; the
+remaining differences are `tool_output` instead of `tool_response`, the
+camelCase `hook_event_name`, and no `cwd` query parameter. Not yet
+isolated; a failing test is the next step.
+
 ## Open questions (live tests)
 
-1. The payload and event set of a real desktop conversation for both the
-   native `.cursor/hooks.json` and the Claude-format hooks, including what
-   `session_id`/`cwd` the Claude-format copy gets once a workspace is open.
+1. The native `.cursor/hooks.json` payloads (only the Claude-format copy
+   has been observed) and the `cwd` a conversation gets once a workspace
+   folder is open — needs a prompt inside the probe workspace.
 2. ~~What the `empty-state-draft` session start does on the server.~~
    Measured 2026-10-08 by replaying the spooled event against a scratch
    server: it creates one `cursor` session with no `cwd` in the
    `default/scratch` project, and every later launch (a new ingest key, the
    same placeholder id) adds another `session-start` observation to that
    same session. Clutter, not loss; whether to drop it is a product call.
-3. Where a desktop conversation's transcript lands (`transcript_path` once
-   set) and whether the `cursor-agent` CLI loads the Claude-format hooks
-   (it needs `cursor-agent login` here first).
+3. Whether the `cursor-agent` CLI loads the Claude-format hooks (it needs
+   `cursor-agent login` here first).
+5. Why Cursor tool events reach the store with empty bodies (above).
 4. Whether a workspace window imports Claude MCP servers.

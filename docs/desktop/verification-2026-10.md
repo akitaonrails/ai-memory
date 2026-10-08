@@ -156,7 +156,14 @@ needs `--config-file ~/.config/Claude/claude_desktop_config.json`.
   `session-start` observation to the same placeholder session.
 - The empty window loaded only Cursor's built-in MCP servers, not the
   Claude config's `ai-memory`.
-- No conversation has run yet; `cursor-agent` is not logged in.
+- Two real conversations in the empty window arrived through the Claude
+  hooks with `session_id`, `prompt`, `tool_name`, `tool_input` and
+  `tool_output` alongside Cursor's fields; the transcript lands under
+  `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl` and its path
+  appears only on `stop`. Replayed to a scratch server, the prompts are
+  stored but the tool events get empty bodies, unlike Claude Code's; the
+  cause is not yet isolated (`cursor.md`).
+- `cursor-agent` is not logged in.
 
 ## Still unverified
 
@@ -165,5 +172,6 @@ needs `--config-file ~/.config/Claude/claude_desktop_config.json`.
 | Does the Codex desktop app pass anything at `thread/start` that disables hooks? | One prompt in the desktop app with the trusted ai-memory hooks in place, then check the hook spool or server for a `codex` session whose rollout originator is the desktop's |
 | Does the Antigravity IDE run `.agents/hooks.json` / `~/.gemini/config/hooks.json`, with the same payload as the CLI? | One IDE prompt in a scratch workspace carrying a recorder `.agents/hooks.json` |
 | Do host hooks and MCP servers reach Cowork's VM on Linux (and on macOS/Windows)? | One Cowork task after the VM images download, then look for hook output in its transcript |
-| Cursor: the hook set and payloads of a real desktop conversation (native and Claude-format), and where its transcript lands | One prompt in the probe workspace, which carries recorder `.cursor/hooks.json` and `.claude/settings.json` files |
+| Cursor: the native `.cursor/hooks.json` payloads and the `cwd` inside an open folder | One prompt in the probe workspace, which carries recorder `.cursor/hooks.json` and `.claude/settings.json` files |
+| Cursor: why tool events reach the store with empty bodies | A failing test that posts the captured payload, then bisect the field differences |
 | Is a per-turn Antigravity session-start acceptable, or should it be gated per conversation? | A product decision once the server-side effect of repeated session-start posts is measured |
