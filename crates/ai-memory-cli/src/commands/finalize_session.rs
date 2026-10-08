@@ -1,6 +1,9 @@
 //! `ai-memory finalize-session` — manually synthesize SessionEnd for an agent.
 
+use std::path::Path;
+
 use ai_memory_core::{AgentKind, SessionId};
+use ai_memory_workstream::ManagedHarness;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +90,18 @@ pub(crate) async fn finalize(
     let fallback_cwd = effective_cwd(config)?;
     let mut finalized = Vec::with_capacity(sessions.len());
     for session in &sessions {
+        if replays_prompts(agent, args.all_owners) {
+            let cwd = session.cwd.as_deref().unwrap_or(fallback_cwd.as_str());
+            replay_prompts(
+                config,
+                &endpoint,
+                &workspace,
+                &project,
+                cwd,
+                &session.session_id,
+            )
+            .await;
+        }
         post_session_end_batch(
             &client,
             &endpoint,
@@ -108,6 +123,52 @@ pub(crate) async fn finalize(
     super::hook::clear_session_id(&config.data_dir, agent);
 
     Ok((workspace, project, finalized))
+}
+
+/// Antigravity CLI's live hooks carry no prompt event, so its sessions reach
+/// the server without a single prompt; its `history.jsonl` has them. Other
+/// agents capture prompts live. `--all-owners` finalizes sessions owned by
+/// other users, whose prompts this machine's history does not hold.
+fn replays_prompts(agent: AgentKind, all_owners: bool) -> bool {
+    agent == AgentKind::AntigravityCli && !all_owners
+}
+
+/// Send the session's prompts from the local transcript before its
+/// session-end, so the summary page and handoff see them. Best effort: a
+/// checkout outside the capture allowlist sends none, and any failure is a
+/// warning, leaving the session-end exactly as before.
+async fn replay_prompts(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    cwd: &str,
+    session_id: &str,
+) {
+    if !super::hook::admits_capture_at(&config.data_dir, Path::new(cwd)) {
+        return;
+    }
+    let Some(home) = super::run::native_home(config) else {
+        eprintln!(
+            "ai-memory: no home directory; session {session_id} is finalized without its prompts"
+        );
+        return;
+    };
+    if let Err(error) = super::backfill::replay_session_prompts(
+        endpoint,
+        workspace,
+        project,
+        &home,
+        Path::new(cwd),
+        ManagedHarness::Antigravity,
+        session_id,
+    )
+    .await
+    {
+        eprintln!(
+            "ai-memory: could not replay the prompts of session {session_id} ({error:#}); finalizing without them"
+        );
+    }
 }
 
 /// List open sessions for the scope + agent via the server. An unknown
@@ -276,6 +337,21 @@ mod tests {
     use ai_memory_core::{NewSession, SessionId};
     use ai_memory_store::Store;
     use tempfile::TempDir;
+
+    #[test]
+    fn only_own_antigravity_sessions_replay_prompts() {
+        assert!(replays_prompts(AgentKind::AntigravityCli, false));
+        assert!(
+            !replays_prompts(AgentKind::AntigravityCli, true),
+            "other owners' prompts are not in this machine's history"
+        );
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenCode] {
+            assert!(
+                !replays_prompts(agent, false),
+                "{agent:?} captures prompts live"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn selects_latest_scoped_session_for_requested_agent_by_default() {
