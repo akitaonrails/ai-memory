@@ -122,3 +122,8 @@ The research's best new target — not the RFC's `.mcpb`:
    session reaches ai-memory twice when Cursor's own hooks are installed
    (the #721 de-duplication covers that) and once otherwise; the
    launch-time `empty-state-draft` session start needs handling.
+10. Extensions (`extensions.md`): a Claude plugin loads hooks in Cowork but
+    not in Chat, and local MCP servers only in Cowork-on-your-computer and
+    Claude Code; Codex, Cursor and Antigravity plugins can bundle hooks and
+    MCP. Distribution could move from writing config files to marketplace
+    plugins; the server itself still needs a separate install.
