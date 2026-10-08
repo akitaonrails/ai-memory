@@ -51,6 +51,12 @@ on:
 permissions:
   contents: read
 
+# Same rule as ci.yml: a newer push to a pull request cancels its in-flight
+# run; pushes, schedules and dispatches each run to completion.
+concurrency:
+  group: nix-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-linux:
     name: nix build (x86_64-linux)

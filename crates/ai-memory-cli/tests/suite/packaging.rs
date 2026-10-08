@@ -759,7 +759,23 @@ fn workflows_keep_fixed_rust_jobs_on_the_fixed_toolchain() {
 fn dev_loop_is_wired_consistently() {
     // One gate, written down in four places; keep them from drifting apart.
     let ci = read_repo(".github/workflows/ci.yml");
-    assert!(ci.contains("cargo test --workspace --all-targets"));
+    assert!(ci.contains("cargo nextest run --workspace --all-targets --profile ci"));
+    // nextest does not run doctests.
+    assert!(ci.contains("cargo test --workspace --doc"));
+    // Windows stays on plain `cargo test`: nextest's per-test processes cost
+    // more there than its parallelism saves.
+    let windows = read_repo(".github/workflows/windows.yml");
+    assert!(windows.contains("cargo test --workspace --all-targets"));
+    // The `ci` profile is what makes CI a full gate: every tier, nothing
+    // turned green by a retry.
+    let nextest = read_repo(".config/nextest.toml");
+    let ci_profile = nextest
+        .split("[profile.ci]")
+        .nth(1)
+        .expect("nextest.toml defines [profile.ci]");
+    let ci_profile = ci_profile.split("\n[").next().unwrap_or(ci_profile);
+    assert!(ci_profile.contains("default-filter = \"all()\""));
+    assert!(ci_profile.contains("retries = 0"));
     assert!(
         ci.contains("TAILWIND_BUILD=1"),
         "CI must regenerate the stylesheet somewhere"
