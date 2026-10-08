@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Hook body excerpts are now sanitized *before* the per-event byte
+  cap, the same `scrub-then-cap` order already used for observation
+  titles (#980) and `memory_feedback` reasons (#1109). Previously
+  `crates/ai-memory-hooks/src/payload.rs` `best_body_excerpt`,
+  `legacy_tool_body`, `extension_body_excerpt`, and `safe_tool_body`
+  ran the 2 KiB tool / 16 KiB user-prompt / 16 KiB post-compaction / 2
+  KiB notification cap first and only then passed the truncated text
+  to the sanitizer, so a secret straddling the cap was cut in half
+  and the kept prefix (too short to match any built-in redaction
+  pattern) survived into body_excerpt in clear text. Each call site
+  now scrubs the full body via `Sanitizer::scrub` and the cap is
+  applied to the already-scrubbed output. A `Sanitizer::builtin()`
+  is constructed per `HookEnvelope` and threaded through the four
+  helpers. Four straddling-secret adversarial tests in
+  `ai-memory-hooks::payload` cover the four surfaces (user prompt,
+  post-compaction, notification, post-tool-use result);
+  `docs/security-boundaries.md` row 7 is updated in the same change.
+  (#1114)
 
 ## [2.6.0] - 2026-10-07
 

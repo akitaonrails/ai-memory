@@ -1,6 +1,8 @@
 //! Wire envelope received on `POST /hook`.
 
-use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, truncate_utf8_bytes};
+use ai_memory_core::{
+    AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer, truncate_utf8_bytes,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
@@ -643,19 +645,25 @@ impl HookEnvelope {
                     .map(|source| extension_title_hint(&raw, source))
             })
         };
+        // Build a single sanitizer per envelope and pass it to every
+        // excerpt helper. The hook router constructs a fully configured
+        // operator-aware sanitizer; for envelope construction we use the
+        // built-in patterns so body excerpts remain redaction-safe even
+        // when the call site does not own a configured sanitizer (#1114).
+        let sanitizer = Sanitizer::builtin();
         let body_excerpt = if closed_tool_event {
-            safe_tool_body(event, tool_metadata.as_ref(), agent, &raw).or_else(|| {
+            safe_tool_body(event, tool_metadata.as_ref(), agent, &raw, &sanitizer).or_else(|| {
                 (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
-                    .then(|| legacy_tool_body(event, agent, &raw))
+                    .then(|| legacy_tool_body(event, agent, &raw, &sanitizer))
                     .flatten()
             })
         } else if matches!(event, HookEvent::PreToolUse | HookEvent::PostToolUse) {
-            legacy_tool_body(event, agent, &raw)
+            legacy_tool_body(event, agent, &raw, &sanitizer)
         } else {
-            best_body_excerpt(event, &raw).or_else(|| {
+            best_body_excerpt(event, &raw, &sanitizer).or_else(|| {
                 source_event
                     .as_deref()
-                    .and_then(|_| extension_body_excerpt(&raw))
+                    .and_then(|_| extension_body_excerpt(&raw, &sanitizer))
             })
         };
         let ingest_key = query.ingest_key.filter(|k| valid_ingest_key(k));
@@ -767,7 +775,12 @@ fn legacy_tool_title(
     })
 }
 
-fn legacy_tool_body(event: HookEvent, agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+fn legacy_tool_body(
+    event: HookEvent,
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    sanitizer: &Sanitizer,
+) -> Option<String> {
     let payload = (event == HookEvent::PostToolUse && agent == AgentKind::OpenCode)
         .then(|| raw.get("payload"))
         .flatten()?;
@@ -777,7 +790,13 @@ fn legacy_tool_body(event: HookEvent, agent: AgentKind, raw: &serde_json::Value)
         &["tool_response", "tool_output", "output", "result"],
     )
     .or_else(|| extract_content(payload, &["error"]))?;
-    Some(truncate_excerpt(&format!("tool: {tool}\n---\n{result}")))
+    // Scrub the full text first, then apply the 2 KiB excerpt cap. The
+    // old order (cap-then-scrub) could split a secret straddling the cap
+    // into an unmatched prefix that survived into storage in clear text
+    // (#1114).
+    Some(truncate_excerpt(
+        &sanitizer.scrub(&format!("tool: {tool}\n---\n{result}")),
+    ))
 }
 
 const fn closed_tool_agent(agent: AgentKind) -> bool {
@@ -846,6 +865,7 @@ fn safe_tool_body(
     metadata: Option<&ToolObservationMetadata>,
     agent: AgentKind,
     raw: &serde_json::Value,
+    sanitizer: &Sanitizer,
 ) -> Option<String> {
     let metadata = metadata?;
     let mut summary = format!(
@@ -864,6 +884,7 @@ fn safe_tool_body(
             summary.push_str("\noutcome: ");
             summary.push_str(tool_observation_outcome(agent, raw).as_str());
             if metadata.tool_family == crate::capture_policy::ToolFamily::Unknown {
+                eprintln!("DEBUG early return Unknown");
                 return Some(summary);
             }
             let result = if agent == AgentKind::Codex {
@@ -885,7 +906,11 @@ fn safe_tool_body(
             }
             .unwrap_or_else(|| "(no output captured)".into());
             summary.push_str("\n---\n");
-            summary.push_str(&result);
+            // Scrub the untrusted `result` text first, then append to the
+            // safe metadata prefix. Truncating before scrubbing could split a
+            // secret straddling the 2 KiB excerpt cap into an unmatched prefix
+            // that survived into storage in clear text (#1114).
+            summary.push_str(&sanitizer.scrub(&result));
             Some(truncate_excerpt(&summary))
         }
         _ => None,
@@ -1039,7 +1064,11 @@ fn extension_title_hint(raw: &serde_json::Value, source_event: &str) -> String {
         .unwrap_or_else(|| source_event.to_string())
 }
 
-fn extension_body_excerpt(raw: &serde_json::Value) -> Option<String> {
+fn extension_body_excerpt(raw: &serde_json::Value, sanitizer: &Sanitizer) -> Option<String> {
+    // Scrub the full text first, then apply the 2 KiB excerpt cap. The
+    // old order (cap-then-scrub) could split a secret straddling the cap
+    // into an unmatched prefix that survived into storage in clear text
+    // (#1114).
     extract_string(
         raw,
         &[
@@ -1051,7 +1080,7 @@ fn extension_body_excerpt(raw: &serde_json::Value) -> Option<String> {
             "details",
         ],
     )
-    .map(|s| truncate_excerpt(&s))
+    .map(|s| truncate_excerpt(&sanitizer.scrub(&s)))
 }
 
 /// Extract human-readable text content for an observation body, accepting the
@@ -1104,10 +1133,19 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
+fn best_body_excerpt(
+    event: HookEvent,
+    raw: &serde_json::Value,
+    sanitizer: &Sanitizer,
+) -> Option<String> {
+    // Each branch scrubs the full text first, then applies the per-event
+    // byte cap to the already-scrubbed output. Cap-then-scrub (the old
+    // order) could split a secret straddling the cap into an unmatched
+    // prefix that survived into storage in clear text (#1114).
     match event {
-        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"])
-            .map(|body| truncate_utf8_bytes(&body, USER_PROMPT_EXCERPT_MAX_BYTES)),
+        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"]).map(|body| {
+            truncate_utf8_bytes(&sanitizer.scrub(&body), USER_PROMPT_EXCERPT_MAX_BYTES)
+        }),
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
@@ -1118,12 +1156,17 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
                     .unwrap_or_else(|| "(no output captured)".into());
-            Some(format!("tool: {tool}\n---\n{}", truncate_excerpt(&result)))
+            Some(format!(
+                "tool: {tool}\n---\n{}",
+                truncate_excerpt(&sanitizer.scrub(&result))
+            ))
         }
-        HookEvent::Notification => extract_content(raw, &["message", "text"])
-            .map(|body| truncate_utf8_bytes(&body, NOTIFICATION_EXCERPT_MAX_BYTES)),
-        HookEvent::PostCompaction => extract_content(raw, &["summary"])
-            .map(|body| truncate_utf8_bytes(&body, POST_COMPACTION_EXCERPT_MAX_BYTES)),
+        HookEvent::Notification => extract_content(raw, &["message", "text"]).map(|body| {
+            truncate_utf8_bytes(&sanitizer.scrub(&body), NOTIFICATION_EXCERPT_MAX_BYTES)
+        }),
+        HookEvent::PostCompaction => extract_content(raw, &["summary"]).map(|body| {
+            truncate_utf8_bytes(&sanitizer.scrub(&body), POST_COMPACTION_EXCERPT_MAX_BYTES)
+        }),
         _ => None,
     }
 }
@@ -3344,6 +3387,149 @@ mod tests {
         assert_eq!(
             post.body_excerpt.as_deref(),
             Some("tool_family: non-file\ntool_call_id: omp-1\noutcome: unknown\n---\ntests passed")
+        );
+    }
+
+    // ---- #1114: body excerpts must be scrubbed *before* the byte cap is
+    // applied, mirroring `Sanitized::new` and `sanitize_feedback_reason`.
+    // Same leak class as #980 (title) and #1109 (feedback reason): the old
+    // order ran the byte cap first and only then passed the truncated text
+    // to the sanitizer, so a secret that straddled the cap was cut in half
+    // and the kept prefix (too short to match any built-in pattern) survived
+    // into storage in clear text. The fix is explicit
+    // `sanitizer.scrub(&full_text)` before the cap helper at every site.
+
+    const STRADDLING_BEARER: &str = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.\
+        eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0.\
+        SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+    #[test]
+    fn body_excerpt_user_prompt_is_scrubbed_before_the_16kib_cap() {
+        let sanitizer = Sanitizer::builtin();
+        // Place the token so it straddles the 16 KiB cap: its tail runs
+        // well past the cutoff, so the old order kept an unmatched
+        // prefix.
+        let pad_len = USER_PROMPT_EXCERPT_MAX_BYTES - STRADDLING_BEARER.len() / 2;
+        let prompt = format!("{}{}{}", "x".repeat(pad_len), STRADDLING_BEARER, " tail");
+        let raw = serde_json::json!({"prompt": prompt});
+        let body = best_body_excerpt(HookEvent::UserPrompt, &raw, &sanitizer)
+            .expect("user-prompt body excerpt");
+        assert!(
+            !body.contains(STRADDLING_BEARER),
+            "full token survived body_excerpt: {body}",
+        );
+        assert!(
+            !body.contains("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+            "token prefix leaked through the cap: {body}",
+        );
+        assert!(
+            body.contains("[REDACTED:"),
+            "expected a [REDACTED:...] marker in: {body}",
+        );
+    }
+
+    #[test]
+    fn body_excerpt_post_compaction_is_scrubbed_before_the_16kib_cap() {
+        let sanitizer = Sanitizer::builtin();
+        let pad_len = POST_COMPACTION_EXCERPT_MAX_BYTES - STRADDLING_BEARER.len() / 2;
+        let summary = format!("{}{}{}", "y".repeat(pad_len), STRADDLING_BEARER, " end");
+        let raw = serde_json::json!({"summary": summary});
+        let body = best_body_excerpt(HookEvent::PostCompaction, &raw, &sanitizer)
+            .expect("post-compaction body excerpt");
+        assert!(
+            !body.contains(STRADDLING_BEARER),
+            "full token survived body_excerpt: {body}",
+        );
+        assert!(
+            !body.contains("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+            "token prefix leaked through the cap: {body}",
+        );
+        assert!(
+            body.contains("[REDACTED:"),
+            "expected a [REDACTED:...] marker in: {body}",
+        );
+    }
+
+    #[test]
+    fn body_excerpt_notification_is_scrubbed_before_the_2kib_cap() {
+        let sanitizer = Sanitizer::builtin();
+        // Same shape, but the 2 KiB notification cap — a token straddling
+        // it is just as exposed as one straddling the 16 KiB prompt cap.
+        let pad_len = NOTIFICATION_EXCERPT_MAX_BYTES - STRADDLING_BEARER.len() / 2;
+        let message = format!("{}{}{}", "z".repeat(pad_len), STRADDLING_BEARER, " done");
+        let raw = serde_json::json!({"message": message});
+        let body = best_body_excerpt(HookEvent::Notification, &raw, &sanitizer)
+            .expect("notification body excerpt");
+        assert!(
+            !body.contains(STRADDLING_BEARER),
+            "full token survived body_excerpt: {body}",
+        );
+        assert!(
+            !body.contains("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"),
+            "token prefix leaked through the cap: {body}",
+        );
+        assert!(
+            body.contains("[REDACTED:"),
+            "expected a [REDACTED:...] marker in: {body}",
+        );
+    }
+
+    #[test]
+    fn safe_tool_body_post_tool_use_result_is_scrubbed_before_the_2kib_cap() {
+        // The `safe_tool_body` summary is "tool_family / tool_call_id /
+        // outcome" plus an untrusted `result` body. The unsafe part is the
+        // `result`; the prefix is metadata, not text, and never reaches
+        // the sanitizer. A secret in `result` that straddles the 2 KiB
+        // excerpt cap must be redacted before the cap clips it.
+        let sanitizer = Sanitizer::builtin();
+        let metadata = ToolObservationMetadata {
+            tool_family: crate::capture_policy::ToolFamily::NonFile,
+            tool_call_id: Some("call-safe-1".into()),
+        };
+        let pad_len = TOOL_EXCERPT_MAX_BYTES - STRADDLING_BEARER.len() / 2 - 26;
+        let result = format!("{}{}{}", "r".repeat(pad_len), STRADDLING_BEARER, " out");
+        let raw = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hello"},
+            "tool_response": result,
+        });
+        let body = safe_tool_body(
+            HookEvent::PostToolUse,
+            Some(&metadata),
+            AgentKind::ClaudeCode,
+            &raw,
+            &sanitizer,
+        )
+        .expect("post-tool-use safe body");
+        // libtest truncates long panic messages, so assert by index/length
+        // rather than substring on the ~2 KiB body. Skip the safe metadata
+        // prefix ("tool_family: ... ---") and locate the r-padding that the
+        // test prepended to the secret.
+        let sep = body.find("---").expect("body has a --- separator");
+        // Skip past the `---\n` separator (4 bytes including the trailing newline).
+        let after_sep = &body[sep + 4..];
+        let r_count = after_sep
+            .as_bytes()
+            .iter()
+            .take_while(|&&b| b == b'r')
+            .count();
+        let tail = after_sep.get(r_count..).unwrap_or("");
+        assert!(
+            !body.contains(STRADDLING_BEARER),
+            "full token survived (body len = {})",
+            body.len(),
+        );
+        assert!(
+            !tail.starts_with("Bearer "),
+            "token prefix leaked through the 2 KiB cap after {} r-padding bytes (body len = {})",
+            r_count,
+            body.len(),
+        );
+        assert!(
+            tail.contains("[REDACTED:"),
+            "expected a [REDACTED:...] marker after {} r-padding bytes (body len = {})",
+            r_count,
+            body.len(),
         );
     }
 }
