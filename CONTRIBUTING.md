@@ -53,7 +53,8 @@ cargo deny check                    # dependency policy
 ```
 
 `cargo tf` needs nextest (`cargo install cargo-nextest --locked`); without it,
-`cargo test --workspace --all-targets` is the equivalent and is what CI runs.
+`cargo test --workspace --all-targets` is the equivalent. Linux and macOS CI run the
+same tests with `cargo nextest run --workspace --all-targets --profile ci`.
 If `cargo-deny` or `cargo-audit` are not installed:
 
 ```bash

@@ -16,6 +16,13 @@ env:
 permissions:
   contents: read
 
+# A newer push to a pull request supersedes its in-flight run, so cancel it.
+# Pushes to main and manual dispatches are never cancelled: each is the record
+# for its commit (a dispatch is the pre-release matrix on an exact SHA).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fmt:
     name: rustfmt
@@ -70,7 +77,14 @@ jobs:
       - name: Regenerate the Tailwind bundle
         if: matrix.os == 'ubuntu-latest'
         run: echo "TAILWIND_BUILD=1" >> "$GITHUB_ENV"
-      - run: cargo test --workspace --all-targets
+      # nextest runs every test binary's tests in parallel across the runner's
+      # cores; `cargo test` ran the binaries one after another, which was most
+      # of this job's wall clock. Profile `ci` (.config/nextest.toml) runs every
+      # tier, including slow::/stress::, with no retries.
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace --all-targets --profile ci
       # `--all-targets` deliberately excludes doctests, so a doc-comment code
       # block that fails to compile (e.g. an indented shell example rustdoc
       # reads as Rust) shipped unnoticed. Run them explicitly.

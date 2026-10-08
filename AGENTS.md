@@ -243,9 +243,10 @@ cargo deny check               # dependency policy (if installed)
 `.config/nextest.toml`. Run them from the repo root. `cargo t` builds the
 workspace's default members, which is every shipped crate; the evals harness
 is two more test binaries that only `cargo tf`, the pre-push hook, and CI
-build (`--workspace`). Without nextest,
-`cargo test --workspace --all-targets` is what CI runs: everything, slower,
-no tiers.
+build (`--workspace`). Linux and macOS CI run `cargo nextest run --workspace
+--all-targets --profile ci`: every tier like `cargo tf`, no retries, a
+10-minute hang kill. Without nextest, `cargo test --workspace --all-targets`
+covers the same tests, slower, no tiers.
 
 - **Slow tier.** A test whose module path has a segment starting with `slow`
   or `stress` (`packaging::slow::*`, `stress_autoscope::*`) runs only under
@@ -332,7 +333,9 @@ no tiers.
   locking, git plumbing, or the hook bundle, so the corresponding Windows
   jobs run before the merge rather than only on the nightly schedule. Both
   the Rust test job and the hook-bundle job use this label gate on pull
-  requests; they also run on manual dispatch.
+  requests; they also run on manual dispatch. That job stays on plain
+  `cargo test`: nextest, partitioning across runners, and a Dev Drive were
+  each measured there and none beat it.
 
 ## Code style guidelines
 
@@ -484,9 +487,11 @@ Additional boundary rules:
 - New disk+SQL mutations need recovery/rollback tests.
 - The recall-eval framework lives at
   `crates/ai-memory-consolidate/tests/recall_eval.rs`.
-- Tests run with `cargo t` locally and `cargo test --workspace --all-targets`
-  in CI (plus `cargo test --workspace --doc`, which `--all-targets` excludes,
-  for doc-comment code blocks).
+- Tests run with `cargo t` locally,
+  `cargo nextest run --workspace --all-targets --profile ci` in Linux/macOS
+  CI, and `cargo test --workspace --all-targets` on Windows (plus
+  `cargo test --workspace --doc`, since neither runs doctests, for
+  doc-comment code blocks).
 
 ## Security considerations
 

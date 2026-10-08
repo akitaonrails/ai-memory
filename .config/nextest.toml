@@ -7,8 +7,7 @@
 # needs more than ~1s alone either gets fixed or moves into a `slow`/`stress`
 # module, and the 5s slow-timeout below surfaces new offenders in every run's
 # summary. Two independent things run the skipped tier anyway: the pre-push
-# hook (`scripts/install-git-hooks.sh`) and CI, which uses `cargo test` and
-# never reads this file.
+# hook (`scripts/install-git-hooks.sh`) and CI, which runs `-P ci` below.
 
 [profile.default]
 default-filter = "not test(/(^|::)(slow|stress)[a-z0-9_]*::/)"
@@ -31,15 +30,21 @@ failure-output = "immediate-final"
 status-level = "fail"
 # The slow tier legitimately sits in the 10-20s range.
 slow-timeout = { period = "30s", terminate-after = 8 }
-# No retries: no genuinely flaky test has been found in this suite, and a
-# local gate should tell the truth. Retries belong in profile.ci.
+# No retries: a gate should tell the truth (profile.ci follows the same rule).
 
 [profile.ci]
+# CI runs every tier, like `cargo tf`: `all()` overrides the everyday skip it
+# would otherwise inherit from profile.default.
 default-filter = "all()"
-# Runner contention is real and separate from flakiness.
-retries = 2
+# No retries: a retry turns a flaky test green, and the suite's real flakes
+# were found because CI showed them failing.
+retries = 0
 failure-output = "immediate-final"
 fail-fast = false
-
-[profile.ci.junit]
-path = "junit.xml"
+status-level = "fail"
+final-status-level = "slow"
+# Hosted runners (Windows especially) are several times slower than a
+# workstation, so the everyday 5s marker would flag most of the suite. Kill a
+# test only after 10 minutes: long enough for a slow runner, short enough that
+# a hang fails the job instead of eating its whole timeout.
+slow-timeout = { period = "60s", terminate-after = 10 }
