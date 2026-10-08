@@ -1075,8 +1075,11 @@ PS_BRIEF_STATIC=$(grep -Fq 'if ($Event -eq "session-start" -and -not $BriefingOn
     && printf 'ok' || printf 'missing')
 assert_eq "powershell session-start handoff GET carries the briefing keys" "ok" "$PS_BRIEF_STATIC"
 
+# A spooled fixture event names this run's temp tree or targets the fake
+# `memory.test` host. Live sessions share the spool and may mention that host
+# in their own payloads, where it is JSON-escaped, so match only the URL field.
 assert_eq "no fixture event was spooled into the caller's data dir" "" \
-    "$(grep -rlF -e "$TMP" -e 'memory.test' "$CALLER_SPOOL" 2>/dev/null | head -n 1)"
+    "$(grep -rlF -e "$TMP" -e '{"url":"http://memory.test' "$CALLER_SPOOL" 2>/dev/null | head -n 1)"
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
