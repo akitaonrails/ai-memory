@@ -16,8 +16,39 @@ CONFIG="$TMP/config"
 LOGS="$TMP/logs"
 SERVER_PID=""
 
+# `ai-memory run` wires the harness it launches into that harness's user
+# config. Every leg below must do that inside a fixture home; a leak points
+# the operator's real Codex or Claude config at this throwaway server. These
+# are the files ai-memory writes, so any change to one fails the run.
+OPERATOR_HOME=$HOME
+OPERATOR_CONFIGS=(
+  "$OPERATOR_HOME/.codex/hooks.json"
+  "$OPERATOR_HOME/.codex/config.toml"
+  "$OPERATOR_HOME/.claude/settings.json"
+  "$OPERATOR_HOME/.gemini/config/hooks.json"
+  "$OPERATOR_HOME/.gemini/config/mcp_config.json"
+  "$OPERATOR_HOME/.kimi-code/config.toml"
+)
+operator_config_digest() {
+  local file
+  for file in "${OPERATOR_CONFIGS[@]}"; do
+    if [ -f "$file" ]; then
+      sha256sum "$file"
+    else
+      printf 'absent  %s\n' "$file"
+    fi
+  done
+}
+OPERATOR_CONFIG_DIGEST=$(operator_config_digest)
+
 cleanup() {
   local code=$?
+  if [ "$(operator_config_digest)" != "$OPERATOR_CONFIG_DIGEST" ]; then
+    printf 'the acceptance run changed the operator'"'"'s agent config:\n' >&2
+    diff <(printf '%s\n' "$OPERATOR_CONFIG_DIGEST") \
+      <(operator_config_digest) >&2 || true
+    code=1
+  fi
   if [ -n "$SERVER_PID" ]; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
@@ -27,6 +58,7 @@ cleanup() {
   else
     rm -rf "$TMP"
   fi
+  exit "$code"
 }
 trap cleanup EXIT INT TERM
 
@@ -465,6 +497,14 @@ EOF
 chmod +x "$FAKE"
 
 printf 'running deterministic wrapper edge checks\n'
+
+# The fake harnesses below need nothing from the operator's home, and each
+# `run` would otherwise autowire the operator's real agent config.
+OPERATOR_XDG_CONFIG_HOME=${XDG_CONFIG_HOME-}
+OPERATOR_XDG_DATA_HOME=${XDG_DATA_HOME-}
+export HOME="$CONFIG/edge-home"
+mkdir -p "$HOME"
+unset CODEX_HOME CLAUDE_CONFIG_DIR XDG_CONFIG_HOME XDG_DATA_HOME
 
 # Utility invocations must not discover and import another process's recent
 # session merely because it is active in the same checkout.
@@ -1484,6 +1524,12 @@ if [ "$DETERMINISTIC_ONLY" = 1 ]; then
   printf 'deterministic managed-workstream acceptance passed\n'
   exit 0
 fi
+
+# The real-harness phase reads credentials from the operator's home and
+# isolates each leg itself.
+export HOME="$OPERATOR_HOME"
+[ -z "$OPERATOR_XDG_CONFIG_HOME" ] || export XDG_CONFIG_HOME="$OPERATOR_XDG_CONFIG_HOME"
+[ -z "$OPERATOR_XDG_DATA_HOME" ] || export XDG_DATA_HOME="$OPERATOR_XDG_DATA_HOME"
 
 read -r -a requested_harnesses <<<"$HARNESS_WORDS"
 harnesses=()

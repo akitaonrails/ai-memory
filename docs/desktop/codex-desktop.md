@@ -75,14 +75,16 @@ Codex has a native lifecycle-hooks framework
 - Handlers can be `command` or `mcp_tool` (a lifecycle event can call a tool
   on a connected MCP server — an interesting future capture path).
 
-**Open question (needs a live test):** the hooks doc does not explicitly
-scope hooks to the CLI. Since the desktop app and CLI "share MCP
-configuration for the same Codex host" and hooks live in the same config
-layers, desktop-app Codex sessions are *expected* to fire the same hooks —
-but none of the fetched pages says so in so many words. Verification test:
-run a session in the desktop app with ai-memory hooks installed and watch
-`/hook` observations arrive (or check `~/.codex/sessions/rollout-*.jsonl`
-creation + ai-memory session list). Until then, treat as *likely, unproven*.
+**Verified 2026-10-08 (see `verification-2026-10.md`):** the desktop app
+spawns `codex app-server` from the `codex` on `PATH` with
+`CODEX_HOME=~/.codex`, and app-server runs the same hooks as the TUI once
+they are trusted. Untrusted or modified hooks are skipped without any
+message, and trust is recorded per hook content (event, matcher, handler),
+so changing an installed hook command needs a fresh trust. `SessionEnd`
+fires when a thread is archived or app-server shuts down cleanly, not when
+a client unsubscribes. The hook payload does not say which client started
+the session; the rollout's `session_meta.originator` does. A desktop-app
+prompt with the ai-memory hooks in place has not been run yet.
 
 ## Transcript store
 

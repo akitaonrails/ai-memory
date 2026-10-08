@@ -17,6 +17,11 @@ TMP=$(mktemp -d)
 ORIG_HOME=${HOME:-}
 HOME="$TMP"
 export HOME
+# The data dir comes from XDG_DATA_HOME before HOME, so an exported one would
+# send this suite's spooled events, and its auth-header lookups, to the
+# caller's real install.
+CALLER_SPOOL="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$ORIG_HOME/.local/share}/ai-memory}/hook-spool"
+unset AI_MEMORY_DATA_DIR XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME
 unset AI_MEMORY_RUN_ID AI_MEMORY_MANAGED_WORKSTREAM_ID AI_MEMORY_MANAGED_WORKSTREAM_NAME
 trap 'rm -rf "$TMP"; HOME=$ORIG_HOME' EXIT
 
@@ -1069,6 +1074,9 @@ PS_BRIEF_STATIC=$(grep -Fq 'if ($Event -eq "session-start" -and -not $BriefingOn
             END {exit !ok}' hooks/lib/ai-memory-hook.ps1 \
     && printf 'ok' || printf 'missing')
 assert_eq "powershell session-start handoff GET carries the briefing keys" "ok" "$PS_BRIEF_STATIC"
+
+assert_eq "no fixture event was spooled into the caller's data dir" "" \
+    "$(grep -rlF -e "$TMP" -e 'memory.test' "$CALLER_SPOOL" 2>/dev/null | head -n 1)"
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

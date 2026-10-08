@@ -12,8 +12,9 @@ apps; Cursor is the exception") needs revision after this research:
 
 | Surface | Capture mechanism | Effort |
 | --- | --- | --- |
-| Claude Desktop **Code/Cowork** | Already captured: desktop runs Claude Code with user `~/.claude/settings.json` → ai-memory hooks fire (`agent=claude-code`, cwd = scratch workspace). **Zero new code.** | 0 |
-| Codex desktop (Codex mode) | Same host config as CLI (`~/.codex/hooks.json`) → hooks expected to fire in-app. **Verify live; then zero code.** | verify |
+| Claude Desktop **Code** tab (local) | Already captured: desktop runs Claude Code with user `~/.claude/settings.json` → ai-memory hooks fire (`agent=claude-code`; a folderless session's cwd is a scratch workspace). Verified from transcripts 2026-10-08. **Zero new code.** | 0 |
+| Claude Desktop **Cowork** | Unverified: on Linux its tasks run in a QEMU/KVM VM; never run on the research machine. | verify |
+| Codex desktop (Codex mode) | Same host config as CLI (`~/.codex/hooks.json`); `codex app-server`, which the app runs, fires trusted hooks (verified 2026-10-08). One in-app prompt still to confirm. **Then zero code.** | verify |
 | Antigravity IDE / 2.0 / CLI | Native hooks (`~/.gemini/config/hooks.json` + `.agents/hooks.json`); payload has `conversationId`, `transcriptPath`, `workspacePaths[]`, `toolCall`. Map to `/hook` observations. ai-memory already ships `install-hooks --agent antigravity-cli`; IDE reads the same global file. | adapter polish |
 | Zed (ACP + terminal agents) | Agent's own hooks; Zed transparent. | 0 |
 | Claude Desktop **Chat tab**, hosted ChatGPT chat, Grok Bot | No hooks, no local store → model-discretion MCP tool calls (option a) and/or explicit capture tool. | RFC Phase 1 |
@@ -39,7 +40,7 @@ output. Practical consequences:
 Now concrete per app (paths verified locally unless noted):
 
 - `~/.claude/projects/<munged-cwd>/<session>.jsonl` — Claude Code-family
-  transcripts (desktop Code/Cowork included). Watcher optional: hooks
+  transcripts (desktop Code tab included). Watcher optional: hooks
   already cover it; a watcher adds value only for hookless flows (e.g.
   user disabled hooks).
 - `~/.codex/sessions/**/rollout-*.jsonl` + `~/.codex/history.jsonl` — Codex.
@@ -64,14 +65,17 @@ Verified mechanics (see `claude-desktop.md`):
   (CLI UUID). `/desktop` and `claude --desktop --resume <id>` move the same
   id across surfaces. ai-memory's `(agent=claude-code, session_id)` key
   therefore sees **one session**, no dedup needed.
-- Desktop Cowork spawns **new** CLI sessions under ephemeral scratch cwds
+- A desktop Code session started without a project folder is a **new** CLI
+  session under an ephemeral scratch cwd
   (`~/.config/Claude/scratch-workspaces/<acct>/<org>/scratch-YYYY-MM-DD-hex`).
+  An earlier version of this note attributed these to Cowork; the desktop
+  records say otherwise (`verification-2026-10.md`).
   Two effects to design for:
   1. **Project fragmentation**: every scratch dir becomes its own
      auto-named project. Today that means a stream of one-off projects.
      Options (product decision, not research):
      - (a) detect the scratch-workspace path prefix in scope resolution and
-       route to a single `desktop/claude-cowork` project (keeps memory in
+       route to a single `desktop/claude-scratch` project (keeps memory in
        one pool); or
      - (b) leave per-scratch projects but tag them `claude-desktop` via
        session metadata for filtering.
@@ -121,14 +125,19 @@ never invent capture from it — treat as metadata only.
 
 ## 3. Open questions
 
-1. Do Codex hooks fire for desktop-app sessions? (live test; if no, a
-   `~/.codex/sessions` watcher is the fallback for desktop capture.)
+1. Codex desktop: `codex app-server` fires trusted hooks (verified
+   2026-10-08); one in-app prompt remains to rule out a desktop-side
+   override.
 2. Does Antigravity IDE honor `~/.gemini/config/hooks.json` in practice, and
-   does `workspacePaths` ever contain >1 path on this setup? (live test)
+   does `workspacePaths` ever contain >1 path on this setup? (The CLI honors
+   `.agents/hooks.json`, verified 2026-10-08; the IDE is still a live test.)
 3. Claude Desktop Chat tab: is any local conversation cache planned
    (desktop extensions/plugins evolve fast)? Re-check quarterly; not
    buildable today.
 4. Grok Bot `mcpBoxServers` entry format — reverse-engineer only if the
    product gains traction with users; no docs.
-5. Scope for scratch-workspace sessions: single `desktop/claude-cowork`
+5. Scope for scratch-workspace sessions: single `desktop/claude-scratch`
    pool vs per-scratch projects (product decision; affects auto-scope).
+6. Antigravity `invocationNum` restarts at 0 on every user turn, so
+   ai-memory's SessionStart mapping runs per turn: acceptable, or gate it
+   per conversation? (product decision after measuring the server effect)

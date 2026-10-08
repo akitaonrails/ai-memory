@@ -67,10 +67,23 @@ handle: no `SessionStart`/`SessionEnd` events (session boundaries must be
 inferred from PreInvocation/Stop), and `cwd` comes as `workspacePaths[]`
 rather than a single `cwd`. Needs a live verification pass on the IDE.
 
+**Verified with the CLI (`agy` 1.3.0, 2026-10-08; see
+`verification-2026-10.md`):** a workspace `.agents/hooks.json` runs with no
+trust prompt; `invocationNum` (and `executionNum`) restart at 0 on every
+user turn of one conversation, so `invocationNum == 0` marks a turn, not a
+new conversation; a `PreToolUse` reply without a `decision` denies the tool;
+`PostToolUse` carries the call but not its output; `transcriptPath` names
+`transcript_full.jsonl`, with `transcript.jsonl` beside it. The IDE has not
+been verified: its agent has never run on this machine.
+
 ## Transcript store (local, readable)
 
 `~/.gemini/antigravity-ide/brain/<conversationId>/` per conversation:
-`transcript.jsonl` + artifacts (per hooks doc). A watcher/poll importer over
+`transcript.jsonl` + artifacts (per hooks doc). The CLI writes both
+`transcript.jsonl` and `transcript_full.jsonl` under
+`brain/<conversationId>/.system_generated/logs/`, each opening with a
+`USER_INPUT` step that holds the prompt, and keeps per-conversation state in
+`conversations/<conversationId>.db` (verified 2026-10-08). A watcher/poll importer over
 `brain/*/` is therefore possible as a fallback capture path.
 
 ## Plugin/extension surface
