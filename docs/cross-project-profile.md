@@ -99,6 +99,13 @@ folder: `stack`, `architecture`, `workflow`, `testing`, `tools`, `style` or
 | `applies_to` | Stack tags the entry is scoped to, e.g. `[rust]` or `typescript`. |
 | `enforced_by` | Something already enforces it (e.g. `pre-push hook`); kept out of the digest. |
 
+`memory_write_page` and `ai-memory write-page` set the last two directly:
+`applies_to: ["rust"]` and `enforced_by: "pre-push hook"` in the tool call,
+or `--applies-to rust --enforced-by "pre-push hook"` on the command line
+(with `--workspace default --project _global --path profile/...` in the
+default deployment). Like the other metadata, a rewrite that omits them
+clears them.
+
 Entries are ordinary wiki pages, markdown in git: edit them by hand, and every
 change is versioned. `memory_delete_page` with `scope: "profile"` removes one
 (git keeps its history). Most entries, though, are learned on their own; see

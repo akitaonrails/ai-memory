@@ -718,3 +718,36 @@ async fn write_page_metadata_store_failure_rolls_back_and_recovers() {
         original_id
     );
 }
+
+/// The route `ai-memory write-page` posts to sets a profile entry's
+/// `applies_to` and `enforced_by`.
+#[tokio::test]
+async fn write_page_sets_profile_fields() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    let request = json!({
+        "workspace": "default", "project": "_global", "path": "profile/style/types.md",
+        "body": "# Types\n\nNever cast.", "applies_to": ["TypeScript"],
+        "enforced_by": "pre-push hook"
+    });
+    assert_eq!(
+        post_json(state.clone(), "/admin/write-page", request)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let ws = state
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let global = state
+        .writer
+        .get_or_create_project(ws, "_global", None)
+        .await
+        .unwrap();
+    let path = ai_memory_core::PagePath::new("profile/style/types.md").unwrap();
+    let md = state.wiki.read_page(ws, global, &path).unwrap();
+    assert_eq!(md.frontmatter["applies_to"], json!(["typescript"]));
+    assert_eq!(md.frontmatter["enforced_by"], "pre-push hook");
+}

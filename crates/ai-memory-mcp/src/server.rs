@@ -339,7 +339,8 @@ should be proposed from a completed session, or at explicit wrap-up \
   fact is a standing user/team preference that should apply to EVERY \
   project ('always use pnpm', 'never force-push', code style rules), \
   pass `scope: \"profile\"` so it joins the cross-project profile \
-  (stored under `profile/`, delivered to every project as a default); \
+  (stored under `profile/`, delivered to every project as a default), \
+  optionally with `applies_to` stack tags and `enforced_by`; \
   `scope: \"global\"` writes the shared `_global` scope directly. When \
   the user explicitly wants a \
   time-bounded note, pass `expires_at` as RFC3339 or `YYYY-MM-DD`; the \
@@ -4289,8 +4290,11 @@ impl AiMemoryServer {
         `scope: \"profile\"` — the page joins the cross-project profile \
         under `profile/` (its path gains that prefix), reaches every \
         project's session start as a default, and default memory_query \
-        calls surface it. `scope: \"global\"` writes the reserved \
-        `_global` scope directly. \
+        calls surface it. A profile entry also takes `applies_to` (stack \
+        tags such as `rust`, limiting it to projects on that stack) and \
+        `enforced_by` (what already enforces it, which keeps it out of the \
+        digest). `scope: \"global\"` writes the \
+        reserved `_global` scope directly. \
         \
         Optional `kind`, `entities`, `abstract`, and `relations` carry bounded \
         metadata. This replaces the whole page; omitted metadata is cleared. \
@@ -15596,6 +15600,83 @@ mod tests {
         )
         .await
         .expect_err("scope: profile is refused while the profile is off");
+    }
+
+    /// `applies_to` and `enforced_by` reach a profile entry's frontmatter
+    /// through the tool, in the shape the digest reads; a rewrite keeps them
+    /// only when it passes them again (writes replace all metadata).
+    #[tokio::test]
+    async fn memory_write_page_sets_profile_applies_to_and_enforced_by() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let app = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, app)
+            .with_wiki(wiki.clone());
+        let with_fields = |applies_to: &[&str], enforced_by: Option<&str>| {
+            let mut args = profile_entry("style/types.md", Some("profile"));
+            args.metadata.applies_to = applies_to.iter().map(|t| (*t).to_owned()).collect();
+            args.metadata.enforced_by = enforced_by.map(str::to_owned);
+            args
+        };
+
+        server
+            .memory_write_page(
+                Parameters(with_fields(&["TypeScript"], Some("pre-push hook"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a profile entry takes both fields");
+        let global = store
+            .writer
+            .get_or_create_project(ws, ai_memory_core::GLOBAL_SCOPE_PROJECT, None)
+            .await
+            .unwrap();
+        let path = PagePath::new("profile/style/types.md").unwrap();
+        let read = |wiki: &Wiki| {
+            let md = wiki.read_page(ws, global, &path).unwrap();
+            ai_memory_core::profile::ProfileEntry::from_page(
+                path.as_str(),
+                "",
+                &md.body,
+                &md.frontmatter,
+            )
+            .unwrap()
+        };
+        let entry = read(&wiki);
+        assert_eq!(entry.applies_to, ["typescript"]);
+        assert!(entry.enforced_by);
+
+        server
+            .memory_write_page(
+                Parameters(with_fields(&["typescript"], Some("pre-push hook"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let entry = read(&wiki);
+        assert_eq!(entry.applies_to, ["typescript"], "passed again, kept");
+        assert!(entry.enforced_by);
+
+        server
+            .memory_write_page(
+                Parameters(with_fields(&[], None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let entry = read(&wiki);
+        assert!(entry.applies_to.is_empty(), "omitted on rewrite, cleared");
+        assert!(!entry.enforced_by);
     }
 
     /// The finding that started #708, as a test.

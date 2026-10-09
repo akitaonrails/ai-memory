@@ -26,6 +26,10 @@ struct WritePageBody {
     tier: String,
     tags: Vec<String>,
     pinned: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    applies_to: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enforced_by: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +76,8 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
             tier: args.tier,
             tags: args.tag,
             pinned: args.pinned,
+            applies_to: args.applies_to,
+            enforced_by: args.enforced_by,
         },
     )
     .await

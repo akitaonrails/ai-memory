@@ -3312,6 +3312,15 @@ pub struct WritePageArgs {
     /// Pin the page so the future decay sweep skips it.
     #[arg(long)]
     pub pinned: bool,
+    /// Profile entries only (`profile/...` paths): repeatable stack tag
+    /// (`rust`, `typescript`, ...) limiting the entry to projects on that
+    /// stack.
+    #[arg(long = "applies-to")]
+    pub applies_to: Vec<String>,
+    /// Profile entries only: what already enforces the entry (e.g.
+    /// `pre-push hook`), which keeps it out of the session-start digest.
+    #[arg(long = "enforced-by")]
+    pub enforced_by: Option<String>,
     /// Workspace name (auto-created if absent).
     #[arg(long)]
     pub workspace: Option<String>,
@@ -3326,6 +3335,30 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn write_page_takes_the_profile_entry_fields() {
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "write-page",
+            "--path",
+            "profile/style/types.md",
+            "--body",
+            "Never cast.",
+            "--applies-to",
+            "rust",
+            "--applies-to",
+            "typescript",
+            "--enforced-by",
+            "pre-push hook",
+        ])
+        .expect("write-page profile args parse");
+        let Command::WritePage(args) = parsed.command else {
+            panic!("expected write-page command");
+        };
+        assert_eq!(args.applies_to, ["rust", "typescript"]);
+        assert_eq!(args.enforced_by.as_deref(), Some("pre-push hook"));
+    }
 
     #[test]
     fn serve_api_only_flag_does_not_enable_the_web_ui() {
