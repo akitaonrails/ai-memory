@@ -2,6 +2,10 @@
 
 use askama::Template;
 
+/// Server version shown in the footer of every page. Workspace crates share
+/// one version, so this crate's version is the running server's.
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---------------------------------------------------------------------------
 // URL helpers
 // ---------------------------------------------------------------------------

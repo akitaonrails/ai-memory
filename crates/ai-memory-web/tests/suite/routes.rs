@@ -98,6 +98,10 @@ async fn smoke_index_returns_200() {
         text.contains("scratch"),
         "expected project name in index response"
     );
+    assert!(
+        text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "expected server version in footer"
+    );
 }
 
 #[tokio::test]
