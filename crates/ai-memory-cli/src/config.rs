@@ -3128,14 +3128,17 @@ mod tests {
         for rendered in [format!("{auth:?}"), format!("{config:?}")] {
             assert!(rendered.contains("root_username: Some(\"operator\")"));
             assert!(rendered.contains("<redacted>"));
-            for secret in [
+            for sentinel in [
                 "bearer-secret-sentinel",
                 "pepper-secret-sentinel",
                 "proxy-secret-sentinel",
                 "initial-password-sentinel",
                 "recovery-token-sentinel-32chars",
             ] {
-                assert!(!rendered.contains(secret), "Debug output exposed {secret}");
+                assert!(
+                    !rendered.contains(sentinel),
+                    "Debug output exposed {sentinel}"
+                );
             }
         }
     }

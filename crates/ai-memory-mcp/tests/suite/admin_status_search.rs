@@ -336,7 +336,7 @@ async fn project_coordinate_reports_all_statuses_and_never_mutates() {
         assert_eq!(body["status"], expected, "{body}");
         assert_eq!(body["rename_eligible"], rename_eligible, "{body}");
         let rendered = body.to_string();
-        for secret in [
+        for sentinel in [
             "github.com/acme/api",
             "/private/repository/path-sentinel",
             "private-user-sentinel",
@@ -344,7 +344,10 @@ async fn project_coordinate_reports_all_statuses_and_never_mutates() {
             "private/repository-path-sentinel.md",
             "private-page-body-sentinel",
         ] {
-            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}"); // lgtm [rust/cleartext-logging]
+            assert!(
+                !rendered.contains(sentinel),
+                "leaked {sentinel}: {rendered}"
+            );
         }
     }
     assert_eq!(snapshot(), before, "diagnostic calls must not mutate SQL");
@@ -388,7 +391,7 @@ async fn project_coordinate_reports_all_statuses_and_never_mutates() {
     assert_eq!(ambiguous["status"], "ambiguous");
     assert_eq!(ambiguous["collision_reason"], "cross_forge_collision");
     let ambiguous_rendered = ambiguous.to_string();
-    for secret in [
+    for sentinel in [
         "github.com/acme/api",
         "/private/repository/path-sentinel",
         "private-user-sentinel",
@@ -397,8 +400,8 @@ async fn project_coordinate_reports_all_statuses_and_never_mutates() {
         "private-page-body-sentinel",
     ] {
         assert!(
-            !ambiguous_rendered.contains(secret),
-            "leaked {secret}: {ambiguous_rendered}" // lgtm [rust/cleartext-logging]
+            !ambiguous_rendered.contains(sentinel),
+            "leaked {sentinel}: {ambiguous_rendered}"
         );
     }
     assert_eq!(
