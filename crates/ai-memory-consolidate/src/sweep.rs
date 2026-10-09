@@ -603,7 +603,7 @@ pub async fn run_sweep_with_hygiene(
             };
             let result = match wiki {
                 Some(w) => match w
-                    .delete_page_if_latest(workspace_id, project_id, &path, page.id, None)
+                    .delete_page_if_latest(workspace_id, project_id, &path, page.id, None, None)
                     .await
                 {
                     Ok(true) => Ok(()),

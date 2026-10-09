@@ -216,6 +216,7 @@ async fn page_handler(
         .map_err(internal_error)?;
 
     let page = ApiPage {
+        id: meta.id.to_string(),
         backlinks: links.backlinks,
         body_markdown: markdown.body,
         created_at: meta.created_at,
@@ -1482,6 +1483,9 @@ struct ApiSessionObservations {
 
 #[derive(Debug, Serialize)]
 struct ApiPage {
+    /// Id of the latest version, the token a conditional MCP write or delete
+    /// passes back. It changes with every new version, so the ETag does too.
+    id: String,
     workspace: String,
     project: String,
     path: String,

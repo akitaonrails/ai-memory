@@ -203,6 +203,66 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
+/// What a conditional page write requires of the current latest version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagePrecondition {
+    /// No latest version exists at the path: the write creates the page.
+    Absent,
+    /// The latest version at the path is this one.
+    Latest(PageId),
+}
+
+/// The outcome of [`upsert_page_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalUpsert {
+    /// The precondition held and the page was written; the id is current.
+    Upserted(PageId),
+    /// The precondition did not hold and nothing was written.
+    Mismatch {
+        /// The latest version id at the path, `None` when there is none.
+        current: Option<PageId>,
+    },
+}
+
+/// [`upsert_page`] only when `precondition` holds, checked in the same
+/// transaction as the write so no other writer can land in between.
+pub fn upsert_page_if(
+    conn: &mut Connection,
+    page: &NewPage,
+    precondition: PagePrecondition,
+) -> StoreResult<ConditionalUpsert> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let current = latest_page_id_in_tx(&tx, page)?;
+    let holds = match precondition {
+        PagePrecondition::Absent => current.is_none(),
+        PagePrecondition::Latest(expected) => current == Some(expected),
+    };
+    if !holds {
+        return Ok(ConditionalUpsert::Mismatch { current });
+    }
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(ConditionalUpsert::Upserted(id))
+}
+
+fn latest_page_id_in_tx(tx: &Transaction<'_>, page: &NewPage) -> StoreResult<Option<PageId>> {
+    let raw: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(|bytes| PageId::from_slice(&bytes).map_err(StoreError::from))
+        .transpose()
+}
+
 /// Resolve a workspace by name, creating it if missing. Atomic.
 pub fn get_or_create_workspace(
     conn: &mut Connection,

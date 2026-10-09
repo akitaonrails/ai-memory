@@ -317,8 +317,10 @@ rewrites and the upgrade of a slice 1 export.
 ### Roadmap (#986)
 
 1. Read-only export into a project repository (shipped).
-2. Conditional mutation seam (compare-and-write) in core, if independently
-   justified.
+2. Conditional mutation seam in core (shipped in 2.7: `expected_page_id` /
+   `create_only` on `memory_write_page`, `expected_page_id` on
+   `memory_delete_page`, and the version id on `memory_read_page` and
+   `/api/v1` pages).
 3. Bidirectional apply through public write tools (shipped as `sync`).
 4. Deletes and conflict reporting.
 5. Post-merge hook / CI integration.

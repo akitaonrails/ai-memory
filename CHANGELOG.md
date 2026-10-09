@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `memory_write_page` accepts `expected_page_id` (write only if that is still
+  the page's latest version) or `create_only` (write only if the page does not
+  exist), and `memory_delete_page` accepts `expected_page_id`. A precondition
+  that no longer holds fails with `reason: "precondition_failed"` and the
+  current version, and changes nothing. `memory_read_page` returns the version
+  as `page_id` and `/api/v1` pages as `id`. This is the compare-and-write the
+  team-wiki sync needed (#986).
 - `ai-memory doctor` now reports three silent capture failures: an unreachable
   server (reported instead of aborting the check), a hook spool that is full and
   evicting undelivered events, and installed ai-memory Codex hooks that Codex

@@ -22,8 +22,8 @@ use ai_memory_core::{
     owner_stamp,
 };
 use ai_memory_store::{
-    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun, Store, StoreError,
-    WorkstreamSelection,
+    ConditionalUpsert, LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PagePrecondition,
+    PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
 };
 
 fn operator(name: &str) -> String {
@@ -85,6 +85,103 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
         entities: Vec::new(),
         evidence: Vec::new(),
     }
+}
+
+/// #986 slice 2 under invariant #16: two harnesses edit one page from the
+/// same version with a precondition. Exactly one wins; the loser writes
+/// nothing, and the version both started from stays reachable as superseded.
+/// Without the in-transaction check both would supersede it and the first
+/// winner's text would be buried under the second.
+#[tokio::test]
+async fn conditional_writers_on_one_base_exactly_one_wins_and_nothing_is_destroyed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "shared", None)
+        .await
+        .unwrap();
+    let base = store
+        .writer
+        .upsert_page(page(ws, proj, "notes/plan.md", "Plan", "# Plan\n\nbase"))
+        .await
+        .unwrap();
+
+    let (a, b) = tokio::join!(
+        store.writer.upsert_page_if(
+            page(
+                ws,
+                proj,
+                "notes/plan.md",
+                "Plan",
+                "# Plan\n\nfrom harness A"
+            ),
+            PagePrecondition::Latest(base),
+        ),
+        store.writer.upsert_page_if(
+            page(
+                ws,
+                proj,
+                "notes/plan.md",
+                "Plan",
+                "# Plan\n\nfrom harness B"
+            ),
+            PagePrecondition::Latest(base),
+        ),
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    let winners: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            ConditionalUpsert::Upserted(id) => Some(*id),
+            ConditionalUpsert::Mismatch { .. } => None,
+        })
+        .collect();
+    assert_eq!(winners.len(), 1, "{outcomes:?}");
+    assert!(
+        outcomes.contains(&ConditionalUpsert::Mismatch {
+            current: Some(winners[0])
+        }),
+        "the loser is told the winner's version: {outcomes:?}"
+    );
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let rows: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT body, is_latest FROM pages WHERE path = 'notes/plan.md' ORDER BY created_at",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "base plus one winner, no loser row: {rows:?}"
+    );
+    assert_eq!((rows[0].0.as_str(), rows[0].1), ("# Plan\n\nbase", 0));
+    assert_eq!(rows[1].1, 1);
+
+    // A precondition naming no page, against an existing page, writes nothing.
+    assert_eq!(
+        store
+            .writer
+            .upsert_page_if(
+                page(ws, proj, "notes/plan.md", "Plan", "# Plan\n\nfresh"),
+                PagePrecondition::Absent,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpsert::Mismatch {
+            current: Some(winners[0])
+        }
+    );
 }
 
 /// #1033 under invariant #16: two operators on two clones of one repository,

@@ -345,7 +345,10 @@ should be proposed from a completed session, or at explicit wrap-up \
   time-bounded note, pass `expires_at` as RFC3339 or `YYYY-MM-DD`; the \
   TTL hides the page after expiry and outranks `pinned`. Optional `kind`, \
   `entities`, `abstract`, and `relations` carry bounded metadata; writes \
-  replace the whole page, and omitted metadata is cleared.\n\
+  replace the whole page, and omitted metadata is cleared. To change a \
+  page only if nobody else has, pass the `page_id` `memory_read_page` \
+  returned as `expected_page_id` (or `create_only: true` for a new page); \
+  a stale one fails with `precondition_failed` and writes nothing.\n\
 - `memory_read_page` — when the user asks to read, open, or show the \
   full content of a specific page. Accepts a `query` (searches FTS5 and \
   returns the top hit's full body) or a `path` (direct lookup). Follow \
@@ -366,7 +369,8 @@ should be proposed from a completed session, or at explicit wrap-up \
   remove a specific page (by exact path). Idempotent; fires the \
   admission chain so mirrors/backups stay consistent. Follow the client-aware \
   project-scope rule above; missing explicit sibling scopes fail closed \
-  instead of falling back.\n\
+  instead of falling back. Pass `expected_page_id` to delete only the \
+  version you read.\n\
 - `memory_feedback` — right after a `memory_query` / `memory_read_page` \
   hit proves useful or misleading, and whenever the user says a recalled \
   page is out of date or wrong. Pass the exact `path` from the hit plus \
@@ -1586,6 +1590,13 @@ struct DeletePageArgs {
     /// `workspace`/`project`.
     #[serde(default)]
     scope: Option<String>,
+    /// Delete only if this is still the page's latest version id (the
+    /// `page_id` that `memory_read_page` returned). If the page changed or is
+    /// already gone, nothing is deleted and the call fails with
+    /// `reason: "precondition_failed"` and the current id. Omit for a normal
+    /// delete.
+    #[serde(default)]
+    expected_page_id: Option<String>,
 }
 
 /// Write one durable wiki page. Optional metadata (`kind`, `entities`,
@@ -1654,6 +1665,18 @@ struct WritePageArgs {
     /// with its own model. Not combinable with `scope: "global"`.
     #[serde(default)]
     session_id: Option<String>,
+    /// Write only if this is still the page's latest version id (the
+    /// `page_id` that `memory_read_page` or an earlier write returned). If
+    /// someone changed the page since, nothing is written and the call fails
+    /// with `reason: "precondition_failed"` and the current id. Omit for a
+    /// normal write. Not combinable with `create_only`.
+    #[serde(default)]
+    expected_page_id: Option<String>,
+    /// Write only if no page exists at `path` yet; otherwise fail with
+    /// `reason: "precondition_failed"`. Not combinable with
+    /// `expected_page_id`.
+    #[serde(default)]
+    create_only: bool,
 }
 
 #[tool_router]
@@ -4314,6 +4337,7 @@ impl AiMemoryServer {
             .map(SessionId::from_str)
             .transpose()
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let precondition = page_precondition(args.expected_page_id.as_deref(), args.create_only)?;
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         path.ensure_portable()
@@ -4516,34 +4540,45 @@ impl AiMemoryServer {
             None
         };
 
-        let page_id = wiki
-            .write_page(WritePageRequest {
-                workspace_id: ws,
-                project_id: proj,
-                path: path.clone(),
-                frontmatter,
-                body,
-                tier,
-                pinned: args.pinned,
-                title,
-                admission_ctx,
-                author_id,
-                actor,
-                evidence: session_id
-                    .map(|id| ai_memory_core::PageEvidence {
-                        kind: ai_memory_core::PageEvidenceKind::Session,
-                        source_id: id.to_string(),
-                    })
-                    .into_iter()
-                    .collect(),
-            })
-            .await
-            .map_err(|e| {
-                Self::with_manifest_warning(
-                    McpError::internal_error(e.to_string(), None),
-                    manifest_warning.as_ref(),
-                )
-            })?;
+        let request = WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter,
+            body,
+            tier,
+            pinned: args.pinned,
+            title,
+            admission_ctx,
+            author_id,
+            actor,
+            evidence: session_id
+                .map(|id| ai_memory_core::PageEvidence {
+                    kind: ai_memory_core::PageEvidenceKind::Session,
+                    source_id: id.to_string(),
+                })
+                .into_iter()
+                .collect(),
+        };
+        let written = match precondition {
+            None => wiki
+                .write_page(request)
+                .await
+                .map(ai_memory_wiki::ConditionalWrite::Written),
+            Some(precondition) => wiki.write_page_if(request, precondition).await,
+        }
+        .map_err(|e| {
+            Self::with_manifest_warning(
+                McpError::internal_error(e.to_string(), None),
+                manifest_warning.as_ref(),
+            )
+        })?;
+        let page_id = match written {
+            ai_memory_wiki::ConditionalWrite::Written(page_id) => page_id,
+            ai_memory_wiki::ConditionalWrite::Mismatch { current } => {
+                return Err(precondition_failed(&path, precondition, current));
+            }
+        };
         let checkpoint = checkpoint_or_warn(wiki, format!("memory_write_page: {}", path.as_str()));
         // Only the session page settles the job: evidence on another page
         // must not close it while `sessions/<id>.md` is still missing.
@@ -4705,12 +4740,14 @@ impl AiMemoryServer {
         // only on the success paths below, so an error read reinforces nothing.
         let bump_actor = Self::bump_actor_from_parts(&parts);
         let mut bump_ids: Vec<PageId> = Vec::new();
-        if let Some(seed_id) = self
+        // Also returned as `page_id`: the version token a conditional
+        // `memory_write_page`/`memory_delete_page` passes back.
+        let page_id = self
             .reader
             .latest_page_id_by_ids(ws, proj, page_path.to_string())
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?
-        {
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let Some(seed_id) = page_id {
             bump_ids.push(seed_id);
         }
         if let Some(nodes) = &related {
@@ -4727,6 +4764,7 @@ impl AiMemoryServer {
                 let title = ai_memory_wiki::derive_title(&md.frontmatter, &md.body, &page_path);
                 ok_json(&attach_related(serde_json::json!({
                     "path": page_path.to_string(),
+                    "page_id": page_id.map(|id| id.to_string()),
                     "title": title,
                     "body": md.body,
                     "frontmatter": md.frontmatter,
@@ -4750,6 +4788,7 @@ impl AiMemoryServer {
                             .or(Some(stored.title));
                         ok_json(&attach_related(serde_json::json!({
                             "path": page_path.to_string(),
+                            "page_id": page_id.map(|id| id.to_string()),
                             "title": title,
                             "body": stored.body,
                             "frontmatter": frontmatter,
@@ -4996,6 +5035,10 @@ impl AiMemoryServer {
                 None,
             ));
         };
+        let expected = match page_precondition(args.expected_page_id.as_deref(), false)? {
+            Some(ai_memory_store::PagePrecondition::Latest(id)) => Some(id),
+            _ => None,
+        };
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let (path, (ws, proj)) = match args.scope.as_deref().map(str::trim) {
@@ -5052,13 +5095,43 @@ impl AiMemoryServer {
             None
         };
 
+        // A conditional delete that cannot succeed leaves no checkpoint behind.
+        if let Some(expected) = expected {
+            let current = self.latest_page_id(ws, proj, &path).await?;
+            if current != Some(expected) {
+                return Err(precondition_failed(
+                    &path,
+                    Some(ai_memory_store::PagePrecondition::Latest(expected)),
+                    current,
+                ));
+            }
+        }
         let pre_checkpoint =
             checkpoint_or_mcp(wiki, format!("pre-memory_delete_page: {}", path.as_str()))?;
 
         let author_id = crate::actor::author_id_from_parts(&parts);
-        wiki.delete_page(ws, proj, &path, admission_ctx, author_id)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        match expected {
+            None => wiki
+                .delete_page(ws, proj, &path, admission_ctx, author_id)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            Some(expected) => {
+                // The authority: re-checked under the exclusive mutation lock
+                // and in the delete transaction.
+                let deleted = wiki
+                    .delete_page_if_latest(ws, proj, &path, expected, admission_ctx, author_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                if !deleted {
+                    let current = self.latest_page_id(ws, proj, &path).await?;
+                    return Err(precondition_failed(
+                        &path,
+                        Some(ai_memory_store::PagePrecondition::Latest(expected)),
+                        current,
+                    ));
+                }
+            }
+        }
         let checkpoint = checkpoint_or_warn(wiki, format!("memory_delete_page: {}", path.as_str()));
 
         ok_json(&serde_json::json!({
@@ -6696,6 +6769,19 @@ fn select_bumpable(
 }
 
 impl AiMemoryServer {
+    /// The latest version id of a page in an already-authorized scope.
+    async fn latest_page_id(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        path: &PagePath,
+    ) -> Result<Option<ai_memory_core::PageId>, McpError> {
+        self.reader
+            .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
     /// The caller's typed identity for keying the bump throttle and the
     /// `page_access` rows it feeds. One derivation for both:
     /// a throttle keyed one way and a table keyed another would throttle one
@@ -6811,6 +6897,56 @@ fn profile_page_path(path: PagePath) -> Result<PagePath, McpError> {
         path.as_str()
     ))
     .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))
+}
+
+/// The precondition a conditional page write or delete asked for, `None` for
+/// a normal one.
+fn page_precondition(
+    expected_page_id: Option<&str>,
+    create_only: bool,
+) -> Result<Option<ai_memory_store::PagePrecondition>, McpError> {
+    let expected = expected_page_id.map(str::trim).filter(|id| !id.is_empty());
+    match (expected, create_only) {
+        (Some(_), true) => Err(McpError::invalid_params(
+            "expected_page_id and create_only cannot be combined",
+            None,
+        )),
+        (Some(id), false) => ai_memory_core::PageId::from_str(id)
+            .map(|id| Some(ai_memory_store::PagePrecondition::Latest(id)))
+            .map_err(|_| {
+                McpError::invalid_params(format!("expected_page_id {id:?} is not a page id"), None)
+            }),
+        (None, true) => Ok(Some(ai_memory_store::PagePrecondition::Absent)),
+        (None, false) => Ok(None),
+    }
+}
+
+/// The error for a conditional write or delete whose precondition no longer
+/// holds. Nothing was changed; `data` carries the ids so a client can re-read
+/// and decide.
+fn precondition_failed(
+    path: &PagePath,
+    precondition: Option<ai_memory_store::PagePrecondition>,
+    current: Option<ai_memory_core::PageId>,
+) -> McpError {
+    let expected = match precondition {
+        Some(ai_memory_store::PagePrecondition::Latest(id)) => Some(id.to_string()),
+        _ => None,
+    };
+    let current = current.map(|id| id.to_string());
+    McpError::invalid_request(
+        format!(
+            "precondition failed for {path}: expected {}, latest is {}; nothing was changed",
+            expected.as_deref().unwrap_or("no page"),
+            current.as_deref().unwrap_or("no page"),
+        ),
+        Some(serde_json::json!({
+            "reason": "precondition_failed",
+            "path": path.as_str(),
+            "expected_page_id": expected,
+            "current_page_id": current,
+        })),
+    )
 }
 
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
@@ -9850,6 +9986,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts),
             )
@@ -10532,6 +10670,8 @@ mod tests {
             scope: scope.map(str::to_string),
             expires_at: None,
             session_id: None,
+            create_only: false,
+            expected_page_id: None,
         };
 
         server
@@ -13937,6 +14077,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts),
             )
@@ -14029,6 +14171,8 @@ mod tests {
             expires_at: None,
             session_id: Some(session_id.to_string()),
             metadata: Default::default(),
+            create_only: false,
+            expected_page_id: None,
         }
     }
 
@@ -14324,6 +14468,8 @@ mod tests {
                         scope: None,
                         expires_at: None,
                         session_id: None,
+                        create_only: false,
+                        expected_page_id: None,
                     }),
                     OptionalParts(test_parts_default()),
                 )
@@ -14369,6 +14515,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -14437,6 +14585,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts),
             )
@@ -14546,6 +14696,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -14597,6 +14749,7 @@ mod tests {
                     path: "notes/keep.md".into(),
                     project: None,
                     workspace: None,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts_as_reader()),
             )
@@ -14607,6 +14760,97 @@ mod tests {
             message.contains("you have read access and this needs write"),
             "the refusal must name both levels: {message}"
         );
+
+        // A precondition is no way around the grant, and the refusal never
+        // reveals the page's current version: right id or wrong, the reader
+        // gets the authorization error, not a precondition mismatch.
+        let seeded = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    include_related: false,
+                    related_depth: None,
+                    path: Some("notes/keep.md".into()),
+                    query: None,
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let seeded: serde_json::Value =
+            serde_json::from_str(&seeded.content[0].as_text().unwrap().text).unwrap();
+        let right = seeded["page_id"].as_str().unwrap().to_owned();
+        let wrong = ai_memory_core::PageId::new().to_string();
+        for expected in [right.clone(), wrong] {
+            let err = server
+                .memory_write_page(
+                    Parameters(WritePageArgs {
+                        metadata: Default::default(),
+                        path: "notes/keep.md".into(),
+                        body: "# Keep\n\nOverwritten by a reader.".into(),
+                        title: None,
+                        tier: None,
+                        tags: vec![],
+                        pinned: false,
+                        project: None,
+                        workspace: None,
+                        scope: None,
+                        expires_at: None,
+                        session_id: None,
+                        create_only: false,
+                        expected_page_id: Some(expected.clone()),
+                    }),
+                    OptionalParts(parts_as_reader()),
+                )
+                .await
+                .expect_err("a reader must not write, with or without a precondition");
+            assert!(
+                err.data.is_none(),
+                "no version data for a refused caller: {err:?}"
+            );
+            let err = server
+                .memory_delete_page(
+                    Parameters(DeletePageArgs {
+                        scope: None,
+                        path: "notes/keep.md".into(),
+                        project: None,
+                        workspace: None,
+                        expected_page_id: Some(expected),
+                    }),
+                    OptionalParts(parts_as_reader()),
+                )
+                .await
+                .expect_err("a reader must not delete, with or without a precondition");
+            assert!(
+                err.message
+                    .contains("you have read access and this needs write"),
+                "{err:?}"
+            );
+            assert!(err.data.is_none(), "{err:?}");
+        }
+        let after: serde_json::Value = serde_json::from_str(
+            &server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        include_related: false,
+                        related_depth: None,
+                        path: Some("notes/keep.md".into()),
+                        query: None,
+                        project: None,
+                        workspace: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap()
+                .content[0]
+                .as_text()
+                .unwrap()
+                .text,
+        )
+        .unwrap();
+        assert_eq!(after["page_id"], right.as_str());
 
         let err = server
             .memory_feedback(
@@ -14706,6 +14950,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -14718,6 +14964,7 @@ mod tests {
                     path: "notes/mine.md".into(),
                     project: None,
                     workspace: None,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -14806,6 +15053,8 @@ mod tests {
             expires_at: None,
             session_id: None,
             metadata: Default::default(),
+            create_only: false,
+            expected_page_id: None,
         }
     }
 
@@ -14872,6 +15121,7 @@ mod tests {
                     path: "preferences.md".into(),
                     project: Some("_global".into()),
                     workspace: Some("default".into()),
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts_as_user(maria)),
             )
@@ -14982,6 +15232,8 @@ mod tests {
             expires_at: None,
             session_id: None,
             metadata: Default::default(),
+            create_only: false,
+            expected_page_id: None,
         }
     }
 
@@ -15158,6 +15410,7 @@ mod tests {
                     path: "profile/tools/pnpm.md".into(),
                     project: Some(joaos.clone()),
                     workspace: Some("default".into()),
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts_as_user(maria)),
             )
@@ -15187,6 +15440,7 @@ mod tests {
                     path: "tools/pnpm.md".into(),
                     project: None,
                     workspace: None,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts_as_user(joao)),
             )
@@ -15420,6 +15674,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(alice_parts),
             )
@@ -15823,6 +16079,8 @@ mod tests {
                             scope: None,
                             expires_at: None,
                             session_id: None,
+                            create_only: false,
+                            expected_page_id: None,
                         }),
                         OptionalParts(parts),
                     )
@@ -15919,6 +16177,8 @@ mod tests {
                             scope: None,
                             expires_at: None,
                             session_id: None,
+                            create_only: false,
+                            expected_page_id: None,
                         }),
                         OptionalParts(parts),
                     )
@@ -16023,6 +16283,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -16091,6 +16353,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -16104,6 +16368,7 @@ mod tests {
                     path: "notes/temp.md".into(),
                     project: None,
                     workspace: None,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -16185,6 +16450,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -16198,6 +16465,7 @@ mod tests {
                     path: "notes/keep.md".into(),
                     project: Some("typo".into()),
                     workspace: None,
+                    expected_page_id: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -16283,6 +16551,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -16303,6 +16573,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -16317,6 +16589,7 @@ mod tests {
                     path: "notes/twin.md".into(),
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -16409,6 +16682,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -18566,6 +18841,8 @@ mod tests {
                     scope: None,
                     expires_at: None,
                     session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -19084,5 +19361,216 @@ mod tests {
         let locked = buffer.lock().unwrap();
         assert!(locked.pending.is_empty());
         assert!(!locked.flush_scheduled);
+    }
+
+    /// #986 slice 2: `memory_write_page`/`memory_delete_page` act only on the
+    /// version the caller saw when it passes `expected_page_id`.
+    mod conditional_page_writes {
+        use super::*;
+
+        async fn server(with_reader: bool) -> (TempDir, AiMemoryServer) {
+            let tmp = TempDir::new().unwrap();
+            let store = Store::open(tmp.path()).unwrap();
+            let ws = store
+                .writer
+                .get_or_create_workspace("default")
+                .await
+                .unwrap();
+            let proj = store
+                .writer
+                .get_or_create_project(ws, "scratch", None)
+                .await
+                .unwrap();
+            store
+                .writer
+                .get_or_create_project(ws, "other", None)
+                .await
+                .unwrap();
+            let mut wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+            if with_reader {
+                wiki = wiki.with_store_reader(store.reader.clone());
+            }
+            let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+                .with_wiki(wiki);
+            (tmp, server)
+        }
+
+        fn write(path: &str, body: &str, project: &str) -> WritePageArgs {
+            WritePageArgs {
+                metadata: Default::default(),
+                path: path.into(),
+                body: body.into(),
+                title: None,
+                tier: None,
+                tags: vec![],
+                pinned: false,
+                project: Some(project.into()),
+                workspace: Some("default".into()),
+                scope: None,
+                expires_at: None,
+                session_id: None,
+                expected_page_id: None,
+                create_only: false,
+            }
+        }
+
+        fn delete(path: &str, expected: Option<&str>) -> DeletePageArgs {
+            DeletePageArgs {
+                path: path.into(),
+                project: Some("scratch".into()),
+                workspace: Some("default".into()),
+                scope: None,
+                expected_page_id: expected.map(str::to_owned),
+            }
+        }
+
+        fn json(result: &CallToolResult) -> serde_json::Value {
+            let text = result.content[0].as_text().expect("tool text").text.clone();
+            serde_json::from_str(&text).unwrap()
+        }
+
+        async fn put(server: &AiMemoryServer, args: WritePageArgs) -> Result<String, McpError> {
+            server
+                .memory_write_page(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .map(|r| json(&r)["page_id"].as_str().unwrap().to_owned())
+        }
+
+        async fn read(server: &AiMemoryServer, path: &str) -> serde_json::Value {
+            let result = server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some(path.into()),
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                        include_related: false,
+                        related_depth: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap();
+            json(&result)
+        }
+
+        fn assert_precondition_failed(err: &McpError, current: Option<&str>) {
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+            let data = err.data.as_ref().expect("precondition data");
+            assert_eq!(data["reason"], "precondition_failed", "{data}");
+            assert_eq!(data["current_page_id"].as_str(), current, "{data}");
+        }
+
+        #[tokio::test]
+        async fn a_write_lands_only_on_the_version_it_saw() {
+            for with_reader in [true, false] {
+                let (_tmp, server) = server(with_reader).await;
+                let first = put(&server, write("notes/a.md", "# A\n\none", "scratch"))
+                    .await
+                    .unwrap();
+                assert_eq!(read(&server, "notes/a.md").await["page_id"], first.as_str());
+
+                let mut next = write("notes/a.md", "# A\n\ntwo", "scratch");
+                next.expected_page_id = Some(first.clone());
+                let second = put(&server, next).await.unwrap();
+                assert_ne!(second, first);
+
+                // A writer still holding the first version is refused and the
+                // page keeps the second.
+                let mut stale = write("notes/a.md", "# A\n\nstale", "scratch");
+                stale.expected_page_id = Some(first.clone());
+                let err = put(&server, stale).await.unwrap_err();
+                assert_precondition_failed(&err, Some(&second));
+                let page = read(&server, "notes/a.md").await;
+                assert_eq!(page["page_id"], second.as_str(), "reader={with_reader}");
+                assert!(page["body"].as_str().unwrap().contains("two"), "{page}");
+
+                // create_only refuses an existing page and creates a new one.
+                let mut again = write("notes/a.md", "# A\n\nagain", "scratch");
+                again.create_only = true;
+                assert_precondition_failed(&put(&server, again).await.unwrap_err(), Some(&second));
+                let mut fresh = write("notes/b.md", "# B", "scratch");
+                fresh.create_only = true;
+                put(&server, fresh).await.unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn malformed_or_combined_preconditions_are_invalid_params() {
+            let (_tmp, server) = server(true).await;
+            let mut both = write("notes/a.md", "# A", "scratch");
+            both.expected_page_id = Some(ai_memory_core::PageId::new().to_string());
+            both.create_only = true;
+            let mut malformed = write("notes/a.md", "# A", "scratch");
+            malformed.expected_page_id = Some("not-a-page".into());
+            for args in [both, malformed] {
+                let err = put(&server, args).await.unwrap_err();
+                assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+            }
+        }
+
+        /// A version id from another project never matches: the precondition
+        /// is checked against the resolved scope's own latest row.
+        #[tokio::test]
+        async fn an_id_from_another_project_is_a_mismatch() {
+            let (_tmp, server) = server(true).await;
+            let theirs = put(&server, write("notes/a.md", "# Theirs", "other"))
+                .await
+                .unwrap();
+            let ours = put(&server, write("notes/a.md", "# Ours", "scratch"))
+                .await
+                .unwrap();
+            let mut cross = write("notes/a.md", "# Hijack", "scratch");
+            cross.expected_page_id = Some(theirs);
+            assert_precondition_failed(&put(&server, cross).await.unwrap_err(), Some(&ours));
+            assert!(
+                read(&server, "notes/a.md").await["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Ours")
+            );
+        }
+
+        #[tokio::test]
+        async fn a_delete_removes_only_the_version_it_saw() {
+            for with_reader in [true] {
+                let (_tmp, server) = server(with_reader).await;
+                let first = put(&server, write("notes/a.md", "# A\n\none", "scratch"))
+                    .await
+                    .unwrap();
+                let mut next = write("notes/a.md", "# A\n\ntwo", "scratch");
+                next.expected_page_id = Some(first.clone());
+                let second = put(&server, next).await.unwrap();
+
+                let err = server
+                    .memory_delete_page(
+                        Parameters(delete("notes/a.md", Some(&first))),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_precondition_failed(&err, Some(&second));
+                assert_eq!(
+                    read(&server, "notes/a.md").await["page_id"],
+                    second.as_str()
+                );
+
+                server
+                    .memory_delete_page(
+                        Parameters(delete("notes/a.md", Some(&second))),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap();
+                let err = server
+                    .memory_delete_page(
+                        Parameters(delete("notes/a.md", Some(&second))),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_precondition_failed(&err, None);
+            }
+        }
     }
 }

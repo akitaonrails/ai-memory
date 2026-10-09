@@ -181,6 +181,7 @@ links + back-links.
 
 ```json
 {
+  "id": "01a11da7-0604-7cc1-b518-1f0e0f2d4705",
   "project": "ai-memory",
   "path": "decisions/0007-db.md",
   "title": "Standardised on Postgres",
@@ -196,6 +197,10 @@ links + back-links.
   "backlinks": [ { "path": "sessions/2026-05-27.md", "title": "Session 2026-05-27", "kind": "session" } ]
 }
 ```
+
+`id` is the latest version's id. It changes with every new version, so it is
+the token to pass back as `expected_page_id` to a conditional
+`memory_write_page` or `memory_delete_page`.
 
 `404` for missing workspace/project, missing page row, or missing file
 on disk (the body is read from the markdown file at request time).
