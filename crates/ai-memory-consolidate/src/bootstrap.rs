@@ -1616,7 +1616,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("AGENTS.md"), "# rules\nuse pnpm\n").unwrap();
         std::os::unix::fs::symlink("AGENTS.md", tmp.path().join("CLAUDE.md")).unwrap();
-        std::fs::hard_link(tmp.path().join("AGENTS.md"), tmp.path().join("claude.md")).unwrap();
+        // Not `claude.md`: on a case-insensitive filesystem that name is
+        // already taken by `CLAUDE.md`.
+        std::fs::hard_link(tmp.path().join("AGENTS.md"), tmp.path().join("AGENT.md")).unwrap();
         assert_eq!(rules_labels(tmp.path()), vec!["rules: CLAUDE.md"]);
     }
 

@@ -6254,7 +6254,7 @@ mod tests {
         let project = temp
             .path()
             .join(".claude/projects")
-            .join(cwd.to_string_lossy().replace('/', "-"));
+            .join(claude_project_dir_name(&cwd));
         fs::create_dir_all(&project).unwrap();
         let write = |id: &str, records: &[Value]| {
             let body = records
