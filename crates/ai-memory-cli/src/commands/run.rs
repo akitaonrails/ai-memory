@@ -6951,12 +6951,14 @@ mod tests {
             pending: 3,
             oldest_age_ms: Some(45_000),
             retries_total: 1,
+            ..SpoolHealth::default()
         });
         assert_eq!(note, "3 hook events remain spooled locally (oldest 45s)");
         let one = spooled_events_note(&SpoolHealth {
             pending: 1,
             oldest_age_ms: Some(0),
             retries_total: 0,
+            ..SpoolHealth::default()
         });
         assert_eq!(one, "1 hook event remains spooled locally (oldest 0s)");
     }

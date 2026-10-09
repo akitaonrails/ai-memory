@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ai-memory doctor` now reports three silent capture failures: an unreachable
+  server (reported instead of aborting the check), a hook spool that is full and
+  evicting undelivered events, and installed ai-memory Codex hooks that Codex
+  skips because they are untrusted or changed since they were trusted (asked
+  of Codex itself through `codex app-server`). `ai-memory status` no longer says
+  queued events will be delivered once the spool has started evicting them.
 - Added two-way sync to the `ai-memory-wikisync` companion (#986, slice 3):
   `sync` imports repository edits and new pages through the public
   `memory_write_page` MCP tool and exports server edits, comparing each

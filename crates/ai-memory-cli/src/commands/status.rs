@@ -179,7 +179,13 @@ fn report_offline_spool(spool: &SpoolHealth, json: bool) {
     eprintln!("  pending:    {}", spool.pending);
     eprintln!("  oldest:     {}", spool_age_line(spool.oldest_age_ms));
     eprintln!("  retries:    {}", spool.retries_total);
-    if spool.pending > 0 {
+    if spool.evicting() {
+        eprintln!(
+            "  The spool is full ({} events): each new event evicts the oldest \
+             undelivered one, which is lost. Bring the server back to stop the loss.",
+            spool.capacity
+        );
+    } else if spool.pending > 0 {
         eprintln!(
             "  {} event(s) are queued locally and will be delivered once the \
              server is reachable again.",
@@ -690,17 +696,21 @@ mod tests {
             pending: 2,
             oldest_age_ms: Some(900_000),
             retries_total: 4,
+            ..SpoolHealth::default()
         };
         let rendered = serde_json::to_string(&spool).expect("SpoolHealth serialises");
         assert_eq!(
             rendered,
-            r#"{"pending":2,"oldest_age_ms":900000,"retries_total":4}"#
+            r#"{"pending":2,"oldest_age_ms":900000,"retries_total":4,"capacity":3}"#
         );
         // The shape is the contract: counts and ages only. If a field
         // carrying captured text is ever added, this fails loudly.
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys, vec!["pending", "oldest_age_ms", "retries_total"]);
+        assert_eq!(
+            keys,
+            vec!["pending", "oldest_age_ms", "retries_total", "capacity"]
+        );
 
         // Both render paths must tolerate an empty spool.
         report_offline_spool(&SpoolHealth::default(), false);

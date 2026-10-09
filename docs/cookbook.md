@@ -458,6 +458,13 @@ ai-memory serve                      # run the server
   and is not reported. An `excluded` verdict applies only to native/generated
   hooks; shell and PowerShell compatibility hooks do not enforce capture-policy
   exclusions.
+- **Nothing new is being remembered at all**: run `ai-memory doctor`. It works
+  with the server down and says so; it reports the local hook spool (events
+  waiting for the server, and a warning once it is full and each new event
+  evicts the oldest undelivered one); and when ai-memory's Codex hooks are
+  installed, it asks Codex whether it will run them. Codex skips a hook you
+  have not trusted, and skips it again after its command changes, without
+  telling you: open Codex, run `/hooks`, and trust them.
 - **I just installed hooks in a project I've worked in for a while**: the first
   time you open the project after installing, ai-memory imports your existing
   local session history once (bounded, sanitized on the server, only into an
