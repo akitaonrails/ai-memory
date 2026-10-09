@@ -126,4 +126,5 @@ The research's best new target — not the RFC's `.mcpb`:
     not in Chat, and local MCP servers only in Cowork-on-your-computer and
     Claude Code; Codex, Cursor and Antigravity plugins can bundle hooks and
     MCP. Distribution could move from writing config files to marketplace
-    plugins; the server itself still needs a separate install.
+    plugins; the server itself still needs a separate install. Design
+    proposal: RFC #1166.
