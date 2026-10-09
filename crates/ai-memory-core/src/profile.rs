@@ -391,6 +391,18 @@ const EXTENSION_TAGS: &[(&str, &str)] = &[
     (".dart", "dart"),
 ];
 
+/// Every stack tag [`stack_tags_in`] can detect in a project. An entry's
+/// `applies_to` tag outside this set matches no project that has activity, so
+/// the entry would only ever show in projects with none.
+#[must_use]
+pub fn detectable_stack_tags() -> BTreeSet<&'static str> {
+    MANIFEST_TAGS
+        .iter()
+        .flat_map(|(_, tags)| tags.iter().copied())
+        .chain(EXTENSION_TAGS.iter().map(|(_, tag)| *tag))
+        .collect()
+}
+
 /// Stack tags named by the file paths mentioned in `text` (observation
 /// titles, tool summaries). Tokens are split on whitespace and punctuation
 /// that never appears inside a path, and only a token's file name is

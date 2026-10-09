@@ -339,7 +339,8 @@ should be proposed from a completed session, or at explicit wrap-up \
   fact is a standing user/team preference that should apply to EVERY \
   project ('always use pnpm', 'never force-push', code style rules), \
   pass `scope: \"profile\"` so it joins the cross-project profile \
-  (stored under `profile/`, delivered to every project as a default); \
+  (stored under `profile/`, delivered to every project as a default), \
+  optionally with `applies_to` stack tags and `enforced_by`; \
   `scope: \"global\"` writes the shared `_global` scope directly. When \
   the user explicitly wants a \
   time-bounded note, pass `expires_at` as RFC3339 or `YYYY-MM-DD`; the \
@@ -4289,8 +4290,11 @@ impl AiMemoryServer {
         `scope: \"profile\"` — the page joins the cross-project profile \
         under `profile/` (its path gains that prefix), reaches every \
         project's session start as a default, and default memory_query \
-        calls surface it. `scope: \"global\"` writes the reserved \
-        `_global` scope directly. \
+        calls surface it. A profile entry also takes `applies_to` (stack \
+        tags such as `rust`, limiting it to projects on that stack) and \
+        `enforced_by` (what already enforces it, which keeps it out of the \
+        digest); other pages refuse both. `scope: \"global\"` writes the \
+        reserved `_global` scope directly. \
         \
         Optional `kind`, `entities`, `abstract`, and `relations` carry bounded \
         metadata. This replaces the whole page; omitted metadata is cleared. \
@@ -4343,11 +4347,25 @@ impl AiMemoryServer {
         path.ensure_portable()
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
-        let path = if args.scope.as_deref().map(str::trim) == Some("profile") {
+        let scope = args.scope.as_deref().map(str::trim);
+        let profile_scope = scope == Some("profile");
+        let path = if profile_scope {
             profile_page_path(path)?
         } else {
             path
         };
+        // `scope: "global"` writes `default/_global`, the single-user profile.
+        ai_memory_core::page::ensure_profile_metadata_placement(
+            &metadata,
+            &path,
+            matches!(scope, Some("profile" | "global"))
+                || args
+                    .project
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(ai_memory_core::profile::is_reserved_scope_project),
+        )
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let session_page =
             session_id.is_some_and(|id| path.as_str() == format!("sessions/{id}.md"));
         // Consolidation writes the session page as episodic; keep that
@@ -15596,6 +15614,164 @@ mod tests {
         )
         .await
         .expect_err("scope: profile is refused while the profile is off");
+    }
+
+    /// `applies_to` and `enforced_by` reach a profile entry's frontmatter
+    /// through the tool, in the shape the digest reads; a rewrite keeps them
+    /// only when it passes them again (writes replace all metadata); an
+    /// unknown tag, or either key on a page outside `profile/` or on a
+    /// `profile/` path in an ordinary project, is refused before anything is
+    /// written.
+    #[tokio::test]
+    async fn memory_write_page_sets_profile_applies_to_and_enforced_by() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let app = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, app)
+            .with_wiki(wiki.clone());
+        let with_fields = |applies_to: &[&str], enforced_by: Option<&str>| {
+            let mut args = profile_entry("style/types.md", Some("profile"));
+            args.metadata.applies_to = applies_to.iter().map(|t| (*t).to_owned()).collect();
+            args.metadata.enforced_by = enforced_by.map(str::to_owned);
+            args
+        };
+
+        server
+            .memory_write_page(
+                Parameters(with_fields(&["TypeScript"], Some("pre-push hook"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a profile entry takes both fields");
+        let global = store
+            .writer
+            .get_or_create_project(ws, ai_memory_core::GLOBAL_SCOPE_PROJECT, None)
+            .await
+            .unwrap();
+        let path = PagePath::new("profile/style/types.md").unwrap();
+        let read = |wiki: &Wiki| {
+            let md = wiki.read_page(ws, global, &path).unwrap();
+            ai_memory_core::profile::ProfileEntry::from_page(
+                path.as_str(),
+                "",
+                &md.body,
+                &md.frontmatter,
+            )
+            .unwrap()
+        };
+        let entry = read(&wiki);
+        assert_eq!(entry.applies_to, ["typescript"]);
+        assert!(entry.enforced_by);
+
+        server
+            .memory_write_page(
+                Parameters(with_fields(&["typescript"], Some("pre-push hook"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let entry = read(&wiki);
+        assert_eq!(entry.applies_to, ["typescript"], "passed again, kept");
+        assert!(entry.enforced_by);
+
+        let err = server
+            .memory_write_page(
+                Parameters(with_fields(&["typscript"], None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a tag no project is detected with is refused");
+        assert!(err.message.contains("typscript"), "{}", err.message);
+        assert_eq!(
+            read(&wiki).applies_to,
+            ["typescript"],
+            "refused write left it"
+        );
+
+        let mut stray = with_fields(&["rust"], None);
+        stray.scope = None;
+        stray.path = "notes/types.md".into();
+        stray.workspace = Some("fresh".into());
+        stray.project = Some("fresh".into());
+        let err = server
+            .memory_write_page(Parameters(stray), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("applies_to is refused outside profile/");
+        assert!(err.message.contains("profile"), "{}", err.message);
+        assert!(
+            store
+                .reader
+                .find_workspace("fresh".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "refused before the scope is created"
+        );
+
+        // A `profile/` path in an ordinary project is not a profile entry:
+        // the digest never reads it.
+        let mut stray = with_fields(&["rust"], None);
+        stray.scope = None;
+        stray.path = "profile/style/types.md".into();
+        stray.workspace = Some("fresh".into());
+        stray.project = Some("fresh".into());
+        server
+            .memory_write_page(Parameters(stray), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("applies_to is refused on a profile/ path outside the profile");
+        assert!(
+            store
+                .reader
+                .find_workspace("fresh".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "refused before the scope is created"
+        );
+
+        // `scope: "global"` writes `default/_global`, the single-user
+        // profile, so a `profile/` path there is a profile entry.
+        let mut global_entry = with_fields(&["rust"], None);
+        global_entry.scope = Some("global".into());
+        global_entry.path = "profile/style/x.md".into();
+        server
+            .memory_write_page(
+                Parameters(global_entry),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("scope global takes applies_to on a profile/ path");
+        let global_path = PagePath::new("profile/style/x.md").unwrap();
+        let md = wiki.read_page(ws, global, &global_path).unwrap();
+        assert_eq!(md.frontmatter["applies_to"], serde_json::json!(["rust"]));
+        let mut global_note = with_fields(&["rust"], None);
+        global_note.scope = Some("global".into());
+        global_note.path = "notes/x.md".into();
+        server
+            .memory_write_page(Parameters(global_note), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("scope global still refuses applies_to outside profile/");
+
+        server
+            .memory_write_page(
+                Parameters(with_fields(&[], None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let entry = read(&wiki);
+        assert!(entry.applies_to.is_empty(), "omitted on rewrite, cleared");
+        assert!(!entry.enforced_by);
     }
 
     /// The finding that started #708, as a test.

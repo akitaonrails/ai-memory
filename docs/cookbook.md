@@ -78,7 +78,9 @@ say nothing. A brand-new repository gets the whole baseline, plus a pointer to
   forget tools/pnpm.md` (it stays dropped until you say it again).
 - Keep a client project out of it: `[profile] contribute = false` in that
   repository's `.ai-memory.toml`; keep the digest out of one: `consume = false`.
-- Scope an entry to a stack with frontmatter `applies_to: [rust]`.
+- Scope an entry to a stack with `applies_to: ["rust"]` on `memory_write_page`
+  (`--applies-to rust` on `write-page`), or mark it `enforced_by` to keep it
+  out of the digest.
 - On by default for a single user (one profile across every workspace). On a
   shared server it is off until the operator sets `[profile] enabled = true`,
   and then each person gets a private profile.
