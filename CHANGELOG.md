@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added two-way sync to the `ai-memory-wikisync` companion (#986, slice 3):
+  `sync` imports repository edits and new pages through the public
+  `memory_write_page` MCP tool and exports server edits, comparing each
+  page with the last sync. A page changed on both sides is a conflict until
+  `--prefer repo` or `--prefer server`; deletes are reported, not synced.
+  It is a dry-run without `--apply`, refuses files without frontmatter,
+  refuses to overwrite server pages whose metadata a write would clear, and
+  re-reads each page right before writing it. (#1164)
 - `finalize-session --agent antigravity-cli` now replays the session's typed
   prompts from `agy`'s `history.jsonl` before its synthetic session-end, so
   live Antigravity sessions — whose hooks carry no prompt event — get a summary
@@ -61,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   summaries without an API key. The default model is `cursor-grok-4.6-high`
   ("Grok 4.6"). `AI_MEMORY_CURSOR_AGENT` overrides the binary. The provider never passes
   `--yolo` or `--force`, because the prompt is captured session text. (#1127)
+
+### Changed
+- Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
+  plus `tags`, `pinned` and a non-default `tier` when set) above the body,
+  so metadata survives a round trip. The first run after upgrading rewrites
+  unedited files of an earlier export in place. (#1164)
 
 ### Fixed
 - Fixed structured LLM responses stopped at the output budget
