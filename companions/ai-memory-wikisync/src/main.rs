@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use ai_memory_wikisync::bidi::{self, Prefer, SyncArgs};
+use ai_memory_wikisync::bidi::{self, DEFAULT_MAX_DELETES, Prefer, SyncArgs, SyncMode};
 use ai_memory_wikisync::client::DEFAULT_SERVER_URL;
 use ai_memory_wikisync::sync::{Mode, RunArgs, run};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -39,6 +39,16 @@ struct SyncCliArgs {
     /// Without it, such a page is a conflict and nothing is written.
     #[arg(long, value_enum)]
     prefer: Option<PreferArg>,
+    /// Propagate deletes: a file deleted in the repository deletes its
+    /// server page, a page deleted on the server deletes its file, as long
+    /// as the other side is unchanged since the last sync. Without it,
+    /// deletes are only reported.
+    #[arg(long)]
+    propagate_deletes: bool,
+    /// Refuse the whole run when it would delete more than this many pages
+    /// and files.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_MAX_DELETES)]
+    max_deletes: usize,
     #[command(flatten)]
     common: CommonArgs,
 }
@@ -120,6 +130,8 @@ impl From<SyncCliArgs> for SyncArgs {
                 PreferArg::Repo => Prefer::Repo,
                 PreferArg::Server => Prefer::Server,
             }),
+            propagate_deletes: args.propagate_deletes,
+            max_deletes: args.max_deletes,
         }
     }
 }
@@ -138,8 +150,12 @@ async fn main() -> anyhow::Result<()> {
             run(&RunArgs::from(args), mode).await
         }
         Commands::Sync(args) => {
-            let apply = args.apply;
-            bidi::run(&SyncArgs::from(args), apply).await
+            let mode = if args.apply {
+                SyncMode::Apply
+            } else {
+                SyncMode::DryRun
+            };
+            bidi::run(&SyncArgs::from(args), mode).await.map(|_| ())
         }
     }
 }

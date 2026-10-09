@@ -50,6 +50,10 @@ pub struct PageState {
     /// Server ETag captured at that write, for `If-None-Match` revalidation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+    /// Server version id (`/api/v1` `id`) at that write. Absent in state
+    /// written before conditional writes existed, which still loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
 }
 
 /// The whole state file. `version` guards against silently misreading a
@@ -193,6 +197,7 @@ mod tests {
         PageState {
             hash: hash.to_string(),
             etag: etag.map(str::to_owned),
+            page_id: None,
         }
     }
 
@@ -218,6 +223,25 @@ mod tests {
             names,
             vec![".gitignore".to_string(), "state.json".to_string()]
         );
+    }
+
+    #[test]
+    fn state_without_page_ids_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(STATE_DIR)).unwrap();
+        fs::write(
+            state_path(&root),
+            r#"{"version":1,"pages":{"notes/a.md":{"hash":"h","etag":"\"e\""}}}"#,
+        )
+        .unwrap();
+        let state = load(&root).unwrap();
+        assert_eq!(state.pages["notes/a.md"].page_id, None);
+
+        let mut with_id = state.clone();
+        with_id.pages.get_mut("notes/a.md").unwrap().page_id = Some("v1".to_string());
+        save(&root, &with_id).unwrap();
+        assert_eq!(load(&root).unwrap(), with_id);
     }
 
     #[test]

@@ -2,13 +2,18 @@
 
 **Team-wiki sync** companion for
 [ai-memory](https://github.com/akitaonrails/ai-memory) (issue #986, slices
-1 and 3). It keeps explicitly allowlisted page families of a running
+1, 3 and 4). It keeps explicitly allowlisted page families of a running
 ai-memory server in step with a directory inside a project repository, so a
 team's shared memory can live as reviewable markdown in git:
 
 - `export` copies server pages into the repository (one way).
 - `sync` also sends repository edits back to the server, through the public
-  `memory_write_page` MCP tool.
+  `memory_write_page` MCP tool, and with `--propagate-deletes` carries
+  deletes both ways through `memory_delete_page`.
+
+`sync --apply` needs ai-memory 2.7 or later: every write and delete is
+conditional on the page version the plan saw, and an older server would
+ignore that condition, so `sync` refuses to write to one.
 
 It is a standalone Cargo package (own workspace, own lockfile); the root
 ai-memory workspace does not build or test it:
@@ -37,6 +42,8 @@ ai-memory-wikisync sync ...
 ai-memory-wikisync sync ... --apply
 # A page changed on both sides is a conflict until a side is chosen.
 ai-memory-wikisync sync ... --apply --prefer repo   # or --prefer server
+# Carry deletes too (at most 10 per run unless --max-deletes says otherwise).
+ai-memory-wikisync sync ... --apply --propagate-deletes
 ```
 
 - `plan` never writes, not even the state file.
@@ -74,8 +81,8 @@ because the tool clears whatever a write omits. Server-generated keys
 All local bookkeeping lives in **one** state file,
 `.ai-memory-wikisync/state.json` (mode 0600, atomically replaced after
 each successful write batch): per page, the SHA-256 of the bytes last
-written plus the server `ETag` observed at that write. Nothing else is
-stored — no tokens, no server credentials.
+written plus the server `ETag` and version id observed at that write.
+Nothing else is stored — no tokens, no server credentials.
 
 The state is per clone. The state directory carries a `.gitignore` of `*`,
 so committing the destination never commits the state: two clones that
@@ -106,9 +113,9 @@ This section describes `plan` and `export`; `sync` adds the rules under
   diverged from both is reported with a diff summary and **refused**; the
   whole batch is refused, nothing is written. `--force` overwrites the
   divergent files with server content.
-- **Never deletes.** Local files and server pages are never deleted,
-  including brand-new local files inside an allowlisted family. Deletes
-  are slice 4.
+- **Never deletes.** `plan` and `export` never delete local files or server
+  pages, including brand-new local files inside an allowlisted family.
+  Only `sync --propagate-deletes` deletes (see below).
 - **Untrusted content.** Page bodies are data: transported verbatim,
   never executed, never rendered, never interpreted. Paths that would
   escape `--dest` are refused.
@@ -125,8 +132,10 @@ and the server page rendered into file bytes.
 | changed | unchanged | import the file with `memory_write_page` |
 | new file | no page | import (create) |
 | changed | changed | conflict: nothing is written until `--prefer repo` or `--prefer server` |
-| deleted | present | reported; the server page is kept |
-| present | deleted | reported; the file is kept |
+| deleted | unchanged | reported; with `--propagate-deletes`, the server page is deleted |
+| unchanged | deleted | reported; with `--propagate-deletes`, the file is deleted |
+| deleted | changed | with `--propagate-deletes`, a conflict: `--prefer repo` deletes the page, `--prefer server` re-exports the file |
+| changed | deleted | with `--propagate-deletes`, a conflict: `--prefer repo` re-creates the page, `--prefer server` deletes the file |
 
 Safety rules:
 
@@ -141,22 +150,36 @@ Safety rules:
   `generated` and `last_modified_by` (a consolidated page's `summary` or
   `sources`, an MCP write's `kind` or `abstract`) is never overwritten by an
   import; the refusal names the keys. Such pages still export.
-- **Re-read before each write.** Right before an import the server page is
-  read again and must still render to the bytes it was classified against.
-  The MCP write has no compare-and-write, so a write that lands between that
-  read and the import is the one race left (the case for slice 2).
+- **Every write is conditional.** Each import carries the page version the
+  plan classified (`expected_page_id`), or `create_only` for a new page, and
+  each delete carries the version too. A page that changes on the server
+  after it was classified is refused by the server, reported as "changed
+  during this run", and left with its old state for the next run; the other
+  pages still sync, and the run exits non-zero. A server without these
+  preconditions (before ai-memory 2.7) is detected before anything is
+  written and refused.
 - **The server's version wins after an import.** If the server stores
   something other than the file (the sanitizer redacting a secret), the file
   is rewritten with the server's rendering.
-- **Deletes are not synced yet** (slice 4). Pages gone from both sides drop
-  out of the state.
+- **Deletes are opt-in.** Without `--propagate-deletes` a delete is only
+  reported, and the page keeps its state entry so the next run reports it
+  again. With it, a side is deleted only if it is unchanged since the last
+  sync; a delete against an edit is a conflict like any other. Pages gone
+  from both sides drop out of the state.
+- **Delete safety.** More than `--max-deletes` deletes (default 10) refuses
+  the whole run. A pinned server page is never deleted unless `--prefer repo`
+  is given. A file is deleted only through the same path checks as a write
+  (no symlinked file or directory, nothing outside `--dest`) and only if it
+  still holds the bytes the plan classified. The tool never runs git: it
+  prints the `git rm` to stage the deletes. Apply order is imports, exports,
+  server deletes, file deletes.
 
 ## Roadmap (#986)
 
 1. Read-only export into a project repository (`export`).
-2. Conditional mutation seam (compare-and-write) in core, if independently
-   justified.
-3. **This release — two-way sync** (`sync`): repository edits flow back
-   through the public MCP write tool.
-4. Deletes and conflict reporting.
+2. Conditional mutation seam (compare-and-write) in core (ai-memory 2.7).
+3. Two-way sync (`sync`): repository edits flow back through the public MCP
+   write tool.
+4. **This release — deletes and conflict reporting** (`--propagate-deletes`,
+   conditional writes).
 5. Post-merge hook / CI integration.
