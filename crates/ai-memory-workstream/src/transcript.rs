@@ -2805,7 +2805,7 @@ fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
     let trimmed = text.trim_start();
     match agent {
         AgentKind::Codex => {
-            trimmed.starts_with("# AGENTS.md instructions for ")
+            ai_memory_core::looks_like_codex_instructions(trimmed)
                 || trimmed.starts_with("<environment_context>")
                 || trimmed.starts_with("<permissions instructions>")
                 || trimmed.starts_with("<INSTRUCTIONS>")
@@ -6653,6 +6653,20 @@ mod tests {
         parse_codex(&value, "session", "record", &mut events, &mut losses);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].content, "actual request");
+    }
+
+    #[test]
+    fn codex_adapter_excludes_the_bare_instructions_heading() {
+        // Codex omits ` for <cwd>` when only the global AGENTS.md contributes.
+        // Backfill then replayed that file as a prompt in every project.
+        let value = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"# AGENTS.md instructions\n\n<INSTRUCTIONS>\nNever commit secrets.\n</INSTRUCTIONS>"},
+            {"type":"input_text","text":"<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&value, "session", "record", &mut events, &mut losses);
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

@@ -1787,6 +1787,7 @@ mod tests {
                 .unwrap()
                 .with_store_reader(store.reader.clone()),
             data_dir: root.into(),
+            home_dir: None,
             trusted_proxy_identity: auth.actor_proxy_bearer().is_some(),
         })
         .layer(axum::middleware::from_fn_with_state(
@@ -1978,6 +1979,7 @@ mod tests {
                     .unwrap()
                     .with_store_reader(store.reader.clone()),
                 data_dir: tmp.path().into(),
+                home_dir: None,
                 trusted_proxy_identity: false,
             })
             .layer(axum::middleware::from_fn_with_state(
@@ -2438,6 +2440,7 @@ mod tests {
                 .unwrap()
                 .with_store_reader(store.reader.clone()),
             data_dir: tmp.path().into(),
+            home_dir: None,
             trusted_proxy_identity: false,
         })
         .layer(axum::middleware::from_fn(

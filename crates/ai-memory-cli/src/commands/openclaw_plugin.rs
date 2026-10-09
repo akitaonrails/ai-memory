@@ -587,7 +587,7 @@ mod tests {
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(plugin.matches("windowsHide: true").count(), 2);
+        assert_eq!(plugin.matches("windowsHide: true").count(), 3);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -826,9 +826,13 @@ mod tests {
             serde_json::to_string(&cases).unwrap()
         );
         std::fs::write(&module, source).unwrap();
+        // A Windows cwd such as `c:/work/api/lib` is relative on Unix, so the
+        // marker walk starts in node's working directory; run it from the temp
+        // dir so a contributor's `.ai-memory.toml` in the checkout is not found.
         let output = std::process::Command::new("node")
             .args(["--experimental-strip-types", "--no-warnings"])
             .arg(&module)
+            .current_dir(tmp.path())
             .env("HOME", &home)
             .env("USERPROFILE", &home)
             .output()

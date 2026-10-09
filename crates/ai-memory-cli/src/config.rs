@@ -730,8 +730,9 @@ impl RuntimeEnv {
                 .is_some_and(|value| !value.trim().is_empty()),
             claude_code_session_id: env_string("CLAUDE_CODE_SESSION_ID"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
-            // CLAUDE_CODE_OAUTH_TOKEN is what `claude setup-token` writes;
-            // ANTHROPIC_OAUTH_TOKEN is our canonical name — accept both.
+            // CLAUDE_CODE_OAUTH_TOKEN is the name Claude Code reads the
+            // `claude setup-token` token from; ANTHROPIC_OAUTH_TOKEN is our
+            // canonical name — accept both.
             anthropic_oauth_token: env_secret("ANTHROPIC_OAUTH_TOKEN")
                 .or_else(|| env_secret("CLAUDE_CODE_OAUTH_TOKEN")),
             openai_api_key: env_secret("OPENAI_API_KEY"),

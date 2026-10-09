@@ -787,6 +787,28 @@ capture and session-end handoff *creation* work, but handoff *injection*
 does not — ask Zero to call `memory_handoff_accept` at the start of a
 resumed session.
 
+Zero runs hook commands inside its execution sandbox. The default policy
+denies all network, loopback included (a separate network namespace on
+Linux, `(deny network*)` on macOS), mounts `/` read-only with writes limited
+to the workspace and temp, and kills a hook's detached children when the
+hook exits. Hooks therefore cannot reach `server_url`: events land in
+`<data_dir>/hook-spool/` and stay there. Zero only lets the user's global
+`~/.config/zero/config.json` relax this (a project config can only tighten
+it), and ai-memory does not edit that file. Either add
+
+```json
+"sandbox": {
+  "network": "allow",
+  "additionalWriteRoots": ["<ai-memory data dir>"]
+}
+```
+
+(network access is all-or-nothing and applies to every shell command Zero
+runs, not only hooks), or set `"sandbox": {"enabled": false}`. Without
+either, run `ai-memory hook-drain` from a normal shell to deliver the
+spooled events. A leftover empty `hook-spool/.drain.lock` does not block
+that drain: the lock is an OS file lock released when its holder exits.
+
 ## ZCode (z.ai)
 
 **Status:** MCP supported. Lifecycle hooks are not installed by this command;

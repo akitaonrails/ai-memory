@@ -15,7 +15,7 @@ use ai_memory_core::{
 };
 use ai_memory_store::{
     FinishWorkstreamRun, PrepareWorkstreamRun, ReaderPool, RenameWorkstream, ScopeResolutionError,
-    StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle,
+    StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle, authorize_scope_for,
     create_explicit_scope_guarded, lookup_existing_scope_guarded,
 };
 use ai_memory_wiki::Wiki;
@@ -48,6 +48,9 @@ pub struct WorkstreamState {
     pub wiki: Wiki,
     /// ai-memory data root containing `raw/workstreams`.
     pub data_dir: PathBuf,
+    /// Operator home directory; a project rooted there never claims a run's
+    /// checkout by cwd prefix, as in hook routing.
+    pub home_dir: Option<String>,
     /// Whether a trusted proxy can distinguish operators without DB users.
     pub trusted_proxy_identity: bool,
     #[cfg(test)]
@@ -214,6 +217,79 @@ fn scope_refusal(failure: ScopeResolutionError) -> Response {
     }
 }
 
+/// The scope a managed run opens in, and whether resolving it renamed the
+/// project in place.
+///
+/// A run whose `project` is the name its checkout's git remote derives routes
+/// by that identity, through the same writer transaction hook capture uses:
+/// the project already carrying the identity wins, else the project whose
+/// `repo_path` contains the cwd is claimed. Routing by name alone would miss a
+/// project created from the folder name before identities were recorded,
+/// create an identity-less twin under the derived name, and leave every later
+/// run ambiguous once capture claimed the original. Any other run keeps the
+/// explicit-name path.
+async fn resolve_run_scope(
+    state: &WorkstreamState,
+    request: &PrepareManagedRunRequest,
+    viewer: Option<ai_memory_core::UserId>,
+) -> Result<(ai_memory_store::ResolvedScope, bool), ScopeResolutionError> {
+    use ai_memory_core::repository_identity::{
+        IdentitySource, IdentityStyle, accept_wire_identity, path_style_name,
+    };
+    let workspace = request.workspace.trim();
+    let project = request.project.trim();
+    let identity = request
+        .repository_identity
+        .as_deref()
+        .and_then(|identity| accept_wire_identity(identity, IdentitySource::GitRemote.as_str()))
+        .filter(|identity| path_style_name(identity).as_deref() == Some(project))
+        .filter(|_| !ai_memory_core::profile::is_reserved_scope_project(project));
+    let Some(identity) = identity else {
+        let resolved =
+            create_explicit_scope_guarded(&state.reader, &state.writer, workspace, project, viewer)
+                .await?;
+        return Ok((resolved.scope, resolved.promoted_from.is_some()));
+    };
+    let workspace_id = state
+        .writer
+        .get_or_create_workspace(workspace.to_owned())
+        .await?;
+    let candidate = state
+        .reader
+        .find_project_by_cwd_prefix(workspace_id, request.cwd.clone(), state.home_dir.as_deref())
+        .await?
+        .map(|(project_id, _)| project_id);
+    let (project_id, resolution) = state
+        .writer
+        .resolve_project_by_identity_for_capture(
+            workspace_id,
+            identity,
+            IdentityStyle::Path,
+            project,
+            None,
+            candidate,
+            viewer,
+        )
+        .await?;
+    // The writer claims or renames only for a caller who may write; matching
+    // or finding a project is not access to it.
+    let scope = authorize_scope_for(
+        &state.reader,
+        Some(&state.writer),
+        ai_memory_store::ResolvedScope {
+            workspace_id,
+            project_id,
+        },
+        viewer,
+        ai_memory_store::ProjectAccess::Write,
+    )
+    .await?;
+    Ok((
+        scope,
+        resolution == ai_memory_store::IdentityResolution::Promoted,
+    ))
+}
+
 async fn prepare_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
@@ -316,36 +392,25 @@ async fn prepare_run(
     if let Err(failure) = selection.validate() {
         return store_error_response(failure);
     }
-    let resolved_scope = match create_explicit_scope_guarded(
-        &state.reader,
-        &state.writer,
-        request.workspace.trim(),
-        request.project.trim(),
-        actor_user(viewer),
-    )
-    .await
-    {
-        Ok(scope) => scope,
+    let (scope, promoted) = match resolve_run_scope(&state, &request, actor_user(viewer)).await {
+        Ok(resolved) => resolved,
         Err(failure) if failure.is_forbidden() => {
             return error(StatusCode::FORBIDDEN, failure.to_string());
         }
         Err(failure) => return error(StatusCode::BAD_REQUEST, failure.to_string()),
     };
-    let manifest_warning = if resolved_scope.promoted_from.is_some() {
+    let manifest_warning = if promoted {
         match state
             .wiki
-            .refresh_renamed_scope(
-                resolved_scope.scope.workspace_id,
-                resolved_scope.scope.project_id,
-            )
+            .refresh_renamed_scope(scope.workspace_id, scope.project_id)
             .await
         {
             Ok(_) => None,
             Err(failure) => {
                 warn!(
                     error = %failure,
-                    workspace_id = %resolved_scope.scope.workspace_id,
-                    project_id = %resolved_scope.scope.project_id,
+                    workspace_id = %scope.workspace_id,
+                    project_id = %scope.project_id,
                     "project name promotion committed; manifest refresh/checkpoint failed; startup backfill can repair"
                 );
                 Some(
@@ -358,7 +423,6 @@ async fn prepare_run(
     } else {
         None
     };
-    let scope = resolved_scope.scope;
     let identity = actor.and_then(|Extension(actor)| actor.identity_key());
     let owner_user = match managed_run_owner_stamp(
         &state.reader,
@@ -1304,6 +1368,7 @@ mod tests {
                 .unwrap()
                 .with_store_reader(store.reader.clone()),
             data_dir: data_dir.to_path_buf(),
+            home_dir: None,
             trusted_proxy_identity: false,
             finish_barrier: None,
         }
@@ -1406,6 +1471,7 @@ mod tests {
             new_workstream: None,
             force_unlock: false,
             lease_owner: "launcher".into(),
+            repository_identity: None,
         };
         let refused = prepare_run(
             State(state.clone()),
@@ -1513,6 +1579,7 @@ mod tests {
                 new_workstream: Some("new".into()),
                 force_unlock: false,
                 lease_owner: "launcher".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -1582,6 +1649,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "launcher".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -1677,6 +1745,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "launcher".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -1760,6 +1829,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "launcher".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -2678,6 +2748,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "automatic".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -2716,6 +2787,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "explicit".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -2766,6 +2838,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "automatic".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -2813,6 +2886,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "alice-launcher".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -2915,6 +2989,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "alice:1".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -3052,6 +3127,7 @@ mod tests {
             new_workstream: None,
             force_unlock,
             lease_owner: lease_owner.into(),
+            repository_identity: None,
         };
 
         let first = prepare_run(
@@ -3136,6 +3212,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "explicit".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -3185,6 +3262,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "automatic".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -3215,6 +3293,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "explicit".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -3264,6 +3343,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "automatic".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -3294,6 +3374,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "explicit".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -3343,6 +3424,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "automatic".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -3393,6 +3475,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "explicit".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -3442,6 +3525,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "automatic".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -3726,6 +3810,7 @@ mod tests {
                 new_workstream: None,
                 force_unlock: false,
                 lease_owner: "alice".into(),
+                repository_identity: None,
             }),
         )
         .await;
@@ -4582,5 +4667,462 @@ mod tests {
             .status(),
             StatusCode::OK
         );
+    }
+
+    /// A checkout's run request as `ai-memory run` sends it for a repository
+    /// whose folder name differs from its remote's derived name.
+    fn identity_run_request(project: &str, identity: Option<&str>) -> PrepareManagedRunRequest {
+        PrepareManagedRunRequest {
+            workspace: "default".into(),
+            project: project.into(),
+            cwd: "/repo/new-space-game".into(),
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            workstream: None,
+            new_workstream: None,
+            force_unlock: false,
+            lease_owner: "launcher".into(),
+            repository_identity: identity.map(str::to_owned),
+        }
+    }
+
+    fn unknown_system() -> ai_memory_core::repository_identity::RepositoryIdentity {
+        ai_memory_core::repository_identity::RepositoryIdentity {
+            identity: "github.com/victorcesc/unknown-system".into(),
+            source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+        }
+    }
+
+    async fn run_project(
+        store: &Store,
+        response: Response,
+    ) -> (ai_memory_core::WorkspaceId, ai_memory_core::ProjectId) {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        store
+            .reader
+            .managed_run_scope(prepared.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn project_names(store: &Store) -> Vec<String> {
+        let mut names: Vec<String> = store
+            .reader
+            .list_projects_with_stats_for_workspace("default".into(), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|summary| summary.project_name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn managed_run_by_remote_identity_claims_the_folder_named_project() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        // Created from the folder name before identities were recorded.
+        let legacy = store
+            .writer
+            .get_or_create_project(
+                workspace_id,
+                "new-space-game",
+                Some("/repo/new-space-game".into()),
+            )
+            .await
+            .unwrap();
+
+        let response = prepare_run(
+            State(state),
+            None,
+            None,
+            None,
+            Json(identity_run_request(
+                "victorcesc-unknown-system",
+                Some("github.com/victorcesc/unknown-system"),
+            )),
+        )
+        .await;
+
+        assert_eq!(run_project(&store, response).await, (workspace_id, legacy));
+        assert_eq!(project_names(&store).await, ["victorcesc-unknown-system"]);
+    }
+
+    #[tokio::test]
+    async fn managed_run_by_remote_identity_routes_past_an_identityless_twin() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (holder, _) = store
+            .writer
+            .resolve_project_by_identity(
+                workspace_id,
+                unknown_system(),
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "new-space-game",
+                Some("/repo/new-space-game".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // The twin an earlier name-only run created under the derived name.
+        store
+            .writer
+            .get_or_create_project(workspace_id, "victorcesc-unknown-system", None)
+            .await
+            .unwrap();
+
+        // By name alone the derived name names both projects.
+        let by_name = prepare_run(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            Json(identity_run_request("victorcesc-unknown-system", None)),
+        )
+        .await;
+        assert_eq!(by_name.status(), StatusCode::BAD_REQUEST);
+
+        let by_identity = prepare_run(
+            State(state),
+            None,
+            None,
+            None,
+            Json(identity_run_request(
+                "victorcesc-unknown-system",
+                Some("github.com/victorcesc/unknown-system"),
+            )),
+        )
+        .await;
+        assert_eq!(
+            run_project(&store, by_identity).await,
+            (workspace_id, holder)
+        );
+        assert_eq!(
+            project_names(&store).await,
+            ["new-space-game", "victorcesc-unknown-system"]
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_run_identity_never_redirects_another_project_name() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (holder, _) = store
+            .writer
+            .resolve_project_by_identity(
+                workspace_id,
+                unknown_system(),
+                ai_memory_core::repository_identity::IdentityStyle::Path,
+                "new-space-game",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // An identity that does not derive the requested name is ignored: the
+        // run opens the project it names, never the identity's holder.
+        let response = prepare_run(
+            State(state),
+            None,
+            None,
+            None,
+            Json(identity_run_request(
+                "scratchpad",
+                Some("github.com/victorcesc/unknown-system"),
+            )),
+        )
+        .await;
+        let (_, opened) = run_project(&store, response).await;
+        assert_ne!(opened, holder);
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(workspace_id, opened)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("scratchpad")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_run_by_remote_identity_refuses_a_viewer_without_write() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (holder, _) = store
+            .writer
+            .resolve_project_by_identity(
+                workspace_id,
+                unknown_system(),
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "new-space-game",
+                Some("/repo/new-space-game".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(holder, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let user = |name: &str, seed: u8| {
+            store.writer.create_user(
+                ai_memory_core::NewUser {
+                    username: name.into(),
+                    name: None,
+                    email: None,
+                },
+                [seed; ai_memory_store::TOKEN_HASH_LEN],
+            )
+        };
+        let outsider = user("outsider", 3).await.unwrap();
+        let member = user("member", 4).await.unwrap();
+        store
+            .writer
+            .grant_memory(member, holder, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        let request = || {
+            Json(identity_run_request(
+                "victorcesc-unknown-system",
+                Some("github.com/victorcesc/unknown-system"),
+            ))
+        };
+
+        let refused = prepare_run(
+            State(state.clone()),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(ai_memory_core::AuthorizedViewer(outsider))),
+            request(),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        // Neither a run nor a project to hold one appeared for the outsider.
+        assert_eq!(project_names(&store).await, ["new-space-game"]);
+
+        let admitted = prepare_run(
+            State(state),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(ai_memory_core::AuthorizedViewer(member))),
+            request(),
+        )
+        .await;
+        assert_eq!(run_project(&store, admitted).await, (workspace_id, holder));
+    }
+
+    /// The claim branch: a legacy project with no recorded identity whose
+    /// `repo_path` contains the run cwd. An outsider who may not write to it
+    /// must neither stamp the identity on it nor get a twin under the derived
+    /// name.
+    #[tokio::test]
+    async fn managed_run_identity_never_claims_a_restricted_legacy_project() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let legacy = store
+            .writer
+            .get_or_create_project(
+                workspace_id,
+                "new-space-game",
+                Some("/repo/new-space-game".into()),
+            )
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(legacy, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let user = |name: &str, seed: u8| {
+            store.writer.create_user(
+                ai_memory_core::NewUser {
+                    username: name.into(),
+                    name: None,
+                    email: None,
+                },
+                [seed; ai_memory_store::TOKEN_HASH_LEN],
+            )
+        };
+        let outsider = user("outsider", 3).await.unwrap();
+        let member = user("member", 4).await.unwrap();
+        store
+            .writer
+            .grant_memory(member, legacy, ai_memory_store::GrantLevel::Write, None)
+            .await
+            .unwrap();
+        let request = || {
+            Json(identity_run_request(
+                "victorcesc-unknown-system",
+                Some("github.com/victorcesc/unknown-system"),
+            ))
+        };
+        let legacy_identity = || async {
+            store
+                .reader
+                .list_all_scopes()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|scope| scope.project_id == legacy)
+                .unwrap()
+                .identity
+        };
+
+        let refused = prepare_run(
+            State(state.clone()),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(ai_memory_core::AuthorizedViewer(outsider))),
+            request(),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(legacy_identity().await, None);
+        assert_eq!(project_names(&store).await, ["new-space-game"]);
+
+        let admitted = prepare_run(
+            State(state),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(ai_memory_core::AuthorizedViewer(member))),
+            request(),
+        )
+        .await;
+        assert_eq!(run_project(&store, admitted).await, (workspace_id, legacy));
+        assert_eq!(
+            legacy_identity().await.as_deref(),
+            Some("github.com/victorcesc/unknown-system")
+        );
+        assert_eq!(project_names(&store).await, ["victorcesc-unknown-system"]);
+    }
+
+    #[tokio::test]
+    async fn managed_run_identity_routing_stays_inside_the_requested_workspace() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let default_ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let (holder, _) = store
+            .writer
+            .resolve_project_by_identity(
+                default_ws,
+                unknown_system(),
+                ai_memory_core::repository_identity::IdentityStyle::HostPath,
+                "new-space-game",
+                Some("/repo/new-space-game".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut request = identity_run_request(
+            "victorcesc-unknown-system",
+            Some("github.com/victorcesc/unknown-system"),
+        );
+        request.workspace = "client-work".into();
+        let response = prepare_run(State(state), None, None, None, Json(request)).await;
+
+        // Another workspace's identity holder is never the target: the run
+        // gets that workspace's own project for the repository.
+        let (workspace_id, opened) = run_project(&store, response).await;
+        assert_ne!(workspace_id, default_ws);
+        assert_ne!(opened, holder);
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(workspace_id, opened)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("victorcesc-unknown-system")
+        );
+        assert_eq!(project_names(&store).await, ["new-space-game"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_identity_runs_on_a_legacy_project_converge_on_it() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let legacy = store
+            .writer
+            .get_or_create_project(
+                workspace_id,
+                "new-space-game",
+                Some("/repo/new-space-game".into()),
+            )
+            .await
+            .unwrap();
+        let request = |workstream: &str| {
+            let mut request = identity_run_request(
+                "victorcesc-unknown-system",
+                Some("github.com/victorcesc/unknown-system"),
+            );
+            request.new_workstream = Some(workstream.into());
+            Json(request)
+        };
+
+        // Two launches in one checkout race the first claim of the row.
+        let (first, second) = tokio::join!(
+            prepare_run(State(state.clone()), None, None, None, request("market")),
+            prepare_run(State(state), None, None, None, request("mine-meshs")),
+        );
+
+        assert_eq!(run_project(&store, first).await, (workspace_id, legacy));
+        assert_eq!(run_project(&store, second).await, (workspace_id, legacy));
+        assert_eq!(project_names(&store).await, ["victorcesc-unknown-system"]);
     }
 }

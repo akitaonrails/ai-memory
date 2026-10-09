@@ -161,18 +161,31 @@ pub(crate) fn resolve_scope(
     explicit_ws: Option<&str>,
     explicit_proj: Option<&str>,
 ) -> Result<(String, String)> {
+    resolve_scope_noting_marker_project(config, explicit_ws, explicit_proj)
+        .map(|(workspace, project, _)| (workspace, project))
+}
+
+/// [`resolve_scope`], also reporting whether a marker's `project` key named
+/// the project. Hook capture routes such a project by name and never reads the
+/// remote, so a caller mirroring capture needs that fact.
+pub(crate) fn resolve_scope_noting_marker_project(
+    config: &Config,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+) -> Result<(String, String, bool)> {
     let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
     let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
     if let (Some(workspace), Some(project)) = (explicit_ws, explicit_proj) {
-        return Ok((workspace.to_string(), project.to_string()));
+        return Ok((workspace.to_string(), project.to_string(), false));
     }
-    resolve_scope_with_marker(
-        config,
-        explicit_ws,
-        explicit_proj,
-        marker_scope(config)?,
-        true,
-    )
+    let marker = marker_scope(config)?;
+    let marker_project = explicit_proj.is_none()
+        && marker
+            .as_ref()
+            .is_some_and(|(scope, _, _)| scope.project.is_some());
+    let (workspace, project) =
+        resolve_scope_with_marker(config, explicit_ws, explicit_proj, marker, true)?;
+    Ok((workspace, project, marker_project))
 }
 
 pub(crate) fn resolve_scope_with_marker(

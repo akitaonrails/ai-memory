@@ -43,7 +43,7 @@ Recommended defaults:
 | Provider | Default | Use when |
 |---|---|---|
 | `anthropic` | `claude-haiku-4-5` | Best default for consolidation quality and rule classification. |
-| `anthropic-oauth` | `claude-sonnet-4-6` | Use a Claude Pro/Max subscription via `claude setup-token`, no API key. |
+| `anthropic-oauth` | `claude-sonnet-4-6` | Use a Claude Pro/Max subscription via `claude setup-token`, no API key. Currently refused by Anthropic for third-party apps (usually `429`); see below. |
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
 | `codex` | `gpt-5.6-luna` | Reuse the Codex CLI-owned `auth.json`; access-token refresh remains owned by `codex app-server`. |
@@ -315,9 +315,10 @@ alone does not redirect embeddings — set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 
 `anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
 authenticates with an OAuth bearer token instead of an API key. Run
-`claude setup-token` once, then set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` and
-`ANTHROPIC_OAUTH_TOKEN=<token>` (or `CLAUDE_CODE_OAUTH_TOKEN`, which `claude
-setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed. The Docker
+`claude setup-token` once; it prints the token and does not save it anywhere, so
+export it yourself as `ANTHROPIC_OAUTH_TOKEN=<token>` (or
+`CLAUDE_CODE_OAUTH_TOKEN`) and set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth`. No
+`ANTHROPIC_API_KEY` is needed. The Docker
 wrappers forward either token by name to short-lived helper commands such as
 `llm-test`; configure the long-lived server container separately as shown in the
 installation guide.
@@ -331,6 +332,14 @@ rule.
 **⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
 it may get your account rate-limited or banned. See
 [the warning in `docs/install.md`](install.md#anthropic-via-claude-subscription-oauth).**
+
+Anthropic currently refuses subscription tokens from third-party apps
+([legal and compliance](https://code.claude.com/docs/en/legal-and-compliance)),
+so expect `anthropic-oauth` to fail on every request, typically with
+`provider error 429` and `rate_limit_error`, even though the same token works
+in the `claude` CLI. That 429 is a policy refusal, not a real rate limit. Use
+the `anthropic` provider with an Anthropic Console API key, or another provider
+from the table above.
 
 `copilot` stores a GitHub user token in the same auth file, exchanges it for a
 short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and

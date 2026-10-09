@@ -126,6 +126,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+- Fixed generated TypeScript integrations (OpenCode, OpenCode 2, OMP,
+  Pi, OpenClaw) flashing a console window on Windows.
+  `discoverRemoteIdentity` spawned `git config --get remote.<name>.url`
+  without `windowsHide`. The spawn now passes `windowsHide: true`, as
+  the repo-root probe's two git spawns already do (#1169).
+- Fixed `AI_MEMORY_LLM_REASONING_EFFORT` being ignored for
+  `claude-haiku-5-5`: the Anthropic provider dropped effort and thinking
+  fields for every Haiku model because Haiku 4.5 rejects them, so Haiku 5.5
+  always ran adaptive thinking at its default `medium` effort. Haiku 5.5 and
+  later now receive `output_config.effort`, adaptive thinking, and
+  `thinking: disabled` for `none`, like the other current Claude models
+  (#1180).
+- Documented that Anthropic currently refuses Claude Free/Pro/Max subscription
+  tokens from third-party apps, so `anthropic-oauth` usually fails with a
+  `429 rate_limit_error` on every request. That is a policy refusal, not a
+  real rate limit; the docs now point to the `anthropic` provider with a
+  Console API key or another provider. Also corrected the claim that
+  `claude setup-token` writes `CLAUDE_CODE_OAUTH_TOKEN`: it only prints the
+  token, which you export yourself. (#1170)
+- Documented that Zero runs hook commands inside its sandbox, whose default
+  policy blocks network (loopback included) and writes outside the
+  workspace, so hook events stay in the spool instead of reaching the
+  server. The `install-hooks --agent zero` and `setup-agent` notes and the
+  Zero install docs now name the global `~/.config/zero/config.json`
+  `sandbox` keys that allow delivery, their tradeoff, and the
+  `ai-memory hook-drain` fallback. (#1172)
+- Fixed a global `~/.codex/AGENTS.md` reaching the cross-project profile as
+  the user's own words. Codex injects its instruction files as a user message
+  headed `# AGENTS.md instructions for <cwd>` when a project `AGENTS.md`
+  contributes, and `# AGENTS.md instructions` with no directory when only the
+  global file does. The transcript import recognized only the first heading,
+  so `backfill` stored the global file as a user prompt in every project, and
+  the profile harvest admitted its "always"/"never" lines, which repeat across
+  projects by construction. The import now recognizes both headings. (#1173)
+- Fixed the profile harvest reading text the user did not write as the
+  user's words: a user-prompt observation that is a harness turn, such as
+  Claude Code's `<task-notification>` blocks or Codex's injected
+  instructions, is now skipped, and ai-memory's own routing and
+  recalled-history blocks inside a prompt are left out, including a block the
+  16 KiB prompt cap cut before its end marker. `profile rebuild` also skips
+  Codex instructions an earlier version stored as prompts, but it keeps the
+  candidates already harvested from them, so those lines can still show as
+  waiting in `profile review`. An entry an earlier version already admitted,
+  or one those candidates reach later, stays until `ai-memory profile forget`
+  removes it. (#1173)
 - Fixed Cursor tool calls being stored with no title or content: Cursor's own
   hooks, and the Claude Code hooks Cursor also runs, send Claude's
   `tool_name`/`tool_input` fields, but Cursor was missing from the tool-capture
@@ -136,6 +181,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the placeholder id `empty-state-draft` and no workspace, and each launch
   appended another observation to that one empty session. The server now
   acknowledges and drops that placeholder.
+- Fixed `profile review` listing page metadata such as `Status:** Accepted` as
+  habits waiting for promotion: a curated page's statement was its first line
+  of prose, which on an ADR-style page is a `**Status:** Accepted` or
+  `**Date:**` field. Statements now skip fields with an ADR metadata label
+  (Status, Date, Deciders, Supersedes and the like) whatever their value; a
+  labelled rule such as `**Package manager:** pnpm` is still a statement.
+  Fields harvested before the fix no longer reach `profile review`; an entry already admitted to the
+  profile stays until `ai-memory profile forget`. (#1175)
 - Fixed `install-mcp --client claude-desktop` refusing to run on Linux:
   Anthropic ships Claude Desktop for Linux as a beta, and the command now
   writes `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (default
@@ -173,6 +226,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Settings window behind the frontmost app, so clicking it appeared to do
   nothing. The item now activates the app before opening the window, as
   **Show Status…** already did. (#1161)
+- Fixed `ai-memory run` creating an empty twin project when a repository's
+  folder name differs from its git remote (a `new-space-game` checkout of
+  `github.com/acme/unknown-system`) and its project predates recorded
+  identities: the run asked for the remote-derived name alone, so it missed
+  the folder-named project, and once hook capture claimed that project every
+  later run failed with `project '…' is ambiguous`. The launcher now sends the
+  checkout's remote identity with the derived name and the server routes the
+  run by identity, as capture does — which also lets runs in an
+  already-affected repository open again. A user whose run cwd sat inside a
+  project they could not write got a silently created twin project; they now
+  get a 403. (#1182)
 
 ## [2.6.2] - 2026-10-08
 

@@ -401,10 +401,11 @@ curl -sI http://127.0.0.1:49374/handoff
 > **You do not need a paid platform API key.** ai-memory's LLM features
 > (consolidation, lint, auto-improve) are opt-in, and when you enable them you
 > can authenticate with a **subscription you already pay for** instead of a
-> metered API key: a Claude Pro/Max plan via `anthropic-oauth`
-> (`claude setup-token`), a ChatGPT Plus/Pro/Codex plan via `openai-oauth`
-> (`ai-memory auth login openai-oauth`), or a GitHub Copilot plan via `copilot`
-> (`ai-memory auth login copilot`). See
+> metered API key: a ChatGPT Plus/Pro/Codex plan via `openai-oauth`
+> (`ai-memory auth login openai-oauth`) or a GitHub Copilot plan via `copilot`
+> (`ai-memory auth login copilot`). (Claude Pro/Max via `anthropic-oauth` is
+> currently refused by Anthropic; see
+> [below](#anthropic-via-claude-subscription-oauth).) See
 > [`docs/llm-providers.md`](llm-providers.md) for the full table. And you can
 > skip an LLM entirely: the default zero-LLM path still captures, searches
 > (FTS), and writes rule-based summaries with no provider at all —
@@ -1917,7 +1918,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | Setting | Default | Why |
 |---|---|---|
 | `AI_MEMORY_LLM_PROVIDER=anthropic` | `claude-haiku-4-5` | **Recommended default.** Best balance of speed, restraint, and classification quality. Not a reasoning model. Consistently classifies durable project rules as `kind: rule`. |
-| `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` | `claude-sonnet-4-6` | Anthropic via Claude subscription. Run `claude setup-token` once; set `ANTHROPIC_OAUTH_TOKEN` (or `CLAUDE_CODE_OAUTH_TOKEN`). No `ANTHROPIC_API_KEY` needed. Same `/v1/messages` endpoint, Bearer token auth. |
+| `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` | `claude-sonnet-4-6` | Anthropic via Claude subscription. Run `claude setup-token` once and export the printed token as `ANTHROPIC_OAUTH_TOKEN` (or `CLAUDE_CODE_OAUTH_TOKEN`). No `ANTHROPIC_API_KEY` needed. Same `/v1/messages` endpoint, Bearer token auth. Anthropic currently refuses these tokens from third-party apps, usually as a `429` on every request. |
 | `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-5.4-mini` | Cheaper + faster alternative. Same parse reliability; mild over-classification on thin sessions. |
 | `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. Optional `AI_MEMORY_LLM_REASONING_EFFORT` (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`/`persistent`) is mapped to each provider's native reasoning field; omit it to keep the model default. |
 | `AI_MEMORY_LLM_PROVIDER=codex` | `gpt-5.6-luna` | Reuses only `access_token` and `account_id` from Codex's `auth.json`; token renewal is delegated to `codex app-server --stdio`. |
@@ -1983,16 +1984,30 @@ export EMBEDDING_API_KEY=sk-or-v1-...
 > `anthropic` provider with a real Platform API key. We ship this purely as an
 > opt-in convenience and make no guarantees about it.
 
+> [!IMPORTANT]
+> **Anthropic currently refuses these tokens from third-party apps.** Its
+> [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance)
+> does not permit third-party developers to route requests through Free, Pro,
+> or Max plan credentials, and the API rejects them server-side. With
+> ai-memory this usually shows up as
+> `provider error 429: {"type":"error","error":{"type":"rate_limit_error",...}}`
+> on every request, including `ai-memory llm-test`, even when the same token
+> works in the `claude` CLI. That is a policy refusal, not a real rate limit,
+> and retrying or changing headers will not fix it. Use the `anthropic`
+> provider with an Anthropic Console API key (`ANTHROPIC_API_KEY`), or another
+> provider from the table above.
+
 `anthropic-oauth` is for Claude Pro/Max subscribers who want to use their
 existing subscription instead of an Anthropic Platform API key. It hits the
 **same** `/v1/messages` endpoint as the `anthropic` provider — only the auth
 headers differ (Bearer token + `anthropic-beta: oauth-2025-04-20`).
 
 ```bash
-# Obtain a token once using the Claude Code CLI:
+# Obtain a token once using the Claude Code CLI. It prints the token and
+# does not save it anywhere, so copy it:
 claude setup-token
 
-# Then export it (the CLI may also write CLAUDE_CODE_OAUTH_TOKEN automatically):
+# Then export it yourself (CLAUDE_CODE_OAUTH_TOKEN is accepted too):
 export ANTHROPIC_OAUTH_TOKEN=<paste token here>
 export AI_MEMORY_LLM_PROVIDER=anthropic-oauth
 ai-memory serve
@@ -2154,9 +2169,9 @@ sends Chat Completions `reasoning_effort` (clamped to `low`/`medium`/`high`/
 `xhigh`, because Grok cannot disable reasoning); other compat endpoints send
 OpenAI-style `reasoning_effort`. Anthropic and Anthropic-OAuth map the same
 key to `output_config.effort` and adaptive/disabled thinking on models that
-accept those fields (Haiku 4.5 omits them so the default model does not 400;
-Fable 5 / Mythos 5 / Mythos Preview omit `thinking: disabled` because those
-models reject it). `ultra` and `persistent` clamp to `max` on OpenAI-style
+accept those fields (Haiku 4.5 omits them because it rejects them, while Haiku
+5.5 receives them; Fable 5 / Mythos 5 / Mythos Preview omit
+`thinking: disabled` because those models reject it). `ultra` and `persistent` clamp to `max` on OpenAI-style
 hosts. Gemini and Copilot ignore the key.
 
 [Atlas Cloud](https://www.atlascloud.ai/models/qwen/qwen3.5-flash) uses the

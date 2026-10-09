@@ -396,8 +396,15 @@ resume, continue, session, or fork selector.
 ## What happens on each run
 
 1. The host client resolves the normal workspace/project scope and a stable
-   repository plus worktree fingerprint. If an identity-backed project still
-   carries its legacy basename, this authorized write promotes the same UUID to
+   repository plus worktree fingerprint. When the project is the canonical path
+   name the checkout's git remote derives, the client also sends that remote
+   identity, and the server opens the run in the project hook capture uses for
+   the checkout: the one already carrying the identity, else the project whose
+   repository path contains the cwd, which a writer claims in place. A project
+   created from a different folder name before identities were recorded is
+   therefore reused rather than twinned under the derived name (#1182); a name
+   from `--project` or a marker routes by name as before. If an
+   identity-backed project still carries its legacy basename, this authorized write promotes the same UUID to
    its canonical path name and refreshes the wiki scope manifest before opening
    the lease; a post-commit manifest failure is returned as
    `manifest_warning` on either success or a later prepare error, retaining the
