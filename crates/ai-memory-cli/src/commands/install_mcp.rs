@@ -269,10 +269,12 @@ pub(crate) fn mcp_config_path_with(
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
-                bail!(
-                    "Claude Desktop is not officially distributed for this OS. \
-                     Pass --config-file explicitly if you know where it lives."
-                );
+                // Anthropic's Linux beta keeps Electron's profile, and the
+                // config, under $XDG_CONFIG_HOME/Claude.
+                claude_desktop_config_path_linux(
+                    &dirs::config_dir()
+                        .context("could not locate the user config directory for Claude Desktop")?,
+                )
             }
         }
         McpClient::GeminiCli => home()?.join(".gemini").join("settings.json"),
@@ -361,6 +363,12 @@ fn swival_project_root(start: &Path) -> PathBuf {
 fn zed_config_path_in(config_dir: &Path, target_os: &str) -> PathBuf {
     let app_dir = if target_os == "windows" { "Zed" } else { "zed" };
     config_dir.join(app_dir).join("settings.json")
+}
+
+/// Claude Desktop's config file under the Linux user config directory.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn claude_desktop_config_path_linux(config_dir: &Path) -> PathBuf {
+    config_dir.join("Claude").join("claude_desktop_config.json")
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1619,8 +1627,8 @@ fn render_claude_desktop(args: &InstallMcpArgs) -> Result<String> {
          #   - Windows (MSIX):       %LOCALAPPDATA%\\Packages\\Claude_<id>\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json\n\
          #     --apply detects the installed form; if multiple MSIX packages\n\
          #     are present, select the active one with --config-file.\n\
-         #   - Linux:    Claude Desktop is not officially distributed for Linux;\n\
-         #               use Claude Code or another HTTP client instead.\n\
+         #   - Linux (beta, Debian/Ubuntu): $XDG_CONFIG_HOME/Claude/claude_desktop_config.json\n\
+         #               (default ~/.config/Claude/claude_desktop_config.json)\n\
          #\n\
          # Claude Desktop's JSON config does not support HTTP MCP servers\n\
          # directly. We bridge through the community `mcp-remote` stdio shim\n\
@@ -2387,6 +2395,18 @@ mod tests {
                 "{client:?} must follow {var}"
             );
         }
+    }
+
+    #[test]
+    fn claude_desktop_config_sits_under_the_linux_config_dir() {
+        let config = Path::new("/home/me/.config");
+        assert_eq!(
+            claude_desktop_config_path_linux(config),
+            Path::new("/home/me/.config/Claude/claude_desktop_config.json")
+        );
+        let rendered = render_claude_desktop(&args_for(McpClient::ClaudeDesktop)).unwrap();
+        assert!(rendered.contains("$XDG_CONFIG_HOME/Claude/claude_desktop_config.json"));
+        assert!(!rendered.contains("not officially distributed"));
     }
 
     /// A relocated Windows profile (`run --env`, a hermetic backup test)

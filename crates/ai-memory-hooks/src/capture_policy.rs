@@ -176,9 +176,12 @@ pub(crate) fn tool_observation_metadata(
         // `tool_input` shape (#1040) — unverified against a real tool-call id
         // field, but `tool_use_id` extraction degrades to `None` gracefully
         // if absent.
+        // Cursor's own hooks and its copies of the Claude Code hooks carry
+        // `tool_name`/`tool_input`/`tool_use_id` (captured live, Cursor 3.24.9).
         AgentKind::ClaudeCode
         | AgentKind::CommandCode
         | AgentKind::Codex
+        | AgentKind::Cursor
         | AgentKind::Grok
         | AgentKind::Grizzybot
         | AgentKind::Zcode
@@ -227,6 +230,7 @@ pub(crate) fn tool_observation_metadata(
                         AgentKind::ClaudeCode
                             | AgentKind::CommandCode
                             | AgentKind::Codex
+                            | AgentKind::Cursor
                             | AgentKind::Grok
                             | AgentKind::Hermes
                             | AgentKind::KiroCli

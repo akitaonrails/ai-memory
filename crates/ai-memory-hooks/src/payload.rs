@@ -817,6 +817,9 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
         AgentKind::ClaudeCode
             | AgentKind::CommandCode
             | AgentKind::Codex
+            // Cursor's own hooks and its copies of the Claude Code hooks carry
+            // Claude's snake_case tool aliases.
+            | AgentKind::Cursor
             | AgentKind::OpenCode
             | AgentKind::Pi
             | AgentKind::Omp
@@ -2804,6 +2807,56 @@ mod tests {
             body.contains("MARKER_OBJ_456"),
             "object tool_response should be serialized into the body: {body:?}"
         );
+    }
+
+    /// Cursor runs the Claude Code hooks too, sending its own payload with
+    /// Claude's `tool_name`/`tool_input` aliases and the result as a JSON
+    /// string in `tool_output`. The payload marks the event as Cursor's, and
+    /// Cursor was absent from `closed_tool_agent`, so its tool observations
+    /// were stored with no title or body (captured live from Cursor 3.24.9).
+    #[test]
+    fn cursor_tool_events_keep_their_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "conversation_id": "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed",
+                "session_id": "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed",
+                "hook_event_name": "postToolUse",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "ls", "cwd": "", "timeout": 30000},
+                "tool_output": "{\"output\":\"MARKER_CURSOR_OUTPUT\",\"exitCode\":0}",
+                "tool_use_id": "9fc522a1-2a0e-4847-9ffc-24256e023574",
+                "cwd": "",
+                "workspace_roots": [],
+            }),
+        );
+        assert_eq!(post.agent, AgentKind::Cursor);
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("cursor post-tool body");
+        assert!(body.contains("MARKER_CURSOR_OUTPUT"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed",
+                "hook_event_name": "preToolUse",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "ls", "cwd": "", "timeout": 30000},
+                "tool_use_id": "9fc522a1-2a0e-4847-9ffc-24256e023574",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool non-file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
     }
 
     /// Grok Build CLI posts a `PostToolUse` with Claude Code's snake_case

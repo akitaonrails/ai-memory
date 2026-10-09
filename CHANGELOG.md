@@ -80,6 +80,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+- Fixed Cursor tool calls being stored with no title or content: Cursor's own
+  hooks, and the Claude Code hooks Cursor also runs, send Claude's
+  `tool_name`/`tool_input` fields, but Cursor was missing from the tool-capture
+  mapping, so every Cursor tool observation reached the store empty. They now
+  get the same tool-family title and output summary as Claude Code's.
+- Fixed every Cursor window adding a session to memory before any
+  conversation: Cursor fires `sessionStart` for its empty draft composer with
+  the placeholder id `empty-state-draft` and no workspace, and each launch
+  appended another observation to that one empty session. The server now
+  acknowledges and drops that placeholder.
+- Fixed `install-mcp --client claude-desktop` refusing to run on Linux:
+  Anthropic ships Claude Desktop for Linux as a beta, and the command now
+  writes `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (default
+  `~/.config/Claude/`) instead of requiring `--config-file`.
 - Corrected the Claude Desktop documentation: Linux is an Anthropic beta for
   Debian-based distributions with its config at
   `~/.config/Claude/claude_desktop_config.json` (pass it to

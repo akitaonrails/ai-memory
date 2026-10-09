@@ -664,6 +664,10 @@ async fn handle_hook(
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "capture policy dropped");
     };
+    if is_cursor_draft_placeholder(&env) {
+        HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
+        return (StatusCode::ACCEPTED, "cursor draft placeholder dropped");
+    }
     // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
     // subagent sessions) when the operator opts in. Returning 202 (not an error)
     // means the client treats the event as delivered and never retries/spools
@@ -932,6 +936,15 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         };
+        if is_cursor_draft_placeholder(&env) {
+            HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedInvalid,
+            });
+            accepted_indices.push(idx);
+            continue;
+        }
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
         // as committed so the client clears it from its spool, but do not store
         // it. Keeps the contiguous-prefix ack contract intact.
@@ -1279,6 +1292,15 @@ const fn canonical_tool_name(family: ToolFamily) -> &'static str {
         ToolFamily::NonFile => "non-file",
         ToolFamily::Unknown => "unknown",
     }
+}
+
+/// Cursor fires `sessionStart` for the empty draft composer of every window it
+/// opens, before any conversation exists, always with this placeholder id and
+/// no workspace. Kept, it piles up as one session that never holds work.
+const CURSOR_DRAFT_SESSION_ID: &str = "empty-state-draft";
+
+fn is_cursor_draft_placeholder(env: &HookEnvelope) -> bool {
+    env.agent == AgentKind::Cursor && env.session_id.as_deref() == Some(CURSOR_DRAFT_SESSION_ID)
 }
 
 /// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
@@ -7969,6 +7991,77 @@ mod tests {
             ingest_rate_key(&with_session, Some("bob")),
             "different actors sharing a session id get separate limiter buckets"
         );
+    }
+
+    #[tokio::test]
+    async fn cursor_draft_placeholder_is_dropped_before_any_capacity_is_spent() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        // One token, no refill: a placeholder that reached the limiter would
+        // leave nothing for the real conversation that follows.
+        state.ingest_rate = Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::new(0.001, 1.0)));
+        let state = Arc::new(state);
+        async fn hit(state: Arc<HookState>, sid: &str) -> (StatusCode, String) {
+            let response = handle_hook(
+                State(state),
+                Query(HookQuery {
+                    event: "session-start".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                Json(serde_json::json!({
+                    "conversation_id": sid, "session_id": sid,
+                    "hook_event_name": "sessionStart", "cursor_version": "3.24.9",
+                    "workspace_roots": [], "transcript_path": null,
+                })),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+
+        for _ in 0..2 {
+            assert_eq!(
+                hit(state.clone(), "empty-state-draft").await,
+                (
+                    StatusCode::ACCEPTED,
+                    "cursor draft placeholder dropped".into()
+                )
+            );
+        }
+        // Control: a real Cursor conversation is queued.
+        assert_eq!(
+            hit(state.clone(), "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed").await,
+            (StatusCode::ACCEPTED, "queued".into())
+        );
+        // A Claude Code session that happens to use the same id is not Cursor's.
+        let claude = handle_hook(
+            State(state),
+            Query(HookQuery {
+                event: "session-start".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(serde_json::json!({ "session_id": "empty-state-draft" })),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(claude.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"queued");
     }
 
     #[tokio::test]

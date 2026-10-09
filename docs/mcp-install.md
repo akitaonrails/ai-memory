@@ -513,9 +513,8 @@ are captured by the [Claude Code](#claude-code) hooks.
   it stops and asks for an explicit `--config-file` instead of guessing.
 - Linux: `~/.config/Claude/claude_desktop_config.json`. Anthropic ships
   Claude Desktop for Linux as a beta for Debian-based distributions
-  (Ubuntu 22.04+, Debian 12+). `install-mcp` does not detect this path on
-  Linux yet, so pass it explicitly:
-  `ai-memory install-mcp --client claude-desktop --apply --config-file ~/.config/Claude/claude_desktop_config.json`.
+  (Ubuntu 22.04+, Debian 12+). `install-mcp --client claude-desktop` writes
+  it there (`$XDG_CONFIG_HOME/Claude/` when that is set).
 
 **Important:** Claude Desktop's JSON config supports stdio MCP
 servers only. To talk to ai-memory's HTTP endpoint, bridge through

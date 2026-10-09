@@ -39,10 +39,8 @@ Two distinct MCP surfaces:
      already detects both)
    - Linux: `~/.config/Claude/claude_desktop_config.json` (**verified
      locally**; the file exists with a `preferences` object — the Linux beta
-     reuses the same file). Note ai-memory's own `docs/mcp-install.md` still
-     says "Linux: not officially distributed by Anthropic" — that is now
-     outdated versus the official Linux beta and should be updated in a
-     follow-up docs PR.
+     reuses the same file). `docs/mcp-install.md` documents it, and
+     `install-mcp --client claude-desktop` writes it on Linux.
    - Source: <https://modelcontextprotocol.io/quickstart/user> (mac/win
      paths), local file inspection, ai-memory `docs/mcp-install.md`.
    - Local MCP logs: `~/Library/Logs/Claude/mcp*.log` (mac),
