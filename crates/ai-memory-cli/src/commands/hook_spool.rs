@@ -149,7 +149,7 @@ pub fn spool_len(spool: &Path) -> usize {
 /// Deliberately content-free: counts, ages, and attempt sums only — never
 /// payload excerpts, URLs, or token material (the spool holds private capture
 /// until it drains).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SpoolHealth {
     /// Events queued locally awaiting delivery.
     pub pending: usize,
@@ -157,6 +157,28 @@ pub struct SpoolHealth {
     pub oldest_age_ms: Option<u64>,
     /// Sum of failed-delivery attempts across all queued events.
     pub retries_total: u64,
+    /// Most events the spool holds; past it the oldest undelivered ones are
+    /// evicted to make room.
+    pub capacity: usize,
+}
+
+impl Default for SpoolHealth {
+    fn default() -> Self {
+        Self {
+            pending: 0,
+            oldest_age_ms: None,
+            retries_total: 0,
+            capacity: MAX_SPOOL_FILES,
+        }
+    }
+}
+
+impl SpoolHealth {
+    /// The spool is full, so each new event evicts the oldest undelivered one.
+    #[must_use]
+    pub fn evicting(&self) -> bool {
+        self.pending >= self.capacity
+    }
 }
 
 /// Snapshot local spool health: queued count and oldest-event age from the
@@ -200,7 +222,7 @@ pub fn spool_health(spool: &Path) -> SpoolHealth {
     let mut health = SpoolHealth {
         pending: files.len(),
         oldest_age_ms: Some(now.saturating_sub(oldest_created)),
-        retries_total: 0,
+        ..SpoolHealth::default()
     };
     for (_, path) in &files {
         if let Ok(bytes) = read_spool_entry_bytes(path)

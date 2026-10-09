@@ -432,6 +432,15 @@ pub(crate) fn augment_connect_error(
     }
 }
 
+/// Whether a request failed because nothing answered — a refused connection
+/// or a timeout — rather than because the server answered with an error.
+pub(crate) fn server_unreachable(err: &anyhow::Error) -> bool {
+    let answered = err
+        .chain()
+        .any(|cause| cause.downcast_ref::<ServerResponseError>().is_some());
+    !answered && err.chain().any(error_chain_indicates_no_answer)
+}
+
 /// Whether an error chain means "nothing answered at the transport
 /// layer": reqwest classified it as a connect-phase or timeout failure,
 /// or a `ConnectionRefused`/`TimedOut` io::Error — or its platform
@@ -558,6 +567,24 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn only_an_unanswered_request_is_unreachable() {
+        let refused =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                .context("HTTP request to http://127.0.0.1:1/admin/status failed");
+        assert!(server_unreachable(&refused));
+        let answered = server_response_error_for_test(
+            reqwest::Method::GET,
+            "/admin/status",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "down for maintenance".to_owned(),
+        );
+        assert!(!server_unreachable(&answered));
+        assert!(!server_unreachable(&anyhow::anyhow!(
+            "malformed response body"
+        )));
+    }
 
     #[cfg(unix)]
     #[test]
