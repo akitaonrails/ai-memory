@@ -80,7 +80,8 @@ SQLite directly. The core read seam is `/api/v1` in API-only mode; the supported
 MCP page arguments are documented in [programmatic memory](programmatic-memory.md).
 
 Slice 1 (read-only export), slice 3 (two-way sync through the MCP write
-tool) and slice 4 (conditional writes and opt-in deletes) ship as
+tool), slice 4 (conditional writes and opt-in deletes) and slice 5 (the CI
+check and post-merge hook) ship as
 [`ai-memory-wikisync`](#ai-memory-wikisync-team-wiki-export-and-sync)
 below; the remaining slices are tracked in #986.
 
@@ -237,7 +238,7 @@ Re-home by kind:
 
 ## `ai-memory-wikisync`: team-wiki export and sync
 
-Slices 1, 3 and 4 of the accepted [team-wiki sync](#proposed-team-wiki-sync-986)
+Slices 1, 3, 4 and 5 of the accepted [team-wiki sync](#proposed-team-wiki-sync-986)
 shape, implemented at [`companions/ai-memory-wikisync`](../companions/ai-memory-wikisync)
 as a standalone Cargo package with its own `[workspace]` (mirroring the
 importer): it is not a member of the root workspace and is not covered by
@@ -263,6 +264,12 @@ family-scoped and dry-run by default.
   (`expected_page_id`, or `create_only` for a new page). It never opens the
   wiki directory or SQLite, and refuses to write to a server older than 2.7,
   which would ignore the precondition.
+- `sync --check` is read-only (no files, no state) and exits 0 in sync,
+  3 on drift, 4 on conflicts or refusals; a clone without state compares
+  the repository with the server directly. `install-hook` writes a marked
+  git `post-merge` block that runs `sync` (a dry-run report unless
+  `--on-merge apply`; never `--prefer`) and `uninstall-hook` removes only
+  that block.
 - `--include FAMILY` is an explicit, repeatable allowlist of top-level
   wiki directories; at least one is required and a bare `*` is refused.
 - Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` only;
@@ -302,6 +309,14 @@ family-scoped and dry-run by default.
   only through the write path checks (no symlinks, confined to `--dest`) and
   only if it still holds the classified bytes. A delete that is not
   propagated keeps its state entry.
+- The post-merge hook never stores a token (`--token` is refused; the hook
+  reads `AI_MEMORY_AUTH_TOKEN` at merge time), single-quotes every argument
+  and refuses newlines or NUL, is written atomically with mode 0755, refuses
+  a symlinked hook, appends to a foreign hook only with `--append` and a
+  POSIX shell shebang, and refuses a repository whose config sets
+  `core.hooksPath` (use `--hooks-dir` or `--print`). The hooks directory is
+  found by reading `.git` (worktree `gitdir:` and `commondir` included); git
+  is never run.
 - An import requires the file's frontmatter (a write clears what it omits),
   and is refused for a server page carrying any metadata the write cannot
   carry (`summary`, `sources`, `kind`, …), naming the keys.
@@ -328,7 +343,12 @@ metadata-loss refusal, the version preconditions the fixture enforces (a
 stale version is reported while the other pages apply), the old-server
 refusal, delete notices and propagated deletes with each `--prefer`, the
 delete ceiling, the pinned-page and symlink refusals, sanitizer rewrites and
-the upgrade of a slice 1 export.
+the upgrade of a slice 1 export. Binary-level tests check the `--check` exit
+codes, that it leaves the destination untouched, and drift in a clone without
+state; hook tests cover fresh install, reinstall, foreign hooks and
+`--append`, shebangs, `core.hooksPath`, worktrees, a `$(…)` workspace name
+that stays inert when the hook runs, and that a token in the environment
+never reaches the hook file.
 
 ### Roadmap (#986)
 
@@ -340,7 +360,8 @@ the upgrade of a slice 1 export.
 3. Bidirectional apply through public write tools (shipped as `sync`).
 4. Deletes and conflict reporting (shipped: `sync --propagate-deletes`,
    `--max-deletes`, conditional writes and deletes).
-5. Post-merge hook / CI integration.
+5. Post-merge hook / CI integration (shipped: `install-hook`,
+   `uninstall-hook`, `sync --check`).
 
 ## `ai-memory-macos`: menu bar wrapper
 

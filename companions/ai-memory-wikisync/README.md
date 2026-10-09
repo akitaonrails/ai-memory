@@ -2,7 +2,7 @@
 
 **Team-wiki sync** companion for
 [ai-memory](https://github.com/akitaonrails/ai-memory) (issue #986, slices
-1, 3 and 4). It keeps explicitly allowlisted page families of a running
+1, 3, 4 and 5). It keeps explicitly allowlisted page families of a running
 ai-memory server in step with a directory inside a project repository, so a
 team's shared memory can live as reviewable markdown in git:
 
@@ -10,6 +10,8 @@ team's shared memory can live as reviewable markdown in git:
 - `sync` also sends repository edits back to the server, through the public
   `memory_write_page` MCP tool, and with `--propagate-deletes` carries
   deletes both ways through `memory_delete_page`.
+- `sync --check` is a read-only CI gate, and `install-hook` runs `sync`
+  after every git merge.
 
 `sync --apply` needs ai-memory 2.7 or later: every write and delete is
 conditional on the page version the plan saw, and an older server would
@@ -174,12 +176,64 @@ Safety rules:
   prints the `git rm` to stage the deletes. Apply order is imports, exports,
   server deletes, file deletes.
 
+## CI and post-merge
+
+`sync --check` writes nothing — no files, no state — and reports through its
+exit code:
+
+| Exit | Meaning |
+|---|---|
+| 0 | in sync |
+| 1 | error (server unreachable or refusing the request, invalid destination, …) |
+| 2 | usage error (clap) |
+| 3 | drift: imports, exports or deletes are pending (unpropagated deletes count) |
+| 4 | conflicts or refusals need a person; wins over 3 |
+
+A clone without a state file (every CI checkout: the state is never
+committed) compares the repository with the server directly, so a page that
+differs is drift (3), not a conflict. `--check` cannot be combined with
+`--apply`. See [the cookbook](../../docs/cookbook.md) for a GitHub Actions job.
+
+`install-hook` writes a git `post-merge` hook so a pull or merge reports
+(or, opt-in, applies) a sync:
+
+```bash
+ai-memory-wikisync install-hook --workspace demo --project app \
+    --dest docs/wiki --include _rules --include decisions \
+    [--on-merge report|apply] [--propagate-deletes] \
+    [--hooks-dir DIR] [--append] [--print]
+ai-memory-wikisync uninstall-hook --dest docs/wiki [--hooks-dir DIR]
+```
+
+- The hook runs `( command -v ai-memory-wikisync >/dev/null &&
+  ai-memory-wikisync sync … ) || true`: a missing binary or a failed sync
+  never fails the merge. It reports by default; `--on-merge apply` adds
+  `--apply`. It never passes `--prefer`, and passes `--propagate-deletes`
+  only if it was given at install.
+- It lives between `# >>> ai-memory-wikisync >>>` and
+  `# <<< ai-memory-wikisync <<<`. Re-running `install-hook` replaces that
+  block; `uninstall-hook` removes only the block (and the file, if nothing
+  but a shebang is left).
+- The hooks directory is found by walking up from `--dest` to `.git`,
+  following a worktree's `gitdir:` file and `commondir`, so one hook serves
+  every worktree; `--dest` is written relative to the repository root. If
+  `core.hooksPath` is set in the repository's config, the install is refused:
+  pass `--hooks-dir` with that directory, or `--print` the block for your hook
+  manager.
+- No token is ever written (`--token` is refused; the hook reads
+  `AI_MEMORY_AUTH_TOKEN` when it runs), every argument is single-quoted, and
+  newlines or NUL are refused. The file is replaced atomically with mode
+  0755; a symlinked hook is refused, and an existing hook without the block
+  is refused unless `--append` is given and its shebang is a POSIX shell.
+  The companion never runs git.
+
 ## Roadmap (#986)
 
 1. Read-only export into a project repository (`export`).
 2. Conditional mutation seam (compare-and-write) in core (ai-memory 2.7).
 3. Two-way sync (`sync`): repository edits flow back through the public MCP
    write tool.
-4. **This release — deletes and conflict reporting** (`--propagate-deletes`,
-   conditional writes).
-5. Post-merge hook / CI integration.
+4. Deletes and conflict reporting (`--propagate-deletes`, conditional
+   writes).
+5. **This release — post-merge hook and CI integration** (`install-hook`,
+   `sync --check`).

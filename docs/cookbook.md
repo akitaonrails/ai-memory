@@ -136,10 +136,53 @@ ai-memory-wikisync export ...same args... --apply   # writes; prints the git com
 
 Everything is opt-in and fail-safe: the family allowlist must be explicit
 (`*` is refused), files edited locally since the last export are reported
-with a diff summary and refused without `--force`, nothing is ever deleted
-(that is a later slice), no frontmatter is forged, and the tool never runs
-git itself. Slice 1 is read-only export; bidirectional sync, deletes and
-conflict handling are tracked in #986.
+with a diff summary and refused without `--force`, no frontmatter is forged,
+and the tool never runs git itself. `sync` sends reviewed repository edits
+back through MCP (each write conditional on the version it planned against;
+needs ai-memory 2.7+), and deletes travel only with `--propagate-deletes`.
+
+### Keep it in step after merges and in CI
+
+`install-hook` writes a git `post-merge` hook that runs `sync` after every
+merge or pull — a dry-run report by default, `--on-merge apply` to write. It
+never stores a token (the hook reads `AI_MEMORY_AUTH_TOKEN` when it runs) and
+never passes `--prefer`, so conflicts still wait for a person:
+
+```bash
+ai-memory-wikisync install-hook --workspace demo --project app \
+    --dest docs/wiki --include _rules --include decisions
+ai-memory-wikisync uninstall-hook --dest docs/wiki   # removes only its block
+```
+
+In CI, `sync --check` writes nothing and exits `0` in sync, `3` when the
+repository and the server differ, and `4` on conflicts or refusals. A CI
+checkout has no sync state, so it compares the repository with the server
+directly. A GitHub Actions job that flags drift on wiki pull requests:
+
+```yaml
+name: team-wiki
+on:
+  pull_request:
+    paths: ["docs/wiki/**"]
+jobs:
+  wiki-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install --locked --git https://github.com/akitaonrails/ai-memory ai-memory-wikisync
+      - name: Compare docs/wiki with the team's ai-memory server
+        env:
+          AI_MEMORY_SERVER_URL: ${{ secrets.AI_MEMORY_SERVER_URL }}
+          AI_MEMORY_AUTH_TOKEN: ${{ secrets.AI_MEMORY_AUTH_TOKEN }}
+        run: |
+          ai-memory-wikisync sync --check \
+            --workspace demo --project app --dest docs/wiki \
+            --include _rules --include decisions
+```
+
+The server must be reachable from the runner (`serve --enable-api` behind a
+token). To tolerate drift and fail only on refusals, end the command with
+`|| [ $? -eq 3 ]`.
 
 ## Recipe: control what gets kept, aged, or consolidated
 

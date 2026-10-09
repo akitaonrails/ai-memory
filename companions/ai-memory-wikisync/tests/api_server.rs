@@ -1431,3 +1431,185 @@ async fn sync_upgrades_a_slice_one_export_without_importing() {
         DECISION_FILE
     );
 }
+
+/// Run the built binary with a clean environment: no server or token
+/// leaks in from the developer's shell.
+async fn wikisync(args: Vec<String>, envs: Vec<(&'static str, &'static str)>) -> (i32, String) {
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory-wikisync"))
+            .args(&args)
+            .env_remove("AI_MEMORY_SERVER_URL")
+            .env_remove("AI_MEMORY_AUTH_TOKEN")
+            .envs(envs)
+            .output()
+            .expect("run ai-memory-wikisync");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.code().unwrap_or(-1), text)
+    })
+    .await
+    .expect("join")
+}
+
+fn check_args(addr: SocketAddr, dest: &std::path::Path, extra: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "sync",
+        "--check",
+        "--server",
+        &format!("http://{addr}"),
+        "--workspace",
+        "demo",
+        "--project",
+        "app",
+        "--dest",
+        dest.to_str().unwrap(),
+        "--include",
+        "decisions",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    args.extend(extra.iter().map(|arg| arg.to_string()));
+    args
+}
+
+/// Every file under `root` with its bytes, so a test can prove a run left
+/// the tree exactly as it was.
+fn snapshot(root: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.insert(path.clone(), fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn sync_check_exit_codes_and_writes_nothing() {
+    let (addr, fixture) = serve(Fixture::with_pages(vec![decision()])).await;
+    let (_tmp, dest) = temp_dest();
+    sync(addr, &dest).await.expect("first sync");
+
+    let (code, out) = wikisync(check_args(addr, &dest, &[]), vec![]).await;
+    assert_eq!(code, 0, "in sync: {out}");
+
+    // Drift: the server moved on.
+    fixture.update("decisions/db.md", |page| {
+        page.body = "# DB\nServer edit.\n".into()
+    });
+    let before = snapshot(&dest);
+    let (code, out) = wikisync(check_args(addr, &dest, &[]), vec![]).await;
+    assert_eq!(code, 3, "drift: {out}");
+    assert_eq!(snapshot(&dest), before, "--check wrote something");
+
+    // A conflict outranks drift.
+    fs::write(
+        dest.join("decisions/db.md"),
+        DECISION_FILE.replace("Use Postgres.", "Repo edit."),
+    )
+    .unwrap();
+    fs::write(
+        dest.join("decisions/new.md"),
+        "---\ntitle: \"New\"\n---\n# New\n",
+    )
+    .unwrap();
+    let before = snapshot(&dest);
+    let (code, out) = wikisync(check_args(addr, &dest, &[]), vec![]).await;
+    assert_eq!(code, 4, "conflict: {out}");
+    assert_eq!(snapshot(&dest), before, "--check wrote something");
+    assert!(fixture.mcp_calls.lock().unwrap().is_empty());
+
+    // An unreachable server is an error, not a verdict.
+    let mut unreachable = check_args(addr, &dest, &[]);
+    unreachable[3] = "http://127.0.0.1:1".to_string();
+    let (code, out) = wikisync(unreachable, vec![]).await;
+    assert_eq!(code, 1, "error: {out}");
+
+    // --check and --apply cannot be combined (a clap usage error).
+    let (code, _) = wikisync(check_args(addr, &dest, &["--apply"]), vec![]).await;
+    assert_eq!(code, 2);
+}
+
+/// A CI checkout has no state (it is never committed): the repository is
+/// compared with the server directly, and a difference is drift.
+#[tokio::test]
+async fn sync_check_in_a_fresh_clone_reports_drift_not_conflict() {
+    let mut other = decision();
+    other.path = "decisions/other.md".to_string();
+    let (addr, fixture) = serve(Fixture::with_pages(vec![decision(), other])).await;
+    let (_tmp, dest) = temp_dest();
+    sync(addr, &dest).await.expect("first sync");
+    fs::remove_dir_all(dest.join(".ai-memory-wikisync")).unwrap();
+
+    let (code, out) = wikisync(check_args(addr, &dest, &[]), vec![]).await;
+    assert_eq!(code, 0, "a matching clone is in sync: {out}");
+
+    fixture.update("decisions/db.md", |page| {
+        page.body = "# DB\nServer edit.\n".into()
+    });
+    let before = snapshot(&dest);
+    let (code, out) = wikisync(check_args(addr, &dest, &[]), vec![]).await;
+    assert_eq!(code, 3, "differs is drift: {out}");
+    assert!(out.contains("differs"), "{out}");
+    assert_eq!(snapshot(&dest), before);
+    assert!(
+        !dest.join(".ai-memory-wikisync").exists(),
+        "--check never creates state"
+    );
+}
+
+#[tokio::test]
+async fn install_hook_never_writes_a_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join(".git/hooks")).unwrap();
+    fs::create_dir_all(root.join("docs/wiki")).unwrap();
+    let dest = root.join("docs/wiki");
+    let base = |extra: &[&str]| {
+        let mut args: Vec<String> = [
+            "install-hook",
+            "--workspace",
+            "demo",
+            "--project",
+            "app",
+            "--dest",
+            dest.to_str().unwrap(),
+            "--include",
+            "decisions",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        args.extend(extra.iter().map(|arg| arg.to_string()));
+        args
+    };
+
+    let (code, out) = wikisync(base(&["--token", "sekrit-flag"]), vec![]).await;
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("never stores a token"), "{out}");
+    assert!(!root.join(".git/hooks/post-merge").exists());
+
+    let (code, out) = wikisync(
+        base(&["--on-merge", "apply"]),
+        vec![("AI_MEMORY_AUTH_TOKEN", "sekrit-env")],
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    let hook = fs::read_to_string(root.join(".git/hooks/post-merge")).unwrap();
+    assert!(!hook.contains("sekrit"), "{hook}");
+    assert!(!hook.contains("AI_MEMORY_AUTH_TOKEN"), "{hook}");
+    assert!(!out.contains("sekrit"), "{out}");
+}

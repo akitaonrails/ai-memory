@@ -1,17 +1,28 @@
 //! Thin CLI: parse arguments once, call the library, render output.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-use ai_memory_wikisync::bidi::{self, DEFAULT_MAX_DELETES, Prefer, SyncArgs, SyncMode};
+use ai_memory_wikisync::bidi::{
+    self, CheckStatus, DEFAULT_MAX_DELETES, Prefer, SyncArgs, SyncMode,
+};
 use ai_memory_wikisync::client::DEFAULT_SERVER_URL;
+use ai_memory_wikisync::hook::{self, HookSpec, InstallArgs, OnMerge};
 use ai_memory_wikisync::sync::{Mode, RunArgs, run};
 use clap::{Parser, Subcommand, ValueEnum};
+
+/// Exit codes. 2 is left to clap's usage errors.
+const EXIT_ERROR: u8 = 1;
+/// `sync --check`: imports, exports or deletes are pending.
+const EXIT_DRIFT: u8 = 3;
+/// `sync --check`: conflicts or refusals need a person; wins over drift.
+const EXIT_BLOCKED: u8 = 4;
 
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
-    about = "Team-wiki sync companion for ai-memory (#986): export and two-way sync"
+    about = "Team-wiki sync companion for ai-memory (#986): export, two-way sync, CI check and post-merge hook"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,7 +38,13 @@ enum Commands {
     Export(ExportArgs),
     /// Sync both ways: repository edits go to the server through MCP,
     /// server edits come to --dest. Dry-run unless --apply is passed.
+    /// With --check, exits 0 in sync, 3 on drift, 4 on conflicts or refusals.
     Sync(SyncCliArgs),
+    /// Install a git post-merge hook that runs `sync` after each merge: a
+    /// dry-run report unless --on-merge apply. Never stores a token.
+    InstallHook(InstallHookArgs),
+    /// Remove the post-merge hook block install-hook wrote, and nothing else.
+    UninstallHook(UninstallHookArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -35,6 +52,11 @@ struct SyncCliArgs {
     /// Perform the writes. Without it, sync stays a dry-run.
     #[arg(long)]
     apply: bool,
+    /// Read-only CI check: write nothing (not even state) and exit 0 in
+    /// sync, 3 when changes are pending, 4 on conflicts or refusals. A clone
+    /// without sync state compares the repository with the server directly.
+    #[arg(long, conflicts_with = "apply")]
+    check: bool,
     /// Which side wins a page changed in the repository and on the server.
     /// Without it, such a page is a conflict and nothing is written.
     #[arg(long, value_enum)]
@@ -51,6 +73,61 @@ struct SyncCliArgs {
     max_deletes: usize,
     #[command(flatten)]
     common: CommonArgs,
+}
+
+#[derive(Parser, Debug, Clone)]
+struct InstallHookArgs {
+    /// Print the hook block instead of writing it.
+    #[arg(long)]
+    print: bool,
+    /// What the hook does after a merge.
+    #[arg(long, value_enum, default_value = "report")]
+    on_merge: OnMergeArg,
+    /// Have the hook pass --propagate-deletes.
+    #[arg(long)]
+    propagate_deletes: bool,
+    /// Hooks directory to write to, instead of the repository's .git/hooks.
+    #[arg(long, value_name = "DIR")]
+    hooks_dir: Option<PathBuf>,
+    /// Add the block to an existing post-merge hook (POSIX shell only).
+    #[arg(long)]
+    append: bool,
+    /// Server origin to bake into the hook. Without it the hook uses
+    /// AI_MEMORY_SERVER_URL or the default when it runs.
+    #[arg(long)]
+    server: Option<String>,
+    /// Refused: the hook reads AI_MEMORY_AUTH_TOKEN when it runs, so no
+    /// token is ever written to disk.
+    #[arg(long, hide = true)]
+    token: Option<String>,
+    /// Source workspace on the server.
+    #[arg(long)]
+    workspace: String,
+    /// Source project on the server.
+    #[arg(long)]
+    project: String,
+    /// Destination directory inside the repository.
+    #[arg(long)]
+    dest: PathBuf,
+    /// Top-level wiki directory (family) to sync; repeatable.
+    #[arg(long = "include", value_name = "FAMILY")]
+    include: Vec<String>,
+}
+
+#[derive(Parser, Debug, Clone)]
+struct UninstallHookArgs {
+    /// A directory inside the repository whose hook to remove.
+    #[arg(long, default_value = ".")]
+    dest: PathBuf,
+    /// Hooks directory to edit, instead of the repository's .git/hooks.
+    #[arg(long, value_name = "DIR")]
+    hooks_dir: Option<PathBuf>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum OnMergeArg {
+    Report,
+    Apply,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -136,28 +213,75 @@ impl From<SyncCliArgs> for SyncArgs {
     }
 }
 
+impl InstallHookArgs {
+    fn into_install(self) -> anyhow::Result<InstallArgs> {
+        if self.token.is_some() {
+            anyhow::bail!(
+                "install-hook never stores a token; the hook reads AI_MEMORY_AUTH_TOKEN from \
+                 the environment git runs it in"
+            );
+        }
+        Ok(InstallArgs {
+            spec: HookSpec {
+                server: self.server,
+                workspace: self.workspace,
+                project: self.project,
+                dest: self.dest,
+                include: self.include,
+                on_merge: match self.on_merge {
+                    OnMergeArg::Report => OnMerge::Report,
+                    OnMergeArg::Apply => OnMerge::Apply,
+                },
+                propagate_deletes: self.propagate_deletes,
+            },
+            print: self.print,
+            hooks_dir: self.hooks_dir,
+            append: self.append,
+        })
+    }
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+async fn main() -> ExitCode {
+    match dispatch(Cli::parse()).await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+async fn dispatch(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
-        Commands::Plan(args) => run(&RunArgs::from(args), Mode::Plan).await,
+        Commands::Plan(args) => run(&RunArgs::from(args), Mode::Plan).await?,
         Commands::Export(args) => {
             let mode = if args.apply {
                 Mode::Apply
             } else {
                 Mode::DryRun
             };
-            run(&RunArgs::from(args), mode).await
+            run(&RunArgs::from(args), mode).await?
         }
         Commands::Sync(args) => {
-            let mode = if args.apply {
-                SyncMode::Apply
-            } else {
-                SyncMode::DryRun
+            let mode = match (args.check, args.apply) {
+                (true, _) => SyncMode::Check,
+                (false, true) => SyncMode::Apply,
+                (false, false) => SyncMode::DryRun,
             };
-            bidi::run(&SyncArgs::from(args), mode).await.map(|_| ())
+            let outcome = bidi::run(&SyncArgs::from(args), mode).await?;
+            if mode == SyncMode::Check {
+                return Ok(match outcome.status() {
+                    CheckStatus::InSync => ExitCode::SUCCESS,
+                    CheckStatus::Drift => ExitCode::from(EXIT_DRIFT),
+                    CheckStatus::Blocked => ExitCode::from(EXIT_BLOCKED),
+                });
+            }
         }
+        Commands::InstallHook(args) => hook::install(&args.into_install()?)?,
+        Commands::UninstallHook(args) => hook::uninstall(&args.dest, args.hooks_dir.as_deref())?,
     }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -175,7 +299,8 @@ mod tests {
             .flat_map(|sub| {
                 let name = sub.get_name().to_string();
                 sub.get_arguments()
-                    .filter(|arg| arg.get_id() == "token")
+                    // install-hook's --token reads no env var; it is refused.
+                    .filter(|arg| arg.get_id() == "token" && arg.get_env().is_some())
                     .map(|arg| (name.clone(), arg.is_hide_env_values_set()))
                     .collect::<Vec<_>>()
             })

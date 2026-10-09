@@ -1,4 +1,4 @@
-//! `ai-memory-wikisync`: team-wiki sync companion (#986, slices 1, 3 and 4).
+//! `ai-memory-wikisync`: team-wiki sync companion (#986, slices 1, 3, 4 and 5).
 //!
 //! Keeps explicitly allowlisted page families of a running ai-memory server
 //! in step with a directory inside a project repository. Reads go through
@@ -14,6 +14,7 @@
 
 pub mod bidi;
 pub mod client;
+pub mod hook;
 pub mod mcp;
 pub mod page_file;
 pub mod paths;
