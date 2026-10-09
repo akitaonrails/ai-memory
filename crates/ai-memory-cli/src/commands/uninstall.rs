@@ -1258,7 +1258,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         // Muse Code spells the key snake_case; the camelCase spelling the
         // clients above use would leave the entry behind.
         McpClient::Muse => Some(&["mcp_servers"]),
-        McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
+        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
     }
 }
 

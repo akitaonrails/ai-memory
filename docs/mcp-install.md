@@ -152,7 +152,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse / dsh
 > ```
 
 ---
@@ -492,6 +492,37 @@ resuming when you need continuity.
 
 Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
 <https://dev.meta.ai/docs/muse-code/extending>.
+
+---
+
+## DeepSeek Harness (DSH)
+
+**Status:** MCP supported (print-only). No lifecycle hooks or managed workstream claimed.
+
+DSH has no fixed JSON/TOML MCP config: the MCP client is a Cordis plugin entry
+(`@deepseek-ai/dsh-mcp-client`) inside a profile's `cordis.patch.yml`.
+`install-mcp` therefore prints a ready-to-merge patch fragment and **refuses
+`--apply`**:
+
+```bash
+ai-memory install-mcp --client dsh
+```
+
+Merge the printed `- insert:` item into
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml` — the `web` profile
+reloads its patch live — then reload or restart the profile. The fragment registers
+the default stateless HTTP endpoint and carries `Authorization: Bearer <token>`
+when `--auth-token` (or a configured server token) is present.
+
+DSH ships a bridge that runs an existing Claude Code `hooks.json` or settings
+file (`@deepseek-ai/dsh-hooks-claude-code`), so lifecycle capture for a DSH
+session is possible by pointing that bridge at a Claude Code hook config. ai-memory
+does not install or manage it, and the bridge delivers only seven Claude Code events
+(`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`Stop`, `SubagentStart`, `SubagentStop`) — `PreCompact` and
+`SessionEnd` are not delivered, and its `SessionStart` injection runs
+detached. Treat DSH as MCP-only here and recover handoffs explicitly with
+`memory_handoff_list` then `memory_handoff_accept` when continuity matters.
 
 ---
 

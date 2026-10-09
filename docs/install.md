@@ -1696,6 +1696,10 @@ docker run --rm akitaonrails/ai-memory:latest \
 docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client zcode           --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client dsh             --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
 ```
 
 Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and OpenClaw support both
@@ -1708,10 +1712,9 @@ so those hooks do not accept the handoff. The first `PostToolUse` prints
 `hookSpecificOutput.additionalContext` (pending handoff, plus an opted-in
 `[briefing]`). The model sees it after that tool result, not before the
 first prompt. A session with no tool call leaves the handoff for
-`memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed,
-and ZCode
-are MCP-only here, so you'll need to nudge the model to call
-`memory_query` / `memory_handoff_accept` itself.
+`memory_handoff_accept`. Claude Desktop, VS Code Copilot, Zed, ZCode, and
+DeepSeek Harness (DSH) are MCP-only here, so you'll need to nudge the model
+to call `memory_query` / `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent, except
 for Zero's no-stdout SessionStart behavior. Grok delivers on the first

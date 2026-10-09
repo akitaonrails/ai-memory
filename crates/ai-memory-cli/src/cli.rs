@@ -2656,6 +2656,14 @@ pub enum McpClient {
     /// `SessionStart` output contract is not, so lifecycle capture and
     /// managed workstreams are not claimed. See `install-mcp --client muse`.
     Muse,
+    /// DeepSeek Harness (DSH) - MCP-only. DSH has no fixed JSON/TOML MCP
+    /// config: the client is a Cordis plugin entry
+    /// (@deepseek-ai/dsh-mcp-client) inside a profile's cordis.patch.yml.
+    /// This integration is print-only (--apply is refused); merge the
+    /// rendered insert list into the profile patch. Pair it with DSH's
+    /// @deepseek-ai/dsh-hooks-claude-code bridge for lifecycle capture.
+    #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
+    Dsh,
 }
 
 /// Arguments for `commit`.

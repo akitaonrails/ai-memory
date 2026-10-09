@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `install-mcp --client dsh` for the DeepSeek Harness (aliases
+  `deepseek-harness` and `deepseek_harness`). DSH keeps its MCP client in
+  a Cordis profile patch rather than a fixed config file, so the command prints a
+  ready-to-merge `- insert:` fragment for `@deepseek-ai/dsh-mcp-client` and
+  refuses `--apply`.
+
 ### Fixed
 - Fixed Cursor tool calls being stored with no title or content: Cursor's own
   hooks, and the Claude Code hooks Cursor also runs, send Claude's
