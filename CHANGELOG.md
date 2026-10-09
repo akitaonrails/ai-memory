@@ -106,7 +106,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entries. Both fields were documented as profile-entry frontmatter, but no
   tool could set them, so scoping an entry to a stack or keeping it out of the
   digest meant editing the wiki file by hand, and the next tool rewrite of the
-  entry dropped the value. (#1178)
+  entry dropped the value. A tag the profile cannot detect in any project
+  (`typscript`) is refused instead of silently hiding the entry, and both
+  arguments are refused on any page the digest does not read: one outside
+  `profile/`, or a `profile/` path in an ordinary project. (#1178)
 
 ### Changed
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,

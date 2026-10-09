@@ -103,8 +103,12 @@ folder: `stack`, `architecture`, `workflow`, `testing`, `tools`, `style` or
 `applies_to: ["rust"]` and `enforced_by: "pre-push hook"` in the tool call,
 or `--applies-to rust --enforced-by "pre-push hook"` on the command line
 (with `--workspace default --project _global --path profile/...` in the
-default deployment). Like the other metadata, a rewrite that omits them
-clears them.
+default deployment). A tag must be one the profile detects in a project
+(`rust`, `typescript`, `python`, ...); an unknown tag is refused rather than
+silently hiding the entry. Like the other metadata, a rewrite that omits them
+clears them. Both are refused on a page the digest does not read: one outside
+`profile/`, or a `profile/` path in a project other than `_global` or a
+profile project.
 
 Entries are ordinary wiki pages, markdown in git: edit them by hand, and every
 change is versioned. `memory_delete_page` with `scope: "profile"` removes one

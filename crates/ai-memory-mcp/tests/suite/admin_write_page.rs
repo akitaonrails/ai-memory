@@ -720,9 +720,11 @@ async fn write_page_metadata_store_failure_rolls_back_and_recovers() {
 }
 
 /// The route `ai-memory write-page` posts to sets a profile entry's
-/// `applies_to` and `enforced_by`.
+/// `applies_to` and `enforced_by`, refuses an unknown tag with 422, and
+/// refuses both keys on a page outside `profile/`, or on a `profile/` path in
+/// an ordinary project, before creating its scope.
 #[tokio::test]
-async fn write_page_sets_profile_fields() {
+async fn write_page_sets_profile_fields_and_refuses_them_elsewhere() {
     let tmp = TempDir::new().unwrap();
     let state = make_state(&tmp).await;
     let request = json!({
@@ -731,7 +733,7 @@ async fn write_page_sets_profile_fields() {
         "enforced_by": "pre-push hook"
     });
     assert_eq!(
-        post_json(state.clone(), "/admin/write-page", request)
+        post_json(state.clone(), "/admin/write-page", request.clone())
             .await
             .status(),
         StatusCode::OK
@@ -750,4 +752,38 @@ async fn write_page_sets_profile_fields() {
     let md = state.wiki.read_page(ws, global, &path).unwrap();
     assert_eq!(md.frontmatter["applies_to"], json!(["typescript"]));
     assert_eq!(md.frontmatter["enforced_by"], "pre-push hook");
+
+    let mut unknown = request.clone();
+    unknown["applies_to"] = json!(["typscript"]);
+    let resp = post_json(state.clone(), "/admin/write-page", unknown).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("typscript")
+    );
+
+    let ws = state
+        .reader
+        .find_workspace("default".into())
+        .await
+        .unwrap()
+        .unwrap();
+    for path in ["notes/types.md", "profile/style/types.md"] {
+        let mut stray = request.clone();
+        stray["project"] = json!("fresh");
+        stray["path"] = json!(path);
+        let resp = post_json(state.clone(), "/admin/write-page", stray).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
+        assert!(
+            state
+                .reader
+                .find_project(ws, "fresh".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "{path}: refused before the project is created"
+        );
+    }
 }

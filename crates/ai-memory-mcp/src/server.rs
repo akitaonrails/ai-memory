@@ -4293,7 +4293,7 @@ impl AiMemoryServer {
         calls surface it. A profile entry also takes `applies_to` (stack \
         tags such as `rust`, limiting it to projects on that stack) and \
         `enforced_by` (what already enforces it, which keeps it out of the \
-        digest). `scope: \"global\"` writes the \
+        digest); other pages refuse both. `scope: \"global\"` writes the \
         reserved `_global` scope directly. \
         \
         Optional `kind`, `entities`, `abstract`, and `relations` carry bounded \
@@ -4347,11 +4347,23 @@ impl AiMemoryServer {
         path.ensure_portable()
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
-        let path = if args.scope.as_deref().map(str::trim) == Some("profile") {
+        let profile_scope = args.scope.as_deref().map(str::trim) == Some("profile");
+        let path = if profile_scope {
             profile_page_path(path)?
         } else {
             path
         };
+        ai_memory_core::page::ensure_profile_metadata_placement(
+            &metadata,
+            &path,
+            profile_scope
+                || args
+                    .project
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(ai_memory_core::profile::is_reserved_scope_project),
+        )
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let session_page =
             session_id.is_some_and(|id| path.as_str() == format!("sessions/{id}.md"));
         // Consolidation writes the session page as episodic; keep that
@@ -15604,7 +15616,10 @@ mod tests {
 
     /// `applies_to` and `enforced_by` reach a profile entry's frontmatter
     /// through the tool, in the shape the digest reads; a rewrite keeps them
-    /// only when it passes them again (writes replace all metadata).
+    /// only when it passes them again (writes replace all metadata); an
+    /// unknown tag, or either key on a page outside `profile/` or on a
+    /// `profile/` path in an ordinary project, is refused before anything is
+    /// written.
     #[tokio::test]
     async fn memory_write_page_sets_profile_applies_to_and_enforced_by() {
         let tmp = TempDir::new().unwrap();
@@ -15666,6 +15681,61 @@ mod tests {
         let entry = read(&wiki);
         assert_eq!(entry.applies_to, ["typescript"], "passed again, kept");
         assert!(entry.enforced_by);
+
+        let err = server
+            .memory_write_page(
+                Parameters(with_fields(&["typscript"], None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a tag no project is detected with is refused");
+        assert!(err.message.contains("typscript"), "{}", err.message);
+        assert_eq!(
+            read(&wiki).applies_to,
+            ["typescript"],
+            "refused write left it"
+        );
+
+        let mut stray = with_fields(&["rust"], None);
+        stray.scope = None;
+        stray.path = "notes/types.md".into();
+        stray.workspace = Some("fresh".into());
+        stray.project = Some("fresh".into());
+        let err = server
+            .memory_write_page(Parameters(stray), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("applies_to is refused outside profile/");
+        assert!(err.message.contains("profile"), "{}", err.message);
+        assert!(
+            store
+                .reader
+                .find_workspace("fresh".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "refused before the scope is created"
+        );
+
+        // A `profile/` path in an ordinary project is not a profile entry:
+        // the digest never reads it.
+        let mut stray = with_fields(&["rust"], None);
+        stray.scope = None;
+        stray.path = "profile/style/types.md".into();
+        stray.workspace = Some("fresh".into());
+        stray.project = Some("fresh".into());
+        server
+            .memory_write_page(Parameters(stray), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("applies_to is refused on a profile/ path outside the profile");
+        assert!(
+            store
+                .reader
+                .find_workspace("fresh".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "refused before the scope is created"
+        );
 
         server
             .memory_write_page(
