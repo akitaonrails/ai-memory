@@ -344,8 +344,10 @@ impl PageWriteMetadata {
 /// digest never reads, where the caller's intent would silently do nothing:
 /// one outside `profile/`, or one written to a project that cannot hold a
 /// profile. `profile_scope` says whether the write targets the profile
-/// (`scope: "profile"`, or `_global` or a reserved profile project by name);
-/// the caller decides it from the request, before any scope is created.
+/// (`scope: "profile"` or `"global"`, or `_global` or a reserved profile
+/// project by name); the caller decides it from the request, before any
+/// scope is created. It looks at the project name only, not the workspace
+/// or share mode, so it errs lenient.
 ///
 /// # Errors
 /// Returns `MalformedRecord` naming the first such key.

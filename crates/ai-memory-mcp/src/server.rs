@@ -4347,16 +4347,18 @@ impl AiMemoryServer {
         path.ensure_portable()
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
-        let profile_scope = args.scope.as_deref().map(str::trim) == Some("profile");
+        let scope = args.scope.as_deref().map(str::trim);
+        let profile_scope = scope == Some("profile");
         let path = if profile_scope {
             profile_page_path(path)?
         } else {
             path
         };
+        // `scope: "global"` writes `default/_global`, the single-user profile.
         ai_memory_core::page::ensure_profile_metadata_placement(
             &metadata,
             &path,
-            profile_scope
+            matches!(scope, Some("profile" | "global"))
                 || args
                     .project
                     .as_deref()
@@ -15736,6 +15738,29 @@ mod tests {
                 .is_none(),
             "refused before the scope is created"
         );
+
+        // `scope: "global"` writes `default/_global`, the single-user
+        // profile, so a `profile/` path there is a profile entry.
+        let mut global_entry = with_fields(&["rust"], None);
+        global_entry.scope = Some("global".into());
+        global_entry.path = "profile/style/x.md".into();
+        server
+            .memory_write_page(
+                Parameters(global_entry),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("scope global takes applies_to on a profile/ path");
+        let global_path = PagePath::new("profile/style/x.md").unwrap();
+        let md = wiki.read_page(ws, global, &global_path).unwrap();
+        assert_eq!(md.frontmatter["applies_to"], serde_json::json!(["rust"]));
+        let mut global_note = with_fields(&["rust"], None);
+        global_note.scope = Some("global".into());
+        global_note.path = "notes/x.md".into();
+        server
+            .memory_write_page(Parameters(global_note), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("scope global still refuses applies_to outside profile/");
 
         server
             .memory_write_page(
