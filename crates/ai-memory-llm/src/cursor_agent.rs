@@ -91,7 +91,7 @@ impl CursorAgentProvider {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = command.spawn().map_err(|err| {
+        let mut child = spawn_retrying_busy(&mut command).await.map_err(|err| {
             LlmError::NotConfigured(format!(
                 "cursor agent CLI ({}) failed to start: {err}. Install the Cursor agent \
                  or set AI_MEMORY_CURSOR_AGENT",
@@ -299,4 +299,24 @@ pub fn cursor_executable(override_path: Option<&Path>) -> PathBuf {
     override_path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("agent"))
+}
+
+/// Spawn, retrying briefly while the executable is busy (ETXTBSY): a file
+/// still open for writing in another process — an agent binary being
+/// replaced by its updater, or a just-written script whose descriptor a
+/// concurrent fork inherited until its exec — cannot be executed yet.
+async fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<tokio::process::Child> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            result => return result,
+        }
+    }
 }
