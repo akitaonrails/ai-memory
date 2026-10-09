@@ -43,6 +43,10 @@ pub struct PageSummary {
 /// locally.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiPage {
+    /// Latest version id, the token a conditional MCP write or delete
+    /// passes back. Servers older than 2.7 do not send it.
+    #[serde(default)]
+    pub id: Option<String>,
     pub path: String,
     pub body_markdown: String,
     #[serde(default)]
@@ -157,46 +161,6 @@ impl ApiClient {
             .await
             .map_err(|e| anyhow!("request to {} failed: {e}", url.as_str()))?;
         check_status(response, url, not_found_hint)
-    }
-
-    /// Read one full page, or `None` when the server has no such page. Used
-    /// right before an import, where absence is an answer, not an error.
-    pub async fn read_page_if_exists(
-        &self,
-        workspace: &str,
-        project: &str,
-        path: &str,
-    ) -> Result<Option<ApiPage>> {
-        let tail: Vec<&str> = path.split('/').collect();
-        let url = self.build_page_url(workspace, project, &tail)?;
-        let mut request = self
-            .http
-            .get(url.clone())
-            .header(reqwest::header::ACCEPT, "application/json");
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| anyhow!("request to {} failed: {e}", url.as_str()))?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let response = check_status(response, &url, "")?;
-        let page: ApiPage = response.json().await.map_err(|e| {
-            anyhow!(
-                "page read from {} returned malformed JSON: {e}",
-                url.as_str()
-            )
-        })?;
-        if page.path != path {
-            bail!(
-                "server answered a read of {path:?} with page {:?}; refusing the mismatch",
-                page.path
-            );
-        }
-        Ok(Some(page))
     }
 
     /// List the project's latest pages via incremental `recent` paging from

@@ -351,6 +351,7 @@ async fn run_batch(
             .read_page(&args.workspace, &args.project, &page.path, etag_hint)
             .await?;
         let mut body = read.page.as_ref().map(render_page).transpose()?;
+        let mut page_id = read.page.as_ref().and_then(|page| page.id.clone());
         let mut decision = classify(
             disk.as_deref(),
             base,
@@ -363,6 +364,7 @@ async fn run_batch(
                 .read_page(&args.workspace, &args.project, &page.path, None)
                 .await?;
             body = refetch.page.as_ref().map(render_page).transpose()?;
+            page_id = refetch.page.as_ref().and_then(|page| page.id.clone());
             decision = classify(
                 disk.as_deref(),
                 base,
@@ -375,7 +377,10 @@ async fn run_batch(
             page,
             disk.as_deref(),
             body,
-            read.etag,
+            Versions {
+                etag: read.etag,
+                page_id,
+            },
             decision,
             args.force,
         )?;
@@ -400,6 +405,12 @@ async fn run_batch(
     Ok((report, new_state, applied))
 }
 
+/// The server's version markers for one page read.
+struct Versions {
+    etag: Option<String>,
+    page_id: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_decision(
     report: &mut Report,
@@ -407,10 +418,11 @@ fn record_decision(
     page: PageSummary,
     disk: Option<&[u8]>,
     body: Option<String>,
-    etag: Option<String>,
+    versions: Versions,
     decision: Classification,
     force: bool,
 ) -> Result<()> {
+    let Versions { etag, page_id } = versions;
     match decision {
         Classification::Unchanged => {
             if let Some(body) = &body {
@@ -421,6 +433,7 @@ fn record_decision(
                     PageState {
                         hash: state::sha256_hex(body.as_bytes()),
                         etag,
+                        page_id,
                     },
                 );
             }
@@ -439,6 +452,7 @@ fn record_decision(
                 PageState {
                     hash: state::sha256_hex(body.as_bytes()),
                     etag: etag.clone(),
+                    page_id: page_id.clone(),
                 },
             );
             report.writes.push(PlannedWrite {
@@ -465,6 +479,7 @@ fn record_decision(
                         PageState {
                             hash: state::sha256_hex(body.as_bytes()),
                             etag: etag.clone(),
+                            page_id,
                         },
                     );
                     report.writes.push(PlannedWrite {
@@ -592,6 +607,7 @@ mod tests {
         PageState {
             hash: hash.to_string(),
             etag: etag.map(str::to_owned),
+            page_id: None,
         }
     }
 

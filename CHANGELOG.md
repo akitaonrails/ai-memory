@@ -15,6 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   current version, and changes nothing. `memory_read_page` returns the version
   as `page_id` and `/api/v1` pages as `id`. This is the compare-and-write the
   team-wiki sync needed (#986).
+- The `ai-memory-wikisync` companion gained CI and post-merge integration
+  (#986, slice 5): `sync --check` writes nothing and exits 0 in sync, 3 on
+  drift and 4 on conflicts or refusals (a clone without sync state compares
+  the repository with the server directly), and `install-hook` /
+  `uninstall-hook` manage a marked git `post-merge` block that runs `sync`
+  after each merge — a dry-run report unless `--on-merge apply`, never with
+  `--prefer`, and never with a stored token. The cookbook has a GitHub
+  Actions recipe. (#986)
+- The `ai-memory-wikisync` companion now propagates deletes with
+  `sync --propagate-deletes` (#986, slice 4): a file deleted in the repository
+  deletes its server page through `memory_delete_page`, and a page deleted on
+  the server deletes its file, when the other side is unchanged since the last
+  sync. A delete against an edit is a conflict that `--prefer` resolves, more
+  than `--max-deletes` (default 10) refuses the run, and a pinned page is
+  deleted only with `--prefer repo`. Every sync write and delete now carries
+  the page version it was planned against, so a page changed during the run is
+  reported and left alone while the rest apply, and `sync --apply` refuses a
+  server older than 2.7. Without the flag deletes are still only reported.
+  (#986)
 - `ai-memory doctor` now reports three silent capture failures: an unreachable
   server (reported instead of aborting the check), a hook spool that is full and
   evicting undelivered events, and installed ai-memory Codex hooks that Codex
