@@ -408,8 +408,14 @@ mod tests {
         .unwrap();
         let signed_in = NotFoundView {}.render().unwrap();
         assert!(!login.contains(&version), "login page leaks {version}");
-        assert!(!change.contains(&version), "change-password page leaks {version}");
-        assert!(signed_in.contains(&version), "signed-in pages show {version}");
+        assert!(
+            !change.contains(&version),
+            "change-password page leaks {version}"
+        );
+        assert!(
+            signed_in.contains(&version),
+            "signed-in pages show {version}"
+        );
     }
 
     #[test]
