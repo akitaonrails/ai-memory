@@ -237,9 +237,10 @@ native HTTP or generated bridge paths.
 
 ## GitHub Copilot CLI
 
-**Status:** MCP and lifecycle hooks are supported. Handoffs are not injected
-at `SessionStart` yet (see below), and there is no managed workstream
-(`ai-memory run copilot`).
+**Status:** MCP and lifecycle hooks are supported, the `SessionStart` hook
+injects the pending handoff (see below), and `ai-memory run copilot` launches
+Copilot CLI as a managed workstream harness (see
+[managed workstreams](managed-workstreams.md)).
 
 **Config files:** `$COPILOT_HOME/mcp-config.json` for MCP and
 `$COPILOT_HOME/hooks/ai-memory.json` for lifecycle hooks (`COPILOT_HOME`
@@ -497,7 +498,9 @@ Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
 
 ## Claude Desktop
 
-**Status:** ✅ MCP supported (via stdio shim for HTTP). ❌ No lifecycle hooks.
+**Status:** ✅ MCP supported (via stdio shim for HTTP). ❌ No lifecycle hooks
+in the Chat tab. The Code tab runs Claude Code itself, so its local sessions
+are captured by the [Claude Code](#claude-code) hooks.
 
 **Config file:**
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
@@ -508,8 +511,11 @@ Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
   `Claude_*` package directories automatically and prefers one that
   already contains a config. If multiple candidates remain ambiguous,
   it stops and asks for an explicit `--config-file` instead of guessing.
-- Linux: not officially distributed by Anthropic. Use Claude Code
-  (terminal) instead.
+- Linux: `~/.config/Claude/claude_desktop_config.json`. Anthropic ships
+  Claude Desktop for Linux as a beta for Debian-based distributions
+  (Ubuntu 22.04+, Debian 12+). `install-mcp` does not detect this path on
+  Linux yet, so pass it explicitly:
+  `ai-memory install-mcp --client claude-desktop --apply --config-file ~/.config/Claude/claude_desktop_config.json`.
 
 **Important:** Claude Desktop's JSON config supports stdio MCP
 servers only. To talk to ai-memory's HTTP endpoint, bridge through
@@ -531,16 +537,29 @@ stdio shim. Requires Node.js installed on the same machine.
 - After editing the config, **fully quit and relaunch** Claude
   Desktop. "Check for Updates…" is not enough.
 - Claude Desktop also has account-level remote custom connectors and
-  `.mcpb` desktop extensions. The ai-memory CLI manages the local
+  `.mcpb` desktop extensions, which Anthropic now presents as the main way
+  to install local MCP servers. The ai-memory CLI manages the local
   JSON-config path because it works with localhost/LAN servers and does
   not require publishing an HTTPS connector.
+- Servers in `claude_desktop_config.json` also reach the Code tab's local
+  sessions, alongside `~/.claude.json` and `.mcp.json`; when both define a
+  server with the same name, the Code tab uses the
+  `claude_desktop_config.json` entry.
 - Claude Desktop's ordinary Chat surface exposes MCP tools but does not run
-  plugin lifecycle hooks, so ai-memory cannot automatically capture its
-  prompts/tools or inject session-boundary handoffs. Cowork is a distinct
-  surface: Anthropic documents that Cowork plugins can run hooks, but ai-memory
-  does not yet ship a Cowork plugin or claim its event/payload semantics.
+  lifecycle hooks, so ai-memory cannot automatically capture its
+  prompts/tools or inject session-boundary handoffs.
+- The Code tab reads the same `~/.claude/settings.json` as the CLI, so
+  `install-hooks --agent claude-code` already captures its local sessions
+  (as `claude-code`). A Code session started without a project folder runs
+  in a scratch directory under
+  `~/.config/Claude/scratch-workspaces/`, so each one lands in its own
+  auto-named project.
+- Cowork is a distinct surface whose capture ai-memory does not claim. On
+  Linux, Anthropic runs Cowork tasks inside a QEMU/KVM virtual machine;
+  whether your host hooks reach it has not been verified.
 - If the MCP indicator doesn't appear after restart, check the logs:
-  `~/Library/Logs/Claude/mcp*.log` (macOS). On Windows, check
+  `~/Library/Logs/Claude/mcp*.log` (macOS), `~/.config/Claude/logs/`
+  (Linux). On Windows, check
   `%APPDATA%\Claude\logs\` for an unpackaged install or the corresponding
   `LocalCache\Roaming\Claude\logs\` directory under the detected
   `%LOCALAPPDATA%\Packages\Claude_<id>\` package.
@@ -551,7 +570,9 @@ stdio shim. Requires Node.js installed on the same machine.
   `install-mcp --client claude-desktop --apply` detects this and writes
   to the packaged location automatically. On an older ai-memory build,
   pass `--config-file` pointed at the `LocalCache` path directly.
-- Sources: <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
+- Sources: <https://code.claude.com/docs/en/desktop-linux>,
+  <https://code.claude.com/docs/en/desktop#shared-configuration>,
+  <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
   <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>,
   <https://support.claude.com/en/articles/13837440-use-plugins-in-claude>,
   <https://learn.microsoft.com/en-us/windows/msix/msix-containerization-overview>
@@ -1442,8 +1463,9 @@ managed routing package. The `memory_install_self_routing` tool is read-only:
 it returns the slim markered instruction block, marker strings, agent filename
 hints, managed skill payloads (`name`, `description`, `relative_path`,
 `content`), and authoritative project/global target hints for `.claude/skills`,
-`.agents/skills`, `.grok/skills`, and `$GROK_HOME/skills` (default
-`~/.grok/skills`), plus overwrite guidance. Agents should use their own file
+`.agents/skills`, `.grok/skills`, `$GROK_HOME/skills` (default
+`~/.grok/skills`), GitHub Copilot CLI's `.github/skills` and
+`$COPILOT_HOME/skills` (default `~/.copilot/skills`), plus overwrite guidance. Agents should use their own file
 editing tools to write those artifacts while preserving unrelated user content.
 
 If the model doesn't see any of those tools, the MCP registration

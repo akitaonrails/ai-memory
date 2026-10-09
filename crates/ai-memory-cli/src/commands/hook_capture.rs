@@ -808,6 +808,13 @@ pub async fn post_hook(
 /// edge auth hop over the whole batch instead of paying it per event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchOutcome {
+    /// Modern server returned one terminal result for each acknowledged item.
+    Detailed {
+        /// Per-item processing outcomes in request order.
+        outcomes: Vec<String>,
+        /// Item that failed after any earlier acknowledged items.
+        failed_index: Option<usize>,
+    },
     /// Server committed the leading `usize` items (contiguous prefix, oldest
     /// first). Equals the request length on full success; a smaller value means
     /// the server stopped on that item (fail-fast) — the caller deletes the
@@ -872,7 +879,12 @@ pub async fn post_batch(
             if status.is_success() {
                 match resp.json::<serde_json::Value>().await {
                     Ok(v) => {
-                        if let Some(indices) = accepted_indices(&v) {
+                        if let Some(outcomes) = batch_outcomes(&v) {
+                            BatchOutcome::Detailed {
+                                outcomes,
+                                failed_index: failed_index(&v),
+                            }
+                        } else if let Some(indices) = accepted_indices(&v) {
                             BatchOutcome::AcceptedIndices {
                                 indices,
                                 failed_index: failed_index(&v),
@@ -913,6 +925,18 @@ pub async fn post_batch(
         }
         Err(_) => BatchOutcome::Unreachable,
     }
+}
+
+fn batch_outcomes(v: &serde_json::Value) -> Option<Vec<String>> {
+    let results = v.get("results")?.as_array()?;
+    let mut outcomes = Vec::with_capacity(results.len());
+    for (position, result) in results.iter().enumerate() {
+        if result.get("index")?.as_u64()? as usize != position {
+            return None;
+        }
+        outcomes.push(result.get("outcome")?.as_str()?.to_owned());
+    }
+    Some(outcomes)
 }
 
 fn failed_index(v: &serde_json::Value) -> Option<usize> {

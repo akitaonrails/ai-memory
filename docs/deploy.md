@@ -188,7 +188,12 @@ alternatives:
 > Claude with extended thinking, GPT-o3, Gemini "thinking" variants) — they burn
 > token budget on internal reasoning before emitting output and hang or emit empty
 > responses with the strict-JSON consolidation prompt. If you must use one, turn
-> reasoning off.
+> reasoning off. For a vLLM / SGLang-hosted Qwen3-class model the local equivalent
+> is `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING=true` (it sends
+> `chat_template_kwargs: {"enable_thinking": false}` on every openai-compat
+> request); if the engine still truncates the structured payload or returns empty
+> content, the job now fails fast with a terminal `truncated-response` /
+> `empty-content` error instead of retrying.
 
 ai-memory's hosted OpenAI-family providers use `json_schema` strict mode for
 structured output. The OpenAI provider normalizes schemars output into

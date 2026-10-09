@@ -9,8 +9,10 @@
 One Electron app, three tabs: **Chat** (claude.ai consumer chat), **Cowork**
 (long-running agentic work / Dispatch), **Code** (Claude Code sessions).
 Officially on macOS and Windows; **Linux is an official beta** (apt/.deb for
-Ubuntu and Debian — <https://code.claude.com/docs/en/desktop>,
-<https://code.claude.com/docs/en/desktop-linux>). The local machine runs the
+Ubuntu 22.04+ and Debian 12+ only; other distributions are pointed at the
+CLI — <https://code.claude.com/docs/en/desktop>,
+<https://code.claude.com/docs/en/desktop-linux>). On Linux, Cowork runs its
+tasks inside a QEMU/KVM virtual machine the app hosts. The local machine runs the
 Linux build (`/usr/share/applications/com.anthropic.Claude.desktop`,
 Electron profile at `~/.config/Claude/`).
 
@@ -60,11 +62,12 @@ Remote per-session MCP servers also appear in desktop session state —
 a `remoteMcpServersConfig` list (verified locally; two remote servers incl.
 Anthropic's own Docs MCP).
 
-**Desktop Extensions (`.mcpb`)** were announced (Sept 2025) as a one-click
-bundle format for local MCP servers. Current official docs route one-click
-extensibility through **plugins** (`/plugin install`, marketplaces) rather
-than `.mcpb`; the RFC's `.mcpb` assumption needs re-validation before any
-Phase-1 work. Ambiguous — flagged rather than guessed.
+**Desktop Extensions (`.mcpb`)** are current: Anthropic's support article
+presents them as the main way to install a local MCP server in Claude
+Desktop, Linux included
+(<https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
+re-checked 2026-10-08, see `verification-2026-10.md`). Plugins are the Code
+tab's extension surface.
 
 ## Lifecycle hooks / capture surface
 
@@ -77,11 +80,18 @@ Phase-1 work. Ambiguous — flagged rather than guessed.
   `ai-memory ... hook --event session-start --agent claude-code ...`).
   Therefore **ai-memory already captures desktop Code sessions today**, keyed
   `agent=claude-code`, `session_id=<CLI UUID>`, `cwd=<session workspace>`.
-- Cowork/local-agent sessions run in per-session scratch workspaces:
+- Code-tab sessions started without a project folder run in per-session
+  scratch workspaces:
   `~/.config/Claude/scratch-workspaces/<account>/<org>/scratch-<date>-<hex>/`
   (verified locally), which show up in `~/.claude/projects/` as ordinary
   per-directory projects (verified: several
-  `-home-...-Claude-scratch-workspaces-...` project dirs).
+  `-home-...-Claude-scratch-workspaces-...` project dirs). Their desktop
+  records sit under `claude-code-sessions/` with `envScopeId: builtin_local`
+  and `scratchOfferFolder: true`; an earlier version of this note
+  attributed them to Cowork, which keeps its own store under
+  `~/.config/Claude/local-agent-mode-sessions/`. Cowork has not run on this
+  machine (its VM images were never downloaded), so its capture is
+  unverified.
 - Consumer-chat transcripts are **cloud-stored**; no stable local transcript
   store for the Chat tab. Code-tab transcripts are the standard
   `~/.claude/projects/<munged-cwd>/<session-uuid>.jsonl` files.
@@ -112,7 +122,10 @@ real and observable on this machine. Mechanism, from local artifacts:
    opens it in the desktop app, then exits the CLI"; from the shell,
    `claude --desktop [--continue | --resume <session-id>]` opens an existing
    CLI session in Desktop and the **session keeps its ID**
-   (<https://code.claude.com/docs/en/desktop#coming-from-the-cli>).
+   (<https://code.claude.com/docs/en/desktop#coming-from-the-cli>). Both are
+   documented for macOS and x64 Windows only; on any platform, `/resume`
+   inside a local Desktop session picks up a CLI session from this
+   computer, again continuing the same session.
 4. **Deep links**: `claude-cli://` URL scheme handled by
    `~/.local/share/applications/claude-code-url-handler.desktop` →
    `claude --handle-uri %u` (verified locally) — how other apps hand a
@@ -126,9 +139,10 @@ real and observable on this machine. Mechanism, from local artifacts:
 
 - A desktop Code session and the CLI session it came from (via
   `--resume`/`/desktop`) are **one session id** — capture dedups naturally.
-- A desktop Cowork session is a *new* CLI session (new UUID) whose cwd is a
-  fresh scratch workspace; ai-memory sees it as a claude-code session in an
-  auto-named project derived from the scratch path. The desktop↔CLI mapping
+- A desktop Code session started without a folder is a *new* CLI session
+  (new UUID) whose cwd is a fresh scratch workspace; ai-memory sees it as a
+  claude-code session in an auto-named project derived from the scratch
+  path. Cowork sessions are a separate, unverified case (see above). The desktop↔CLI mapping
   (`local_* ↔ cliSessionId`) is available on disk if we ever want to join or
   relabel desktop-originated sessions (see `capture-and-dedup.md`).
 - The `entrypoint: "claude-desktop"` marker in `~/.claude/sessions/<pid>.json`

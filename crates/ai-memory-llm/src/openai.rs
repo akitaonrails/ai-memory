@@ -116,6 +116,10 @@ pub struct OpenAiProvider {
     /// turns it on only for the configured `openai-compat` provider, so
     /// the official OpenAI and OpenCode providers never gain the header.
     request_id_header: bool,
+    /// OpenAI-compat only: send `chat_template_kwargs` with every chat
+    /// request (see [`Self::with_disable_thinking`]). Ignored by the
+    /// `Official` dialect, which would 400 on the unknown parameter.
+    disable_thinking: bool,
 }
 
 /// Defaults for a provider whose gateway wants the caller identified: an
@@ -146,6 +150,7 @@ impl OpenAiProvider {
             extra_headers: ExtraHeaders::default(),
             client_headers: None,
             request_id_header: false,
+            disable_thinking: false,
         })
     }
 
@@ -228,6 +233,28 @@ impl OpenAiProvider {
         self
     }
 
+    /// Send `chat_template_kwargs: {"enable_thinking": false}` with every
+    /// chat request. Thinking-capable local engines (vLLM / SGLang serving
+    /// Qwen3-class models) otherwise spend the output budget on a reasoning
+    /// pass before the structured payload and can truncate it. The
+    /// `Official` dialect never emits the field — api.openai.com rejects
+    /// unknown top-level parameters — so the flag only ever reaches the
+    /// wire through the openai-compat wrapper
+    /// (`AI_MEMORY_LLM_COMPAT_DISABLE_THINKING`).
+    #[must_use]
+    pub(crate) fn with_disable_thinking(mut self, enabled: bool) -> Self {
+        self.disable_thinking = enabled;
+        self
+    }
+
+    /// Test-visible state so wrapper tests (`OpenAiCompatProvider`) can
+    /// assert the thinking switch reached the inner client without
+    /// exposing the field.
+    #[cfg(test)]
+    pub(crate) fn disable_thinking(&self) -> bool {
+        self.disable_thinking
+    }
+
     /// Endpoint the client will call. Test-visible so wrappers that default
     /// the base URL and let it be overridden can assert which one is set.
     #[cfg(test)]
@@ -252,6 +279,23 @@ struct OpenAiRequest<'a> {
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<OpenAiReasoning>,
+    /// vLLM / SGLang / llama.cpp chat-template overrides. Emitted only by
+    /// the `Compat` dialect with the thinking switch on (see
+    /// [`OpenAiProvider::with_disable_thinking`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+/// Chat-template override payload for local engines.
+///
+/// Today this carries only the thinking switch: Qwen3-class thinking
+/// models on a local engine otherwise emit `reasoning_content` (or
+/// think blocks inside `content`) that consume the output budget and
+/// truncate the structured payload that follows.
+#[derive(Debug, Serialize)]
+struct ChatTemplateKwargs {
+    /// `false` turns the engine's thinking pass off.
+    enable_thinking: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,6 +337,11 @@ struct OpenAiResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiChoice {
     message: OpenAiMessageResponse,
+    /// Why the engine stopped generating: `stop`, `length`, `tool_calls`,
+    /// `content_filter`, … Engines that predate the field omit it, so the
+    /// value is optional.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -353,6 +402,27 @@ impl LlmProvider for OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    /// Plain chat completion that also reports the engine's
+    /// `finish_reason` for the first choice, so the openai-compat tolerant
+    /// path can classify a `length`-truncated response before trying to
+    /// parse it. The [`LlmProvider`] [`Self::complete_with_operation_id`]
+    /// path deliberately drops the field: prose cut at the token budget is
+    /// a normal outcome there, not an error.
+    pub(crate) async fn complete_with_operation_id_and_finish_reason(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<(ChatResponse, Option<String>)> {
+        let response = self
+            .post(&self.build_request(&request, None), operation_id)
+            .await?;
+        let finish_reason = response
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.clone());
+        Ok((self.to_chat_response(response), finish_reason))
+    }
+
     async fn complete_structured(
         &self,
         request: ChatRequest,
@@ -378,11 +448,36 @@ impl OpenAiProvider {
                 operation_id,
             )
             .await?;
-        let text = response
+        // A `length` stop on a structured response means the engine hit
+        // its output budget before the JSON could finish (observed on
+        // vLLM-hosted Qwen3 with the thinking pass on). Surface a
+        // terminal, content-free error: a tolerant retry would just
+        // re-truncate and double the token spend, and a parse failure is
+        // the wrong class — nothing is wrong with the JSON, it is cut
+        // short.
+        let finish_reason = response
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.clone());
+        if is_length_truncated(finish_reason.as_deref()) {
+            return Err(LlmError::TruncatedResponse {
+                model: self.model.clone(),
+                completion_tokens: response.usage.as_ref().map(|u| u.completion_tokens),
+            });
+        }
+        // No content at all (missing, empty, or whitespace-only) is a
+        // distinct terminal failure, not a JSON parse error: there is
+        // nothing to parse and no retry can conjure output.
+        let Some(text) = response
             .choices
             .first()
             .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("");
+            .filter(|t| !t.trim().is_empty())
+        else {
+            return Err(LlmError::EmptyContent {
+                model: self.model.clone(),
+            });
+        };
         serde_json::from_str::<serde_json::Value>(text).map_err(LlmError::from)
     }
 
@@ -433,6 +528,15 @@ impl OpenAiProvider {
             }
         };
         let (reasoning_effort, reasoning) = self.chat_reasoning_fields();
+        // Only the `Compat` dialect may carry chat-template overrides —
+        // api.openai.com rejects unknown top-level parameters, so the
+        // `Official` dialect must never emit this even if the flag was
+        // set on a wrapped client.
+        let chat_template_kwargs = (self.dialect == RequestDialect::Compat
+            && self.disable_thinking)
+            .then_some(ChatTemplateKwargs {
+                enable_thinking: false,
+            });
         OpenAiRequest {
             model: &self.model,
             messages,
@@ -442,6 +546,7 @@ impl OpenAiProvider {
             response_format,
             reasoning_effort,
             reasoning,
+            chat_template_kwargs,
         }
     }
 
@@ -538,6 +643,14 @@ impl OpenAiProvider {
         }
         response_json_limited::<OpenAiResponse>(resp).await
     }
+}
+
+/// `true` when the engine reports the output stopped at the token budget
+/// rather than at a natural end. OpenAI and the local engines spell it
+/// `length`; engines that omit the field report `None` and are never
+/// truncated by this classifier.
+pub(crate) fn is_length_truncated(finish_reason: Option<&str>) -> bool {
+    finish_reason.is_some_and(|reason| reason.trim().eq_ignore_ascii_case("length"))
 }
 
 /// Recursively normalise a JSON schema for OpenAI Structured Outputs
@@ -719,8 +832,9 @@ fn max_output_tokens_for(model: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiProvider, REQUEST_ID_HEADER, RequestDialect, enforce_strict_object_schemas,
-        model_requires_max_completion_tokens, normalize_openai_base,
+        OpenAiJsonSchema, OpenAiProvider, OpenAiResponse, OpenAiResponseFormat, REQUEST_ID_HEADER,
+        RequestDialect, STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas,
+        is_length_truncated, model_requires_max_completion_tokens, normalize_openai_base,
     };
     use crate::provider::LlmProvider;
     use crate::types::{ChatMessage, ChatRequest, LlmOperationId, ReasoningEffort, Role};
@@ -1245,6 +1359,102 @@ mod tests {
             (temp - 0.2).abs() < 1e-6,
             "compat dialect must forward temperature unchanged, got {temp}"
         );
+    }
+
+    #[test]
+    fn build_request_compat_omits_chat_template_kwargs_by_default() {
+        // The thinking switch is opt-in: an unconfigured vLLM / Ollama /
+        // LM Studio setup must see a byte-identical request shape, so the
+        // key is absent entirely rather than false.
+        let p = OpenAiProvider::new(SecretString::new("dummy".into()), "qwen3.8-27b")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat);
+        let json = serde_json::to_value(p.build_request(&chat_request(), None)).unwrap();
+        assert!(
+            json.get("chat_template_kwargs").is_none(),
+            "no chat_template_kwargs without opt-in, got {json}"
+        );
+    }
+
+    #[test]
+    fn build_request_compat_sends_enable_thinking_false_when_opted_in() {
+        let p = OpenAiProvider::new(SecretString::new("dummy".into()), "qwen3.8-27b")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat)
+            .with_disable_thinking(true);
+        let json = serde_json::to_value(p.build_request(&chat_request(), None)).unwrap();
+        assert_eq!(
+            json["chat_template_kwargs"],
+            json!({ "enable_thinking": false }),
+            "opt-in must send the vLLM/SGLang thinking switch verbatim"
+        );
+    }
+
+    #[test]
+    fn build_request_official_never_emits_chat_template_kwargs() {
+        // api.openai.com rejects unknown top-level parameters; the dialect
+        // gate must hold even if the flag somehow reaches an official
+        // client (only the openai-compat wrapper sets it today).
+        let p = provider_for("gpt-4o-mini").with_disable_thinking(true);
+        let json = serde_json::to_value(p.build_request(&chat_request(), None)).unwrap();
+        assert!(
+            json.get("chat_template_kwargs").is_none(),
+            "the Official dialect must never send chat_template_kwargs, got {json}"
+        );
+    }
+
+    #[test]
+    fn build_request_structured_request_keeps_chat_template_kwargs() {
+        // The thinking switch is per-request-body, not per-endpoint: the
+        // structured path (response_format set) carries it too.
+        let p = OpenAiProvider::new(SecretString::new("dummy".into()), "qwen3.8-27b")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat)
+            .with_disable_thinking(true);
+        let response_format = OpenAiResponseFormat::JsonSchema {
+            json_schema: OpenAiJsonSchema {
+                name: STRUCTURED_OUTPUT_SCHEMA_NAME.into(),
+                schema: json!({
+                    "type": "object",
+                    "properties": { "ok": { "type": "boolean" } },
+                    "required": ["ok"]
+                }),
+                strict: true,
+            },
+        };
+        let json =
+            serde_json::to_value(p.build_request(&chat_request(), Some(response_format))).unwrap();
+        assert_eq!(
+            json["chat_template_kwargs"],
+            json!({ "enable_thinking": false }),
+            "the structured request must carry the thinking switch alongside response_format"
+        );
+        assert_eq!(json["response_format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn is_length_truncated_classifies_engine_values() {
+        assert!(is_length_truncated(Some("length")));
+        // Defensive: an engine that pads or uppercases the value must
+        // still classify, and every other stop reason must not.
+        assert!(is_length_truncated(Some(" length ")));
+        assert!(is_length_truncated(Some("LENGTH")));
+        assert!(!is_length_truncated(None));
+        assert!(!is_length_truncated(Some("stop")));
+        assert!(!is_length_truncated(Some("tool_calls")));
+        assert!(!is_length_truncated(Some("content_filter")));
+        assert!(!is_length_truncated(Some("")));
+    }
+
+    #[test]
+    fn response_without_finish_reason_or_usage_deserializes() {
+        // Engines that predate the field omit it; the shape must stay
+        // backwards compatible and classify as not truncated.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}],"model":"m"}"#;
+        let resp: OpenAiResponse = serde_json::from_str(body).expect("deserialises");
+        let finish_reason = resp.choices.first().and_then(|c| c.finish_reason.clone());
+        assert_eq!(finish_reason, None);
+        assert!(!is_length_truncated(finish_reason.as_deref()));
     }
 
     #[test]

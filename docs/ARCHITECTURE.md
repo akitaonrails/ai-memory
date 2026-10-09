@@ -68,7 +68,12 @@ from hook paths.
 2. Server's hook router sanitises the payload (the only path from
    untrusted text into the store), assigns an [`ObservationKind`], and
    enqueues a `WriteCmd` to the writer actor. For native keyed events, the
-   project-scoped key and observation commit together. The key is marked
+   project-scoped key and observation commit together. Ordinary keys expire
+   after 30 days; validated `recovery_<55 hex>` keys are bound to the actual
+   session, agent, event kind, and sanitized event identity and retained until
+   session/project deletion, so a writer cannot preclaim another recovery
+   event and an old journal cannot duplicate observations after ordinary
+   cleanup. The key is marked
    complete only after downstream processing: an incomplete replay resumes
    wiki/handoff effects without another observation, while a completed replay
    is acknowledged and skipped. A bounded per-project/key gate serializes an
@@ -268,8 +273,15 @@ death remains bounded by the renewable lease expiry. An explicit
 `--force-unlock` recovery expires and replaces a selected active lease in the
 same writer transaction, but only when its durable operator attribution equals
 the new run's attribution; the informational `host:pid` lease label is never an
-authorization key. The old run can no longer heartbeat or finish. See [Managed
-cross-harness workstreams](managed-workstreams.md).
+authorization key. The old run can no longer heartbeat or finish normally.
+`POST /workstream/runs/{run_id}/recover/finish` is the narrower outage path: it
+reuses the normal owner and project-write checks and admits an expired run only
+when no newer run in that workstream superseded it. A finished retry validates
+only durable transcript/native/cursor/exit identity and does not regenerate a
+repository checkpoint. Degraded resumed sessions persist a validated native
+source cursor before launch, and bounded recovery export reads only the delta
+on a blocking worker. See [Managed cross-harness
+workstreams](managed-workstreams.md).
 
 ## Hook event vocabulary
 
@@ -674,17 +686,18 @@ hook                        install-mcp          commit
 checkpoints                 restore-page         llm-test
 forget-sweep                lint                 curator
 auto-improve-report         auto-improve         finalize-session
-pending-writes              embed                generate-auth-token
-setup-agent                 bootstrap            install-instructions
-install-skills              reorg                purge-project
-rename-project              move-project         move-session
-uninstall                   upgrade              auth
-user                        completions          handoffs
-purge-session               compact              api-key
-export-okf                  message              doctor
-backfill                    project              reclaim-ledger-versions
-repair-backfill-timestamps  server               backup-agents
-restore-agents              profile
+recover                     pending-writes       embed
+generate-auth-token         setup-agent          bootstrap
+install-instructions        install-skills       reorg
+purge-project               rename-project       move-project
+move-session                uninstall            upgrade
+auth                        user                 completions
+handoffs                    purge-session        compact
+api-key                     export-okf           message
+doctor                      backfill             project
+reclaim-ledger-versions     repair-backfill-timestamps
+server                      backup-agents        restore-agents
+profile
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -1054,7 +1067,7 @@ stopwords or adding a ranking signal.
 **LLM provider env** (opt-in):
 ```
 AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | codex | copilot |
-                           gemini | openai-compat | opencode
+                           cursor | gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
@@ -1069,6 +1082,12 @@ LLM_BASE_URL               the unprefixed cross-tool convention, accepted for
                            an operator's leftover Ollama URL must not silently
                            rewrite every Gemini request into a 404
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
+AI_MEMORY_LLM_COMPAT_DISABLE_THINKING  openai-compat only, false by default; true sends
+                           chat_template_kwargs:{"enable_thinking":false} on every
+                           request (vLLM / SGLang thinking models). A structured
+                           response that stops with finish_reason=length, or a 2xx
+                           with empty message.content, is a terminal error
+                           (classes truncated-response / empty-content)
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
                            (none|minimal|low|medium|high|xhigh|max|ultra|persistent)
@@ -1095,6 +1114,7 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
 AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 AI_MEMORY_CODEX_EXECUTABLE optional Codex executable; defaults to codex on PATH
+AI_MEMORY_CURSOR_AGENT     optional Cursor Agent CLI executable for cursor; defaults to agent on PATH
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override
 ```

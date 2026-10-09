@@ -23,6 +23,9 @@
 //! * **Gemini**: `generationConfig.responseMimeType = "application/json"`
 //!   plus `responseSchema` (OpenAPI 3 subset; `$ref`s inlined,
 //!   Draft-2020-12 keywords stripped before send).
+//! * **Cursor**: the logged-in `agent` CLI in `--mode ask`. No HTTP client
+//!   and no copied token; `--yolo` is never passed because the prompt is
+//!   captured session text.
 //! * **OpenAI-compat** (Ollama, vLLM, LM Studio): we ask for
 //!   `response_format: { type: "json_object" }` when supported,
 //!   otherwise parse the first balanced `{…}` from the text body.
@@ -71,6 +74,7 @@ pub mod anthropic;
 pub mod auth;
 pub mod codex;
 pub mod copilot;
+pub mod cursor_agent;
 pub mod embedding;
 pub mod error;
 pub mod factory;
@@ -97,7 +101,7 @@ mod text;
 
 pub use anthropic::AnthropicProvider;
 pub use auth::{
-    AuthRequirement, CodexAuth, CopilotAuth, Credential, CredentialSource, ProviderAuth,
+    AuthRequirement, CodexAuth, CopilotAuth, Credential, CredentialSource, CursorAuth, ProviderAuth,
 };
 pub use codex::CodexProvider;
 pub use copilot::{
@@ -106,6 +110,7 @@ pub use copilot::{
     GITHUB_ACCESS_TOKEN_URL, GITHUB_COPILOT_CLIENT_ID, GITHUB_COPILOT_TOKEN_URL,
     GITHUB_DEVICE_CODE_URL,
 };
+pub use cursor_agent::{CURSOR_DEFAULT_MODEL, CursorAgentProvider, cursor_executable};
 pub use embedding::{
     Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, SyntheticEmbedder, VoyageEmbedder, cosine,
 };

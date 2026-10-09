@@ -66,8 +66,23 @@ const MAX_BATCH_ITEMS: usize = 256;
 /// `DefaultBodyLimit` with margin for JSON framing. A chunk always carries at
 /// least one event even if that event alone exceeds this.
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const RECOVERY_DIR: &str = ".recovery";
+const RECOVERY_MATCH_FILE: &str = ".active";
+const RECOVERY_COMPLETED_FILE: &str = ".completed";
+const SPOOL_CAPACITY_LOCK_FILE: &str = ".capacity.lock";
+const SPOOL_COORD_LOCK_WAIT: Duration = Duration::from_millis(5);
+const MAX_SPOOL_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
+const RECOVERY_TOMBSTONE_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_RECOVERY_TOMBSTONES: usize = 512;
+const MAX_RECOVERY_SWEEP_DIRS: usize = 1_024;
 
 static ENQUEUE_SEQ: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static PAUSE_ENQUEUE_AFTER_MAIN_RENAME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static ENQUEUE_REACHED_RECOVERY_WINDOW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// How a spooled event authenticates to the server when drained.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -188,7 +203,7 @@ pub fn spool_health(spool: &Path) -> SpoolHealth {
         retries_total: 0,
     };
     for (_, path) in &files {
-        if let Ok(bytes) = std::fs::read(path)
+        if let Ok(bytes) = read_spool_entry_bytes(path)
             && let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes)
         {
             health.retries_total += u64::from(entry.attempts);
@@ -207,12 +222,9 @@ pub fn spool_health(spool: &Path) -> SpoolHealth {
 /// entry enqueued at the Unix epoch — see [`spool_health`].
 fn created_ms_from_name(file_name: &str) -> Option<u64> {
     let (stamp, rest) = file_name.split_once('-')?;
-    // Require the full zero-padded width the writer emits, so a name that
-    // merely *starts* with digits is not accepted.
     if stamp.len() != 13 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    // And require the remainder to look like `{pid}-{seq}.json`.
     if !rest.ends_with(".json") || !rest.contains('-') {
         return None;
     }
@@ -235,11 +247,21 @@ fn now_ms() -> u64 {
 ///
 /// # Errors
 /// Returns an error only when the spool file cannot be written.
+#[cfg(test)]
 pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
+    enqueue_with_config(spool, entry, None)
+}
+
+pub fn enqueue_with_config(
+    spool: &Path,
+    entry: &SpoolEntry,
+    config: Option<&crate::config::Config>,
+) -> std::io::Result<()> {
     create_spool_dir(spool)?;
     let seq = ENQUEUE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let recovery_key = recovery_coordinate_key_for_entry(entry, config)?;
     let name = format!(
-        "{:013}-{}-{seq:016x}.json",
+        "{:013}-{}-{seq:016x}-{recovery_key}.json",
         entry.created_ms,
         std::process::id()
     );
@@ -247,8 +269,53 @@ pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
     let final_path = spool.join(&name);
     let bytes = serde_json::to_vec(entry)?;
     write_private(&tmp, &bytes)?;
+    let capacity_lock = open_spool_capacity_lock(spool)?;
+    let started = Instant::now();
+    loop {
+        match capacity_lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error)
+                if is_drain_lock_busy_error(&error)
+                    && started.elapsed() < SPOOL_COORD_LOCK_WAIT =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if is_drain_lock_busy_error(&error) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if total_spool_entries(spool)? >= MAX_SPOOL_FILES {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!(
+            "ai-memory: hook-spool at capacity ({MAX_SPOOL_FILES}); dropping one new UNDELIVERED event"
+        );
+        return Ok(());
+    }
     std::fs::rename(&tmp, &final_path)?;
-    prune_spool_file_count(spool);
+    #[cfg(test)]
+    if PAUSE_ENQUEUE_AFTER_MAIN_RENAME.load(Ordering::SeqCst) {
+        ENQUEUE_REACHED_RECOVERY_WINDOW.store(true, Ordering::SeqCst);
+        while PAUSE_ENQUEUE_AFTER_MAIN_RENAME.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+    let coord_lock = open_recovery_coord_lock(spool)?;
+    if coord_lock.try_lock_exclusive().is_ok() {
+        match recovery_target_for_entry(spool, entry, config)? {
+            Some(RecoveryTarget::Active(dir)) => {
+                std::fs::rename(&final_path, dir.join(&name))?;
+            }
+            Some(RecoveryTarget::Completed(_)) => match std::fs::remove_file(&final_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            },
+            None => {}
+        }
+    }
     Ok(())
 }
 
@@ -258,6 +325,38 @@ pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
 /// capture until it drains; a world-readable directory would leak that.
 fn create_spool_dir(spool: &Path) -> std::io::Result<()> {
     super::path_util::create_private_dir(spool)
+}
+
+fn open_spool_capacity_lock(spool: &Path) -> std::io::Result<File> {
+    create_spool_dir(spool)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(spool.with_extension(SPOOL_CAPACITY_LOCK_FILE))
+}
+
+fn total_spool_entries(spool: &Path) -> std::io::Result<usize> {
+    let mut total = list_entries(spool).map_or(0, |(files, _)| files.len());
+    let recovery = spool.join(RECOVERY_DIR);
+    let directories = match std::fs::read_dir(recovery) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(total),
+        Err(error) => return Err(error),
+    };
+    for (index, directory) in directories.enumerate() {
+        if index >= MAX_RECOVERY_SWEEP_DIRS {
+            return Ok(MAX_SPOOL_FILES);
+        }
+        let directory = directory?;
+        if directory.file_type()?.is_dir() {
+            total = total.saturating_add(
+                list_entries(&directory.path()).map_or(0, |(files, _)| files.len()),
+            );
+        }
+    }
+    Ok(total)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -315,6 +414,8 @@ impl SpoolEntry {
 pub struct DrainResult {
     /// Events delivered (server answered 2xx) and removed from the spool.
     pub sent: usize,
+    /// Events whose modern per-item acknowledgement proves durable storage.
+    pub durable: usize,
     /// Events still queued (failed this pass, or skipped when the budget ran out).
     pub remaining: usize,
     /// Events discarded as undeliverable (too old or too many failed attempts).
@@ -333,6 +434,587 @@ pub enum DrainLockWait {
 /// An exclusive hook-spool drain lock. The OS releases it when dropped.
 pub struct DrainLock {
     _file: File,
+}
+
+/// Outcome of [`QuarantinedSpool::restore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// Quarantined events were moved back to the plain spool (or the
+    /// quarantine directory no longer existed).
+    Restored,
+    /// The interval was already completed, so its correlated evidence is
+    /// durably delivered and there is nothing left to restore or re-deliver.
+    AlreadyDelivered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryMatch {
+    journal_id: String,
+    coordinate_key: String,
+    interval_started_ms: u64,
+    interval_ended_ms: u64,
+    server_identity: String,
+    agent: String,
+    workspace: String,
+    project: String,
+    cwd: String,
+    native_session_id: String,
+}
+
+pub struct QuarantinedSpool {
+    dir: PathBuf,
+    spool: PathBuf,
+    config: crate::config::Config,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CorrelatedDrainResult {
+    pub durable: usize,
+    pub remaining: usize,
+    pub dropped: usize,
+}
+
+impl QuarantinedSpool {
+    pub fn len(&self) -> usize {
+        list_entries(&self.dir).map_or(0, |(files, _)| files.len())
+    }
+
+    pub fn complete(self) -> std::io::Result<()> {
+        if self.dir.exists() {
+            let lock = open_recovery_coord_lock(&self.spool)?;
+            lock.lock_exclusive()?;
+            let active = self.dir.join(RECOVERY_MATCH_FILE);
+            let completed = self.dir.join(RECOVERY_COMPLETED_FILE);
+            let spec = read_recovery_match(&active)?;
+            std::fs::rename(&active, &completed)?;
+            move_late_matching_entries(&self.spool, &self.dir, &self.config, &spec)?;
+            for item in std::fs::read_dir(&self.dir)? {
+                let item = item?;
+                if item.path().extension().and_then(|value| value.to_str()) == Some("json") {
+                    std::fs::remove_file(item.path())?;
+                }
+            }
+            sweep_recovery_tombstones(&self.spool)?;
+        }
+        Ok(())
+    }
+
+    pub async fn drain_strict(
+        &self,
+        data_dir: &Path,
+        total_budget: Duration,
+        per_event_timeout: Duration,
+        max_attempts: MaxAttempts,
+    ) -> CorrelatedDrainResult {
+        let Ok((mut files, unreadable)) = list_entries(&self.dir) else {
+            return CorrelatedDrainResult {
+                remaining: 1,
+                ..CorrelatedDrainResult::default()
+            };
+        };
+        files.sort();
+        let client = build_client();
+        let started = Instant::now();
+        let mut oidc_cache = None;
+        let mut result = DrainResult {
+            remaining: unreadable,
+            ..DrainResult::default()
+        };
+        for path in files {
+            if started.elapsed() >= total_budget {
+                result.remaining += 1;
+                continue;
+            }
+            let Some(entry) = load_live_entry(&path, &mut result) else {
+                continue;
+            };
+            if body_is_malformed(&entry) {
+                bump_or_drop(&path, &entry, max_attempts.0, &mut result);
+                continue;
+            }
+            let bearer = entry_bearer(&entry, &client, data_dir, &mut oidc_cache).await;
+            let Some(payload) = batch_payload(&[(path.clone(), entry.clone())]) else {
+                bump_or_drop(&path, &entry, max_attempts.0, &mut result);
+                continue;
+            };
+            let remaining_budget = total_budget.saturating_sub(started.elapsed());
+            let timeout = per_event_timeout.min(remaining_budget);
+            match post_batch(
+                &client,
+                &batch_endpoint(&entry.url),
+                &payload,
+                bearer.as_deref(),
+                timeout,
+            )
+            .await
+            {
+                BatchOutcome::Detailed {
+                    outcomes,
+                    failed_index: None,
+                } if outcomes.len() == 1 => {
+                    let outcome = outcomes[0].as_str();
+                    let durable = matches!(outcome, "stored" | "replayed")
+                        || outcome == "ignored_end"
+                            && entry_event(&entry).as_deref() == Some("session-end");
+                    if durable {
+                        let _ = std::fs::remove_file(path);
+                        result.sent += 1;
+                        result.durable += 1;
+                    } else if outcome.starts_with("dropped_") {
+                        let _ = std::fs::remove_file(path);
+                        result.dropped += 1;
+                    } else {
+                        bump_or_drop(&path, &entry, max_attempts.0, &mut result);
+                    }
+                }
+                _ => bump_or_drop(&path, &entry, max_attempts.0, &mut result),
+            }
+        }
+        CorrelatedDrainResult {
+            durable: result.durable,
+            remaining: result.remaining,
+            dropped: result.dropped,
+        }
+    }
+
+    pub fn complete_spool_only(&self) -> std::io::Result<bool> {
+        let lock = open_recovery_coord_lock(&self.spool)?;
+        lock.lock_exclusive()?;
+        let active = self.dir.join(RECOVERY_MATCH_FILE);
+        let completed = self.dir.join(RECOVERY_COMPLETED_FILE);
+        let spec = read_recovery_match(&active)?;
+        move_late_matching_entries(&self.spool, &self.dir, &self.config, &spec)?;
+        if self.len() != 0 {
+            return Ok(false);
+        }
+        std::fs::rename(active, completed)?;
+        Ok(true)
+    }
+
+    pub fn restore(self, spool: &Path) -> std::io::Result<RestoreOutcome> {
+        if !self.dir.exists() {
+            return Ok(RestoreOutcome::Restored);
+        }
+        let lock = open_recovery_coord_lock(spool)?;
+        lock.lock_exclusive()?;
+        let active = self.dir.join(RECOVERY_MATCH_FILE);
+        let completed = self.dir.join(RECOVERY_COMPLETED_FILE);
+        // Completion is terminal: a `.completed` marker is durable proof the
+        // interval's correlated evidence reached the server, so a restore has
+        // nothing to put back. A `.active` beside the tombstone is a rerun
+        // rewriting the same interval, not a re-opened one.
+        if completed.is_file() {
+            match std::fs::remove_file(&active) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            move_quarantined_entries_to_spool(&self.dir, spool)?;
+            return Ok(RestoreOutcome::AlreadyDelivered);
+        }
+        if !active.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "recovery interval {} has neither an active nor a completed marker",
+                    self.dir.display()
+                ),
+            ));
+        }
+        let spec = read_recovery_match(&active)?;
+        move_late_matching_entries(spool, &self.dir, &self.config, &spec)?;
+        let _ = std::fs::remove_file(active);
+        move_quarantined_entries_to_spool(&self.dir, spool)?;
+        std::fs::remove_dir(self.dir)?;
+        Ok(RestoreOutcome::Restored)
+    }
+}
+
+/// Move every quarantined `*.json` event back to the plain spool, leaving the
+/// marker files where they are.
+fn move_quarantined_entries_to_spool(dir: &Path, spool: &Path) -> std::io::Result<()> {
+    for item in std::fs::read_dir(dir)? {
+        let item = item?;
+        if item.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let destination = spool.join(item.file_name());
+        std::fs::rename(item.path(), destination)?;
+    }
+    Ok(())
+}
+
+fn read_recovery_match(path: &Path) -> std::io::Result<RecoveryMatch> {
+    serde_json::from_slice(&read_spool_entry_bytes(path)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn move_late_matching_entries(
+    spool: &Path,
+    dir: &Path,
+    config: &crate::config::Config,
+    spec: &RecoveryMatch,
+) -> std::io::Result<()> {
+    let (files, _) = list_entries(spool)?;
+    for path in files {
+        let Ok(bytes) = read_spool_entry_bytes(&path) else {
+            continue;
+        };
+        let Ok(entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
+            continue;
+        };
+        if entry.created_ms >= spec.interval_started_ms
+            && entry.created_ms <= spec.interval_ended_ms
+            && spool_entry_matches_session(
+                &entry,
+                &spec.server_identity,
+                &spec.agent,
+                Some(config),
+                &spec.workspace,
+                &spec.project,
+                Path::new(&spec.cwd),
+                &spec.native_session_id,
+            )
+            && recovery_target_for_entry(spool, &entry, Some(config))?
+                .is_some_and(|target| target.dir() == dir)
+            && let Some(name) = path.file_name()
+        {
+            std::fs::rename(&path, dir.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn quarantine_session_entries(
+    config: &crate::config::Config,
+    spool: &Path,
+    journal_id: &str,
+    interval_started_ms: u64,
+    interval_ended_ms: u64,
+    server_identity: &str,
+    agent: &str,
+    workspace: &str,
+    project: &str,
+    cwd: &Path,
+    native_session_id: &str,
+) -> std::io::Result<QuarantinedSpool> {
+    let coord_lock = open_recovery_coord_lock(spool)?;
+    coord_lock.lock_exclusive()?;
+    sweep_recovery_tombstones(spool)?;
+    let coordinate_key = recovery_coordinate_key(
+        server_identity,
+        agent,
+        workspace,
+        project,
+        cwd.to_string_lossy().as_ref(),
+        native_session_id,
+    )?;
+    let dir = spool
+        .join(RECOVERY_DIR)
+        .join(recovery_interval_key(journal_id)?);
+    create_spool_dir(&dir)?;
+    let match_spec = RecoveryMatch {
+        journal_id: journal_id.to_owned(),
+        coordinate_key,
+        interval_started_ms,
+        interval_ended_ms,
+        server_identity: server_identity.to_owned(),
+        agent: agent.to_owned(),
+        workspace: workspace.to_owned(),
+        project: project.to_owned(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        native_session_id: native_session_id.to_owned(),
+    };
+    write_private(
+        &dir.join(RECOVERY_MATCH_FILE),
+        &serde_json::to_vec(&match_spec)?,
+    )?;
+    if let Err(error) = move_late_matching_entries(spool, &dir, config, &match_spec) {
+        let _ = std::fs::remove_file(dir.join(RECOVERY_MATCH_FILE));
+        return Err(error);
+    }
+    Ok(QuarantinedSpool {
+        dir,
+        spool: spool.to_path_buf(),
+        config: config.clone(),
+    })
+}
+
+fn open_recovery_coord_lock(spool: &Path) -> std::io::Result<File> {
+    create_spool_dir(spool)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(spool.with_extension("recovery.lock"))
+}
+
+fn sweep_recovery_tombstones(spool: &Path) -> std::io::Result<()> {
+    let recovery = spool.join(RECOVERY_DIR);
+    let entries = match std::fs::read_dir(&recovery) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let now = SystemTime::now();
+    let mut completed = Vec::new();
+    for entry in entries.take(MAX_RECOVERY_SWEEP_DIRS) {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let marker = entry.path().join(RECOVERY_COMPLETED_FILE);
+        let Ok(metadata) = marker.metadata() else {
+            continue;
+        };
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        if now.duration_since(modified).unwrap_or_default().as_millis() as u64
+            > RECOVERY_TOMBSTONE_AGE_MS
+        {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            completed.push((modified, entry.path()));
+        }
+    }
+    if completed.len() > MAX_RECOVERY_TOMBSTONES {
+        completed.sort_by_key(|(modified, _)| *modified);
+        let excess = completed.len() - MAX_RECOVERY_TOMBSTONES;
+        for (_, path) in completed.into_iter().take(excess) {
+            std::fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
+}
+
+enum RecoveryTarget {
+    Active(PathBuf),
+    Completed(PathBuf),
+}
+
+impl RecoveryTarget {
+    fn dir(&self) -> &Path {
+        match self {
+            Self::Active(dir) | Self::Completed(dir) => dir,
+        }
+    }
+}
+
+fn recovery_target_for_entry(
+    spool: &Path,
+    entry: &SpoolEntry,
+    config: Option<&crate::config::Config>,
+) -> std::io::Result<Option<RecoveryTarget>> {
+    let coordinate_key = recovery_coordinate_key_for_entry(entry, config)?;
+    let recovery = spool.join(RECOVERY_DIR);
+    let directories = match std::fs::read_dir(recovery) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut matched = None;
+    for directory in directories.take(MAX_RECOVERY_SWEEP_DIRS) {
+        let directory = directory?;
+        if !directory.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = directory.path();
+        let marker = if dir.join(RECOVERY_MATCH_FILE).is_file() {
+            RECOVERY_MATCH_FILE
+        } else if dir.join(RECOVERY_COMPLETED_FILE).is_file() {
+            RECOVERY_COMPLETED_FILE
+        } else {
+            continue;
+        };
+        let Ok(spec) = read_recovery_match(&dir.join(marker)) else {
+            continue;
+        };
+        if spec.coordinate_key != coordinate_key
+            || entry.created_ms < spec.interval_started_ms
+            || entry.created_ms > spec.interval_ended_ms
+        {
+            continue;
+        }
+        let candidate = if marker == RECOVERY_MATCH_FILE {
+            RecoveryTarget::Active(dir)
+        } else {
+            RecoveryTarget::Completed(dir)
+        };
+        if matched.is_some() {
+            return Ok(None);
+        }
+        matched = Some(candidate);
+    }
+    Ok(matched)
+}
+
+fn recovery_coordinate_key_for_entry(
+    entry: &SpoolEntry,
+    config: Option<&crate::config::Config>,
+) -> std::io::Result<String> {
+    let url = reqwest::Url::parse(&entry.url)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut identity = url.clone();
+    identity.set_query(None);
+    if identity.path().ends_with("/hook") {
+        let path = identity.path().trim_end_matches("/hook").to_owned();
+        identity.set_path(&path);
+    }
+    let mut agent = None;
+    let mut workspace = None;
+    let mut project = None;
+    let mut session = None;
+    let mut cwd = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "agent" => agent = Some(value.into_owned()),
+            "workspace" => workspace = Some(value.into_owned()),
+            "project" => project = Some(value.into_owned()),
+            "session_id" => session = Some(value.into_owned()),
+            "cwd" => cwd = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(&entry.body) {
+        let context = ai_memory_hooks::hook_payload_context(&body);
+        session = context.session_id.or(session);
+        cwd = context.cwd.or(cwd);
+    }
+    let (workspace, project) = match (config, cwd.as_deref()) {
+        (Some(config), Some(cwd)) => super::resolve_scope_for_path_with_explicit(
+            config,
+            Path::new(cwd),
+            workspace.as_deref(),
+            project.as_deref(),
+        )
+        .unwrap_or_else(|_| {
+            (
+                workspace.clone().unwrap_or_default(),
+                project.clone().unwrap_or_default(),
+            )
+        }),
+        _ => (workspace.unwrap_or_default(), project.unwrap_or_default()),
+    };
+    recovery_coordinate_key(
+        identity.as_str().trim_end_matches('/'),
+        agent.as_deref().unwrap_or_default(),
+        &workspace,
+        &project,
+        cwd.as_deref().unwrap_or_default(),
+        session.as_deref().unwrap_or_default(),
+    )
+}
+
+fn recovery_interval_key(journal_id: &str) -> std::io::Result<String> {
+    if journal_id.is_empty()
+        || journal_id.len() > 128
+        || !journal_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid recovery journal interval id",
+        ));
+    }
+    use sha2::{Digest as _, Sha256};
+    Ok(format!("{:x}", Sha256::digest(journal_id.as_bytes())))
+}
+
+fn recovery_coordinate_key(
+    server_identity: &str,
+    agent: &str,
+    workspace: &str,
+    project: &str,
+    cwd: &str,
+    native_session_id: &str,
+) -> std::io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    let cwd = crate::marker::absolute_normalized(Path::new(cwd));
+    let mut hasher = Sha256::new();
+    for value in [
+        server_identity,
+        agent,
+        workspace,
+        project,
+        cwd.to_string_lossy().as_ref(),
+        native_session_id,
+    ] {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spool_entry_matches_session(
+    entry: &SpoolEntry,
+    server_identity: &str,
+    agent: &str,
+    config: Option<&crate::config::Config>,
+    workspace: &str,
+    project: &str,
+    cwd: &Path,
+    native_session_id: &str,
+) -> bool {
+    let Ok(url) = reqwest::Url::parse(&entry.url) else {
+        return false;
+    };
+    let mut identity = url.clone();
+    identity.set_query(None);
+    if identity.path().ends_with("/hook") {
+        let path = identity.path().trim_end_matches("/hook").to_owned();
+        identity.set_path(&path);
+    }
+    let identity = identity.as_str().trim_end_matches('/');
+    if identity != server_identity.trim_end_matches('/') {
+        return false;
+    }
+    let mut session = None;
+    let mut event_agent = None;
+    let mut ws = None;
+    let mut proj = None;
+    let mut event_cwd = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "agent" => event_agent = Some(value.into_owned()),
+            "session_id" => session = Some(value.into_owned()),
+            "workspace" => ws = Some(value.into_owned()),
+            "project" => proj = Some(value.into_owned()),
+            "cwd" => event_cwd = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(&entry.body) {
+        let context = ai_memory_hooks::hook_payload_context(&body);
+        session = context.session_id.or(session);
+        event_cwd = context.cwd.or(event_cwd);
+    }
+    let expected_cwd = crate::marker::absolute_normalized(cwd);
+    let same_cwd = event_cwd
+        .as_deref()
+        .is_some_and(|value| crate::marker::absolute_normalized(Path::new(value)) == expected_cwd);
+    let explicit_match = ws.as_deref() == Some(workspace) && proj.as_deref() == Some(project);
+    let scope_matches = if explicit_match {
+        true
+    } else if let (Some(config), Some(event_cwd)) = (config, event_cwd.as_deref()) {
+        super::resolve_scope_for_path_with_explicit(
+            config,
+            Path::new(event_cwd),
+            ws.as_deref(),
+            proj.as_deref(),
+        )
+        .is_ok_and(|resolved| resolved == (workspace.to_owned(), project.to_owned()))
+    } else {
+        ws.as_deref().is_none_or(|value| value == workspace)
+            && proj.as_deref().is_none_or(|value| value == project)
+            && ((ws.is_some() && proj.is_some()) || same_cwd)
+    };
+    event_agent.as_deref() == Some(agent)
+        && session.as_deref() == Some(native_session_id)
+        && scope_matches
+        && same_cwd
 }
 
 /// Windows can report a contended fs2 byte-range lock as this native OS code
@@ -486,42 +1168,86 @@ pub async fn drain_until_quiescent(
     wait: DrainLockWait,
     max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
+    drain_until_quiescent_with_live_token(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        live_static_token().as_deref(),
+        max_attempts,
+    )
+    .await
+}
+
+pub async fn drain_until_quiescent_with_live_token(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+    live_token: Option<&str>,
+    max_attempts: MaxAttempts,
+) -> std::io::Result<LockedDrainResult> {
     let Some(_lock) = acquire_drain_lock(spool, wait)? else {
         return Ok(LockedDrainResult::LockBusy);
     };
+    Ok(LockedDrainResult::Drained(
+        drain_until_quiescent_locked_with_live_token(
+            spool,
+            data_dir,
+            total_budget,
+            per_event_timeout,
+            live_token,
+            max_attempts,
+        )
+        .await,
+    ))
+}
+
+pub async fn drain_until_quiescent_locked_with_live_token(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    live_token: Option<&str>,
+    max_attempts: MaxAttempts,
+) -> DrainResult {
     let started = Instant::now();
     let mut combined = DrainResult::default();
 
     loop {
         let Some(remaining_budget) = total_budget.checked_sub(started.elapsed()) else {
             combined.remaining = spool_len(spool);
-            return Ok(LockedDrainResult::Drained(combined));
+            return combined;
         };
         if remaining_budget.is_zero() {
             combined.remaining = spool_len(spool);
-            return Ok(LockedDrainResult::Drained(combined));
+            return combined;
         }
 
-        let result = drain_with_max_attempts(
+        let result = drain_with_live_token(
             spool,
             data_dir,
             remaining_budget,
             per_event_timeout,
+            live_token,
             max_attempts,
         )
         .await;
         combined.sent += result.sent;
+        combined.durable += result.durable;
         combined.dropped += result.dropped;
         combined.remaining = result.remaining;
 
         if result.remaining > 0 {
-            return Ok(LockedDrainResult::Drained(combined));
+            return combined;
         }
 
         let queued = spool_len(spool);
         if queued == 0 {
             combined.remaining = 0;
-            return Ok(LockedDrainResult::Drained(combined));
+            return combined;
         }
         combined.remaining = queued;
     }
@@ -725,6 +1451,49 @@ pub async fn drain_with_live_token(
             let batch_timeout =
                 batch_request_timeout(per_event_timeout, remaining_budget, chunk.len());
             match post_batch(&client, &base, &payload, bearer.as_deref(), batch_timeout).await {
+                BatchOutcome::Detailed {
+                    outcomes,
+                    failed_index,
+                } => {
+                    if outcomes.len() > chunk.len()
+                        || failed_index.is_some_and(|index| index >= chunk.len())
+                    {
+                        bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
+                        result.remaining +=
+                            chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
+                        break;
+                    }
+                    for (position, outcome) in outcomes.iter().enumerate() {
+                        let terminal = matches!(outcome.as_str(), "stored" | "replayed")
+                            || outcome == "ignored_end"
+                                && entry_event(&chunk[position].1).as_deref()
+                                    == Some("session-end");
+                        if terminal {
+                            let _ = std::fs::remove_file(&chunk[position].0);
+                            result.sent += 1;
+                            result.durable += 1;
+                        } else {
+                            bump_or_drop(
+                                &chunk[position].0,
+                                &chunk[position].1,
+                                max_attempts,
+                                &mut result,
+                            );
+                        }
+                    }
+                    if let Some(failed_index) = failed_index {
+                        bump_or_drop(
+                            &chunk[failed_index].0,
+                            &chunk[failed_index].1,
+                            max_attempts,
+                            &mut result,
+                        );
+                    }
+                    result.remaining += chunk
+                        .len()
+                        .saturating_sub(outcomes.len())
+                        .saturating_sub(usize::from(failed_index.is_some()));
+                }
                 BatchOutcome::Accepted(k) => {
                     let k = k.min(chunk.len());
                     for (path, _) in &chunk[..k] {
@@ -909,6 +1678,24 @@ pub async fn drain_with_live_token(
                         )
                         .await
                         {
+                            BatchOutcome::Detailed { outcomes, .. } => {
+                                let durable = outcomes
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(position, outcome)| {
+                                        matches!(outcome.as_str(), "stored" | "replayed")
+                                            || outcome.as_str() == "ignored_end"
+                                                && entry_event(&chunk[*position].1).as_deref()
+                                                    == Some("session-end")
+                                    })
+                                    .map(|(position, _)| position)
+                                    .collect::<Vec<_>>();
+                                let sent = delete_accepted_indices(&chunk, &durable);
+                                result.sent += sent;
+                                result.durable += sent;
+                                result.remaining += chunk.len().saturating_sub(sent);
+                                continue;
+                            }
                             BatchOutcome::Accepted(k) => {
                                 let k = k.min(chunk.len());
                                 for (path, _) in &chunk[..k] {
@@ -978,6 +1765,24 @@ pub async fn drain_with_live_token(
                         match post_batch(&client, &base, &payload, Some(&token), batch_timeout)
                             .await
                         {
+                            BatchOutcome::Detailed { outcomes, .. } => {
+                                let durable = outcomes
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(position, outcome)| {
+                                        matches!(outcome.as_str(), "stored" | "replayed")
+                                            || outcome.as_str() == "ignored_end"
+                                                && entry_event(&chunk[*position].1).as_deref()
+                                                    == Some("session-end")
+                                    })
+                                    .map(|(position, _)| position)
+                                    .collect::<Vec<_>>();
+                                let sent = delete_accepted_indices(&chunk, &durable);
+                                result.sent += sent;
+                                result.durable += sent;
+                                result.remaining += chunk.len().saturating_sub(sent);
+                                continue;
+                            }
                             BatchOutcome::Accepted(k) => {
                                 let k = k.min(chunk.len());
                                 for (path, _) in &chunk[..k] {
@@ -1115,8 +1920,71 @@ fn batch_request_timeout(
         .min(remaining_budget)
 }
 
+fn completed_tombstone_for_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".json") else {
+        return false;
+    };
+    let Some(coordinate_key) = stem.rsplit('-').next() else {
+        return false;
+    };
+    let Some(created_ms) = created_ms_from_name(name) else {
+        return false;
+    };
+    let Some(spool) = path.parent() else {
+        return false;
+    };
+    let Ok(directories) = std::fs::read_dir(spool.join(RECOVERY_DIR)) else {
+        return false;
+    };
+    let mut matches = 0usize;
+    for directory in directories.take(MAX_RECOVERY_SWEEP_DIRS).flatten() {
+        let marker = directory.path().join(RECOVERY_COMPLETED_FILE);
+        let Ok(spec) = read_recovery_match(&marker) else {
+            continue;
+        };
+        if spec.coordinate_key == coordinate_key
+            && created_ms >= spec.interval_started_ms
+            && created_ms <= spec.interval_ended_ms
+        {
+            matches += 1;
+            if matches > 1 {
+                return false;
+            }
+        }
+    }
+    matches == 1
+}
+
+fn read_spool_entry_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let file = File::open(path)?;
+    if file.metadata()?.len() > MAX_SPOOL_ENTRY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "spool entry exceeds its byte limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SPOOL_ENTRY_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SPOOL_ENTRY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "spool entry exceeds its byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> {
-    let Ok(bytes) = std::fs::read(path) else {
+    if completed_tombstone_for_path(path) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    let Ok(bytes) = read_spool_entry_bytes(path) else {
         result.remaining += 1;
         return None;
     };
@@ -1317,6 +2185,13 @@ fn configured_server_url(data_dir: &Path) -> Option<String> {
 /// The `/hook/batch` URL for a spooled per-event URL: strip the `?…` query and
 /// append `/batch` (a spooled URL ends in `…/hook` before its query). Entries
 /// whose endpoint string matches can ride one batch request.
+fn entry_event(entry: &SpoolEntry) -> Option<String> {
+    reqwest::Url::parse(&entry.url)
+        .ok()?
+        .query_pairs()
+        .find_map(|(key, value)| (key == "event").then(|| value.into_owned()))
+}
+
 fn batch_endpoint(url: &str) -> String {
     let path = url.split('?').next().unwrap_or(url);
     format!("{path}/batch")
@@ -1395,28 +2270,6 @@ pub async fn resolve_bearer(
     crate::auth_bearer::resolve_bearer(client, &data_dir.join("auth.json"), auth_token).await
 }
 
-fn prune_spool_file_count(spool: &Path) {
-    let Ok((mut files, _)) = list_entries(spool) else {
-        return;
-    };
-    let excess = files.len().saturating_sub(MAX_SPOOL_FILES);
-    if excess == 0 {
-        return;
-    }
-    files.sort();
-    // The spool is at its hard cap: the oldest events are about to be deleted
-    // WITHOUT ever reaching the server — silent capture loss otherwise. Surface
-    // it on stderr (never stdout, which carries the hook's JSON protocol output)
-    // so a sustained backlog dropping events is visible, not invisible.
-    eprintln!(
-        "ai-memory: hook-spool at capacity ({} > {MAX_SPOOL_FILES}); evicting {excess} oldest UNDELIVERED event(s)",
-        files.len()
-    );
-    for path in files.into_iter().take(excess) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 /// List `*.json` spool files (ignoring in-flight `*.json.tmp`), or None when the
 /// directory doesn't exist yet.
 /// Spool files awaiting delivery, or the IO error that prevented listing them.
@@ -1441,6 +2294,9 @@ fn list_entries(spool: &Path) -> std::io::Result<(Vec<PathBuf>, usize)> {
                 let path = ent.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("json") {
                     out.push(path);
+                    if out.len() > MAX_SPOOL_FILES {
+                        break;
+                    }
                 }
             }
             Err(_) => unreadable += 1,
@@ -1452,6 +2308,457 @@ fn list_entries(spool: &Path) -> std::io::Result<(Vec<PathBuf>, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correlated_session_entries_quarantine_and_restore_without_touching_others() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let matching = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project&session_id=native-1".into(),
+            body: r#"{"session_id":"native-1","cwd":"/repo","prompt":"same prompt"}"#.into(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let other = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&workspace=ws&project=project&session_id=native-2".into(),
+            body: r#"{"session_id":"native-2","cwd":"/repo","prompt":"other"}"#.into(),
+            ..matching.clone()
+        };
+        enqueue(&spool, &matching).unwrap();
+        enqueue(&spool, &other).unwrap();
+        let quarantine = quarantine_session_entries(
+            &crate::config::Config::default(),
+            &spool,
+            "journal-1",
+            matching.created_ms.saturating_sub(1),
+            matching.created_ms.saturating_add(1),
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            "native-1",
+        )
+        .unwrap();
+        assert_eq!(spool_len(&spool), 1);
+        quarantine.restore(&spool).unwrap();
+        assert_eq!(spool_len(&spool), 2);
+    }
+
+    /// A quarantine whose `.active` marker is gone because the interval
+    /// already completed restores as already-delivered instead of erroring —
+    /// including when a rerun rewrote a fresh `.active` over the completed
+    /// tombstone — while a directory with neither marker is still an error.
+    #[test]
+    fn restore_treats_a_completed_interval_as_already_delivered() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let quarantine = |journal: &str| {
+            quarantine_session_entries(
+                &crate::config::Config::default(),
+                &spool,
+                journal,
+                0,
+                u64::MAX,
+                "http://127.0.0.1:49374",
+                "claude-code",
+                "ws",
+                "project",
+                Path::new("/repo"),
+                "native-1",
+            )
+        };
+        let interval_dir = |journal: &str| {
+            spool
+                .join(RECOVERY_DIR)
+                .join(recovery_interval_key(journal).unwrap())
+        };
+        let completed = quarantine("journal-done").unwrap();
+        assert!(completed.complete_spool_only().unwrap());
+        assert_eq!(
+            completed.restore(&spool).unwrap(),
+            RestoreOutcome::AlreadyDelivered,
+            "a missing .active beside a completed marker means durable delivery"
+        );
+        let rerun = quarantine("journal-done").unwrap();
+        assert!(
+            interval_dir("journal-done")
+                .join(RECOVERY_MATCH_FILE)
+                .is_file(),
+            "the rerun rewrites .active over the completed tombstone"
+        );
+        assert_eq!(
+            rerun.restore(&spool).unwrap(),
+            RestoreOutcome::AlreadyDelivered,
+            "a rerun's rewritten .active never re-opens a completed interval"
+        );
+        assert!(
+            interval_dir("journal-done")
+                .join(RECOVERY_COMPLETED_FILE)
+                .is_file()
+        );
+        assert!(
+            !interval_dir("journal-done")
+                .join(RECOVERY_MATCH_FILE)
+                .is_file()
+        );
+
+        let broken = quarantine("journal-broken").unwrap();
+        std::fs::remove_file(interval_dir("journal-broken").join(RECOVERY_MATCH_FILE)).unwrap();
+        assert!(
+            broken.restore(&spool).is_err(),
+            "a directory with neither marker is still an error"
+        );
+    }
+
+    #[test]
+    fn quarantine_matching_reuses_every_canonical_nested_hook_context_shape() {
+        let base = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: String::new(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let matching = [
+            serde_json::json!({"info": {"id": "native-1", "directory": "/repo"}}),
+            serde_json::json!({"properties": {"session_id": "native-1", "cwd": "/repo"}}),
+            serde_json::json!({"properties": {"sessionID": "native-1", "cwd": "/repo"}}),
+            serde_json::json!({"properties": {"info": {"id": "native-1", "directory": "/repo"}}}),
+            serde_json::json!({"event": {"sessionId": "native-1", "working_dir": "/repo"}}),
+            serde_json::json!({"event": {"properties": {"sessionID": "native-1", "cwd": "/repo"}}}),
+            serde_json::json!({"event": {"properties": {"info": {"id": "native-1", "directory": "/repo"}}}}),
+            serde_json::json!({"payload": {"conversationId": "native-1", "directory": "/repo"}}),
+            serde_json::json!({"payload": {"path": {"session": "native-1", "cwd": "/repo"}}}),
+            serde_json::json!({"payload": {"info": {"id": "native-1", "directory": "/repo"}}}),
+            serde_json::json!({"payload": {"properties": {"sessionID": "native-1", "cwd": "/repo"}}}),
+            serde_json::json!({"payload": {"properties": {"info": {"id": "native-1", "directory": "/repo"}}}}),
+        ];
+        for body in matching {
+            let entry = SpoolEntry {
+                body: body.to_string(),
+                ..base.clone()
+            };
+            assert!(spool_entry_matches_session(
+                &entry,
+                "http://127.0.0.1:49374",
+                "claude-code",
+                None,
+                "ws",
+                "project",
+                Path::new("/repo"),
+                "native-1",
+            ));
+        }
+        for body in [
+            serde_json::json!({"payload": {"info": {"id": "other", "directory": "/repo"}}}),
+            serde_json::json!({"payload": {"info": {"id": "native-1", "directory": "/other"}}}),
+            serde_json::json!({"payload": {"info": {"id": "native-1"}}, "unrelated": {"cwd": "/repo"}}),
+        ] {
+            let entry = SpoolEntry {
+                body: body.to_string(),
+                ..base.clone()
+            };
+            assert!(!spool_entry_matches_session(
+                &entry,
+                "http://127.0.0.1:49374",
+                "claude-code",
+                None,
+                "ws",
+                "project",
+                Path::new("/repo"),
+                "native-1",
+            ));
+        }
+    }
+
+    #[test]
+    fn quarantine_matches_partial_scope_and_captures_late_enqueue() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("project");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"ws\"\nproject = \"project\"\n",
+        )
+        .unwrap();
+        let spool = temp.path().join("hook-spool");
+        let config = crate::config::Config::default();
+        let base = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws".into(),
+            body: serde_json::json!({"session_id":"native-1","cwd":repo,"prompt":"one"})
+                .to_string(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        enqueue_with_config(&spool, &base, Some(&config)).unwrap();
+        let quarantine = quarantine_session_entries(
+            &config,
+            &spool,
+            "journal-partial",
+            base.created_ms.saturating_sub(1),
+            base.created_ms.saturating_add(1),
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            &repo,
+            "native-1",
+        )
+        .unwrap();
+        assert_eq!(
+            quarantine.len(),
+            1,
+            "workspace-only event is correlated by cwd"
+        );
+        enqueue_with_config(
+            &spool,
+            &SpoolEntry {
+                url: "http://127.0.0.1:49374/hook?event=stop&agent=claude-code&project=project"
+                    .into(),
+                body: serde_json::json!({"session_id":"native-1","cwd":repo}).to_string(),
+                ..base.clone()
+            },
+            Some(&config),
+        )
+        .unwrap();
+        assert_eq!(
+            quarantine.len(),
+            2,
+            "late enqueue joins the active quarantine"
+        );
+        assert_eq!(spool_len(&spool), 0, "neither correlated event can drain");
+        quarantine.restore(&spool).unwrap();
+        assert_eq!(spool_len(&spool), 2);
+    }
+
+    #[test]
+    fn enqueue_is_bounded_when_recovery_coordination_lock_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let lock = open_recovery_coord_lock(&spool).unwrap();
+        lock.lock_exclusive().unwrap();
+        let entry = entry_for(
+            "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            r#"{"session_id":"native-1","cwd":"/repo","prompt":"late"}"#.into(),
+            None,
+            false,
+        );
+        let started = Instant::now();
+        enqueue(&spool, &entry).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(spool_len(&spool), 1, "content is retained for recovery");
+    }
+
+    #[test]
+    fn completion_race_leaves_contended_enqueue_safe_for_tombstone_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let config = crate::config::Config::default();
+        let entry = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: r#"{"session_id":"native-1","cwd":"/repo","prompt":"late"}"#.into(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let quarantine = quarantine_session_entries(
+            &config,
+            &spool,
+            "journal",
+            entry.created_ms.saturating_sub(1),
+            entry.created_ms.saturating_add(1),
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            "native-1",
+        )
+        .unwrap();
+        PAUSE_ENQUEUE_AFTER_MAIN_RENAME.store(true, Ordering::SeqCst);
+        ENQUEUE_REACHED_RECOVERY_WINDOW.store(false, Ordering::SeqCst);
+        let enqueue_spool = spool.clone();
+        let enqueue_config = config.clone();
+        let enqueue = std::thread::spawn(move || {
+            enqueue_with_config(&enqueue_spool, &entry, Some(&enqueue_config)).unwrap()
+        });
+        while !ENQUEUE_REACHED_RECOVERY_WINDOW.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        quarantine.complete().unwrap();
+        PAUSE_ENQUEUE_AFTER_MAIN_RENAME.store(false, Ordering::SeqCst);
+        enqueue.join().unwrap();
+        let mut result = DrainResult::default();
+        if let Some(path) = list_entries(&spool).unwrap().0.into_iter().next() {
+            assert!(load_live_entry(&path, &mut result).is_none());
+        }
+        assert_eq!(spool_len(&spool), 0, "completed tombstone removes overlap");
+    }
+
+    #[test]
+    fn completed_recovery_tombstone_retires_late_overlap() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let entry = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: r#"{"session_id":"native-1","cwd":"/repo","prompt":"late"}"#.into(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        let quarantine = quarantine_session_entries(
+            &crate::config::Config::default(),
+            &spool,
+            "journal",
+            entry.created_ms.saturating_sub(1),
+            entry.created_ms.saturating_add(1),
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            "native-1",
+        )
+        .unwrap();
+        quarantine.complete().unwrap();
+        enqueue(&spool, &entry).unwrap();
+        assert_eq!(spool_len(&spool), 0, "late overlap must not be delivered");
+    }
+
+    /// The completed tombstone is bounded by its interval: a hook from a
+    /// LATER resume of the same native session is fresh evidence and must be
+    /// delivered, never swallowed by the earlier interval's tombstone.
+    #[test]
+    fn completed_tombstone_keeps_a_later_resume_of_the_same_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let interval_ended = now_ms().saturating_sub(60_000);
+        let quarantine = quarantine_session_entries(
+            &crate::config::Config::default(),
+            &spool,
+            "journal",
+            interval_ended.saturating_sub(1_000),
+            interval_ended,
+            "http://127.0.0.1:49374",
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            "native-1",
+        )
+        .unwrap();
+        quarantine.complete().unwrap();
+        let later_resume = SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: r#"{"session_id":"native-1","cwd":"/repo","prompt":"from a later resume"}"#.into(),
+            created_ms: now_ms(),
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        };
+        enqueue(&spool, &later_resume).unwrap();
+        assert_eq!(
+            spool_len(&spool),
+            1,
+            "a hook from a later resume must stay queued for delivery"
+        );
+        let path = list_entries(&spool).unwrap().0.into_iter().next().unwrap();
+        let mut result = DrainResult::default();
+        assert!(
+            load_live_entry(&path, &mut result).is_some(),
+            "the drain path must deliver, not drop, post-interval evidence"
+        );
+        assert_eq!(result.dropped, 0);
+    }
+
+    /// Completing one interval only ever consumes its own correlated entries:
+    /// another interval's quarantine keeps its evidence, keeps capturing its
+    /// late hooks, and an entry attributable to two intervals at once fails
+    /// closed into the main spool instead of being attributed by guesswork.
+    #[test]
+    fn completing_one_recovery_interval_leaves_the_other_intervals_entries_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp.path().join("hook-spool");
+        let config = crate::config::Config::default();
+        let first_ms = now_ms().saturating_sub(120_000);
+        let second_ms = first_ms + 60_000;
+        let entry = |created_ms: u64, prompt: &str| {
+            SpoolEntry {
+            url: "http://127.0.0.1:49374/hook?event=user-prompt-submit&agent=claude-code&workspace=ws&project=project".into(),
+            body: format!(r#"{{"session_id":"native-1","cwd":"/repo","prompt":"{prompt}"}}"#),
+            created_ms,
+            auth_mode: AuthMode::Anonymous,
+            token: None,
+            attempts: 0,
+            profile: None,
+        }
+        };
+        let quarantine = |journal: &str, started: u64, ended: u64| {
+            quarantine_session_entries(
+                &config,
+                &spool,
+                journal,
+                started,
+                ended,
+                "http://127.0.0.1:49374",
+                "claude-code",
+                "ws",
+                "project",
+                Path::new("/repo"),
+                "native-1",
+            )
+        };
+        enqueue(&spool, &entry(first_ms, "first interval")).unwrap();
+        enqueue(&spool, &entry(second_ms, "second interval")).unwrap();
+        let first = quarantine("journal-a", first_ms - 1, first_ms + 1).unwrap();
+        let second = quarantine("journal-b", second_ms - 1, second_ms + 1).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(spool_len(&spool), 0);
+
+        first.complete().unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "completing one interval never deletes another interval's correlated entries"
+        );
+        enqueue(&spool, &entry(second_ms, "second interval late hook")).unwrap();
+        assert_eq!(
+            second.len(),
+            2,
+            "the still-active interval keeps capturing its own late hooks"
+        );
+        assert_eq!(spool_len(&spool), 0);
+
+        let overlapping = quarantine("journal-c", second_ms - 1, second_ms + 1).unwrap();
+        assert_eq!(
+            overlapping.len(),
+            0,
+            "the new interval claims nothing already attributed to journal-b"
+        );
+        enqueue(&spool, &entry(second_ms, "attributable to both")).unwrap();
+        assert_eq!(
+            spool_len(&spool),
+            1,
+            "an entry two intervals could own fails closed into the main spool"
+        );
+        second.restore(&spool).unwrap();
+        assert_eq!(spool_len(&spool), 3);
+    }
 
     #[test]
     fn entry_for_picks_auth_mode() {
@@ -1625,7 +2932,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_prunes_oldest_files_when_spool_exceeds_limit() {
+    fn enqueue_refuses_new_entries_when_spool_reaches_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
         for i in 0..(MAX_SPOOL_FILES + 2) {
@@ -1646,7 +2953,77 @@ mod tests {
             .iter()
             .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
             .collect();
-        assert!(bodies.iter().all(|entry| entry.created_ms >= 2));
+        assert!(
+            bodies
+                .iter()
+                .all(|entry| entry.created_ms < MAX_SPOOL_FILES as u64)
+        );
+    }
+
+    #[test]
+    fn capacity_tracks_current_global_occupancy_across_restart_and_quarantine() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(temp.path());
+        for cycle in 0..(MAX_SPOOL_FILES * 3) {
+            let entry = entry_for(
+                format!("https://x/hook?event={cycle}"),
+                "{}".into(),
+                None,
+                false,
+            );
+            enqueue(&spool, &entry).unwrap();
+            let path = list_entries(&spool).unwrap().0.into_iter().next().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+        let accepted = entry_for(
+            "https://x/hook?event=accepted".into(),
+            "{}".into(),
+            None,
+            false,
+        );
+        enqueue(&spool, &accepted).unwrap();
+        assert_eq!(total_spool_entries(&spool).unwrap(), 1);
+        std::fs::remove_file(list_entries(&spool).unwrap().0[0].clone()).unwrap();
+
+        let quarantine = spool.join(RECOVERY_DIR).join("full");
+        std::fs::create_dir_all(&quarantine).unwrap();
+        for index in 0..MAX_SPOOL_FILES {
+            std::fs::write(quarantine.join(format!("{index}.json")), b"{}").unwrap();
+        }
+        enqueue(&spool, &accepted).unwrap();
+        assert_eq!(
+            spool_len(&spool),
+            0,
+            "active quarantines count toward the cap"
+        );
+    }
+
+    #[test]
+    fn oversized_spool_entry_is_refused_before_read_allocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.json");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SPOOL_ENTRY_BYTES + 1).unwrap();
+        let error = read_spool_entry_bytes(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn tombstone_sweep_is_global_and_bounded_by_age_and_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(temp.path());
+        let recovery = spool.join(RECOVERY_DIR);
+        std::fs::create_dir_all(&recovery).unwrap();
+        for index in 0..(MAX_RECOVERY_TOMBSTONES + 2) {
+            let dir = recovery.join(format!("done-{index:04}"));
+            std::fs::create_dir(&dir).unwrap();
+            write_private(&dir.join(RECOVERY_COMPLETED_FILE), b"done").unwrap();
+        }
+        sweep_recovery_tombstones(&spool).unwrap();
+        assert!(
+            std::fs::read_dir(&recovery).unwrap().count() <= MAX_RECOVERY_TOMBSTONES,
+            "completed tombstones are globally count-bounded"
+        );
     }
 
     #[tokio::test]

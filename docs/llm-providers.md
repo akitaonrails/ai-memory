@@ -47,6 +47,7 @@ Recommended defaults:
 | `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
 | `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
 | `codex` | `gpt-5.6-luna` | Reuse the Codex CLI-owned `auth.json`; access-token refresh remains owned by `codex app-server`. |
+| `cursor` | `cursor-grok-4.6-high` | Cursor subscription via the logged-in `agent` CLI. Runs `agent --print --mode ask` (read-only). Does not pass `--yolo`. The default id is the one `agent --list-models` labels "Grok 4.6". |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
 | `opencode` | `mimo-v2.6-flash` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
@@ -73,6 +74,23 @@ export AI_MEMORY_LLM_MODEL=gpt-5.6-luna
 export AI_MEMORY_LLM_REASONING_EFFORT=medium
 ai-memory llm-test --provider codex --model gpt-5.6-luna --prompt "Reply with OK"
 ai-memory llm-test --provider codex --model gpt-5.6-luna --structured --prompt "Return a short answer"
+```
+
+`cursor` uses the Cursor Agent already logged in on this machine. Set
+`AI_MEMORY_LLM_PROVIDER=cursor`. The default model is `cursor-grok-4.6-high`
+("Grok 4.6" in `agent --list-models`); any other id from that list works.
+`AI_MEMORY_CURSOR_AGENT` overrides the binary. The provider writes the prompt
+into a temporary workspace and calls `agent --print --mode ask --trust`. It
+does not pass `--yolo` or `--force`: consolidation text is untrusted captured
+content, and those flags would allow tool execution. The Cursor CLI has no
+JSON-schema mode, so the schema travels in the prompt and the answer is parsed
+and validated against it. The `agent` process inherits the server's
+environment, so run the server with only the credentials it needs.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=cursor
+export AI_MEMORY_LLM_MODEL=cursor-grok-4.6-high
+ai-memory llm-test --provider cursor --model cursor-grok-4.6-high --prompt "Reply with OK"
 ```
 
 Codex credential storage mode `file` is supported. `auto` works only when its
@@ -341,6 +359,22 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > llama.cpp releases honour. It falls back to the tolerant parser when an
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
+
+> [!TIP]
+> **Thinking-capable local engines (vLLM / SGLang serving Qwen3-class
+> models).** Such engines spend the output budget on a reasoning pass before
+> the structured payload and can truncate the JSON mid-object
+> (`finish_reason = "length"`). Set
+> `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING=true` to send
+> `chat_template_kwargs: {"enable_thinking": false}` on every openai-compat
+> request so the engine spends the budget on the payload instead. The knob is
+> opt-in, openai-compat only, and off by default — existing vLLM / Ollama /
+> LM Studio setups are unchanged unless it is set, and every other provider
+> ignores it. When the engine still truncates a structured response, or
+> returns HTTP 2xx with an empty `message.content`, the call now fails fast
+> with the terminal errors `truncated-response` / `empty-content` — no
+> retry, no second HTTP call, and the error text carries no response
+> content.
 
 For small-context local models, configure both consolidation limits. The input
 target accounts for the complete rendered prompt, including bounded slot and

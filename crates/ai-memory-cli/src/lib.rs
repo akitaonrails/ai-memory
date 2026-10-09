@@ -160,6 +160,13 @@ pub async fn run() -> Result<()> {
         Command::AutoImproveReport(args) => commands::auto_improve_report::run(&config, args).await,
         Command::AutoImprove(args) => commands::auto_improve::run(&config, args).await,
         Command::FinalizeSession(args) => commands::finalize_session::run(&config, args).await,
+        Command::Recover(args) => {
+            let exit_code = commands::recovery::run(&config, args).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Command::PendingWrites(args) => commands::pending_writes::run(&config, args).await,
         Command::Embed(args) => commands::embed::run(&config, args).await,
         Command::GenerateAuthToken(args) => commands::generate_auth_token::run(&config, args),

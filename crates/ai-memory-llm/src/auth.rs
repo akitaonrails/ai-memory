@@ -49,6 +49,8 @@ pub enum AuthRequirement {
     /// Provider requires an Anthropic OAuth subscription token
     /// (from `claude setup-token`).
     AnthropicOAuthToken,
+    /// Provider shells out to the logged-in Cursor Agent CLI.
+    CursorCli,
 }
 
 /// Resolved Copilot auth inputs.
@@ -73,6 +75,13 @@ pub struct CodexAuth {
     pub executable: PathBuf,
 }
 
+/// Resolved inputs for the Cursor Agent CLI provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorAuth {
+    /// `agent` binary, or the path in `AI_MEMORY_CURSOR_AGENT`.
+    pub executable: PathBuf,
+}
+
 /// Materialized provider credential.
 #[derive(Debug, Clone)]
 pub enum Credential {
@@ -86,6 +95,8 @@ pub enum Credential {
     Copilot(CopilotAuth),
     /// Anthropic OAuth subscription token from `claude setup-token`.
     AnthropicOAuthToken(SecretString),
+    /// Cursor Agent CLI executable. Login lives in the Cursor app, not here.
+    Cursor(CursorAuth),
 }
 
 /// Resolved authentication for one provider instance.
@@ -157,6 +168,20 @@ impl ProviderAuth {
                 api_base_url,
             })),
             source: CredentialSource::TokenFile,
+        }
+    }
+
+    /// Resolve Cursor auth from the agent executable path.
+    #[must_use]
+    pub fn cursor(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            requirement: AuthRequirement::CursorCli,
+            credential: Some(Credential::Cursor(CursorAuth {
+                executable: executable.into(),
+            })),
+            source: CredentialSource::Environment {
+                name: "AI_MEMORY_CURSOR_AGENT",
+            },
         }
     }
 
@@ -236,6 +261,9 @@ impl ProviderAuth {
             (_, Some(Credential::AnthropicOAuthToken(_))) => Err(LlmError::NotConfigured(
                 "API key credential expected, got anthropic-oauth token".into(),
             )),
+            (_, Some(Credential::Cursor(_))) => Err(LlmError::NotConfigured(
+                "API key credential expected, got cursor agent CLI".into(),
+            )),
             (AuthRequirement::RequiredApiKey { env_var }, None) => {
                 Err(LlmError::NotConfigured((*env_var).into()))
             }
@@ -258,6 +286,10 @@ impl ProviderAuth {
                  ANTHROPIC_OAUTH_TOKEN (or CLAUDE_CODE_OAUTH_TOKEN)"
                     .into(),
             )),
+            (AuthRequirement::CursorCli, None) => Err(LlmError::NotConfigured(
+                "cursor agent executable missing; set AI_MEMORY_CURSOR_AGENT or install `agent`"
+                    .into(),
+            )),
         }
     }
 
@@ -270,7 +302,8 @@ impl ProviderAuth {
                 Credential::OpenAiOAuthTokenFile(_)
                 | Credential::Codex(_)
                 | Credential::Copilot(_)
-                | Credential::AnthropicOAuthToken(_),
+                | Credential::AnthropicOAuthToken(_)
+                | Credential::Cursor(_),
             )
             | None => None,
         }
@@ -329,6 +362,23 @@ impl ProviderAuth {
             )),
             _ => Err(LlmError::NotConfigured(
                 "codex auth-file credential required".into(),
+            )),
+        }
+    }
+
+    /// Extract the Cursor Agent executable.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] if this is not Cursor CLI auth.
+    pub fn require_cursor_auth(&self) -> LlmResult<CursorAuth> {
+        match (&self.requirement, &self.credential) {
+            (AuthRequirement::CursorCli, Some(Credential::Cursor(auth))) => Ok(auth.clone()),
+            (AuthRequirement::CursorCli, None) => Err(LlmError::NotConfigured(
+                "cursor agent executable missing; set AI_MEMORY_CURSOR_AGENT or install `agent`"
+                    .into(),
+            )),
+            _ => Err(LlmError::NotConfigured(
+                "cursor agent credential required".into(),
             )),
         }
     }

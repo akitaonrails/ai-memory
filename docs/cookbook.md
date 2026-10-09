@@ -387,6 +387,7 @@ ai-memory resume --search auth       # pick a matching workstream in this checko
 ai-memory resume --all               # pick from every linked checkout on this machine
 ai-memory workstreams                # list this checkout's managed workstreams
 ai-memory status                     # counts, paths, health
+ai-memory recover                    # replay outage spool/transcripts safely
 ai-memory list-projects              # every workspace/project the server knows about
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
@@ -406,9 +407,23 @@ ai-memory serve                      # run the server
   automatically when the server returns), an existing MCP registration
   degrades to no-recall for the session, and the child's exit code is
   returned. What you lose for that run is the workstream lease/context,
-  transcript import, and handoff delivery; sessions resume only through an
-  explicit native selector because no lease means no mutual exclusion. See
-  [Degraded offline
+  immediate transcript import, and handoff delivery; sessions resume only
+  through an explicit native selector because no lease means no mutual
+  exclusion. An explicit resume is journaled with its exact pre-launch native
+  cursor and recovery imports only the appended delta; a cursor that cannot be
+  proven requires manual repair. A fresh run is journaled only when one new
+  native session can be correlated; ambiguity prints a manual backfill action.
+  Once the server returns, run `ai-memory recover`: for transcript-capable
+  harnesses it quarantines correlated spool entries, drains unrelated events,
+  and replays the bounded exact transcript through sanitized `/hook/batch`;
+  Antigravity has no supported transcript exporter, so its degraded run is
+  journaled as spool-only and clears only after correlated hook evidence has a
+  durable-delivery confirmation; recovery never calls its exporter. Empty or
+  previously correlated-loss spool state stays journaled for manual repair. Owner-authorized recovery
+  finishes an expired original managed run only when it was not superseded. A full journal refuses
+  new entries instead of evicting old work, and dropped spool events make the
+  command fail while retaining every journal entry for a later clean pass.
+  Re-running is safe. See [Degraded offline
   launches](managed-workstreams.md#degraded-offline-launches). To fail instead
   of degrading, pass `--require-server` (or set `run.require_server = true` /
   `AI_MEMORY_RUN_REQUIRE_SERVER=true`). For a planned outage, consider

@@ -25,7 +25,8 @@ use ai_memory_workstream::{
     kiro_selects_v3_engine, kiro_v3_resume_uses_default_store, list_native_sessions,
     marked_choices, native_session_exists, native_session_in_checkout, native_store_root,
     omp_profile_flag, omp_profile_flag_env, parse_jail_toggles, store_override_vars,
-    usable_ai_jail_here, wait_for_transcript_flush,
+    transcript_baseline, transcript_interval_digests, usable_ai_jail_here,
+    wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use clap::ValueEnum as _;
@@ -448,6 +449,7 @@ const fn run_harness_choice(harness: ManagedHarness) -> RunHarnessChoice {
         ManagedHarness::Kiro | ManagedHarness::KiroV3 => RunHarnessChoice::Kiro,
         ManagedHarness::Grok => RunHarnessChoice::Grok,
         ManagedHarness::Antigravity => RunHarnessChoice::Antigravity,
+        ManagedHarness::Copilot => RunHarnessChoice::Copilot,
     }
 }
 
@@ -629,6 +631,8 @@ async fn run_once_with_wiring(
                 harness: provisional_harness,
                 executable: executable.clone(),
                 native_args: &native_args,
+                workspace: &workspace,
+                project: &project,
                 force_fresh,
                 yolo_modes,
                 jail_plan: &jail_plan,
@@ -1217,25 +1221,43 @@ async fn run_once_with_wiring(
         )
         .await
     );
-    let transcript = if plan.mode == LaunchMode::Session {
-        let source_cursor = if native_session_id.as_deref() == prepared.native_session_id.as_deref()
-        {
-            prepared.source_cursor.as_deref()
+    let recovery_start_cursor =
+        if native_session_id.as_deref() == prepared.native_session_id.as_deref() {
+            prepared.source_cursor.clone()
         } else {
             None
         };
-        export_after_flush(
+    let (transcript, exact_export_available) = if plan.mode == LaunchMode::Session
+        && harness.transcript_capability() == ai_memory_workstream::TranscriptCapability::Export
+    {
+        let exported = export_after_flush(
             harness,
             &home,
             &repository.cwd,
             plan.session_dir.as_deref(),
             native_session_id.as_deref(),
-            source_cursor,
+            recovery_start_cursor.as_deref(),
         )
-        .await
+        .await;
+        let exact = exported.losses.iter().all(|loss| {
+            !loss.starts_with("native session id could not be discovered")
+                && !loss.starts_with("native transcript import failed")
+        }) && exported.source_cursor.is_some();
+        (exported, exact)
     } else {
-        ExportedTranscript::default()
+        (
+            ExportedTranscript {
+                native_session_id: native_session_id.clone().unwrap_or_default(),
+                ..ExportedTranscript::default()
+            },
+            false,
+        )
     };
+    let recovery_event_digests =
+        exact_export_available.then(|| transcript_interval_digests(&transcript.events));
+    let recovery_cursor = exact_export_available
+        .then(|| transcript.source_cursor.clone())
+        .flatten();
     let checkpoint = inspect_repository(&repository.cwd)
         .map(|identity| identity.checkpoint)
         .unwrap_or(repository.checkpoint);
@@ -1265,6 +1287,23 @@ async fn run_once_with_wiring(
                     &project,
                     &error,
                 )
+            );
+            journal_finish_failed_run(
+                config,
+                &endpoint,
+                harness,
+                native_session_id.as_deref(),
+                &plan,
+                &workspace,
+                &project,
+                &repository.cwd,
+                started_at,
+                exit_code,
+                prepared.run_id,
+                recovery_event_digests.as_deref(),
+                recovery_start_cursor.as_deref(),
+                recovery_cursor.as_deref(),
+                &privacy,
             );
             interrupt_task.abort();
             return Ok(RunOutcome {
@@ -1348,6 +1387,8 @@ struct DegradedLaunch<'a> {
     harness: ManagedHarness,
     executable: Option<OsString>,
     native_args: &'a [OsString],
+    workspace: &'a str,
+    project: &'a str,
     force_fresh: bool,
     yolo_modes: YoloModes,
     jail_plan: &'a JailPlan,
@@ -1470,6 +1511,41 @@ async fn degraded_launch(
     for name in blank_home_overrides(launch.harness, &launch_env) {
         command.env_remove(name);
     }
+    let prelaunch_sessions = snapshot_native_sessions(
+        launch.harness,
+        launch.home,
+        launch.cwd,
+        plan.session_dir.as_deref(),
+    )
+    .await;
+    let prelaunch_cursor = if let Some(session) = plan.expected_session_id.as_deref()
+        && launch.harness.transcript_capability()
+            == ai_memory_workstream::TranscriptCapability::Export
+    {
+        match native_session_exists(
+            launch.harness,
+            launch.home,
+            launch.cwd,
+            plan.session_dir.as_deref(),
+            session,
+        ) {
+            Ok(true) => Some(
+                transcript_baseline(
+                    launch.harness,
+                    launch.home,
+                    launch.cwd,
+                    plan.session_dir.as_deref(),
+                    session,
+                )
+                .await,
+            ),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        }
+    } else {
+        None
+    };
+    let started_at = SystemTime::now();
     let child = command.spawn().map_err(|spawn_error| {
         let spawn_message = spawn_error.to_string();
         anyhow!(spawn_message).context(format!(
@@ -1486,6 +1562,16 @@ async fn degraded_launch(
         "ai-memory: this run was not recorded on the server; {}",
         spooled_events_note(&spool)
     );
+    journal_degraded_run(
+        config,
+        launch,
+        &plan,
+        exit_code,
+        started_at,
+        prelaunch_sessions,
+        prelaunch_cursor,
+    )
+    .await;
     Ok(RunOutcome {
         exit_code,
         harness: launch.harness,
@@ -1493,6 +1579,255 @@ async fn degraded_launch(
         mode: plan.mode,
         workstream_name: "(offline)".to_string(),
         degraded: true,
+    })
+}
+
+/// Journal a degraded session launch so `ai-memory recover` can close it out
+/// once the server returns. Best-effort by contract: the child has already
+/// exited and its exit code is preserved above everything else, so a journal
+/// problem may only warn. Passthrough launches are not journaled — they hold
+/// no session and no transcript, so there is nothing to recover.
+async fn journal_degraded_run(
+    config: &Config,
+    launch: &DegradedLaunch<'_>,
+    plan: &LaunchPlan,
+    exit_code: i32,
+    started_at: SystemTime,
+    prelaunch_sessions: Option<std::collections::HashSet<String>>,
+    prelaunch_cursor: Option<Result<String>>,
+) {
+    if plan.mode != LaunchMode::Session {
+        return;
+    }
+    let native_session_id = match Sanitizer::new(&config.sanitize) {
+        Ok(privacy) => resolve_degraded_session(
+            plan,
+            launch.harness,
+            launch.home,
+            launch.cwd,
+            started_at,
+            prelaunch_sessions.as_ref(),
+            &privacy,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "ai-memory: could not uniquely identify the session this run used ({error:#}); \
+                 nothing was journaled; preserve the local transcript and run `ai-memory \
+                 backfill --force --session <id>` after identifying it"
+            );
+            None
+        }),
+        Err(error) => {
+            eprintln!(
+                "ai-memory: could not record this run for recovery (privacy config: {error}); \
+                 nothing was journaled"
+            );
+            return;
+        }
+    };
+    let Some(native_session_id) = native_session_id else {
+        eprintln!(
+            "ai-memory: no native session was discovered, so this run could not be journaled; \
+             retain the harness transcript for manual backfill"
+        );
+        return;
+    };
+    let source_cursor = match prelaunch_cursor {
+        Some(Ok(cursor)) => Some(cursor),
+        Some(Err(error)) => {
+            eprintln!(
+                "ai-memory: could not record a safe delta baseline for resumed session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                display_session_id(&native_session_id)
+            );
+            return;
+        }
+        None => None,
+    };
+    let spool_only = launch.harness.transcript_capability()
+        == ai_memory_workstream::TranscriptCapability::SpoolOnly;
+    let (event_digests, final_cursor) = if spool_only {
+        (None, None)
+    } else {
+        let exact_export = match export_exact_after_run(
+            launch.harness,
+            launch.home,
+            launch.cwd,
+            plan.session_dir.as_deref(),
+            &native_session_id,
+            source_cursor.as_deref(),
+        )
+        .await
+        {
+            Ok(export) => export,
+            Err(error) => {
+                eprintln!(
+                    "ai-memory: could not capture an exact post-run transcript bound for session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                    display_session_id(&native_session_id)
+                );
+                return;
+            }
+        };
+        let Some(final_cursor) = exact_export.source_cursor.clone() else {
+            eprintln!(
+                "ai-memory: the {} transcript adapter produced no post-run cursor; nothing was journaled; retain the native transcript for manual repair",
+                launch.harness.as_str()
+            );
+            return;
+        };
+        (
+            Some(transcript_interval_digests(&exact_export.events)),
+            Some(final_cursor),
+        )
+    };
+    let entry = super::recovery::JournalEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        recorded_at: jiff::Timestamp::now().to_string(),
+        interval_started_ms: system_time_ms(started_at),
+        interval_ended_ms: system_time_ms(SystemTime::now()),
+        kind: super::recovery::JournalKind::DegradedRun,
+        harness: launch.harness.as_str().to_string(),
+        native_session_id: Some(native_session_id),
+        session_dir: absolute_session_dir(plan.session_dir.as_deref(), launch.cwd)
+            .map(|path| path.to_string_lossy().into_owned()),
+        cwd: launch.cwd.to_string_lossy().into_owned(),
+        workspace: launch.workspace.to_string(),
+        project: launch.project.to_string(),
+        server_url: launch.endpoint.identity(),
+        run_id: None,
+        event_digests,
+        spool_only,
+        source_cursor,
+        final_cursor,
+        correlated_events_seen: false,
+        correlated_delivery_confirmed: false,
+        correlated_loss: false,
+        exit_code: Some(exit_code),
+        failures: Vec::new(),
+    };
+    match super::recovery::append_journal_entry(&config.data_dir, entry) {
+        Ok(()) => {
+            eprintln!(
+                "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
+                 is back to replay this session's exact native transcript"
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "ai-memory: could not record this run for recovery ({error:#}); the native \
+                 transcript remains in the harness store and can be imported with `ai-memory \
+                 backfill --force --session <id>`"
+            );
+        }
+    }
+}
+
+const DEGRADED_SESSION_SNAPSHOT_LIMIT: usize = 2_000;
+
+async fn snapshot_native_sessions(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+) -> Option<std::collections::HashSet<String>> {
+    let sessions = list_native_sessions(
+        harness,
+        home,
+        cwd,
+        session_dir,
+        DEGRADED_SESSION_SNAPSHOT_LIMIT + 1,
+    )
+    .await
+    .ok()?;
+    if sessions.len() > DEGRADED_SESSION_SNAPSHOT_LIMIT {
+        return None;
+    }
+    Some(
+        sessions
+            .into_iter()
+            .map(|session| session.native_session_id)
+            .collect(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_degraded_session(
+    plan: &LaunchPlan,
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    started_at: SystemTime,
+    before: Option<&std::collections::HashSet<String>>,
+    sanitizer: &Sanitizer,
+) -> Result<Option<String>> {
+    if let Some(expected) = plan.expected_session_id.as_deref() {
+        return NativeSessionIdentity::parse(expected, sanitizer)
+            .map(NativeSessionIdentity::into_string)
+            .map(Some)
+            .map_err(anyhow::Error::from);
+    }
+    let Some(before) = before else {
+        return Err(anyhow!(
+            "pre-launch native-session snapshot was unavailable"
+        ));
+    };
+    let after = list_native_sessions(
+        harness,
+        home,
+        cwd,
+        plan.session_dir.as_deref(),
+        DEGRADED_SESSION_SNAPSHOT_LIMIT + 1,
+    )
+    .await?;
+    if after.len() > DEGRADED_SESSION_SNAPSHOT_LIMIT {
+        return Err(anyhow!(
+            "post-launch native-session snapshot exceeded its {}-record limit",
+            DEGRADED_SESSION_SNAPSHOT_LIMIT
+        ));
+    }
+    let native_session_id = unique_new_session(after, before, started_at)?;
+    NativeSessionIdentity::parse(&native_session_id, sanitizer)
+        .map(NativeSessionIdentity::into_string)
+        .map(Some)
+        .map_err(anyhow::Error::from)
+}
+
+fn unique_new_session(
+    after: Vec<NativeSessionCandidate>,
+    before: &std::collections::HashSet<String>,
+    started_at: SystemTime,
+) -> Result<String> {
+    let mut new = after
+        .into_iter()
+        .filter(|candidate| {
+            candidate.updated_at + Duration::from_secs(2) >= started_at
+                && !before.contains(&candidate.native_session_id)
+        })
+        .collect::<Vec<_>>();
+    if new.len() != 1 {
+        return Err(anyhow!(
+            "expected one new native session after launch, found {}",
+            new.len()
+        ));
+    }
+    Ok(new.remove(0).native_session_id)
+}
+
+fn system_time_ms(time: SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn absolute_session_dir(session_dir: Option<&Path>, cwd: &Path) -> Option<PathBuf> {
+    session_dir.map(|path| {
+        if path.is_absolute() {
+            clean_path(path)
+        } else {
+            clean_path(&cwd.join(path))
+        }
     })
 }
 
@@ -1526,9 +1861,10 @@ fn offline_launch_warning(
     format!(
         "ai-memory: WARNING: the ai-memory server at {} is unreachable — launching {} \
          WITHOUT server support.\n  {diagnosis:#}\n  Lost this run: no workstream lease or \
-         cross-harness context, no transcript import, no handoff delivery.\n  Still works: \
-         lifecycle hooks spool events locally and drain when the server returns; an existing \
-         MCP registration degrades to no-recall rather than blocking the session.\n  Spooled \
+         cross-harness context, no immediate transcript import, no handoff delivery.\n  Still \
+         works: lifecycle hooks spool events locally, and the native transcript is journaled \
+         after session discovery. Run `ai-memory recover` when the server returns to drain the \
+         spool and replay the exact transcript through the sanitized backfill path.\n  Spooled \
          events are dropped after {} failed drain passes, 7 days, or the 10,000-file spool \
          cap (set AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0 for a planned outage). Pass \
          --require-server to fail instead of degrading.",
@@ -1548,21 +1884,84 @@ fn offline_import_warning(
     project: &str,
     error: &anyhow::Error,
 ) -> String {
-    let repair = match native_session_id {
-        Some(session) => format!(
-            "ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}",
-            harness.agent_kind().as_str(),
-            SessionId::from_native(session),
-            super::render_shared::shell_quote(workspace),
-            super::render_shared::shell_quote(project),
-        ),
-        None => "ai-memory finalize-session (see --help)".to_string(),
-    };
+    let session = native_session_id
+        .map(SessionId::from_native)
+        .map_or_else(|| "unknown".to_string(), |session| session.to_string());
     format!(
-        "ai-memory: warning: {error:#}; the transcript was not imported and the orphaned lease \
-         will expire automatically within 90 seconds. The harness exit code is preserved. \
-         Repair it once the server is back with `{repair}`."
+        "ai-memory: warning: {error:#}; the transcript for {} session {session} in {}/{} was \
+         not imported and the orphaned lease will expire automatically within 90 seconds. The \
+         harness exit code is preserved. Run `ai-memory recover` once the server is back.",
+        harness.as_str(),
+        workspace,
+        project,
     )
+}
+
+/// Journal a run whose transcript import failed on an unreachable server, so
+/// `ai-memory recover` can re-export and re-import it once the server
+/// returns. The journal keeps only locators and recomputes the repository
+/// checkpoint during recovery — never transcript content. Best-effort: the
+/// child's exit code is already preserved, so a journal problem may only warn.
+#[allow(clippy::too_many_arguments)]
+fn journal_finish_failed_run(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    harness: ManagedHarness,
+    native_session_id: Option<&str>,
+    plan: &LaunchPlan,
+    workspace: &str,
+    project: &str,
+    cwd: &Path,
+    started_at: SystemTime,
+    exit_code: i32,
+    run_id: ai_memory_core::ManagedRunId,
+    event_digests: Option<&[String]>,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
+    sanitizer: &Sanitizer,
+) {
+    let entry = super::recovery::JournalEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        recorded_at: jiff::Timestamp::now().to_string(),
+        interval_started_ms: system_time_ms(started_at),
+        interval_ended_ms: system_time_ms(SystemTime::now()),
+        kind: super::recovery::JournalKind::FinishFailed,
+        harness: harness.as_str().to_string(),
+        native_session_id: native_session_id
+            .and_then(|id| NativeSessionIdentity::parse(id, sanitizer).ok())
+            .map(NativeSessionIdentity::into_string),
+        session_dir: absolute_session_dir(plan.session_dir.as_deref(), cwd)
+            .map(|path| path.to_string_lossy().into_owned()),
+        cwd: cwd.to_string_lossy().into_owned(),
+        workspace: workspace.to_string(),
+        project: project.to_string(),
+        server_url: endpoint.identity(),
+        run_id: Some(run_id.to_string()),
+        event_digests: event_digests.map(<[String]>::to_vec),
+        spool_only: harness.transcript_capability()
+            == ai_memory_workstream::TranscriptCapability::SpoolOnly,
+        source_cursor: source_cursor.map(str::to_owned),
+        final_cursor: final_cursor.map(str::to_owned),
+        correlated_events_seen: false,
+        correlated_delivery_confirmed: false,
+        correlated_loss: false,
+        exit_code: Some(exit_code),
+        failures: Vec::new(),
+    };
+    match super::recovery::append_journal_entry(&config.data_dir, entry) {
+        Ok(()) => {
+            eprintln!(
+                "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
+                 is back to re-import this transcript"
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "ai-memory: could not record this run for recovery ({error:#}); retain the \
+                 native transcript and original run id for manual repair"
+            );
+        }
+    }
 }
 
 /// Whether a managed-run request failed because the server could not be
@@ -3276,6 +3675,26 @@ fn session_age(updated_at: SystemTime, now: SystemTime) -> String {
     super::humanize_age_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
+async fn export_exact_after_run(
+    harness: ManagedHarness,
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    session_dir: Option<&std::path::Path>,
+    native_session_id: &str,
+    source_cursor: Option<&str>,
+) -> Result<ExportedTranscript> {
+    wait_for_transcript_flush(harness, home, cwd, session_dir, native_session_id).await?;
+    export_transcript(
+        harness,
+        home,
+        cwd,
+        session_dir,
+        native_session_id,
+        source_cursor,
+    )
+    .await
+}
+
 async fn export_after_flush(
     harness: ManagedHarness,
     home: &std::path::Path,
@@ -3317,7 +3736,7 @@ async fn export_after_flush(
     }
 }
 
-async fn import_batches(
+pub(crate) async fn import_batches(
     endpoint: &ServerEndpoint,
     run_path: &str,
     transcript: ExportedTranscript,
@@ -3700,6 +4119,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Kiro => ManagedHarness::Kiro,
         RunHarnessChoice::Grok => ManagedHarness::Grok,
         RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
+        RunHarnessChoice::Copilot => ManagedHarness::Copilot,
     }
 }
 
@@ -3724,6 +4144,30 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::KiroCli => Some(ManagedHarness::Kiro),
         AgentKind::Grok => Some(ManagedHarness::Grok),
         AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
+        AgentKind::CopilotCli => Some(ManagedHarness::Copilot),
+        _ => None,
+    }
+}
+
+/// Parse the exact harness names the recovery journal writes
+/// (`ManagedHarness::as_str`). The user-facing `from_name` table deliberately
+/// has no "kiro-v3" spelling (no one types that), but the journal must round
+/// trip its own exact value, engine flavor included.
+pub(crate) fn harness_from_journal_name(name: &str) -> Option<ManagedHarness> {
+    match name {
+        "claude" => Some(ManagedHarness::Claude),
+        "codex" => Some(ManagedHarness::Codex),
+        "opencode" => Some(ManagedHarness::OpenCode),
+        "opencode2" => Some(ManagedHarness::OpenCode2),
+        "pi" => Some(ManagedHarness::Pi),
+        "crush" => Some(ManagedHarness::Crush),
+        "omp" => Some(ManagedHarness::Omp),
+        "kimi" => Some(ManagedHarness::Kimi),
+        "command-code" => Some(ManagedHarness::CommandCode),
+        "kiro" => Some(ManagedHarness::Kiro),
+        "kiro-v3" => Some(ManagedHarness::KiroV3),
+        "grok" => Some(ManagedHarness::Grok),
+        "antigravity" => Some(ManagedHarness::Antigravity),
         _ => None,
     }
 }
@@ -4611,6 +5055,43 @@ mod tests {
     }
 
     #[test]
+    fn degraded_session_correlation_requires_one_new_session() {
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let before = std::collections::HashSet::from(["old".to_string()]);
+        let candidate = |id: &str| NativeSessionCandidate {
+            native_session_id: id.into(),
+            updated_at: started + Duration::from_secs(1),
+        };
+        assert_eq!(
+            unique_new_session(vec![candidate("old"), candidate("new")], &before, started).unwrap(),
+            "new"
+        );
+        assert!(
+            unique_new_session(
+                vec![candidate("first"), candidate("second")],
+                &before,
+                started
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("found 2")
+        );
+        assert!(unique_new_session(vec![candidate("old")], &before, started).is_err());
+    }
+
+    #[test]
+    fn relative_session_dir_is_persisted_against_launch_cwd() {
+        assert_eq!(
+            absolute_session_dir(Some(Path::new("stores/native")), Path::new("/repo")),
+            Some(PathBuf::from("/repo/stores/native"))
+        );
+        assert_eq!(
+            absolute_session_dir(Some(Path::new("/stores/native")), Path::new("/repo")),
+            Some(PathBuf::from("/stores/native"))
+        );
+    }
+
+    #[test]
     fn native_grok_rules_flags_suppress_context_injection() {
         for args in [
             vec![OsString::from("--rules"), OsString::from("be terse")],
@@ -5381,6 +5862,35 @@ mod tests {
     }
 
     #[test]
+    fn copilot_aliases_select_the_managed_adapter() {
+        for name in ["copilot", "copilot-cli"] {
+            let cli = Cli::try_parse_from([
+                OsStr::new("ai-memory"),
+                OsStr::new("run"),
+                OsStr::new(name),
+                OsStr::new("--model"),
+                OsStr::new("gpt-5.6"),
+            ])
+            .unwrap();
+            let CliCommand::Run(args) = cli.command else {
+                panic!("expected run command");
+            };
+            let choice = args.harness.expect("explicit harness");
+            assert_eq!(choice, crate::cli::RunHarnessChoice::Copilot, "{name}");
+            assert_eq!(managed_harness(choice), ManagedHarness::Copilot);
+            assert_eq!(run_harness_choice(ManagedHarness::Copilot), choice);
+            assert_eq!(
+                args.native_args,
+                ["--model", "gpt-5.6"].map(OsString::from).to_vec()
+            );
+        }
+        assert_eq!(
+            managed_harness_from_agent(AgentKind::CopilotCli),
+            Some(ManagedHarness::Copilot)
+        );
+    }
+
+    #[test]
     fn command_code_aliases_select_the_managed_adapter() {
         for name in ["command-code", "commandcode", "cmdc", "cmd"] {
             let cli = Cli::try_parse_from([
@@ -6126,8 +6636,7 @@ mod tests {
     }
 
     /// A fake Claude executable: captures its environment and argv, writes
-    /// the (empty-session) transcript the launcher waits for, and exits with
-    /// `code`.
+    /// the transcript the launcher waits for, and exits with `code`.
     #[cfg(unix)]
     fn capture_env_claude(repo: &Path, home: &Path, code: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -6401,8 +6910,8 @@ mod tests {
     }
 
     /// The degraded-launch warning names everything the operator needs: the
-    /// server URL, what is lost, what still works (spool + no-recall MCP),
-    /// the bounded retention, and the opt-outs.
+    /// server URL, what is unavailable, what remains recoverable, the bounded
+    /// retention, and the opt-outs.
     #[tokio::test]
     async fn offline_launch_warning_names_the_tradeoffs() {
         let url = closed_port_url().await;
@@ -6421,7 +6930,8 @@ mod tests {
         assert!(warning.contains("Lost this run"), "{warning}");
         assert!(warning.contains("Still works"), "{warning}");
         assert!(warning.contains("spool"), "{warning}");
-        assert!(warning.contains("no-recall"), "{warning}");
+        assert!(warning.contains("ai-memory recover"), "{warning}");
+        assert!(warning.contains("sanitized backfill"), "{warning}");
         assert!(warning.contains("8 failed drain passes"), "{warning}");
         assert!(
             warning.contains("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0"),
@@ -6476,7 +6986,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_import_warning_points_at_finalize_session() {
+    fn offline_import_warning_points_at_recovery() {
         let warning = offline_import_warning(
             ManagedHarness::Claude,
             Some("session-123"),
@@ -6485,15 +6995,10 @@ mod tests {
             &anyhow!("connection refused"),
         );
         assert!(warning.contains("exit code is preserved"), "{warning}");
+        assert!(warning.contains("ai-memory recover"), "{warning}");
+        assert!(warning.contains("in ws/proj"), "{warning}");
         assert!(
-            warning.contains(&format!(
-                "ai-memory finalize-session --agent claude-code --reopen --session-id {}",
-                SessionId::from_native("session-123")
-            )),
-            "{warning}"
-        );
-        assert!(
-            warning.contains("--workspace ws --project proj"),
+            warning.contains(&SessionId::from_native("session-123").to_string()),
             "{warning}"
         );
 
@@ -6504,10 +7009,8 @@ mod tests {
             "proj",
             &anyhow!("timed out"),
         );
-        assert!(
-            generic.contains("finalize-session (see --help)"),
-            "{generic}"
-        );
+        assert!(generic.contains("session unknown"), "{generic}");
+        assert!(generic.contains("ai-memory recover"), "{generic}");
     }
 
     /// A server that dies between prepare and finish: the child's exit code

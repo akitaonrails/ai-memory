@@ -80,6 +80,7 @@ pub mod purge_project;
 pub mod purge_session;
 pub mod read_page;
 pub mod reclaim_ledger_versions;
+pub mod recovery;
 pub mod reindex;
 pub mod rename_project;
 pub mod rename_workstream;
@@ -257,6 +258,15 @@ pub(crate) fn resolve_scope_for_path(
     config: &Config,
     cwd: &std::path::Path,
 ) -> Result<(String, String)> {
+    resolve_scope_for_path_with_explicit(config, cwd, None, None)
+}
+
+pub(crate) fn resolve_scope_for_path_with_explicit(
+    config: &Config,
+    cwd: &std::path::Path,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+) -> Result<(String, String)> {
     if !cwd.exists() {
         return Err(anyhow!(
             "project candidate does not exist: {}",
@@ -266,39 +276,44 @@ pub(crate) fn resolve_scope_for_path(
     let cwd = crate::marker::absolute_normalized(cwd);
     let identity = cwd.to_string_lossy().into_owned();
     let marker = crate::marker::read_scope(&identity, &config.runtime_env)?;
-    let workspace = marker
-        .as_ref()
-        .and_then(|scope| scope.workspace.clone())
+    let workspace = explicit_ws
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| marker.as_ref().and_then(|scope| scope.workspace.clone()))
         .unwrap_or_else(|| crate::config::DEFAULT_WORKSPACE.to_string());
-    let project = match marker.as_ref() {
-        Some(scope) => scope
-            .project
-            .clone()
-            .or_else(|| scope.canonical_remote_project())
-            .or_else(|| {
-                if scope.is_repo_root() {
-                    crate::marker::repo_root_project(&identity)
-                } else {
+    let project = if let Some(project) = explicit_proj.filter(|value| !value.is_empty()) {
+        project.to_owned()
+    } else {
+        match marker.as_ref() {
+            Some(scope) => scope
+                .project
+                .clone()
+                .or_else(|| scope.canonical_remote_project())
+                .or_else(|| {
+                    if scope.is_repo_root() {
+                        crate::marker::repo_root_project(&identity)
+                    } else {
+                        ai_memory_consolidate::derive_project_name(
+                            &cwd,
+                            ai_memory_consolidate::ProjectNameStrategy::Basename,
+                        )
+                        .map(|(name, _)| name)
+                    }
+                })
+                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+            None => crate::marker::discover_remote_identity(&identity)
+                .and_then(|repository| {
+                    ai_memory_core::repository_identity::path_style_name(&repository)
+                })
+                .or_else(|| {
                     ai_memory_consolidate::derive_project_name(
                         &cwd,
                         ai_memory_consolidate::ProjectNameStrategy::Basename,
                     )
                     .map(|(name, _)| name)
-                }
-            })
-            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
-        None => crate::marker::discover_remote_identity(&identity)
-            .and_then(|repository| {
-                ai_memory_core::repository_identity::path_style_name(&repository)
-            })
-            .or_else(|| {
-                ai_memory_consolidate::derive_project_name(
-                    &cwd,
-                    ai_memory_consolidate::ProjectNameStrategy::Basename,
-                )
-                .map(|(name, _)| name)
-            })
-            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+                })
+                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+        }
     };
     Ok((workspace, project))
 }

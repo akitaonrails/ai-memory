@@ -527,6 +527,62 @@ pub fn agent_from_payload(raw: &serde_json::Value) -> Option<AgentKind> {
     extract_string(raw, &["cursor_version"]).map(|_| AgentKind::Cursor)
 }
 
+/// Session and checkout fields extracted from the canonical hook payload shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookPayloadContext {
+    /// Harness-native session identity.
+    pub session_id: Option<String>,
+    /// Current checkout directory.
+    pub cwd: Option<String>,
+}
+
+/// Extract the session and checkout exactly as [`HookEnvelope`] does.
+#[must_use]
+pub fn hook_payload_context(raw: &serde_json::Value) -> HookPayloadContext {
+    let session_id = extract_string(
+        raw,
+        &[
+            "session_id",
+            "sessionId",
+            "sessionID",
+            "session",
+            "conversationId",
+        ],
+    )
+    .or_else(|| {
+        extract_string_path(
+            raw,
+            &[
+                &["info", "id"],
+                &["properties", "sessionID"],
+                &["properties", "info", "id"],
+                &["event", "properties", "sessionID"],
+                &["event", "properties", "info", "id"],
+                &["payload", "info", "id"],
+                &["payload", "properties", "sessionID"],
+                &["payload", "properties", "info", "id"],
+            ],
+        )
+    });
+    let cwd = extract_string(raw, &["cwd", "current_dir", "working_dir", "directory"])
+        .or_else(|| extract_first_string_array_item(raw, &["workspacePaths", "workspace_roots"]))
+        .or_else(|| {
+            extract_string_path(
+                raw,
+                &[
+                    &["path", "cwd"],
+                    &["info", "directory"],
+                    &["properties", "info", "directory"],
+                    &["event", "properties", "info", "directory"],
+                    &["payload", "path", "cwd"],
+                    &["payload", "info", "directory"],
+                    &["payload", "properties", "info", "directory"],
+                ],
+            )
+        });
+    HookPayloadContext { session_id, cwd }
+}
+
 impl HookEnvelope {
     /// Build an envelope from the parsed query + the body JSON. Performs
     /// best-effort extraction of `session_id` / `cwd` / a body excerpt
@@ -537,66 +593,14 @@ impl HookEnvelope {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
-        // OpenCode's plugin SDK sends `sessionID` (capital `ID`) on the
-        // tool.execute.*/session.* events; Claude Code and native Codex use
-        // `session_id`, older Codex bridges `sessionId`, and Antigravity CLI
-        // uses `conversationId`.
-        // JSON keys are case-sensitive, so all spellings must be listed
-        // or tool events fail the router's "missing session_id" check.
-        let body_session_id = extract_string(
-            &raw,
-            &[
-                "session_id",
-                "sessionId",
-                "sessionID",
-                "session",
-                "conversationId",
-            ],
-        )
-        .or_else(|| {
-            extract_string_path(
-                &raw,
-                &[
-                    &["info", "id"],
-                    &["properties", "sessionID"],
-                    &["properties", "info", "id"],
-                    &["event", "properties", "sessionID"],
-                    &["event", "properties", "info", "id"],
-                    &["payload", "info", "id"],
-                    &["payload", "properties", "sessionID"],
-                    &["payload", "properties", "info", "id"],
-                ],
-            )
-        });
-        let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
-        // Cursor spells the workspace directory `workspace_roots` (an array,
-        // normally one entry; multi-root workspaces carry several) and never
-        // sends a usable top-level `cwd`: its `sessionStart` / `sessionEnd`
-        // payloads omit `cwd` entirely, and its tool events send `cwd: ""`.
-        // Without this spelling every Cursor session resolved to no cwd at all
-        // and landed in the server-default `default/scratch` bucket.
-        let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
-            .or_else(|| {
-                extract_first_string_array_item(&raw, &["workspacePaths", "workspace_roots"])
-            })
-            .or_else(|| {
-                extract_string_path(
-                    &raw,
-                    &[
-                        &["path", "cwd"],
-                        &["info", "directory"],
-                        &["properties", "info", "directory"],
-                        &["event", "properties", "info", "directory"],
-                        &["payload", "path", "cwd"],
-                        &["payload", "info", "directory"],
-                        &["payload", "properties", "info", "directory"],
-                    ],
-                )
-            });
+        let context = hook_payload_context(&raw);
+        let session_id = context
+            .session_id
+            .or_else(|| query.session_id.filter(|s| !s.is_empty()));
         // Body cwd wins over the query-string fallback: the body is
         // what agent CLIs natively send, so any query-string `cwd` is
         // a bridge / test override that should defer to live data.
-        let cwd = body_cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
+        let cwd = context.cwd.or_else(|| query.cwd.filter(|s| !s.is_empty()));
         let workspace_override = query.workspace.filter(|s| !s.is_empty());
         let project_override = query.project.filter(|s| !s.is_empty());
         let project_strategy = ProjectStrategy::parse(query.project_strategy.as_deref());

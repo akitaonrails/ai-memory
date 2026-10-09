@@ -363,6 +363,12 @@ impl Server {
     /// `serve` resolves only once a client has initialized, so this is what
     /// moves the stdio arm out of its pre-handshake select and into the branch
     /// that owns the service — where every real harness ends up.
+    ///
+    /// The initialize response alone does not prove that: stdout is written
+    /// and flushed on tokio's blocking pool, so its bytes can reach the pipe
+    /// before `serve` returns, and a signal sent in that gap still lands in
+    /// the pre-handshake select. Only the main service loop answers a `ping`,
+    /// so its reply is the proof.
     fn initialize(&mut self, timeout: Duration) -> String {
         // `2025-11-25` is `ProtocolVersion::LATEST` in rmcp 1.7 (its
         // `model.rs`); the server answers with its own version when the
@@ -379,16 +385,35 @@ impl Server {
             .write_all(INITIALIZE.as_bytes())
             .expect("write the initialize request");
         stdin.flush().expect("flush the initialize request");
-        let response = self
+        let response = self.next_frame("initialize response", timeout);
+        const PING: &str = concat!(
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
+            "\n",
+        );
+        let stdin = self.stdin.as_mut().expect("stdin piped");
+        stdin.write_all(PING.as_bytes()).expect("write the ping");
+        stdin.flush().expect("flush the ping");
+        let pong = self.next_frame("ping response", timeout);
+        assert!(
+            pong.contains(r#""id":2"#) && pong.contains(r#""result""#),
+            "the ping must be answered by the running service: {pong}"
+        );
+        response
+    }
+
+    fn next_frame(&mut self, what: &str, timeout: Duration) -> String {
+        let frame = self
             .frames
             .as_ref()
             .expect("stdout piped")
             .recv_timeout(timeout);
-        match response {
+        match frame {
             Ok(frame) => frame,
             // Disconnected also lands here: stdout closed means the child died.
             Err(_) => panic!(
-                "no initialize response on stdout within {timeout:?}.\nstderr:\n{}",
+                "no {what} on stdout within {timeout:?}.\nstderr:\n{}",
                 self.stderr()
             ),
         }

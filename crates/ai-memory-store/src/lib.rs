@@ -3381,7 +3381,12 @@ mod tests {
             .unwrap();
         let session_a = SessionId::new();
         let session_b = SessionId::new();
-        for (session_id, project_id) in [(session_a, proj_a), (session_b, proj_b)] {
+        let session_c = SessionId::new();
+        for (session_id, project_id) in [
+            (session_a, proj_a),
+            (session_b, proj_b),
+            (session_c, proj_a),
+        ] {
             store
                 .writer
                 .begin_session(NewSession {
@@ -3479,6 +3484,74 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(reused, IngestObservationOutcome::Inserted(_)));
+
+        let recovery_key = format!("recovery_{}", "a".repeat(55));
+        let recovery_first = store
+            .writer
+            .insert_observation_ingest(
+                Sanitized::new(obs(session_a, proj_a), &Sanitizer::builtin()),
+                recovery_key.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            recovery_first,
+            IngestObservationOutcome::Inserted(_)
+        ));
+        store
+            .writer
+            .complete_observation_ingest(proj_a, recovery_key.clone())
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE ingest_keys SET seen_at = 1 WHERE project_id = ?1 AND key = ?2",
+            params![proj_a.as_bytes(), recovery_key],
+        )
+        .unwrap();
+        drop(conn);
+        let recovery_replay = store
+            .writer
+            .insert_observation_ingest(
+                Sanitized::new(obs(session_a, proj_a), &Sanitizer::builtin()),
+                recovery_key.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovery_replay, IngestObservationOutcome::AlreadyComplete);
+        assert!(matches!(
+            store
+                .writer
+                .insert_observation_ingest(
+                    Sanitized::new(obs(session_c, proj_a), &Sanitizer::builtin()),
+                    recovery_key.clone(),
+                )
+                .await,
+            Err(StoreError::SessionCollision)
+        ));
+        let mut changed = obs(session_a, proj_a);
+        changed.body = "different event body".into();
+        assert!(matches!(
+            store
+                .writer
+                .insert_observation_ingest(
+                    Sanitized::new(changed, &Sanitizer::builtin()),
+                    recovery_key,
+                )
+                .await,
+            Err(StoreError::SessionCollision)
+        ));
+        let conn = Connection::open(store.db_path()).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+                params![proj_a.as_bytes()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3,
+            "a different session cannot preclaim or suppress a recovery key"
+        );
     }
 
     #[tokio::test]

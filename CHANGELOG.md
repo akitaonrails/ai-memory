@@ -16,6 +16,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It is a dry-run without `--apply`, refuses files without frontmatter,
   refuses to overwrite server pages whose metadata a write would clear, and
   re-reads each page right before writing it. (#1164)
+- `finalize-session --agent antigravity-cli` now replays the session's typed
+  prompts from `agy`'s `history.jsonl` before its synthetic session-end, so
+  live Antigravity sessions — whose hooks carry no prompt event — get a summary
+  page titled by the first prompt, a handoff with "Started/Last", and prompts
+  that `memory_query` and `memory_recent` can find. Only lines whose
+  conversation and workspace match the session are read; each prompt carries
+  the key `backfill` mints for it, so a repeated `--reopen` stores it once and a
+  prompt typed after the first finalize arrives with the next one. A checkout
+  the capture allowlist does not admit and `--all-owners` runs replay nothing,
+  and a missing `history.jsonl` only warns. (#1160)
+- `ai-memory run` accepts `copilot` (alias `copilot-cli`) and manages GitHub
+  Copilot CLI as a workstream harness: a fresh session gets a generated
+  `--session-id`, a returning one is resumed with `--resume=<id>`, user
+  selectors (`--resume`, `--continue`, `--session-id`, `--connect`) win,
+  utility subcommands pass through, and `--yolo` maps to Copilot's native
+  `--yolo`. Visible messages, tool calls and results, and compaction summaries
+  are imported read-only from `$COPILOT_HOME/session-state/<uuid>/events.jsonl`
+  (system prompts, hidden reasoning, hook output, and telemetry are excluded),
+  and the existing SessionStart hook delivers the workstream context. The
+  first managed launch auto-wires Copilot's hooks and MCP, and `doctor` now
+  counts its local sessions. Verified against Copilot CLI 1.0.92. (#1040)
+- GitHub Copilot CLI is now a first-class routing target:
+  `install-skills --agent copilot-cli` (and `install-instructions
+  --skills-agent copilot-cli`) writes the managed Agent Skills to the
+  repository's `.github/skills` or, globally, to `$COPILOT_HOME/skills`
+  (default `~/.copilot/skills`); `memory_install_self_routing` returns
+  `copilot_cli` filename and skill-root hints; the routing snippet, the
+  routing-install skill, and the MCP instructions name Copilot CLI with
+  `AGENTS.md`; and `uninstall` sweeps both Copilot roots, removing only
+  marker-bearing ai-memory skills. (#1040)
+- Added `ai-memory recover` and a bounded local recovery journal for server
+  outages. Offline managed launches now record only uniquely correlated native
+  session locators; recovery quarantines overlapping spool entries before exact
+  `/hook/batch` transcript replay, journals harnesses without transcript export
+  as spool-only without calling their exporter, retains bounded recovery dedup
+  keys with their sessions,
+  fails closed on terminal drops, and lets only the original owner finish an
+  expired unsuperseded managed run through exact idempotent replay. Backfill
+  and recovery replay now use reserved `recovery_*` idempotency keys, so
+  re-running `backfill --force` over sessions imported by ai-memory ≤2.6.0 (or
+  plain-backfilling a recovery-replayed session) can duplicate those older
+  observations. (#1125)
+- Added `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` for the `openai-compat`
+  provider (opt-in, off by default, ignored by every other provider): when
+  set, every chat request carries
+  `chat_template_kwargs: {"enable_thinking": false}`, so thinking-capable
+  local engines (vLLM / SGLang serving Qwen3-class models) spend the output
+  budget on the structured payload instead of a reasoning pass. (#1130)
+- Added the `cursor` LLM provider. Consolidation calls the logged-in Cursor
+  Agent CLI (`agent --print --mode ask`) so a Cursor subscription can drive
+  summaries without an API key. The default model is `cursor-grok-4.6-high`
+  ("Grok 4.6"). `AI_MEMORY_CURSOR_AGENT` overrides the binary. The provider never passes
+  `--yolo` or `--force`, because the prompt is captured session text. (#1127)
 
 ### Changed
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
@@ -24,12 +77,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unedited files of an earlier export in place. (#1164)
 
 ### Fixed
+- Fixed structured LLM responses stopped at the output budget
+  (`finish_reason = "length"`) or returned without usable content: they now
+  fail with redacted terminal errors, without copying the response. (#1130)
+- Corrected the Claude Desktop documentation: Linux is an Anthropic beta for
+  Debian-based distributions with its config at
+  `~/.config/Claude/claude_desktop_config.json` (pass it to
+  `install-mcp --client claude-desktop` with `--config-file`), the Code tab's
+  local sessions are already captured by the Claude Code hooks, and Cowork
+  capture is not claimed. The desktop-app research notes record what was
+  verified live and what is still open. (#878)
 - Fixed `ai-memory-wikisync` committing its per-clone export state: the
   `git add` of the destination that `export --apply` prints also staged
   `.ai-memory-wikisync/state.json`, so two clones would conflict on it and
   trust each other's baselines. The state directory now ignores itself with
   a `.gitignore` of `*`. A state committed by an earlier export needs one
   `git rm -r --cached <dest>/.ai-memory-wikisync`. (#1162)
+- Fixed `bootstrap` reading a rules file twice when it is reachable under two
+  names: on a case-insensitive filesystem `claude.md` opened `CLAUDE.md`
+  again, and on any system a `CLAUDE.md` linked to `AGENTS.md` did the same.
+  The doubled text inflated the token estimate, could push every source over
+  the budget (`no input sources selected`), and repeated the rules in the
+  prompt. Only names the directory lists are read now, and identical text is
+  read once. (#1168)
+- Fixed `backfill` and managed runs not finding a Claude Code transcript when
+  the session's directory contains anything but letters, digits and `/`:
+  Claude Code names a project's folder by turning every other character into
+  `-`, but ai-memory replaced only `/`, so every Windows path and any path
+  with `.`, `_` or a space missed it, and the bounded fallback scan could run
+  out on a large store first. The folder name now follows Claude Code's rule,
+  every project folder is probed for the exact transcript before the scan,
+  and a subagent's `subagents/*.jsonl` sidechain, which carries its parent's
+  session id, is never taken for the session's transcript. (#1167)
+- Fixed the macOS menu bar companion's **Settings…** item opening the
+  Settings window behind the frontmost app, so clicking it appeared to do
+  nothing. The item now activates the app before opening the window, as
+  **Show Status…** already did. (#1161)
 
 ## [2.6.2] - 2026-10-08
 

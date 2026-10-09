@@ -388,7 +388,8 @@ should be proposed from a completed session, or at explicit wrap-up \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
   slim markered snippet (`markered_block`), filename hints, \
   `managed_skills` payloads, `target_hints` for `.claude/skills`, \
-  `.agents/skills`, `.devin/skills`, `.grok/skills`, `.hermes/skills`, and Devin's Windows global \
+  `.agents/skills`, `.devin/skills`, `.grok/skills`, `.github/skills` (GitHub Copilot CLI), \
+  `.hermes/skills`, and Devin's Windows global \
   `%APPDATA%\\devin\\skills` root, and overwrite guidance. Use your own Write/Edit \
   tool to replace only the ai-memory marker block in the rules file, \
   then write each managed skill under the selected skill root. Only \
@@ -6089,7 +6090,8 @@ impl AiMemoryServer {
         `agent_filenames` for rules-file targets, `managed_skills` for \
         Agent Skill files, and `target_hints` for project/global \
         `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, \
-        `.hermes/skills`, `$GROK_HOME/skills` (default `~/.grok/skills`), and Devin Windows global roots. \
+        `.github/skills`, `.hermes/skills`, `$GROK_HOME/skills` (default `~/.grok/skills`), \
+        `$COPILOT_HOME/skills` (default `~/.copilot/skills`), and Devin Windows global roots. \
         Use when the user asks to install or refresh ai-memory routing in this project. \
         Pass `compact: true` to return the compact routing block that delegates \
         to installed Agent Skills, or when refreshing a file that already uses the compact snippet. \
@@ -6142,6 +6144,7 @@ impl AiMemoryServer {
                 "kimi_code": "AGENTS.md",
                 "command_code": "AGENTS.md",
                 "grok": "AGENTS.md",
+                "copilot_cli": "AGENTS.md",
                 "default": "AGENTS.md"
             },
             "managed_skills": managed_skills,
@@ -6151,6 +6154,7 @@ impl AiMemoryServer {
                     "agents": ".agents/skills",
                     "devin": ".devin/skills",
                     "grok": ".grok/skills",
+                    "copilot_cli": ".github/skills",
                     "hermes": ".hermes/skills"
                 },
                 "global": {
@@ -6161,6 +6165,7 @@ impl AiMemoryServer {
                         "non_windows": "~/.devin/skills"
                     },
                     "grok": "$GROK_HOME/skills (default: ~/.grok/skills)",
+                    "copilot_cli": "$COPILOT_HOME/skills (default: ~/.copilot/skills)",
                     "hermes": "~/.hermes/skills"
                 }
             },
@@ -6175,7 +6180,7 @@ impl AiMemoryServer {
                 "If the target file already uses the compact routing block (or if managed Agent Skills handle detailed routing), call memory_install_self_routing with compact: true so the compact format is preserved.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
-                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path>, .agents/skills/<relative_path>, .devin/skills/<relative_path>, .grok/skills/<relative_path>, $GROK_HOME/skills/<relative_path> (default ~/.grok/skills), or %APPDATA%\\devin\\skills\\<relative_path> on Windows global Devin installs.",
+                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path>, .agents/skills/<relative_path>, .devin/skills/<relative_path>, .grok/skills/<relative_path>, $GROK_HOME/skills/<relative_path> (default ~/.grok/skills), .github/skills/<relative_path> or $COPILOT_HOME/skills/<relative_path> (default ~/.copilot/skills) for GitHub Copilot CLI, or %APPDATA%\\devin\\skills\\<relative_path> on Windows global Devin installs.",
                 "Existing skill files containing the managed marker <!-- ai-memory-managed: routing-skill --> may be replaced; unmanaged same-name skills must not be overwritten unless the human explicitly forces replacement."
             ]
         });
@@ -8562,6 +8567,17 @@ mod tests {
     }
 
     #[test]
+    fn installed_prompt_surface_routes_copilot_cli_to_agents_md() {
+        let installed = installed_ai_memory_prompt_surface();
+        assert!(
+            installed.contains("GitHub Copilot CLI")
+                && installed.contains("Copilot CLI -> `AGENTS.md`")
+                && installed.contains(".github/skills"),
+            "installed snippet and managed skills must route Copilot CLI to AGENTS.md and .github/skills"
+        );
+    }
+
+    #[test]
     fn installed_prompt_surface_routes_grok_to_agents_md() {
         let installed = installed_ai_memory_prompt_surface();
         assert!(
@@ -8988,6 +9004,12 @@ mod tests {
                 && routing_install_content.contains("~/.grok/skills"),
             "routing-install skill must treat target_hints as authoritative and include Grok roots"
         );
+        assert!(
+            routing_install_content.contains(".github/skills")
+                && routing_install_content.contains("$COPILOT_HOME/skills")
+                && routing_install_content.contains("~/.copilot/skills"),
+            "routing-install skill must include GitHub Copilot CLI roots"
+        );
 
         assert_eq!(
             response["target_hints"]["project"]["claude_code"]
@@ -9057,6 +9079,22 @@ mod tests {
             response["agent_filenames"]["grok"].as_str().unwrap(),
             "AGENTS.md"
         );
+        assert_eq!(
+            response["target_hints"]["project"]["copilot_cli"]
+                .as_str()
+                .unwrap(),
+            ".github/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["global"]["copilot_cli"]
+                .as_str()
+                .unwrap(),
+            "$COPILOT_HOME/skills (default: ~/.copilot/skills)"
+        );
+        assert_eq!(
+            response["agent_filenames"]["copilot_cli"].as_str().unwrap(),
+            "AGENTS.md"
+        );
 
         let notes = response["notes"]
             .as_array()
@@ -9112,8 +9150,10 @@ mod tests {
                 && desc.contains(".agents/skills")
                 && desc.contains(".devin/skills")
                 && desc.contains(".grok/skills")
-                && desc.contains("$GROK_HOME/skills"),
-            "tool description must name Claude, .agents, Devin, and Grok skill targets; got: {desc}"
+                && desc.contains("$GROK_HOME/skills")
+                && desc.contains(".github/skills")
+                && desc.contains("$COPILOT_HOME/skills"),
+            "tool description must name Claude, .agents, Devin, Grok, and Copilot CLI skill targets; got: {desc}"
         );
         assert!(
             desc.contains("preserve non-ai-memory user content"),

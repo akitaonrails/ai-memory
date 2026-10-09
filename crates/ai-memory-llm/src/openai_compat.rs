@@ -15,7 +15,9 @@ use secrecy::SecretString;
 use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
-use crate::openai::{OpenAiProvider, RequestDialect, enforce_strict_object_schemas};
+use crate::openai::{
+    OpenAiProvider, RequestDialect, enforce_strict_object_schemas, is_length_truncated,
+};
 use crate::provider::LlmProvider;
 use crate::text::{suffix_within_bytes, truncate_with_ellipsis};
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
@@ -96,6 +98,21 @@ impl OpenAiCompatProvider {
     #[must_use]
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Send `chat_template_kwargs: {"enable_thinking": false}` with every
+    /// request, for thinking-capable local engines (vLLM / SGLang serving
+    /// Qwen3-class models): the engine otherwise spends the output budget
+    /// on a reasoning pass before the structured payload and can truncate
+    /// it. The factory calls this with
+    /// `ProviderConfig::compat_disable_thinking`; `new` defaults it off so
+    /// existing vLLM / Ollama / LM Studio setups are unchanged. Forwarded
+    /// to the inner Chat Completions client, where the `Compat` dialect
+    /// gate keeps it off the wire for every other dialect.
+    #[must_use]
+    pub fn with_disable_thinking(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.with_disable_thinking(enabled);
         self
     }
 
@@ -282,10 +299,26 @@ impl OpenAiCompatProvider {
         // Default (and strict fallback): most older local engines don't
         // honour `response_format`. Ask for JSON and extract the first
         // balanced `{…}` object from the text.
-        let res = self
+        let (res, finish_reason) = self
             .inner
-            .complete_with_operation_id(request, operation_id)
+            .complete_with_operation_id_and_finish_reason(request, operation_id)
             .await?;
+        // A `length` stop means the engine hit its output budget before
+        // the JSON could finish (the Qwen3-with-thinking-on case this
+        // guard exists for). Terminal and content-free: a tolerant retry
+        // would just re-truncate and double the token spend, and the old
+        // `unexpected-shape` / `serde` classes pointed at the wrong cause.
+        if is_length_truncated(finish_reason.as_deref()) {
+            return Err(LlmError::TruncatedResponse {
+                model: res.model,
+                completion_tokens: res.usage.as_ref().map(|u| u.output_tokens),
+            });
+        }
+        // No content at all (missing, empty, or whitespace-only) is a
+        // distinct terminal failure: nothing was produced to parse.
+        if res.text.trim().is_empty() {
+            return Err(LlmError::EmptyContent { model: res.model });
+        }
         // Reasoning models (DeepSeek, Qwen, MiniMax M2.7, …) prepend
         // `<think>…</think>` before the JSON. Strip those blocks (and any
         // surrounding markdown fences) before trying to parse — otherwise
@@ -572,6 +605,18 @@ mod tests {
         assert!(!p.strict);
         let p = p.with_strict(true);
         assert!(p.strict);
+    }
+
+    /// The thinking switch is opt-in at the wrapper too: `new` leaves it
+    /// off (existing vLLM / Ollama / LM Studio setups are unchanged) and
+    /// `with_disable_thinking` forwards it to the inner client.
+    #[test]
+    fn disable_thinking_defaults_off_and_reaches_the_inner_provider() {
+        let p = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "qwen3.8-27b")
+            .expect("provider builds");
+        assert!(!p.inner.disable_thinking());
+        let p = p.with_disable_thinking(true);
+        assert!(p.inner.disable_thinking());
     }
 
     #[test]

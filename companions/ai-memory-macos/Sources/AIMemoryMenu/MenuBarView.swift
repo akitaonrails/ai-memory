@@ -5,6 +5,7 @@ import AIMemoryMenuCore
 struct MenuBarView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         Text(model.headlineVersion)
@@ -57,8 +58,11 @@ struct MenuBarView: View {
             model.openLogs()
         }
         Divider()
-        SettingsLink {
-            Text("Settings…")
+        // An accessory app is never frontmost, so a bare SettingsLink opens the
+        // window behind every other app. Activate first, as "Show Status…" does.
+        Button("Settings…") {
+            NSApp.activate(ignoringOtherApps: true)
+            openSettings()
         }
         Button("Quit") {
             NSApp.terminate(nil)

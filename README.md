@@ -373,9 +373,9 @@ no separate `install-hooks`/`install-mcp` step to forget), it wires the right
 project scope by construction, and it adds cross-harness *session* continuity on
 top of shared memory. Everything is idempotent and one-time per harness and
 config home. If the server is unreachable, `run` warns and launches anyway
-with local capture spooling (see [Degraded offline
-launches](docs/managed-workstreams.md#degraded-offline-launches)); pass
-`--require-server` to fail closed instead.
+with local capture spooling; run `ai-memory recover` after the server returns
+(see [Degraded offline launches](docs/managed-workstreams.md#degraded-offline-launches)).
+Pass `--require-server` to fail closed instead.
 
 ```bash
 ai-memory run claude

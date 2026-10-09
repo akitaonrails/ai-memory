@@ -1622,6 +1622,7 @@ pub(crate) fn hook_config_target_with(
         }
         AgentChoice::Grok => grok_hooks_path_in(env("GROK_HOME")),
         AgentChoice::AntigravityCli => antigravity_hooks_path(),
+        AgentChoice::CopilotCli => copilot_cli_hooks_path_in(env("COPILOT_HOME")),
         other => anyhow::bail!(
             "{} is not auto-wired by `ai-memory run`",
             other.kind().as_str()

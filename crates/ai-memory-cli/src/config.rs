@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_llm::{
-    AuthRequirement, Candidate, EmbedderChoice, EmbedderConfig, ExtraHeaders, FallbackLlmProvider,
-    LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice,
-    ProviderConfig, ReasoningEffort, build_provider,
+    AuthRequirement, CURSOR_DEFAULT_MODEL, Candidate, EmbedderChoice, EmbedderConfig, ExtraHeaders,
+    FallbackLlmProvider, LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL, ProviderAuth,
+    ProviderChoice, ProviderConfig, ReasoningEffort, build_provider, cursor_executable,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -310,6 +310,15 @@ pub struct Config {
     /// already supplies its own schema. Set
     /// `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint.
     pub llm_compat_strict: bool,
+    /// OpenAI-compat only: send
+    /// `chat_template_kwargs: {"enable_thinking": false}` with every chat
+    /// request, for thinking-capable local engines (vLLM / SGLang serving
+    /// Qwen3-class models): the engine otherwise spends the output budget
+    /// on a reasoning pass before the structured payload and can truncate
+    /// it mid-JSON. Ignored by every other provider; off by default. Set
+    /// with `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` (or
+    /// `llm_compat_disable_thinking = true` in `config.toml`).
+    pub llm_compat_disable_thinking: bool,
     /// Per-request timeout (seconds) applied to every chat
     /// completion request and to the Copilot token exchange; the
     /// openai-oauth token refresh keeps the built-in default ceiling
@@ -661,6 +670,7 @@ pub struct RuntimeEnv {
     platform_home: Option<PathBuf>,
     codex_home: Option<PathBuf>,
     codex_executable: Option<PathBuf>,
+    cursor_executable: Option<PathBuf>,
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
@@ -702,6 +712,7 @@ impl RuntimeEnv {
             platform_home,
             codex_home: env_path("CODEX_HOME"),
             codex_executable: env_path("AI_MEMORY_CODEX_EXECUTABLE"),
+            cursor_executable: env_path("AI_MEMORY_CURSOR_AGENT"),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
@@ -1078,6 +1089,7 @@ impl Default for Config {
             llm_model: None,
             llm_base_url: None,
             llm_compat_strict: true,
+            llm_compat_disable_thinking: false,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
@@ -2184,7 +2196,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "AI_MEMORY_LLM_PROVIDER={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
         let model = match non_empty(self.llm_model.as_deref()) {
@@ -2205,6 +2217,7 @@ impl Config {
                     ));
                 }
                 ProviderChoice::OpenCode => OPENCODE_DEFAULT_MODEL.to_string(),
+                ProviderChoice::Cursor => CURSOR_DEFAULT_MODEL.to_string(),
             },
         };
         Ok(Some(ProviderConfig {
@@ -2213,6 +2226,7 @@ impl Config {
             auth: self.provider_auth(provider, None),
             base_url: self.resolve_base_url(provider),
             compat_strict: self.llm_compat_strict,
+            compat_disable_thinking: self.llm_compat_disable_thinking,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -2244,7 +2258,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "llm_fallbacks[{index}].provider={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
         let model = non_empty(Some(profile.model.as_str()))
@@ -2269,6 +2283,7 @@ impl Config {
             auth: self.fallback_provider_auth(provider, resolved_key),
             base_url: non_empty(profile.base_url.as_deref()).map(str::to_string),
             compat_strict: self.llm_compat_strict,
+            compat_disable_thinking: self.llm_compat_disable_thinking,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -2318,6 +2333,9 @@ impl Config {
             AuthRequirement::AnthropicOAuthToken => {
                 ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
             }
+            AuthRequirement::CursorCli => ProviderAuth::cursor(cursor_executable(
+                self.runtime_env.cursor_executable.as_deref(),
+            )),
         }
     }
 
@@ -2566,6 +2584,7 @@ impl Config {
             ProviderChoice::Copilot => None,
             ProviderChoice::AnthropicOAuth => None,
             ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
+            ProviderChoice::Cursor => None,
         }
     }
 
@@ -2657,6 +2676,9 @@ impl Config {
             AuthRequirement::AnthropicOAuthToken => {
                 ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
             }
+            AuthRequirement::CursorCli => ProviderAuth::cursor(cursor_executable(
+                self.runtime_env.cursor_executable.as_deref(),
+            )),
         }
     }
 
@@ -2713,6 +2735,7 @@ fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
         "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
         "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
         "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
+        "cursor" => ProviderChoice::Cursor,
         _ => return None,
     })
 }
@@ -4852,6 +4875,45 @@ mod tests {
         assert!(!provider.compat_strict);
     }
 
+    /// The thinking switch is opt-in: off by default (existing vLLM /
+    /// Ollama / LM Studio setups are unchanged) and forwarded verbatim to
+    /// the provider config when the operator turns it on.
+    #[test]
+    fn openai_compat_disable_thinking_defaults_off_and_is_forwarded() {
+        let mut cfg = Config {
+            llm_provider: Some("openai-compat".into()),
+            llm_model: Some("qwen3.8-27b".into()),
+            llm_base_url: Some("http://localhost:8000/v1".into()),
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(!provider.compat_disable_thinking);
+
+        cfg.llm_compat_disable_thinking = true;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(provider.compat_disable_thinking);
+    }
+
+    /// TOML key loads and stays independent from the strict-mode default.
+    #[test]
+    fn load_accepts_llm_compat_disable_thinking_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_compat_disable_thinking = true\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(cfg.llm_compat_disable_thinking);
+        // The sibling strict knob keeps its own default — independent keys.
+        assert!(cfg.llm_compat_strict);
+    }
+
+    #[test]
+    fn load_defaults_llm_compat_disable_thinking_off() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!cfg.llm_compat_disable_thinking);
+    }
+
     #[test]
     fn openai_oauth_provider_uses_data_dir_token_file() {
         let tmp = TempDir::new().unwrap();
@@ -5064,6 +5126,26 @@ mod tests {
                 "{spelling}"
             );
         }
+    }
+
+    #[test]
+    fn cursor_provider_resolves_choice_default_model_and_executable() {
+        let cfg = Config {
+            llm_provider: Some("cursor".into()),
+            runtime_env: RuntimeEnv {
+                cursor_executable: Some(PathBuf::from("/opt/cursor/agent")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_cursor_auth().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::Cursor);
+        assert_eq!(provider.model, CURSOR_DEFAULT_MODEL);
+        assert_eq!(auth.executable, PathBuf::from("/opt/cursor/agent"));
+        assert_eq!(provider.auth.requirement(), AuthRequirement::CursorCli);
     }
 
     fn load_with_toml(toml: &str) -> anyhow::Result<Config> {

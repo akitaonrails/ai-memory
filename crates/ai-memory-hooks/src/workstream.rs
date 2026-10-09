@@ -83,6 +83,10 @@ pub fn workstream_router(state: WorkstreamState) -> Router {
         )
         .route("/workstream/runs/{run_id}/link", post(link_run))
         .route("/workstream/runs/{run_id}/finish", post(finish_run))
+        .route(
+            "/workstream/runs/{run_id}/recover/finish",
+            post(recover_finish_run),
+        )
         .route("/workstream/recent", post(list_recent_workstreams))
         .route("/workstream/rename", post(rename_workstream))
         .route("/workstream/{workstream_id}/events", get(search_events))
@@ -254,6 +258,7 @@ async fn prepare_run(
             | AgentKind::KiroCli
             | AgentKind::Grok
             | AgentKind::AntigravityCli
+            | AgentKind::CopilotCli
     ) {
         return error(
             StatusCode::BAD_REQUEST,
@@ -887,6 +892,21 @@ async fn link_run(
     }
 }
 
+async fn recover_finish_run(
+    State(state): State<WorkstreamState>,
+    level: Option<Extension<AuthLevel>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
+    AxumPath(raw_run_id): AxumPath<String>,
+    Json(request): Json<FinishManagedRunRequest>,
+) -> Response {
+    finish_run_inner(
+        state, level, viewer, actor, user_id, raw_run_id, request, true,
+    )
+    .await
+}
+
 async fn finish_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
@@ -894,7 +914,24 @@ async fn finish_run(
     actor: Option<Extension<ai_memory_core::ActorContext>>,
     user_id: Option<Extension<ai_memory_core::UserId>>,
     AxumPath(raw_run_id): AxumPath<String>,
-    Json(mut request): Json<FinishManagedRunRequest>,
+    Json(request): Json<FinishManagedRunRequest>,
+) -> Response {
+    finish_run_inner(
+        state, level, viewer, actor, user_id, raw_run_id, request, false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_run_inner(
+    state: WorkstreamState,
+    level: Option<Extension<AuthLevel>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    user_id: Option<Extension<ai_memory_core::UserId>>,
+    raw_run_id: String,
+    mut request: FinishManagedRunRequest,
+    recover_expired: bool,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
         return response.into_response();
@@ -943,7 +980,7 @@ async fn finish_run(
         Ok(None) => return error(StatusCode::NOT_FOUND, "managed run not found"),
         Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
     };
-    if status.state == "finished" {
+    if status.state == "finished" && !recover_expired {
         return match state
             .writer
             .finish_workstream_run(
@@ -969,8 +1006,10 @@ async fn finish_run(
             Err(failure) => store_error_response(failure),
         };
     }
-    if status.state != "active" {
-        return error(StatusCode::CONFLICT, "managed run is not active");
+    if status.state != "active"
+        && !(recover_expired && matches!(status.state.as_str(), "expired" | "finished"))
+    {
+        return error(StatusCode::CONFLICT, "managed run is not recoverable");
     }
     let native_identity = match request
         .native_session_id
@@ -999,7 +1038,7 @@ async fn finish_run(
     ) {
         return error(StatusCode::BAD_REQUEST, message);
     }
-    if request.complete {
+    if request.complete && status.state != "finished" {
         append_boundary_events(
             &state.sanitizer,
             run_id,
@@ -1008,16 +1047,20 @@ async fn finish_run(
             &mut request,
         );
     }
-    let segment_path = match write_segment(
-        &state.data_dir,
-        status.workstream_id,
-        run_id,
-        &request.events,
-    ) {
-        Ok(path) => path,
-        Err(failure) => {
-            warn!(error = %failure, run = %run_id, "managed transcript segment write failed");
-            return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string());
+    let segment_path = if status.state == "finished" {
+        None
+    } else {
+        match write_segment(
+            &state.data_dir,
+            status.workstream_id,
+            run_id,
+            &request.events,
+        ) {
+            Ok(path) => Some(path),
+            Err(failure) => {
+                warn!(error = %failure, run = %run_id, "managed transcript segment write failed");
+                return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string());
+            }
         }
     };
     let input = FinishWorkstreamRun {
@@ -1027,10 +1070,18 @@ async fn finish_run(
         source_cursor: request.source_cursor,
         events: request.events,
         complete: request.complete,
-        segment_path: Some(segment_path),
+        segment_path,
         exit_code: request.exit_code,
     };
-    match state.writer.finish_workstream_run(authority, input).await {
+    let result = if recover_expired {
+        state
+            .writer
+            .recover_expired_workstream_run(authority, input)
+            .await
+    } else {
+        state.writer.finish_workstream_run(authority, input).await
+    };
+    match result {
         Ok(result) => Json(FinishManagedRunResponse {
             imported_events: result.imported_events,
             latest_sequence: result.latest_sequence,
@@ -3303,6 +3354,23 @@ mod tests {
     /// command-line harness" after the user already picked the harness.
     #[tokio::test]
     async fn antigravity_is_accepted_explicitly_but_not_in_the_automatic_pool() {
+        assert_explicit_only_managed_harness(
+            AgentKind::AntigravityCli,
+            "a0d5ac62-2501-4780-b783-76d159c56cb3",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn copilot_cli_is_accepted_explicitly_but_not_in_the_automatic_pool() {
+        assert_explicit_only_managed_harness(
+            AgentKind::CopilotCli,
+            "318db77d-e19b-4750-82df-192a6b931437",
+        )
+        .await;
+    }
+
+    async fn assert_explicit_only_managed_harness(agent: AgentKind, native_session_id: &str) {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
         let state = test_state(&store, temp.path());
@@ -3318,7 +3386,7 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
-                agent: AgentKind::AntigravityCli,
+                agent,
                 automatic_harness: false,
                 available_agents: Vec::new(),
                 workstream: None,
@@ -3331,7 +3399,7 @@ mod tests {
         assert_eq!(explicit.status(), StatusCode::OK);
         let body = to_bytes(explicit.into_body(), 64 * 1024).await.unwrap();
         let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(prepared.resolved_agent, Some(AgentKind::AntigravityCli));
+        assert_eq!(prepared.resolved_agent, Some(agent));
         store
             .writer
             .finish_workstream_run(
@@ -3345,7 +3413,7 @@ mod tests {
                 FinishWorkstreamRun {
                     sanitizer: ai_memory_core::Sanitizer::default(),
                     run_id: prepared.run_id,
-                    native_session_id: Some("a0d5ac62-2501-4780-b783-76d159c56cb3".into()),
+                    native_session_id: Some(native_session_id.into()),
                     source_cursor: None,
                     events: Vec::new(),
                     complete: true,
@@ -3367,9 +3435,9 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
-                agent: AgentKind::AntigravityCli,
+                agent,
                 automatic_harness: true,
-                available_agents: vec![AgentKind::AntigravityCli],
+                available_agents: vec![agent],
                 workstream: None,
                 new_workstream: None,
                 force_unlock: false,
@@ -4254,6 +4322,201 @@ mod tests {
             "HTTP configured privacy must project UNKNOWN"
         );
         assert_eq!(finish_sql_snapshot(&store).await, before);
+    }
+
+    #[tokio::test]
+    async fn expired_run_recovery_is_owner_only_and_refuses_superseded_runs() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let mut state = test_state(&store, temp.path());
+        state.trusted_proxy_identity = true;
+        let (ws, project) = seed_scope(&store).await;
+        let prepare = |name: &str| PrepareWorkstreamRun {
+            workspace_id: ws,
+            project_id: project,
+            repo_fingerprint: name.into(),
+            worktree_fingerprint: name.into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            selection: WorkstreamSelection::New(name.into()),
+            lease_owner: "launcher".into(),
+        };
+        let alice_actor = ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            ..ai_memory_core::ActorContext::anonymous()
+        };
+        let bob_actor = ai_memory_core::ActorContext {
+            user: Some("bob".into()),
+            ..ai_memory_core::ActorContext::anonymous()
+        };
+        let recoverable = store
+            .writer
+            .prepare_workstream_run_owned(prepare("recoverable"), Some("user:alice".into()))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(recoverable.run_id)
+            .await
+            .unwrap();
+        let request = || FinishManagedRunRequest {
+            native_session_id: Some("native-recovery".into()),
+            source_cursor: None,
+            events: vec![NewWorkstreamEvent {
+                event_id: "recovered-event".into(),
+                agent: AgentKind::Codex,
+                native_session_id: "native-recovery".into(),
+                source_record_id: None,
+                kind: WorkstreamEventKind::Message,
+                role: Some("user".into()),
+                content: "recovered".into(),
+                occurred_at: None,
+                metadata: serde_json::Value::Null,
+            }],
+            complete: true,
+            checkpoint: Default::default(),
+            losses: Vec::new(),
+            exit_code: Some(0),
+        };
+        let refused = recover_finish_run(
+            State(state.clone()),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(bob_actor)),
+            None,
+            AxumPath(recoverable.run_id.to_string()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let accepted = recover_finish_run(
+            State(state.clone()),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(alice_actor.clone())),
+            None,
+            AxumPath(recoverable.run_id.to_string()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let exact_retry = recover_finish_run(
+            State(state.clone()),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(alice_actor.clone())),
+            None,
+            AxumPath(recoverable.run_id.to_string()),
+            Json(request()),
+        )
+        .await;
+        let exact_status = exact_retry.status();
+        let exact_body = to_bytes(exact_retry.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            exact_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&exact_body)
+        );
+        let changed_checkpoint = recover_finish_run(
+            State(state.clone()),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(alice_actor.clone())),
+            None,
+            AxumPath(recoverable.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                checkpoint: ai_memory_core::WorkstreamCheckpoint {
+                    head: Some("repository-changed-after-finish".into()),
+                    ..Default::default()
+                },
+                ..request()
+            }),
+        )
+        .await;
+        assert_eq!(changed_checkpoint.status(), StatusCode::OK);
+        assert_eq!(
+            store
+                .reader
+                .search_workstream_events(
+                    recoverable.workstream_id,
+                    "".into(),
+                    100,
+                    Sanitizer::default(),
+                )
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "a finished retry must not append a regenerated checkpoint"
+        );
+        for changed in [
+            FinishManagedRunRequest {
+                native_session_id: Some("changed-native".into()),
+                ..request()
+            },
+            FinishManagedRunRequest {
+                events: {
+                    let mut events = request().events;
+                    events[0].event_id = "losing-event".into();
+                    events
+                },
+                ..request()
+            },
+            FinishManagedRunRequest {
+                source_cursor: Some("uncommitted-cursor".into()),
+                ..request()
+            },
+            FinishManagedRunRequest {
+                exit_code: Some(9),
+                ..request()
+            },
+        ] {
+            let changed_finished = recover_finish_run(
+                State(state.clone()),
+                Some(Extension(AuthLevel::User)),
+                None,
+                Some(Extension(alice_actor.clone())),
+                None,
+                AxumPath(recoverable.run_id.to_string()),
+                Json(changed),
+            )
+            .await;
+            assert_eq!(changed_finished.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let old = store
+            .writer
+            .prepare_workstream_run_owned(prepare("superseded"), Some("user:alice".into()))
+            .await
+            .unwrap();
+        store.writer.cancel_managed_run(old.run_id).await.unwrap();
+        store
+            .writer
+            .prepare_workstream_run_owned(
+                PrepareWorkstreamRun {
+                    repo_fingerprint: "superseded".into(),
+                    worktree_fingerprint: "superseded".into(),
+                    selection: WorkstreamSelection::Named("superseded".into()),
+                    ..prepare("replacement")
+                },
+                Some("user:alice".into()),
+            )
+            .await
+            .unwrap();
+        let superseded = recover_finish_run(
+            State(state),
+            Some(Extension(AuthLevel::User)),
+            None,
+            Some(Extension(alice_actor)),
+            None,
+            AxumPath(old.run_id.to_string()),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(superseded.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
