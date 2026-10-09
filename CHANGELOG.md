@@ -73,6 +73,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local sessions are already captured by the Claude Code hooks, and Cowork
   capture is not claimed. The desktop-app research notes record what was
   verified live and what is still open. (#878)
+- Fixed `ai-memory-wikisync` committing its per-clone export state: the
+  `git add` of the destination that `export --apply` prints also staged
+  `.ai-memory-wikisync/state.json`, so two clones would conflict on it and
+  trust each other's baselines. The state directory now ignores itself with
+  a `.gitignore` of `*`. A state committed by an earlier export needs one
+  `git rm -r --cached <dest>/.ai-memory-wikisync`. (#1162)
+- Fixed `bootstrap` reading a rules file twice when it is reachable under two
+  names: on a case-insensitive filesystem `claude.md` opened `CLAUDE.md`
+  again, and on any system a `CLAUDE.md` linked to `AGENTS.md` did the same.
+  The doubled text inflated the token estimate, could push every source over
+  the budget (`no input sources selected`), and repeated the rules in the
+  prompt. Only names the directory lists are read now, and identical text is
+  read once. (#1168)
+- Fixed `backfill` and managed runs not finding a Claude Code transcript when
+  the session's directory contains anything but letters, digits and `/`:
+  Claude Code names a project's folder by turning every other character into
+  `-`, but ai-memory replaced only `/`, so every Windows path and any path
+  with `.`, `_` or a space missed it, and the bounded fallback scan could run
+  out on a large store first. The folder name now follows Claude Code's rule,
+  every project folder is probed for the exact transcript before the scan,
+  and a subagent's `subagents/*.jsonl` sidechain, which carries its parent's
+  session id, is never taken for the session's transcript. (#1167)
+- Fixed the macOS menu bar companion's **Settings…** item opening the
+  Settings window behind the frontmost app, so clicking it appeared to do
+  nothing. The item now activates the app before opening the window, as
+  **Show Status…** already did. (#1161)
 
 ## [2.6.2] - 2026-10-08
 

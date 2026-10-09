@@ -263,7 +263,8 @@ the code it documents — read-only, family-scoped, and dry-run by default.
   with no forged attribution/generated frontmatter. All local bookkeeping
   lives in one state file under the destination
   (`.ai-memory-wikisync/state.json`, 0600, atomically replaced after each
-  successful write batch).
+  successful write batch). The directory ignores itself with a `.gitignore`
+  of `*`, so the state stays per clone and never reaches a commit.
 
 ### Safety requirements honored
 

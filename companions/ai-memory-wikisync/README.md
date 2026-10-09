@@ -54,6 +54,13 @@ each successful write batch): per page, the SHA-256 of the bytes last
 written plus the server `ETag` observed at that write. Nothing else is
 stored — no tokens, no server credentials.
 
+The state is per clone. The state directory carries a `.gitignore` of `*`,
+so committing the destination never commits the state: two clones that
+shared one would conflict on every merge and trust each other's baselines.
+An export made before this file existed may already have committed the
+state; untrack it once with
+`git rm -r --cached <dest>/.ai-memory-wikisync`.
+
 ## Safety model
 
 - **API-only.** Documented read-only `/api/v1` endpoints (incremental

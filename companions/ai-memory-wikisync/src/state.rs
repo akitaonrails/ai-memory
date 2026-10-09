@@ -5,6 +5,10 @@
 //! the server ETag observed at that write, so later runs can revalidate with
 //! `If-None-Match` and detect local edits with a three-way comparison. No
 //! token, server credential, or page frontmatter ever lands in it.
+//!
+//! The state is per clone: a `.gitignore` of `*` beside it keeps the whole
+//! state directory out of the repository the export lands in, so the
+//! `git add` of the destination never commits it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,6 +22,11 @@ use sha2::{Digest, Sha256};
 use crate::STATE_DIR;
 
 const STATE_FILE: &str = "state.json";
+const IGNORE_FILE: &str = ".gitignore";
+/// Ignores the state directory, this file included. Two clones that both
+/// commit their state would conflict on every merge and replay each other's
+/// baselines.
+const IGNORE_ALL: &[u8] = b"# Written by ai-memory-wikisync: export state is per clone.\n*\n";
 const STATE_VERSION: u32 = 1;
 const TMP_SUFFIX: &str = ".tmp";
 
@@ -124,6 +133,7 @@ pub fn save(dest_root: &Path, state: &SyncState) -> Result<()> {
     {
         bail!("state directory became a symlink: {}", dir.display());
     }
+    ignore_state_dir(dir)?;
     let json = serde_json::to_vec_pretty(state).context("cannot serialize state")?;
     let tmp = PathBuf::from(format!("{}{TMP_SUFFIX}", path.display()));
     // Leftover tmp from a crashed run is ours by name; clear it.
@@ -154,6 +164,27 @@ pub fn save(dest_root: &Path, state: &SyncState) -> Result<()> {
     Ok(())
 }
 
+/// Keep the state directory out of git. An existing `.gitignore` is left as
+/// it is: the operator may have written it, and `create_new` never follows a
+/// symlink planted under that name.
+fn ignore_state_dir(dir: &Path) -> Result<()> {
+    let path = dir.join(IGNORE_FILE);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(IGNORE_ALL)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("cannot sync {}", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e)).context(format!("cannot create {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,11 +209,15 @@ mod tests {
         assert_eq!(load(&root).unwrap(), state);
         // No tmp file is left behind.
         let dir = fs::read_dir(root.join(STATE_DIR)).unwrap();
-        let names: Vec<String> = dir
+        let mut names: Vec<String> = dir
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["state.json".to_string()]);
+        names.sort();
+        assert_eq!(
+            names,
+            vec![".gitignore".to_string(), "state.json".to_string()]
+        );
     }
 
     #[test]
@@ -245,5 +280,50 @@ mod tests {
         fs::write(root.join(STATE_DIR).join("state.json.tmp"), b"junk").unwrap();
         save(&root, &SyncState::default()).unwrap();
         assert!(load(&root).unwrap() == SyncState::default());
+    }
+
+    #[test]
+    fn state_dir_ignores_itself_and_keeps_an_existing_ignore_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        save(&root, &SyncState::default()).unwrap();
+        let ignore = root.join(STATE_DIR).join(IGNORE_FILE);
+        assert_eq!(fs::read(&ignore).unwrap(), IGNORE_ALL);
+
+        fs::write(&ignore, b"state.json\n").unwrap();
+        save(&root, &SyncState::default()).unwrap();
+        assert_eq!(fs::read(&ignore).unwrap(), b"state.json\n");
+    }
+
+    /// The state must not reach a commit: `git add` of the destination, the
+    /// command the export prints, stages the pages and nothing under the
+    /// state directory.
+    #[test]
+    fn git_add_of_the_destination_skips_the_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+        };
+        let Ok(init) = git(&["init", "-q"]) else {
+            eprintln!("git is not installed; skipping");
+            return;
+        };
+        assert!(init.status.success());
+        let dest = repo.join("docs/wiki");
+        fs::create_dir_all(dest.join("decisions")).unwrap();
+        fs::write(dest.join("decisions/a.md"), b"# A\n").unwrap();
+        save(&dest, &SyncState::default()).unwrap();
+
+        let added = git(&["add", "--dry-run", "--", "docs/wiki"]).unwrap();
+        assert!(added.status.success());
+        let added = String::from_utf8(added.stdout).unwrap();
+        assert!(added.contains("docs/wiki/decisions/a.md"), "{added}");
+        assert!(!added.contains(STATE_DIR), "{added}");
     }
 }

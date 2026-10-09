@@ -3292,10 +3292,28 @@ fn locate_session_file(
         return Ok(session_path_matches(harness, &exact, id, cwd)?.then_some(exact));
     }
     if harness == ManagedHarness::Claude {
-        let encoded = cwd.to_string_lossy().replace('/', "-");
-        let exact = root.join(encoded).join(format!("{id}.jsonl"));
-        if exact.is_file() {
+        // The project folder is the cwd with every character outside
+        // `[A-Za-z0-9]` turned into `-` (#1167). A name that does not derive
+        // from the cwd (a shortened long path) is found by probing each
+        // folder for the exact file, before the bounded scan below, which a
+        // large store can exhaust before reaching the transcript.
+        let exact = root
+            .join(claude_project_dir_name(cwd))
+            .join(format!("{id}.jsonl"));
+        if session_path_matches(harness, &exact, id, cwd)? {
             return Ok(Some(exact));
+        }
+        if let Ok(buckets) = fs::read_dir(root) {
+            for bucket in buckets.take(MAX_SCAN_FILES) {
+                let bucket = bucket?;
+                if !bucket.file_type()?.is_dir() {
+                    continue;
+                }
+                let candidate = bucket.path().join(format!("{id}.jsonl"));
+                if session_path_matches(harness, &candidate, id, cwd)? {
+                    return Ok(Some(candidate));
+                }
+            }
         }
     }
     if harness == ManagedHarness::Kimi {
@@ -3380,6 +3398,16 @@ fn locate_session_file(
     Ok(None)
 }
 
+/// The folder Claude Code keeps a project's transcripts in: the cwd with
+/// every character outside `[A-Za-z0-9]` replaced by `-`, so `/a/b.c_d` is
+/// `-a-b-c-d` and `C:\\Users\\me` is `C--Users-me`.
+fn claude_project_dir_name(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 fn session_path_matches(
     harness: ManagedHarness,
     path: &Path,
@@ -3394,6 +3422,14 @@ fn session_path_matches(
 }
 
 fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
+    if harness == ManagedHarness::Claude {
+        // `<id>/subagents/agent-*.jsonl` sidechains carry the parent's session
+        // id and cwd; they are part of a session, never one of their own.
+        return path.extension().is_some_and(|ext| ext == "jsonl")
+            && !path
+                .components()
+                .any(|component| component.as_os_str() == "subagents");
+    }
     if harness == ManagedHarness::Grok {
         // Only the conversation journal. `events.jsonl`, `updates.jsonl`, and
         // `rewind_points.jsonl` in the same session directory carry harness
@@ -6148,6 +6184,66 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn claude_project_dir_name_replaces_every_non_alphanumeric() {
+        for (cwd, folder) in [
+            (
+                "/mnt/data/Projects/ai-memory",
+                "-mnt-data-Projects-ai-memory",
+            ),
+            ("/home/me/.config/Claude", "-home-me--config-Claude"),
+            (
+                "/mnt/data/Projects/frank_mega",
+                "-mnt-data-Projects-frank-mega",
+            ),
+            ("/home/me/my repo", "-home-me-my-repo"),
+            (r"C:\Users\me\my.repo", "C--Users-me-my-repo"),
+            ("/home/me/café", "-home-me-caf-"),
+        ] {
+            assert_eq!(claude_project_dir_name(Path::new(cwd)), folder, "{cwd}");
+        }
+    }
+
+    /// #1167: a cwd with `.` or `_` maps to a folder the old `/`-only rule
+    /// missed; the transcript is found there, a folder whose name does not
+    /// derive from the cwd is still probed, and neither a subagent sidechain
+    /// nor another checkout's transcript with the same id is returned.
+    #[test]
+    fn claude_transcript_is_located_by_the_real_folder_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join(".claude/projects");
+        let cwd = temp.path().join("work/my.repo_x");
+        fs::create_dir_all(&cwd).unwrap();
+        let id = "11111111-2222-4333-8444-555555555555";
+        let record =
+            |cwd: &Path| format!("{}\n", json!({"type": "user", "sessionId": id, "cwd": cwd}));
+        let locate =
+            || locate_session_file(ManagedHarness::Claude, temp.path(), &cwd, None, id).unwrap();
+
+        // A subagent sidechain and another checkout's transcript, both with
+        // the same session id, come first and must never be returned.
+        let other_cwd = temp.path().join("elsewhere");
+        let other = projects.join(claude_project_dir_name(&other_cwd));
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(format!("{id}.jsonl")), record(&other_cwd)).unwrap();
+        let folder = projects.join(claude_project_dir_name(&cwd));
+        let sidechain = folder.join(id).join("subagents");
+        fs::create_dir_all(&sidechain).unwrap();
+        fs::write(sidechain.join("agent-x.jsonl"), record(&cwd)).unwrap();
+        assert_eq!(locate(), None);
+
+        let exact = folder.join(format!("{id}.jsonl"));
+        fs::write(&exact, record(&cwd)).unwrap();
+        assert_eq!(locate(), Some(exact.clone()));
+
+        // A folder whose name is not derived from the cwd is probed too.
+        fs::remove_file(&exact).unwrap();
+        let shortened = projects.join("-work-my-repo-x-1a2b3c");
+        fs::create_dir_all(&shortened).unwrap();
+        fs::write(shortened.join(format!("{id}.jsonl")), record(&cwd)).unwrap();
+        assert_eq!(locate(), Some(shortened.join(format!("{id}.jsonl"))));
     }
 
     #[test]
