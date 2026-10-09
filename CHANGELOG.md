@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added the server version to the footer of every `/web` page, on the right
+  side opposite "ai-memory · read-only", so you can tell which build a browser
+  tab is talking to without running `ai-memory status`. (#1171)
+
 ### Fixed
 - Fixed Cursor tool calls being stored with no title or content: Cursor's own
   hooks, and the Claude Code hooks Cursor also runs, send Claude's
