@@ -2,6 +2,10 @@
 
 use askama::Template;
 
+/// Server version shown in the footer of every page. Workspace crates share
+/// one version, so this crate's version is the running server's.
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ---------------------------------------------------------------------------
 // URL helpers
 // ---------------------------------------------------------------------------
@@ -387,6 +391,26 @@ pub(crate) struct ChangePasswordView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_auth_pages_do_not_show_the_server_version() {
+        let version = format!("v{VERSION}");
+        let login = LoginView {
+            next: "/web/".into(),
+            change_password_href: "/web/change-password".into(),
+        }
+        .render()
+        .unwrap();
+        let change = ChangePasswordView {
+            next: "/web/".into(),
+        }
+        .render()
+        .unwrap();
+        let signed_in = NotFoundView {}.render().unwrap();
+        assert!(!login.contains(&version), "login page leaks {version}");
+        assert!(!change.contains(&version), "change-password page leaks {version}");
+        assert!(signed_in.contains(&version), "signed-in pages show {version}");
+    }
 
     #[test]
     fn href_helpers_percent_encode_segments() {

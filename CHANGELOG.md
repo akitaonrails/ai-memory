@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arguments are refused on any page the digest does not read: one outside
   `profile/`, or a `profile/` path in an ordinary project. (#1178)
 
+- Added the server version to the footer of every signed-in `/web` page (the
+  public login and change-password pages leave it out), on the right
+  side opposite "ai-memory · read-only", so you can tell which build a browser
+  tab is talking to without running `ai-memory status`. (#1171)
+
 ### Changed
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
