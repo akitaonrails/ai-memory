@@ -26,7 +26,7 @@ use serde_json::json;
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
-use crate::commands::render_shared::bearer_header_value;
+use crate::commands::render_shared::{bearer_header_value, yaml_single_quote};
 use crate::config::{Config, DEFAULT_MCP_URL};
 
 const GEMINI_MCP_TIMEOUT_MS: u64 = 5000;
@@ -1742,26 +1742,32 @@ fn render_dsh(args: &InstallMcpArgs) -> Result<String> {
          # DSH has no fixed MCP config file: the client is a Cordis plugin\n\
          # entry, so this integration is print-only. A new top-level\n\
          # - insert: item is fine - patch row order carries no load\n\
-         # semantics. Pair it with DSH's @deepseek-ai/dsh-hooks-claude-code\n\
-         # bridge if you want lifecycle capture.\n\
+         # semantics. This wires MCP only; no lifecycle capture.\n\
          {snippet}\n",
         snippet = render_dsh_snippet(args),
     ))
 }
 
 fn render_dsh_snippet(args: &InstallMcpArgs) -> String {
-    let url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
+    // Single-quote every interpolated scalar: a plain YAML scalar would turn
+    // a valid `--name 123` into an integer `serverName`, and a URL or token
+    // carrying `"`, `\` or ` #` would no longer parse as one string.
+    let name = yaml_single_quote(&args.name);
+    let url = yaml_single_quote(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL));
     let mut out = String::new();
     out.push_str("- insert:\n");
-    out.push_str(&format!("    - id: {}\n", args.name));
+    out.push_str(&format!("    - id: {name}\n"));
     out.push_str("      name: '@deepseek-ai/dsh-mcp-client'\n");
     out.push_str("      config:\n");
-    out.push_str(&format!("        serverName: {}\n", args.name));
+    out.push_str(&format!("        serverName: {name}\n"));
     out.push_str("        transport: streamable-http\n");
-    out.push_str(&format!("        url: \"{url}\"\n"));
+    out.push_str(&format!("        url: {url}\n"));
     if let Some(value) = bearer_header_value(args.auth_token.as_deref()) {
         out.push_str("        headers:\n");
-        out.push_str(&format!("          Authorization: {value}\n"));
+        out.push_str(&format!(
+            "          Authorization: {}\n",
+            yaml_single_quote(&value)
+        ));
     }
     // Fixed at the value validated against DSH. Pending: candidate for a CLI
     // parameter (e.g. --tool-call-timeout-ms) if demand appears.
@@ -2396,14 +2402,38 @@ mod tests {
         assert!(rendered.contains("- insert:"));
         assert!(rendered.contains("name: '@deepseek-ai/dsh-mcp-client'"));
         assert!(rendered.contains("transport: streamable-http"));
-        assert!(rendered.contains("url: \"http://127.0.0.1:49374/mcp\""));
+        assert!(rendered.contains("url: 'http://127.0.0.1:49374/mcp'"));
         assert!(rendered.contains("toolCallTimeoutMs: 120000"));
     }
 
     #[test]
     fn dsh_render_carries_the_bearer_header_when_a_token_is_present() {
         let rendered = render_dsh(&args_with_token(McpClient::Dsh)).expect("render");
-        assert!(rendered.contains("Authorization: Bearer test-token-deadbeef"));
+        assert!(rendered.contains("Authorization: 'Bearer test-token-deadbeef'"));
+    }
+
+    #[test]
+    fn dsh_render_quotes_every_interpolated_scalar_as_a_yaml_string() {
+        // `123` passes the serverName check but is a YAML integer unquoted;
+        // the URL and token carry characters that end a plain scalar.
+        let mut args = args_with_token(McpClient::Dsh);
+        args.name = "123".into();
+        args.server_url = Some("http://h:1/mcp?a=\"b\" #c".into());
+        args.auth_token = Some("it's #x".into());
+        let rendered = render_dsh(&args).expect("render");
+        assert!(rendered.contains("    - id: '123'\n"), "{rendered}");
+        assert!(
+            rendered.contains("        serverName: '123'\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("        url: 'http://h:1/mcp?a=\"b\" #c'\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("          Authorization: 'Bearer it''s #x'\n"),
+            "{rendered}"
+        );
     }
 
     #[test]

@@ -876,7 +876,7 @@ fn build_pool_settings_yaml_for_platform(
 /// Emit a YAML single-quoted scalar: wrap in `'…'`, doubling any embedded
 /// `'`. Single-quote style is the only YAML form in which the POSIX shell
 /// quoting inside the hook command survives byte-for-byte.
-fn yaml_single_quote(s: &str) -> String {
+pub(crate) fn yaml_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
