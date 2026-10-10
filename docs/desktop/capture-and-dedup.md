@@ -23,8 +23,8 @@ apps; Cursor is the exception") needs revision after this research:
 ### What the MCP server can see server-side (all apps)
 
 ai-memory *is* the MCP server, so on any MCP-connected app we observe:
-tool calls (name + args + results), call timestamps, and — through the MCP
-session — nothing else. We do **not** see chat turns, prompts, or model
+tool calls (name + args + results) and call timestamps, and nothing else
+through the MCP session. We do **not** see chat turns, prompts, or model
 output. Practical consequences:
 
 - Server-side observation is enough for **usage telemetry** (which tools an
@@ -39,18 +39,18 @@ output. Practical consequences:
 
 Now concrete per app (paths verified locally unless noted):
 
-- `~/.claude/projects/<munged-cwd>/<session>.jsonl` — Claude Code-family
+- `~/.claude/projects/<munged-cwd>/<session>.jsonl`: Claude Code-family
   transcripts (desktop Code tab included). Watcher optional: hooks
   already cover it; a watcher adds value only for hookless flows (e.g.
   user disabled hooks).
-- `~/.codex/sessions/**/rollout-*.jsonl` + `~/.codex/history.jsonl` — Codex.
-- `~/.gemini/antigravity{,-ide,-cli}/brain/<conversationId>/**/transcript.jsonl`
-  — Antigravity (per hooks doc; not yet verified locally — no IDE chats on
-  the machine).
-- Zed native agent: internal DB in Zed's data dir — **do not** build on it
+- `~/.codex/sessions/**/rollout-*.jsonl` + `~/.codex/history.jsonl`: Codex.
+- `~/.gemini/antigravity{,-ide,-cli}/brain/<conversationId>/**/transcript.jsonl`:
+  Antigravity (per hooks doc; not yet verified locally because there are no IDE
+  chats on the machine).
+- Zed native agent: internal DB in Zed's data dir. **Do not** build on it
   (unstable, version-fragile); rely on ACP agents instead.
-- Claude Chat tab / hosted ChatGPT / Grok Bot: **no local store** — watcher
-  class does not apply.
+- Claude Chat tab / hosted ChatGPT / Grok Bot: **no local store**, so the
+  watcher class does not apply.
 
 A watcher/importer remains the importer-envelope (`/hook/batch`) pattern
 from `companions/ai-memory-importer`; keep it out of core (RFC #878 rule).
@@ -81,7 +81,7 @@ Verified mechanics (see `claude-desktop.md`):
        session metadata for filtering.
      The desktop-side record (`~/.config/Claude/claude-code-sessions/.../
      local_*.json`) provides `title`, `createdAt`, account/org and the
-     `local_* ↔ cliSessionId` mapping if we want to enrich/label — but it is
+     `local_* ↔ cliSessionId` mapping if we want to enrich/label, but it is
      an implementation detail of a closed app; treat as optional hint, not
      a dependency (it can move without notice).
   2. **Bridging id exposure**: the desktop id (`local_*`) never reaches
@@ -90,15 +90,15 @@ Verified mechanics (see `claude-desktop.md`):
   `entrypoint: claude-desktop` + `hostSessionId` while a process runs. Not
   archival; useful at most for a tray app's "current desktop sessions" view.
 - The cc-socks Unix sockets (`/run/user/<uid>/cc-socks/<pid>.sock`) are an
-  internal IPC of the closed app — **do not** build on them.
+  internal IPC of the closed app; **do not** build on them.
 
 ### Codex
 
 One Codex host per user: CLI + desktop + IDE extension share `~/.codex`
 (config **and** session rollout store). Session ids are the rollout UUIDs;
 `(agent=codex, session_id)` is already correct, and a session started in
-the desktop app is distinguishable only by content/absence of TUI markers —
-no id-level split. Hosted ChatGPT/Codex-cloud sessions are cloud ids that
+the desktop app is distinguishable only by content/absence of TUI markers,
+with no id-level split. Hosted ChatGPT/Codex-cloud sessions are cloud ids that
 never touch the local store; if cloud-side capture ever matters it arrives
 via export/API, mapped as a *separate* agent kind (e.g. `codex-cloud`) to
 avoid double-counting with local rollouts.
@@ -110,7 +110,7 @@ for the same conversation; the surface is distinguishable by the
 `transcriptPath` prefix (`antigravity-ide/` vs `antigravity-cli/` vs
 `antigravity/`). Map to ai-memory: `agent=antigravity`, session_id =
 `conversationId`, cwd = `workspacePaths[0]` (fallback: last path; the
-payload has no scalar `cwd`). Hook set lacks SessionStart/SessionEnd —
+payload has no scalar `cwd`). The hook set lacks SessionStart/SessionEnd, so
 derive session boundaries from first/last observation timestamps per
 conversation id (ai-memory sessions are already built from observation
 streams, so a Stop-hook flush marker is enough; optional).
@@ -121,7 +121,7 @@ Dedup key stays `(agent, session_id)`; **surface variants of one agent
 ecosystem that share an id space stay one agent kind** (claude-code covers
 CLI+desktop; codex covers CLI+desktop+IDE ext; antigravity covers
 IDE+CLI+2.0). Where a closed app keeps its own id (desktop `local_*`),
-never invent capture from it — treat as metadata only.
+never invent capture from it; treat it as metadata only.
 
 ## 3. Open questions
 
@@ -134,7 +134,7 @@ never invent capture from it — treat as metadata only.
 3. Claude Desktop Chat tab: is any local conversation cache planned
    (desktop extensions/plugins evolve fast)? Re-check quarterly; not
    buildable today.
-4. Grok Bot `mcpBoxServers` entry format — reverse-engineer only if the
+4. Grok Bot `mcpBoxServers` entry format: reverse-engineer only if the
    product gains traction with users; no docs.
 5. Scope for scratch-workspace sessions: single `desktop/claude-scratch`
    pool vs per-scratch projects (product decision; affects auto-scope).

@@ -7,17 +7,17 @@ SQLite index and models cache that the mirror repo deliberately excludes.
 See [`docs/backup.md`](../../backup.md) for the walkthrough. The pieces in this
 directory are:
 
-- `ai-memory-snapshot.sh` — the rsync + git push + tarball loop. Configurable
+- `ai-memory-snapshot.sh`: the rsync + git push + tarball loop, configurable
   through six environment variables (`REPO_DIR`, `DATA_SRC`, `CFG_SRC`,
   `TARBALL_DIR`, `LOG_DIR`, `SECRET_EXCLUDES`) with sensible defaults for a
   single-user Linux/WSL/macOS install.
-- `ai-memory-backup.service` — a `systemd --user` oneshot that runs the
+- `ai-memory-backup.service`: a `systemd --user` oneshot that runs the
   script. `%h` expands to the user's home directory.
-- `ai-memory-backup.timer` — a daily user timer with a small randomised delay
+- `ai-memory-backup.timer`: a daily user timer with a small randomised delay
   and `Persistent=true` so the missed run after a reboot still fires.
-- `.gitignore` — the exclusion list to drop into the root of the mirror
-  repository. Belt-and-braces to the rsync/tar exclude lists in the script
-  itself.
+- `.gitignore`: the exclusion list to drop into the root of the mirror
+  repository, as a second layer behind the rsync/tar exclude lists in the
+  script itself.
 
 ## Quickstart
 

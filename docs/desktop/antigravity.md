@@ -7,13 +7,13 @@
 
 ## Product shape (as of 2026-10)
 
-Google ships **Antigravity 2.0** (the desktop agent app), the **Antigravity
-IDE** (standalone Windsurf-derived editor), the **Antigravity CLI** (`agy`),
+Google ships Antigravity 2.0 (the desktop agent app), the Antigravity
+IDE (standalone Windsurf-derived editor), the Antigravity CLI (`agy`),
 and an SDK, all documented at <https://antigravity.google/docs/>. The local
 machine runs the IDE (`/usr/share/applications/antigravity-ide.desktop`,
 `antigravity-ide-url-handler.desktop`, Electron/VS Code profile at
-`~/.config/Antigravity IDE/` — `User/globalStorage/state.vscdb`,
-`workspaceStorage`, `languagepacks.json` confirm the VS Code fork layout).
+`~/.config/Antigravity IDE/`, where `User/globalStorage/state.vscdb`,
+`workspaceStorage` and `languagepacks.json` confirm the VS Code fork layout).
 `~/.gemini/` exists locally with `antigravity-cli/` and `antigravity-ide/`
 subdirs plus `config/`, `settings.json`, `oauth_creds.json`.
 
@@ -54,13 +54,13 @@ Official: <https://antigravity.google/docs/hooks/>
   **`transcriptPath`**, `artifactDirectoryPath`, `modelName`, plus
   `toolCall`, `stepIdx`, etc. Handlers are shell commands with a `timeout`
   (default 30s).
-- **Crucially, the payload names the transcript file**:
+- The payload names the transcript file:
   `<app_data_dir>/brain/<conversationId>/.system_generated/logs/transcript.jsonl`
   where `<app_data_dir>` = `~/.gemini/antigravity` (2.0),
   `~/.gemini/antigravity-cli` (CLI), **`~/.gemini/antigravity-ide` (IDE)**.
 
 **Consequence for ai-memory:** `install-hooks --agent antigravity-cli` writes
-`~/.gemini/config/hooks.json`, which the **IDE also loads** — so global
+`~/.gemini/config/hooks.json`, which the IDE also loads, so global
 capture likely already extends to IDE sessions, with the IDE distinguishable
 by its `transcriptPath` prefix (`antigravity-ide/brain/...`). Differences to
 handle: no `SessionStart`/`SessionEnd` events (session boundaries must be
@@ -107,7 +107,7 @@ needed for capture conclusions.)
 - <https://antigravity.google/docs/mcp/>, <https://antigravity.google/docs/hooks/>,
   <https://antigravity.google/docs/cli/overview/>
 - Local: `~/.config/Antigravity IDE/` (VS Code-fork layout,
-  `User/globalStorage/state.vscdb` — no MCP keys configured yet),
+  `User/globalStorage/state.vscdb`; no MCP keys configured yet),
   `~/.gemini/` (config root shared by CLI + IDE),
   `/usr/share/applications/antigravity-ide*.desktop`
 - ai-memory repo: `docs/mcp-install.md` (Antigravity CLI section)

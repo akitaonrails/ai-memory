@@ -1,6 +1,6 @@
 # Security
 
-> The full security model. Moved verbatim from the README front page; the README keeps a summary.
+> The full security model. Moved from the README front page; the README keeps a summary.
 
 Loopback-only (`127.0.0.1:49374`) with no auth is the default because
 it is safe for a single-user laptop: no process outside the machine can
@@ -88,24 +88,23 @@ sessions. Shared servers that rely on `[auto_scope]` session isolation still
 need explicit `workspace` + `project` / `scopes`, or a bridge that forwards the
 real lifecycle-hook session id on MCP requests.
 
-**Want HTTPS?** ai-memory deliberately does not terminate TLS itself —
-the right answer is a battle-tested reverse proxy in front of it.
+**HTTPS.** ai-memory deliberately does not terminate TLS itself; put a
+well-tested reverse proxy in front of it.
 [`docs/https-via-proxy.md`](https-via-proxy.md) is the deployment
 guide, with copy-paste docker compose templates in
 [`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml) (Caddy
 with Let's Encrypt or internal CA) and
 [`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml)
-(Cloudflare Tunnel — no open ports). Both are recommended once you
-turn on multi-user or bind beyond loopback. The Quick Start happy
-path of single-user on loopback doesn't need TLS — that case is
-called out explicitly in the guide so you don't add ceremony where
-it doesn't earn its keep.
+(Cloudflare Tunnel, no open ports). Both are recommended once you
+turn on multi-user or bind beyond loopback. The Quick Start default
+of single-user on loopback doesn't need TLS; the guide says so
+explicitly so you don't add setup you don't need.
 
 **Multi-user attribution (v0.8, optional) plus human login.** When more
 than one human shares a server, ai-memory attributes each write to a
 named user. Humans sign in with username/password; agents and CLIs use
 `Authorization: Bearer` (`AI_MEMORY_AUTH_TOKEN` for root automation, or
-an `aim_` key from `ai-memory api-key add`). Data stays single-tenant —
+an `aim_` key from `ai-memory api-key add`). Data stays single-tenant:
 there is no per-page RBAC. A
 `[auth].token_pepper` is required for DB-user authentication, but creating the
 first user row is what immediately switches every `/admin/*` endpoint to

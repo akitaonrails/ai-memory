@@ -18,7 +18,7 @@ reaches the agent only when a `memory_query` happens to match it, and is
 deliberately kept out of the SessionStart brief. `docs/design-rules-promotion.md`
 defers cross-project sharing, and RFC #1000 asks for exactly that.
 
-The **profile** is the missing piece: a small, curated, cross-project record of
+The **profile** fills that gap. It is a small, curated, cross-project record of
 how this user usually works, built from evidence, delivered to every project
 and every harness, and used as the default whenever nothing more specific says
 otherwise.

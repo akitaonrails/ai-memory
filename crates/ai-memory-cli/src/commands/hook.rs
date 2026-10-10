@@ -20,7 +20,7 @@ use std::time::Duration;
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
-    CaptureDisposition, CaptureMode, HookEvent, PolicyState, absolute_file_tool_paths,
+    CaptureDisposition, CaptureMode, HookEvent, PolicyState, absolute_tool_location_paths,
     repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
@@ -728,18 +728,19 @@ where
     }
     let (payload_cwd, canonical_session_id) = hook_context(&args.agent, &json);
     let tool_event = is_tool_event(&args.event);
-    // Some harnesses keep a subagent's parent cwd in every payload even when
-    // a file tool operates in another checkout (#932). A recognized absolute
-    // target may select that checkout, but only when every path proves the
-    // same repository/marker boundary. This must precede capture policy and
+    // Some harnesses report a cwd other than where the tool ran: a subagent's
+    // parent session (#932), or Hermes' own process cwd while its tools take
+    // a per-call `workdir`/`path` (#1199). A recognized absolute location may
+    // select that checkout, but only when every path proves the same
+    // repository/marker boundary. This must precede capture policy and
     // server-profile resolution so the destination's privacy and credentials
     // remain authoritative.
-    let file_routing_cwd = payload_cwd.as_deref().and_then(|cwd| {
+    let tool_routing_cwd = payload_cwd.as_deref().and_then(|cwd| {
         tool_event
-            .then(|| file_tool_routing_cwd(agent_kind, &json, cwd))
+            .then(|| tool_location_routing_cwd(agent_kind, &json, cwd))
             .flatten()
     });
-    if let Some(cwd) = file_routing_cwd.as_deref()
+    if let Some(cwd) = tool_routing_cwd.as_deref()
         && let Some(object) = json.as_object_mut()
     {
         // `HookEnvelope` deliberately gives the native body cwd precedence
@@ -748,7 +749,7 @@ where
         object.insert("cwd".into(), cwd.into());
         payload = serde_json::to_string(&json)?;
     }
-    let policy_cwd = file_routing_cwd.or(payload_cwd);
+    let policy_cwd = tool_routing_cwd.or(payload_cwd);
     let inspection_cwd = policy_cwd.as_deref().map(lexical_capture_cwd);
     let policy = policy_cwd.as_deref().map(capture_policy);
     let decision = policy.as_ref().filter(|_| tool_event).map(|policy| {
@@ -1254,14 +1255,23 @@ fn file_route_anchor(cwd: &Path) -> FileRouteAnchor {
     }
 }
 
-/// Pick a destination cwd only when absolute file-tool paths prove a single
-/// repository/marker boundary different from the payload cwd.
-fn file_tool_routing_cwd(
+/// Pick a destination cwd only when a tool call's absolute location (file
+/// targets, a search directory, a shell `workdir`) proves a single
+/// repository/marker boundary different from the payload cwd, and the payload
+/// cwd's own capture policy would keep the event.
+///
+/// The second condition keeps a reroute from escaping the source's
+/// `ignore_paths`: patterns may name paths outside the source checkout
+/// (`~/vault/**`, an absolute path), and a shell command's arguments may name
+/// source files while its `workdir` points elsewhere. Without a reroute the
+/// event stays with the payload cwd, whose policy then drops it exactly as it
+/// would have before any rerouting existed.
+fn tool_location_routing_cwd(
     agent: AgentKind,
     raw: &serde_json::Value,
     payload_cwd: &str,
 ) -> Option<String> {
-    let paths = absolute_file_tool_paths(agent, raw, payload_cwd)?;
+    let paths = absolute_tool_location_paths(agent, raw, payload_cwd)?;
     let source_dir = existing_target_dir(Path::new(payload_cwd))?;
     let source_anchor = file_route_anchor(&source_dir);
     let mut selected: Option<(FileRouteAnchor, PathBuf)> = None;
@@ -1280,7 +1290,15 @@ fn file_tool_routing_cwd(
         }
     }
     let (target_anchor, dir) = selected?;
-    (target_anchor != source_anchor).then(|| dir.to_string_lossy().into_owned())
+    if target_anchor == source_anchor {
+        return None;
+    }
+    let source_keeps = capture_policy(payload_cwd)
+        .inspect(agent, raw, &lexical_capture_cwd(payload_cwd))
+        .protocol()
+        .disposition()
+        == CaptureDisposition::Keep;
+    source_keeps.then(|| dir.to_string_lossy().into_owned())
 }
 
 /// Where one event is delivered (#992).
@@ -2788,7 +2806,7 @@ mod tests {
             "tool_input": {"file_path": "../destination/file.txt"}
         });
         assert_eq!(
-            file_tool_routing_cwd(AgentKind::ClaudeCode, &relative, cwd),
+            tool_location_routing_cwd(AgentKind::ClaudeCode, &relative, cwd),
             None,
             "a relative path cannot independently prove a destination"
         );
@@ -2800,7 +2818,7 @@ mod tests {
             "tool_input": {"file_path": external_dir.join("file.txt")}
         });
         assert_eq!(
-            file_tool_routing_cwd(AgentKind::ClaudeCode, &external, cwd),
+            tool_location_routing_cwd(AgentKind::ClaudeCode, &external, cwd),
             None,
             "an arbitrary absolute path must not mint a project"
         );
@@ -2813,10 +2831,238 @@ mod tests {
             ]}
         });
         assert_eq!(
-            file_tool_routing_cwd(AgentKind::ClaudeCode, &mixed, cwd),
+            tool_location_routing_cwd(AgentKind::ClaudeCode, &mixed, cwd),
             None,
             "one event cannot be attributed to two projects"
         );
+    }
+
+    /// Spool one native hook event and return what reached the spool.
+    async fn spool_one(
+        data_dir: &Path,
+        agent: &str,
+        capture_mode: Option<crate::cli::CaptureModeArg>,
+        raw: &serde_json::Value,
+    ) -> Vec<hook_spool::SpoolEntry> {
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = agent.into();
+        args.capture_mode = capture_mode;
+        run_with_payload(
+            Some(data_dir.to_path_buf()),
+            args,
+            raw.to_string(),
+            &mut Vec::new(),
+            |_, _| panic!("a tool event below the threshold must only spool"),
+        )
+        .await
+        .unwrap();
+        let spool = hook_spool::spool_dir(data_dir);
+        if spool.exists() {
+            read_spooled_entries(&spool)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Hermes reports its own process cwd (usually `~`) on every tool event and
+    /// points each call at a repository through `workdir` or `path` (#1199).
+    /// Under allowlist mode the process cwd has no marker, so the tool's own
+    /// absolute location must find the repository's marker.
+    #[tokio::test]
+    async fn hermes_tool_location_finds_the_marker_the_process_cwd_lacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("dev/some-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "workspace = \"w\"\nproject = \"some-repo\"\n",
+        )
+        .unwrap();
+        let allowlist = Some(crate::cli::CaptureModeArg::Allowlist);
+        let event = |tool: &str, input: serde_json::Value| {
+            serde_json::json!({
+                "hook_event_name": "post_tool_call",
+                "tool_name": tool,
+                "tool_input": input,
+                "session_id": "hermes-session",
+                "cwd": home,
+                "extra": {"tool_call_id": "call-1", "status": "ok"}
+            })
+        };
+
+        for (name, raw) in [
+            (
+                "terminal workdir",
+                event(
+                    "terminal",
+                    serde_json::json!({"command": "git status", "workdir": repo}),
+                ),
+            ),
+            (
+                "file path",
+                event(
+                    "read_file",
+                    serde_json::json!({"path": repo.join("README.md")}),
+                ),
+            ),
+            (
+                "search directory",
+                event(
+                    "search_files",
+                    serde_json::json!({"pattern": "fn", "path": repo}),
+                ),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, "hermes", allowlist, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert_eq!(
+                query_param(&entries[0].url, "project"),
+                Some("some-repo"),
+                "{name}"
+            );
+            let body: serde_json::Value = serde_json::from_str(&entries[0].body).unwrap();
+            assert_eq!(body["cwd"], repo.to_string_lossy().as_ref(), "{name}");
+        }
+
+        // Controls: a command with no location, or a relative one Hermes
+        // resolves against a session cwd the payload never carries, still
+        // belongs to the unmarked process cwd and is not captured.
+        for (name, raw) in [
+            (
+                "no workdir",
+                event("terminal", serde_json::json!({"command": "git status"})),
+            ),
+            (
+                "relative workdir",
+                event(
+                    "terminal",
+                    serde_json::json!({"command": "git status", "workdir": "dev/some-repo"}),
+                ),
+            ),
+            (
+                "relative search",
+                event(
+                    "search_files",
+                    serde_json::json!({"pattern": "fn", "path": "."}),
+                ),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            assert!(
+                spool_one(&data_dir, "hermes", allowlist, &raw)
+                    .await
+                    .is_empty(),
+                "{name}"
+            );
+        }
+    }
+
+    /// A shell `workdir` reroute lands under the destination's exclusions: a
+    /// command reading an ignored path there is dropped, a public one is kept.
+    #[tokio::test]
+    async fn workdir_reroute_applies_the_destination_capture_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".ai-memory.toml"),
+            "project = \"repo\"\n[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        for (command, spooled) in [("cat secret/token.txt", 0), ("cat README.md", 1)] {
+            let raw = serde_json::json!({
+                "tool_name": "terminal",
+                "tool_input": {"command": command, "workdir": repo},
+                "tool_response": "SENTINEL_CONTENT",
+                "session_id": "hermes-session",
+                "cwd": home,
+            });
+            let data_dir = tmp.path().join(format!("data-{spooled}"));
+            assert_eq!(
+                spool_one(&data_dir, "hermes", None, &raw).await.len(),
+                spooled,
+                "{command}"
+            );
+        }
+    }
+
+    /// Adversarial: a reroute must never escape the payload cwd's own
+    /// `ignore_paths`. The source excludes a path outside its checkout and a
+    /// path inside it; a file tool targeting the first, or a shell command
+    /// naming the second while its `workdir` points at another project, would
+    /// otherwise be judged only by the destination's (inactive) policy and
+    /// spooled. Controls: the same tools on public paths still reroute.
+    #[tokio::test]
+    async fn a_reroute_cannot_escape_the_source_capture_exclusions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let vault = tmp.path().join("vault");
+        let other = tmp.path().join("other");
+        for dir in [&source, &vault, &other] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            source.join(".ai-memory.toml"),
+            format!(
+                "project = \"source\"\n[capture]\nignore_paths = [\"secret/**\", {:?}]\n",
+                format!("{}/**", vault.display())
+            ),
+        )
+        .unwrap();
+        std::fs::write(vault.join(".ai-memory.toml"), "project = \"vault\"\n").unwrap();
+        std::fs::write(other.join(".ai-memory.toml"), "project = \"other\"\n").unwrap();
+        let bash = |command: String| {
+            serde_json::json!({
+                "session_id": "escape",
+                "cwd": source,
+                "tool_name": "Bash",
+                "tool_input": {"command": command, "workdir": other},
+                "tool_response": {"stdout": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+        let read = |path: PathBuf| {
+            serde_json::json!({
+                "session_id": "escape",
+                "cwd": source,
+                "tool_name": "Read",
+                "tool_input": {"file_path": path},
+                "tool_response": {"content": "SENTINEL_MUST_NOT_BE_SPOOLED"}
+            })
+        };
+
+        for (name, raw) in [
+            ("file outside the source", read(vault.join("key.md"))),
+            (
+                "shell naming a source file",
+                bash(format!("cat {}", source.join("secret/token.txt").display())),
+            ),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            assert!(
+                spool_one(&data_dir, "claude-code", None, &raw)
+                    .await
+                    .is_empty(),
+                "{name}: the source exclusion must still drop the event"
+            );
+        }
+
+        for (name, raw, project) in [
+            ("public file", read(other.join("readme.md")), "other"),
+            ("public shell", bash("git status".to_owned()), "other"),
+        ] {
+            let data_dir = tmp.path().join(format!("data-{}", name.replace(' ', "-")));
+            let entries = spool_one(&data_dir, "claude-code", None, &raw).await;
+            assert_eq!(entries.len(), 1, "{name}");
+            assert_eq!(
+                query_param(&entries[0].url, "project"),
+                Some(project),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

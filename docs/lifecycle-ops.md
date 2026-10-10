@@ -8,20 +8,20 @@ on a homelab box where mistakes are harder to undo.
 
 | Command | Safe with server **running**? | Wipes data? | Reversible? | Notes |
 |---|---|---|---|---|
-| `purge-project --confirm` | ✅ yes | the one project's data, **plus** any observation stamped into a different project by one of this project's sessions (cascades regardless of the observation's own `project_id`), and it nulls (does not delete) the session reference on any handoff in a different project that this project's sessions authored or accepted | no | Deletes the UUID-namespaced wiki root and raw workstream segments. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). Without `--confirm` it previews the same counts, including the cross-project ones, before refusing — see below. |
-| `purge-session --session-id --confirm` | ✅ yes | the one session's data, **plus** any observation stamped into a different project by this session (cascades regardless of the observation's own `project_id`), and it nulls (does not delete) the session reference on any handoff in a different project that this session authored or accepted | no | Deletes one session by UUID: its row, its observations, the handoffs it **authored**, its `sessions/<id>.md` page and every superseded version, their embeddings, and its auto-improve runs. Strictly scoped — a session that does not belong to the named workspace/project is a `404` and nothing is deleted. Handoffs the session only *accepted* are kept: that text belongs to the session that wrote it. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). Without `--confirm` it previews the same counts, including the cross-project ones, before refusing — see below. |
-| `handoffs --expire-all --confirm` | ✅ yes | no (state change only) | no (but nothing is destroyed) | Marks every **open** handoff in the scope `expired` so it stops being offered to an agent. Rows, summaries and provenance are kept and stay visible in the audit log. Unlike the automatic sweep it does **not** spare manual handoffs or ones from another directory — those exemptions are exactly what a leftover backlog is made of, so honouring them would clear nothing. `--older-than-days N` keeps recent batons. Owner-scoped: never touches another user's baton. |
+| `purge-project --confirm` | ✅ yes | the one project's data, **plus** any observation stamped into a different project by one of this project's sessions (cascades regardless of the observation's own `project_id`), and it nulls (does not delete) the session reference on any handoff in a different project that this project's sessions authored or accepted | no | Deletes the UUID-namespaced wiki root and raw workstream segments. Refuses with `409` while a managed workstream under the project holds a live run lease; `--force` overrides. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). Without `--confirm` it previews the same counts, including the cross-project ones, before refusing (see below). |
+| `purge-session --session-id --confirm` | ✅ yes | the one session's data, **plus** any observation stamped into a different project by this session (cascades regardless of the observation's own `project_id`), and it nulls (does not delete) the session reference on any handoff in a different project that this session authored or accepted | no | Deletes one session by UUID: its row, its observations, the handoffs it **authored**, its `sessions/<id>.md` page and every superseded version, their embeddings, and its auto-improve runs. Strictly scoped: a session that does not belong to the named workspace/project is a `404` and nothing is deleted. Handoffs the session only *accepted* are kept: that text belongs to the session that wrote it. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). Without `--confirm` it previews the same counts, including the cross-project ones, before refusing (see below). |
+| `handoffs --expire-all --confirm` | ✅ yes | no (state change only) | no (but nothing is destroyed) | Marks every **open** handoff in the scope `expired` so it stops being offered to an agent. Rows, summaries and provenance are kept and stay visible in the audit log. Unlike the automatic sweep it does **not** spare manual handoffs or ones from another directory. A leftover backlog is made of exactly those, so honouring the exemptions would clear nothing. `--older-than-days N` keeps recent batons. Owner-scoped: never touches another user's baton. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
-| `/admin/delete-workspace` | ✅ yes | the workspace and every child project, **plus** any observation stamped into a different workspace by one of this workspace's sessions (cascades regardless of the observation's own `workspace_id`), and it nulls (does not delete) the session reference on any handoff in a different workspace that this workspace's sessions authored or accepted | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. Logical delete by default; `"compact": true` additionally rebuilds the FTS indexes and `VACUUM`s (see below). `"dry_run": true` previews the same counts, including the cross-workspace ones, without deleting anything — see below. |
+| `/admin/delete-workspace` | ✅ yes | the workspace and every child project, **plus** any observation stamped into a different workspace by one of this workspace's sessions (cascades regardless of the observation's own `workspace_id`), and it nulls (does not delete) the session reference on any handoff in a different workspace that this workspace's sessions authored or accepted | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. Logical delete by default; `"compact": true` additionally rebuilds the FTS indexes and `VACUUM`s (see below). `"dry_run": true` previews the same counts, including the cross-workspace ones, without deleting anything (see below). |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate. |
 | `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
-| `repair-backfill-timestamps --project --confirm` | ✅ yes | no | yes, if the operator kept the audit row or the CLI's before/after report (nothing else) | Corrects `sessions.started_at`/`ended_at` for sessions an older `backfill` imported before it carried the transcript's own event time. The CLI reads the operator's local transcripts read-only and posts candidate `(session_id, started_at, ended_at)` tuples to `POST /admin/repair-session-times`, which validates each one against `(workspace, project)` — a candidate outside that scope is `not_found` and untouched — only rewrites a row whose `started_at` postdates the candidate's own end (`not_flattened` otherwise, so a correctly hook-captured session or a re-run is a no-op), refuses negative/inverted/future-dated times, and never assigns an end time to a session still open. Without `--confirm` the server validates and reports inside a rolled-back transaction, so it is a real dry run; a confirmed run writes one `audit_log` row per request with the before/after times. Touches only the two timestamp columns of rows already in scope; `observations` and pages (including the session's own page frontmatter) are untouched. |
+| `repair-backfill-timestamps --project --confirm` | ✅ yes | no | yes, if the operator kept the audit row or the CLI's before/after report (nothing else) | Corrects `sessions.started_at`/`ended_at` for sessions an older `backfill` imported before it carried the transcript's own event time. The CLI reads the operator's local transcripts read-only and posts candidate `(session_id, started_at, ended_at)` tuples to `POST /admin/repair-session-times`, which validates each one against `(workspace, project)` (a candidate outside that scope is `not_found` and untouched), only rewrites a row whose `started_at` postdates the candidate's own end (`not_flattened` otherwise, so a correctly hook-captured session or a re-run is a no-op), refuses negative/inverted/future-dated times, and never assigns an end time to a session still open. Without `--confirm` the server validates and reports inside a rolled-back transaction, so it is a real dry run; a confirmed run writes one `audit_log` row per request with the before/after times. Touches only the two timestamp columns of rows already in scope; `observations` and pages (including the session's own page frontmatter) are untouched. |
 | `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `reclaim-ledger-versions` | ✅ yes | superseded pre-#660 ledger page *versions* only | no (the latest page version stays) | Dry-run by default; needs `--confirm` to delete. Online through the writer actor, safe alongside the live writer. Content-gated: only non-latest, non-decay `log.md`/`log-YYYY-MM.md` versions whose body opens with a ledger hook entry are removed; a real page that merely shares the name is untouched. `--compact` additionally rebuilds FTS and `VACUUM`s to reclaim the freed bytes. |
 | `checkpoints` | ✅ yes | no | n/a | Lists recent wiki git checkpoints. Read-only. |
 | `restore-page --path --from` | ✅ yes | overwrites one markdown page version | yes (restore another checkpoint) | Restores one page from wiki git history, reindexes it into SQLite, and writes a post-restore checkpoint. Does not restore DB-only state. |
-| `backup-agents --to` / `restore-agents --from <tarball>` | ✅ yes (client-side; never touches the server or its data dir) | no | yes (`restore-agents --apply` keeps timestamped copies of overwritten files) | Agent-config assets, not wiki/db: MCP configs (redacted unless `--include-secrets`), hook configs, instructions, skills, plugins. `restore-agents` is a dry run by default; `--apply` writes to disk and `--force` overwrites existing or differing targets. Non-MCP assets are restored verbatim and may contain secrets — only `--apply` an archive whose source you trust. |
+| `backup-agents --to` / `restore-agents --from <tarball>` | ✅ yes (client-side; never touches the server or its data dir) | no | yes (`restore-agents --apply` keeps timestamped copies of overwritten files) | Agent-config assets, not wiki/db: MCP configs (redacted unless `--include-secrets`), hook configs, instructions, skills, plugins. `restore-agents` is a dry run by default; `--apply` writes to disk and `--force` overwrites existing or differing targets. Non-MCP assets are restored verbatim and may contain secrets, so only `--apply` an archive whose source you trust. |
 | `restore --from <tarball>` | ❌ **stop the server first** | overwrites the data dir | no (without prior backup) | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). Stages and verifies the archive before swapping it in, so a failed restore leaves `wiki/` and `db/` as they were. |
 | `reset --confirm` | ❌ **stop the server first** | yes, all data | no | Refuses if any sibling `ai-memory` process is alive (sysinfo guard). |
 | `reindex` | ❌ **stop the server first** | no wiki wipe; requires a clean DB | only with prior DB backup | Rebuilds pages/links/FTS from `wiki/` using `_meta.md` manifests. Refuses if SQLite already has rows so stale DB-only state cannot survive silently. |
@@ -60,10 +60,9 @@ regulatory erasure request rather than tidying up:
 | Present in backups taken before the purge | **yes** | **yes** |
 | Cost | one transaction | rewrites the whole database |
 
-`--compact` rebuilds the affected FTS5 indexes — an ordinary delete leaves the
-tokens inside the index segments, which is why a rebuild rather than a
-`VACUUM` alone is what clears them — and then `VACUUM`s to release the freed
-pages. It needs free disk space of roughly the database's own size and takes
+`--compact` rebuilds the affected FTS5 indexes and then `VACUUM`s to release the freed
+pages. The rebuild is needed because an ordinary delete leaves the tokens inside
+the index segments, and a `VACUUM` alone does not clear them. It needs free disk space of roughly the database's own size and takes
 minutes on a large store, which is why it is opt-in.
 
 **`--compact` is not forensic erasure.** The wiki git repository stores page
@@ -76,20 +75,18 @@ guarantee that the content is unrecoverable, because it is not.
 
 Without `--confirm`, the CLI first asks the server for a preview
 (`"dry_run": true` in the request, exactly like `purge-project`'s own field).
-`dry_run` always wins over `confirm` — `{"confirm": true, "dry_run": true}`
-still only previews — so a preview request can never become destructive by
+`dry_run` always wins over `confirm` (`{"confirm": true, "dry_run": true}`
+still only previews), so a preview request can never become destructive by
 accident.
 
 The preview runs the same lookups and counts a confirmed purge uses to decide
-what to delete — same 404 for a session outside the named scope — including
+what to delete, with the same 404 for a session outside the named scope, including
 two cross-project counts for what purging this *session* collaterally
 deletes or orphans in a *different* project through its own id
-(`collateral_observations_deleted`, `collateral_handoffs_denulled` — the same
-shape `purge-project`'s preview reports one level up, at project rather than
+(`collateral_observations_deleted`, `collateral_handoffs_denulled`, the same shape `purge-project`'s preview reports one level up, at project rather than
 session granularity), without ever issuing the `DELETE`. It never runs the
 delete and rolls it back. Because nothing is deleted, `removed_paths` in the
-reply names the wiki page paths a confirmed purge *would* remove — not paths
-already gone — and `files_deleted`/`files_failed` are always empty, since no
+reply names the wiki page paths a confirmed purge *would* remove (not paths already gone), and `files_deleted`/`files_failed` are always empty, since no
 file is touched; neither the `purged_sessions` tombstone nor the `audit_log`
 row is written, and neither checkpoint is taken. The reply carries
 `"dry_run": true`. The CLI prints:
@@ -100,16 +97,15 @@ Would purge session from default/my-app: 1063 observations, 0 handoffs, 1 pages,
 
 (with a trailing "Plus N observations in other projects via this session" /
 "Plus N handoffs ..." clause when either cross-project count is non-zero;
-note the session id itself is never printed — the caller already has it, and
+note the session id itself is never printed: the caller already has it, and
 this command exists to make a session stop existing), then still refuses with
-the existing "destructive and irreversible" message and a non-zero exit — the
-preview is information layered on top of the refusal, never a substitute for
-`--confirm`.
+the existing "destructive and irreversible" message and a non-zero exit. The preview adds information to the refusal and never
+substitutes for `--confirm`.
 
 A preview also skips the blocking admission call a confirmed purge makes
 before deleting anything (`admit_purge_session`): nothing was decided yet, so
 there is nothing for a `Reject`-policy webhook to act on. This means a `200`
-preview is not a guarantee — that same webhook only runs on the confirmed
+preview is not a guarantee: that same webhook only runs on the confirmed
 path and can still refuse the real purge afterward.
 
 If the server is unreachable, times out (a few seconds, auth-token refresh
@@ -120,7 +116,7 @@ instead, since the operator asked what would happen and the server has a
 real answer.
 
 A handoff this session only *accepted* (did not author) keeps its row and
-its text either way — confirmed or previewed — and loses only its
+its text either way, confirmed or previewed, and loses only its
 `accepted_by_session` pointer (`ON DELETE SET NULL`) once the session row is
 actually gone; it is never counted in `handoffs_deleted`. Two more places a
 purged session's id is referenced are neither counted nor previewed today,
@@ -128,7 +124,7 @@ as a known follow-up: `agent_messages.from_session_id` /
 `claimed_by_session` (the cross-project mailbox, V64) and another project's
 `auto_improve_runs.session_id`, both `ON DELETE SET NULL` and out of scope
 for this preview's two `collateral_*` fields, which only cover observations
-and handoffs — the same set `purge-project`'s own preview covers, one level
+and handoffs: the same set `purge-project`'s own preview covers, one level
 up.
 
 ### The same is true of `purge-project` and `delete-workspace`
@@ -138,8 +134,7 @@ Every row above applies unchanged to `ai-memory purge-project --compact` and to
 property of *any* SQLite delete, not of one command: rows go, bytes stay in
 free pages until the file is rewritten.
 
-This is worth saying explicitly because the help text for those two commands
-used to promise "ALL its data", which read as byte-level removal they never
+The help text for those two commands used to promise "ALL its data", which read as byte-level removal they never
 performed (#540). Both now describe the same boundary and both accept the same
 opt-in.
 
@@ -148,8 +143,8 @@ workstream's `workstream_events` rows leave through the
 `projects → workstreams → workstream_events` cascade rather than through a
 `DELETE` against that table, and a cascade does not fire the `AFTER DELETE`
 trigger that would drop the row from `workstream_events_fts`. Compaction
-therefore rebuilds **all three** FTS indexes — `pages_fts`,
-`observations_fts` and `workstream_events_fts` — not just the two a session
+therefore rebuilds all three FTS indexes (`pages_fts`,
+`observations_fts` and `workstream_events_fts`), not just the two a session
 purge needs. Rebuilding only the indexes a given caller "should" have touched
 is what leaves a managed agent's transcript text in the file after an operator
 asked for it to be reclaimed.
@@ -162,8 +157,8 @@ File cleanup failures still leave the database purge committed and are reported
 in `files_failed`; this coordination does not provide crash-atomic rollback.
 
 The guard is taken before the purge is submitted to the writer actor, so it also
-covers the wait for whatever that single queue is already draining, and — with
-`compact: true` — the `VACUUM` that runs after the delete commits. A purge on a
+covers the wait for whatever that single queue is already draining, and, with
+`compact: true`, the `VACUUM` that runs after the delete commits. A purge on a
 busy server therefore holds up wiki mutations for longer than the delete itself.
 The git checkpoints taken before and after the purge sit outside the guard: they
 bracket it, they do not snapshot it.
@@ -173,8 +168,7 @@ bracket it, they do not snapshot it.
 The session id is never authority on its own. Every statement is filtered on
 `workspace_id` and `project_id` as well as `session_id`, the session must
 belong to the named scope or the call is a `404` with nothing deleted, and the
-derived pages are deleted by **id** rather than by path — two projects can
-hold the same `sessions/<uuid>.md`, and deleting by path would take the other
+derived pages are deleted by **id** rather than by path, because two projects can hold the same `sessions/<uuid>.md`, and deleting by path would take the other
 one with it. `/admin/purge-session` runs the admission chain before any row is
 touched, so a `failure_policy = reject` webhook can still abort the whole
 operation while the data is intact. After the SQL transaction commits, the
@@ -212,7 +206,7 @@ The mutable **project name** (the human-readable `distrobox-gaming`
 or `.config` you see in `/web/`) never appears in any disk path; the
 stable **project_id UUID** does. SQLite's `projects.name` column maps
 name → id. Two projects can have the exact same `pages.path` (e.g.
-both have `decisions/0001.md`) without colliding on disk - the
+both have `decisions/0001.md`) without colliding on disk; the
 namespaced layout guarantees structural isolation.
 
 The git history is rooted at `<wiki_root>` (one repo, all projects
@@ -236,7 +230,7 @@ ai-memory purge-project --workspace default --project my-project --confirm
 ai-memory purge-project --workspace default --project my-project --confirm --compact
 ```
 
-Like `purge-session`, this is a logical delete unless `--compact` is given —
+Like `purge-session`, this is a logical delete unless `--compact` is given;
 see [What "deleted" means](#what-deleted-means-purge-session-purge-project-delete-workspace).
 
 What happens, in order:
@@ -255,7 +249,7 @@ What happens, in order:
 3. Counts rows that will cascade (`pages`, `sessions`,
    `observations`, `handoffs`, `page_embeddings`, plus `workstreams`
    and `managed_runs`).
-4. Single `DELETE FROM projects WHERE id = ?` - the V01 + V05
+4. Single `DELETE FROM projects WHERE id = ?`: the V01 + V05
    `ON DELETE CASCADE` foreign keys propagate to every dependent
    table in one transaction.
 5. Best-effort filesystem cleanup removes both the UUID-namespaced wiki root
@@ -273,14 +267,14 @@ cleanup failures.
 #### Preview without `--confirm`
 
 Without `--confirm`, the CLI first asks the server for a preview
-(`"dry_run": true` in the request). `dry_run` always wins over `confirm` —
+(`"dry_run": true` in the request). `dry_run` always wins over `confirm`:
 `{"confirm": true, "dry_run": true}` still only previews, the same way
-`reclaim-ledger-versions` treats its own `dry_run` field — so a preview
+`reclaim-ledger-versions` treats its own `dry_run` field, so a preview
 request can never become destructive by accident.
 
 The preview runs the same lookups and counts steps 1-3 above use to decide
-what a confirmed purge would delete — same 404 on an unknown scope, same
-`409` on a live managed-run lease without `--force` — and returns those
+what a confirmed purge would delete (same 404 on an unknown scope, same
+`409` on a live managed-run lease without `--force`) and returns those
 counts, including the two cross-project ones (an observation deleted, or a
 handoff's session reference nulled, in a project other than the one named;
 see the matrix row above), without ever issuing the `DELETE` in step 4. It
@@ -299,19 +293,19 @@ Would purge default/my-project: 3 pages, 1 sessions, 1063 observations, 0 handof
 (with a trailing "Plus N observations in other projects via their sessions"
 / "Plus N handoffs ..." clause when either cross-project count is non-zero),
 then still refuses with the existing "destructive and irreversible" message
-and a non-zero exit — the preview is information layered on top of the
-refusal, never a substitute for `--confirm`.
+and a non-zero exit. The preview adds information to the refusal and never
+substitutes for `--confirm`.
 
 A preview also skips the blocking admission call a confirmed purge makes
 before deleting anything (`admit_purge_project`): nothing was decided yet,
 so there is nothing for a `Reject`-policy or scope-guard webhook to act on.
-This means a `200` preview is not a guarantee — that same webhook only runs
+This means a `200` preview is not a guarantee: that same webhook only runs
 on the confirmed path and can still refuse the real purge afterward.
 
 If the server is unreachable, times out (a few seconds, auth-token refresh
 included), or predates this field (a plain `400`), the CLI falls back
 silently to the plain refusal with no preview line, so no existing script's
-exit code or error shape changes — only a confirmed purge is ever
+exit code or error shape changes; only a confirmed purge is ever
 destructive. A `404`/`409`/`403` (or any other unexpected status) prints the
 server's own error before the refusal instead, since the operator asked what
 would happen and the server has a real answer.
@@ -334,7 +328,7 @@ Why this is safe with the server running:
   it against any other writes.
 - The on-disk delete touches only the project's UUID-keyed subdir,
   which no other project shares files with. No race with the
-  watcher even mid-write - at worst the watcher emits delete
+  watcher even mid-write: at worst the watcher emits delete
   events for files we just removed, which it ignores (no DB row
   to reindex).
 
@@ -410,7 +404,7 @@ Deletes a workspace row and all child projects/pages/sessions/managed
 workstreams through the `workspace_id` cascade. The route is guarded by
 `force: true` for non-empty workspaces and follows the destructive-operation
 ordering used by project purges. It accepts the same opt-in reclaim as the
-other two destructive commands — `{"compact": true}` — and is otherwise a
+other two destructive commands (`{"compact": true}`) and is otherwise a
 logical delete; see
 [What "deleted" means](#what-deleted-means-purge-session-purge-project-delete-workspace).
 
@@ -422,8 +416,7 @@ logical delete; see
    `projects_deleted`, `pages_deleted`, `sessions_deleted`,
    `observations_deleted`, `handoffs_deleted`, `embeddings_deleted`,
    `workstreams_deleted`, `managed_runs_deleted`, plus the two cross-workspace
-   counts (`collateral_observations_deleted`, `collateral_handoffs_denulled`
-   — the same shape `purge-project`'s preview reports one level down, at
+   counts (`collateral_observations_deleted`, `collateral_handoffs_denulled`, the same shape `purge-project`'s preview reports one level down, at
    project rather than workspace granularity) before issuing the `DELETE`.
 5. Remove `<wiki_root>/<workspace_id>` and every affected
    `<data_dir>/raw/workstreams/<workstream_id>` directory from disk. The
@@ -445,8 +438,8 @@ Failure modes:
 
 #### Preview with `"dry_run": true`
 
-`"dry_run": true` in the request body always wins — `{"force": true,
-"dry_run": true}` still only previews — so a preview request can never
+`"dry_run": true` in the request body always wins (`{"force": true,
+"dry_run": true}` still only previews), so a preview request can never
 become destructive by accident, the same pattern `purge-project` uses for
 its own `dry_run` field. The preview runs step 4's
 counts (including the two cross-workspace ones) against the same rows a
@@ -454,7 +447,7 @@ confirmed delete would remove, using the same `409` for a non-empty
 workspace without `force` and the same `404` for an unknown workspace, and
 returns before ever issuing the `DELETE`. Steps 2, 3, 5, 6, and 7 never run
 under `dry_run`: no admission call, no wiki directory removal, no mirror
-dispatch, no checkpoint — `files_deleted`/`files_failed` are always empty and
+dispatch, no checkpoint; `files_deleted`/`files_failed` are always empty and
 `pre_checkpoint`/`checkpoint` are always absent. The reply carries
 `"dry_run": true`. There is no CLI subcommand for `delete-workspace` today,
 so this preview is HTTP-only.
@@ -479,7 +472,7 @@ ai-memory move-project --from-workspace default --project my-project \
 
 Moves a project into a **different** workspace. Unlike `rename-project`
 (a same-workspace column update), this crosses the workspace boundary.
-The destination decides which of two strategies runs — reported as
+The destination decides which of two strategies runs, reported as
 `moved_via` in the response:
 
 **1. Fresh destination → `"true-move"` (lossless, the common case).**
@@ -523,14 +516,13 @@ writes/reindexes take the shared side of the same mutation gate and validate the
 `(workspace_id, project_id)` pair before touching disk, so stale source writes
 fail without creating orphan files after the move.
 
-This is O(1) (one transaction + one rename), re-embeds nothing, and
-**preserves everything** — sessions, observations, handoffs and the full
+This is O(1) (one transaction + one rename), re-embeds nothing, and preserves everything: sessions, observations, handoffs and the full
 supersession history all travel with the project.
 
 **Live-session guard.** The server refuses (409) to move the project the
 hook router has published as the *active* project (a live session's next
 observation would carry a now-stale `workspace_id`). Pass `--force` /
-`force: true` to override — still safe: the move republishes the active
+`force: true` to override. That is still safe: the move republishes the active
 pointer, and the wiki pair validator plus `(workspace_id, project_id)` insert
 trigger (V18) reject stale writes cleanly, so the router re-resolves instead of
 corrupting or creating old-workspace files.
@@ -539,8 +531,8 @@ corrupting or creating old-workspace files.
 (merge).** Two distinct `project_id`s can't be re-stamped into one (it
 would collide on `UNIQUE (workspace_id, name)`), so the source's latest
 pages are copied into the existing destination project via
-`Wiki::write_page` (sanitization, link re-resolution, FTS, and — on
-deploy — the admission/git-mirror webhooks all fire), source embeddings
+`Wiki::write_page` (sanitization, link re-resolution, FTS, and, on
+deploy, the admission/git-mirror webhooks all fire), source embeddings
 are carried over verbatim, and only then is the source purged
 (`merged_into_existing: true`, `source_purged: true`).
 
@@ -552,7 +544,7 @@ lease ids, so it does not need this additional guard.
 Copy-before-purge means any copy failure aborts **before** the purge,
 leaving the source intact. An unreadable source file is skipped and also
 blocks the purge (`source_purged: false`) so a fixed re-run is safe
-(re-running is idempotent — copied pages just supersede). A **live managed
+(re-running is idempotent; copied pages just supersede). A **live managed
 run** under the source blocks the purge leg the same way: the move returns
 409 saying how many pages were already copied, and the source stays intact
 until the session ends and the move is re-run.
@@ -562,13 +554,13 @@ exists in the destination with a different body, frontmatter, title, tier, or
 pinned bit, the policy decides (identical pages are always a no-op supersession
 at the same path):
 
-- **`block`** (default) — abort the whole move with 409, listing the
+- **`block`** (default): abort the whole move with 409, listing the
   conflicting paths; the source is left intact. The safe default for a
   destructive op: nothing is overwritten or split silently. The operator
   resolves the conflicts or re-runs with an explicit policy.
-- **`overwrite`** — the source page supersedes the destination page at the
+- **`overwrite`**: the source page supersedes the destination page at the
   same path (the destination's prior version becomes history).
-- **`duplicate`** — keep both: the source page lands at
+- **`duplicate`**: keep both. The source page lands at
   `<stem>-from-<src_workspace_slug>.md`, then `-2`, `-3`, … on
   further collisions. The `-from-` literal is the `DEDUP_FROM_TOKEN`
   constant in `crates/ai-memory-mcp/src/admin.rs`; if you ever
@@ -590,7 +582,7 @@ capture log) are dropped by the purge, and the moved pages start a fresh
 supersession chain (the real page history lives in the wiki's git
 mirror). The `true-move` path has no such loss.
 
-> **Operational caveat — moving the project the current session writes
+> **Operational caveat: moving the project the current session writes
 > to.** Lifecycle hooks stamp a bounded observation on every supported tool-lifecycle event into the
 > session's project. If you move that very project mid-session, the next
 > hook re-creates the source (`scratch`-style) under the old workspace.
@@ -604,8 +596,7 @@ Failure modes:
 - **`from_workspace == to_workspace`** → 422 (use `rename-project`).
 - **Source project not found** → 404.
 - **Destination workspace directory already exists** (true-move only)
-  → 409 with `WikiError::DestinationExists` body — the destination
-  has on-disk content for the same `(workspace, project)` UUID pair
+  → 409 with `WikiError::DestinationExists` body: the destination has on-disk content for the same `(workspace, project)` UUID pair
   without a corresponding DB row; refuse and let the operator
   reconcile manually.
 - **Block-policy same-path conflict** (copy-purge merge only) → 409
@@ -754,7 +745,7 @@ Failure modes:
 **It drains every scope, not just the one you named.** Dependent rows are
 matched by session id alone, so a session whose observations were scattered
 across projects (pre-`sticky` mid-session routing, for instance) is gathered
-whole. That is the point of the command — but it means a move can empty a
+whole. That is the point of the command, but it means a move can empty a
 project you did not mention, and it is **not cleanly reversible**: moving the
 session back later returns every row to a single project, and the original
 per-row split is gone.
@@ -787,8 +778,7 @@ Before #660 the wiki indexer stored every rewrite of an OKF event ledger
 superseded versions dominate the database (one report: ~95 % of a 45 GB store).
 This online command deletes exactly that residue: a page version is removed only
 when it is **not** the latest, is not a retention-decay version, its path matches
-the ledger shape, **and** its own body opens with a `## [timestamp]` ledger hook
-entry — so a genuine page that merely happens to be named `log-2026-09.md` is
+the ledger shape, **and** its own body opens with a `## [timestamp]` ledger hook entry, so a genuine page that merely happens to be named `log-2026-09.md` is
 never touched, and no live/latest page is affected. Deletion runs through the
 single writer actor in one transaction; derived rows (embeddings, links,
 feedback) cascade, and the kept latest version's supersession back-pointer is
@@ -837,8 +827,7 @@ unboundedly; over the cap is a 400 before any scope lookup.
 it (never the caller's belief about it):**
 
 - **Scope containment**, exactly like `purge-session`: a `session_id` that
-  does not belong to `(workspace, project)` — wrong scope or nonexistent — is
-  reported `skipped: {reason: "not_found"}` and left untouched. The two cases
+  does not belong to `(workspace, project)` (wrong scope or nonexistent) is reported `skipped: {reason: "not_found"}` and left untouched. The two cases
   are never distinguished, so an id existing in a different project is not
   leaked to the caller.
 - **A no-op candidate is `"unchanged"`, not counted as repaired.** Checked
@@ -846,7 +835,7 @@ it (never the caller's belief about it):**
   always a no-op regardless of whether the row happens to look flattened.
 - **The bug's own signature is the gate, not the caller's say-so.** A row is
   only rewritten when its current `started_at` sits AFTER the candidate's own
-  end (or start, when the candidate carries no end) — the actual shape of
+  end (or start, when the candidate carries no end), which is the actual shape of
   "backfill dated this at import time". A row that already sits at or before
   that point is `"not_flattened"` and left untouched: this endpoint repairs
   the specific backfill bug, it is not a generic "set session times"
@@ -856,35 +845,34 @@ it (never the caller's belief about it):**
 - **Sane times**: `started_at_us` and `ended_at_us` (when given) must be
   positive, and `started_at_us` must not be later than the end the row will
   actually have once the candidate lands (its own new end, or, when that
-  stays unwritten, whatever end the row already had) — otherwise
+  stays unwritten, whatever end the row already had); otherwise
   `"invalid_time"` or `"inverted_times"`.
 - **Never into the future**: either time more than five minutes past "now" is
   `"future_time"`. Clock-skew margin, not a real correction target.
 - **Never closes an open session**: when the session's current `ended_at` is
-  `NULL`, the candidate's `ended_at_us` is silently withheld — `started_at` is
-  still applied, and the report marks that session `end_kept_open: true`
+  `NULL`, the candidate's `ended_at_us` is silently withheld; `started_at` is still applied, and the report marks that session `end_kept_open: true`
   rather than skipping it outright.
 
 **Dry run by default.** Without `confirm: true` the server validates and
 computes the exact would-be write inside a transaction it then rolls back, so
 the report (`repaired`, `skipped`, before/after times) is the literal outcome,
-not an estimate — same pattern as `move-session`. `--confirm` applies through
+not an estimate (same pattern as `move-session`). `--confirm` applies through
 the single `WriterHandle`, one transaction per request (chunk).
 
 **What it touches.** Only `sessions.started_at`/`ended_at` of rows already in
-the requested scope — never `observations`, pages, or any other table, and
+the requested scope, never `observations`, pages, or any other table, and
 never a row outside `(workspace, project)`. Session identity (`sessions.id`
 and its 3-tuple scope) is never written; this is a correction of two
 timestamp columns on rows that already exist, not a move or a delete.
 `observations.created_at` and the `sessions/<id>.md` page's own frontmatter
-timestamps still carry the old import-day times after a repair — only the
+timestamps still carry the old import-day times after a repair. Only the
 `sessions` row's two columns are corrected; regenerating the session page
 (e.g. via a fresh consolidation) is what would bring its frontmatter in line.
 
 **Reversibility.** A confirmed batch writes one `audit_log` row (`op =
 "repair_session_times"`) per request with every repaired session's before/
 after times in `detail`, and the CLI's human report prints the same old →
-new values per session — an operator who kept either can restore the prior
+new values per session. An operator who kept either can restore the prior
 values by hand; there is no automatic undo.
 
 ### `checkpoints`
@@ -952,15 +940,15 @@ ai-memory backup --to /tmp/ai-memory-backup.tar.gz
 
 What happens on the server:
 
-1. SQLite online-backup API copies the live WAL DB to a temp file -
-   guaranteed consistent snapshot without stopping the writer.
+1. SQLite online-backup API copies the live WAL DB to a temp file,
+   a guaranteed consistent snapshot without stopping the writer.
 2. Server tar-gzips the snapshot + the wiki tree + `config.toml`.
 3. Response body IS the gzipped tarball
    (`Content-Type: application/gzip`).
 
 CLI writes the response body to `--to`. For a homelab user
 this is the standard "snapshot before doing something dangerous"
-move - `ai-memory backup` first, then proceed.
+move: `ai-memory backup` first, then proceed.
 
 Restoring a backup follows the inverse:
 
@@ -992,7 +980,7 @@ Order of operations:
 2. Extract the tarball into a staging directory beside the live data
    (`<data_dir>/.restore-staging-<stamp>/`), validating every entry.
 3. Open the staged store so pending migrations run and the SQLite
-   snapshot is verified — still without touching the live data.
+   snapshot is verified, still without touching the live data.
 4. Swap: rename the live `wiki/` and `db/` (and `config.toml`, when the
    archive carries one) aside, rename the staged copies into place, then
    delete the previous data. Each move is a same-filesystem rename; if
@@ -1007,7 +995,7 @@ copy exists.
 Failure modes:
 
 - **Server still running** → exits with "another ai-memory process is
-  alive (pid X); stop it before restoring" - same wording as `reset`.
+  alive (pid X); stop it before restoring" (same wording as `reset`).
 - **Data dir not empty + no `--force`** → exits with "data dir not
   empty; pass `--force` to overwrite".
 - **Truncated or corrupt tarball, an entry outside the allowed layout, or
@@ -1030,13 +1018,13 @@ alive. Removes the contents of `wiki/`, `db/`, and `raw/` under the
 configured data dir. `config.toml` is preserved.
 
 Identical sysinfo guard to `restore`. The use case is "wipe and start
-over" - typically when changing major version with a breaking
+over", typically when changing major version with a breaking
 migration, or when bootstrapping a new install on top of an old
 data dir.
 
 For a docker deploy where the data lives in a host-path bind mount,
 you can also just `rm -rf <host-path>/*` after stopping the
-container - but `ai-memory reset` is the cross-platform path that
+container, but `ai-memory reset` is the cross-platform path that
 works whether the data dir is local, bind-mounted, or in a named
 volume.
 
@@ -1083,7 +1071,7 @@ optional typed `identity`, `identity_source`, `canonical_name`, and
 `legacy_name` fields. Older manifests without those
 fields remain valid and rebuild identity-less projects. The manifest is written
 with the scope's first page, so a project that first appears while the server is
-running is rebuildable from that moment on — no restart required. The startup
+running is rebuildable from that moment on, with no restart required. The startup
 backfill still runs on every boot and repairs a tree written by an older release,
 or one whose manifests were removed by hand. If `reindex` reports a missing manifest,
 start the server once against that data directory and let the backfill write
@@ -1161,9 +1149,8 @@ click returned 404 because the on-disk file was gone.
 
 The shipped band-aid was a `path_still_referenced` check before each
 delete. The proper fix landed in `e7b9a17`: per-project disk roots
-make path-collision structurally impossible. Both the band-aid and
-the underlying class of bug are gone. Lifecycle ops are now safe
-by construction.
+make path-collision structurally impossible, so both the band-aid and the
+underlying class of bug are gone and lifecycle ops are safe by construction.
 
 This is also why `rename-project` is free: the disk path is keyed
 by surrogate `project_id`, not the mutable name. Rename touches one

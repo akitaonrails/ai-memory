@@ -101,8 +101,8 @@ ai-memory install-hooks --agent claude-code --scope project --apply
 
 This writes the repository's gitignored `.claude/settings.local.json` at the
 git root (the main checkout's root from a worktree), which is where Claude Code
-reads that file even when launched from a subdirectory — see
-[where Claude Code looks for each file](https://code.claude.com/docs/en/settings#where-claude-code-looks-for-each-file).
+reads that file even when launched from a subdirectory (see
+[where Claude Code looks for each file](https://code.claude.com/docs/en/settings#where-claude-code-looks-for-each-file)).
 On Windows, and when the repository root is your home directory, Claude Code
 reads the launch directory instead, so the installer writes to the current
 directory there: run it, and launch Claude Code, from the same directory.
@@ -118,7 +118,7 @@ next to the file, so nothing new appears in `git status`.
 `ai-memory uninstall --only hooks --apply` run from inside the checkout
 removes the entries again; run elsewhere it does not reach into the
 repository, so run it in every project-scoped checkout before removing
-ai-memory — those files otherwise keep calling the removed binary and data
+ai-memory. Otherwise those files keep calling the removed binary and data
 dir. `upgrade` and the `ai-memory run` auto-wire leave the user-level file
 alone while a project-scoped install is the only one present. `upgrade`
 replaces the binary the hook commands call but does not rewrite project
@@ -226,7 +226,7 @@ choice explicitly for upgrade safety. Repositories without a valid remote use
 `basename(cwd)`, including from a git subdirectory. Because an agent shell keeps its working directory between tool calls, a single
 `mkdir sub && cd sub` reparents the rest of the session into a phantom project
 named `sub`. To make every session for an install resolve its project from the
-git repo root instead — collapsing subdirectories and worktrees — bake the
+git repo root instead, collapsing subdirectories and worktrees, bake the
 strategy into the hooks:
 
 ```bash
@@ -239,7 +239,7 @@ already baked into that agent's ai-memory hooks, including during the wrapper's
 automatic post-upgrade refresh. Pass `basename` explicitly to remove an
 existing `repo-root` default. This works for every agent and delivery path. A
 per-repo `.ai-memory.toml` marker's own `project_strategy` / `project` still
-take precedence — see
+take precedence; see
 [the marker-file reference](marker-file.md#install-wide-default-no-marker).
 
 ---
@@ -408,7 +408,7 @@ curl -sI http://127.0.0.1:49374/handoff
 > [below](#anthropic-via-claude-subscription-oauth).) See
 > [`docs/llm-providers.md`](llm-providers.md) for the full table. And you can
 > skip an LLM entirely: the default zero-LLM path still captures, searches
-> (FTS), and writes rule-based summaries with no provider at all —
+> (FTS), and writes rule-based summaries with no provider at all, and
 > [`docs/local-embeddings.md`](local-embeddings.md) makes vector search
 > keyless too.
 
@@ -563,21 +563,21 @@ stream; tool and session-boundary capture continues unchanged.
 **Capture only repositories that opt in.** The controls above narrow *what* is
 captured; this one narrows *where*. By default a repository with no
 `.ai-memory.toml` marker is still captured, so a machine that works across many
-checkouts captures every new one automatically — forgetting a marker means
+checkouts captures every new one automatically. Forgetting a marker means
 capturing more, not less. Allowlist mode inverts that:
 
 ```bash
 ai-memory install-hooks --apply --capture-mode allowlist
 ```
 
-A repository without a marker then emits **no lifecycle event at all** — not a
+A repository without a marker then emits **no lifecycle event at all**, not even a
 trimmed one. The event is dropped in the hook process before it can reach the
 local spool or the wire, so nothing is written to disk for a repository that
-never opted in. Opting a repository in is just placing a `.ai-memory.toml`
+never opted in. To opt a repository in, place a `.ai-memory.toml`
 marker in it, which is the same file that already configures routing and
 `ignore_paths`.
 
-**It is enforced by native `ai-memory hook` commands only** — the same
+**It is enforced by native `ai-memory hook` commands only**, the same
 boundary that already applies to `[capture] ignore_paths`, and for the same
 reason: the gate runs inside the hook binary, immediately before it spools.
 
@@ -594,8 +594,8 @@ the install it is writing cannot enforce it.
 Within that boundary the mode is not per-agent: it is stored once in the data
 directory and every native hook command reads it, whichever agent invoked it.
 That also means a later bare
-`install-hooks --apply` — including the auto-refresh inside `ai-memory upgrade`
-— leaves it alone by construction rather than by re-detecting it. Every
+`install-hooks --apply`, including the auto-refresh inside `ai-memory upgrade`,
+leaves it alone by construction rather than by re-detecting it. Every
 `--apply` prints the mode in force. Return to the default with
 `--capture-mode denylist`.
 
@@ -624,14 +624,14 @@ instead of falling back. Native hook commands route profiles; the generated
 TypeScript integrations and the script hooks drop routed repositories. See
 [`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
 
-Some agent harnesses attach the assistant's final turn to their `Stop` event —
+Some agent harnesses attach the assistant's final turn to their `Stop` event;
 Claude Code sends it as a raw `last_assistant_message`. By default that text is
 never persisted: the native hook binary strips the raw field before it can reach
 the local spool or the wire, and the server strips it defensively on arrival.
 
 **Opt-in capture (#196).** You can opt in to storing a sanitized, 2 KB-capped
 excerpt of the assistant's final turn as the Stop body. It is a **double
-opt-in** — enable the server first, then the client:
+opt-in**: enable the server first, then the client:
 
 1. **Server:** set `capture_assistant = true` in the live
    `<data_dir>/config.toml` (or the service's configured TOML file), or set
@@ -646,12 +646,12 @@ opt-in** — enable the server first, then the client:
 
 The client sanitizes (built-in patterns) and truncates the excerpt before it
 touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
-before storing. If either side is off — or the marker is malformed — the Stop
+before storing. If either side is off, or the marker is malformed, the Stop
 stays empty. Re-running `install-hooks` without `--capture-assistant` removes
 the flag (idempotent). `--capture-assistant` is Claude Code, Codex and
 OpenCode 2 (`--agent opencode2`) on a native hook platform only; on any other agent or the script fallback the
 installer refuses it rather than enabling something that cannot take effect. Assistant text is
-privacy-sensitive — read the `SECURITY.md` notes on what it can contain and where
+privacy-sensitive. Read the `SECURITY.md` notes on what it can contain and where
 it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
 is configured) before enabling it.
 
@@ -696,8 +696,8 @@ passes when the server is unreachable. Set `max_attempts = 0` under
 `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0`) to keep
 retrying until the 7-day age limit or 10,000-file spool cap applies. A positive
 value sets the number of failed passes before a drop. The same bounds apply to
-`ai-memory run`'s degraded offline launches, which rely on this spool — see
-[Degraded offline launches](managed-workstreams.md#degraded-offline-launches).
+`ai-memory run`'s degraded offline launches, which rely on this spool (see
+[Degraded offline launches](managed-workstreams.md#degraded-offline-launches)).
 
 The built-in timings stay short on agent-facing paths, but high-latency or
 large-backlog instances can raise them with whole-minute runtime env vars in the
@@ -715,7 +715,7 @@ agent's environment; no `install-hooks` rerun is needed:
 The retry setting can also be written as `max_attempts` under `[hook_spool]` in
 `<data_dir>/config.toml`; the runtime environment wins when both are set. A set
 but invalid `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS` value (non-numeric) falls back to
-the built-in default of 8, overriding any `config.toml` value — same convention
+the built-in default of 8, overriding any `config.toml` value, the same convention
 as the timing vars. A zero
 value still leaves the 7-day age limit and 10,000-file spool cap active.
 
@@ -808,16 +808,16 @@ AI_MEMORY_NATIVE_TEST_IMAGE=quay.io/toolbx/arch-toolbox:latest scripts/test-nati
 User-facing NixOS module setup lives in the [README NixOS
 section](../README.md#nixos) (`nixosModules.default`,
 `services.ai-memory.enable`). This section is the maintainer test ladder
-for the flake and module — what CI runs, and what each tier proves.
+for the flake and module: what CI runs, and what each tier proves.
 
 ### Maintainer test ladder
 
-1. **Package smoke** — `nix build .#packages.<system>.default` then
+1. **Package smoke**: `nix build .#packages.<system>.default` then
    `scripts/check-nix-packaging.sh ./result` (binary `--version`, hooks
    tree, config template, `nix run`). Linux runs on every path-filtered
    `nix.yml` PR; Darwin is schedule / `workflow_dispatch` / `nix` or
    `full-ci` label only.
-2. **Eval contracts** — `nix build .#checks.x86_64-linux.nixos-module-eval`
+2. **Eval contracts**: `nix build .#checks.x86_64-linux.nixos-module-eval`
    and `nixos-sandbox-parity`. Cheap Linux-only asserts for enable/bind/
    `--config`/secrets wiring, API-only vs web mounts, refusal messages (age+sops mutex, secrets in
    `settings.auth`, `settings.bind`), escaped `ExecStart` (`--data-dir`,
@@ -825,7 +825,7 @@ for the flake and module — what CI runs, and what each tier proves.
    `dataDir` tmpfiles/`ReadWritePaths`, and sandbox key parity with
    `nix/systemd-sandbox.nix`. Runs on path-filtered PRs with the Linux
    package job.
-3. **Toplevel → OCI → container smoke** — one closure path. Building
+3. **Toplevel → OCI → container smoke**: one closure path. Building
    `packages.x86_64-linux.nixos-ai-memory-docker` builds
    `system.build.toplevel` once (via the nixpkgs docker-image tarball);
    there is no separate bare-toplevel CI job. Then:
@@ -903,7 +903,7 @@ source-build, Docker-wrapper, and hand-installed launchd paths remain in
 > `install-mcp --server-url` accepts either the bare server origin or the full
 > MCP endpoint and appends a missing `/mcp` exactly once.
 > `install-hooks --server-url` takes the bare server **origin**
-> (e.g. `http://homelab:49374`) — hook scripts append `/hook`, `/handoff`,
+> (e.g. `http://homelab:49374`); hook scripts append `/hook`, `/handoff`,
 > etc. themselves.
 
 Each agent CLI needs two things:
@@ -1051,7 +1051,7 @@ Kimi Code keeps MCP servers in `~/.kimi-code/mcp.json` and lifecycle hooks in
 The CLI also accepts `--agent kimi` as an alias. `install-mcp` writes the
 server URL with a `?flavor=moonshot` query because the Moonshot API rejects
 root-level `anyOf`/`oneOf`/`allOf` in tool parameter schemas ("moonshot
-flavored json schema") — the ai-memory server answers flavored requests with
+flavored json schema"). The ai-memory server answers flavored requests with
 flat schemas, and all other clients keep the upstream shape.
 
 ```bash
@@ -1065,11 +1065,11 @@ ai-memory install-hooks --agent kimi-code --apply \
 ```
 
 `install-hooks` merges `[[hooks]]` entries into `config.toml`, preserving the
-provider/model settings the same file holds. Entries cover 10 events —
-`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+provider/model settings the same file holds. Entries cover 10 events
+(`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `PostToolUseFailure` (Kimi Code reports tool failures separately from
 successful calls; it reuses the post-tool-use handler), `Stop`,
-`SubagentStart`, `SubagentStop`, and `PreCompact` — and default to
+`SubagentStart`, `SubagentStop`, and `PreCompact`) and default to
 native `ai-memory hook --event … --agent kimi-code` commands on local installs
 (local spool plus batched delivery, capture-policy v1 enforced); the staged
 script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
@@ -1245,7 +1245,7 @@ stores. See
 ### Pool (Poolside Agent CLI)
 
 Pool reads lifecycle hooks from a project-scoped `.poolside/settings.yaml` at
-the root of each repository it runs in — there is no user-global hook file for
+the root of each repository it runs in; there is no user-global hook file for
 ai-memory to merge. `install-hooks --agent pool` (alias `poolside`) therefore
 stages the hook scripts to the stable user-global location and prints a
 ready-to-paste `hooks:` snippet; ai-memory deliberately does not write
@@ -1261,7 +1261,7 @@ ai-memory install-hooks --agent pool --apply \
     --auth-token "$TOKEN"
 ```
 
-The snippet wires Pool's five documented events — `SessionStart`,
+The snippet wires Pool's five documented events: `SessionStart`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop` (Claude-shaped
 names, snake_case JSON payload on stdin, verified against Poolside CLI
 v1.0.16). Local installs use the native `ai-memory hook` command, so Pool's
@@ -1280,7 +1280,7 @@ ai-memory finalize-session --agent pool --session-id <uuid>
 
 Pool tolerates hook stdout, but model-visible context injection from
 `SessionStart` stdout is not demonstrated, so the session-start hook captures
-only and never fetches the (single-use) handoff — recover a prior session's
+only and never fetches the (single-use) handoff. Recover a prior session's
 handoff via the MCP `memory_handoff_accept` tool. No first-party
 `install-mcp` client and no managed workstream (`ai-memory run pool`) are
 claimed: Pool's native session-store contract is not demonstrated, per
@@ -1289,7 +1289,7 @@ claimed: Pool's native session-store contract is not demonstrated, per
 ### ZCode (z.ai)
 
 ZCode wires lifecycle hooks in the root `hooks` block of
-`~/.zcode/cli/config.json` — the same file that holds its other CLI
+`~/.zcode/cli/config.json`, the same file that holds its other CLI
 registration. `install-hooks --agent zcode` (alias `zai`) merges ai-memory's
 entries into that block around any third-party hooks you already have, and is
 idempotent: re-running strips only ai-memory's own entries (marked by
@@ -1306,7 +1306,7 @@ ai-memory install-hooks --agent zcode \
 ```
 
 Entries are exec-form `{"type": "process", "command": <ai-memory>, "args":
-[…]}` — ZCode spawns them with the event JSON on stdin and no shell, which the
+[…]}`. ZCode spawns them with the event JSON on stdin and no shell, which the
 native `ai-memory hook` command reads directly, so the local spool, bearer
 auth, and `[capture] ignore_paths` exclusions all apply. Every emitted key is
 from ZCode's documented hook schema (`type`, `command`, `args`, `enabled`,
@@ -1324,7 +1324,7 @@ design.
 ZCode injects `SessionStart` stdout as model context
 (`hookSpecificOutput.additionalContext`), so unlike Pool, Zero, and Grok the
 prior session's handoff is delivered automatically at session start. There is
-no true session-end event — `Stop` fires at the end of every turn — so close
+no true session-end event (`Stop` fires at the end of every turn), so close
 finished sessions explicitly; use the exact id when several ZCode sessions are
 open in the same project:
 
@@ -1341,8 +1341,8 @@ No first-party `install-mcp` client and no managed workstream
 Copilot CLI keeps its config in `~/.copilot` (or `$COPILOT_HOME`).
 `install-mcp --client copilot-cli` merges the remote server entry into
 `mcp-config.json` there, and `install-hooks --agent copilot-cli` writes
-`hooks/ai-memory.json` — Copilot's standalone `{"version": 1, "hooks": {…}}`
-format — merging around any third-party entries already in each file:
+`hooks/ai-memory.json` in Copilot's standalone `{"version": 1, "hooks": {…}}`
+format, merging around any third-party entries already in each file:
 
 ```bash
 ai-memory install-mcp --client copilot-cli --apply \
@@ -1394,7 +1394,7 @@ ai-memory install-hooks --agent hermes \
 ```
 
 Hermes splits each configured `command` with `shlex.split` and runs it with
-**no shell**, passing the event JSON on stdin — so the generated entry invokes
+**no shell**, passing the event JSON on stdin, so the generated entry invokes
 the native `ai-memory hook` command directly (the same exec-form shape Zero and
 ZCode use) and there is no script bundle to stage. There is also no `--apply`
 that writes the file: `~/.hermes/config.yaml` is YAML you also edit, and Hermes
@@ -1404,7 +1404,14 @@ the block and let Hermes accept it.
 Two events are wired: `pre_tool_call` → `pre-tool-use` and `post_tool_call` →
 `post-tool-use`. Their payload carries `tool_name` / `tool_input`, which is what
 gives Hermes sessions tool observations, tool-family titles, and
-`[capture] ignore_paths` exclusion enforcement.
+`[capture] ignore_paths` exclusion enforcement. Hermes reports its own process
+directory (usually `~`) as the payload `cwd`, so the hook finds the project's
+`.ai-memory.toml` from each tool's absolute location instead: `terminal`'s
+`workdir`, a file tool's `path`, or `search_files`' `path`. A tool call with no
+absolute location (a relative `workdir`, the default `search_files` path)
+stays with the process directory and, under `capture_mode = allowlist`, is
+captured only if that directory carries a marker. See
+[marker-file.md](marker-file.md) for the routing rules.
 
 Session lifecycle is deliberately not wired here: automatic recall, prompt
 capture, session-end and the automatic handoff for Hermes belong to the memory
@@ -1506,7 +1513,7 @@ and MCP locations.
 > ai-memory only ever opens that database read-only; the migration risk
 > comes from launching `opencode2` itself, not from this integration.
 >
-> **The beta's background service defaults to port 49374 — ai-memory's own
+> **The beta's background service defaults to port 49374, which is also ai-memory's
 > default.** Running both on defaults crash-loops the opencode2 service
 > (`Managed service port 49374 ... is already in use`). Move one side:
 > `opencode2 service set port <free-port>`, or start ai-memory with
@@ -1564,7 +1571,7 @@ Pi's whole `~/.pi/agent` home), the extension is written to
 
 The Pi and OMP extensions use distinct filenames (`ai-memory-pi.ts` and
 `ai-memory-omp.ts`) so installing one never overwrites the other. They are
-not interchangeable — only Pi's bridges MCP tools.
+not interchangeable: only Pi's bridges MCP tools.
 
 #### OMP profiles
 
@@ -1786,8 +1793,8 @@ The generated TypeScript integrations survive an unreachable server the
 same way the native hooks do: a delivery that fails at the network level
 (or gets a 5xx, 408, 425 or 429) is written to `<data_dir>/hook-spool/` in the exact
 format `ai-memory hook-drain` reads, and the plugin drains that backlog
-itself once the server is reachable again — so a day of laptop work off
-the server's network is captured, not silently dropped. Each spooled
+itself once the server is reachable again. A day of laptop work off
+the server's network is therefore captured, not silently dropped. Each spooled
 entry carries an idempotency key, so the plugin's own drain and a
 manual `hook-drain` can race without double-ingesting. Note the spool
 lands in the *agent host's* data dir (`AI_MEMORY_DATA_DIR` or the
@@ -1816,8 +1823,8 @@ automatically; you only set it by hand for custom container setups.
 
 Most users should stick to the docker wrapper from the Quick start. Arch
 Linux users have the [AUR packages](#arch-linux-native-packages-aur). For any
-other host, `mise` installs a tagged release binary directly from GitHub —
-no Rust toolchain needed:
+other host, `mise` installs a tagged release binary directly from GitHub,
+with no Rust toolchain needed:
 
 ```bash
 mise use -g github:akitaonrails/ai-memory
@@ -1831,7 +1838,7 @@ it and puts `ai-memory` on `PATH`. (mise can also check GitHub artifact
 attestation and SLSA provenance where a project publishes them; ai-memory's
 release workflow does not emit either today, so only the checksum applies.)
 No dedicated mise plugin or
-registry entry is required — the backend works against any repo whose
+registry entry is required; the backend works against any repo whose
 release assets follow this naming convention. By default mise also holds back
 the very newest release for a short safety window
 ([`minimum_release_age`](https://mise.jdx.dev/dev-tools/github-backend.html)),
@@ -1842,7 +1849,7 @@ that.
 `cargo install ai-memory` is not available: the crate name is already taken
 by an unrelated project on crates.io, as is `ai-memory-core` (the workspace's
 foundational internal crate). Publishing would require renaming at least
-that crate for the registry — a naming decision the project hasn't made yet.
+that crate for the registry, a naming decision the project hasn't made yet.
 
 Build from source only when hacking on ai-memory itself or running on a
 platform none of the above covers. On macOS, tagged releases also publish
@@ -1873,10 +1880,10 @@ The `serve` subcommand also accepts:
 |---|---|---|
 | `--enable-web` | `AI_MEMORY_ENABLE_WEB=true` | Mount the read-only web browser and `/api/v1` JSON API. |
 | `--enable-api` | `AI_MEMORY_ENABLE_API=true` | Mount only the protected, read-only `/api/v1` JSON API for companions and other non-browser clients. |
-| `--base-path /wiki` | `AI_MEMORY_BASE_PATH` | Host the entire HTTP surface (`/mcp`, `/hook`, `/admin/*`, `/api/v1`, `/web`) under a configurable subpath — useful behind a reverse proxy sharing a hostname. `.` and `..` segments are rejected; unsafe chars cause a fallback to root with a warning. See [`docs/https-via-proxy.md`](https-via-proxy.md#hosting-under-a-subpath). |
+| `--base-path /wiki` | `AI_MEMORY_BASE_PATH` | Host the entire HTTP surface (`/mcp`, `/hook`, `/admin/*`, `/api/v1`, `/web`) under a configurable subpath, useful behind a reverse proxy sharing a hostname. `.` and `..` segments are rejected; unsafe chars cause a fallback to root with a warning. See [`docs/https-via-proxy.md`](https-via-proxy.md#hosting-under-a-subpath). |
 | `--web-slug /web` | `AI_MEMORY_WEB_SLUG` | Where the web UI mounts within the base-path. Default `/web`; set to `/` to mount the UI at the base-path root. |
 | `--web-ui-dir <path>` | `AI_MEMORY_WEB_UI_DIR` | Serve a custom SPA from `<path>` instead of the built-in browser. ai-memory injects `<base href>` and `<meta name="ai-memory-base-path">` so the SPA can build relative URLs and API calls under the configured prefix. |
-| `--cors-allow-origin <origin>` | `AI_MEMORY_CORS_ALLOW_ORIGINS` (CSV) | Allow listed origins to call `/api/v1`. Layer is scoped only to that route — `/mcp`, `/hook`, `/admin`, and `/web` remain origin-locked. |
+| `--cors-allow-origin <origin>` | `AI_MEMORY_CORS_ALLOW_ORIGINS` (CSV) | Allow listed origins to call `/api/v1`. The layer is scoped only to that route; `/mcp`, `/hook`, `/admin`, and `/web` remain origin-locked. |
 | _(config only)_ | `AI_MEMORY_HOOK_RATE_PER_SEC`, `AI_MEMORY_HOOK_RATE_BURST` | Optional per-actor/session hook ingest token bucket. Unset/`0` rate disables it; burst defaults to the rate (minimum one token when enabled). |
 
 On macOS, see [`docs/macos.md`](macos.md); use the archive matching your
@@ -1935,17 +1942,17 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=cursor` | `cursor-grok-4.6-high` | Cursor subscription via `agent --print --mode ask --trust`. No API key and no `--yolo`. This id is "Grok 4.6" in `agent --list-models`. Override the binary with `AI_MEMORY_CURSOR_AGENT`. Any other id from that list works as `AI_MEMORY_LLM_MODEL`. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
-| `AI_MEMORY_LLM_PROVIDER=opencode` | `mimo-v2.6-flash` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1` — a cost-optimised model subset. Published Responses models, including GPT-5.6 Luna and GPT-6 Luna, use `/responses`; supported Claude and Qwen Messages models use `/messages`. MiniMax M3/M2.7 and Qwen3.8 Max use Messages on Go and Chat Completions on Zen; Go Muse Contributor models use Responses. Changing the base URL reselects the transport and preserves request settings. See the [Go](https://opencode.ai/docs/go/#endpoints) and [Zen](https://opencode.ai/docs/zen/#endpoints) endpoint tables. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it, such as `claude-sonnet-5-5`; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` — historical, and it selects Go like the others; the endpoint is chosen by the base URL, not the alias, with no automatic billing-product switch. |
+| `AI_MEMORY_LLM_PROVIDER=opencode` | `mimo-v2.6-flash` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1`, a cost-optimised model subset. Published Responses models, including GPT-5.6 Luna and GPT-6 Luna, use `/responses`; supported Claude and Qwen Messages models use `/messages`. MiniMax M3/M2.7 and Qwen3.8 Max use Messages on Go and Chat Completions on Zen; Go Muse Contributor models use Responses. Changing the base URL reselects the transport and preserves request settings. See the [Go](https://opencode.ai/docs/go/#endpoints) and [Zen](https://opencode.ai/docs/zen/#endpoints) endpoint tables. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it, such as `claude-sonnet-5-5`; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` (historical); it selects Go like the others, and the endpoint is chosen by the base URL, not the alias, with no automatic billing-product switch. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY` or `OPENAI_API_KEY`, with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://api.orcarouter.ai/v1` | `openai/text-embedding-3-small` via [OrcaRouter](https://www.orcarouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY`, with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=voyage` | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=google` / `gemini` | `gemini-embedding-001` (768-dim) | Google-hosted embeddings via `embedContent`. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
-| `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `EMBEDDING_API_KEY`, else `LLM_API_KEY`, is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. Asymmetric models need `AI_MEMORY_EMBEDDING_QUERY_PREFIX` / `AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX`, e.g. `nvidia/Nemotron-3-Embed-1B-BF16` wants `query: ` / `passage: ` — see [`docs/llm-providers.md`](llm-providers.md) for that and for Qwen3-Embedding/instruction-tuned E5, which need a different (query-only) format. |
-| `AI_MEMORY_EMBEDDING_PROVIDER=copilot` | `text-embedding-3-small` (1536-dim) | Reuses the `copilot` LLM provider's OAuth login (`ai-memory auth login copilot`, `COPILOT_GITHUB_TOKEN`, or `GITHUB_COPILOT_API_TOKEN`) — no separate API key. Calls Copilot's `/embeddings` endpoint following the OpenAI-compatible contract Copilot documents for chat; that endpoint's exact shape is not covered by a live test against Copilot here, so treat it as needing a real-Copilot smoke test. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default; set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `EMBEDDING_API_KEY`, else `LLM_API_KEY`, is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple, so run `ai-memory embed --force` to re-embed. Asymmetric models need `AI_MEMORY_EMBEDDING_QUERY_PREFIX` / `AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX`, e.g. `nvidia/Nemotron-3-Embed-1B-BF16` wants `query: ` / `passage: `. See [`docs/llm-providers.md`](llm-providers.md) for that and for Qwen3-Embedding/instruction-tuned E5, which need a different (query-only) format. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=copilot` | `text-embedding-3-small` (1536-dim) | Reuses the `copilot` LLM provider's OAuth login (`ai-memory auth login copilot`, `COPILOT_GITHUB_TOKEN`, or `GITHUB_COPILOT_API_TOKEN`), with no separate API key. Calls Copilot's `/embeddings` endpoint following the OpenAI-compatible contract Copilot documents for chat; that endpoint's exact shape is not covered by a live test against Copilot here, so treat it as needing a real-Copilot smoke test. |
 
 > **What we don't recommend:** reasoning-mode models (Claude with extended
-> thinking, GPT-o3, Gemini "thinking" variants) — they burn token budget on
+> thinking, GPT-o3, Gemini "thinking" variants). They burn token budget on
 > internal reasoning and hang or emit empty responses with the strict-JSON
 > consolidation prompt. Turn reasoning off if you must use one.
 
@@ -1953,7 +1960,7 @@ If you set only the provider, ai-memory picks a sensible default:
 
 `EMBEDDING_API_KEY` is optional and credentials the embedding role alone. Set
 it when the embedder should authenticate against a different provider than the
-LLM — the `openai` and `openai-compat` embedders otherwise borrow the chat
+LLM. Otherwise the `openai` and `openai-compat` embedders borrow the chat
 model's `OPENAI_API_KEY` or `LLM_API_KEY`, which is then sent to whatever
 `AI_MEMORY_EMBEDDING_BASE_URL` points at and rejected with a 401.
 
@@ -1983,7 +1990,7 @@ export EMBEDDING_API_KEY=sk-or-v1-...
 ### Anthropic via Claude subscription (OAuth)
 
 > [!WARNING]
-> **Unofficial and against Anthropic's usage policies — use at your own risk.**
+> **Unofficial and against Anthropic's usage policies. Use at your own risk.**
 > Anthropic provides no public OAuth API for the Claude Pro/Max subscription;
 > this reuses the `claude setup-token` credential against `/v1/messages`, which
 > is **not a supported or sanctioned integration**. Anthropic's terms reserve
@@ -2009,7 +2016,7 @@ export EMBEDDING_API_KEY=sk-or-v1-...
 
 `anthropic-oauth` is for Claude Pro/Max subscribers who want to use their
 existing subscription instead of an Anthropic Platform API key. It hits the
-**same** `/v1/messages` endpoint as the `anthropic` provider — only the auth
+**same** `/v1/messages` endpoint as the `anthropic` provider; only the auth
 headers differ (Bearer token + `anthropic-beta: oauth-2025-04-20`).
 
 ```bash
@@ -2049,9 +2056,9 @@ representative 0.2 value as bootstrap and consolidation, then exercises the
 provider's compatibility normalization before sending the request.
 
 > [!TIP]
-> **Pick a small, fast model.** ai-memory's LLM work — session
-> consolidation, lint, and explore — is summarisation/extraction, not hard
-> reasoning, so a Haiku-class model is plenty: faster, cheaper, and far easier
+> **Pick a small, fast model.** ai-memory's LLM work (session
+> consolidation, lint, and explore) is summarisation/extraction, not hard
+> reasoning, so a Haiku-class model is enough. It is faster, cheaper, and far easier
 > on subscription rate limits than Sonnet/Opus. Set e.g.
 > `AI_MEMORY_LLM_MODEL=claude-haiku-4-5`. Save the high-effort thinking models
 > for your actual coding agent.
@@ -2087,7 +2094,7 @@ Use `ai-memory auth status` to check whether a token is present and
 > [!TIP]
 > **Leave the model at the provider default (`gpt-5.5`).** The Codex/ChatGPT
 > backend behind `openai-oauth` only accepts a small server-defined set of model
-> ids and rejects others — including `gpt-5-mini` — with a deterministic 400, so
+> ids and rejects others, including `gpt-5-mini`, with a deterministic 400, so
 > do not set `AI_MEMORY_LLM_MODEL` for this backend. Consolidation / lint /
 > explore are summarisation tasks, so if the default reasoning is too heavy set
 > `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` instead, so hidden thought
@@ -2294,7 +2301,7 @@ ceiling to match the gateway's worst-case generation time:
 Every chat request already carries `User-Agent: ai-memory/<version>`, so a
 gateway can tell what is calling it. Some also require a header of their own
 for request correlation, and reject or throttle traffic without it. Declare
-those once — they are sent on every chat request, whatever the provider:
+those once; they are sent on every chat request, whatever the provider:
 
 ```bash
 -e AI_MEMORY_LLM_HEADERS=x-opencode-session=prod-01,x-opencode-client=ai-memory
@@ -2310,7 +2317,7 @@ overrides the default. Values are never logged.
 
 The `opencode` provider needs no configuration for this: OpenCode asks
 callers for `x-opencode-session`, and that provider already sends one id per
-logical operation — stable across retries and the structured-output
+logical operation. The id is stable across retries and the structured-output
 fallback, so one consolidation pass reads as one operation in OpenCode's
 metrics. Supply the header through `AI_MEMORY_LLM_HEADERS` to override that,
 for instance to tell several ai-memory instances apart under one account.
@@ -2495,13 +2502,13 @@ remains opt-in and keeps its interval-only behavior (no startup catch-up).
 `reconcile_tombstones_deleted_pages` (default `false`, also under
 `[maintenance]`) is a separate, experimental opt-in: it lets the watcher's
 own 30s reconcile pass (not the scheduled jobs above) tombstone an
-OKF-imported content page (session summary pages are excluded — see
+OKF-imported content page (session summary pages are excluded; see
 `docs/okf.md`) whose file has disappeared from disk, after it has been
 missing on two consecutive passes and survived a circuit breaker that
 refuses to act when more than `max(3, 50%)` of a scope's candidate pages
 look missing at once, or when a walk finds nothing at all. The tombstone is
 soft (`is_latest = 0` + `superseded_at`, the same shape decay eviction uses)
-and is picked up by the same aged-tombstone hard-delete sweep — it is not
+and is picked up by the same aged-tombstone hard-delete sweep; it is not
 exempt from it. What actually protects it: a reconcile tombstone is never
 itself destroyed while its chain has no successor; if the file returns, the
 new version re-links to the tombstoned chain instead of starting fresh, so
@@ -2620,8 +2627,8 @@ this is recoverable: review what landed, `docker exec ai-memory git
 
 The CLI and server write daily-rolling logs to `<data_dir>/logs/`
 (`~/.local/share/ai-memory/logs/` by default). When that location is not
-writable — sandboxes like [ai-jail](https://github.com/akitaonrails/ai-jail)
-mount `$HOME` read-only or as throwaway tmpfs — ai-memory degrades instead
+writable (sandboxes like [ai-jail](https://github.com/akitaonrails/ai-jail)
+mount `$HOME` read-only or as throwaway tmpfs), ai-memory degrades instead
 of failing: it falls back to the OS temp dir, then to stderr-only logging,
 printing the exact path that failed at each step. Commands keep working
 either way. To keep durable file logs (and durable hook spooling) inside a
@@ -2644,7 +2651,7 @@ an API key never logs into `/auth/login`.
 Set a one-shot password, then start `serve`. The engine creates the configured
 `root_username` (default `root`) with `must_change_password=true` and marks
 bootstrap complete. Later restarts ignore the value even if it stays in the
-environment — unset it so the plaintext is not kept in process env.
+environment, so unset it to keep the plaintext out of the process env.
 
 ```bash
 # At least 12 characters. Must not equal the root bearer, actor-proxy bearer,
@@ -2749,7 +2756,7 @@ named volume.
 
 `bootstrap` is in that list even though it only *reads* host files: an
 unmapped UID and a confined label block reads just as hard, and the failure is
-misleading — it degrades silently to `no .git found at /work; bootstrapping
+misleading: it degrades silently to `no .git found at /work; bootstrapping
 from README/docs/rules only` before dying with `Permission denied (os error
 13)`.
 
@@ -2758,7 +2765,7 @@ The two engines report these facts under different keys. Docker answers
 fails that template, so the wrapper falls back to podman's
 `{{.Host.Security.Rootless}}` and `{{.Host.Security.SELinuxEnabled}}` when the
 Docker probe comes back empty. Rootless engines additionally need `-u 0:0`,
-because only container UID 0 maps back to the invoking host user — on rootless
+because only container UID 0 maps back to the invoking host user. On rootless
 podman with SELinux enforcing, both adjustments are required and neither alone
 lets the write land.
 
@@ -2850,14 +2857,14 @@ in addition to the 128 MiB response-body cap. Windows uses rename-aside
 (`.exe` → `.old`, then promote `.new`) because
 a running image cannot be overwritten in place. It refuses Homebrew/AUR/`/usr`
 installs (use the package manager), unwritable prefixes (for example Program
-Files — download the zip manually), and in-container binaries (upgrade the
+Files; download the zip manually), and in-container binaries (upgrade the
 host wrapper/image instead). Windows aarch64 has no release asset yet. For
 mirrors or hermetic tests, set `AI_MEMORY_RELEASE_BASE_URL` (or
 `release_base_url` in config.toml) to a Releases-compatible base that serves
 `{base}/latest/tag` and `{base}/download/<tag>/<asset>` (+ `.sha256`). That
 override is a trust boundary: archive and checksum are fetched from the same
 base, so the `.sha256` only proves the base served a consistent pair, not that
-the binary is genuine — point it only at origins you control. Prefer an
+the binary is genuine. Point it only at origins you control. Prefer an
 `https://` base; a plain-`http://` base has no transit protection, so an
 on-path attacker can substitute both the archive and its matching checksum.
 Each response body is capped at 128 MiB.
@@ -2875,7 +2882,7 @@ to roll back to the previous version.
 ### Upgrading to 2.3.0
 
 2.3.0 is a normal forward upgrade (the only new migration, `V64`, just adds the
-cross-project `agent_messages` table — nothing existing is altered or removed).
+cross-project `agent_messages` table; nothing existing is altered or removed).
 Two capture/UX conveniences are **on by default**; both are additive and
 non-destructive, but worth knowing about for your first session after upgrading:
 

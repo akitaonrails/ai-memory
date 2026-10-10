@@ -1,21 +1,21 @@
 # Upgrading to 2.0
 
 2.0 changes the wiki's on-disk format to the [Open Knowledge Format
-v0.2](okf.md). The upgrade is automatic, backup-gated, and reversible.
-This page describes exactly what happens and how to go back.
+v0.2](okf.md). The upgrade is automatic, runs only after a backup succeeds,
+and is reversible. This page describes what happens and how to go back.
 
 > **The safety archive is a true pre-migration recovery point.** It is
 > written **before** the SQLite schema is migrated forward (#633), so its
 > `db/` is still at the 1.x schema and restoring it lets you start the old
 > 1.x binary again. (Earlier 2.0.x builds took this archive *after* the DB
-> migration, which left it 2.x-only — fixed in 2.0.3.)
+> migration, which left it 2.x-only; fixed in 2.0.3.)
 
 ## What happens on the first 2.0 start
 
 When `ai-memory serve` starts on a data directory created by 1.x, a
 one-shot wiki migration runs before the server accepts any traffic:
 
-1. **A full backup is taken first — or nothing happens at all.** The
+1. **A full backup is taken first, or nothing happens at all.** The
    entire data directory (wiki files, SQLite database, config) is
    compressed to a timestamped archive in your home directory:
 
@@ -27,20 +27,20 @@ one-shot wiki migration runs before the server accepts any traffic:
    home is small; the destination must be outside the data directory.
 The archive is re-opened and verified after writing. **If the backup
     cannot be written or verified, the migration aborts and the server
-    refuses to start** — your data is untouched and the error says why.
+    refuses to start**. Your data is untouched and the error says why.
 
     The walk skips the runtime `.serve.lock` file (and its
-    `.serve.lock.holder` sidecar) so the initial-start abort seen on
-    Windows — where the same `serve` process holds that lock under a
-    mandatory exclusive `LockFileEx`, making the backup read fail with
-    `os error 33` — cannot happen. If you are on 2.0.0/2.0.1 and still
+    `.serve.lock.holder` sidecar), so the initial-start abort seen on
+    Windows cannot happen. There, the same `serve` process holds that lock
+    under a mandatory exclusive `LockFileEx`, which made the backup read fail
+    with `os error 33`. If you are on 2.0.0/2.0.1 and still
     hit it, dropping the container/process (or using a byte-range decoy
     lock above the first 64 KiB with `serve --force`) unblocks the
     one-time migration; a later patch releases these notes.
 
 2. The wiki git history gets a `pre-okf-migration checkpoint` commit.
 
-3. Every page's frontmatter is rewritten **in place** — same page ids,
+3. Every page's frontmatter is rewritten **in place**: same page ids,
    same version rows, bodies untouched, timestamps untouched. No page
    is superseded, embeddings stay valid, nothing looks freshly edited.
 
@@ -60,14 +60,14 @@ that never configured an embedding provider: the first start downloads
 the ~87 MB model in the background (checksum-pinned, to
 `<data_dir>/models/`), the next start enables hybrid search, and
 existing pages are embedded automatically by a startup backfill. No
-data leaves the machine — inference is in-process. Hosts that cannot
+data leaves the machine, because inference is in-process. Hosts that cannot
 fetch the model keep the old FTS-only behaviour with a warning. Opt
 out with `embedding_provider = "none"`; installs with a configured
 provider are untouched.
 
 ## Running in a server or container (docker deploys)
 
-Inside a container the home directory is **ephemeral** — it lives in
+Inside a container the home directory is **ephemeral**. It lives in
 the container layer and is destroyed on the next `docker compose up
 -d` recreation, which would silently lose the safety archive. The
 migration detects containers (the official image's
@@ -87,8 +87,8 @@ docker cp ai-memory:/data/backups/ai-memory-backup-okf-v0.2-<date>.tar.gz .
 ```
 
 `AI_MEMORY_BACKUP_DIR` still wins when set (point it at another
-mounted volume if you prefer). Deleting the archive — from inside or
-outside the container — clears the homepage notice, same as on a
+mounted volume if you prefer). Deleting the archive, from inside or
+outside the container, clears the homepage notice, the same as on a
 workstation.
 
 ## After the migration
@@ -112,8 +112,8 @@ grep -L "^type:" <data_dir>/wiki/*/*/*/*.md   # no output = all pages typed
 
 ## Restoring the backup
 
-Blunt and complete — returns the entire data directory to its exact
-pre-migration state (the archive is taken before both the DB schema and
+This is the blunt, complete option. It returns the entire data directory
+to its exact pre-migration state (the archive is taken before both the DB schema and
 the wiki are migrated, #633), so you can start the old 1.x binary again:
 
 ```bash
@@ -138,7 +138,7 @@ migrates it (as above). An **older 2.0+** binary opening a **newer**
 wiki refuses to start with `NewerWikiFormat` instead of silently mixing
 formats. (1.x binaries predate the guard: they can open a migrated
 directory and will tolerate the extra frontmatter, but new writes from
-1.x will not carry the OKF keys — avoid mixing. To stay on 1.x cleanly,
+1.x will not carry the OKF keys, so avoid mixing. To stay on 1.x cleanly,
 restore the pre-migration archive, which is captured before the DB
 migration and so reopens under 1.x.)
 

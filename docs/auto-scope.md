@@ -11,11 +11,11 @@ delayed post-tool, stop, or session-end tail from an older process must not
 redirect a newer session's unscoped reads.
 
 Since v1.39 that pointer is **keyed by the caller's own coordinate** by
-default (`per_actor`), so two harnesses in one project — or two operators on
-one server — cannot overwrite each other's notion of "current project".
+default (`per_actor`), so two harnesses in one project, or two operators on
+one server, cannot overwrite each other's notion of "current project".
 
-Before v1.39 the default was a single process-wide slot (`single`). That is
-right for exactly one harness at a time and collapses as soon as there are
+Before v1.39 the default was a single process-wide slot (`single`). That
+works for exactly one harness at a time and breaks as soon as there are
 two: a hook firing from `~/repo-A` overwrites the slot that a concurrent
 `memory_query` (with no explicit project) in `~/repo-B` was about to read.
 Because unscoped **writes** resolve through the same pointer, that could also
@@ -134,12 +134,12 @@ valid remote uses its folder basename.
 
 Owner and agent are what identify a session; scope is not. The same operator's
 session legitimately produces events in another project when its cwd moves, so
-a differing `(workspace, project)` is recorded rather than rejected — see
+a differing `(workspace, project)` is recorded rather than rejected. See
 [`[routing] mid_session`](marker-file.md#mid-session-navigation-routing-mid_session)
 for how those events are attributed. The one exception is a terminal event: a
 `SessionEnd` naming a different scope than its session is not that session's
-end, so it is dropped rather than ending someone else's session — unless it
-comes from the session's own cwd. Then the scope drifted under the same
+end, so it is dropped rather than ending someone else's session, unless it
+comes from the session's own cwd. In that case the scope drifted under the same
 directory (a `.ai-memory.toml` appeared mid-session), and the end closes the
 session in the scope it was recorded in.
 
@@ -215,7 +215,7 @@ For built-in installs that use static MCP config, prefer:
 ## Pairing with multi-user mode
 
 `per_actor` is most useful when the engine is in multi-user mode (see
-[`docs/users.md`](users.md)) — each native API credential resolves through
+[`docs/users.md`](users.md)): each native API credential resolves through
 `api_credentials` to its owning `users` row, so the auth middleware tags
 every request with the right `user`. With `[auto_scope] mode = "per_actor"`, two
 authenticated users running concurrent agent sessions through the same
@@ -230,9 +230,9 @@ configs, use explicit `workspace` + `project` arguments for concurrent windows.
 
 ## Surviving a restart
 
-The pointer is process memory: restarting the daemon — which is exactly what
-the packages tell you to do after an upgrade — empties it, including for
-sessions that are still open. Until the next foreground hook event lands, every
+The pointer is process memory. Restarting the daemon, which the packages tell
+you to do after an upgrade, empties it, including for sessions that are still
+open. Until the next foreground hook event lands, every
 keyed read misses, and an unscoped read used to resolve through the baked
 default scope and report an empty project through the success path. Nothing in
 the answer or the log said "scope unresolved", so an agent asking "what do we
@@ -240,12 +240,12 @@ have here?" was told "nothing" while thousands of observations sat in the DB.
 
 `serve` therefore seeds a **read-side fallback slot** at startup from the most
 recently active project already recorded in SQLite, so a keyed miss right after
-a restart degrades to real data instead of an empty default. Four bounds keep
-that narrow:
+a restart degrades to real data instead of an empty default. Four bounds limit
+it:
 
 - **Reads only.** The seed is a reconstruction, not an observed publish, so it
   lives in its own slot. An unscoped **write** still resolves as if nothing
-  were published — it fails closed on a genuine mismatch and otherwise uses the
+  were published: it fails closed on a genuine mismatch and otherwise uses the
   configured default, exactly as before. Nothing in a restart should retarget
   where a page lands.
 - **Keyed entries are never reconstructed**, so a keyed hit still wins and
@@ -282,16 +282,16 @@ observable changes:
 
 | your setup | before | after |
 |---|---|---|
-| one harness, hooks installed | shared slot | keyed slot for that session — same project |
-| static MCP client (bearer, no session id) | shared slot | that operator's identity-only slot — same project |
+| one harness, hooks installed | shared slot | keyed slot for that session, same project |
+| static MCP client (bearer, no session id) | shared slot | that operator's identity-only slot, same project |
 | client that forwards no identity at all | shared slot | shared slot, unchanged |
-| **MCP-only install, no lifecycle hooks** | shared slot | shared slot — nothing is ever keyed, so the fallback applies |
+| **MCP-only install, no lifecycle hooks** | shared slot | shared slot; nothing is ever keyed, so the fallback applies |
 | two harnesses / two operators | one slot, last write wins | one slot each |
 
-The single behavioural change is deliberate: a client that forwards a session
+The one behavioural change is deliberate: a client that forwards a session
 id which does **not** match any published hook activity no longer inherits the
-shared slot. Answering it from there is what routed a request into whichever
-project published last — on a shared server, potentially another operator's.
+shared slot. Answering it from there routed a request into whichever
+project published last, which on a shared server could be another operator's.
 Such a caller now resolves to the server's configured default instead.
 
 To restore the old behaviour exactly:

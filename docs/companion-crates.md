@@ -54,8 +54,7 @@ Companion projects should not:
   resolution, or the single-writer store boundary;
 - require ai-memory to host arbitrary plugin code in-process.
 
-Companion features should be treated as separate products, not rejected ideas.
-They can move faster than core, have their own UX, and carry source-specific or
+Companion features are separate products. They can move faster than core, have their own UX, and carry source-specific or
 workflow-specific behavior without widening ai-memory's default install.
 
 If a companion exposes browser writes, it must implement its own server-side
@@ -367,7 +366,7 @@ never reaches the hook file.
 
 Self-contained macOS accessory app at
 [`companions/ai-memory-macos`](../companions/ai-memory-macos). It is a
-**wrapper**, not a data-seam dashboard: it ships the `ai-memory` binary and
+**wrapper** rather than a data-seam dashboard: it ships the `ai-memory` binary and
 `hooks/` tree inside an `.app`, governs the existing LaunchAgent, and opens
 `/web`, `ai-memory status`, `config.toml`, the data directory, and logs.
 
@@ -575,17 +574,16 @@ Not every adjacent tool is that shape.
 
 **Working-tree coordination is out of core, and is an *independent hook
 consumer*, not a data-seam companion** (decided in #620). Several agent sessions
-sharing one checkout collide over the single git index — one session's
-`git add .` sweeps up another's staged work, a `--fix` run rewrites an unclaimed
-tree — and the natural instinct is to build the guard on ai-memory's captured
-`PreToolUse`/`PostToolUse` signal. That does not work, for two deliberate
-reasons:
+sharing one checkout collide over the single git index: one session's
+`git add .` sweeps up another's staged work, or a `--fix` run rewrites an
+unclaimed tree. Building the guard on ai-memory's captured
+`PreToolUse`/`PostToolUse` signal does not work, for two deliberate reasons:
 
 - **ai-memory cannot block a tool action.** The `/hook` path is capture-only and
   fire-and-forget (it returns `202`/`429`, never allow/deny/ask, and processes
   after responding). Hooks that await a REST round-trip can deadlock the engine
-  (agentmemory #221) — so there is no synchronous veto channel back to the
-  harness, by design.
+  (agentmemory #221), so by design there is no synchronous veto channel back to
+  the harness.
 - **ai-memory does not retain the file paths.** For closed-tool agents the
   stored observation is reduced to a `tool_family` label plus outcome; raw
   arguments, paths, and tool names are extracted only transiently for
@@ -593,13 +591,13 @@ reasons:
   arguments, paths, or arbitrary tool names"). A consumer can see *that* a file
   op happened in a session, never *which file*.
 
-Reversing either — persisting paths, or adding a blocking hook — trades away a
-privacy/bounding invariant or the anti-deadlock invariant. Both stay.
+Reversing either (persisting paths, or adding a blocking hook) would trade away a
+privacy/bounding invariant or the anti-deadlock invariant, so both stay.
 
 So a working-tree coordinator installs its **own** `PreToolUse` hook alongside
 ai-memory's, reads the raw `tool_input`, and arbitrates synchronously in its own
-process with its own ephemeral ownership state (a lock file or small store —
-never the wiki or SQLite). It is a *sibling on the same hook event*, not a
+process with its own ephemeral ownership state (a lock file or small store,
+never the wiki or SQLite). It is a *sibling on the same hook event* rather than a
 seam-consumer. It may still live under `companions/` for discoverability, but it
 depends on the harness's hook mechanism, not on ai-memory's surfaces. Scope it
 to the shared-index / file-ownership class; stale-tree builds and host
@@ -625,4 +623,4 @@ Poor core candidates:
 - project-specific scoring, pruning, or normalization policies;
 - companion-only admin commands.
 
-This keeps ai-memory stable while still allowing richer tools to grow around it.
+That keeps ai-memory stable while richer tools grow around it.

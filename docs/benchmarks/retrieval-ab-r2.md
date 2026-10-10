@@ -4,11 +4,11 @@ The `retrieval` harness can compare two server/query configurations over
 the **same** LongMemEval-S question set in one run, reporting a triple per
 config and a baseline→candidate delta:
 
-- **accuracy** — `hit@k` / `recall@k` (as the single-config baselines do);
-- **latency** — `memory_query` MCP round-trip p50 / p95, milliseconds;
-- **context tokens** — the context an agent would ingest from a result,
+- **accuracy**: `hit@k` / `recall@k` (as the single-config baselines do);
+- **latency**: `memory_query` MCP round-trip p50 / p95, milliseconds;
+- **context tokens**: the context an agent would ingest from a result,
   estimated as **chars / 4** over every returned hit's `title` + `snippet`
-  (a documented, provider-agnostic heuristic — not a real tokenizer).
+  (a documented, provider-agnostic heuristic, not a real tokenizer).
 
 Provenance (commit, dataset sha256, hardware, per-config knob summary) is
 carried exactly as the single-config reports carry it. See
@@ -62,8 +62,8 @@ questions excluded).
 | ctx tok median | 316.5 | 367.5 | +51.0 |
 
 Local embeddings buy a large recall gain (hit@10 +0.198, recall@10 +0.254)
-for ~90 ms added p50 query latency and ~65 more context tokens — the expected
-tradeoff, now measured on the full set rather than a smoke.
+for ~90 ms added p50 query latency and ~65 more context tokens. That is the
+expected tradeoff, now measured on the full set rather than a smoke.
 
 Per-slice `hit@5` (candidate, local): knowledge-update 0.875, multi-session
 0.868, temporal-reasoning 0.780, single-session-assistant 0.821,
@@ -71,12 +71,12 @@ single-session-preference 0.767, single-session-user 0.734.
 
 **Determinism check (baseline vs baseline, `--candidate`):** every accuracy
 and context-token delta is exactly `0.000` (latency wobbles ±5 ms at wall-clock
-noise) — the harness is sound on the 2.4 tree.
+noise), so the harness is sound on the 2.4 tree.
 
 **No default-ranking regression on 2.4.** The 2.4 aging/retrieval features are
 opt-in / off by default, so default retrieval is unchanged from 2.3.x: overall
 FTS `hit@5` 0.668 → 0.666 and local `hit@5` 0.823 → 0.815 versus the
-2026-09-01 snapshot (commit `0ac0dcf`) — identical within run-to-run noise.
+2026-09-01 snapshot (commit `0ac0dcf`), identical within run-to-run noise.
 
 **Cross-run variance (read the numbers accordingly).** The harness is
 deterministic *within* a run (the `--candidate` determinism check is exactly
@@ -86,7 +86,7 @@ wobble up to ~0.02–0.03 on the small-n slices in **both directions** (e.g.
 knowledge-update 0.875 then 0.903; single-session-user 0.734 then 0.750). Treat
 overall `hit@5` as ≈ 0.82 ± 0.005 and don't over-read a single small-n slice
 from one run. Both 2.4 runs are statistically identical to the 2.3.x 0.823
-baseline — a genuine per-slice regression is a drop that persists across a
+baseline. A genuine per-slice regression is a drop that persists across a
 confirmation re-run, not a one-run dip.
 
 Reproduce:
@@ -100,7 +100,7 @@ cargo run --release -p ai-memory-eval -- retrieval --candidate
 ### Illustrative sample-20 run (triple + QA-accuracy, NOT a baseline)
 
 Recorded to show the triple + QA columns on a real run. **`--sample 20`, 20
-LongMemEval-S questions — illustrative, NOT the full-500 baseline.** The
+LongMemEval-S questions: illustrative, NOT the full-500 baseline.** The
 published baseline stays 0.823 hit@5 (local) / 0.668 zero-LLM in
 [README.md](README.md); do not cite the numbers below as a baseline.
 

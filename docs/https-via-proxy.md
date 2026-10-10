@@ -4,12 +4,12 @@
 > the operator's guide to fronting it with a mature TLS terminator
 > (Caddy, Cloudflare Tunnel, nginx) so tokens and `/web` cookies
 > travel encrypted between clients and the server. Default install
-> stays plain HTTP on loopback — no change for existing users on
-> upgrade.
+> stays plain HTTP on loopback, so nothing changes for existing users
+> on upgrade.
 
 ## When you don't need this
 
-Skip TLS entirely if you're in one of these shapes — the security
+Skip TLS entirely if you're in one of these shapes; the security
 budget is better spent elsewhere:
 
 - **Single-user, stdio MCP transport.** `claude mcp add ai-memory -- ai-memory serve --transport stdio` never touches the network. No TLS to worry about.
@@ -26,7 +26,7 @@ apply:
 
 - **Multi-user mode is on** (at least one user row exists; `[auth].token_pepper`
   is the credential prerequisite). Native `aim_` keys travel between clients and
-  the server — sniffable over plain HTTP on the LAN. See
+  the server and are sniffable over plain HTTP on the LAN. See
   [`docs/users.md`](users.md).
 - **The server is bound beyond loopback** (`AI_MEMORY_BIND=0.0.0.0:49374` or a LAN-routable IP). Anyone on the network segment sees plaintext token traffic and `/web` cookies.
 - **You access `/web` from a different machine** than the one running ai-memory. The browser session cookie set after password login lives in the clear over HTTP.
@@ -46,14 +46,14 @@ cookies are supported only on an actual loopback listener.
 |---|---|---|
 | **Caddy + public domain + Let's Encrypt** | Operators with a domain name + port 80/443 reachable from the internet (most homelabs behind a forwarding router). | DNS A/AAAA record pointing at your IP. |
 | **Caddy + internal CA (LAN-only)** | LAN-only multi-user, no public exposure. Each client machine has to trust Caddy's root cert once. | One-time root cert install per client. |
-| **Cloudflare Tunnel** | "I don't want to open ports on my router" — outbound-only tunnel, TLS terminated at Cloudflare's edge. | A Cloudflare account (free tier works) + a domain on Cloudflare. |
+| **Cloudflare Tunnel** | "I don't want to open ports on my router": outbound-only tunnel, TLS terminated at Cloudflare's edge. | A Cloudflare account (free tier works) + a domain on Cloudflare. |
 | **External cert files (Caddy or nginx)** | You already have a corporate or homelab CA issuing certs to your services. | The cert/key files, however your environment produces them. |
 | **nginx** | You already run nginx for other services and want one config language. | Same as Caddy: a domain or files. |
 
 The compose templates in `docker/` are ready to copy:
 
-- [`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml) — Caddy front, both LE and internal-CA variants documented inline.
-- [`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml) — Cloudflare Tunnel sidecar, zero open ports.
+- [`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml): Caddy front, both LE and internal-CA variants documented inline.
+- [`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml): Cloudflare Tunnel sidecar, zero open ports.
 
 The sections below walk through each.
 
@@ -104,7 +104,7 @@ volumes:
 
 ### Caddyfile
 
-A complete one, three lines that actually matter:
+A complete Caddyfile is three lines:
 
 ```caddyfile
 memory.example.com {
@@ -170,7 +170,7 @@ protected data rather than an authentication page.
 **Safety rules on both flags.** `AI_MEMORY_BASE_PATH` and
 `AI_MEMORY_WEB_SLUG` go through the same normaliser. Segments must be
 RFC 3986 unreserved characters (`[A-Za-z0-9-._~]`). Dot-segments
-(`.` / `..`) are rejected — they mean "current" and "parent" at a
+(`.` / `..`) are rejected: they mean "current" and "parent" at a
 segment boundary, so accepting them would let a typo turn the prefix
 into traversal. Anything outside the unreserved set falls back to a
 root mount, and the startup log says why. The trailing-slash redirect
@@ -240,11 +240,11 @@ Then install it into each client OS's trust store:
 | Windows | `certutil -addstore -f "Root" caddy-root.crt` (Administrator PowerShell) |
 | iOS / Android | Email the file to the device, open it, install as a profile in Settings → General → VPN & Device Management. Then **also** explicitly trust it under Settings → General → About → Certificate Trust Settings. |
 
-**The warning that has to be loud**: if you skip the trust-install
+**Warning:** if you skip the trust-install
 step on a client, that client will either refuse TLS connections
 (MCP clients, curl) or train the operator to click through warnings
 (browsers). In the latter case **you have neither HTTP's transparency
-nor HTTPS's protection** — you have a security theatre cert that
+nor HTTPS's protection**, only a security theatre cert that
 makes everyone less safe. Install the root cert on every client
 machine you connect from, or use Path 1 / Path 3 instead.
 
@@ -261,8 +261,8 @@ Cloudflare's `cloudflared` daemon establishes an outbound-only tunnel
 to Cloudflare's edge. **No ports open on your router**, no public IP
 needed, TLS terminated at the Cloudflare edge with their cert. Pairs
 particularly well with the homelab multi-user case because the trust
-story is "Cloudflare is the CA" — universally trusted, no per-client
-install dance.
+story is "Cloudflare is the CA": universally trusted, with no per-client
+install step.
 
 ### One-time Cloudflare setup
 
@@ -270,7 +270,7 @@ install dance.
 2. In the Cloudflare dashboard, go to **Zero Trust → Networks → Tunnels** → **Create a tunnel** → name it `ai-memory-homelab` (or whatever) → save.
 3. Cloudflare gives you a long token string. Save it for the compose file.
 4. Add a public hostname to the tunnel: `memory.example.com` → service `http://ai-memory:49374`. Save.
-5. (Optional but recommended) Wrap the hostname in a **Cloudflare Access** application — Cloudflare's zero-trust SSO sits in front of the tunnel and you get human auth via Google/GitHub/etc. **on top of** ai-memory's bearer token.
+5. (Optional but recommended) Wrap the hostname in a **Cloudflare Access** application. Cloudflare's zero-trust SSO sits in front of the tunnel and you get human auth via Google/GitHub/etc. **on top of** ai-memory's bearer token.
 
 ### Compose template
 
@@ -405,7 +405,7 @@ Install Caddy natively (`brew install caddy` / `pacman -S caddy` /
 (`/etc/caddy/Caddyfile` on Linux, `/opt/homebrew/etc/Caddyfile` on
 macOS), and `systemctl enable --now caddy` / `brew services start
 caddy`. Everything else (LE, internal CA, external certs) works the
-same as the Docker paths above — Caddy doesn't care which side of the
+same as the Docker paths above; Caddy doesn't care which side of the
 container boundary it's on.
 
 For Cloudflare Tunnel: `cloudflared service install ${CLOUDFLARE_TUNNEL_TOKEN}`
@@ -417,7 +417,7 @@ LaunchDaemon on macOS. Same shape as the Docker variant.
 ## Long-running requests: `bootstrap` and proxy idle timeouts
 
 `ai-memory bootstrap` on a large repository holds a **single POST open for
-the whole multi-chunk run** — often 20+ minutes — while the server makes
+the whole multi-chunk run** (often 20+ minutes) while the server makes
 LLM calls, with no bytes flowing over the wire in between. A reverse proxy
 with a default idle/read timeout in front of the server will cut that
 connection (`Connection reset by peer`), and the run is lost.
@@ -425,7 +425,7 @@ connection (`Connection reset by peer`), and the run is lost.
 If you run `bootstrap` through a proxy, raise or disable the upstream
 read/write timeout for ai-memory's route.
 
-**Caddy** — disable the backend read/write timeouts on the `reverse_proxy`:
+**Caddy**: disable the backend read/write timeouts on the `reverse_proxy`:
 
 ```caddyfile
 memory.example.com {
@@ -438,7 +438,7 @@ memory.example.com {
 }
 ```
 
-**nginx** — raise `proxy_read_timeout` / `proxy_send_timeout` (default 60s)
+**nginx**: raise `proxy_read_timeout` / `proxy_send_timeout` (default 60s)
 well past your longest run:
 
 ```nginx
@@ -452,15 +452,14 @@ location / {
 
 This only matters for the long-held `bootstrap` POST; ordinary MCP and
 `/api/v1` requests are short and unaffected. (A genuinely failed chunk still
-loses the run today — the durable-progress/`--resume` question is tracked
+loses the run today. The durable-progress/`--resume` question is tracked
 separately; see #614.)
 
 ---
 
 ## Outbound LLM calls fail behind a TLS-inspecting firewall
 
-The paths above are about clients trusting *ai-memory's* certificate. This
-section is the mirror image: **ai-memory trusting an upstream interceptor** so
+The paths above are about clients trusting *ai-memory's* certificate. This section covers the reverse case: ai-memory trusting an upstream interceptor so
 its own outbound LLM/embedding calls succeed.
 
 **Symptom.** Consolidation, lint, or embeddings fail and the logs show
@@ -471,7 +470,7 @@ re-signs TLS with a private interception root the container doesn't trust.
 
 **Why it happens.** ai-memory's HTTP client (reqwest + rustls, built with
 `rustls-tls-native-roots`) trusts the **operating system** certificate store,
-not a bundled root list — it reads the container's `/etc/ssl/certs` and honors
+not a bundled root list. It reads the container's `/etc/ssl/certs` and honors
 `SSL_CERT_FILE` / `SSL_CERT_DIR`. The stock image ships only the public Debian
 roots, so the interception root is unknown. `curl` from your host may succeed
 because your host already trusts that root; the container does not.
@@ -479,7 +478,7 @@ because your host already trusts that root; the container does not.
 **Fix.** Give the container a CA bundle that includes the interception root.
 
 1. Export the interception root your gateway presents (from a trusted host),
-   or — better — get it from your IT team, which is the authoritative source:
+   or, better, get it from your IT team, which is the authoritative source:
 
    ```bash
    openssl s_client -showcerts -connect api.openai.com:443 </dev/null 2>/dev/null \
@@ -518,15 +517,15 @@ because your host already trusts that root; the container does not.
 
 **Notes.**
 - Point `SSL_CERT_FILE` at the *combined* bundle, never at the interception
-  root alone — that would drop every public root and break all other TLS.
+  root alone; that would drop every public root and break all other TLS.
 - Native (non-Docker) installs: on Linux, install the root system-wide
   (`update-ca-certificates` / `trust anchor`) or set `SSL_CERT_FILE`; on
   Windows the client reads the schannel store, so import the root there
-  instead — `SSL_CERT_FILE` does not apply.
+  instead (`SSL_CERT_FILE` does not apply).
 
 ## What ai-memory does to support being behind a proxy
 
-Nothing special — the server intentionally generates no absolute URLs
+Nothing special. The server intentionally generates no absolute URLs
 in responses, so it doesn't matter whether `https://` or `http://`
 sits in front. The bearer token middleware reads `Authorization`
 directly off the request, which proxies forward verbatim. The
@@ -552,12 +551,11 @@ Three things to actively avoid:
 
 1. **Don't disable the allowed-hosts guard.** It's the DNS-rebinding defence; pruning it because the proxy "should be" filtering is exactly the kind of "the other layer handles it" assumption that ships bugs. Add the public hostname; don't widen to `*`.
 2. **Don't skip the trust-install step in Path 2.** The temptation is to add `-k` (curl) or `--insecure` (MCP clients that support it) "just to get it working." If you do, you have a security theatre cert: TLS without authentication, which is worse than HTTP with the bearer because it looks safe and isn't.
-3. **Don't run cloudflared with `--no-tls-verify`.** Cloudflare's tunnel daemon validates ai-memory's cert by default — which is fine because ai-memory is on plain HTTP inside the docker network. Don't override the flag; you'd be reaching for it because something else is misconfigured.
+3. **Don't run cloudflared with `--no-tls-verify`.** Cloudflare's tunnel daemon validates ai-memory's cert by default, which is fine because ai-memory is on plain HTTP inside the docker network. Don't override the flag; you'd be reaching for it because something else is misconfigured.
 
-If you can't take one of these paths cleanly, the honest answer is
-"keep ai-memory loopback-only" or "front it with the proxy you
-already trust." The configuration that gives operators the wrong
-mental model — looking secure, not being secure — is worse than
+If you can't take one of these paths cleanly, keep ai-memory loopback-only or
+front it with the proxy you already trust. A configuration that gives operators
+the wrong mental model, looking secure without being secure, is worse than
 either.
 
 ## The session-aware MCP bridge and HTTPS
@@ -566,9 +564,9 @@ either.
 its transport pulled in a second `reqwest` with no TLS backend compiled, so any
 non-`http` scheme was refused before a connection was attempted. If you front
 ai-memory with a TLS-terminating proxy as described above, point the bridge at the
-proxied `https://` URL directly — a second, local proxy on each client machine is
+proxied `https://` URL directly; a second, local proxy on each client machine is
 not needed.
 
 The bridge uses the platform certificate verifier, so it trusts the same roots the
-operating system does. A certificate the OS does not trust — a self-signed one, or a
-private CA that has not been installed into the system trust store — is rejected.
+operating system does. A certificate the OS does not trust (a self-signed one, or a
+private CA that has not been installed into the system trust store) is rejected.

@@ -2,15 +2,15 @@
 
 *2.0 item 4.* The entity index carries an **ingestion-time** validity
 window, so "what did we know about X as of June" is answerable from
-the store — the one mainstream graph-camp mechanism (Zep/Graphiti)
-worth having at our scale.
+the store. Of the mainstream graph-camp mechanisms (Zep/Graphiti), this is
+the one worth having at our scale.
 
 *2.2, issue #656.* Page versions carry the same window at page grain
 (`pages.valid_from` / `valid_to`, V62), and `as_of` fuses the entity
 timeline with version-filtered full-text search. Vocabulary is pinned
 in `docs/design-page-ingestion-windows.md`: this is **ingestion time**
 ("the version the store treated as current"), never world-time
-validity — "valid-time" stays reserved for the deferred Phase B.
+validity; "valid-time" stays reserved for the deferred Phase B.
 
 ## Honest scope
 
@@ -23,11 +23,11 @@ validity — "valid-time" stays reserved for the deferred Phase B.
 - **Two grains, one semantic.** Entity links inherit their page
   version's timeline (V56, repaired by V58); page versions now
   materialize it directly (V62). Typed relation edges (item 3) die with
-  their page version, which is already a timeline — no extra columns
-  needed there yet.
+  their page version, which is already a timeline, so they need no extra
+  columns yet.
 - **Deletion is deletion.** Purged pages cascade their entity links
   away; the timeline does not survive an explicit purge (that is what
-  purge means here — see the purge docs).
+  purge means here; see the purge docs).
 
 ## Schema
 
@@ -43,7 +43,7 @@ from the linked version's `created_at`; `superseded_at` from the
 superseding version's `created_at` (found via `pages.supersedes`),
 `NULL` for latest versions. New writes populate `valid_from` at
 insert, and the supersede path closes the outgoing version's windows
-in the same transaction — a link's window can never be open-ended in
+in the same transaction, so a link's window can never be open-ended in
 a superseded version.
 
 `pages` carries the same window at page grain (V62, issue #656):
@@ -65,7 +65,7 @@ NULL`. Every retire path closes both grains in the same transaction
 (supersede, decay, reorg graveyard, move-regenerate); the V62 backfill
 covers existing stores with the same rules. No FTS rebuild is needed:
 the `pages_fts_*` triggers already index every version row, superseded
-ones included — version-filtered search is a join-predicate change,
+ones included, so version-filtered search is a join-predicate change,
 not an index change.
 
 ## When to reach for it
@@ -93,7 +93,7 @@ memory_query { "query": "postgres", "as_of": "2026-07-01T00:00:00Z" }
 ```
 
 The entity leg needs the entity: it only answers when the query names
-a tracked entity the version carried. The FTS leg covers the rest — a
+a tracked entity the version carried. The FTS leg covers the rest: a
 version with no `entities:`/`tags:` frontmatter, or a question phrased
 without the exact retired term ("which database were we on during the
 outage?"), still resolves through the text that was live at T.
@@ -139,7 +139,7 @@ salient nouns a page is *about*, and they are populated from each page's
 frontmatter at write time:
 
 - an explicit `entities:` list, when an LLM consolidator emits one; and
-- the page's `tags:` list, which nearly every page carries — tags *are*
+- the page's `tags:` list, which nearly every page carries. Tags *are*
   "what this page is about", so they seed the entity index deterministically
   with no LLM pass and no re-consolidation.
 
@@ -150,7 +150,7 @@ proportionally little.
 Existing stores self-heal. On the first start after upgrading, a
 one-shot, idempotent backfill scans latest pages that have no entity
 links yet, derives their entities from the same frontmatter, and opens
-each link's validity window at the page version's own `created_at` — so
+each link's validity window at the page version's own `created_at`, so
 `as_of` works historically, not just from the upgrade forward. A store
 whose pages were all written through the current path finds no
 candidates and the pass is a no-op. No command is required; a manual

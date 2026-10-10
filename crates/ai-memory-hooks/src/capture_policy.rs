@@ -733,6 +733,10 @@ struct Extracted<'a> {
     /// `web_search` is non-file but runs nothing.
     shell: bool,
     workdir: Option<String>,
+    /// A search/list tool's explicit directory or file argument. Used only to
+    /// locate where the tool ran; capture policy drops search output under an
+    /// active marker regardless of it.
+    search_paths: Option<Vec<String>>,
     call_id: Option<String>,
     state: ExtractionState,
 }
@@ -797,6 +801,9 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
     let command = (family == ToolFamily::NonFile)
         .then(|| args.and_then(shell_command))
         .flatten();
+    let search_paths = (family == ToolFamily::SearchList)
+        .then(|| args.and_then(|value| direct_paths(value.as_object()?)))
+        .flatten();
     // OpenCode `bash`, OpenClaw `exec` and Codex `shell` run in `workdir`
     // when given, so relative arguments resolve from there.
     let shell = family == ToolFamily::NonFile && !name.eq_ignore_ascii_case("web_search");
@@ -833,6 +840,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         command,
         shell,
         workdir,
+        search_paths,
         call_id,
         state,
     }
@@ -943,22 +951,33 @@ fn extract_paths(name: &str, args: &Value) -> Option<Vec<String>> {
     .then_some(paths)
 }
 
-/// Return the bounded, normalized absolute paths named by a recognized file
-/// tool call, in the path's own separator style.
+/// Return the bounded, normalized absolute paths that locate where a
+/// recognized tool call ran, in the path's own separator style: a file tool's
+/// targets, a search/list tool's explicit directory, or a shell command's
+/// `workdir`.
 ///
-/// Native hook clients use this only to notice a file operation that targets
-/// another checkout while the harness keeps reporting the parent session's
-/// cwd. Relative paths are intentionally excluded: joining them to any cwd
-/// other than the payload's would be ambiguous, and they cannot independently
-/// prove a cross-project target. Unknown schemas and mixed/oversized inputs
-/// fail closed with `None`, matching capture-policy extraction.
+/// Native hook clients use this only to notice a tool call that operates in
+/// another checkout while the harness keeps reporting a different cwd — a
+/// subagent's parent session (#932), or Hermes' process cwd (#1199).
+/// Relative paths are intentionally excluded: joining them to any cwd other
+/// than the payload's would be ambiguous, and they cannot independently prove
+/// a cross-project target. Free-form command text is never parsed for a
+/// location; only the structured `workdir` field counts. Unknown schemas and
+/// mixed/oversized inputs fail closed with `None`, matching capture-policy
+/// extraction.
 #[must_use]
-pub fn absolute_file_tool_paths(agent: AgentKind, raw: &Value, cwd: &str) -> Option<Vec<String>> {
+pub fn absolute_tool_location_paths(
+    agent: AgentKind,
+    raw: &Value,
+    cwd: &str,
+) -> Option<Vec<String>> {
     let extracted = extract(agent, raw);
-    if extracted.family != ToolFamily::File {
-        return None;
-    }
-    let paths = extracted.paths?;
+    let paths = match extracted.family {
+        ToolFamily::File => extracted.paths?,
+        ToolFamily::SearchList => extracted.search_paths?,
+        ToolFamily::NonFile => vec![extracted.workdir?],
+        ToolFamily::Unknown => return None,
+    };
     paths
         .iter()
         .map(|path| {
@@ -1448,7 +1467,7 @@ mod tests {
     /// still collapsed; a POSIX target is unchanged. Windows CI caught the
     /// forward-slash `C:/…` form being sent as the destination cwd.
     #[test]
-    fn absolute_file_tool_paths_keep_the_native_separator_style() {
+    fn absolute_tool_location_paths_keep_the_native_separator_style() {
         let edit = |path: &str| {
             serde_json::json!({
                 "tool_name": "Edit",
@@ -1456,7 +1475,7 @@ mod tests {
             })
         };
         assert_eq!(
-            absolute_file_tool_paths(
+            absolute_tool_location_paths(
                 AgentKind::ClaudeCode,
                 &edit(r"C:\work\destination\sub\..\a.txt"),
                 r"C:\work\source",
@@ -1464,13 +1483,67 @@ mod tests {
             Some(vec![r"C:\work\destination\a.txt".to_owned()])
         );
         assert_eq!(
-            absolute_file_tool_paths(
+            absolute_tool_location_paths(
                 AgentKind::ClaudeCode,
                 &edit("/work/destination/sub/../a.txt"),
                 "/work/source",
             ),
             Some(vec!["/work/destination/a.txt".to_owned()])
         );
+    }
+
+    /// A tool's location is its file targets, a search tool's explicit
+    /// directory, or a shell command's structured `workdir` — absolute only,
+    /// and never a path parsed out of the command text (#1199).
+    #[test]
+    fn absolute_tool_location_paths_cover_search_dirs_and_shell_workdirs() {
+        let hermes = |tool: &str, input: Value| {
+            absolute_tool_location_paths(
+                AgentKind::Hermes,
+                &serde_json::json!({"tool_name": tool, "tool_input": input}),
+                "/home/user",
+            )
+        };
+        assert_eq!(
+            hermes(
+                "terminal",
+                serde_json::json!({"command": "ls", "workdir": "/work/repo/./src/.."})
+            ),
+            Some(vec!["/work/repo".to_owned()])
+        );
+        assert_eq!(
+            hermes(
+                "search_files",
+                serde_json::json!({"pattern": "x", "path": "/work/repo"})
+            ),
+            Some(vec!["/work/repo".to_owned()])
+        );
+        assert_eq!(
+            hermes("read_file", serde_json::json!({"path": "/work/repo/a.rs"})),
+            Some(vec!["/work/repo/a.rs".to_owned()])
+        );
+        for (tool, input) in [
+            (
+                "terminal",
+                serde_json::json!({"command": "ls", "workdir": "repo"}),
+            ),
+            (
+                "terminal",
+                serde_json::json!({"command": "cat /work/repo/a.rs"}),
+            ),
+            ("terminal", serde_json::json!({"workdir": "/work/repo"})),
+            (
+                "search_files",
+                serde_json::json!({"pattern": "x", "path": "."}),
+            ),
+            ("search_files", serde_json::json!({"pattern": "x"})),
+            (
+                "process",
+                serde_json::json!({"action": "list", "workdir": "/work/repo"}),
+            ),
+        ] {
+            assert_eq!(hermes(tool, input.clone()), None, "{tool} {input}");
+        }
     }
 
     #[test]

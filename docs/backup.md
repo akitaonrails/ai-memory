@@ -11,7 +11,7 @@ Ai-memory's wiki directory is a real git repository. Every consolidation pass
 writes a checkpoint through libgit2 (see cross-cutting invariant #10 in
 [`AGENTS.md`](../AGENTS.md) and the wiki design notes in
 [`docs/ARCHITECTURE.md`](ARCHITECTURE.md)). That means half of a remote-backup
-setup is already done for you — the wiki has its own commit history and can be
+setup is already done for you: the wiki has its own commit history and can be
 pushed to any git remote you own. The rest of this doc is about wiring that
 up, what else to include, what to exclude, and how to schedule it.
 
@@ -49,7 +49,7 @@ running `reindex` after a restore), pair the git mirror with a periodic
 
 ## Security: what ends up in your wiki
 
-Read this before configuring a remote — decide what is acceptable to have
+Read this before configuring a remote. Decide what is acceptable to have
 off your machine, then pick the shape of backup that matches.
 
 The wiki captures **everything the coding agent sees during a session**
@@ -62,8 +62,8 @@ a private client name, a customer record, or a file path they consider
 sensitive into a captured session, it is on disk in the wiki tree, and
 whatever you push will carry it.
 
-For any remote target — even a private repository on a service you
-control — assume an operator or administrator on the receiving side
+For any remote target, even a private repository on a service you
+control, assume an operator or administrator on the receiving side
 could read the contents. Employer-managed cloud repositories
 (GitHub Enterprise, GitLab self-hosted, Bitbucket Data Center) may be
 routinely audited by administrators, and a repository private to you on
@@ -94,7 +94,7 @@ ships this list already; expand it for anything install-specific
 site-specific env files).
 
 **Alternatives when the wiki content is too sensitive to store as text
-on a remote** — pick whichever fits the threat model:
+on a remote**; pick whichever fits the threat model:
 
 - **Encrypted archive to object storage.** `restic` or `borg` snapshots
   of the data dir to a private object store (S3, Backblaze B2, Wasabi,
@@ -114,8 +114,8 @@ on a remote** — pick whichever fits the threat model:
   convenience for zero third-party exposure.
 
 If none of the wiki content is more sensitive than what already lives
-in your project's source repository, a private mirror repo is fine —
-this section is for the case where it is.
+in your project's source repository, a private mirror repo is fine.
+This section is for the case where it is.
 
 ## Backing up the wiki to a remote git repository
 
@@ -141,7 +141,7 @@ Two caveats:
 
 ## Backing up the whole data dir (mirror + push)
 
-For a full-install backup — wiki, raw ledger, sanitized config — the
+For a full-install backup (wiki, raw ledger, sanitized config), the
 supported pattern is a scheduled rsync into a mirror git repository, followed
 by a git push. This avoids running git operations against the live wiki
 repository (which the server writes to) while still giving you a single
@@ -150,12 +150,12 @@ remote with the full recoverable state.
 A worked example lives at
 [`docs/examples/backup/`](examples/backup/README.md) and consists of:
 
-- `ai-memory-snapshot.sh` — an idempotent rsync + `git commit && git push` +
+- `ai-memory-snapshot.sh`: an idempotent rsync + `git commit && git push` +
   tarball script driven by six environment variables.
-- `ai-memory-backup.service` — a `systemd --user` oneshot unit that runs it.
-- `ai-memory-backup.timer` — a daily user timer with a randomised delay and
+- `ai-memory-backup.service`: a `systemd --user` oneshot unit that runs it.
+- `ai-memory-backup.timer`: a daily user timer with a randomised delay and
   `Persistent=true` so a missed run after a reboot still fires.
-- `.gitignore` — an exclusion list to drop into the root of the mirror
+- `.gitignore`: an exclusion list to drop into the root of the mirror
   repository so derived state and secrets never land in commits.
 
 The high-level flow, one invocation per day (adjust the timer for a different
@@ -192,18 +192,18 @@ Recovering the full ai-memory install from it is two steps:
 2. Rebuild the SQLite index from the recovered markdown:
    [`lifecycle-ops.md#reindex`](lifecycle-ops.md#reindex) walks through this.
    Sessions, observations, handoffs, users/tokens, audit rows, and
-   embeddings live only in the DB and are not rebuilt by `reindex` — for
+   embeddings live only in the DB and are not rebuilt by `reindex`. For
    those, restore from the paired tarball via `ai-memory restore --from
    <tarball> --data-dir <path> --force`.
 
 ## Security posture
 
-Remote sync is your own channel, not ai-memory's — this is called out
+Remote sync is your own channel, not ai-memory's. This is called out
 explicitly in [`SECURITY.md`](../SECURITY.md) ("Remote sync security" under
 out-of-scope for v1). What that means in practice:
 
 - **Private repository, always.** ai-memory captures prompts, tool calls, and
-  synthesized page bodies verbatim — the same content you would treat as
+  synthesized page bodies verbatim, the same content you would treat as
   project source.
 - **Least-privilege push credential.** Prefer an SSH deploy key or a
   fine-grained personal-access token scoped to the mirror repository only.
@@ -211,8 +211,8 @@ out-of-scope for v1). What that means in practice:
 - **Explicit secret exclusion.** The example script rejects any file matching
   `SECRET_EXCLUDES` (`*.env`, `auth.json`, `.secrets`, `*.pem`, `*.key`, `*.crt` by default), and the
   suggested mirror-repo `.gitignore` matches the same set. Add anything else
-  install-specific — private CA bundles, host-side certificates, cloud
-  credential files — to both lists.
+  install-specific (private CA bundles, host-side certificates, cloud
+  credential files) to both lists.
 - **Encryption at rest is out of scope for ai-memory.** If your threat model
   requires it, either put the mirror on an encrypted remote (`git-crypt`,
   GitLab's group-level encryption, a self-hosted Gitea over TLS with disk
@@ -221,13 +221,13 @@ out-of-scope for v1). What that means in practice:
 
 ## Related documents
 
-- [`docs/lifecycle-ops.md`](lifecycle-ops.md) — `ai-memory backup`, `restore`,
+- [`docs/lifecycle-ops.md`](lifecycle-ops.md): `ai-memory backup`, `restore`,
   `restore-page`, `reset`, `reindex` reference.
-- [`docs/deploy.md#backups`](deploy.md#backups) — the on-box tarball routine
+- [`docs/deploy.md#backups`](deploy.md#backups): the on-box tarball routine
   and the `scp`-to-laptop idiom for Docker deployments.
-- [`docs/airgapped-install.md`](airgapped-install.md) — offline installs,
+- [`docs/airgapped-install.md`](airgapped-install.md): offline installs,
   including the callout that remote git sync is user-owned plumbing.
-- [`SECURITY.md`](../SECURITY.md) — the "Remote sync security" out-of-scope
+- [`SECURITY.md`](../SECURITY.md): the "Remote sync security" out-of-scope
   note this doc expands into a walkthrough.
-- [`docs/local-embeddings.md`](local-embeddings.md) — how `models/` is
+- [`docs/local-embeddings.md`](local-embeddings.md): how `models/` is
   fetched and pinned (why it does not need to be in the mirror).

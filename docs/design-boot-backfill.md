@@ -9,7 +9,7 @@ behavior and touches the trust boundary (retroactive untrusted text enters the s
 1. **Ingest path is B, not A.** The plan recommended path A (reuse the managed-workstream
    begin → link → finish endpoints, for the incremental cursor). A live smoke proved A
    populates the *workstream continuity ledger*, not the `sessions`/`observations`/`pages`
-   pipeline — `observation` count stayed zero after import, so the history was not
+   pipeline: `observation` count stayed zero after import, so the history was not
    recall-able via `memory_query`. The implementation therefore **replays each transcript
    through `/hook/batch`** (the same ingress live capture uses, as the companion importer
    does): `export_transcript` normalizes the native transcript, then each event is posted
@@ -40,37 +40,37 @@ Surfacing the count in the next session's on-start context is a possible follow-
 ## Problem
 
 Capture is forward-only. The lifecycle hooks record events *from the moment they are
-installed*. If you have already been working in a project for weeks — a long Claude or
-Codex session on disk — and only now install ai-memory, none of that prior context is
-in memory. You get a "cold start": the tool that exists to give cross-session continuity
-begins with amnesia about the very session you are resuming.
+installed*. If you have already been working in a project for weeks (a long Claude or
+Codex session on disk) and only now install ai-memory, none of that prior context is
+in memory. You get a "cold start": a tool meant to give cross-session continuity knows
+nothing about the session you are resuming.
 
 The `ai-memory doctor` command (shipped alongside this proposal) makes the related gap
-visible — "this harness ran here but captured nothing." This proposal fills a specific
+visible: "this harness ran here but captured nothing." This proposal fills a specific
 instance of it: **when a project's store is brand new (empty) and the harness is resuming
 a session that already has local transcript history, import that history once, so the
 first consolidated pages reflect what you actually did rather than nothing.**
 
 ## What already exists (do not rebuild)
 
-The hard part — read a native transcript, sanitize it, get it into the store — is built
-twice already. This proposal is a *trigger and guards* around existing ingest, not a new
-importer.
+The hard part (read a native transcript, sanitize it, get it into the store) is already
+built twice. This proposal adds a *trigger and guards* around existing ingest and does not
+add a new importer.
 
 - **`ai-memory-workstream` transcript adapters** read every supported harness's native
   session store read-only, keyed by cwd, with per-harness path/id encoding in one place
   (`export_transcript`, `list_native_sessions`, `discover_native_session`). `doctor`
   already reuses `list_native_sessions`; boot-backfill reuses `export_transcript`.
 - **`export_transcript`** returns an `ExportedTranscript { native_session_id, events:
-  Vec<NewWorkstreamEvent>, source_cursor, losses }` — a bounded, sanitizable visible-event
+  Vec<NewWorkstreamEvent>, source_cursor, losses }`: a bounded, sanitizable visible-event
   ledger plus an **opaque incremental cursor**. `ai-memory run` calls it after a managed
   child exits and POSTs the events in size-bounded batches (`FinishManagedRunRequest`,
   `event_batches`) to the managed-workstream finish endpoint; the server persists
   `source_cursor` so the next read is incremental. This is a working backfill engine that
   only ever runs *after* a managed launch today.
 - **The companion importer** (`companions/ai-memory-importer`) has `ExternalConversation`
-  — "replay a generic external conversation through ai-memory's hook API" — with exactly
-  the bounding discipline this needs: `MAX_CONVERSATION_MESSAGES = 128`,
+  ("replay a generic external conversation through ai-memory's hook API") with the
+  bounds this needs: `MAX_CONVERSATION_MESSAGES = 128`,
   `MAX_USER_MESSAGE_BYTES = 16 KiB`, `MAX_CONVERSATION_TOTAL_BYTES = 1 MiB`, a dedicated
   `external-import` agent kind, all through the sanitizer.
 - **The sanitizer** (`ai-memory-hooks`, `Sanitized<NewObservation>`) is the only path from
@@ -84,7 +84,7 @@ importer.
 - **Default on**, with a clean opt-out.
 - **Full project bootstrap**: when the store is empty on first boot in a project,
   import *all* local sessions for this cwd across every supported harness, not just the
-  current resumed session — hard-capped, with a one-line notice printed.
+  current resumed session. The import is hard-capped and prints a one-line notice.
 
 ## Design
 
@@ -93,10 +93,10 @@ importer.
 The SessionStart hook already fires and already contacts the server (it fetches the
 hot-context/handoff block). Extend that one round-trip to also learn, cheaply:
 
-- **Is this project's store empty?** A scoped count — the same family as doctor's
+- **Is this project's store empty?** A scoped count, in the same family as doctor's
   `GET /admin/sessions/by-agent` for `(workspace, project)`; sum of sessions == 0 means
   empty. Emptiness is the gate: an established project is never retro-imported (that would
-  duplicate/rewrite real history and confuse consolidation). Boot-backfill is a strictly
+  duplicate/rewrite real history and confuse consolidation). Boot-backfill is strictly a
   **one-time bootstrap**.
 - **Backfill enabled?** `[capture] backfill_on_start` (default true), overridable by
   `AI_MEMORY_BACKFILL_ON_START` and a `.ai-memory.toml` marker key.
@@ -119,7 +119,7 @@ and cwd:
    events, attaching to the harness-native session id so the imported session id matches
    what forward capture would have used (Claude/Codex local id == server session id).
 4. Persist each session's `source_cursor` so a later real resume continues incrementally
-   from where the backfill stopped — no double-capture of the overlap.
+   from where the backfill stopped, without double-capturing the overlap.
 5. Print one notice to the operator's next surface: `📼 ai-memory imported N prior local
    sessions (~M events) for this project. Opt out with AI_MEMORY_BACKFILL_ON_START=0.`
 
@@ -132,11 +132,11 @@ store, explicit) for operators who want it outside the boot path.
 The events from `export_transcript` are `NewWorkstreamEvent`s. Two ways to land them:
 
 - **(A) Reuse the managed-workstream finish endpoint** (`FinishManagedRunRequest` +
-  `source_cursor`, batched by `event_batches`). Richest fit: the cursor and incremental
+  `source_cursor`, batched by `event_batches`). Best fit: the cursor and incremental
   semantics already exist and the server already consolidates workstream ledgers. Cost: it
   is currently coupled to a managed *run* lifecycle (a `WorkstreamCheckpoint`, an
-  `exit_code`); backfill has no live child, so it needs a "finish without a run" entry —
-  a synthetic/adopted workstream for the pre-hook history.
+  `exit_code`); backfill has no live child, so it needs a "finish without a run" entry,
+  meaning a synthetic/adopted workstream for the pre-hook history.
 - **(B) Replay as sanitized hook observations** (the importer's approach). Simpler and
   lifecycle-free; integrates with the ordinary capture/consolidation path. Cost: needs a
   `NewWorkstreamEvent → NewObservation` mapping and its own idempotency (no built-in
@@ -144,19 +144,19 @@ The events from `export_transcript` are `NewWorkstreamEvent`s. Two ways to land 
 
 **Recommendation: (A)**, extended with a lifecycle-free "import" variant of the finish
 endpoint. It preserves the incremental `source_cursor` contract end to end (critical for
-step 4 — the overlap between backfilled history and the resumed live session must not be
+step 4: the overlap between backfilled history and the resumed live session must not be
 captured twice), and reuses the server's existing workstream consolidation rather than
-inventing an observation mapping. The cursor is the load-bearing reason to prefer A.
+inventing an observation mapping. The cursor is the main reason to prefer A.
 
 ### 4. Idempotency and overlap
 
 Three guards, all reusing existing mechanisms:
 
-- **Emptiness gate** — only an empty store bootstraps; a populated store is never touched
+- **Emptiness gate:** only an empty store bootstraps; a populated store is never touched
   by the automatic path.
-- **Bootstrap lease** — claim-once per project (handoff/message pattern) prevents
+- **Bootstrap lease:** claim-once per project (handoff/message pattern) prevents
   concurrent double-import across simultaneous boots.
-- **Per-session `source_cursor`** — the imported session's cursor is persisted, so when
+- **Per-session `source_cursor`:** the imported session's cursor is persisted, so when
   the operator's live resume then produces new events, forward capture continues *after*
   the cursor. No event is both backfilled and live-captured.
 
@@ -175,7 +175,7 @@ Bound everything, defaults chosen to protect boot and the single-writer actor:
 
 ### 6. Security
 
-Retroactive text is exactly as untrusted as live hook text — it is old model/tool output.
+Retroactive text is exactly as untrusted as live hook text, since it is old model/tool output.
 
 - **No sanitizer bypass.** Every imported record passes the same
   `Sanitized<NewObservation>` / workstream sanitize boundary and the same caps. The e2e
@@ -190,12 +190,12 @@ Retroactive text is exactly as untrusted as live hook text — it is old model/t
   operator, imports only into an *empty* project scope, and is opt-outable per project via
   the marker. Consider gating the automatic path to the default (loopback/single-operator)
   posture and requiring explicit `ai-memory backfill` on `deployment_distinguishes_operators()`
-  servers — an open question below.
+  servers (an open question below).
 
 ### 7. Opt-out and configuration
 
 - `[capture] backfill_on_start = true` (default) in config.
-- `AI_MEMORY_BACKFILL_ON_START=0` env override (one config-read path — read in
+- `AI_MEMORY_BACKFILL_ON_START=0` env override (one config-read path: read in
   `Config::load`, never ad hoc).
 - `.ai-memory.toml` marker key so a specific project can opt out regardless of global
   config (mirrors how `ignore_paths` is project-scoped).
@@ -204,14 +204,15 @@ Retroactive text is exactly as untrusted as live hook text — it is old model/t
 ### 8. Harness coverage
 
 Exactly the set with read-only native transcript adapters (doctor's `SCANNED_HARNESSES`).
-A harness whose store is unreadable/absent contributes nothing — backfill never invents
-history it cannot read, same conservative stance as doctor.
+A harness whose store is unreadable/absent contributes nothing. Like doctor, backfill
+never invents history it cannot read.
 
 ## Relationship to `ai-memory doctor`
 
-Complementary: **doctor detects** the coverage gap (a harness ran here but captured
-nothing); **backfill fills** the specific first-boot instance of it. The docs should
-cross-link them — doctor is the ongoing check, backfill is the one-time bootstrap.
+The two commands complement each other. Doctor detects the coverage gap (a harness ran
+here but captured nothing); backfill fills the specific first-boot instance of it. The
+docs should cross-link them: doctor is the ongoing check, backfill is the one-time
+bootstrap.
 
 ## Testing plan
 
@@ -225,23 +226,23 @@ cross-link them — doctor is the ongoing check, backfill is the one-time bootst
 - **Security**: a canary secret in a planted transcript is scrubbed; an `ignore_paths`
   match in a planted file-tool event is dropped.
 - **Multi-session**: two concurrent boots → exactly one import (lease claim-once), the
-  other no-ops — the invariant-#16 concurrency shape, proven at integration level.
+  other no-ops. This is the invariant-#16 concurrency shape, proven at integration level.
 
 ## Open questions — resolved as built
 
 These were the pre-implementation questions; the shipped feature (see the **As-built
 note** at the top) resolved each:
 
-1. **Ingest path A vs B** — resolved to **B** (replay through `/hook`). A live smoke proved
+1. **Ingest path A vs B:** resolved to **B** (replay through `/hook`). A live smoke proved
    path A populated the workstream continuity ledger, not the searchable memory pipeline
    (observation count stayed zero), so it was abandoned.
-2. **Shared-server default** — shipped **on by default** with `AI_MEMORY_BACKFILL_ON_START=false`
+2. **Shared-server default:** shipped **on by default** with `AI_MEMORY_BACKFILL_ON_START=false`
    / `--no`-style opt-out; the emptiness gate makes it safe on any posture (it only ever
    bootstraps an empty project).
-3. **Notice delivery** — the automatic path runs detached and silent (like Claude Code's
+3. **Notice delivery:** the automatic path runs detached and silent (like Claude Code's
    own auto-memory); the summary shows on a manual `ai-memory backfill`. Surfacing it in
    the next session's on-start context remains a possible follow-up.
-4. **Consolidation quality** — shipped **behind the hard cap** (newest 25 sessions / 50k
+4. **Consolidation quality:** shipped **behind the hard cap** (newest 25 sessions / 50k
    events) and iterating; a dedicated eval remains a follow-up.
 
 ## Semver

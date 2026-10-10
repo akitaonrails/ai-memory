@@ -15,14 +15,14 @@ every tool call with no confirmation. Three gaps:
 1. **No warning.** A user types `--yolo` and the agent is immediately
    unsupervised, with no reminder of what that means or a way to back out.
 2. **No sandbox nudge.** ai-jail exists precisely to contain an unsupervised
-   agent, but nothing connects the two — the user must remember to type
+   agent, but nothing connects the two: the user must remember to type
    `ai-jail ai-memory run …` themselves.
 3. **Claude still pauses.** Even with `--dangerously-skip-permissions`, Claude
    Code still prompts on explicit `permissions.ask` rules and on its own
    command-safety checks (e.g. "Contains brace with quote character (expansion
    obfuscation)"), so an "unattended" yolo run can stall. Anthropic documents
-   these under "Actions no mode auto-approves": no permission mode — including
-   `bypassPermissions` — skips them.
+   these under "Actions no mode auto-approves": no permission mode, including
+   `bypassPermissions`, skips them.
 
 ## Non-goals
 
@@ -39,7 +39,7 @@ every tool call with no confirmation. Three gaps:
 ### 1. Yolo warning prompt (all OSes)
 
 Before `apply_yolo` runs in `run.rs`, when `--yolo` is requested **and** the
-session is interactive (`stdin` and `stderr` are both terminals — the same
+session is interactive (`stdin` and `stderr` are both terminals, the same
 gate the native-session picker already uses) **and** we are not already inside
 ai-jail:
 
@@ -63,7 +63,7 @@ The offer appears only when accepting it can actually work
 `ai-jail --dry-run` preflight then applies ai-jail's own backend trust and local
 configuration checks before the offer is shown. It never appears on Windows,
 where ai-jail is unsupported, even if a file named `ai-jail` happens to be on `PATH`.
-When ai-jail is not usable there is no question at all — the run proceeds
+When ai-jail is not usable there is no question at all; the run proceeds
 directly after the §1 warning. The re-exec runs the exact path this check
 resolved, never a bare `ai-jail` re-looked-up through `PATH` (which missed a
 `~/.local/bin`-only install after the user had already accepted).
@@ -90,8 +90,8 @@ ai-jail --network --agent-state --no-save-config \
   `ai-jail cmd --network` means the sandbox or the child. `ai-memory run`
   shares flag names with ai-jail (`--env`, …), so without the separator a
   forwarded `run claude --env GH_TOKEN=…` aborted the launch. After `--`
-  ai-jail passes everything to the wrapped command verbatim — from ai-jail
-  2.4.2; earlier releases' guard ignores `--` (despite its error text
+  ai-jail passes everything to the wrapped command verbatim, starting with ai-jail
+  2.4.2. Earlier releases' guard ignores `--` (despite its error text
   suggesting it), so a colliding forwarded flag still fails there. ai-memory
   emits the separator regardless, as the documented contract.
 
@@ -102,8 +102,8 @@ ai-jail --network --agent-state --no-save-config \
 - **`--network` (not `--allow-host`).** ai-jail only adds `--unshare-net` when
   network is *off* (`bwrap.rs`: `if !network_enabled { push("--unshare-net") }`),
   so `--network` shares the host network namespace and the host-side ai-memory
-  server on `127.0.0.1:49374` — which the managed run and the agent's hooks
-  both need — is reachable. Filtered `--allow-host` uses a private netns with a
+  server on `127.0.0.1:49374`, which the managed run and the agent's hooks
+  both need, is reachable. Filtered `--allow-host` uses a private netns with a
   CONNECT proxy for *external* hosts only, so it would cut the loopback server
   off; we deliberately do not use it. This is soft protection (full egress),
   which is acceptable: the agent needs outbound network for its own model API
@@ -133,7 +133,7 @@ observable surface, per OS:
 - **macOS:** seatbelt has no UTS namespace, so the hostname is unchanged.
   ai-jail forces `PS1` to begin with `(jail) ` on both backends; on macOS that
   is the available signal. Weaker (a shell can overwrite `PS1`), but it only
-  ever *suppresses* the warning — a false negative just shows the warning
+  ever *suppresses* the warning: a false negative just shows the warning
   again inside the jail, which is safe; a false positive is unlikely because
   ai-memory is exec'd directly by ai-jail, not through an interactive shell
   that would reset `PS1`.
@@ -141,7 +141,7 @@ observable surface, per OS:
   the ai-jail offer is never shown.
 
 When detected as already jailed, both the warning and the ai-jail offer are
-skipped and the run proceeds directly — a user who typed
+skipped and the run proceeds directly, so a user who typed
 `ai-jail ai-memory run … --yolo` sees no extra friction.
 
 ### 4. Claude "true yolo" (opt-in, all OSes; recommended only under ai-jail)
@@ -160,7 +160,7 @@ What it deliberately does **not** claim to do, verified against Claude Code
   *union* with the user/project/local scopes instead of replacing them, so an
   empty `ask` array there is a no-op (earlier releases injected one). To run
   without those pauses, remove the `ask` rules from your own settings; `deny`
-  rules never pause — they block — so keeping them costs no interruptions.
+  rules never pause (they block), so keeping them costs no interruptions.
 - It cannot skip Claude Code's built-in command-safety checks.
 - Earlier releases also set three `CLAUDE_CODE_DISABLE_*RM*` environment
   variables. Claude Code reads none of them (they are absent from its binary
@@ -173,9 +173,9 @@ Off by default. **`--true-yolo` is a superset of `--yolo`**: it implies
 `--yolo` (the §1 warning, the §2 offer, and each harness's dangerous-mode
 mapping) and adds the Claude extras above, so passing both is redundant but
 harmless. For every non-Claude harness it is simply interchangeable with
-`--yolo`. Like `--yolo`, it is recognized anywhere after `run` — including
-after native arguments (`run claude --model opus --true-yolo`), where clap
-leaves it in the native argv — and never forwarded to the harness as an
+`--yolo`. Like `--yolo`, it is recognized anywhere after `run`, including
+after native arguments (`run claude --model opus --true-yolo`) where clap
+leaves it in the native argv, and it is never forwarded to the harness as an
 unknown flag.
 The `claude_true_yolo` config key only upgrades a launch that is already
 `--yolo`/`--true-yolo`; on its own it never turns an ordinary run into a
@@ -186,7 +186,7 @@ permission-bypassing one without the warning.
 ai-jail keeps credentials and host devices out by default and exposes each
 through a boolean toggle (`--X` / `--no-X`). A jailed agent that cannot reach
 `gh`, the AWS CLI, or an SSH key often cannot finish the task, so the user
-picks what the jail mounts — from the CLI or an interactive checklist — and
+picks what the jail mounts, from the CLI or an interactive checklist, and
 pressing Enter does the friendly thing.
 
 **CLI.** Two wrapper flags on `ai-memory run` (and recognized after native
@@ -201,7 +201,7 @@ arguments too, like `--yolo`; neither ever reaches the harness):
 
 `--jail` needs `=` for its list (`require_equals`), so `ai-memory run --jail
 claude` keeps `claude` as the harness. It works with or without `--yolo` and
-in non-interactive runs too — that is how a script gets a jailed run. When
+in non-interactive runs too; that is how a script gets a jailed run. When
 ai-jail is not usable on the host (§2) it fails with an error instead of
 silently running unjailed. An explicit `--jail` re-execs *before* the managed
 run is prepared, so no lease is opened and cancelled outside the jail. Inside
@@ -210,7 +210,7 @@ ai-jail (§3) both flags are ignored: no nesting, no error.
 There are deliberately **no bare `--github`-style flags** on `ai-memory run`.
 They would collide with harness-native flags of the same name (Claude Code
 has its own `--worktree`), and wrapper flags after the harness name are
-stripped from the native argv — a bare `--worktree` meant for Claude would be
+stripped from the native argv: a bare `--worktree` meant for Claude would be
 silently taken away from it. The single namespaced `--jail=` list has no such
 collision.
 
@@ -233,7 +233,7 @@ collision.
 Why these defaults: every credential is pre-checked when present because a
 user who keeps `gh` or AWS credentials on the machine almost always wants the
 agent able to use them, and a box shown only when the path exists never mounts
-nothing. The credential rows check the exact path ai-jail mounts — `GH_CONFIG_DIR`
+nothing. The credential rows check the exact path ai-jail mounts. `GH_CONFIG_DIR`
 is not consulted, because ai-jail 2.5.0 mounts `~/.config/gh` regardless. SSH
 is shown but left unchecked for an HTTPS remote, since only an SSH `origin`
 makes `git push` need it. `worktree` is pre-checked in a linked worktree,
@@ -242,11 +242,11 @@ capabilities stay off: they widen the sandbox without being needed for the
 usual task.
 
 **Semantics: an explicit selection is exact.** ai-jail's own config can
-enable toggles too — the trusted global `~/.ai-jail` may turn on, say,
+enable toggles too: the trusted global `~/.ai-jail` may turn on, say,
 `docker`. So whenever the user makes a selection, ai-memory states every
 visible row explicitly, and ai-jail's CLI flags override its config:
 
-- **Interactive checklist:** every row the user saw is passed as marked —
+- **Interactive checklist:** every row the user saw is passed as marked:
   checked `--X`, unchecked `--no-X` (`marked_choices`). An unchecked
   `[ ] Docker socket` stays off even when `~/.ai-jail` enables it; the
   checklist is what-you-see-is-what-you-get.
@@ -274,7 +274,7 @@ ai-memory. When a regular file `.ai-jail` exists there:
 | bare `--jail` | smart-default rows on; the rest left to ai-jail config | no toggles: the file is loaded as-is |
 | `--jail=LIST` | exactly the list; unnamed visible rows `--no-X` | the same exact list, on top of the file (CLI flags override config in ai-jail) |
 
-A project file is untrusted — it lives in the repository the agent works on.
+A project file is untrusted because it lives in the repository the agent works on.
 ai-jail lets it disable capabilities but never enable credentials, `docker`,
 `agent_state`, and the like, so ai-memory must not pre-check anything on its
 behalf either, and an untrusted repository must not be able to steer the
@@ -291,7 +291,7 @@ into the project config and writes `.ai-jail` back. Without the flag, the
 first jailed run would persist ai-memory's transient flags (`--network`,
 `--agent-state`, the checked credentials) into the user's repository; every
 later run would then find a project file, skip the checklist, and silently
-lose the credential mounts a project file cannot enable — and ai-jail would
+lose the credential mounts a project file cannot enable, and ai-jail would
 warn that the project file's `agent_state` is ignored because it weakens the
 baseline sandbox. `--no-save-config` sits in the baseline next to `--network`
 / `--agent-state`, before the `--`, guarded by the same `--help` detection (both
@@ -370,7 +370,7 @@ directly.
 ## Code shape
 
 - `ai-memory-workstream/src/jail.rs` (new): pure, OS-aware, dependency-injected
-  detection + command construction — `usable_ai_jail(os, lookup)`,
+  detection + command construction: `usable_ai_jail(os, lookup)`,
   `inside_ai_jail(env, hostname)`, `build_ai_jail_invocation(exe, args, env_names)`.
   Pure functions so the OS branches and the argv/env assembly are unit-tested
   without a sandbox.

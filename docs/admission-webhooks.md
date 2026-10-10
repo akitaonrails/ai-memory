@@ -7,15 +7,15 @@
 > (return a new frontmatter / body); delete/purge/move hooks are notifications
 > that can observe, mirror, or reject. Sourced from
 > `crates/ai-memory-wiki/src/admission.rs` and the wiring in
-> `crates/ai-memory-cli/src/commands/serve.rs` — keep both as the
-> canonical reference if anything here drifts.
+> `crates/ai-memory-cli/src/commands/serve.rs`. If anything here drifts,
+> those two files are the canonical reference.
 
 ## 1. What this is (and isn't)
 
 | | What you can do | What you can't do |
 |---|---|---|
-| Chain | Add canonical frontmatter fields (e.g. `contributors`); mirror the write into an external system (git, search index, audit log); reject writes that fail policy (e.g. `validate-no-secrets`). | Talk back to the engine's writer or store directly — the chain only sees one page at a time and mutates it in place. |
-| Engine | Stays closed for modification: every new behaviour ships as an independent HTTP service in any language. | The engine doesn't discover or auto-register webhooks — operators name them in config. |
+| Chain | Add canonical frontmatter fields (e.g. `contributors`); mirror the write into an external system (git, search index, audit log); reject writes that fail policy (e.g. `validate-no-secrets`). | Talk back to the engine's writer or store directly. The chain only sees one page at a time and mutates it in place. |
+| Engine | Stays closed for modification: every new behaviour ships as an independent HTTP service in any language. | The engine doesn't discover or auto-register webhooks; operators name them in config. |
 
 If your idea doesn't fit "mutate the page or observe the write", it's
 probably a different extension point (`/hook` ingress, `/admin/*` admin
@@ -32,81 +32,81 @@ in a single atomic step (see
 invariants).
 
 Webhooks run **sequentially**, in the order declared in config. Each one
-sees the (possibly mutated) page from the previous webhook — so a
+sees the (possibly mutated) page from the previous webhook, so a
 `contributors` hook that adds frontmatter is followed by a `git-mirror`
 hook that mirrors the enriched page.
 
 Webhooks fire on these `op` values today (extensible enum):
 
-- `write_page` — direct writes via MCP `memory_write_page`, the CLI
+- `write_page`: direct writes via MCP `memory_write_page`, the CLI
   `write-page`, `/admin/write-page`, the lint rewriter, hook synthesis.
-- `consolidate` — LLM consolidation writes from the consolidator
+- `consolidate`: LLM consolidation writes from the consolidator
   (SessionEnd opt-in + PreCompact + manual `memory_consolidate`) and the
   rule-based PreCompact/PostCompaction fallback after a provider failure.
   **Fires up to twice per consolidation**: once as an admission *preflight*
-  before the LLM call — with an **empty body** and the target page path (for
-  multi-page runs, the canonical `sessions/<id>.md` anchor path) — and again
+  before the LLM call, with an **empty body** and the target page path (for
+  multi-page runs, the canonical `sessions/<id>.md` anchor path), and again
   as the normal write-time check with the real content. Treat blocking calls
   as **decisions, not delivery events**: gate on `op` / `actor` / `workspace`
   / `project` / path, don't reject solely because the body is empty, and
   don't count blocking calls as one-write-happened side effects (use a
   non-blocking observer webhook for that). Any mutation returned during the
   preflight is discarded.
-- `delete` — a single page is removed (`Wiki::delete_page`, triggered by the
+- `delete`: a single page is removed (`Wiki::delete_page`, triggered by the
   `memory_delete_page` MCP tool). Carries the page path, no body; fired
   **before** the file is removed so a mirror can `git rm` the same path. The
   SQLite index is deleted directly by the writer actor; the watcher does not
   reconcile delete events.
-- `purge_project` — a whole project is purged (`Wiki::purge_project` →
+- `purge_project`: a whole project is purged (`Wiki::purge_project` →
   `remove_dir_all`, routed from `/admin/purge-project`). Carries the
   project in `ctx`, **no** page path; fired before the directory is
   removed so a mirror can drop the project.
-- `purge_session` — one session is purged (routed from
+- `purge_session`: one session is purged (routed from
   `/admin/purge-session`). Carries the workspace/project in `ctx`, **no** page
-  path — the operation is driven by session id rather than by path. Fired
+  path, because the operation is driven by session id rather than by path. Fired
   before any row is deleted, so a `reject`-policy webhook can refuse the purge
   while the session's data is still intact. Non-blocking observers are
   dispatched again after the SQL purge and page-file cleanup are durable.
-- `purge_workspace` — a whole workspace is purged (routed from
+- `purge_workspace`: a whole workspace is purged (routed from
   `/admin/delete-workspace`). Carries the workspace in `ctx.workspace`, leaves
   `ctx.project` empty, and has **no** page path; fired before SQL/file
   destruction for reject-policy admission and dispatched again to non-blocking
   observers after durable work.
-- `move_project` — a whole project is moved between workspaces without
+- `move_project`: a whole project is moved between workspaces without
   changing `project_id` (fresh-destination true move). Carries the source
   project in `ctx.workspace` / `ctx.project`, destination names in
   `ctx.destination_workspace` / `ctx.destination_project`, and no page path;
   fired before the directory rename + DB re-stamp so a mirror can rename or
   reject the project move.
-- `move_session` — one session (its rows and its `sessions/<id>.md` page)
+- `move_session`: one session (its rows and its `sessions/<id>.md` page)
   is moved to another project (`/admin/move-session`). Carries the source
   project in `ctx.workspace` / `ctx.project`, destination names in
   `ctx.destination_workspace` / `ctx.destination_project`, and no page path;
   fired before the page file moves and the DB re-stamps so a mirror can move
   or reject it.
-- `handoff_begin` / `handoff_accept` / `handoff_cancel` — a handoff is created,
+- `handoff_begin` / `handoff_accept` / `handoff_cancel`: a handoff is created,
   consumed, or discarded. Carries the workspace / project and the acting
   operator, no page path (handoffs live in their own table, not the wiki tree).
   Fired by the MCP tools **and** by the automatic hook paths: the SessionEnd
   baton (`handoff_begin`) and the session-start claim (`handoff_accept`).
 
 The three handoff lifecycle ops are dispatched in one fixed order, the same
-from every path that raises them: the webhooks that can refuse — `blocking`
-with `failure_policy = "reject"` — are awaited **before** the operation, the
+from every path that raises them. The webhooks that can refuse (`blocking`
+with `failure_policy = "reject"`) are awaited **before** the operation, the
 operation then runs, and every other subscriber (observers, blocking or not) is
 dispatched fire-and-forget **after** it, only if it happened. So no observer is
 told about an `accept` that found no pending handoff or a `cancel` another
-operator's ownership refused — an `accept` with nothing pending is not
+operator's ownership refused. An `accept` with nothing pending is not
 announced to a decider either, since the engine knows there is nothing to
-accept before it asks — and an observer subscribed to one of these ops sees the
+accept before it asks. An observer subscribed to one of these ops sees the
 same event whether it came from an MCP tool or the hook ingress. (`write_page`
 and the notification ops below are unchanged: there, a `blocking` webhook is
-awaited up front whatever its `failure_policy` — on `write_page` because it can
-still mutate the page.)
+awaited up front whatever its `failure_policy`; on `write_page` that is because
+it can still mutate the page.)
 
 What a `reject` costs the caller depends on **which path** raised the op, and
-the difference is deliberate. On the MCP tools — `memory_handoff_begin`,
-`memory_handoff_accept`, `memory_handoff_cancel` — a refusal aborts the tool
+the difference is deliberate. On the MCP tools (`memory_handoff_begin`,
+`memory_handoff_accept`, `memory_handoff_cancel`), a refusal aborts the tool
 call and is returned to the caller as a JSON-RPC error, exactly like
 `write_page`: there is a caller who asked for the operation, so it is told the
 operation did not happen. On the automatic paths there is no such caller, so a
@@ -125,7 +125,7 @@ refusal degrades the lifecycle event instead of failing it:
 Budgeting the session-start claim: the deciding webhooks are awaited
 **sequentially**, and the chain stops at the first refusal, so what the operator
 waits for in the worst case is the **sum** of the `timeout_ms` of every
-`reject`-policy webhook subscribed to `handoff_accept` — not the largest of them.
+`reject`-policy webhook subscribed to `handoff_accept`, not the largest of them.
 That sum is then capped by the server's 750 ms automatic-claim deadline.
 `timeout_ms` still defaults to 2000 ms per webhook for ordinary MCP and write
 paths; on automatic session-start acceptance, a chain that cannot approve
@@ -133,7 +133,7 @@ within 750 ms is treated as a refusal and the baton remains open. Configure
 smaller per-webhook values when you need logs to identify which decider timed
 out rather than the aggregate deadline firing first.
 
-`delete` / `purge_project` / `purge_workspace` / `move_project` / `move_session` are notifications — there is no
+`delete` / `purge_project` / `purge_workspace` / `move_project` / `move_session` are notifications with no
 body to mutate; a `Reject`-policy webhook still aborts the operation
 (admission fires BEFORE the SQL destruction in both the `/admin/purge-project`
 and `/admin/delete-workspace` paths, and before source teardown in
@@ -171,28 +171,28 @@ terminal `purge_project` notification is unchanged.
 
 ### What does NOT fire the chain (by design)
 
-- **`log.md` / `log-YYYY-MM.md` appends** — written on every hook event
+- **`log.md` / `log-YYYY-MM.md` appends**: written on every hook event
   (per prompt/tool-call). Routing each through the chain would mean an
   HTTP POST per observation, violating the fire-and-forget hook budget. The
   per-event log is a local audit artifact; back it up out-of-band (batched
   rsync), not per-line.
-- **The page bodies behind a handoff** — the `handoff_*` ops above carry only
+- **The page bodies behind a handoff**: the `handoff_*` ops above carry only
   the scope and the acting operator. A handoff is SQLite rows, so a file mirror
   has no file change to reconcile from one; what it gets is the lifecycle
   event, not a page.
-- **Aged decay-history cleanup** — only the old SQLite version chain changes;
+- **Aged decay-history cleanup**: only the old SQLite version chain changes;
   any Markdown file at the path remains authoritative and is reindexed first
   when necessary. Initial decay eviction and frontmatter TTL expiry use the
   conditional `delete` admission path.
-- **`rename-project`** — a `projects.name` column update; the on-disk path
+- **`rename-project`**: a `projects.name` column update; the on-disk path
   is the stable UUID, so no file moves and nothing to propagate.
-- **`rename-workspace`** — a `workspaces.name` column update plus refreshed
+- **`rename-workspace`**: a `workspaces.name` column update plus refreshed
   `_meta.md` manifests; workspace paths are stable UUIDs, so no file move
   notification is needed.
-- **`repair-backfill-timestamps`** (`/admin/repair-session-times`) — a
+- **`repair-backfill-timestamps`** (`/admin/repair-session-times`): a
   `sessions.started_at`/`ended_at` column update only; no wiki page or file
   is touched, so there is nothing for a mirror to reconcile.
-- **External / manual edits on disk** — reconciled by the watcher, not the
+- **External / manual edits on disk**: reconciled by the watcher, not the
   admission chain (the chain is for the engine's own write path).
 
 ## 3. Wire contract
@@ -248,12 +248,12 @@ serialisation source.
 
 | Status | Body | Behaviour |
 |---|---|---|
-| `200 OK` | `{ "page": { "frontmatter": ..., "body": ... } }` — both inner fields optional. Anything missing means "leave that field unchanged". | The engine swaps in the returned values before the next webhook (or the final atomic write). |
-| `204 No Content` | (empty) | The engine treats the webhook as a pure observer / side-effect — no mutation, no parse. |
+| `200 OK` | `{ "page": { "frontmatter": ..., "body": ... } }`; both inner fields optional. Anything missing means "leave that field unchanged". | The engine swaps in the returned values before the next webhook (or the final atomic write). |
+| `204 No Content` | (empty) | The engine treats the webhook as a pure observer / side-effect: no mutation, no parse. |
 | `4xx` / `5xx` | (optional textual body, logged) | See **§4 Failure policy**. |
 
 The engine bounds the response read at `MAX_RESPONSE_BYTES` (1 MiB).
-Anything beyond that is treated as a no-op with a `warn` log — webhooks
+Anything beyond that is treated as a no-op with a `warn` log, since webhooks
 have no legitimate reason to return more than the page envelope.
 
 ## 4. Failure policy
@@ -261,16 +261,16 @@ have no legitimate reason to return more than the page envelope.
 Each webhook picks one when the engine can't reach it or it returns
 non-2xx:
 
-- **`ignore` (default, recommended)** — Engine logs a `warn` and
+- **`ignore` (default, recommended)**: the engine logs a `warn` and
   continues with the unmutated page. The page write still succeeds.
   This is the right choice for everything except safety-critical
   enforcers.
-- **`reject`** — Engine aborts the write, propagating the error up to
+- **`reject`**: the engine aborts the write, propagating the error up to
   the caller. Use this **only** when the webhook is a hard precondition
   for persistence (e.g. a future `validate-no-secrets` enforcer).
 
 A webhook that subscribes to multiple ops uses the same policy across
-all of them — including the handoff lifecycle ops above, where "abort" means
+all of them, including the handoff lifecycle ops above, where "abort" means
 "decline this handoff", not "fail the event".
 
 ## 5. Workspace / project names
@@ -284,8 +284,8 @@ embedders, tests that wire a chain without a reader).
 
 External webhooks should treat the names as opaque strings (workspace /
 project values use the same validation as `--workspace` / `--project`
-CLI flags). They are stable for the lifetime of the workspace / project
-— the engine doesn't rename them silently. `rename-project` is a manual
+CLI flags). They are stable for the lifetime of the workspace / project;
+the engine doesn't rename them silently. `rename-project` is a manual
 op that an operator runs and that will eventually trigger a fresh
 webhook fan-out if you wire one.
 
@@ -313,7 +313,7 @@ Constants are exported from the `ai-memory-wiki` crate root:
 
 | Constant | Value | What it caps |
 |---|---|---|
-| `MAX_ADMISSION_WEBHOOKS` | `16` | Chain length. `AdmissionChain::new` errors out beyond this — a misconfigured template (helm loop, duplicated block) can't push N hooks into the write-path. |
+| `MAX_ADMISSION_WEBHOOKS` | `16` | Chain length. `AdmissionChain::new` errors out beyond this, so a misconfigured template (helm loop, duplicated block) can't push N hooks into the write-path. |
 | `MAX_RESPONSE_BYTES` | `1 MiB` | Webhook response body. Beyond this the response is dropped (treated as no-op + `warn`). |
 | Per-webhook `timeout_ms` | operator-set (default `2000`) | Single request. The chain is sequential, so total worst case ≈ `Σ timeout_ms`; automatic session-start handoff acceptance additionally caps the whole deciding chain at 750 ms. |
 
@@ -343,17 +343,17 @@ blocking = false                                         # fire-and-forget after
 
 A webhook is either **blocking** or **non-blocking**:
 
-- **`blocking = true`** (default) — runs *synchronously* inside the write path.
+- **`blocking = true`** (default): runs *synchronously* inside the write path.
   It can mutate the page (`write_page`/`consolidate`), and a `reject` failure
   aborts the write. The write waits for it (up to `timeout_ms`). Use for
   enrichers/validators (e.g. `contributors`, `validate-no-secrets`).
-- **`blocking = false`** — dispatched *fire-and-forget* **after** the durable
+- **`blocking = false`**: dispatched *fire-and-forget* **after** the durable
   operation has completed. For writes that means the final page is on disk and
   indexed in SQLite; for deletes that means the file and index row are gone;
   for project purges that means the DB purge has completed and filesystem
   removal has been attempted; for project moves it means the directory and DB
   rows now point at the destination workspace. The engine does not wait for it
-  and ignores its response, so it **cannot mutate or reject** — it only
+  and ignores its response, so it **cannot mutate or reject**; it only
   observes/mirrors the final state. Use for pure backups/mirrors (e.g.
   `git-mirror`) so a slow or down sink never adds latency to writes. Still
   honours `events` and the skip list.
@@ -364,13 +364,13 @@ Since the blocking chain is sequential, total worst-case write latency is
 Fire-and-forget dispatch is bounded: **256** such requests may be in flight per
 process, and beyond that the request is dropped and logged rather than queued
 (the durable operation has already completed, so the caller is never stalled).
-On the handoff lifecycle ops — `handoff_begin`, `handoff_accept`,
-`handoff_cancel` — only a `reject`-policy webhook is awaited, so a
+On the handoff lifecycle ops (`handoff_begin`, `handoff_accept`,
+`handoff_cancel`), only a `reject`-policy webhook is awaited, so a
 `blocking = true` hook with `failure_policy = "ignore"` is dispatched
 fire-and-forget there and shares that budget: under sustained load it too can be
 dropped. Such a drop is logged at ERROR (a non-blocking one at WARN). A hook that
 must not be dropped on those ops needs `failure_policy = "reject"`, which makes
-it a decider — awaited before the operation, and able to refuse it.
+it a decider: awaited before the operation, and able to refuse it.
 
 Env override:
 
@@ -422,7 +422,7 @@ persisting. `body` is left untouched (not in the response).
 
 The webhook materialises the page into a local clone of an external
 repo, batches commits, and pushes asynchronously. The engine doesn't
-wait for the push — only the local enqueue runs inside the write path
+wait for the push; only the local enqueue runs inside the write path
 under the webhook's `timeout_ms`.
 
 ## 10. Tests
@@ -460,13 +460,13 @@ covers the integrated path (`Wiki::write_page` → store reader resolution
 
 ## 12. Non-goals (planned iterations, not blockers)
 
-- **Parallel fan-out.** The chain is sequential by design today —
+- **Parallel fan-out.** The chain is sequential by design today, because
   mutation composition is well-defined that way. A future
   `parallel = true` for side-effect-only webhooks (no body mutation
   expected) is possible but not in scope.
 - **Webhook discovery / dynamic registration.** Hooks are operator-named
   in config. A future `/admin/admission-webhooks` POST surface is
-  conceivable but explicitly out of scope here — single-tenant config
+  conceivable but explicitly out of scope here. Single-tenant config
   is simpler and matches how the engine treats every other extension
   point (`[[etl_sources]]`, etc.).
 - **Per-webhook metrics surface.** The chain logs via `tracing` today.

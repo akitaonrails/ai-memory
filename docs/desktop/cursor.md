@@ -17,7 +17,7 @@ Config and agent data live in `~/.cursor/` (`projects/<workspace>/`,
 ai-memory already supports Cursor: `install-mcp --client cursor`
 (`~/.cursor/mcp.json` or `.cursor/mcp.json`) and `install-hooks --agent
 cursor` (`~/.cursor/hooks.json`, flat `{"version": 1, "hooks": {...}}`
-schema) — see `docs/mcp-install.md#cursor`.
+schema); see `docs/mcp-install.md#cursor`.
 
 ## Lifecycle hooks — which files run where
 
@@ -102,21 +102,27 @@ events replayed to the same server got their capture-policy summaries
 (`tool non-file`). Giving the Cursor event a real `cwd` did not change it,
 and `Shell` classifies as a non-file tool, so neither is the cause; the
 remaining differences are `tool_output` instead of `tool_response`, the
-camelCase `hook_event_name`, and no `cwd` query parameter. Not yet
-isolated; a failing test is the next step.
+camelCase `hook_event_name`, and no `cwd` query parameter. The cause was
+neither: Cursor was missing from the tool-capture agent list
+(`closed_tool_agent` in `crates/ai-memory-hooks/src/payload.rs`, plus the
+capture-policy name/input mapping), so its tool events fell through to the
+legacy path. Fixed in 2.6.3 (8bb89e28); Cursor tool events now get the same
+family title and output summary as Claude Code's.
 
 ## Open questions (live tests)
 
 1. The native `.cursor/hooks.json` payloads (only the Claude-format copy
    has been observed) and the `cwd` a conversation gets once a workspace
-   folder is open — needs a prompt inside the probe workspace.
+   folder is open. This needs a prompt inside the probe workspace.
 2. ~~What the `empty-state-draft` session start does on the server.~~
    Measured 2026-10-08 by replaying the spooled event against a scratch
    server: it creates one `cursor` session with no `cwd` in the
    `default/scratch` project, and every later launch (a new ingest key, the
    same placeholder id) adds another `session-start` observation to that
-   same session. Clutter, not loss; whether to drop it is a product call.
+   same session. That adds clutter but loses nothing; whether to drop it is a
+   product call.
 3. Whether the `cursor-agent` CLI loads the Claude-format hooks (it needs
    `cursor-agent login` here first).
-5. Why Cursor tool events reach the store with empty bodies (above).
 4. Whether a workspace window imports Claude MCP servers.
+5. ~~Why Cursor tool events reach the store with empty bodies.~~ Fixed in
+   2.6.3 (above).

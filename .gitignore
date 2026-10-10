@@ -26,6 +26,9 @@
 .idea/
 .vscode/
 
+# Python bytecode from running the docs/examples stdlib tests.
+__pycache__/
+
 # Local debugging.
 *.log
 # Runtime logs are `ai-memory.log.<date>`, so `.log` is not the final

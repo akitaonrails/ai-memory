@@ -1,7 +1,7 @@
 # Deploying ai-memory to a homelab
 
-This walks through the pattern documented in `bin/deploy`. The end
-state is: a long-lived ai-memory container on your homelab host,
+This guide follows the pattern documented in `bin/deploy`. You end up
+with a long-lived ai-memory container on your homelab host,
 reachable on your LAN at `http://<host>:49374/mcp`, configured with
 your LLM/embedding API keys, with backups handled by whatever you
 already use for `/var/opt/docker/...`.
@@ -30,7 +30,7 @@ stripped, and are gitignored.
 | `docker/.env.production.example` | `docker/.env.production` | LLM + embedding API keys |
 
 `.gitignore` excludes the live files. If you ever see one staged,
-something has drifted - unstage before committing.
+something has drifted; unstage it before committing.
 
 ## First-time setup (one-time)
 
@@ -107,27 +107,27 @@ middleware validates with a constant-time comparison.
 **Encrypted transport.** Plain HTTP on the LAN means anyone with a
 packet capture can read the bearer token (and native `aim_` keys once
 multi-user mode is on) in transit. Add a TLS-terminating reverse
-proxy in front of ai-memory — Caddy with Let's Encrypt, Caddy with
-its internal CA, Cloudflare Tunnel, nginx, or external cert files —
+proxy in front of ai-memory (Caddy with Let's Encrypt, Caddy with
+its internal CA, Cloudflare Tunnel, nginx, or external cert files)
 when you bind beyond loopback or turn on multi-user.
 
 **See [`docs/https-via-proxy.md`](https-via-proxy.md)** for the full
 deployment guide, including:
 
-- When to add TLS and when to skip it (the loopback + stdio cases honestly don't need it).
+- When to add TLS and when to skip it (the loopback + stdio cases don't need it).
 - Copy-paste docker compose templates in [`docker/compose.tls.caddy.yml`](../docker/compose.tls.caddy.yml) and [`docker/compose.tls.cloudflared.yml`](../docker/compose.tls.cloudflared.yml).
 - Per-OS trust-store install for the internal-CA path (the load-bearing manual step).
 - [Hosting under a subpath](https-via-proxy.md#hosting-under-a-subpath) via `--base-path` / `AI_MEMORY_BASE_PATH` when ai-memory shares a hostname with other apps.
-- The explicit "what can go wrong" sections so you don't ship security theatre by accident.
+- The "what can go wrong" sections, so you don't ship security theatre by accident.
 
 For the single-user-on-loopback Quick Start, the bearer token alone
-remains acceptable — the token is what stops the LAN neighbour, and
-loopback is what stops the packet capture. TLS earns its keep once
-the deployment shape stops being "single user, single machine."
+remains acceptable: the token stops the LAN neighbour, and loopback
+stops the packet capture. Add TLS once the deployment is no longer
+"single user, single machine."
 
 ## Routine deploys
 
-After the first-time setup, every subsequent deploy is just:
+After the first-time setup, every later deploy is:
 
 ```bash
 bin/deploy
@@ -140,8 +140,8 @@ new copy + re-run `bin/deploy`.
 
 The restart step stops the running container with SIGTERM. The server
 handles SIGINT and SIGTERM on both transports and bounds each wait in
-its shutdown path at five seconds, so a restart — or a plain `docker
-stop` or `docker compose down` — drains and exits in a few seconds
+its shutdown path at five seconds, so a restart (or a plain `docker
+stop` or `docker compose down`) drains and exits in a few seconds
 instead of waiting out the supervisor's grace period and ending in
 SIGKILL. Before those handlers existed the two deployment shapes failed
 differently. In the container the server is PID 1, and for PID 1 the
@@ -149,7 +149,7 @@ kernel discards a signal whose handler is not installed, so `docker
 stop` burned its full grace period and `docker kill` was the only way
 out. Under the native systemd unit the server is not PID 1, so
 `systemctl stop` fell through to the kernel's default disposition and
-killed it instantly instead — fast, but with no drain and the durable
+killed it instantly instead: fast, but with no drain and the durable
 SessionEnd consolidation worker cut off mid-flight. There the stop is
 now slower and clean. The five-second bound is fixed and not
 configurable. `docker kill` remains the way to stop the server without
@@ -171,8 +171,8 @@ with the new values. No rebuild needed.
 ## LLM provider choices
 
 The `.env.production.example` defaults to **Kimi 2.6 via OpenRouter**
-(openai-compat transport, $0.73/$3.49 per million tokens). Reasonable
-alternatives:
+(openai-compat transport, $0.73/$3.49 per million tokens). Other
+options:
 
 | Provider | Model | Approx. cost / consolidation | Notes |
 |---|---|---|---|
@@ -185,7 +185,7 @@ alternatives:
 | openai-compat (Ollama) | `qwen3:32b` | $0 | Self-hosted. Set `AI_MEMORY_LLM_BASE_URL=http://host.docker.internal:11434/v1`. Quality depends on the model. |
 
 > **What we don't recommend:** reasoning-mode models (Kimi-K2.6 in reasoning mode,
-> Claude with extended thinking, GPT-o3, Gemini "thinking" variants) — they burn
+> Claude with extended thinking, GPT-o3, Gemini "thinking" variants). They burn
 > token budget on internal reasoning before emitting output and hang or emit empty
 > responses with the strict-JSON consolidation prompt. If you must use one, turn
 > reasoning off. For a vLLM / SGLang-hosted Qwen3-class model the local equivalent
@@ -248,16 +248,16 @@ and models), see [`docs/backup.md`](backup.md) and the worked example under
 
 ## Sharing one server between people or harnesses
 
-A deployed server is the supported way to share a project — between teammates,
-or between several harnesses you run yourself. Two things are worth knowing
+A deployed server is the supported way to share a project, whether between
+teammates or between several harnesses you run yourself. Check two things
 before you hand out the URL.
 
 **One server per data directory.** Point two `ai-memory serve` processes at the
 same `data/` (a synced folder, an NFS mount, two containers on one volume) and
 they will each run their own writer and their own git handle on the wiki. SQLite
 survives it; the wiki and the in-process state do not. Run one server and let
-everyone connect to it — which is also what makes the shared-knowledge model
-work.
+everyone connect to it, which is also what the shared-knowledge model relies
+on.
 
 **Check the isolation mode.** Unscoped MCP calls resolve "current project"
 through a pointer that, since v1.39, is keyed per caller. The startup line says
@@ -268,15 +268,14 @@ active-project isolation mode mode=PerActor …
 ```
 
 `PerActor` is the default and the one you want on a shared server. `Single` is
-a single process-wide slot — fine for one harness, but concurrent sessions then
-share it, and unscoped **writes** resolve through it too. See
+a single process-wide slot. That is fine for one harness, but concurrent sessions
+then share it, and unscoped **writes** resolve through it too. See
 [auto-scope.md](auto-scope.md) and [users.md](users.md#running-for-a-team).
 
 ### How much load one server absorbs
 
-Every write goes through a single writer actor — the right design for SQLite,
-and the obvious question it raises is when that becomes the ceiling. Measured
-rather than estimated, with
+Every write goes through a single writer actor, which suits SQLite but sets a
+ceiling. These figures were measured, not estimated, with
 `cargo test -p ai-memory-store --test writer_throughput -- --ignored --nocapture`:
 
 | concurrent writers | throughput | mean latency |
@@ -286,11 +285,9 @@ rather than estimated, with
 | 32 | 698/s | 1.43 ms |
 | 128 | 700/s | 1.43 ms |
 
-Read it in two parts.
-
 **The ceiling is ~700 writes/second**, reached around 32 concurrent writers and
-flat from there — 128 writers produce the same throughput at the same latency.
-Past saturation the server applies backpressure instead of degrading: the queue
+flat from there: 128 writers produce the same throughput at the same latency.
+Past saturation the server applies backpressure instead of degrading. The queue
 is bounded at 1024 with an awaiting send, so a burst larger than the queue slows
 its producers down and still lands every write. Nothing is dropped, and nothing
 grows without limit.
@@ -301,14 +298,14 @@ which is why throughput rises 17× while per-write latency *falls*.
 
 For capacity planning: an actively working agent emits on the order of one
 lifecycle write per tool call. Even at a pessimistic one tool call per second
-per agent, ~700/s is several hundred concurrently active agents — far beyond a
-team, and beyond most shared installs. The writer is not the thing that will
+per agent, ~700/s is several hundred concurrently active agents, far beyond a
+team and beyond most shared installs. Something other than the writer will
 break first.
 
 Two caveats before you lean on the numbers. They were taken on a fast local
 disk; because the cost is `fsync`, a network filesystem or a slow volume will
 be materially lower, which is another reason to keep the data dir on local
-storage. And they measure the store, not the HTTP front door — an install that
+storage. They also measure the store, not the HTTP front door; an install that
 saturates this is far more likely to be limited by the agent side than by
 SQLite.
 
@@ -332,25 +329,25 @@ does:
 ssh "$SERVER" "docker exec ai-memory /usr/local/bin/ai-memory compact --confirm"
 ```
 
-Compaction deletes nothing — it rebuilds the FTS indexes and `VACUUM`s.
+Compaction deletes nothing. It rebuilds the FTS indexes and `VACUUM`s.
 
 ### Do not schedule an unconditional nightly VACUUM
 
-The obvious move is a nightly cron entry. Resist it:
+Avoid a nightly cron entry for it:
 
 - `VACUUM` takes an **exclusive lock** and rewrites the entire database. Every
-  write blocks for the duration, which on a large store is minutes — and this
-  server's job is answering hook traffic, so blocking writes drops captures.
+  write blocks for the duration, which on a large store is minutes. This
+  server answers hook traffic, so blocking writes drops captures.
 - It needs free disk space of roughly the database's own size, so the nightly
   job also sets a permanent floor on free space.
 - Because SQLite reuses free pages, a store in steady use usually has almost
   nothing to reclaim. The nightly run pays the full cost for no benefit on most
   nights.
 
-The case that genuinely leaves a large freelist is a **one-off deletion** — a
+What leaves a large freelist is a **one-off deletion**: a
 `purge-project`, a big retention sweep, a `forget-sweep` over months of
-episodic pages. Those are events, not a schedule, and the destructive commands
-already offer `--compact` inline for exactly that moment.
+episodic pages. Those happen once rather than on a schedule, and the
+destructive commands already offer `--compact` inline for that moment.
 
 If you do want it automated, make it **conditional** on the figure above and
 put it in off hours:
@@ -377,8 +374,8 @@ every night.
 
 It is not erasure. The wiki git history keeps page content in its objects and
 commit messages, and any backup taken earlier still holds everything. Compaction
-returns bytes from the live SQLite file — worth doing on its own terms, and not
-a guarantee that content is unrecoverable. See
+returns bytes from the live SQLite file. That is worth doing on its own terms,
+but it does not guarantee that content is unrecoverable. See
 [lifecycle-ops.md](lifecycle-ops.md) for the full boundary.
 
 ## Rolling back
@@ -429,7 +426,7 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
   the rebuild. Scheduled embedding backfill can also fill missing
   rows when enabled.
 - **Capture looks delayed, or observations are missing**: `ai-memory
-  status` reports local hook-spool health — how many events are queued
+  status` reports local hook-spool health: how many events are queued
   client-side, the age of the oldest one, and the total failed-delivery
   attempts:
 
@@ -445,11 +442,10 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
   once it is reachable. `pending: 0` means capture is keeping up.
 
   The spool is **client-side**, so this section reflects the machine you
-  run the command on, not the server — it is the local data dir even when
+  run the command on, not the server. It is the local data dir even when
   `AI_MEMORY_SERVER_URL` points at a homelab. It is also printed when the
   server cannot be reached at all (to stderr, so `--json` consumers still
-  get a single object on stdout), which is precisely when a backlog is
-  worth seeing. `--json` carries the same numbers under a `spool` object
+  get a single object on stdout), which is when a backlog matters most. `--json` carries the same numbers under a `spool` object
   (`pending`, `oldest_age_ms`, `retries_total`).
 
 - **Provider failures**: `ai-memory status` reports passive LLM and
@@ -460,7 +456,7 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
   TLS-inspecting firewall or antivirus, see
   [https-via-proxy.md](https-via-proxy.md#outbound-llm-calls-fail-behind-a-tls-inspecting-firewall).
 - **Container restart loop**: check
-  `docker logs ai-memory` - the `ai-memory starting` line at the top
+  `docker logs ai-memory`. The `ai-memory starting` line at the top
   reports the resolved config; a missing required env var (e.g.
   `LLM_API_KEY` with `openai-compat` selected but no model) will fail
   here with a clear error.

@@ -4,15 +4,15 @@
 > frontends against an `ai-memory` server. Added in **v0.6.0** (PR #7).
 > Everything below is sourced from the actual route handlers in
 > `crates/ai-memory-web/src/routes/api.rs` and the response structs in
-> `crates/ai-memory-store/src/reader.rs` — keep them as the canonical
+> `crates/ai-memory-store/src/reader.rs`. Treat those files as the canonical
 > reference if anything here drifts.
 
 ## 1. What this surface is (and isn't)
 
 | | What you can do | What you can't do |
 |---|---|---|
-| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction** — the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
-| `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy — use same-origin hosting or configure CORS deliberately (see §9). |
+| `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages; list a project's sessions and read one session's raw observations. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction**: the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
+| `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy. Use same-origin hosting or configure CORS deliberately (see §9). |
 
 ## 2. Auth model
 
@@ -207,7 +207,7 @@ on disk (the body is read from the markdown file at request time).
 
 ### 4.5 Search
 
-Two forms — query-string for the common single-scope or global case,
+Two forms: query-string for the common single-scope or global case, and a
 JSON body for multi-scope.
 
 ```http
@@ -255,7 +255,7 @@ Rules:
   top-level `workspace`/`project`.
 - `snippet` contains FTS5 HTML markers (`<mark>…</mark>`) around the
   matched terms.
-- `rank` is FTS5 rank — **lower is better** (closer to query terms).
+- `rank` is FTS5 rank; **lower is better** (closer to query terms).
 
 ### 4.6 Recent
 
@@ -315,7 +315,7 @@ parameter retain the legacy array, descending order and cache behavior.
 GET /api/v1/workspaces/{workspace}/projects/{project}/briefing?limit=10
 ```
 
-Same payload `memory_briefing` returns — counts + activity windows +
+Same payload `memory_briefing` returns: counts + activity windows +
 last-observation + open handoffs + `_rules/` + `_slots/` + N most-recent
 pages. No LLM, deterministic.
 
@@ -355,7 +355,7 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs?all_owners=true
 `state` accepts `open` | `accepted` | `expired`; omit it to list every state,
 which is how you find a baton that was already consumed. Results are scoped by
 owner: an authenticated caller sees their own plus the shared handoffs, an
-anonymous browser sees only shared ones — an owned handoff (and the prompt-
+anonymous browser sees only shared ones. An owned handoff (and the prompt-
 derived text inside it) is never rendered to someone it does not belong to.
 The same scoping applies to the `handoff` field of both overview endpoints and
 to `pending_handoff_count`, so the count and the fetch always agree.
@@ -363,8 +363,8 @@ For recovery, a root-authorized request may pass `all_owners=true` to list all
 operators' rows. User and anonymous requests receive `403`; the default remains
 own plus shared, including for root.
 
-On a server that authenticates, the listing's prompt-derived fields —
-`summary`, `open_questions`, `next_steps` — are served to a caller the server
+On a server that authenticates, the listing's prompt-derived fields
+(`summary`, `open_questions`, `next_steps`) are served to a caller the server
 can name and to the root operator; an automatic handoff synthesises them
 verbatim from the operator's prompts, and the listing returns the project's
 whole history rather than the single newest open row. A caller that is neither
@@ -379,7 +379,7 @@ one, otherwise the username. An ingress that terminates OIDC and forwards both
 `X-Memory-Actor-Issuer` and `X-Memory-Actor-Sub` therefore reads its own
 handoffs and the shared ones with `redacted: false`, and no rung of the auth
 chain produces an
-authenticated-but-unnameable caller today — the redacting arm is a fail-safe
+authenticated-but-unnameable caller today. The redacting arm is a fail-safe
 floor, not a live tier. `owner` / `accepted_by` carry the qualified storage key
 (`user:alice`, `oidc:<issuer-byte-length>:<issuer><subject>`).
 
@@ -442,7 +442,7 @@ either response, `handoff` is `null` when no open handoff matches the scope:
 }
 ```
 
-> Note: `handoff` is **not** consumed by the read API — the
+> Note: `handoff` is **not** consumed by the read API. The
 > handoff stays "open" and can still be accepted by the next agent.
 
 ### 4.9 Cross-project graph
@@ -482,8 +482,8 @@ GET /favicon.ico
 Returns the same transparent PNG the built-in web UI serves as the
 header logo. Browsers fetch this path automatically. The route is
 present whenever the web UI is enabled (`--enable-web`) and is
-mounted at the absolute host root — outside `--base-path` and outside
-the `/web` nest — so the browser's automatic fetch reaches it even
+mounted at the absolute host root, outside `--base-path` and outside
+the `/web` nest, so the browser's automatic fetch reaches it even
 under a subpath deployment. The response is `image/png` despite the
 `.ico` URL (modern browsers accept PNG icons), and the route is
 **exempt from authentication and host allowlist**: a fresh tab can fetch the
@@ -673,8 +673,8 @@ characters (`[A-Za-z0-9-._~]`). Three things collapse the prefix to
 downgrade in the log:
 
 - `.` or `..` segments. Their characters are unreserved on their own,
-  but at the segment boundary they mean "current" and "parent" — one
-  typo and your prefix is a traversal vector.
+  but at the segment boundary they mean "current" and "parent", so a
+  single typo would turn your prefix into a traversal vector.
 - Any character outside the unreserved set (spaces, `<`, `"`, etc.).
 - Empty / whitespace-only input.
 
@@ -684,7 +684,7 @@ client-side and never reach the server.
 
 When `--web-ui-dir` is **absent**, the built-in server-side `/web`
 browser is the default (read-only HTML rendering, FTS5 search,
-project tree). No regression.
+project tree), unchanged from before.
 
 ## 7. Worked example: minimal SPA fetch
 
@@ -781,7 +781,7 @@ Read these:
 ## 9. CORS
 
 `/api/v1` accepts cross-origin requests when the operator configures
-the allow-list. The CORS layer is scoped to that router only — `/mcp`,
+the allow-list. The CORS layer is scoped to that router only; `/mcp`,
 `/hook`, `/admin/*`, and `/web` stay same-origin.
 
 Configure via either `--cors-allow-origin <origin>` (repeatable) on
@@ -799,7 +799,7 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
 
 ## 10. Known gaps and deliberate non-goals
 
-- **No write surface, by design — not a pending iteration.** Browsers
+- **No write surface, by design.** This is not a pending iteration: browsers
   can't mutate, and won't. The wiki is a record of what a project
   produced, authored by automated summarisation over captured
   observations; retrieval, provenance and the audit trail all rest on
@@ -808,12 +808,12 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
   "what did someone want it to say", with no way to tell the two apart
   afterwards.
 
-  This is not a ban on human input. `memory_write_page` exists for
+  Human input is still allowed. `memory_write_page` exists for
   durable human annotations and lands them in the same lineage as
   everything else (pages supersede on body change). The line is between
   adding to the record through the normal path and editing it from
   outside. A human-editable wiki is a reasonable thing to want and a
-  separate product — see #482.
+  separate product; see #482.
 - **Rate limiting** is shared with `/mcp` + `/admin` (only the body
   cap is enforced today). A future global limiter would tighten the
   authenticated-misbehaviour case.

@@ -6,18 +6,23 @@
 [`AI_MEMORY_RERANKER=llm`](llm-providers.md) reorders `memory_query`
 candidates with the configured chat provider. That works until the provider
 is a hosted reasoning model: the reranker prompt is long, a graded judgement
-over up to 30 candidates, and a slow model answers in tens of seconds —
-longer than one `memory_query` should ever take, and long enough to trip the
+over up to 30 candidates, and a slow model answers in tens of seconds.
+That is longer than one `memory_query` should ever take, and long enough to trip the
 server's completion timeout, which turns the reranker into a dead feature
 that stalls every query before falling back to the original order.
 
 The reranker prompt, though, is already a scoring rubric: grade each
 candidate 1.0 (direct answer) / 0.7 (same topic) / 0.3 (tangential) /
 0.0 (unrelated). A judge endpoint that scores a fixed rubric answers the
-same question without autoregressive decoding. The adapter in
-[`docs/examples/jev-reranker-adapter/jev_rerank_shim.py`](examples/jev-reranker-adapter/jev_rerank_shim.py)
-sits between ai-memory and the provider, translates exactly that request
-into one batched Jev `score` call, and proxies everything else unchanged.
+same question without autoregressive decoding. The rubric adapter
+described here sits between ai-memory and the provider, translates exactly
+that request into one batched Jev `score` call, and proxies everything else
+unchanged. Its script, `jev_rerank_shim.py`, is no longer in the tree (it
+was removed in commit `e45db18a`; recover it with
+`git show 311fe87f:docs/examples/jev-reranker-adapter/jev_rerank_shim.py`).
+The adapter that ships under
+[`docs/examples/jev-reranker-adapter/`](examples/jev-reranker-adapter/) is
+the [choice-contrastive variant](#choice-contrastive-variant).
 
 ## How it works
 
@@ -37,8 +42,8 @@ configuration; it splits traffic by request shape:
 3. Each answer's rubric index maps back to `relevance` 0.0 / 0.3 / 0.7 /
    1.0 (index / 3), and the adapter returns
    `{"scores": [{"candidate": n, "relevance": f}]}` as plain chat-completion
-   content — the exact shape the reranker's tolerant parser expects.
-4. Every other request — consolidation, lint, bootstrap, plain chats — is
+   content, which is the exact shape the reranker's tolerant parser expects.
+4. Every other request (consolidation, lint, bootstrap, plain chats) is
    reverse-proxied to the real upstream byte-for-byte, `Authorization`
    forwarded verbatim. The adapter stores no secrets.
 
@@ -46,6 +51,15 @@ Failure semantics match the server contract: if the Jev call fails, the
 adapter answers HTTP 500 and ai-memory keeps its own candidate order, the
 same as any provider outage. A judge endpoint that is down degrades to
 "no reranking", never to "no search".
+
+The choice variant also fails closed on a *malformed* answer: an HTTP 200
+whose `probabilities` object is missing, renamed, short of candidates,
+padded with extras, or holds booleans, NaN/Inf, out-of-range numbers, or a
+distribution nowhere near normalised is rejected with 500 as well. The
+older shim defaulted those to `0.0`, which produced a well-formed but
+meaningless score set the server could not distinguish from a real
+judgement. `test_jev_rerank_shim_choice.py` (stdlib `unittest`, no backend
+needed) pins each rejection path.
 
 One cosmetic note: the server logs still show the provider's configured
 model name for reranking (it comes from provider config, not from the
@@ -72,7 +86,7 @@ Description=ai-memory Jev reranker adapter
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/ai-memory/ops/jev_rerank_shim.py
+ExecStart=/usr/bin/python3 /opt/ai-memory/ops/jev_rerank_shim_choice.py
 Environment=JEV_URL=http://127.0.0.1:18095/v1/systemone
 Environment=UPSTREAM=http://127.0.0.1:8000
 Environment=LISTEN=127.0.0.1:18097
@@ -91,13 +105,14 @@ AI_MEMORY_LLM_BASE_URL=http://127.0.0.1:18097/v1
 AI_MEMORY_RERANKER=llm
 ```
 
-To run the choice-contrastive variant instead, point `ExecStart` at
-`jev_rerank_shim_choice.py`; reranker requests then log
-`jev-choice N candidates in X.XXXs`. Everything else (env, unit,
-provider config) is identical.
+The unit runs the shipped choice-contrastive variant. To run the rubric
+adapter instead, recover `jev_rerank_shim.py` from git history and point
+`ExecStart` at it. Everything else (env, unit, provider config) is
+identical.
 
 Verify the split with `journalctl -u <unit>`: reranker requests log
-`jev N candidates in X.XXXs`, everything else is silent (proxied).
+`jev-choice N candidates in X.XXXs` (the rubric adapter logs
+`jev N candidates in X.XXXs`), everything else is silent (proxied).
 
 ## Benchmarks
 
@@ -125,7 +140,7 @@ max 3.07 s), 110/110 rerank translations served, 0 adapter failures. The
 gap to the offline arm is candidate-pool shape, not scoring: the live
 server over-fetches 15–30 candidates with its own bounded snippets (the
 offline arm rescored a fixed top-10 pool), and in 32 of 34 non-top-1
-queries the expected page was still returned — mostly at rank 2 — with
+queries the expected page was still returned, mostly at rank 2, with
 hit@5 at 0.949. Versus the no-reranker baseline that is +16.2 points
 hit@1 and +10.4 points NDCG@10 end to end.
 
@@ -147,7 +162,7 @@ On a 30-candidate pool that wording moved the 35B from 0.828 to 0.879 hit@1
 below is the earlier choice-versus-rubric comparison, not that wording test.
 
 That is deliberately the substitution the caveat below used to warn about.
-It is sound here because the reranker's consumer is **sort-only**: the
+It is sound here because the reranker's consumer is sort-only: the
 server reorders candidates by `relevance` and never thresholds or sums its
 absolute value, and a per-question monotonic map preserves order exactly.
 The old warning applies to consumers that *read* absolute relevance
@@ -175,7 +190,7 @@ judge, the choice adapter is the difference between usable and not.
 
 Prefer the choice adapter when the reranker leg is the only consumer.
 Keep the rubric adapter if anything downstream reads absolute relevance
-grades (thresholding, logging heuristics, score fusion) — choice
+grades (thresholding, logging heuristics, score fusion), because choice
 probabilities carry no absolute meaning and their scale shifts with
 candidate count.
 

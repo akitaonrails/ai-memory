@@ -50,8 +50,8 @@ ai-memory-wikisync sync ... --apply --propagate-deletes
 
 - `plan` never writes, not even the state file.
 - `export --apply` writes/updates markdown files under `--dest` and prints
-  the `git add` / `git commit` / `git push` commands you may run yourself —
-  the tool never runs git, never commits, never pushes.
+  the `git add` / `git commit` / `git push` commands you may run yourself.
+  The tool never runs git, never commits, and never pushes.
 - `--include FAMILY` is a strict, explicit allowlist of top-level wiki
   directories (`_rules`, `decisions`, …). At least one is required and a
   bare `*` is refused: only what you name is exported.
@@ -80,7 +80,7 @@ which are also valid YAML. A sync sends these fields back with every import,
 because the tool clears whatever a write omits. Server-generated keys
 (`type`, `generated`, `last_modified_by`) never reach the repository.
 
-All local bookkeeping lives in **one** state file,
+All local bookkeeping lives in one state file,
 `.ai-memory-wikisync/state.json` (mode 0600, atomically replaced after
 each successful write batch): per page, the SHA-256 of the bytes last
 written plus the server `ETag` and version id observed at that write.
@@ -110,16 +110,16 @@ This section describes `plan` and `export`; `sync` adds the rules under
   `--dest`; case-fold collisions are refused; symlinked destinations,
   symlinked components and symlinked state directories are refused; files
   are replaced atomically (tmp + rename + fsync).
-- **Local edits win until forced.** Each page is classified three ways —
+- **Local edits win until forced.** Each page is compared three ways:
   destination file, last exported state, server body. A file that
-  diverged from both is reported with a diff summary and **refused**; the
-  whole batch is refused, nothing is written. `--force` overwrites the
+  diverged from both is reported with a diff summary and refused; the
+  whole batch is then refused and nothing is written. `--force` overwrites the
   divergent files with server content.
 - **Never deletes.** `plan` and `export` never delete local files or server
   pages, including brand-new local files inside an allowlisted family.
   Only `sync --propagate-deletes` deletes (see below).
-- **Untrusted content.** Page bodies are data: transported verbatim,
-  never executed, never rendered, never interpreted. Paths that would
+- **Untrusted content.** Page bodies are data. They are transported
+  verbatim and never executed, rendered, or interpreted. Paths that would
   escape `--dest` are refused.
 
 ## Two-way sync

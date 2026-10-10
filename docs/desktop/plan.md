@@ -6,7 +6,7 @@
 
 ## What the research changed vs the RFC
 
-RFC #878's headline — "connection is solved, capture is the crux" — still
+RFC #878's headline, "connection is solved, capture is the crux", still
 holds, but two of its premises moved:
 
 1. **"Most desktop chat apps expose no hook/event surface"** is now false
@@ -18,7 +18,7 @@ holds, but two of its premises moved:
    in the payload. The truly hookless set is now: Claude Desktop Chat tab,
    hosted ChatGPT chat, Grok Bot.
 2. **"Claude Desktop .mcpb bundle"** as the Phase-1 one-click route:
-   re-validated 2026-10-08 — Anthropic's support article presents `.mcpb`
+   re-validated 2026-10-08. Anthropic's support article presents `.mcpb`
    desktop extensions as the main way to install a local MCP server in the
    desktop app. Plugins (marketplace; can bundle MCP servers + hooks) are
    the Code tab's extension surface.
@@ -28,7 +28,7 @@ holds, but two of its premises moved:
 Status 2026-10-08: docs done, verification mostly done; results in
 [`verification-2026-10.md`](verification-2026-10.md).
 
-1. Update `docs/mcp-install.md`: **done** — Linux beta and its config path
+1. Update `docs/mcp-install.md`: **done**. Covers the Linux beta and its config path
    (with the `--config-file` the CLI needs there), the Code tab's capture
    through Claude Code hooks, `.mcpb` status, the Cowork boundary.
 2. Live verifications (machine with the apps installed):
@@ -52,7 +52,7 @@ Status 2026-10-08: docs done, verification mostly done; results in
 
 ## Phase 1 — Antigravity IDE capture parity (smallest new-code step)
 
-The research's best new target — not the RFC's `.mcpb`:
+The research's best new target, ahead of the RFC's `.mcpb`:
 
 - Ensure `install-hooks --agent antigravity-cli` output also satisfies the
   IDE (same global file; verify; add `.agents/hooks.json` workspace install
@@ -69,11 +69,11 @@ The research's best new target — not the RFC's `.mcpb`:
 - Decide scratch-workspace routing: single `desktop/claude-scratch` project
   vs per-scratch projects with a `claude-desktop` tag (see
   `capture-and-dedup.md` §2). This is the only dedup work the research
-  found necessary — CLI↔Desktop handoffs keep one session id, so no
+  found necessary: CLI↔Desktop handoffs keep one session id, so no
   id-level dedup layer is needed.
 - Optional metadata enrichment from
   `~/.config/Claude/claude-code-sessions/**/local_*.json` (titles,
-  account/org) — strictly optional, closed-app internals.
+  account/org). Strictly optional, since these are closed-app internals.
 
 ## Phase 3 — explicit capture for hookless surfaces (RFC Phase 1, adjusted)
 
@@ -96,7 +96,7 @@ The research's best new target — not the RFC's `.mcpb`:
 
 - Hosted-ChatGPT plugin (remote MCP to a user-run server): real but a new
   distribution surface; needs published-plugin review requirements
-  (<https://developers.openai.com/plugins/deploy/app-review>) — separate
+  (<https://developers.openai.com/plugins/deploy/app-review>). Separate
   RFC if demand appears.
 - Watching Zed's native-agent database: fragile, version-locked; ACP
   agents already give us capture for free.
@@ -109,7 +109,7 @@ The research's best new target — not the RFC's `.mcpb`:
 
 1. Codex-in-app hook firing: engine verified; one in-app prompt left.
 2. Antigravity IDE honoring global hooks (Phase 0 verification).
-3. `.mcpb` vs plugins for Claude Desktop one-click: resolved — `.mcpb` is
+3. `.mcpb` vs plugins for Claude Desktop one-click: resolved. `.mcpb` is
    Anthropic's current route for local MCP servers in the desktop app.
 4. Scratch-workspace scoping product decision (Phase 2).
 5. Tray stack choice + Flatpak feasibility (Phase 4).

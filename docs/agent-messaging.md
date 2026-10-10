@@ -18,7 +18,7 @@ ever sees mail addressed **to** it (its inbox) or sent **from** it (its outbox).
 
 - A message is addressed to a **project**, not a person. Any session working in
   the recipient project can pop it. (Knowledge is shared; the pop is the
-  claim-once baton — the same rule handoffs follow.)
+  claim-once baton, the same rule handoffs follow.)
 - **Claim-once queue.** A message is `pending` until a session in the recipient
   project pops it (→ `claimed`, exactly once) or the sender cancels it
   (→ `cancelled`). A second pop of the same message returns nothing.
@@ -47,7 +47,7 @@ Four MCP tools (documented in the installed `ai-memory-messaging` skill):
 
 Kimi calls `memory_message_send` with `to_workspace: "default"`,
 `to_project: "project-b"`, and a self-contained `body`. Compose the body as a
-complete prompt — the recipient cannot see project A.
+complete prompt, because the recipient cannot see project A.
 
 **In Claude (project B), receiving:**
 
@@ -157,8 +157,8 @@ each message records who sent it for audit.
 ai-memory already gives a resuming agent a hot start: every agent's SessionStart
 hook (or, for clients that discard SessionStart output like Kimi, its first
 user-prompt hook) fetches `GET /handoff`, which returns any pending single-use
-**handoff** plus — when the project's `.ai-memory.toml` opts in with
-`[briefing] inject_on_session_start = true` — a compiled **project brief** of
+**handoff** plus, when the project's `.ai-memory.toml` opts in with
+`[briefing] inject_on_session_start = true`, a compiled **project brief** of
 pinned / `_rules/` / `_slots/` pages and recent-page pointers. That block is
 prepended to the new session's context automatically.
 
@@ -173,7 +173,7 @@ weigh, not instructions to obey.
 ```
 
 The notice carries only a count and the inbox's own server-side workspace and
-project names — never any message text — so it cannot be used to inject content
+project names, never any message text, so it cannot be used to inject content
 into a resuming agent. The names are there so a static client can pass them to
 the pop; if they cannot be looked up, the notice falls back to "this project's
 inbox". The count is also available on demand via `memory_briefing`

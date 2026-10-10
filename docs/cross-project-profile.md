@@ -3,8 +3,8 @@
 ai-memory keeps knowledge per project, so switching harness costs nothing:
 Claude Code, Codex and OpenCode in one checkout read the same pages. The
 **profile** removes the other cost, switching *project*. It is a small set of
-pages recording how you usually work — the package manager you reach for, how
-you lay out tests, the architecture you prefer, the review workflow you follow —
+pages recording how you usually work (the package manager you reach for, how
+you lay out tests, the architecture you prefer, the review workflow you follow),
 and every project receives it at session start, through every harness.
 
 When you start a new repository and describe what you want, the agent already
@@ -309,8 +309,8 @@ llm = true
   - `auto` (default): `global` on a single-operator server, `user` on a
     multi-user one.
 - **`min_projects`**: how many distinct projects a choice must appear in before
-  it joins the profile on its own (a choice you state as general — "in all my
-  projects" — needs only one).
+  it joins the profile on its own (a choice you state as general, such as "in all my
+  projects", needs only one).
 - **`inject_on_session_start`**: `false` keeps the digest out of session start;
   the profile still reaches `memory_query`.
 - **`digest_max_bytes`** / **`baseline_max_bytes`**: the digest budgets, in

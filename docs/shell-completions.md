@@ -3,7 +3,7 @@
 `ai-memory completions <shell>` prints a completion script to stdout for
 `bash`, `zsh`, `fish`, `powershell`, or `elvish`. The script is generated from
 the binary's own command tree, so it covers every subcommand and flag of the
-version that produced it — including nested commands like `user reset-password`,
+version that produced it, including nested commands like `user reset-password`,
 `api-key rotate`, and `auth login`.
 
 The Docker wrapper's `upgrade` command is wrapper-owned rather than part of the
@@ -27,8 +27,8 @@ mkdir -p ~/.config/fish/completions
 ai-memory completions fish > ~/.config/fish/completions/ai-memory.fish
 ```
 
-Fish loads that path lazily on first use — no shell restart, no `config.fish`
-edit.
+Fish loads that path lazily on first use, so you need neither a shell restart
+nor a `config.fish` edit.
 
 ### zsh
 
@@ -96,7 +96,7 @@ Then add `use ai-memory` to `~/.config/elvish/rc.elv`.
 
 The script is a snapshot of the command tree at the moment it was generated.
 Re-run the same command after upgrading `ai-memory` so completions pick up new
-subcommands and flags. Nothing is checked into the repository, precisely so a
+subcommands and flags. Nothing is checked into the repository, so a
 stale script cannot ship alongside a newer binary.
 
 Docker users can generate a script without a local install:

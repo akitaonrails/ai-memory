@@ -12,12 +12,12 @@ without one uses `project = basename($cwd)`. That works for a solo developer in
 `~/projects/<repo>` but breaks down
 for the cases this marker file is built for:
 
-- **Multi-client consultancies** with `~/projects/<client>/<repo>` —
+- **Multi-client consultancies** with `~/projects/<client>/<repo>`:
   every client should land in a dedicated workspace, not "default".
 - **Work / personal / open-source separation** for solo developers
   who want isolation by life context.
 - **Mono-repos** where you'd like all packages under one project
-  (instead of basename-of-each-package buckets) — or each package
+  (instead of basename-of-each-package buckets), or each package
   under its own project, your call.
 
 The marker file lets you declare these mappings without forking
@@ -265,7 +265,7 @@ falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
 `[profile]` keys is a settings boundary, like one with `[briefing]` keys.
 
 `default_global` and `inject_on_session_start` accept a truthy value
-(`true` / `1` / `yes` / `on`, quoted or bare — section-style keys are
+(`true` / `1` / `yes` / `on`, quoted or bare; section-style keys are
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
 
@@ -276,7 +276,7 @@ after the brief (see `docs/cross-project-profile.md`): the profile's entries
 are delivered as defaults the agent applies when the user and the
 repository's rules file say nothing. A hard rule that must hold in this
 repository whatever the defaults say still belongs in the agent's own rules
-file (`CLAUDE.md` / `AGENTS.md`), which takes precedence over memory — see the
+file (`CLAUDE.md` / `AGENTS.md`), which takes precedence over memory. See the
 "Rules, memory and the profile" guidance in `docs/usage.md`. Other `_global`
 pages stay reachable on demand through `memory_query`, which unions them.
 
@@ -295,7 +295,7 @@ others on a shared instance.
 
 ## Allowlist mode: the marker as an opt-in
 
-By default this file is optional — a repository without one is still captured,
+By default this file is optional: a repository without one is still captured,
 and the marker only *narrows* what is taken. An install can invert that:
 
 ```bash
@@ -303,8 +303,8 @@ ai-memory install-hooks --apply --capture-mode allowlist
 ```
 
 Under allowlist mode the presence of a `.ai-memory.toml` **is** the opt-in. A
-repository without one emits no lifecycle event at all — prompts, tool calls
-and session boundaries alike — dropped in the hook process before anything
+repository without one emits no lifecycle event at all. Prompts, tool calls
+and session boundaries alike are dropped in the hook process before anything
 reaches the local spool or the wire. No extra key is needed: an existing marker
 already opts its repository in, whatever else it configures.
 
@@ -317,7 +317,7 @@ The mode is stored per install rather than per agent, and a later bare
 `install-hooks --apply` (including an upgrade refresh) leaves it in place.
 
 It is enforced both by native `ai-memory hook` commands and by the generated
-TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`, `openclaw`) —
+TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`, `openclaw`);
 each bakes the selected mode in and carries the same marker-presence gate
 before it ever POSTs. Only the raw script-fallback paths (the
 `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper, and
@@ -459,9 +459,9 @@ out of capture:
 ignore_paths = ["private/**", "~/personal-notes/**"]
 ```
 
-A repository that keeps its decision records in the tree — an ADR directory,
+A repository that keeps its decision records in the tree (an ADR directory,
 a [Keep the Why](https://github.com/oliver-zehentleitner/keep-the-why)
-`context/` tree — belongs here too: `ignore_paths = ["docs/adr/**"]` or
+`context/` tree) belongs here too: `ignore_paths = ["docs/adr/**"]` or
 `["context/**"]`. The repo owns that record; without the exclusion an agent's
 read of it is captured and consolidation compiles it into wiki pages that do
 not follow the repo, so the copy is stale the moment the record is superseded
@@ -600,7 +600,7 @@ Stop/assistant-message capture is disabled by default and never persisted; it is
 available only through the explicit double opt-in described in the install guide
 (`install-hooks --capture-assistant` on the client plus `capture_assistant` on
 the server), where the excerpt is sanitized on both sides and capped. It is not
-gated by this marker file — assistant text is not path-attributable, so a
+gated by this marker file: assistant text is not path-attributable, so a
 `.ai-memory.toml` cannot narrow it. The metadata header is closed; the
 PostToolUse response/error excerpt remains the existing bounded content capture.
 Capture exclusions are evaluated only where paths have a proven schema, so they
@@ -666,8 +666,8 @@ This means it works even when the worktree directory lives **outside**
 the main repo tree (some tools keep worktrees in a separate directory,
 so the worktree has no `.ai-memory.toml` ancestor of its own) and even
 when the server runs in a container that cannot see the host checkout.
-Put the marker anywhere on the walk-up path from the worktree — commonly
-a single `~/.ai-memory.toml` — to select the strategy.
+Put the marker anywhere on the walk-up path from the worktree (commonly
+a single `~/.ai-memory.toml`) to select the strategy.
 
 ### Repository identity
 
@@ -685,9 +685,9 @@ with each event. The first rung that yields one wins:
 4. the folder name.
 
 Only rungs 1 and 3 change routing. A declared `project` routes by name as it
-always has — a statement outranks the remote, so a fork whose marker names
-its own project is never filed under the repository it forked from — and a
-bare folder name routes exactly as before. What routes by identity is an
+always has, because a statement outranks the remote: a fork whose marker names
+its own project is never filed under the repository it forked from. A bare
+folder name routes exactly as before. What routes by identity is an
 undeclared checkout with a remote, or a checkout with an explicit
 `identity`:
 
@@ -721,7 +721,7 @@ repository path without the host, with `/` written as `-`
 `https://gitlab.com/acme/group/api.git` → `acme-group-api`), so every
 worktree and clone agrees on the name. Only the name changes: captures still
 route by the full identity (`github.com/acme/api`), and the style rides along
-only with a remote identity — a declared `project` or `identity` keeps its
+only with a remote identity. A declared `project` or `identity` keeps its
 own name.
 
 - **Existing projects keep their UUID.** Reads by the canonical path name or
@@ -731,8 +731,8 @@ own name.
   every other dependent row remain attached to the same UUID. The v2 basename
   remains readable through v3.
 - **Another forge is never merged in.** When the path name is already held by
-  a different repository — typically the same path on another forge
-  (`gitlab.com/acme/api` after `github.com/acme/api`) — the newcomer falls
+  a different repository (typically the same path on another forge,
+  `gitlab.com/acme/api` after `github.com/acme/api`), the newcomer falls
   back to the name it would get without the style.
 - Local marker aliases and operator-home identity/path routes keep their
   documented precedence over the default and remain available for migration or
@@ -794,14 +794,14 @@ ai-memory install-hooks --apply --agent claude-code --project-strategy repo-root
 ```
 
 Every session for that install then resolves its project from the main git
-repo root — so an agent that runs `mkdir sub && cd sub` and stays there no
+repo root, so an agent that runs `mkdir sub && cd sub` and stays there no
 longer forks the rest of the session into a phantom project named `sub`.
 
 This is **install-time config**, written into the agent's hook command (and
-the generated OpenCode / OMP / Pi / OpenClaw plugins) — the same status as the
+the generated OpenCode / OMP / Pi / OpenClaw plugins), with the same status as the
 `AI_MEMORY_AUTH_TOKEN` / `AI_MEMORY_HOOK_URL` it sits beside, *not* a user-set
 runtime override (which was deliberately rejected in #16). The flag accepts
-`basename` (the new-install default — bakes nothing) or `repo-root`. A later
+`basename` (the new-install default, which bakes nothing) or `repo-root`. A later
 `install-hooks --apply` without the flag preserves the value already baked into
 ai-memory's hooks; pass `--project-strategy basename` explicitly to remove it.
 
@@ -842,23 +842,31 @@ Two guarantees hold in **both** modes:
   name while honoring a declared one. A client older than v1.27 sends no
   provenance, and its overrides stay authoritative.
 - **Broad anchors never stick.** A session rooted at `/` or at `$HOME` is not
-  a meaningful anchor, so it never captures events beneath it — otherwise one
+  a meaningful anchor, so it never captures events beneath it. Otherwise one
   stray session started in `$HOME` would fold every project into a single
   bucket.
 
 Session-creating events are unaffected in both modes: opening a session in a
 plain non-git folder still names the project after that folder.
 
-Some harnesses keep reporting the parent session's cwd when a subagent uses a
-file tool in another checkout. Native `ai-memory hook` commands compensate for
-that case before applying `follow-cwd` or `sticky`: a fixture-backed file-tool
-schema with absolute target paths is routed from the target when every path
-proves the same repository or marker boundary. The destination's capture
-policy and `server` profile are authoritative, so a cross-project call cannot
-use the source repository's policy or credentials. Relative paths,
-mixed-project calls, unknown schemas, and absolute paths outside a recognized
-repository/marker keep the payload cwd. Free-form shell commands are not
-reinterpreted as project routing instructions. This changes raw observation
+Some harnesses report a cwd other than where a tool ran: a subagent keeps its
+parent session's cwd while using a file tool in another checkout, and Hermes
+Agent always reports its own process directory (usually `~`) while each tool
+call names its repository through `workdir` or `path`. Native `ai-memory hook`
+commands compensate before applying `follow-cwd` or `sticky`: a tool call's
+absolute location (a fixture-backed file tool's target paths, a search/list
+tool's explicit `path`, or a shell command's structured `workdir`) routes the
+event when every path proves the same repository or marker boundary. That
+destination's marker decides allowlist admission, and its capture policy and
+`server` profile apply, so a cross-project call cannot use the source
+repository's credentials. The source's exclusions still bind: if the payload
+cwd's own `ignore_paths` would drop the event (a pattern can name a path
+outside its checkout, and a command can name a source file while its `workdir`
+points elsewhere), the event is not rerouted and that exclusion drops it.
+Relative paths and workdirs, mixed-project calls, unknown schemas, and absolute
+paths outside a recognized repository/marker keep the payload cwd. Free-form
+shell command text is never reinterpreted as a project routing instruction;
+only the structured `workdir` field counts. This changes raw observation
 attribution only; the session row and its compiled session page remain in the
 project where the session began.
 
@@ -876,14 +884,14 @@ Both entry points, as of v1.20:
 - **Lifecycle hooks** forward the marker's fields to the server on every
   event, so session captures land in the declared scope.
 - **Client CLI commands** resolve `(workspace, project)` locally before
-  calling the server — `run`, `bootstrap`, `search`, `read-page`,
+  calling the server: `run`, `bootstrap`, `search`, `read-page`,
   `write-page`, `lint`, `curator`, `embed`, `pending-writes`,
   `forget-sweep`, `auto-improve`, `purge-project`, `rename-project`,
   `move-project` and `move-session --from-project` (source side), and friends.
 
 Before v1.20 only the hooks read it. A checkout declaring
 `workspace = "acme"` therefore had its captures land in `acme` while every
-CLI command resolved into `default` — the same repository split across two
+CLI command resolved into `default`: the same repository split across two
 scopes, with `ai-memory run`'s managed workstream on the wrong side of the
 split.
 
@@ -908,7 +916,7 @@ ai-memory: scope acme/api (workspace + project from /Users/dev/projects/acme/.ai
 
 `AI_MEMORY_IGNORE_MARKER=1` skips rung 2 for one invocation, restoring the
 pre-v1.20 resolution without editing or leaving the marker's tree. It
-applies to **client commands only** — the lifecycle hooks still forward the
+applies to **client commands only**. The lifecycle hooks still forward the
 marker's fields on every event, so an invocation run with it set resolves
 into a different scope than the session captures around it. Use it for
 one-off reads, not as a way to relocate a repository's memory.
@@ -919,21 +927,21 @@ hook events that arrive without a usable one.
 
 ## What the marker file does NOT do
 
-- ❌ No glob patterns. Walk-up by literal ancestry only.
-- ❌ No merge of ancestor markers. Closest wins. (`server` is the one key
+- No glob patterns. Walk-up by literal ancestry only.
+- No merge of ancestor markers. Closest wins. (`server` is the one key
   inherited from the nearest marker that declares it; see above.)
-- ❌ No automatic migration of `default`-workspace projects.
-- ❌ No automatic repo-root collapsing. Worktrees and subdirectories only
+- No automatic migration of `default`-workspace projects.
+- No automatic repo-root collapsing. Worktrees and subdirectories only
   share a project when `project_strategy = "repo-root"` is explicitly set
-  (per marker, or baked install-wide — see above).
-- ❌ No URL or token in the marker. `server = "<name>"` selects a server
+  (per marker, or baked install-wide; see above).
+- No URL or token in the marker. `server = "<name>"` selects a server
   profile registered locally with `ai-memory server add`; it cannot introduce a
   new destination or carry a credential. Otherwise use the existing env vars
   (`AI_MEMORY_AUTH_TOKEN`, `AI_MEMORY_HOOK_URL`). (A repo-root
   *default* can still be baked into an install without a marker via
   `install-hooks --project-strategy repo-root`, but that is install-time
   config, not a runtime override the user sets in their shell.)
-- ❌ No reach outside the trust boundary. The walk stops at `$HOME`; a
+- No reach outside the trust boundary. The walk stops at `$HOME`; a
   checkout outside it stops at that checkout's root and needs a marker inside
   the checkout. A non-git directory outside `$HOME` needs a marker in its
   exact cwd.
@@ -943,7 +951,7 @@ hook events that arrive without a usable one.
 **My marker isn't being picked up.** Walk through:
 
 1. File is named exactly `.ai-memory.toml` (note the leading dot).
-2. File is in an **ancestor** of the cwd — not a sibling, not a
+2. File is in an **ancestor** of the cwd, not a sibling or a
    descendant.
 3. There isn't a closer marker overriding it. Run
    `find ~/projects -maxdepth 5 -name '.ai-memory.toml'` to see all

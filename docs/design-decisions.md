@@ -11,7 +11,7 @@
 A self-contained Rust binary that:
 
 1. Runs as an **MCP server** (stdio + HTTP/SSE) for coding-agent CLIs (Claude Code, OpenAI Codex, Cursor, Gemini CLI, Antigravity CLI, OpenClaw, OpenCode, OMP, and MCP-capable clients).
-2. Captures sanitized, bounded lifecycle observations **automatically** - no `write_note` ceremony - via hook scripts or generated extensions that agent CLIs invoke. User prompts and post-compaction summaries retain at most 16 KiB; notifications and tool excerpts retain at most 2 KB; every sanitized durable body has a 16 KiB backstop. Optional `ai-memory run` workstreams additionally read visible native transcript tails through host-side, read-only adapters.
+2. Captures sanitized, bounded lifecycle observations **automatically** (no `write_note` ceremony) via hook scripts or generated extensions that agent CLIs invoke. User prompts and post-compaction summaries retain at most 16 KiB; notifications and tool excerpts retain at most 2 KB; every sanitized durable body has a 16 KiB backstop. Optional `ai-memory run` workstreams additionally read visible native transcript tails through host-side, read-only adapters.
 3. Maintains a **Karpathy-style wiki**: incrementally-compiled markdown pages with cross-links, supersession, an `index.md` and a `log.md`.
 4. Serves retrieval via the MCP `tools/list` to coding agents: a handful of *narrow* tools, not 50.
 5. Ships a **Docker image** (`docker run -v ai-memory-data:/data -p 49374:49374 ai-memory`) so it can move between desktop and homelab.
@@ -23,11 +23,11 @@ A self-contained Rust binary that:
 - Cargo-format clean.
 - Docker-deployable, easy backup, easy move desktop↔homelab.
 - MCP server for coding agents.
-- **Automatic** memory capture/fetch - minimal manual tool invocations.
+- **Automatic** memory capture/fetch, with minimal manual tool invocations.
 - Differentiates **short-term** vs **long-term** memory temporally (like agentmemory).
 - Self-healing memory management.
 - Helps with handoffs between agent CLIs (resume from Codex where Claude Code left off).
-- Iteratively planned - each feature working before the next starts. No dead code.
+- Iteratively planned: each feature works before the next starts. No dead code.
 
 ## 3. Storage model - the biggest architectural decision
 
@@ -39,12 +39,12 @@ Three options surveyed:
 | **B. Markdown-in-git** primary | Files in repo | Derived index | Diff-able, grep-able, portable, Karpathy-faithful | Watcher correctness (basic-memory #580/#758/#798), inode races (#765), startup cost |
 | **C. DB-primary with on-demand export** | SQLite | Everything | Best of both | Two formats to keep coherent; user must remember to export |
 
-**Decision: Option B - markdown in a git repo is source of truth, SQLite is derived index.**
+**Decision: Option B. Markdown in a git repo is the source of truth, and SQLite is a derived index.**
 
 **Why:**
-- Backup/move story is trivial - `git clone` or `rsync` a directory. The user explicitly asked for this.
+- Backup/move is trivial: `git clone` or `rsync` a directory. The user explicitly asked for this.
 - Karpathy's pattern *is* the wiki on disk. Faking it with an export step loses the inspect-in-Obsidian property.
-- DB is rebuildable from files - corruption is recoverable.
+- DB is rebuildable from files, so corruption is recoverable.
 - Cross-tool compatibility for free: any agent that reads `~/.ai-memory/wiki/*.md` works without an MCP integration.
 
 **How we avoid basic-memory's watcher pain:**
@@ -78,12 +78,12 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 - SurrealDB: heavy, multi-mode storage; we'd inherit a lot of surface we don't need.
 - Packed vectors in SQLite keep v1 dependency-light; `sqlite-vec` remains the scale-up path once brute-force cosine stops being enough.
 
-**The graph is just SQL tables.** A `wiki_pages` table, a `wiki_links (from_id, to_id, link_type)` table, optional `wiki_concepts (page_id, concept)`. Graph queries are recursive CTEs in SQLite. Petgraph in-memory for batch traversals. Avoids the entire "embedded graph DB" footgun cognee fell into.
+**The graph is just SQL tables.** A `wiki_pages` table, a `wiki_links (from_id, to_id, link_type)` table, optional `wiki_concepts (page_id, concept)`. Graph queries are recursive CTEs in SQLite. Petgraph in-memory for batch traversals. This avoids the "embedded graph DB" footgun cognee fell into.
 
 **Crates** (research-backed picks):
 - `rusqlite` for embedded SQLite access. `bundled-sqlcipher` if we want encryption later.
 - `refinery` for SQL migrations.
-- `tantivy` *not* used initially - sqlite FTS5 is sufficient at the corpus sizes we expect (hundreds to low-thousands of pages per project). Revisit only if FTS5 ranking proves inadequate.
+- `tantivy` *not* used initially; sqlite FTS5 is sufficient at the corpus sizes we expect (hundreds to low-thousands of pages per project). Revisit only if FTS5 ranking proves inadequate.
 - `petgraph` for in-memory graph algorithms during consolidation.
 
 ## 5. Embedding & LLM
@@ -98,14 +98,14 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 - **Off by default**, behaves like agentmemory after #138's fix. Without a provider, the system still works: synthetic compression (rule-based), no LLM-generated summaries, no `memory_consolidate` page-rewrite.
 - With a provider, LLM consolidation runs on PreCompact, on demand via `memory_consolidate`, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true` (off by default). A substantive session end always writes a rule-based summary page + handoff regardless, except that a session page the agent wrote itself through `memory_write_page` with the session's id (`consolidated_by: agent`) is kept in place of the summary and skipped by the SessionEnd worker; a session containing only `SessionStart` / `SessionEnd` boundaries closes without either artifact or provider work and releases any startup handoff bound to that receiver. SessionEnd provider work is persisted by observation generation and consumed outside the hook request by one bounded retrying worker, so client drain cancellation cannot lose it. The automatic handoff and completed-end watermark commit in one SQLite transaction; an already-ended keyed replay converges the remaining wiki commit, provider enqueue, and ingest-key completion. The completed end also stores the observation count it covered; a resumed session re-enters the end path only after that count advances, avoiding non-convergent wall-clock comparisons. Optional 6h maintenance timer.
 - Providers implement `LlmProvider { complete(...); complete_structured(...) }`. The current provider and authentication matrix lives in [`ARCHITECTURE.md`](ARCHITECTURE.md); this design boundary also covers OpenAI-compatible endpoints such as Ollama, vLLM, and LM Studio.
-- **Native HTTP per provider** - no LiteLLM-equivalent. The cognee tracker (#2412/#2430/#2537/#2608/#2749/#2782/#2840/#2842) showed silent-kwarg-drop in a generic gateway is the #1 source of provider bugs. Each provider's typed JSON, errors on unknown fields. Hand-coded but correct.
+- **Native HTTP per provider**, no LiteLLM-equivalent. The cognee tracker (#2412/#2430/#2537/#2608/#2749/#2782/#2840/#2842) showed silent-kwarg-drop in a generic gateway is the #1 source of provider bugs. Each provider gets typed JSON that errors on unknown fields. It is hand-coded, but correct.
 - **Structured output via JSON schema, not XML, not Instructor-style wrapping.** Use each provider's native JSON-mode where available; for Anthropic, request a tool-use response with a typed schema. Validate with `serde_json` + `schemars`-derived schemas.
 
 ## 6. Capture model - auto, never `write_note`
 
 Three capture surfaces, in priority order:
 
-1. **Lifecycle hooks/extensions.** The current clients are listed in the README support matrix. These are fast, reliable, structured. We ship hook scripts or generated TypeScript integrations the user installs once. Lessons from agentmemory:
+1. **Lifecycle hooks/extensions.** The current clients are listed in the README support matrix. These are fast, reliable, and structured. We ship hook scripts or generated TypeScript integrations the user installs once. Lessons from agentmemory:
   - Hooks must be **fire-and-forget** (#221). No `await fetch()` blocking session start.
   - Sub-second hard timeouts on the writer side (`tokio::time::timeout`).
   - All hooks → single HTTP/Unix-socket POST → server queues → returns 202
@@ -114,7 +114,7 @@ Three capture surfaces, in priority order:
 
 2. **Managed-workstream transcript import** (opt-in through `ai-memory run`). Each supported adapter reads its linked native session after a managed launch and appends portable visible events to the shared ledger. ai-memory does not ship a universal background watcher over private harness stores.
 
-3. **Manual MCP tool** (`memory_write_page`) - only for explicit durable project knowledge from the user ("remember this"). Routine session capture remains automatic.
+3. **Manual MCP tool** (`memory_write_page`), only for explicit durable project knowledge from the user ("remember this"). Routine session capture remains automatic.
 
 ### Capture-policy boundary (#194)
 
@@ -138,7 +138,7 @@ Adopt agentmemory's tier model **but** keep the surface narrow:
 |---|---|---|---|
 | **Working** | Current session: last N observations, last user prompt, current files | Until session end | Drop on session end (kept in DB for forensics, but excluded from default recall) |
 | **Episodic** | Per-session summaries with concept tags, files-touched, decisions made | 30 days hot, 180 days cold, then evict if cold-score < threshold | `salience · exp(-λ · age_days) + σ · log(1 + access_count) · exp(-μ · days_since_access)`. Code of record: [`crates/ai-memory-store/src/decay.rs`](../crates/ai-memory-store/src/decay.rs). |
-| **Semantic** | Distilled facts/preferences/architecture notes - the wiki pages themselves | Indefinite, supersedeable | Versioned in place: old `is_latest=false`, new `supersedes=old_id` |
+| **Semantic** | Distilled facts/preferences/architecture notes: the wiki pages themselves | Indefinite, supersedeable | Versioned in place: old `is_latest=false`, new `supersedes=old_id` |
 | **Procedural** | Repeated patterns extracted from episodic clusters (`pattern` type with frequency ≥ 2) | Indefinite | Frequency-decay if not re-observed in N days |
 
 **Implementation note:** the four tiers map to one `pages` table with a `tier` enum column + an `observations` table for bounded working/episodic projections, not four separate tables. Keeps schema migrations sane.
@@ -264,7 +264,7 @@ not authorize an unscoped write. Any future schema simplification may improve
 the explicit/static path, but must preserve the session-aware path unless a
 separate major-version decision replaces its UX and concurrency guarantees.
 
-**Install-time `project_strategy` default (#128).** `basename(cwd)` remains the fallback for a checkout without a valid remote, but an agent shell that `cd`s into a subdirectory and stays there can otherwise fork the rest of the session into a phantom project named after the subdir. The #1033 default now names remote-backed repositories from normalized `upstream`, then `origin`, before this strategy applies. A `.ai-memory.toml` marker with `project_strategy = "repo-root"` fixes the remote-less case (#16, #23, #111) but needs a marker in (or above) every repo; a runtime env-var fallback that the *user* sets was deliberately rejected in #16. `install-hooks --project-strategy repo-root` instead **bakes** the strategy into the generated hook command (and the OpenCode / OMP / OpenClaw plugins) at install time — the same status as the already-baked `AI_MEMORY_AUTH_TOKEN` / `AI_MEMORY_HOOK_URL` / `--data-dir`, not a user runtime override. This is a client/install-time-only change: the server already parses `project_strategy=repo-root`. A marker's explicit `project` or `identity` and operator-home routing still win; an unpinned marker `project_strategy` changes only the no-valid-remote fallback.
+**Install-time `project_strategy` default (#128).** `basename(cwd)` remains the fallback for a checkout without a valid remote, but an agent shell that `cd`s into a subdirectory and stays there can otherwise fork the rest of the session into a phantom project named after the subdir. The #1033 default now names remote-backed repositories from normalized `upstream`, then `origin`, before this strategy applies. A `.ai-memory.toml` marker with `project_strategy = "repo-root"` fixes the remote-less case (#16, #23, #111) but needs a marker in (or above) every repo; a runtime env-var fallback that the *user* sets was deliberately rejected in #16. `install-hooks --project-strategy repo-root` instead **bakes** the strategy into the generated hook command (and the OpenCode / OMP / OpenClaw plugins) at install time. That gives it the same status as the already-baked `AI_MEMORY_AUTH_TOKEN` / `AI_MEMORY_HOOK_URL` / `--data-dir`, not a user runtime override. This is a client/install-time-only change: the server already parses `project_strategy=repo-root`. A marker's explicit `project` or `identity` and operator-home routing still win; an unpinned marker `project_strategy` changes only the no-valid-remote fallback.
 
 ## 12. Operability
 
@@ -294,7 +294,7 @@ historical decision boundary rather than a current support matrix.
 - No alternative graph DB (SQL recursive CTEs only).
 - No multimodal (text only).
 - No general "skills" / slash-command bundle in v1 (agentmemory plugin format). The narrow exception is the managed ai-memory Agent Skills that package routing guidance for agents; hooks + MCP remain the product surface.
-- No LongMemEval-style benchmark harness in v1 - add in v0.4.
+- No LongMemEval-style benchmark harness in v1; add in v0.4.
 
 ## 14. Mistakes-to-avoid checklist (from issue research)
 
@@ -318,7 +318,7 @@ Top-line rules carved into the codebase:
 16. No `lru_cache` on configs (cognee #2228/#2853).
 17. Datasets/projects are query-time filters, not orchestration-mode-conditional (cognee #2867).
 18. LLM has off by default; opt-in via env (agentmemory #138/#143).
-19. `cargo deny` for transitive license audits (cognee #2807 - FastEmbed removed for license).
+19. `cargo deny` for transitive license audits (cognee #2807: FastEmbed removed for license).
 20. Pin upstream native deps; ship a lockfile (agentmemory #555/#540).
 
 ## 15. Managed workstreams use a portable ledger, not native format conversion

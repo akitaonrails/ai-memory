@@ -36,14 +36,14 @@
 audits published numbers (mempalace). We publish none until this exists.
 
 - In-repo harness, on-demand like `writer_throughput` (`#[ignore]`d or a
-  `cargo run -p ai-memory-eval` target - the `evals/` crate already
+  `cargo run -p ai-memory-eval` target; the `evals/` crate already
   exists as a home). Fetches/loads the LongMemEval-V2 dataset, ingests
   through the *real* store (hooks-shaped ingestion, not direct SQL),
   queries through the real retrieval stack, reports R@k / P@k per task
   category, zero-LLM and LLM-assisted modes separately.
 - Deterministic where possible; provider-dependent parts clearly marked.
 - **Dataset decision (verified 2026-09-01):** V2 is Apache-2.0 on
-  HuggingFace (`xiaowu0162/longmemeval-v2`) with an official harness -
+  HuggingFace (`xiaowu0162/longmemeval-v2`) with an official harness,
   but its trajectories are WebArena/ServiceNow-style *web-agent*
   histories, not coding sessions. The numbers competitors publish
   (agentmemory 0.967 R@5, mcp-memory-service 0.804/0.860) are against
@@ -51,8 +51,8 @@ audits published numbers (mempalace). We publish none until this exists.
   cross-project comparability**, and adopt **V2's five-ability taxonomy**
   (static state recall, dynamic state tracking, workflow knowledge,
   environment gotchas, premise awareness) as the rubric for a
-  coding-agent-native companion eval built from replayed real sessions -
-  the agentmemory "coding-agent-life" precedent, with our own corpus.
+  coding-agent-native companion eval built from replayed real sessions
+  (the agentmemory "coding-agent-life" precedent, with our own corpus).
 - Deliverables: harness, baseline numbers committed to
   `docs/benchmarks/` with date + commit + hardware, docs on how to run.
 - Migration: none.
@@ -65,9 +65,9 @@ knowledge portable to any OKF-aware consumer.
 
 - **Design doc first** (`docs/okf.md`): field-by-field mapping of our
   frontmatter to OKF (`type` required; our `tier`, `kind`, `tags`,
-  `entities`, TTL fields as extensions - OKF explicitly allows unknown
-  fields). Decide native conformance vs export-only. Bias: native -
-  wiki pages *are* OKF files - because "export" forks the truth.
+  `entities`, TTL fields as extensions; OKF explicitly allows unknown
+  fields). Decide native conformance vs export-only. Bias: native (wiki
+  pages *are* OKF files), because "export" forks the truth.
 - **The migration is the hard part, and it must not churn versions.**
   Renaming/adding frontmatter across every page via normal writes would
   supersede every page in every store (version explosion, embedding
@@ -78,7 +78,7 @@ knowledge portable to any OKF-aware consumer.
     user's home (e.g. `~/ai-memory-backup-pre-2.0-<date>.tar.gz`),
     verifies the archive is readable (entry listing + size sanity)
     before proceeding, and **aborts the migration if the backup cannot
-    be written or verified** - no backup, no migration. The archive
+    be written or verified**: no backup, no migration. The archive
     path is recorded in the wiki meta manifest.
   - **the HTML wiki homepage surfaces the backup**: after migration,
     `serve`'s homepage shows a notice with the archive's path, size,
@@ -96,8 +96,8 @@ knowledge portable to any OKF-aware consumer.
   - idempotent: re-running migrates zero pages.
 - Round-trip tests: our page → OKF file → parsed back identical; foreign
   OKF bundle imports into a project; migration control test proves the
-  no-churn property (same ids before/after); backup control test - break
-  the archive step and the migration must refuse to run; homepage notice
+  no-churn property (same ids before/after); backup control test (break
+  the archive step and the migration must refuse to run); homepage notice
   renders the recorded archive path and clears when the file is gone.
 - `ai-memory export --okf <dir>` / `import --okf` for the non-native
   direction regardless, for interop with bundles outside the store.
@@ -107,39 +107,38 @@ knowledge portable to any OKF-aware consumer.
 *Why:* `causes` / `fixes` / `contradicts` on the existing `links` model;
 `contradicts` feeds the lint pass that already exists.
 
-- Schema: `links.relation` (nullable TEXT, default NULL = plain link) -
-  additive migration, zero rewrite of existing rows.
+- Schema: `links.relation` (nullable TEXT, default NULL = plain link),
+  an additive migration with zero rewrite of existing rows.
 - Producers: wikilink syntax extension (`[[page|fixes]]` or frontmatter
   `relations:`) decided in a short design note; consolidation prompt
   gains the vocabulary (JSON-schema constrained, per invariant 7).
 - Consumers: lint (contradiction findings from `contradicts` edges),
   retrieval graph stream (relation-aware weighting only if item 1 shows
-  it helps - otherwise store, don't weight).
+  it helps; otherwise store, don't weight).
 - Migration: none needed (additive). Docs: usage + graph docs.
 
 ## Item 4 - Temporal validity on entity links (bi-temporal-lite)
 
-*Why:* "what was true in June" - the one mainstream graph-camp mechanism
+*Why:* "what was true in June", the one mainstream graph-camp mechanism
 worth having. Builds on item 3's schema work.
 
 - **Design doc before schema.** Reference: Zep/Graphiti paper. Scope
   deliberately small: `valid_from` / `superseded_at` on
   `entity_page_links` (and possibly typed edges), populated by
-  supersession events we already emit - when a page version supersedes,
+  supersession events we already emit: when a page version supersedes,
   its entity links inherit the timeline. No world-time vs
-  ingestion-time split in v1 of this; ingestion-time only, documented as
-  such honestly.
+  ingestion-time split in v1 of this; ingestion-time only, documented as such.
 - Retrieval: `as_of` parameter on entity queries (additive, default
   now).
 - Migration: additive columns; backfill `valid_from` from the page
-  version's `created_at` - a one-shot data migration inside refinery.
+  version's `created_at` as a one-shot data migration inside refinery.
 
 ## Item 5 - Local embeddings (all-MiniLM class; shipped via candle, not ONNX)
 
 *Why:* zero-config hybrid retrieval with no provider; `models/` has been
 reserved for this since M9.5. Competitors ship it by default.
 
-- `ort` crate; model NOT bundled in the binary (size) - fetched on
+- `ort` crate; model NOT bundled in the binary (size); it is fetched on
   `ai-memory embed --provider local` first use into `models/`, with
   checksum pinning and an offline path (drop the file in manually).
 - Coexistence is already designed: `(provider, model, dim)` is
@@ -151,26 +150,24 @@ reserved for this since M9.5. Competitors ship it by default.
   configured provider either way.
 - Watch: `ort`/onnxruntime licensing + build weight on all release
   targets (incl. Windows); a `local-embeddings` cargo feature if the
-  dependency is heavy. **As built: this watch item decided the
-  implementation — candle (pure Rust) instead of ort, no native
+  dependency is heavy. **As built: this watch item decided the implementation: candle (pure Rust) instead of ort, no native
   runtime, feature `local-embeddings` (default on). Same model, same
   use case; see `docs/local-embeddings.md`.**
 
 ## Item 6 - Cross-session abstraction ("Experience" stage)
 
 *Why:* the frontier the survey names; the narrative layer TriMem argues
-for. Most speculative, therefore last - and shaped by whatever items
+for. Most speculative, therefore last, and shaped by whatever items
 1-5 taught us.
 
 - A periodic pass (auto-improve is the host; scheduled like existing
   maintenance) that reads the last N sessions per project and stages
-  rewrites of pattern/preference/architecture pages - cross-trajectory,
-  not per-session. Staged through `pending-writes` exactly like other
+  rewrites of pattern/preference/architecture pages, cross-trajectory rather than per-session. Staged through `pending-writes` exactly like other
   auto-improve output: reviewable, never silent.
 - Zero-LLM default preserved: pass is opt-in like consolidation.
 - Success metric from item 1 plus a curated before/after page-quality
   review; if it cannot demonstrate value, it ships disabled-by-default
-  with the honest note, or not at all.
+  with a note saying so, or not at all.
 
 ## Item 7 - `status` truthfulness audit (pre-cut, low priority)
 
@@ -180,8 +177,7 @@ from reality. Scheduled deliberately **after** items 1-6 so it audits
 the final surface, not a moving one.
 
 - Assessment first, fixes second: for every line `status` prints, trace
-  it to the source of truth and answer "has this been true so far?" -
-  counts vs actual rows, FTS coverage vs actual index, embedding
+  it to the source of truth and answer "has this been true so far?": counts vs actual rows, FTS coverage vs actual index, embedding
   backlog vs reality, spool depth, server/bind/data-dir provenance.
 - Then the inverse: what health signal exists that `status` *doesn't*
   show? 2.0 candidates from items 1-6: `wiki_format` generation and
@@ -199,12 +195,12 @@ the final surface, not a moving one.
 *Why:* feature docs written alongside code default to "what it does";
 readers deciding whether to ADOPT a feature need "why it exists",
 "when to reach for it" (and when not to), and a real-world example
-showing the possibility — the way `docs/local-embeddings.md` leads
+showing the possibility, the way `docs/local-embeddings.md` leads
 with the egress/paraphrase-recall story before the mechanics.
 
 - Sweep every user-facing doc (README sections, docs/*.md, the
   config template comments) and grade each feature's coverage: what /
-  why / when / example. Fix the gaps — a short scenario ("two
+  why / when / example. Fix the gaps: a short scenario ("two
   teammates on one server", "resuming on the laptop what the desktop
   left off", "asking what we knew about X before the rewrite") beats a
   flag list.
@@ -223,13 +219,12 @@ with the egress/paraphrase-recall story before the mechanics.
 ```
 
 Each lands on main individually gated (fmt, clippy -D warnings, full
-tests, changelog guards, harness numbers where retrieval is touched) —
+tests, changelog guards, harness numbers where retrieval is touched), with
 **fast Linux CI only per item**; the slow macOS/Windows matrix runs
 once, mandatorily, on the release-candidate SHA before the cut (see
 AGENTS.md "CI pacing"). 2.0 is cut when:
 
-- all six items (or an explicitly-decided subset - item 6 may justifiably
-  drop) are merged with docs;
+- all six items (or an explicitly-decided subset; item 6 may justifiably drop) are merged with docs;
 - `docs/MIGRATION-2.0.md` reads as a complete upgrade guide and has been
   exercised against a copy of a real 1.x data dir, **including a full
   restore drill from the pre-migration backup archive**;
@@ -238,12 +233,11 @@ AGENTS.md "CI pacing"). 2.0 is cut when:
 - a **pr-post-audit over the whole 2.0 range** (v1.39.0 → the
   release candidate) has run clean: every item PR re-verified against
   the final combined tree, cross-PR interactions swept, documentation
-  ledger checked — findings fixed and re-audited before anything else
+  ledger checked, with findings fixed and re-audited before anything else
   proceeds;
 - the full macOS/Windows CI matrix is green on the release-candidate
   SHA (dispatched, not assumed), and **the user has reviewed the summary
-  of everything done and explicitly approved the release** — 2.0 is
-  never cut automatically.
+  of everything done and explicitly approved the release**. 2.0 is never cut automatically.
 
 Deploy/live-test follows the same v1.39 pipeline: exact-main gates,
 hosted CI, `compose pull` (never `bin/deploy`), health + status + a

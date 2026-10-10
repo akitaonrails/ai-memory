@@ -141,9 +141,10 @@ Core design:
   optional vector RRF when an embedding provider is configured, plus bounded
   raw-observation fallback.
 - **LLM is opt-in.** Zero-LLM mode still captures, searches (FTS5), and
-  writes rule-based summaries. Providers (Anthropic, OpenAI, OpenAI/Codex
-  OAuth, GitHub Copilot, Gemini, OpenAI-compatible endpoints, Cursor Agent
-  CLI) enable consolidation, lint, and the auto-improvement loop.
+  writes rule-based summaries. Providers (Anthropic, Anthropic OAuth,
+  OpenAI, OpenAI/Codex OAuth, GitHub Copilot, Gemini, OpenCode,
+  OpenAI-compatible endpoints, Cursor Agent CLI) enable consolidation, lint,
+  and the auto-improvement loop.
 - **Per-project isolation by construction**: every row and page is keyed
   by `(workspace_id, project_id, path)`, resolved from the caller's cwd,
   a `.ai-memory.toml` marker file, or explicit scope arguments.
@@ -160,7 +161,7 @@ or prompt routing for learning review.
   workspace resolver 3. The authoritative workspace version is
   `workspace.package.version` in `Cargo.toml`.
 - **Async runtime:** `tokio` (full features).
-- **MCP/HTTP:** `rmcp` 1.7 (server SDK) + `axum` 0.8 for MCP HTTP, hooks,
+- **MCP/HTTP:** `rmcp` 2.2 (server SDK) + `axum` 0.8 for MCP HTTP, hooks,
   admin, `/api/v1`, and the built-in `/web` UI; `tower` / `tower-http`.
 - **Store:** `rusqlite` (bundled SQLite, backup API), `refinery`
   migrations, FTS5, `parking_lot`.
@@ -194,18 +195,22 @@ crates/
 ├── ai-memory-consolidate/ Karpathy ingest / lint / sweep / auto-improve pipeline.
 ├── ai-memory-web/         read-only /web UI and /api/v1 JSON routes.
 ├── ai-memory-workstream/  read-only native transcript + launch adapters (`ai-memory run`).
+├── ai-memory-test-support/ shared test helpers (dev-dependency only, no test binary).
 └── ai-memory-cli/         `ai-memory` binary entry point + thin HTTP subcommands.
 evals/                     live A/B harness; workspace member, not shipped.
 companions/ai-memory-importer/  standalone OMC + external-conversation importer; NOT a root
                            workspace member — build/test it with
                            `--manifest-path companions/ai-memory-importer/Cargo.toml`.
+companions/ai-memory-client/    capture-privacy helpers shared by relay + importer; own workspace.
+companions/ai-memory-relay/     durable external-lifecycle event relay (POST /hook/batch); own workspace.
 companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace member —
                            `swift test --package-path companions/ai-memory-macos`
                            and `./companions/ai-memory-macos/build.sh`.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
 bin/                       host wrapper scripts (`ai-memory`, `deploy`, `release`).
 docker/                    Dockerfile, compose files, TLS proxy templates.
-packaging/                 AUR/systemd/sysusers/tmpfiles native packaging assets.
+packaging/                 AUR/RPM/systemd/launchd/sysusers/tmpfiles/env native packaging assets.
+nix/, flake.nix            Nix package + NixOS module.
 scripts/                   packaging checks, hook installer, acceptance scripts.
 tests/                     e2e smoke (`e2e/handoff_smoke.sh`), hook shell tests, fixtures.
 docs/                      architecture, design decisions, install/deploy/usage guides.
@@ -261,7 +266,8 @@ covers the same tests, slower, no tiers.
   `#[cfg(test)]`, so the tests compile into the lib's own harness and cost no
   extra binary; the CLI keeps a separate `main.rs` target because its tests
   run the built executable. Every test binary is a link and, on macOS and
-  Windows, a first-run malware scan, so each crate gets at most one. A
+  Windows, a first-run malware scan, so each crate gets at most one (the CLI
+  two: its lib and `tests/suite`). A
   repo-layout test in the CLI suite fails on an undeclared file, a stray
   top-level `tests/*.rs`, or a `mod.rs` that `lib.rs` never includes.
 - **Shared test helpers** live in `crates/ai-memory-test-support`
@@ -274,10 +280,13 @@ covers the same tests, slower, no tiers.
   ai-memory-web` downloads the pinned Tailwind CLI and rewrites
   `static/tailwind.css`; commit the result. CI regenerates it on Linux and
   fails if the committed file is stale, so nothing else needs the download.
-- Run the companion importer separately:
-  `cargo test --manifest-path companions/ai-memory-importer/Cargo.toml`
-  (plus fmt/clippy on the same manifest). Root `--workspace` commands do
-  not cover it.
+- Run each Cargo companion separately (`ai-memory-client`,
+  `ai-memory-importer`, `ai-memory-relay`, and on `release/2.7`
+  `ai-memory-wikisync`): `cargo fmt --check`, `cargo clippy --locked
+  --all-targets -- -D warnings` and `cargo test --locked`, each with
+  `--manifest-path companions/<name>/Cargo.toml`. CI also builds the relay
+  and runs `uv run --no-project python tests/e2e/external_relay_smoke.py`
+  against the real server. Root `--workspace` commands cover none of them.
 - Run the macOS menu bar companion separately:
   `swift test --package-path companions/ai-memory-macos`
   (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
@@ -313,8 +322,13 @@ covers the same tests, slower, no tiers.
   "$HOME\.rustup"`.
 
 - Shell-level checks: `tests/hooks/test_lib.sh`,
-  `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`,
-  `scripts/check-nix-packaging.sh` (Nix flake output).
+  `tests/e2e/handoff_smoke.sh`, `tests/wrapper_upgrade.sh`,
+  `tests/e2e/external_relay_smoke.py`, `scripts/check-native-packaging.sh`,
+  `scripts/check-nix-packaging.sh` (Nix flake output),
+  `scripts/check-changelog-sections.sh` and
+  `scripts/check-changelog-frozen.sh origin/<base>`.
+- `.github/workflows/macos-app.yml` builds and tests the Swift companion on
+  a `macos` / `full-ci` PR label or dispatch.
 - `.github/workflows/nix.yml`: path-filtered PRs always run `x86_64-linux`
   (package + NixOS module eval / sandbox-parity). `aarch64-darwin` and the
   privileged NixOS container smoke run on schedule, `workflow_dispatch`, or
@@ -325,15 +339,16 @@ covers the same tests, slower, no tiers.
   `.github/workflows/secret-scan.yml` runs the separate weekly/manual
   full-history gitleaks scan.
 - **Windows runs in its own workflow** (`.github/workflows/windows.yml`):
-  nightly, on demand, and on any PR labelled `windows`. It is the only place
-  `#[cfg(windows)]` tests compile, and it is ~4x slower than the same tests on
-  Linux — keeping it out of `ci.yml`
-  is what holds PR feedback near the eight minutes the gating jobs take.
-  **Add the `windows` label** to a PR touching path handling, file
-  locking, git plumbing, or the hook bundle, so the corresponding Windows
-  jobs run before the merge rather than only on the nightly schedule. Both
-  the Rust test job and the hook-bundle job use this label gate on pull
-  requests; they also run on manual dispatch. That job stays on plain
+  nightly, on dispatch, and automatically on any PR touching the
+  platform-sensitive paths in its `changes` filter (the wiki, store and
+  hooks crates, `install_hooks.rs`, `hooks/`, `tests/hooks/`). It is the only
+  place `#[cfg(windows)]` tests run, and it is ~4x slower than the same tests
+  on Linux — keeping it out of `ci.yml` is what holds PR feedback near the
+  eight minutes the gating jobs take. **Add the `windows` label** to force a
+  run on a PR outside those paths that still touches path handling, file
+  locking or git plumbing. `ci.yml`'s `windows-cross` job cross-builds every
+  target, `#[cfg(windows)]` tests included, on every PR (it does not run
+  them). The Windows Rust test job stays on plain
   `cargo test`: nextest, partitioning across runners, and a Dev Drive were
   each measured there and none beat it.
 
@@ -362,8 +377,12 @@ covers the same tests, slower, no tiers.
 These are carved into the architecture; each traces to a documented
 prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
 
-1. **One config-read path.** `Config::load()` runs once at startup; never
-   call `std::env::var` outside it.
+1. **One config-read path.** ai-memory's own settings are read once by
+   `Config::load()` at startup and passed down; never re-read them from the
+   environment. Code that must read process or third-party-harness
+   environment (harness homes, `HOME`, hook-client variables in processes
+   that never load server config) takes an injectable lookup so tests can
+   stub it.
 2. **Single-writer SQLite actor.** All writes go through one `mpsc`
    channel to one dedicated thread (`WriterHandle`). Batch hot-path work
    into one command/transaction; avoid N+1 reads.
@@ -422,7 +441,7 @@ prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
 
     Unit tests do not cover this: they exercise one session at a time, which
     is the exact shape that cannot see a collaboration or concurrency defect.
-    `crates/ai-memory-store/tests/multi_session.rs` and the pointer tests in
+    `crates/ai-memory-store/tests/suite/multi_session.rs` and the pointer tests in
     `ai-memory-core::active_project` are the guards. Any change to scope
     resolution, page supersession, session identity, handoff acceptance, the
     writer actor, or owner filters must be argued against this invariant
@@ -486,7 +505,7 @@ Additional boundary rules:
   root, DB-user, and anonymous cases — now recorded against the inventory.
 - New disk+SQL mutations need recovery/rollback tests.
 - The recall-eval framework lives at
-  `crates/ai-memory-consolidate/tests/recall_eval.rs`.
+  `crates/ai-memory-consolidate/tests/suite/recall_eval.rs`.
 - Tests run with `cargo t` locally,
   `cargo nextest run --workspace --all-targets --profile ci` in Linux/macOS
   CI, and `cargo test --workspace --all-targets` on Windows (plus
@@ -510,9 +529,12 @@ Additional boundary rules:
   `.ai-memory.toml` marker) drop recognized file-tool events before they
   reach spool, transport, logs, or storage — preserve this behavior in
   native hook commands and generated integrations.
-- **Auth ladder:** static root bearer token → DB-user tokens
-  (attribution only, no admin) → OIDC device tokens at the hook edge.
-  `/admin/*` becomes root-only the moment the first DB user exists.
+- **Auth ladder** (`docs/users.md`): anonymous (no bearer configured) →
+  static root bearer → proxy-asserted user (a distinct
+  `actor_proxy_bearer_token` plus trusted actor headers) → DB-user `aim_`
+  tokens (attribution only, never admin) → 401 for an unknown bearer. OIDC
+  device login (`ai-memory auth login oidc-device`) supplies client/hook
+  tokens. `/admin/*` becomes root-only the moment the first DB user exists.
 - **Dependency policy:** `cargo deny --all-features check` and
   `cargo audit` run in CI; do not add dependencies without checking the
   project doesn't already have the capability, and match existing
@@ -525,10 +547,21 @@ Additional boundary rules:
 - **CHANGELOG is a merge gate.** Any change affecting user-visible
   behavior, installation, supported platforms/agents/providers,
   deployment, env/config, or public tool/admin surfaces must add a
-  `CHANGELOG.md` entry under `## [Unreleased]` (correct
-  `Added`/`Changed`/`Fixed` heading, past-tense, trailing `(#NNN)`
-  reference) and update the relevant README/docs references in the same
-  commit. Internal refactors and test-only churn are exempt.
+  `CHANGELOG.md` entry under `## [Unreleased]` (correct Keep-a-Changelog
+  heading — `Added`/`Changed`/`Deprecated`/`Removed`/`Fixed`/`Security` —
+  past-tense, trailing `(#NNN)` reference) and update the relevant
+  README/docs references in the same commit. Internal refactors and
+  test-only churn are exempt. CI rejects a duplicated heading
+  (`scripts/check-changelog-sections.sh`) and any edit to an already
+  released section (`scripts/check-changelog-frozen.sh`).
+- **Run the humanizer on new or heavily edited prose.** New documentation,
+  and any large rewrite of existing text (a new doc section, a rewritten guide,
+  a long CHANGELOG entry, an RFC or design note), goes through the `humanizer`
+  skill (a maintainer-side skill; contributors without it leave the pass to
+  review) before it is committed: it strips AI-writing patterns while keeping
+  every fact. Prose only — code blocks, commands, paths, link targets and
+  headings (anchors) stay unchanged, and a rewrite that adds or drops a fact is
+  a defect. Released CHANGELOG sections are frozen and are not rewritten.
 - **Competitor research keeps the comparison docs in sync — never let them
   go stale.** Any new competitor research pass, or a correction to an existing
   one, must land its findings in the comparison docs in the *same* change, not
@@ -545,10 +578,12 @@ Additional boundary rules:
   Treat a stale claim in `comparison.md` (the doc that promises to be *fair*) as
   a defect, not a nicety.
 - **CI pacing: fast per merge, full matrix before release.** Every
-  implementation merge gates on the fast Linux jobs only. The slow
-  macOS/Windows legs run on a `full-ci` PR label, nightly (windows), or
-  manual dispatch — and running them is **mandatory right before a
-  release**: dispatch `ci` (macOS legs) and `windows` on the exact
+  implementation merge gates on the fast Linux jobs (plus the Windows jobs
+  that its path filter triggers; see Platform notes). The full macOS/Windows
+  legs run on a `full-ci` PR label, nightly (windows), or manual dispatch.
+  `ci.yml` does not run on pushes to `release/*`: after pushing there
+  directly, dispatch `ci` (and `windows` if platform paths changed) on that
+  SHA. Running the full matrix is **mandatory right before a release**: dispatch `ci` (macOS legs) and `windows` on the exact
   release-candidate SHA and wait for green before tagging. Nix follows the
   same rule: Darwin nix build and the privileged NixOS container smoke need
   `nix` / `full-ci`, schedule, or dispatch (not every `Cargo.lock` bump).
@@ -575,8 +610,17 @@ Additional boundary rules:
   lighter-touch equivalent.
 - **No version bumps or release tags without explicit user approval.**
   Do not bump crate/package versions automatically.
-- **PR evaluation:** report pros, cons, and recommended fix, then ask for
-  approval before merging or pushing PR changes.
+- **Non-negotiable quality bar.** No malicious or obfuscated code, no
+  regressions (add tests when unsure), no stale docs, no security or quality
+  degradation. Any one blocks a merge regardless of approval; when in doubt,
+  double-check and live-test with the automated checks.
+- **PR evaluation:** audit each PR (pros, cons, recommended fix) and carry
+  approved tickets through yourself: resolve soft blockers (rebase or base
+  retarget, missing tests/docs/CHANGELOG, small fixes and easy decisions) as
+  maintainer commits; ask the author only about a hard blocker you cannot
+  resolve. Once the maintainer approves a batch, push each green task to its
+  branch as it finishes. Version bumps and tags always need explicit
+  approval.
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
@@ -589,12 +633,19 @@ Additional boundary rules:
   ship fixes as a patch release promptly — never let a bug fix wait on
   unreleased feature work. The `[Unreleased]` section signals the bump:
   only `### Fixed` → patch; any `### Added` → minor; anything breaking →
-  major. Releases cut from `main` (trunk-based). If `main` already holds
-  unreleased feature work and a fix must ship, cut `release/X.Y` from
-  the last tag, cherry-pick the fix (it lands on `main` first, always),
-  tag from the branch, then let the branch go dormant — no standing
-  develop/gitflow branches. Bucket incoming work at triage with the
-  `breaking-change` label and version milestones.
+  major. Bucket incoming work at triage with the `breaking-change` label
+  and version milestones.
+- **Branch model.** `main` is the patch line: it takes fixes and docs only
+  (`[Unreleased]` holds only `### Fixed`), and patch tags are cut from it.
+  Additive work targets the standing `release/X.Y` branch for the next minor
+  (currently `release/2.7`). Keep `main` an ancestor of it by forward-merging
+  `main` into it after every fix lands, never the reverse; when a patch
+  release ships, rebuild the branch's `[Unreleased]` as only its own entries
+  so released sections stay identical to `main`'s. A fix lands on `main`
+  first. To ship the minor, merge `release/X.Y` into `main`, run the release
+  gates on that SHA and tag from `main`; the old `release/X.Y` then goes
+  dormant. A PR's base branch follows its semver bucket: fixes → `main`,
+  features → `release/X.Y`.
 - Keep `CLAUDE.md` as a pointer to this file.
 
 ## Documentation map
@@ -617,6 +668,10 @@ Additional boundary rules:
   internal audit: per-competitor migration-worthiness (do we do the basics +
   add enough to justify switching?), the "did we copy without improving?"
   borrowed-ideas verdicts, and documented gap-fill recommendations.
+- [`docs/security-boundaries.md`](docs/security-boundaries.md) — inventory of
+  every isolation/security guard and the test that bites if it is removed.
+- [`docs/external-lifecycle.md`](docs/external-lifecycle.md) — the relay and
+  external lifecycle event contract.
 - [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) — read before touching
   purge/rename/backup/restore/reset/reindex/restore-page.
 - [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) —

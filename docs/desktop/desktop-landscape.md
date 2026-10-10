@@ -18,35 +18,35 @@
 ## Highlights vs RFC #878's assumptions (what changed)
 
 1. **The capture picture improved for two ecosystems:**
-   - **Claude Desktop's Code tab is literally Claude Code** — hooks in
+   - **Claude Desktop's Code tab is Claude Code itself**: hooks in
      `~/.claude/settings.json` already capture it (`agent=claude-code`;
      a folderless session gets a scratch-workspace cwd). RFC #878 classed
      Claude Desktop wholesale as "no hook/event surface"; that is true of
      the Chat tab, and Cowork is unverified.
    - **Antigravity (IDE included) has first-class lifecycle hooks** with
-     `transcriptPath` in every payload — a full auto-capture target the RFC
+     `transcriptPath` in every payload, a full auto-capture target the RFC
      didn't evaluate (it listed Cursor as the only hook-bearing desktop
      target).
 2. **Codex is now the ChatGPT desktop app** with shared `~/.codex` config:
    one `install-mcp`/`install-hooks` write serves CLI + desktop + IDE
    extension (desktop-app hook firing needs one live verification).
 3. **Official Linux desktop builds now exist** for Claude Desktop (beta) and
-   the ChatGPT/Codex app — ai-memory's `docs/mcp-install.md` "Linux: not
+   the ChatGPT/Codex app, so ai-memory's `docs/mcp-install.md` "Linux: not
    officially distributed" note for claude-desktop is stale.
 4. **Grok Bot is a Cursor product** (not xAI) with embedded MCP support but
-   no public docs — opportunistic, not plannable.
+   no public docs, so support is opportunistic and cannot be planned.
 5. Remote/streamable-HTTP MCP is now the norm across Codex/Antigravity/Zed/
-   Claude(Code) — a loopback ai-memory HTTP server needs **no npx shims** on
+   Claude(Code), so a loopback ai-memory HTTP server needs **no npx shims** on
    any researched app except legacy Claude-Desktop-Chat stdio config.
 
 ## Ordered capture opportunity (auto-capture without new product code)
 
-1. Claude Desktop Code tab — works today via existing hooks (verified).
-2. Codex desktop — its engine fires the existing `~/.codex` hooks once
+1. Claude Desktop Code tab: works today via existing hooks (verified).
+2. Codex desktop: its engine fires the existing `~/.codex` hooks once
    trusted (verified); one in-app prompt pending.
-3. Antigravity IDE — via existing `~/.gemini/config/hooks.json` (agent
+3. Antigravity IDE: via existing `~/.gemini/config/hooks.json` (agent
    mapping/`workspacePaths` handling + verification needed).
-4. Zed — via ACP/terminal agents' own hooks (nothing to build).
-5. Chat tab / hosted ChatGPT / Grok Bot — model-discretion only (MCP tools);
+4. Zed: via ACP/terminal agents' own hooks (nothing to build).
+5. Chat tab / hosted ChatGPT / Grok Bot: model-discretion only (MCP tools);
    hosted ChatGPT additionally needs a published plugin to reach a
    user-run server at all.

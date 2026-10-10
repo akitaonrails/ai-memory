@@ -148,6 +148,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+- Fixed the Jev choice reranker adapter silently fabricating scores from a
+  malformed judge response: `docs/examples/jev-reranker-adapter/jev_rerank_shim_choice.py`
+  defaulted missing or misnamed `probabilities` entries to `0.0`, so an HTTP
+  200 with a broken payload produced a well-formed but meaningless ranking
+  the server could not tell apart from a real judgement. The shim now
+  validates the response (key set matches the candidate list, no duplicate
+  JSON keys, numeric non-boolean values in `[0, 1]`, NaN/Inf rejected,
+  distribution sum near 1) and answers HTTP 500 on any violation, which is
+  the failure mode ai-memory already degrades safely on. Includes stdlib
+  `unittest` coverage in `test_jev_rerank_shim_choice.py`. (#1198)
+- Fixed Hermes Agent tool events being dropped under `capture_mode =
+  allowlist`. Hermes reports its own process directory (usually `~`) as the
+  payload `cwd` and points each tool at a repository with an absolute
+  `workdir` or `path`, so the marker lookup never found the repository's
+  `.ai-memory.toml`. The native `ai-memory hook` now also routes a shell
+  command by its absolute `workdir` and a search/list tool by its absolute
+  `path`, alongside the file-tool targets it already followed, when that
+  location proves one other repository or marker; relative locations still
+  keep the payload `cwd`. A reroute is now refused when the payload `cwd`'s own
+  `[capture] ignore_paths` would drop the event, so an exclusion that names a
+  path outside its checkout, or a source file read by a command whose
+  `workdir` points at another project, is no longer judged only by the
+  destination's policy. (#1199)
 
 ## [2.6.3] - 2026-10-09
 

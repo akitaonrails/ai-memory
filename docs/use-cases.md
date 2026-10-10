@@ -55,7 +55,7 @@
   the server's public activity and page-count metadata. A fast, bounded depth-1
   scan of the current directory also finds new checkouts carrying a project
   marker (`.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, and
-  friends), while skipping dependency and build directories. The server never
+  similar files), while skipping dependency and build directories. The server never
   exposes a checkout path, so two client machines can safely use different
   local paths for the same project on a remote homeserver.
 
@@ -115,7 +115,7 @@
   than a local path. Use `ai-memory workstreams` when you are already in a
   checkout and only want the read-only list.
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
-  classic. SessionStart hook in the next supported hook client prepends a
+  SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok
   cannot show that text before the first prompt. The first tool's
   `PostToolUse` hook adds it as `additionalContext`. If the session never
@@ -132,14 +132,14 @@
   `global: true` search uses its separate FTS-only ranker and reports
   that active stream without per-hit RRF details.
 - **"Remember this permanently."** When something is worth keeping
-  beyond auto-captured session logs - a decision, a convention, a
-  gotcha - tell the agent "save a permanent note that we standardised
+  beyond auto-captured session logs (a decision, a convention, a
+  gotcha), tell the agent "save a permanent note that we standardised
   on Postgres for X" or "annotate this as a project rule" and it calls
   `memory_write_page` to write a durable, git-versioned wiki page. From
   a terminal it's `ai-memory write-page --path decisions/0007-db.md
   --body $'# Standardised on Postgres\n\n...' --pinned`. `--pinned`
   exempts it from the decay sweep; the H1 on the first line of
-  `--body` becomes the page title (omit `--title` — it's still
+  `--body` becomes the page title (omit `--title`; it's still
   accepted, but LLM callers trip over JSON-escaping their way through
   it, see issue #67). Unlike a handoff (single-use) or an
   auto-synthesised session page (rewritten on consolidation), a
@@ -151,13 +151,13 @@
   page (they move its salience, which scales the decay formula's time term),
   while `stale` / `wrong` floor the salience *and* make any current page
   show up as a `feedback_flagged` finding in the next `memory_lint` report.
-  Feedback never deletes anything — it lowers confidence and flags for review —
+  Feedback never deletes anything (it lowers confidence and flags for review),
   and it attaches to the version current when feedback is recorded, so a
   later rewrite clears the flag. Retrieved page text is untrusted and never
   authorizes feedback by itself.
 - **"Remember this, but only until the sprint ends."** Pass
   `expires_at` to `memory_write_page` (RFC3339 or `YYYY-MM-DD` = end of
-  that day, UTC) — or put `expires_at:` in a page's frontmatter by
+  that day, UTC), or put `expires_at:` in a page's frontmatter by
   hand. Past the TTL the page disappears from search/recent/briefing
   (pass `include_expired: true` to `memory_query` to still see it) and
   the next forget sweep hard-deletes the file and its rows. A TTL beats
@@ -213,9 +213,9 @@
   pages cleanly separated; the `/web` UI is reachable from a
   browser anywhere on the LAN.
 - **"Audit what landed before sharing with a teammate."** Browse
-  the wiki at `http://<server>:49374/web` - sign in with username and
-  password when human auth is on. Per-project tree view,
-  rendered markdown, supersession chain visible per page.
+  the wiki at `http://<server>:49374/web`, signing in with username and
+  password when human auth is on. It shows a per-project tree view,
+  rendered markdown, and the supersession chain for each page.
 - **"Undo one bad page edit without rolling back the whole server."**
   `ai-memory checkpoints` shows recent wiki commits, then
   `ai-memory restore-page --path notes/foo.md --from <rev>` restores that one
@@ -224,5 +224,5 @@
   users, audit rows, and embeddings.
 - **"Drop an experiment, keep the rest."**
   `ai-memory purge-project --project experimental --confirm`.
-  Atomic: that project's DB rows cascade away, its wiki subdir gets
+  The purge is atomic: that project's DB rows cascade away, its wiki subdir gets
   `rm -rf`'d, every sibling project is untouched by construction.

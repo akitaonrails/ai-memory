@@ -14,11 +14,11 @@ durability, opt-in LLM consolidation, structured JSON outputs, typed
 handoffs, versioned supersession, per-project UUID isolation, and an
 agentmemory-style retention formula.
 
-The remaining high-value improvements were not a rewrite. They were
-mostly lifecycle and retrieval layers on top of the solid base: small
+The remaining high-value improvements did not need a rewrite. They were
+mostly lifecycle and retrieval layers on top of the existing base: small
 editable memory slots, scheduled maintenance, first-class graph/link
 retrieval, bounded raw/verbatim fallback recall, diagnostics, and real
-retrieval checks. The most important caution remains keeping the current
+retrieval checks. The main caution is still to keep the current
 substrate simple. Do not copy agentmemory's sidecar surface, cognee's
 multi-store orchestration, basic-memory's manual write-note workflow, or
 MemPalace's verbatim-everything storage model.
@@ -205,9 +205,9 @@ enough for the expected corpus size.
 
 ### P1: Add Bounded Raw/Verbatim Fallback Recall
 
-MemPalace's strongest useful idea is not its storage stack. It is the
-evidence that raw text recall can recover details that compiled summaries
-drop. ai-memory reserves `raw/`; the implemented fallback searches the
+The most useful thing in MemPalace is the evidence that raw text recall
+can recover details that compiled summaries drop; its storage stack is not
+worth taking. ai-memory reserves `raw/`; the implemented fallback searches the
 durable `observations` table through `observations_fts`.
 
 Recommended shape:
@@ -219,8 +219,8 @@ Recommended shape:
 | retention budget | Prevent MemPalace-style bloat. |
 | privacy boundary | Use the same sanitizer before raw text becomes durable/searchable. |
 
-This gives ai-memory the best of both philosophies: compile first, but
-keep a bounded escape hatch for exact details.
+This lets ai-memory compile first while keeping a bounded escape hatch
+for exact details.
 
 ### P1: Add Diagnostics And Safe Heal Paths
 
@@ -259,8 +259,8 @@ Recommended benchmark matrix:
 | FTS5 + entity + vector + graph RRF | Current embedding-enabled hybrid path. |
 | compiled wiki + raw fallback | Current MemPalace-inspired miss path. |
 
-Borrow MemPalace's transparency, not its headline-chasing. Public claims
-should have tests or should not be claims.
+Borrow MemPalace's transparency about benchmarks and skip its
+headline-chasing. Public claims should be backed by tests or not made.
 
 ### P2: Consider Feedback/Reinforcement Beyond Access Counts
 

@@ -161,8 +161,9 @@ needs `--config-file ~/.config/Claude/claude_desktop_config.json`.
   `tool_output` alongside Cursor's fields; the transcript lands under
   `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl` and its path
   appears only on `stop`. Replayed to a scratch server, the prompts are
-  stored but the tool events get empty bodies, unlike Claude Code's; the
-  cause is not yet isolated (`cursor.md`).
+  stored but the tool events got empty bodies, unlike Claude Code's, because
+  Cursor was missing from the tool-capture agent list; fixed in 2.6.3
+  (`cursor.md`).
 - `cursor-agent` is not logged in.
 
 ## Still unverified
@@ -173,5 +174,4 @@ needs `--config-file ~/.config/Claude/claude_desktop_config.json`.
 | Does the Antigravity IDE run `.agents/hooks.json` / `~/.gemini/config/hooks.json`, with the same payload as the CLI? | One IDE prompt in a scratch workspace carrying a recorder `.agents/hooks.json` |
 | Do host hooks and MCP servers reach Cowork's VM on Linux (and on macOS/Windows)? | One Cowork task after the VM images download, then look for hook output in its transcript |
 | Cursor: the native `.cursor/hooks.json` payloads and the `cwd` inside an open folder | One prompt in the probe workspace, which carries recorder `.cursor/hooks.json` and `.claude/settings.json` files |
-| Cursor: why tool events reach the store with empty bodies | A failing test that posts the captured payload, then bisect the field differences |
 | Is a per-turn Antigravity session-start acceptable, or should it be gated per conversation? | A product decision once the server-side effect of repeated session-start posts is measured |

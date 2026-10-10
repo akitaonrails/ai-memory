@@ -3,8 +3,8 @@
 ## The 60-second version (read this first)
 
 When an LLM provider is configured, the server periodically reviews
-newly completed sessions and proposes small wiki edits — a new gotcha,
-a rule promotion, a patch to a stale concept page. Every proposal is
+newly completed sessions and proposes small wiki edits, such as
+a new gotcha, a rule promotion, or a patch to a stale concept page. Every proposal is
 validated (schema, confidence floor, size caps, eval gate) and staged
 into `_pending/auto-improve/` with a human-readable sidecar, then
 **auto-approved by default** through the normal wiki write path.
@@ -12,17 +12,17 @@ into `_pending/auto-improve/` with a human-readable sidecar, then
 What that means for you:
 
 - **Solo, zero-LLM install**: this never runs. Nothing to decide.
-- **Solo with an LLM**: the default is fine — proposals are small,
+- **Solo with an LLM**: the default is fine. Proposals are small,
   bounded, audited (every one lands in the pending-writes trail with
   evidence quotes and a confidence score), and reversible via wiki
   history. Run `ai-memory pending-writes list` for a week if you want to
-  build trust — that (and SQLite) is the source of truth for a proposal's
+  build trust; that list (and SQLite) is the source of truth for a proposal's
   status. The `_pending/auto-improve/` sidecar files are a human-readable
   snapshot frozen at staging time; they do not track a proposal to
   approved/applied/rejected.
 - **Shared / team server**: set `[auto_improve] require_approval =
   true`. On a server several people trust, an LLM should not
-  auto-apply edits nobody reviewed — proposals then wait in
+  auto-apply edits nobody reviewed. Proposals then wait in
   `_pending/` until a human approves each one.
 - **Cost**: one bounded LLM call per completed session that passes the
   preflight filters (minimum observations/duration); prompt and output
@@ -30,8 +30,8 @@ What that means for you:
 
 A typical staged proposal sidecar looks like: the target path, the
 operation (create or patch), a confidence like `0.86`, the rationale,
-bounded evidence quotes from the session, and the exact body or edits
-— enough to approve or reject without opening anything else.
+bounded evidence quotes from the session, and the exact body or edits.
+That is enough to approve or reject without opening anything else.
 
 The rest of this page is the original design research plus
 implementation notes, kept for depth.
@@ -51,8 +51,7 @@ implementation notes, kept for depth.
 An ai-memory equivalent of Hermes Agent's self-improvement loop is worth
 shipping as a default-available, review-gated staging path. The current wiki
 already captures useful durable knowledge: decisions, gotchas, concepts, rules,
-notes, and session summaries. The missing piece is not more capture. It is a
-careful reviewer that can identify durable lessons and apply small wiki patches
+notes, and session summaries. What is missing is a careful reviewer that can identify durable lessons and apply small wiki patches
 through the existing review/audit path without mutating the active agent context
 or silently promoting weak session residue into rules.
 
@@ -121,7 +120,7 @@ The default is off, preserving existing behavior. When enabled:
 Validation runs before staging, so invalid writes are rejected immediately
 instead of being queued for approval and failing later.
 
-This maps strongly to ai-memory. Wiki edits are closer to Hermes skills than to
+This maps closely to ai-memory. Wiki edits are closer to Hermes skills than to
 small memory entries: they can be large, durable, and project-shaping. Staging
 should be the default for autonomous ai-memory learning writes.
 
@@ -381,12 +380,12 @@ min_session_age_secs = 600
 
 `patchable_page_prefixes` decides which folders' **page bodies** are sent to the
 reviewer. Everything else in the project reaches it through the recent-page list
-as a single line — path, title, kind, updated_at — with no content.
+as a single line (path, title, kind, updated_at) with no content.
 
 That matters because the reviewer cannot avoid duplicating what it cannot read.
 A project that keeps its invariants in `decisions/` or `gotchas/`, with no
 `_rules/` pages at all, sends **no page bodies**, and the model will keep
-proposing rules that are already written down — often with high confidence,
+proposing rules that are already written down, often with high confidence,
 because the claim really is well evidenced by the session.
 
 The default is the historical pair, so existing installations are unchanged. Add
@@ -555,7 +554,7 @@ can notice already exists, and therefore what it may redundantly re-propose:
   recently updated ones. To keep those slots for durable knowledge, the
   auto-improve reviewer excludes `sessions/` pages from *its* recent-page context
   (session pages are never valid proposal targets and would otherwise dominate
-  the list). This exclusion is scoped to the reviewer only — the SessionStart
+  the list). This exclusion is scoped to the reviewer only; the SessionStart
   briefing and `memory_briefing` still include session pages, where they belong.
 
 The practical consequence: a durable page that lives outside `_rules/` /
@@ -650,9 +649,9 @@ Tests:
 
 ## Current Conclusion
 
-Hermes validates the idea, but also shows why the boundaries matter. The useful
-part is not that the agent can write memory by itself. The useful part is a
-bounded, observable, reviewable loop that turns repeated work into durable
+Hermes validates the idea and also shows why the boundaries matter. An agent
+that can write memory by itself is not what makes it useful. The useful part is
+a bounded, observable, reviewable loop that turns repeated work into durable
 knowledge while keeping active task execution isolated.
 
 For ai-memory, the current correct boundary is scheduled review plus pending

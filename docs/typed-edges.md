@@ -1,7 +1,7 @@
 # Typed relation edges
 
-Pages can declare *typed* edges to other pages — not just "these are
-related" but *how*:
+Pages can declare *typed* edges to other pages, which say *how* two pages
+are related instead of only that they are:
 
 ```yaml
 ---
@@ -15,19 +15,19 @@ relations:
 ## When to bother — and when not to
 
 Plain `[[wikilinks]]` remain the default and are enough for "these
-pages are related". Typed edges earn their keep in one specific loop —
-**contradictions you want lint to chase**:
+pages are related". Typed edges are worth adding in one specific loop:
+**contradictions you want lint to chase**.
 
 1. A gotcha page exists: `gotchas/linker-oom.md` ("the linker OOMs on
    machines under 32 GB").
 2. Months later a session fixes it; the consolidator (or you) writes
    `notes/linker-fix.md` with `relations: { fixes:
-   ["gotchas/linker-oom.md"] }` — the gotcha's page history now shows
+   ["gotchas/linker-oom.md"] }`, and the gotcha's page history now shows
    what resolved it.
 3. Later still, new evidence disagrees with a stored decision; the new
-   page declares `contradicts:` — and `memory_lint` reports the pair as
-   a `contradiction` finding until someone reconciles them. No LLM
-   involved: the declaration IS the signal.
+   page declares `contradicts:`, and `memory_lint` reports the pair as
+   a `contradiction` finding until someone reconciles them. No LLM is
+   involved, because the declaration itself is the signal.
 
 If you are not using lint and don't need fix/cause chains, skip the
 frontmatter entirely; nothing else changes.
@@ -42,7 +42,7 @@ frontmatter entirely; nothing else changes.
 
 The set is deliberately closed: a free-text relation column turns into
 an unqueryable folksonomy. Keys outside the vocabulary are skipped at
-the write boundary (with a warning) — a typo cannot mint a new edge
+the write boundary (with a warning), so a typo cannot mint a new edge
 kind. Targets use the same grammar as wikilinks: `path`,
 `project:path`, `workspace/project:path`, or `_global:path` (the
 reserved preferences project in the default workspace); extension-less
@@ -51,14 +51,14 @@ targets gain `.md`.
 ## What typed edges do
 
 - **`contradicts` feeds lint.** A declared contradiction is the
-  highest-signal zero-LLM finding possible — someone (or the
+  strongest zero-LLM finding available, because someone (or the
   consolidator) explicitly said two pages disagree. `memory_lint`
   reports each edge as a `contradiction` finding until the pages are
   reconciled, including the case where the target no longer resolves
   (a stale declaration).
 - **They participate in the retrieval graph** as ordinary edges. No
-  relation-specific ranking weight is applied — the LongMemEval
-  harness showed no basis for one yet; the data is stored so a future
+  relation-specific ranking weight is applied, since the LongMemEval
+  harness showed no basis for one yet. The data is stored so a future
   change can be measured rather than guessed.
 - **Backlinks stay clean.** A typed edge and a plain `[[wikilink]]`
   to the same target coexist as distinct rows (`links.link_type`), but
@@ -67,7 +67,7 @@ targets gain `.md`.
 ## Who writes them
 
 - **You**, in any page's frontmatter (the wiki files are plain
-  markdown — edit them and let the watcher reindex the page; `ai-memory
+  markdown: edit them and let the watcher reindex the page; `ai-memory
   reindex` only rebuilds a clean store from the markdown).
 - **The consolidator**, sparingly: both single-page consolidation and
   `memory_consolidate` with `multi_page=true` can preserve a relation

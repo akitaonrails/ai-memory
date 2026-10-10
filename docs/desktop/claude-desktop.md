@@ -10,7 +10,7 @@ One Electron app, three tabs: **Chat** (claude.ai consumer chat), **Cowork**
 (long-running agentic work / Dispatch), **Code** (Claude Code sessions).
 Officially on macOS and Windows; **Linux is an official beta** (apt/.deb for
 Ubuntu 22.04+ and Debian 12+ only; other distributions are pointed at the
-CLI — <https://code.claude.com/docs/en/desktop>,
+CLI; see <https://code.claude.com/docs/en/desktop>,
 <https://code.claude.com/docs/en/desktop-linux>). On Linux, Cowork runs its
 tasks inside a QEMU/KVM virtual machine the app hosts. The local machine runs the
 Linux build (`/usr/share/applications/com.anthropic.Claude.desktop`,
@@ -24,28 +24,28 @@ app reads the same settings files as the CLI"
 
 The desktop app ships and auto-manages its own Claude Code CLI copy:
 `~/.config/Claude/claude-code/2.1.280/claude` (+ `.payload`, `.verified`
-marker files) — found locally.
+marker files), found locally.
 
 ## MCP client support
 
 Two distinct MCP surfaces:
 
-1. **Chat tab (consumer app)** — local stdio MCP servers via the classic
+1. **Chat tab (consumer app)**: local stdio MCP servers via the classic
    config file `claude_desktop_config.json` under an `mcpServers` key, plus
    remote HTTPS connectors configured in-app ("Connectors"). Config paths:
    - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
    - Windows: `%APPDATA%\Claude\claude_desktop_config.json` (or the MSIX
-     AppContainer path — ai-memory's `install-mcp --client claude-desktop`
+     AppContainer path; ai-memory's `install-mcp --client claude-desktop`
      already detects both)
    - Linux: `~/.config/Claude/claude_desktop_config.json` (**verified
-     locally**; the file exists with a `preferences` object — the Linux beta
+     locally**; the file exists with a `preferences` object, so the Linux beta
      reuses the same file). `docs/mcp-install.md` documents it, and
      `install-mcp --client claude-desktop` writes it on Linux.
    - Source: <https://modelcontextprotocol.io/quickstart/user> (mac/win
      paths), local file inspection, ai-memory `docs/mcp-install.md`.
    - Local MCP logs: `~/Library/Logs/Claude/mcp*.log` (mac),
-     `%APPDATA%\Claude\logs` (win) — same source.
-2. **Code tab (Claude Code host)** — the same MCP configuration the CLI uses:
+     `%APPDATA%\Claude\logs` (win), same source.
+2. **Code tab (Claude Code host)**: the same MCP configuration the CLI uses:
    `~/.claude.json` (local/user scope), `.mcp.json` (project scope), settings
    files, and **plugins** (a plugin can bundle MCP servers + hooks; the
    desktop app has a plugin browser). Connectors in the prompt "+" menu are
@@ -55,7 +55,7 @@ Two distinct MCP surfaces:
    in-process `type: "sdk"` reserved for host applications such as the
    desktop app (<https://code.claude.com/docs/en/mcp>).
 
-Remote per-session MCP servers also appear in desktop session state —
+Remote per-session MCP servers also appear in desktop session state:
 `~/.config/Claude/claude-code-sessions/<account>/<org>/local_*.json` contains
 a `remoteMcpServersConfig` list (verified locally; two remote servers incl.
 Anthropic's own Docs MCP).
@@ -70,10 +70,10 @@ tab's extension surface.
 ## Lifecycle hooks / capture surface
 
 - **No push hooks in the Chat/Cowork tabs.** Capture for consumer-chat
-  conversations stays model-discretion (memory tool calls) — unchanged from
+  conversations stays model-discretion (memory tool calls), unchanged from
   RFC #878's conclusion.
 - **The Code tab is full Claude Code**, and it reads the user's
-  `~/.claude/settings.json` — where ai-memory's hooks are already installed
+  `~/.claude/settings.json`, where ai-memory's hooks are already installed
   (verified locally: `hooks.SessionStart` →
   `ai-memory ... hook --event session-start --agent claude-code ...`).
   Therefore **ai-memory already captures desktop Code sessions today**, keyed
@@ -101,18 +101,18 @@ real and observable on this machine. Mechanism, from local artifacts:
 
 1. **Every running `claude` process registers a live descriptor** at
    `~/.claude/sessions/<pid>.json` (verified locally). Fields include:
-   - `sessionId` — the Claude Code session UUID
+   - `sessionId`: the Claude Code session UUID
    - `entrypoint: "claude-desktop"` when desktop-spawned
-   - `hostSessionId: "local_<uuid>"` — the desktop app's own session id
+   - `hostSessionId: "local_<uuid>"`: the desktop app's own session id
    - `cwd`, `version`, `peerProtocol`, `peerFeatures`
      (`notify_idle`, `reply_across_default_dirs`, `artifact_yield`)
-   - `messagingSocketPath: /run/user/<uid>/cc-socks/<pid>.sock` — a Unix
+   - `messagingSocketPath: /run/user/<uid>/cc-socks/<pid>.sock`: a Unix
      socket used for cross-surface messaging between desktop and CLI peers.
 2. **Desktop-side session records** live at
    `~/.config/Claude/claude-code-sessions/<account>/<org>/local_<uuid>.json`
    (verified locally) and carry the join key:
    - `sessionId: "local_<uuid>"` (desktop id)
-   - `cliSessionId: "<CLI session UUID>"` — **the same UUID as the
+   - `cliSessionId: "<CLI session UUID>"`: **the same UUID as the
      `~/.claude/projects/.../<uuid>.jsonl` transcript**
    - plus `cwd`, `originCwd`, `model`, `permissionMode`, `title`,
      `remoteMcpServersConfig`, timestamps.
@@ -126,7 +126,7 @@ real and observable on this machine. Mechanism, from local artifacts:
    computer, again continuing the same session.
 4. **Deep links**: `claude-cli://` URL scheme handled by
    `~/.local/share/applications/claude-code-url-handler.desktop` →
-   `claude --handle-uri %u` (verified locally) — how other apps hand a
+   `claude --handle-uri %u` (verified locally). This is how other apps hand a
    session to Claude Code.
 5. Desktop's "work across sessions" surface only sees sessions the desktop
    app itself runs (local/SSH/WSL), **not** terminal CLI or VS Code extension
@@ -136,7 +136,7 @@ real and observable on this machine. Mechanism, from local artifacts:
 ### What ai-memory's `(agent, session_id)` key sees
 
 - A desktop Code session and the CLI session it came from (via
-  `--resume`/`/desktop`) are **one session id** — capture dedups naturally.
+  `--resume`/`/desktop`) are **one session id**, so capture dedups naturally.
 - A desktop Code session started without a folder is a *new* CLI session
   (new UUID) whose cwd is a fresh scratch workspace; ai-memory sees it as a
   claude-code session in an auto-named project derived from the scratch

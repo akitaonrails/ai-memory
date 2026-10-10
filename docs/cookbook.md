@@ -50,11 +50,11 @@ Your agent calls `memory_write_page` and it lands as a durable wiki page (routed
 under `_rules/` when it's a rule). Next session, `memory_query` surfaces it, and
 if the project's `.ai-memory.toml` opts into the on-start brief, rules are
 prepended to the agent's context automatically. To make it apply to **all** your
-projects, ask for it as a standing preference — it goes to your cross-project
+projects, ask for it as a standing preference. It goes to your cross-project
 profile (see the next recipe), or to the shared `_global` scope with
 `scope: "global"`. On a multi-user
 server, writing a global rule needs root or a `write` grant on `_global`. From
-another project's page, link to that standing page with `[[_global:path]]` — it
+another project's page, link to that standing page with `[[_global:path]]`, which
 always names the reserved `_global` project in the default workspace. Sibling
 projects use `[[project:path]]`; another workspace uses
 `[[workspace/project:path]]`. Bare `[[name]]` stays inside the current project.
@@ -64,8 +64,8 @@ projects use `[[project:path]]`; another workspace uses
 > "In all my projects: use pnpm, keep integration tests in tests/suite."
 
 Your agent writes each one into the cross-project profile
-(`memory_write_page` with `scope: "profile"`). From then on every project — and
-every harness — gets a short "your usual choices" section at session start, and
+(`memory_write_page` with `scope: "profile"`). From then on every project, in
+every harness, gets a short "your usual choices" section at session start, and
 the agent applies those choices whenever the repository's rules file and you
 say nothing. A brand-new repository gets the whole baseline, plus a pointer to
 `ai-memory profile apply` for writing it into that repository's rules file.
@@ -91,8 +91,8 @@ Details: [`cross-project-profile.md`](cross-project-profile.md).
 
 Two ways, depending on where the document lives:
 
-1. **It's already a wiki page** (you saved it, or imported it — below): tell the
-   agent "read the `norms/gdpr-retention` page before implementing" — it calls
+1. **It's already a wiki page** (you saved it, or imported it as described below): tell the
+   agent "read the `norms/gdpr-retention` page before implementing" and it calls
    `memory_read_page` with that path and works from the full body.
 2. **It's an external file** (a norm/spec on disk): save it as a page first
    ("remember this spec as `norms/gdpr-retention`", paste or point at it), then
@@ -109,7 +109,7 @@ bring an existing body of documents in as project memory:
   document, under a stable prefix like `norms/…`. Then any project can read a
   specific one before implementing (recipe above).
 - **A whole OKF/Obsidian vault or an export from another tool**: use the
-  companion importer (see [`companion-crates.md`](companion-crates.md)) — it
+  companion importer (see [`companion-crates.md`](companion-crates.md)). It
   ingests OMC and external-conversation exports into the store. `ai-memory
   export-okf` is the inverse (export your wiki as an OKF bundle), useful to see
   the exact on-disk shape your documents should take.
@@ -127,7 +127,7 @@ To keep a team's shared memory reviewable next to the code it documents, use
 the [`ai-memory-wikisync`](../companions/ai-memory-wikisync) companion
 (boundary in [`companion-crates.md`](companion-crates.md)). It exports
 explicitly allowlisted page families from the server's read-only `/api/v1`
-surface into a directory in your repo — dry-run by default:
+surface into a directory in your repo. It is dry-run by default:
 
 ```bash
 ai-memory-wikisync plan   --server http://127.0.0.1:49374 \
@@ -188,15 +188,15 @@ token). To tolerate drift and fail only on refusals, end the command with
 
 ## Recipe: control what gets kept, aged, or consolidated
 
-By default nothing you have to think about: memory decays on a single gentle
+By default there is nothing to think about: memory decays on a single gentle
 curve, and an upgrade to 2.4 changes no scores and evicts nothing. When you *do*
-want to tune aging, it is all opt-in and reversible — the original of anything
+want to tune aging, it is all opt-in and reversible. The original of anything
 compacted or merged stays in git and the supersession chain, recoverable with
 `ai-memory restore-page`.
 
 - **Keep something forever:** pin it. A pinned page is exempt from the
   forget-sweep regardless of tier or age. Semantic and procedural pages never
-  decay either — only working/episodic memory ages.
+  decay either; only working/episodic memory ages.
 - **Make a note expire on a deadline:** ask your agent to remember it "until
   <date>" (an `expires_at`); the forget-sweep deletes it when the time passes,
   no matter how often it was read. A TTL outranks pinning.
@@ -208,7 +208,7 @@ compacted or merged stays in git and the supersession chain, recoverable with
   prose; `[decay] dedup_cold_clusters` collapses near-duplicate cold pages into
   one survivor. Both are zero-LLM, off by default, and supersede rather than
   delete.
-- **Keep used memory longer:** nothing to configure — a page you open, search,
+- **Keep used memory longer:** nothing to configure. A page you open, search,
   or reach through a related-pages walk is reinforced automatically and resists
   decay.
 - **Surface likely contradictions:** run `memory_lint` (through your agent or the
@@ -217,7 +217,7 @@ compacted or merged stays in git and the supersession chain, recoverable with
   as disagreement, so a single-domain or single-language store yields mostly
   candidate pairs: read each finding as a pair to check, not as a defect. If
   that noise is too high, raise `contradiction_band_min` (`config.toml` or
-  `AI_MEMORY_CONTRADICTION_BAND_MIN`, default `0.4`) — on such a store the
+  `AI_MEMORY_CONTRADICTION_BAND_MIN`, default `0.4`). On such a store the
   band measures domain proximity more than conflict, so a higher floor trims
   same-domain-but-unrelated pairs.
 - **Let an LLM consolidate on idle ("dream"):** with a provider *and* an embedder
@@ -232,7 +232,7 @@ compacted or merged stays in git and the supersession chain, recoverable with
   in the same repo): automatic. A handoff is captured at session end and the
   next session's on-start hook prepends it. Ask "where did we leave off?".
 - **Ask an agent in another project to do something** without loading that
-  project's context here: cross-project messaging — "send project-b a request to
+  project's context here: use cross-project messaging. Say "send project-b a request to
   add the export endpoint" (`memory_message_send`), and over there "check my
   inbox" (`memory_message_pop`). See [`agent-messaging.md`](agent-messaging.md).
 
@@ -289,15 +289,15 @@ ai-memory run --yolo claude
   `Enter`/`y`/`yes` proceeds (the default); `n`/`no` aborts before anything
   launches.
 - **The ai-jail offer.** If [ai-jail](https://github.com/akitaonrails/ai-jail)
-  is usable — on Linux/macOS, installed on `PATH` (or `~/.local/bin/ai-jail`),
-  with its sandbox backend present (`bwrap` on Linux, `sandbox-exec` on
-  macOS) — and you are not already inside it, a second question offers to
+  is usable (on Linux/macOS, installed on `PATH` or `~/.local/bin/ai-jail`,
+  with its sandbox backend present: `bwrap` on Linux, `sandbox-exec` on
+  macOS) and you are not already inside it, a second question offers to
   re-run the session inside it. When it is not usable (or on Windows) there is
   no second question; the run just proceeds. Accepting re-execs the original
   command under `ai-jail --network --agent-state --env <NAME>... --`,
   forwarding only the credential/config
   environment variables that are already set (server/hook URL,
-  `CLAUDE_CONFIG_DIR`, provider API keys, etc.) — `--network` keeps the
+  `CLAUDE_CONFIG_DIR`, provider API keys, etc.). `--network` keeps the
   loopback ai-memory server reachable while still sandboxing the filesystem.
   Declining keeps the run unsandboxed (your choice, already warned).
 - **Choosing what the jail gets.** After you accept the offer, a checklist
@@ -312,8 +312,8 @@ ai-memory run --yolo claude
   as `--no-X`, so they stay off even if your global `~/.ai-jail` enables them.
 - **Skipping the questions.** `ai-memory run --jail claude` re-runs inside
   ai-jail straight away, turning on those pre-marked defaults and leaving
-  everything else to your own ai-jail config — with or without `--yolo`, and
-  in scripts too; it fails rather than running unjailed if ai-jail is not
+  everything else to your own ai-jail config. This works with or without
+  `--yolo`, and in scripts too; it fails rather than running unjailed if ai-jail is not
   usable. `--jail=github,ssh,no-mise` is exact: the listed toggles (`no-X`
   forces one off), with every other checklist row forced off; `all` turns
   every row on and `none` turns every row off. `--no-jail` never jails and skips the
@@ -329,7 +329,7 @@ ai-memory run --yolo claude
   `--jail=github,…`. ai-memory always passes `--no-save-config`, so a jailed
   run never writes its own flags into your repository's `.ai-jail`.
 - **Already inside ai-jail.** Both prompts are skipped and the run proceeds
-  directly — `ai-jail ai-memory run … --yolo` sees no extra friction.
+  directly, so `ai-jail ai-memory run … --yolo` sees no extra friction.
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with
   `(jail) `); it fails open (shows the warning) when undetectable, never
   open to skipping it silently.
@@ -343,7 +343,7 @@ ai-memory run --yolo claude
   **It cannot remove your own `ask` rules**: Claude Code honors explicit
   `permissions.ask` rules (and its built-in command-safety checks) in every
   mode, so a rule like `Bash(docker run *)` in `~/.claude/settings.json` still
-  pauses the run. For a pause-free sandbox, drop those `ask` entries — `deny`
+  pauses the run. For a pause-free sandbox, drop those `ask` entries; `deny`
   rules block without pausing, so they can stay. Best paired with ai-jail.
 - **Passing extra env, e.g. a GitHub token.** `ai-memory run claude --yolo
   --env GH_TOKEN="$(gh auth token)"` forwards it into the jailed agent (needs
@@ -448,7 +448,7 @@ ai-memory serve                      # run the server
 
 - **Server/homelab down**: `ai-memory run` does not need the server to start a
   harness. When the server is unreachable it prints one loud warning and
-  launches anyway — hooks keep capturing to the local spool (drained
+  launches anyway. Hooks keep capturing to the local spool (drained
   automatically when the server returns), an existing MCP registration
   degrades to no-recall for the session, and the child's exit code is
   returned. What you lose for that run is the workstream lease/context,
@@ -494,7 +494,7 @@ ai-memory serve                      # run the server
   counts are shown as unavailable rather than zero.
 - **Only *some* agents are being remembered**: run `ai-memory doctor`. It lists
   every harness that has local sessions in this project and whether the server
-  captured them — so a harness you rotated in without installing its hook (a
+  captured them. A harness you rotated in without installing its hook (a
   silent gap: it keeps its own local history while capturing nothing) shows up
   as a warning with the exact `install-hooks` command to fix it. For Claude
   Code it also reports the detected default auto-memory directory and whether
@@ -517,7 +517,7 @@ ai-memory serve                      # run the server
   background; you can trigger or preview it yourself with `ai-memory backfill`
   (`--dry-run` to see what it would import), or turn it off with
   `AI_MEMORY_BACKFILL_ON_START=false`.
-- **A search misses something you saved**: confirm the scope — memory is
+- **A search misses something you saved**: confirm the scope. Memory is
   per-project; a page saved in project A is not returned in project B unless it
   was written to the global scope or you query with an explicit scope.
 - **You want an LLM feature (consolidation, digests)**: set a provider

@@ -1,6 +1,6 @@
 # Design: Page-grain ingestion windows + version-filtered `as_of` (issue #656)
 
-*Status: implemented on the `release/2.2` line (2.2.0) — V62 page-grain
+*Status: implemented on the `release/2.2` line (2.2.0): V62 page-grain
 windows, version-filtered `as_of` FTS fused via the default path's RRF,
 `docs/temporal.md` updated. Scope stayed Phase A only; Phase B remains
 deferred (§7). Open question 1 resolved by the v2.1.0 cut (new features
@@ -51,9 +51,8 @@ link grain:
 
 The issue title frames the feature as valid-time ("true in the world").
 Phase A's `valid_from`/`valid_to` are **ingestion time**: the version's own
-`created_at` and the superseding version's `created_at` — the *same*
-dimension the entity-link windows already use, just materialized at page
-grain. "Valid-time" stays reserved for the world-time split (Phase B, §7).
+`created_at` and the superseding version's `created_at`. That is the *same*
+dimension the entity-link windows already use, materialized at page grain. "Valid-time" stays reserved for the world-time split (Phase B, §7).
 
 Pinned terms for this doc and the implementation PR:
 
@@ -68,14 +67,14 @@ Pinned terms for this doc and the implementation PR:
 - `valid_from` mirrors `entity_page_links.valid_from` deliberately: same
   dimension, same predicate shape, same tests. The "valid" here reads as
   "the version the store treated as current", never as world truth.
-- The window end is **`valid_to`, not `superseded_at`**, for a load-bearing
-  reason: `pages.superseded_at` already exists with a different meaning —
+- The window end is **`valid_to`, not `superseded_at`**, because
+  `pages.superseded_at` already exists with a different meaning: it is
   the V03 decay-tombstone eviction marker, written exactly when
   `supersedes IS NULL` (sweep eviction, not supersession). Reusing that
   name would conflate "evicted by the forget sweep" with "replaced by a
   newer version". `valid_to` also covers ends that have no superseding
   version at all (retirement without successor, below), where
-  "superseded_at" would be a lie.
+  "superseded_at" would be wrong.
 - `valid_from` duplicates `created_at` by construction. That duplication is
   accepted (see §4): it keeps the window self-describing per row and the
   `as_of` predicate symmetric with the link-grain one.
@@ -84,15 +83,15 @@ Pinned terms for this doc and the implementation PR:
 
 A version's window closes at exactly one of:
 
-1. **Supersede** — a new version of the same path is written. `valid_to` =
+1. **Supersede**: a new version of the same path is written. `valid_to` =
    the new version's `created_at`, closed in the same transaction as the
    `is_latest` flip (mirrors the link-window close in `upsert_page_in_tx`).
-2. **Retire without successor** — decay tombstone, purge-regenerate,
+2. **Retire without successor**: decay tombstone, purge-regenerate,
    graveyard merge (the V58 class). `valid_to` = the retirement instant
    (recorded explicitly on both grains), closed in the same
    transaction as the retire. New retire paths must close both grains;
    V58's audit is the checklist.
-3. **Open** — `valid_to IS NULL` while the version is the latest live one.
+3. **Open**: `valid_to IS NULL` while the version is the latest live one.
 
 Deletion stays deletion: purged pages cascade away and the timeline does
 not survive a purge, exactly as `docs/temporal.md` already states for
@@ -108,23 +107,23 @@ for successor-less retirements. No migration required. Weighed against
 stored nullable columns + backfill:
 
 **View/join.**
-- Pro: zero migration — no refinery step, no backup gate, no backfill, no
-  new V58-class risk; a window can never be left open by construction.
+- Pro: zero migration (no refinery step, no backup gate, no backfill, no
+  new V58-class risk); a window can never be left open by construction.
 - Con: every `as_of` FTS query pays a self-join against `pages_fts`
   candidates on the read path, with an FTS5+join plan to defend in review;
-  the retirement-instant rule does not disappear, it relocates into the
-  view definition (the V58 logic must still be specified somewhere); no
+  the retirement-instant rule moves into the view definition instead of
+  going away (the V58 logic must still be specified somewhere); no
   covering index for the range predicate.
 
 **Materialized (`ALTER TABLE pages ADD COLUMN valid_from/valid_to` +
 index + one-shot backfill).**
-- Pro: symmetric with the V56 link windows — same predicate shape
+- Pro: symmetric with the V56 link windows, with the same predicate shape
   (`valid_from <= T AND (valid_to IS NULL OR valid_to > T)`), same
   close-in-the-same-transaction discipline, same test shapes; a sargable
   range predicate with a covering index for the `as_of` FTS join; each
   row's window is auditable without joining.
-- Con: it is a backup-gated store migration (§5) — a bigger step than the
-  issue frames; it introduces a new leave-open risk, held down only by
+- Con: it is a backup-gated store migration (§5), a bigger step than the
+  issue suggests; it introduces a new leave-open risk, held down only by
   transactional closes plus tests with controls.
 
 **Recommendation: materialized.** The deciding factors are predicate
@@ -132,16 +131,16 @@ symmetry across the two grains (one window semantic, two tables) and
 keeping the `as_of` FTS join sargable. The migration cost is real but
 bounded and precedented (V56 pattern + the §5 backup gate). If review
 prefers zero-migration, the view is a legitimate fallback with identical
-query semantics — the rest of this doc is unchanged either way.
+query semantics, and the rest of this doc is unchanged either way.
 
 No FTS rebuild is needed in either case: the `pages_fts_*` triggers index
-every version row already (including superseded ones); version-filtered
-FTS is a join-predicate change, not an index change.
+every version row already (including superseded ones), so version-filtered
+FTS only changes a join predicate.
 
 ## 5. Migration: backup-gated, and stated plainly
 
 Phase A is additive (nullable columns + index + backfill, no removed or
-renamed surface, no changed defaults) — but additive is not free:
+renamed surface, no changed defaults), but it still has costs:
 
 - **Refinery migration**, one step: add the nullable columns, backfill
   (`valid_from = created_at`; `valid_to` from the superseding version's
@@ -154,9 +153,9 @@ renamed surface, no changed defaults) — but additive is not free:
 - **Backup gate.** The migration refuses to run without a verified
   pre-migration safety archive, per the current store-migration policy
   (the #633 ordering fix: archive *before* the schema migration, abort
-  when the archive cannot be written or verified). This is the step the
-  issue understates, stated here so the implementation PR is sized
-  honestly.
+  when the archive cannot be written or verified). The issue understates
+  this step; it is listed here so the implementation PR is sized
+  correctly.
 - **Rollback.** Restore the verified pre-migration snapshot from #633
   before starting the older binary. Refinery rejects newer applied
   schema versions; an older binary cannot read the migrated store.
@@ -169,9 +168,8 @@ lookup and skips FTS/vector/graph: "mixing current relevance with
 historical validity answers neither honestly" (`server.rs` returns early
 with `streams_active: ["entity"]`, no raw-observation fallback).
 
-Version-filtered FTS at T is a genuine answer to that objection, and this
-section is the explicit argument the maintainer asked for rather than a
-silent scope slip:
+Version-filtered FTS at T answers that objection. The maintainer asked for an
+explicit argument instead of a silent scope change, and this section is it:
 
 - The original objection is about mixing **present-tense relevance** with
   **past validity**. Constraining the FTS corpus to versions whose
@@ -206,10 +204,10 @@ its precision for entity-phrased questions.
   could never populate it. `NULL = unknown, fall back to ingestion time`
   remains a future design, not this one.
 - **Default-path rank changes.** The issue proposes capping superseded /
-  validity-expired pages in non-`as_of` ranking — but the default path
+  validity-expired pages in non-`as_of` ranking, but the default path
   only indexes `is_latest = 1` rows, so superseded versions never rank
-  today; the "freshness never touches ranking" complaint is really about
-  *stale-but-latest* pages, a different problem. Tag-carried staleness
+  today. The "freshness never touches ranking" complaint is about
+  *stale-but-latest* pages, which is a different problem. Tag-carried staleness
   already has an authority mechanism (`superseded → 0.65`,
   `historical → 0.80` in `PageAuthority`). Phase A makes **no default-path
   rank change**; any freshness signal is a separate proposal with eval
@@ -235,7 +233,7 @@ its precision for entity-phrased questions.
    implementation PR still ride the `release/2.1` line (2.1.x additive)
    or wait for the next minor?
 2. Materialized pair (`valid_from` + `valid_to`) vs. minimal single
-   `valid_to` with `valid_from` read as `created_at` — is the symmetry
+   `valid_to` with `valid_from` read as `created_at`: is the symmetry
    worth the duplicated column?
 3. In `as_of` mode, should FTS and entity merge via RRF, or should FTS
    act strictly as fallback when the entity stream misses?

@@ -101,6 +101,21 @@ jobs:
           uv run --no-project python tests/e2e/external_relay_smoke.py
           --ai-memory-bin "${{ github.workspace }}/target/debug/ai-memory"
           --relay-bin "${{ github.workspace }}/target/debug/ai-memory-relay"
+      # The Jev reranker adapter under docs/examples is stdlib Python with its
+      # own unittest suite; nothing else runs it. `unittest discover` exits 5
+      # when it finds no tests, so the step skips cleanly until a test file
+      # exists there.
+      - name: Jev reranker adapter example tests
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          dir=docs/examples/jev-reranker-adapter
+          if compgen -G "$dir/test_*.py" > /dev/null; then
+            uv run --no-project python -m unittest discover -s "$dir" -p 'test_*.py' -v
+          else
+            echo "no tests under $dir"
+          fi
       # The capture policy every generated OpenCode/OMP/Pi/OpenClaw plugin
       # embeds is TypeScript; only Node can execute it against the shared
       # capture-policy fixture. The test is ignored locally, where Node is not

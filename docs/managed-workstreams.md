@@ -7,32 +7,31 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
-**`ai-memory run` is the preferred way to start a harness — "if in doubt, run
-with ai-memory."** Beyond session continuity, the first time it launches a given
-harness it **auto-installs that harness's ai-memory hooks and MCP** if they are
+`ai-memory run` is the preferred way to start a harness: if in doubt, run
+with ai-memory. Besides session continuity, the first time it launches a given
+harness it auto-installs that harness's ai-memory hooks and MCP if they are
 not already wired, so capture and recall work without a separate `install-hooks`
 / `install-mcp` step (a common footgun: `ai-memory run kimi` used to capture
 nothing if the Kimi hooks were never installed). Auto-wire is idempotent and
 one-time per harness, binary version and install location (a second config home,
 such as another `CLAUDE_CONFIG_DIR`, gets its own first launch; `ai-memory
-uninstall` of hooks or MCP clears that record, so the next launch wires again),
-preserves
-unrelated user config, runs
-before the harness starts so it picks up the fresh hooks, and is best-effort —
-if an install fails it warns and still launches. Harnesses without installer
+uninstall` of hooks or MCP clears that record, so the next launch wires again).
+It preserves unrelated user config, runs before the harness starts so it picks
+up the fresh hooks, and is best-effort: if an install fails it warns and still
+launches. Harnesses without installer
 support (Crush) are skipped; Pi wires hooks but has no MCP client to write. Turn
 it off with `ai-memory run --no-autowire`, `AI_MEMORY_RUN_AUTOWIRE=false`, or
 `run_autowire = false` in config; manual `install-hooks` / `install-mcp` remain
 available for harnesses you never launch through `run`.
 
-The launcher resolves its executable name through `PATH` directly — it does
+The launcher resolves its executable name through `PATH` directly. It does
 not go through an interactive shell, so a `claude` defined only as a shell
 `alias` in `.bashrc`/`.zshrc` is invisible to it. If you switch Claude
 accounts by alias, put a same-named script or shim earlier on `PATH` instead
 (or pass `--executable PATH`, which also resolves a bare name through
 `PATH`), so the resolved `claude` process actually is the one you meant.
 
-**Named launch profiles.** Persist repeated per-account environment overrides
+Named launch profiles persist repeated per-account environment overrides
 in the same `config.toml` the client loads:
 
 ```toml
@@ -65,7 +64,7 @@ ai-memory run --profile work omp --profile omp-work
 
 **Multiple Claude accounts (e.g. Corporate and Personal).** Any harness name
 starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
-and always selects the Claude harness — the exact spelling never changes
+and always selects the Claude harness. The exact spelling never changes
 the agent kind, session store, or transcript import.
 Combine that wildcard with `--executable` to launch the right account's
 binary while keeping each account's managed workstream distinguishable in
@@ -141,7 +140,7 @@ ai-memory run [--workspace NAME] [--project NAME]
 The default is the most recently selected workstream for the current repository
 and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
-branching controls, not harness-switch controls.
+branching controls; they do not switch harnesses.
 
 List the workstreams available to those selectors without launching a harness:
 
@@ -168,27 +167,27 @@ prints. The rename is metadata only. Names are unique per checkout, so a
 destination another workstream already holds is refused rather than merged,
 and the destination is validated exactly like a `--new` name. Because the
 ledger, linked harnesses, and managed runs all key on the workstream id rather
-than its name, nothing else moves — including which workstream a bare
-`ai-memory run` resumes, and the listing order, both of which stay put because
+than its name, nothing else moves. That includes which workstream a bare
+`ai-memory run` resumes and the listing order, both of which stay put because
 a rename deliberately does not touch `selected_at` or `updated_at`. A run that
 is already live keeps displaying the name it launched with until it exits.
 
 ## Do you need this?
 
-Probably not at first — hooks alone already carry most continuity.
+Probably not at first. Hooks alone already carry most continuity.
 
-- **Skip it** when a handoff is all you want: you quit Claude Code
+- Skip it when a handoff is all you want: you quit Claude Code
   mid-task, open Codex in the same directory, and the next session
   starts with "where you left off, what failed, what's open". That
   works with nothing but `install-hooks`; no `ai-memory run` involved.
-- **Use it** when you want the harness's own native resume (`claude
-  --resume` / the picker) to survive a harness SWITCH — the managed
-  ledger records the visible event stream portably, so `ai-memory
+- Use it when you want the harness's own native resume (`claude
+  --resume` / the picker) to survive a switch to another harness. The
+  managed ledger records the visible event stream portably, so `ai-memory
   continue` can reopen the same workstream in a different agent with
-  the exact tool-call history, not just a summary.
+  the exact tool-call history instead of a summary.
 
 If you never switch harnesses mid-workstream, the default path is
-simpler and loses you nothing.
+simpler and you lose nothing by staying on it.
 
 ## Project-first launcher
 
@@ -243,7 +242,7 @@ ai-memory continue --workspace work
 
 The checkout is chosen entirely on the client, from the `linked_at` stamp that
 every successful managed prepare writes to `client-projects.json`. The server
-is never asked which directory to use — it does not expose host paths, and a
+is never asked which directory to use: it does not expose host paths, and a
 link can only be trusted after this host revalidates it.
 
 Before launching, the newest link is rechecked twice: the recorded path must
@@ -348,10 +347,10 @@ adapter to the pool, so shared V1/V2 storage never duplicates a candidate.
 OpenCode 2 sessions run inside a shared background service, so its plugin
 cannot see a managed run's environment the way in-process plugins do. Managed
 `run opencode2` legs launch with the correct resume selectors, capture through
-hooks, and import the beta transcript — all verified live — but the
+hooks, and import the beta transcript (all verified live), but the
 ledger-delta acknowledgement (`context_delivered`) does not fire, because the
-accept path requires the run id on the session-start hook. The failure mode is
-redelivery, never loss: a later leg into another harness may receive the range
+accept path requires the run id on the session-start hook. When this fails the
+range is redelivered, never lost: a later leg into another harness may receive the range
 again. Until the beta offers per-invocation plugin context, cross-harness
 continuity into opencode2 arrives through the ordinary handoff loop rather
 than the ledger delta.
@@ -423,7 +422,7 @@ resume, continue, session, or fork selector.
    not seen. Crush, which has no SessionStart hook, receives the same bounded
    packet through a temporary `options.global_context_paths` entry. Kimi Code
    fires SessionStart but discards its stdout, so the kimi adapter's
-   SessionStart hook only captures the event — it neither fetches nor links.
+   SessionStart hook only captures the event; it neither fetches nor links.
    The UserPromptSubmit hook issues the `/handoff` GET with the native
    `session_id` in the query; the server links the session and renders the
    packet atomically, and Kimi Code injects the hook's stdout as a user
@@ -513,8 +512,8 @@ active run.
 
 ## Degraded offline launches
 
-When the ai-memory server is unreachable — a remote homelab down for
-maintenance, a VPN that is not up — `ai-memory run` does not abort. It probes
+When the ai-memory server is unreachable (a remote homelab down for
+maintenance, a VPN that is not up), `ai-memory run` does not abort. It probes
 the server first (any HTTP answer counts as reachable, so an older build
 without `/healthz` still passes), prints one loud warning naming the server
 URL and what the degraded run means, and launches the harness anyway:
@@ -581,7 +580,7 @@ bounded: they are dropped after the configured number of failed drain passes
 outage set `AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS=0` to disable only the
 attempt-count drops (see `docs/install.md`).
 
-If the server dies *during* a run — after the lease was acquired — the exit
+If the server dies *during* a run, after the lease was acquired, the exit
 code is still preserved. The journal records the original run id, native
 session locator, absolute store path, and exit code; repository branch and path
 state are not persisted. Recovery retries validate the exact ordered semantic
@@ -828,7 +827,7 @@ opt-in real-harness acceptance pass.
 
 Recent Codex releases run sessions through a shared background app-server
 daemon (`codex agents` lists it). The daemon keeps the environment it started
-with, and the lifecycle hooks it launches inherit that environment — including
+with, and the lifecycle hooks it launches inherit that environment, including
 the `AI_MEMORY_RUN_ID` of whichever managed run auto-started it. When a later
 managed Codex SessionStart reports that finished id, ai-memory ignores it as
 authority and searches only the request's already-resolved repository, exact
@@ -848,8 +847,8 @@ ai-memory run codex --no-daemon
 
 `--no-daemon` makes that one session run without the shared background server
 even if one is already running; it is available on Codex's interactive and
-`resume` commands (checked on Codex 0.156). It remains a useful isolation
-switch, not a requirement for normal workstream continuity.
+`resume` commands (checked on Codex 0.156). It remains useful for isolation,
+but normal workstream continuity does not require it.
 
 ## Installation and recovery
 
@@ -879,9 +878,10 @@ is a one-way hash of the working directory, so discovery always reads
 `state.json`'s current `cwd` field or legacy `workDir` alias and never parses
 the bucket name. Conflicting aliases or a persisted id that disagrees with the
 session directory are rejected. Event ids derive
-from the SHA-256 of the raw wire.jsonl line, so two byte-identical lines —
-only possible with identical content in the same millisecond, because Kimi
-Code stamps each record with `time` — collapse into a single ledger event.
+from the SHA-256 of the raw wire.jsonl line, so two byte-identical lines
+collapse into a single ledger event. That can only happen with identical
+content in the same millisecond, because Kimi Code stamps each record with
+`time`.
 The incremental cursor stores both the complete-record byte offset and a
 SHA-256 of that imported prefix. Normal appends resume at the saved offset;
 if Kimi rewrites `wire.jsonl` in place, ai-memory resets to the beginning and
@@ -950,8 +950,8 @@ Antigravity keeps one SQLite database per conversation at
 file name and no scan is needed to locate one. The workspace a conversation was
 opened on comes from `trajectory_metadata_blob`, a protobuf message whose first
 field holds a nested message whose first field is the workspace `file://` URI;
-only those two fields are read. A database that does not carry them — an older
-or newer `agy` — is skipped rather than failing the listing. Note the recorded
+only those two fields are read. A database that does not carry them (from an
+older or newer `agy`) is skipped instead of failing the listing. Note the recorded
 workspace is the directory `agy` was launched from, not a checkout root, so a
 conversation started one level up is not offered inside a subdirectory.
 
@@ -1047,14 +1047,14 @@ the conflict remains and concurrent writers are still rejected.
 
 ### Lease recovery
 
-A launcher that dies without releasing its lease — killed, its terminal
-closed, or a sandbox such as ai-jail torn down — leaves the workstream held
+A launcher that dies without releasing its lease (killed, its terminal
+closed, or a sandbox such as ai-jail torn down) leaves the workstream held
 until that lease lapses. An interactive relaunch (stdin and stderr are
 terminals) no longer fails on that: the conflict reports the lease's expiry, so
 ai-memory says who holds it and waits for it to lapse (at most one lease,
 ~90 seconds; `Ctrl+C` aborts), then starts normally. If the holder renews the
 lease while you wait, it is a launcher that is still running, and you get an
-error instead — stop it, or pass `--new <name>` for a separate workstream. The
+error instead. Stop it, or pass `--new <name>` for a separate workstream. The
 server's busy check stays the only arbiter: the waiting launcher never forces
 another run off. Non-interactive launches (scripts, hooks, CI) keep the short
 retry window and fail fast rather than hanging. Terminal
@@ -1073,7 +1073,7 @@ ai-memory run codex --force-unlock
 The replacement is atomic and limited to the same durable authenticated
 operator; in single-user or otherwise unattributed operation, both runs must be
 unattributed. A different operator's active run is still refused. The command
-expires the managed lease only — it does not signal or kill a native process.
+expires the managed lease only; it does not signal or kill a native process.
 If the previous launcher is actually alive, its later heartbeats and finish are
 rejected, and its final transcript tail may not be imported. Use
 `--force-unlock` only after verifying that launcher has stopped. Older servers
@@ -1145,8 +1145,8 @@ content, system/developer prompt records, and hidden reasoning are not copied. T
 server sanitizer runs before both the SQLite FTS ledger and immutable files under
 `<data_dir>/raw/workstreams/<workstream-id>/segments/` are written.
 
-The ledger is an operational continuity substrate, not a replacement for the
-markdown wiki. Durable decisions, rules, procedures, and project facts still
+The ledger carries operational continuity and does not replace the markdown
+wiki. Durable decisions, rules, procedures, and project facts still
 belong in wiki pages through consolidation or explicit durable writes.
 
 ## Project and directory renames
@@ -1252,28 +1252,28 @@ process, falling back to matching the agent's own screen output against
 per-agent manifests.
 
 `ai-memory run` sits awkwardly between the two. The foreground process is the
-wrapper and the agent is its child — one process group whose leader is
-`ai-memory` — so process detection does not find the agent. The pane resolves
+wrapper and the agent is its child (one process group whose leader is
+`ai-memory`), so process detection does not find the agent. The pane resolves
 only once the harness paints a title Herdr recognizes, which can be well after
 launch and may never happen for a harness whose output matches no manifest.
 Until then Herdr's agents pane shows nothing for that pane.
 
-ai-memory does not try to fix this from the inside, deliberately. Herdr's hint
+ai-memory deliberately does not try to fix this from the inside. Herdr's hint
 for wrapper commands, `HERDR_AGENT`, is scoped to the pane's foreground
-process, and a process cannot amend its own environment after exec — so the
+process, and a process cannot amend its own environment after exec, so the
 wrapper has no way to describe itself to Herdr once it is already running.
 Setting the variable on the agent it spawns would put it somewhere Herdr does
 not look for it.
 
 Two things work today.
 
-**Name the agent on the command**, where Herdr does look:
+Name the agent on the command, where Herdr does look:
 
 ```bash
 HERDR_AGENT=codex ai-memory run codex
 ```
 
-**Or install Herdr's own agent integration**, which is the better answer:
+Or install Herdr's own agent integration, which is the better option:
 
 ```bash
 herdr integration install codex
@@ -1281,8 +1281,8 @@ herdr integration install claude
 ```
 
 An installed integration reports agent identity and lifecycle state over
-Herdr's socket and is authoritative regardless of process detection — so the
-wrapper stops mattering entirely. It also upgrades what Herdr can show: real
+Herdr's socket and is authoritative regardless of process detection, so the
+wrapper no longer matters. It also upgrades what Herdr can show: real
 `idle` / `working` / `blocked` signals instead of inferring from the screen,
 which cannot reliably see `blocked` at all.
 
