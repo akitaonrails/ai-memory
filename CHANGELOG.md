@@ -120,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `deepseek-harness` and `deepseek_harness`). DSH keeps its MCP client in
   a Cordis profile patch rather than a fixed config file, so the command prints a
   ready-to-merge `- insert:` fragment for `@deepseek-ai/dsh-mcp-client` and
-  refuses `--apply`.
+  refuses `--apply`. (#1193)
 
 ### Changed
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
