@@ -143,6 +143,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | VS Code Copilot | MCP-only |
 | Zed | MCP-only |
 | Muse Code | MCP-only |
+| DeepSeek Harness (DSH) | MCP-only |
 | Hermes Agent | Supported |
 | GrizzyBot | Supported |
 | LLM/auth providers | Supported |

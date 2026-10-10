@@ -1483,6 +1483,9 @@ fn infer_installed_mcp_config(
             "url",
         )),
         McpClient::Pi => Ok(None),
+        // DeepSeek Harness has no fixed MCP config file; no AgentChoice
+        // counterpart routes here, so this arm only satisfies exhaustiveness.
+        McpClient::Dsh => Ok(None),
         McpClient::AntigravityCli => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],

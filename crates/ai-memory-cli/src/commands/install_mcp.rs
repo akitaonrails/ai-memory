@@ -26,7 +26,7 @@ use serde_json::json;
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
-use crate::commands::render_shared::bearer_header_value;
+use crate::commands::render_shared::{bearer_header_value, yaml_single_quote};
 use crate::config::{Config, DEFAULT_MCP_URL};
 
 const GEMINI_MCP_TIMEOUT_MS: u64 = 5000;
@@ -135,6 +135,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
         McpClient::Muse => render_muse(&args)?,
+        McpClient::Dsh => render_dsh(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -171,6 +172,24 @@ fn validate_args(args: &InstallMcpArgs) -> Result<()> {
     }
     if matches!(args.client, McpClient::KiroCli) {
         validate_kiro_remote_url(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL))?;
+    }
+    if matches!(args.client, McpClient::Dsh) {
+        validate_dsh_server_name(&args.name)?;
+    }
+    Ok(())
+}
+
+/// DSH's `serverName` must match `[A-Za-z0-9_-]{1,32}`, and the
+/// rendered entry reuses the entry name for it, so reject an unusable
+/// `--name` before printing a snippet DSH would refuse.
+fn validate_dsh_server_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !valid {
+        bail!("DSH serverName must be 1-32 characters of [A-Za-z0-9_-]; got {name:?}");
     }
     Ok(())
 }
@@ -281,6 +300,9 @@ pub(crate) fn mcp_config_path_with(
         McpClient::Openclaw => home()?.join(".openclaw").join("config.json"),
         McpClient::Pi => bail!(
             "Pi has no native mcp.json; use `ai-memory install-hooks --agent pi --apply` to install the generated MCP bridge extension."
+        ),
+        McpClient::Dsh => bail!(
+            "DeepSeek Harness has no fixed MCP config file; merge the printed snippet into $DSH_HOME/profiles/<profile>/cordis.patch.yml."
         ),
         // OMP reads mcp.json from its agent dir, the one its extensions live
         // in, so a profile, PI_CODING_AGENT_DIR or PI_CONFIG_DIR moves it too.
@@ -600,6 +622,9 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
     if matches!(args.client, McpClient::Pi) {
         bail!(pi_mcp_apply_guidance(args));
     }
+    if matches!(args.client, McpClient::Dsh) {
+        bail!(dsh_mcp_apply_guidance(args));
+    }
     let path = resolve_config_file(args)?;
     let outcome = match args.client {
         McpClient::Codex => apply_atomic(&path, |existing| {
@@ -690,7 +715,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
         McpClient::Zed => Some(JsonMcpLocation::RootContextServers),
         McpClient::Muse => Some(JsonMcpLocation::RootMcpServersSnake),
-        McpClient::Codex | McpClient::Grok | McpClient::Pi => None,
+        McpClient::Codex | McpClient::Grok | McpClient::Pi | McpClient::Dsh => None,
     }
 }
 
@@ -705,6 +730,9 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::Muse => build_mcp_entry_muse(args),
         McpClient::Codex | McpClient::Grok => {
             bail!("internal: Codex/Grok MCP config is TOML, not JSON")
+        }
+        McpClient::Dsh => {
+            bail!("internal: DeepSeek Harness MCP config is a Cordis YAML patch, not JSON")
         }
         _ => build_mcp_entry(args),
     }
@@ -1702,6 +1730,62 @@ fn render_muse(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+/// DeepSeek Harness (DSH) has no fixed JSON/TOML MCP config: the client is a
+/// Cordis plugin entry inside a profile's cordis.patch.yml. Render the
+/// patch-list fragment the operator merges by hand; --apply is refused.
+fn render_dsh(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# DeepSeek Harness (DSH) - merge the entry below into the DSH\n\
+         # profile patch at $DSH_HOME/profiles/<profile>/cordis.patch.yml,\n\
+         # then reload the profile (the web profile reloads live).\n\
+         #\n\
+         # DSH has no fixed MCP config file: the client is a Cordis plugin\n\
+         # entry, so this integration is print-only. A new top-level\n\
+         # - insert: item is fine - patch row order carries no load\n\
+         # semantics. This wires MCP only; no lifecycle capture.\n\
+         {snippet}\n",
+        snippet = render_dsh_snippet(args),
+    ))
+}
+
+fn render_dsh_snippet(args: &InstallMcpArgs) -> String {
+    // Single-quote every interpolated scalar: a plain YAML scalar would turn
+    // a valid `--name 123` into an integer `serverName`, and a URL or token
+    // carrying `"`, `\` or ` #` would no longer parse as one string.
+    let name = yaml_single_quote(&args.name);
+    let url = yaml_single_quote(args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL));
+    let mut out = String::new();
+    out.push_str("- insert:\n");
+    out.push_str(&format!("    - id: {name}\n"));
+    out.push_str("      name: '@deepseek-ai/dsh-mcp-client'\n");
+    out.push_str("      config:\n");
+    out.push_str(&format!("        serverName: {name}\n"));
+    out.push_str("        transport: streamable-http\n");
+    out.push_str(&format!("        url: {url}\n"));
+    if let Some(value) = bearer_header_value(args.auth_token.as_deref()) {
+        out.push_str("        headers:\n");
+        out.push_str(&format!(
+            "          Authorization: {}\n",
+            yaml_single_quote(&value)
+        ));
+    }
+    // Fixed at the value validated against DSH. Pending: candidate for a CLI
+    // parameter (e.g. --tool-call-timeout-ms) if demand appears.
+    out.push_str("        toolCallTimeoutMs: 120000");
+    out
+}
+
+fn dsh_mcp_apply_guidance(args: &InstallMcpArgs) -> String {
+    format!(
+        "DeepSeek Harness has no fixed MCP config file; refusing to write MCP config. Re-run without --apply to print the Cordis patch fragment, then merge it into $DSH_HOME/profiles/<profile>/cordis.patch.yml{}",
+        if args.auth_token.is_some() {
+            " (the printed entry carries the auth header)."
+        } else {
+            "."
+        }
+    )
+}
+
 fn render_pi(args: &InstallMcpArgs) -> Result<String> {
     Ok(pi_mcp_render_guidance(args))
 }
@@ -2313,6 +2397,69 @@ mod tests {
     }
 
     #[test]
+    fn dsh_render_uses_cordis_patch_insert_shape() {
+        let rendered = render_dsh(&args_for(McpClient::Dsh)).expect("render");
+        assert!(rendered.contains("- insert:"));
+        assert!(rendered.contains("name: '@deepseek-ai/dsh-mcp-client'"));
+        assert!(rendered.contains("transport: streamable-http"));
+        assert!(rendered.contains("url: 'http://127.0.0.1:49374/mcp'"));
+        assert!(rendered.contains("toolCallTimeoutMs: 120000"));
+    }
+
+    #[test]
+    fn dsh_render_carries_the_bearer_header_when_a_token_is_present() {
+        let rendered = render_dsh(&args_with_token(McpClient::Dsh)).expect("render");
+        assert!(rendered.contains("Authorization: 'Bearer test-token-deadbeef'"));
+    }
+
+    #[test]
+    fn dsh_render_quotes_every_interpolated_scalar_as_a_yaml_string() {
+        // `123` passes the serverName check but is a YAML integer unquoted;
+        // the URL and token carry characters that end a plain scalar.
+        let mut args = args_with_token(McpClient::Dsh);
+        args.name = "123".into();
+        args.server_url = Some("http://h:1/mcp?a=\"b\" #c".into());
+        args.auth_token = Some("it's #x".into());
+        let rendered = render_dsh(&args).expect("render");
+        assert!(rendered.contains("    - id: '123'\n"), "{rendered}");
+        assert!(
+            rendered.contains("        serverName: '123'\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("        url: 'http://h:1/mcp?a=\"b\" #c'\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("          Authorization: 'Bearer it''s #x'\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn dsh_rejects_an_unusable_server_name() {
+        let mut args = args_for(McpClient::Dsh);
+        args.name = "not a name".into();
+        let error = validate_args(&args).expect_err("name must be rejected");
+        assert!(format!("{error}").contains("serverName"));
+    }
+
+    #[test]
+    fn dsh_accepts_a_valid_server_name() {
+        let mut args = args_for(McpClient::Dsh);
+        args.name = "ai-memory_2".into();
+        validate_args(&args).expect("valid name");
+    }
+
+    #[test]
+    fn dsh_apply_is_refused_with_the_patch_pointer() {
+        let mut args = args_for(McpClient::Dsh);
+        args.apply = true;
+        let error = apply_to_config_file(&args).expect_err("apply must be refused");
+        assert!(format!("{error}").contains("cordis.patch.yml"));
+    }
+
+    #[test]
     fn claude_desktop_render_lists_packaged_and_unpacked_windows_paths() {
         let rendered = render_claude_desktop(&args_for(McpClient::ClaudeDesktop)).unwrap();
         assert!(rendered.contains(r"%APPDATA%\Claude\claude_desktop_config.json"));
@@ -2880,6 +3027,7 @@ mod tests {
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
+            McpClient::Dsh => render_dsh(&args).unwrap(),
         }
     }
 
@@ -2909,6 +3057,7 @@ mod tests {
             McpClient::Swival,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
+            McpClient::Dsh,
         ] {
             let out = render_with_token(client);
             // Every client embeds the token as `Authorization:
@@ -2953,6 +3102,7 @@ mod tests {
             McpClient::VsCodeCopilot,
             McpClient::Zed,
             McpClient::Muse,
+            McpClient::Dsh,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -2990,6 +3140,7 @@ mod tests {
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
+            McpClient::Dsh => render_dsh(&args).unwrap(),
         }
     }
 

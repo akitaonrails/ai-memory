@@ -116,6 +116,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   side opposite "ai-memory · read-only", so you can tell which build a browser
   tab is talking to without running `ai-memory status`. (#1171)
 
+- Added `install-mcp --client dsh` for the DeepSeek Harness (aliases
+  `deepseek-harness` and `deepseek_harness`). DSH keeps its MCP client in
+  a Cordis profile patch rather than a fixed config file, so the command prints a
+  ready-to-merge `- insert:` fragment for `@deepseek-ai/dsh-mcp-client` and
+  refuses `--apply`. (#1193)
+
 ### Changed
 - Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
   plus `tags`, `pinned` and a non-default `tier` when set) above the body,
