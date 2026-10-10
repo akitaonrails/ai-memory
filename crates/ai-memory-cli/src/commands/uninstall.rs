@@ -413,6 +413,7 @@ fn build_plan(args: &UninstallArgs, data_dir: &Path) -> anyhow::Result<Vec<Plann
             CopilotCli,
             Swival,
             Muse,
+            PrimeAgent,
         ] {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
@@ -1257,7 +1258,8 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::CommandCode
         | McpClient::CopilotCli
         | McpClient::Swival
-        | McpClient::Devin => Some(&["mcpServers"]),
+        | McpClient::Devin
+        | McpClient::PrimeAgent => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::OpenCode2 => Some(&["mcp", "servers"]),
         McpClient::Openclaw | McpClient::Zero | McpClient::Zcode => Some(&["mcp", "servers"]),
@@ -2246,6 +2248,26 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["mcpServers"].get("ai-memory").is_none());
         assert!(v["mcpServers"].get("github").is_some());
+    }
+
+    /// Prime Agent's settings.json carries every other Prime Agent setting
+    /// beside `mcpServers`; the strip removes only ai-memory's entry.
+    #[test]
+    fn strip_mcp_prime_agent_keeps_other_settings_and_servers() {
+        let content = r#"{"defaultModel":"glm","mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp","bearerTokenEnvVar":"AI_MEMORY_AUTH_TOKEN"},"search":{"type":"http","url":"https://search.example/mcp"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::PrimeAgent,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcpServers"].get("ai-memory").is_none());
+        assert!(v["mcpServers"].get("search").is_some());
+        assert_eq!(v["defaultModel"], "glm");
     }
 
     #[test]

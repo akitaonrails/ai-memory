@@ -2684,6 +2684,14 @@ pub enum McpClient {
     /// claimed.
     #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
     Dsh,
+    /// Prime Agent (PrimeIntellect-ai/prime-agent) - the `mcpServers` map of
+    /// `$PRIME_AGENT_CODING_AGENT_DIR/settings.json` (default
+    /// `~/.prime/agent/settings.json`) with `type: "http"` + `url`. A token is
+    /// referenced through `bearerTokenEnvVar: "AI_MEMORY_AUTH_TOKEN"`, never
+    /// written literally: that is the only non-OAuth credential Prime Agent
+    /// counts as connected and names to the model. MCP-only: Prime Agent 0.10
+    /// has no lifecycle hooks (its earlier TypeScript extensions were removed).
+    PrimeAgent,
 }
 
 /// Arguments for `commit`.
@@ -4458,6 +4466,16 @@ mod tests {
             panic!("expected install-mcp for swival");
         };
         assert_eq!(args.client, McpClient::Swival);
+    }
+
+    #[test]
+    fn prime_agent_mcp_client_parses() {
+        let cli = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", "prime-agent"])
+            .unwrap_or_else(|error| panic!("failed to parse MCP client prime-agent: {error}"));
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp for prime-agent");
+        };
+        assert_eq!(args.client, McpClient::PrimeAgent);
     }
 
     #[test]
