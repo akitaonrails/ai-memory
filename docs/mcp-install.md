@@ -836,8 +836,10 @@ it), and ai-memory does not edit that file. Either add
 ```
 
 (network access is all-or-nothing and applies to every shell command Zero
-runs, not only hooks), or set `"sandbox": {"enabled": false}`. Without
-either, run `ai-memory hook-drain` from a normal shell to deliver the
+runs, not only hooks), or set `"sandbox": {"enabled": false}`. With network
+allowed, `sessionEnd` delivers the spool from the hook process itself within a
+fixed 10-second budget, because the sandbox would kill the detached drainer
+other agents use; whatever does not make it stays spooled. Without either, run `ai-memory hook-drain` from a normal shell to deliver the
 spooled events. A leftover empty `hook-spool/.drain.lock` does not block
 that drain: the lock is an OS file lock released when its holder exits.
 

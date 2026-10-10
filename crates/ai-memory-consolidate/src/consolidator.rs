@@ -16,6 +16,7 @@ use ai_memory_llm::{
 };
 use ai_memory_store::{ReaderPool, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -1728,6 +1729,29 @@ fn slugify_for_rule(title: &str) -> String {
         out.pop();
     }
     if out.is_empty() {
+        // A title with no ASCII letter or digit (Cyrillic, CJK, ...) would
+        // share one name with every other such title, and each rule would
+        // overwrite the last. Name it after the title instead. A title with
+        // no letter or digit at all has nothing to name it by. The hash takes
+        // the same fold as the ASCII slug (lower-cased words, separators
+        // collapsed) so a restated rule updates its own page; combining
+        // marks stay with their letter so `й` and `и` remain distinct.
+        let in_word = |c: char| c.is_alphanumeric() || ('\u{0300}'..='\u{036F}').contains(&c);
+        let key = decomposed
+            .split(|c: char| !in_word(c))
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+            .join("-");
+        if key.chars().any(char::is_alphanumeric) {
+            let digest = Sha256::digest(key.as_bytes());
+            let hex: String = digest
+                .iter()
+                .take(4)
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            return format!("rule-{hex}");
+        }
         return "rule".into();
     }
     if out.len() > 60 {
@@ -3216,13 +3240,45 @@ mod tests {
         assert_eq!(slugify_for_rule("---hyphenated---"), "hyphenated");
     }
 
-    /// Non-Latin / empty-after-cleanup titles fall back to a static
-    /// slug instead of producing an invalid PagePath.
+    /// Empty and punctuation-only titles fall back to a static slug
+    /// instead of producing an invalid PagePath.
     #[test]
     fn slugify_falls_back_for_unprintable_titles() {
         assert_eq!(slugify_for_rule(""), "rule");
         assert_eq!(slugify_for_rule("!!!"), "rule");
-        assert_eq!(slugify_for_rule("中文"), "rule");
+    }
+
+    /// A title in a script with no ASCII letters would slug to `rule` like
+    /// every other, and each rule would overwrite the last at
+    /// `_rules/rule.md`. Each gets a name of its own, stable across
+    /// spellings of the same title and always a valid page path.
+    #[test]
+    fn slugify_names_non_latin_titles_apart() {
+        let chinese = slugify_for_rule("中文");
+        let russian = slugify_for_rule("Не коммитить секреты");
+        assert!(chinese.starts_with("rule-"), "{chinese}");
+        assert!(russian.starts_with("rule-"), "{russian}");
+        assert_ne!(chinese, russian);
+        assert_eq!(slugify_for_rule("中文"), chinese);
+        // `й` as one scalar and as `и` + a combining breve are one title.
+        assert_eq!(
+            slugify_for_rule("\u{439}\u{43e}"),
+            slugify_for_rule("\u{438}\u{306}\u{43e}")
+        );
+        // A restated title updates its own page, as an ASCII one does: case,
+        // spacing and punctuation do not name a new rule.
+        assert_eq!(slugify_for_rule("не коммитить  секреты!"), russian);
+        assert_eq!(slugify_for_rule("НЕ КОММИТИТЬ, СЕКРЕТЫ."), russian);
+        // A combining mark is part of its letter, not a separator.
+        assert_ne!(
+            slugify_for_rule("\u{439}\u{43e}"),
+            slugify_for_rule("\u{438} \u{43e}")
+        );
+        for slug in [chinese, russian] {
+            let path = format!("_rules/{slug}.md");
+            let path = PagePath::new(path).unwrap();
+            path.ensure_portable().unwrap();
+        }
     }
 
     /// Very long titles get capped at 60 chars with no trailing dash.
@@ -3266,11 +3322,11 @@ mod tests {
         );
     }
 
-    /// #886: a CJK-only title still folds to nothing and falls back to the
-    /// static slug — diacritic folding must not resurrect it.
+    /// #886: a CJK-only title still folds to no ASCII slug — diacritic
+    /// folding must not resurrect it — and takes the title-keyed fallback.
     #[test]
     fn slugify_cjk_still_falls_back() {
-        assert_eq!(slugify_for_rule("中文标题"), "rule");
+        assert!(slugify_for_rule("中文标题").starts_with("rule-"));
     }
 
     /// A slug whose first 60 chars already end on a whole word keeps that

@@ -138,6 +138,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+- Fixed a purged session coming back. `purge-session` leaves a tombstone so a
+  late event cannot recreate the session, but live hook ingest creates its
+  session row on a path that never checked it, so the next event for a purged
+  session brought back the session and a new observation. Hook ingest now
+  refuses it, and the delivery is acknowledged as `dropped_invalid` instead of
+  failing and being retried from the client's spool. (#1194)
+- Fixed `purge-session` leaving the user's own sentences behind in the
+  cross-project profile's evidence: the profile harvests preference-shaped
+  sentences from prompts into candidate rows keyed to the session, and the
+  purge removed the session but not those rows, so a later pass could still
+  converge a purged sentence into a profile page. The purge now deletes the
+  session's prompt candidates in the same transaction. (#1195)
+- Fixed `move-project` leaving rows on the old workspace. Pending
+  cross-project messages (addressed to the project and sent by it), entities,
+  page feedback, session purge tombstones and the profile evidence were not
+  re-stamped with the project's other tables, so the moved project lost its
+  pending mail, its entity retrieval and open feedback findings, and a purged
+  session could be recreated. They now move in the same transaction. (#1196)
+- Fixed a Codex, Pi, OMP or Grok session going missing once its store held more
+  than 2,000 transcripts. Looking a session up by id read the first 2,000 files
+  in directory-walk order, so the rest came back as not found: `ai-memory run`
+  dropped the linked session and started a fresh one, and a transcript import
+  failed. The lookup now reads the transcript that names the session id first,
+  then the newest. (#1189)
+- Fixed Crush sub-agent sessions being listed as sessions of their own:
+  `backfill`, `doctor` and the automatic session pick of `ai-memory run` read
+  the Crush `sessions` table without skipping rows that have a parent, so a
+  sub-agent session could be imported as a separate session or chosen for the
+  resume. The listing now skips them, as session discovery already did.
+  (#1190)
+- Fixed rules titled in a script without ASCII letters (Cyrillic, CJK, Arabic
+  and others) overwriting each other: multi-page consolidation named every such
+  rule page `_rules/rule.md`, so only the last survived in the live rules list.
+  Each rule now gets a `_rules/rule-<hash>.md` name derived from its title. Rule
+  titles in Latin scripts are named as before. A restated non-Latin title
+  (case, spacing or punctuation aside) updates its own page. An existing
+  `_rules/rule.md` is left in place; delete it once its rule is restated.
+  (#1191)
+- Fixed auto-improve accepting a proposal whose confidence is outside 0 to 1:
+  a model that answered in percent (`85`) cleared the confidence floor and was
+  staged, shown to the reviewer as 8500% and ranked first when sorting by
+  confidence. Such a value is now rejected as `confidence_out_of_range` and
+  recorded with the other rejected candidates. (#1192)
+- Fixed the curl hook installer (`ai-memory-install-hooks`) installing event
+  scripts that could not run. Every script sources the shared `_lib.sh` helper
+  from its own directory or the one above it, but the installer fetched only
+  the per-agent scripts, so the helper was never written and each script
+  stopped at the line that sources it. The installer now also extracts
+  `_lib.sh` from the verified archive into the install root, beside the agent
+  directories, and refuses to continue when the archive does not contain it.
+  (#1184)
+- Fixed the curl hook installer (`ai-memory-install-hooks`) disagreeing with
+  the hook bundles about which scripts an agent has. `--agent antigravity-cli`
+  always failed: it asked for the seven default event scripts, the Antigravity
+  bundle ships four, and the install stopped at the first missing one.
+  `--agent claude-code` and `--agent grok` never installed `subagent-start.sh`
+  and `subagent-stop.sh`, which their hook config points at, so `install-hooks`
+  warned that both were missing. The installer now installs the scripts each
+  bundle ships, and a test checks every script-based agent against the
+  repository bundles. (#1185)
+- Fixed Kiro CLI tool calls being stored with no title or content: Kiro's
+  `PreToolUse` and `PostToolUse` hooks carry `tool_name` and `tool_input`
+  (plus `tool_response` after the call), and the capture policy already read
+  them, but Kiro was missing from the tool-capture mapping, so every Kiro tool
+  observation reached the store with a generic title and an empty body. They
+  now get the same tool-family title and output summary as Claude Code's.
+  (#1187)
+- Fixed the generated OpenCode, OpenCode 2, OMP, Pi and OpenClaw integrations
+  losing hook events when the server is saturated. They treated every 4xx as a
+  permanent rejection, so a `429` (or a `408` or `425`) was dropped instead of
+  spooled, and their spool drain deleted each queued entry it met on such a
+  response. Both now keep `408`, `425`, `429` and every `5xx` for a later
+  drain, as the shell, PowerShell and native hooks already do. Re-run
+  `install-hooks --apply` for the agent to regenerate its plugin. (#1188)
+- Fixed Claude Code's Windows `PowerShell` tool being classified as an
+  unknown tool, so its output never reached the session record and
+  `[capture] ignore_paths` never checked its command. It is now a shell tool
+  like `Bash`, in the native hook, the server, and the generated TypeScript
+  integrations, and the shell argument reader also follows PowerShell's
+  `-Param:value` binding (`Get-Content -Path:docs\adr\x.md`). (#1186)
+- Fixed Zero's `sessionEnd` never delivering spooled events even with
+  network allowed in Zero's sandbox. Zero kills a hook's detached children
+  when the hook exits, which took the background drainer down with it. For
+  Zero, `session-end` now drains in-process within a fixed 10-second budget
+  (hard stop at 20 seconds, inside Zero's 30-second hook timeout); events
+  that cannot be delivered stay spooled. Other agents keep the detached
+  drainer. (#1172)
 - Fixed generated TypeScript integrations (OpenCode, OpenCode 2, OMP,
   Pi, OpenClaw) flashing a console window on Windows.
   `discoverRemoteIdentity` spawned `git config --get remote.<name>.url`

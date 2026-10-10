@@ -867,6 +867,9 @@ fn family(name: &str) -> ToolFamily {
         "bash" | "shell" | "shell_command" | "exec" | "execute" | "run_command" | "web_search"
         | "search_web" | "manage_task" | "manage_subagents" | "terminal" | "execute_bash"
         | "execute_cmd" => ToolFamily::NonFile,
+        // Claude Code on Windows exposes `PowerShell` beside `Bash`, with the
+        // same `tool_input.command` field (#1186).
+        "powershell" => ToolFamily::NonFile,
         // Hermes Agent tool surface (agent/shell_hooks.py envelope; tool
         // names from model_tools registry, live-captured 2026-10-07). These
         // execute code, drive a browser, or fetch the web — none touch
@@ -1105,10 +1108,15 @@ fn shell_words(command: &str) -> Vec<String> {
 }
 
 /// Path-like values carried by one shell word: the word itself unless it is
-/// a flag, plus the value of a `--flag=value` or `NAME=value` word.
+/// a flag, plus the value of a `--flag=value`, `NAME=value`, or PowerShell
+/// `-Param:value` word.
 fn shell_arguments(word: &str) -> impl Iterator<Item = &str> {
-    let whole = (!word.starts_with('-')).then_some(word);
-    let value = word.split_once('=').map(|(_, value)| value);
+    let flag = word.starts_with('-');
+    let whole = (!flag).then_some(word);
+    let value = word
+        .split_once('=')
+        .or_else(|| flag.then(|| word.split_once(':')).flatten())
+        .map(|(_, value)| value);
     whole
         .into_iter()
         .chain(value)
@@ -2291,6 +2299,52 @@ mod tests {
                 assert_eq!(decision.protocol().tool_family(), ToolFamily::Unknown);
             }
         }
+    }
+
+    /// Claude Code's Windows `PowerShell` tool was classified unknown, so its
+    /// output was captured without `ignore_paths` ever seeing the command
+    /// (#1186). Once it is a shell tool, a command naming an ignored path in
+    /// Windows spelling, including PowerShell's `-Param:value` binding, must
+    /// drop; one naming a public path must still be kept.
+    #[test]
+    fn claude_code_powershell_honors_ignored_paths_on_a_windows_host() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            r"C:\repo",
+            None,
+        );
+        let powershell = |command: &str| json!({"tool_name": "PowerShell", "tool_input": {"command": command}, "tool_use_id": "toolu_1"});
+        for (command, expected) in [
+            (r"Get-Content docs\adr\x.md", CaptureDisposition::Drop),
+            (
+                r"Get-Content -Path .\docs\adr\x.md",
+                CaptureDisposition::Drop,
+            ),
+            (r"Get-Content -Path:docs\adr\x.md", CaptureDisposition::Drop),
+            (r"type C:\repo\DOCS\ADR\x.md", CaptureDisposition::Drop),
+            (r"Get-Content -Path:src\lib.rs", CaptureDisposition::Keep),
+            ("git status", CaptureDisposition::Keep),
+        ] {
+            let decision = policy.inspect(AgentKind::ClaudeCode, &powershell(command), r"C:\repo");
+            assert_eq!(
+                decision.protocol().tool_family(),
+                ToolFamily::NonFile,
+                "{command}"
+            );
+            assert_eq!(decision.protocol().disposition(), expected, "{command}");
+        }
+        // A broken marker cannot prove a PowerShell command misses every
+        // ignored path, exactly like Bash.
+        let invalid = CapturePolicy::resolve(CaptureSource::Invalid, r"C:\repo", None);
+        assert_eq!(
+            invalid
+                .inspect(AgentKind::ClaudeCode, &powershell("git status"), r"C:\repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::MetadataOnly,
+        );
     }
 
     #[test]

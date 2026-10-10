@@ -1,5 +1,6 @@
 //! Incremental, read-only extraction from native harness session stores.
 
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom};
@@ -3388,14 +3389,40 @@ fn locate_session_file(
         }
         return Ok(None);
     }
-    let mut files = collect_session_files(harness, home, session_dir)?;
-    files.sort_by_key(|path| temporary_transcript(path));
-    for path in files.into_iter().take(2_000) {
+    let files = collect_session_files(harness, home, session_dir)?;
+    for path in lookup_candidates(files, id) {
         if session_path_matches(harness, &path, id, cwd)? {
             return Ok(Some(path));
         }
     }
     Ok(None)
+}
+
+/// The transcripts a session lookup reads, in the order it reads them, up to a
+/// fixed number. A store can hold more than that, and the directory walk lists
+/// them in no useful order, so the order decides which sessions can be found.
+/// Codex, Pi, OMP and Grok put the session id in the transcript's file or
+/// directory name, so a transcript that names it comes first. Within each
+/// group temporary copies go last; naming ranks above that because OMP can
+/// leave a session only as an atomic-write temp, which a store-wide
+/// temporary-last rule would push past the cap. The rest follow newest
+/// first, as discovery and listing do.
+fn lookup_candidates(mut files: Vec<PathBuf>, id: &str) -> Vec<PathBuf> {
+    files.sort_by_cached_key(|path| {
+        (
+            !names_session(path, id),
+            temporary_transcript(path),
+            Reverse(modified(path)),
+            path.clone(),
+        )
+    });
+    files.truncate(2_000);
+    files
+}
+
+fn names_session(path: &Path, id: &str) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().to_string_lossy().contains(id))
 }
 
 /// The folder Claude Code keeps a project's transcripts in: the cwd with
@@ -4542,8 +4569,12 @@ fn list_crush_sessions(
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    let mut statement = connection
-        .prepare("SELECT id, updated_at FROM sessions ORDER BY updated_at DESC LIMIT ?1")?;
+    // Sub-agent and title sessions name their session as parent; discovery
+    // skips them for the same reason.
+    let mut statement = connection.prepare(
+        "SELECT id, updated_at FROM sessions WHERE parent_session_id IS NULL \
+         ORDER BY updated_at DESC LIMIT ?1",
+    )?;
     let rows = statement.query_map([limit as i64], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
@@ -6010,8 +6041,9 @@ mod tests {
         let connection = Connection::open(repo.join(".crush").join("crush.db")).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE sessions(id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL);\n\
-                 INSERT INTO sessions VALUES ('above', 1800000000);",
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, \
+                 updated_at INTEGER NOT NULL);\n\
+                 INSERT INTO sessions(id, updated_at) VALUES ('above', 1800000000);",
             )
             .unwrap();
 
@@ -6081,7 +6113,8 @@ mod tests {
         let connection = Connection::open(&db).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE sessions(id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL);\n\
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, \
+                 updated_at INTEGER NOT NULL);\n\
                  CREATE TABLE messages(\
                     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,\
                     parts TEXT NOT NULL, updated_at INTEGER NOT NULL,\
@@ -6090,9 +6123,20 @@ mod tests {
             .unwrap();
         for (id, updated) in [("older", 1_700_000_000_i64), ("newer", 1_800_000_000)] {
             connection
-                .execute("INSERT INTO sessions VALUES (?1, ?2)", params![id, updated])
+                .execute(
+                    "INSERT INTO sessions(id, updated_at) VALUES (?1, ?2)",
+                    params![id, updated],
+                )
                 .unwrap();
         }
+        // A sub-agent session, newer than both, is not a session of its own.
+        connection
+            .execute(
+                "INSERT INTO sessions(id, parent_session_id, updated_at) \
+                 VALUES ('child', 'newer', 1900000000)",
+                [],
+            )
+            .unwrap();
         connection
             .execute(
                 "INSERT INTO messages VALUES ('m1', 'newer', 'assistant', ?1, 1, 0)",
@@ -6244,6 +6288,40 @@ mod tests {
         fs::create_dir_all(&shortened).unwrap();
         fs::write(shortened.join(format!("{id}.jsonl")), record(&cwd)).unwrap();
         assert_eq!(locate(), Some(shortened.join(format!("{id}.jsonl"))));
+    }
+
+    /// A store can hold more transcripts than a lookup reads, and the walk
+    /// lists them in no useful order. The transcript named after the session
+    /// id is read first wherever the walk put it, and temporary copies last.
+    #[test]
+    fn session_lookup_reads_the_transcript_named_after_the_id_first() {
+        let id = "5973b6c0-94b8-487b-a530-2aeb6098ae0e";
+        let root = Path::new("/store/sessions");
+        let decoy = |n: usize| root.join(format!("rollout-{n:04}.jsonl"));
+
+        let named = root.join(format!("rollout-2500-{id}.jsonl"));
+        let mut files = (0..2_500).map(&decoy).collect::<Vec<_>>();
+        files.push(named.clone());
+        let candidates = lookup_candidates(files, id);
+        assert_eq!(candidates.len(), 2_000);
+        assert_eq!(candidates.first(), Some(&named));
+
+        // Grok keeps each session in a directory named after it.
+        let grok = root.join(id).join("chat_history.jsonl");
+        let candidates = lookup_candidates(vec![decoy(1), decoy(2), grok.clone()], id);
+        assert_eq!(candidates.first(), Some(&grok));
+
+        // The real transcript still wins over its own temporary copy, but a
+        // temporary copy that names the id outranks every unrelated
+        // transcript: OMP can leave a session only as an atomic-write temp.
+        let temporary = root.join(format!("{id}.jsonl.1a2b.tmp"));
+        let candidates = lookup_candidates(vec![temporary.clone(), decoy(1), named.clone()], id);
+        assert_eq!(candidates, [named, temporary.clone(), decoy(1)]);
+
+        let mut files = (0..2_500).map(&decoy).collect::<Vec<_>>();
+        files.push(temporary.clone());
+        let candidates = lookup_candidates(files, id);
+        assert_eq!(candidates.first(), Some(&temporary));
     }
 
     #[test]

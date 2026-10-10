@@ -167,7 +167,8 @@ Use the tuple recipe when event IDs have narrower scope.
   index order, including an empty array when nothing was acknowledged. Outcomes
   are `stored`, `replayed`, `resumed`, `ignored_end`, `dropped_policy`,
   `dropped_subagent`, `dropped_unauthorized`, `dropped_collision` and
-  `dropped_invalid` (no session id outside a SessionStart). A drop is a
+  `dropped_invalid` (no session id outside a SessionStart, or a purged
+  session). A drop is a
   terminal acknowledgement. Older servers omit `results`; the relay records
   those receipts as `unknown`.
 - A rate-limited source can be skipped while other sources advance. Inspect

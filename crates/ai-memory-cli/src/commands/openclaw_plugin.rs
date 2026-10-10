@@ -381,9 +381,10 @@ function postPreCompact(event: any, ctx: any): void {{
   const policy = capturePolicy(body, typeof body.cwd === "string" ? body.cwd : undefined);
   if (policy.disposition === "drop") return;
   try {{
-    // Fire-and-forget, but never silent loss: an unreachable server or
-    // 5xx spools the event in the CLI hook-spool format for a later
-    // drain (#580); a delivered post opportunistically drains backlog.
+    // Fire-and-forget, but never silent loss: an unreachable server, a
+    // 5xx or a transient 4xx spools the event in the CLI hook-spool format
+    // for a later drain (#580); a delivered post opportunistically drains
+    // backlog.
     // Tracked in pendingHookRequests so session_end can await a bounded
     // flush instead of letting teardown kill the in-flight fetch (#676).
     const request = fetch(url, {{
@@ -394,7 +395,7 @@ function postPreCompact(event: any, ctx: any): void {{
     }})
       .catch(() => undefined)
       .then((resp) => {{
-        if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);
+        if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(url, policy.payload);
         else requestSpoolDrain();
       }})
       .catch(() => undefined);
@@ -506,10 +507,9 @@ mod tests {
         let plugin = build_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(plugin.contains("function spoolFailedHook("));
         assert!(plugin.contains("async function drainHookSpool()"));
-        assert!(
-            plugin
-                .contains("if (!resp || resp.status >= 500) spoolFailedHook(url, policy.payload);")
-        );
+        assert!(plugin.contains(
+            "if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(url, policy.payload);"
+        ));
         assert!(plugin.contains("else requestSpoolDrain();"));
         crate::commands::render_shared::assert_shared_ts_delivery_runtime("openclaw", &plugin);
         assert!(plugin.contains(r#"return join(env, "hook-spool");"#));

@@ -333,12 +333,12 @@ function captureShellCommand(args: Record<string, unknown> | undefined): string 
 // Split only when a policy is active: this runs for every tool event.
 function captureShellWordList(command: string | string[]): string[] { if (typeof command === "string") return captureShellWords(command); return command.flatMap((item) => { const tokens = captureShellWords(item); return tokens.length === 1 && tokens[0] === item || [...item].length > 256 ? tokens : [item, ...tokens]; }); }
 function captureShellWords(command: string): string[] { const special = (c: string) => /\s/.test(c) || "|&;<>()".includes(c); const chars = [...command]; const words: string[] = []; let word = ""; let inWord = false; let quote = ""; for (let i = 0; i < chars.length; i++) { const c = chars[i]; const next = chars[i + 1]; if (quote) { if (c === quote) quote = ""; else if (quote === '"' && c === "\\" && (next === '"' || next === "\\")) { word += next; i++; } else word += c; } else if (c === "'" || c === '"') { quote = c; inWord = true; } else if (c === "\\" && next !== undefined && (special(next) || next === "'" || next === '"' || next === "\\")) { word += next; i++; inWord = true; } else if (special(c)) { if (inWord) words.push(word); word = ""; inWord = false; } else { word += c; inWord = true; } } if (inWord) words.push(word); return words; }
-function captureShellArguments(word: string): string[] { const out = word.startsWith("-") ? [] : [word]; const eq = word.indexOf("="); if (eq >= 0) out.push(word.slice(eq + 1)); return out.filter((argument) => argument.trim() !== ""); }
+function captureShellArguments(word: string): string[] { const flag = word.startsWith("-"); const out = flag ? [] : [word]; const eq = word.indexOf("="); const colon = flag && eq < 0 ? word.indexOf(":") : -1; if (eq >= 0) out.push(word.slice(eq + 1)); else if (colon >= 0) out.push(word.slice(colon + 1)); return out.filter((argument) => argument.trim() !== ""); }
 // Lexical only, like the native hook: nothing is expanded or executed, so
 // variables, command substitution, and `cd` state are not followed. A tool's
 // own `workdir` replaces the event cwd for relative arguments.
 function captureMatchCommand(command: string | string[], config: CaptureConfig, workdir?: string): boolean | undefined { const budget = { work: 0 }; const home = homedir(); const base = workdir === undefined ? config.base : /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(workdir) ? workdir : config.base && captureJoin(config.base, workdir); for (const word of captureShellWordList(command)) for (const argument of captureShellArguments(word)) { const expanded = argument.startsWith("~/") ? captureJoin(home, argument.slice(2)) : argument; if ([...expanded].length > CAPTURE_MAX_PATH_CHARS) continue; const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(expanded); if (!absolute && !base) continue; const candidate = captureNormalize(absolute ? expanded : captureJoin(base, expanded), config.windowsHost); if (!candidate) continue; const glob = /[*?]/.test(candidate.path); for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; const under = captureStartsWith(candidate.path, pattern.prefix, pattern.windows); if (!under && !glob) continue; if (under) { const directory = pattern.directory ? captureGlob(pattern.directory, candidate.path, pattern.windows, budget) : false; if (directory !== false) return directory; const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match !== false) return match; } if (glob) { const reaches = captureGlobReaches(candidate.path, pattern.prefix, pattern.windows, budget); if (reaches !== false) return reaches; } } } return false; }
-function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; workdir?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir","list_dir","grep_search","search_files","find_by_name"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","shell_command","exec","execute","run_command","web_search","search_web","manage_task","manage_subagents","terminal","execute_bash","execute_cmd"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", workdir: typeof args?.workdir === "string" && args.workdir.trim() ? args.workdir : undefined }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
+function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; workdir?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir","list_dir","grep_search","search_files","find_by_name"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","shell_command","exec","execute","run_command","web_search","search_web","manage_task","manage_subagents","terminal","execute_bash","execute_cmd","powershell"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", workdir: typeof args?.workdir === "string" && args.workdir.trim() ? args.workdir : undefined }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
 // An external lifecycle owner (`AI_MEMORY_CAPTURE_OWNER`, any value that is
 // non-empty after trimming) takes over capture for this process: the gate runs
 // before the capture-policy marker scan, so no disposition work, no marker read
@@ -2177,6 +2177,14 @@ function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): v
   }
 }
 
+// A 5xx, or one of the 4xx a saturated or momentarily unwilling server answers
+// with (408, 425, 429), asks for a retry: the event is fine and a later attempt
+// can land it. Any other 4xx rejects the event for good. The shell, PowerShell
+// and native drains classify the same way.
+function hookStatusRetryable(status: number): boolean {
+  return status >= 500 || status === 408 || status === 425 || status === 429;
+}
+
 let spoolDrainPromise: Promise<void> | undefined;
 
 function requestSpoolDrain(): void {
@@ -2213,11 +2221,11 @@ async function drainHookSpool(): Promise<void> {
         signal: timeoutSignal(2000),
       }).catch(() => undefined);
       if (!resp) return; // still unreachable; stop, keep the backlog
-      if (resp.ok || (resp.status >= 400 && resp.status < 500)) {
+      if (resp.ok || (resp.status >= 400 && resp.status < 500 && !hookStatusRetryable(resp.status))) {
         // Delivered, or permanently rejected - either way, done with it.
         try { unlinkSync(file); } catch (_e) {}
       } else {
-        return; // 5xx: server unhappy; retry a later drain
+        return; // 5xx or a transient 4xx: server unhappy; retry a later drain
       }
     } catch (_e) {
       return;
@@ -2280,6 +2288,16 @@ pub(crate) fn assert_shared_ts_delivery_runtime(name: &str, source: &str) {
     assert!(
         source.contains("anyFactory([hookAbort.signal, factory(ms)])"),
         "{name}: request deadlines must also honour hookAbort"
+    );
+    assert!(
+        source.contains(
+            "return status >= 500 || status === 408 || status === 425 || status === 429;"
+        ),
+        "{name}: a transient 4xx must stay retryable like a 5xx"
+    );
+    assert!(
+        source.contains("resp.status < 500 && !hookStatusRetryable(resp.status)"),
+        "{name}: the drain must keep an entry the server only asked to retry"
     );
 }
 

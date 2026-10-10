@@ -1792,6 +1792,13 @@ fn validate_proposal(
     if proposal.operation != CANONICAL_OPERATION {
         return Err("unsupported_operation".into());
     }
+    // Confidence is documented as `0.0..=1.0`. A model that answers in percent
+    // (`85`) would clear the floor below and be stored, and shown to the
+    // reviewer, as 8500%. NaN fails every comparison, so it needs this test
+    // too.
+    if !(0.0..=1.0).contains(&proposal.confidence) {
+        return Err("confidence_out_of_range".into());
+    }
     if proposal.confidence < cfg.min_confidence {
         return Err("confidence_below_threshold".into());
     }
@@ -3675,6 +3682,28 @@ mod tests {
         assert_eq!(rejected.len(), 2);
         assert_eq!(rejected[0].reason, "confidence_below_threshold");
         assert_eq!(rejected[1].reason, "unsupported_path_prefix");
+    }
+
+    #[test]
+    fn validation_rejects_confidence_outside_the_unit_interval() {
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![
+                proposal("gotchas/percent.md", "gotcha", 85.0),
+                proposal("gotchas/nan.md", "gotcha", f32::NAN),
+                proposal("gotchas/negative.md", "gotcha", -0.5),
+                proposal("gotchas/one.md", "gotcha", 1.0),
+            ],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, _warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path, "gotchas/one.md");
+        assert_eq!(rejected.len(), 3);
+        for rejection in &rejected {
+            assert_eq!(rejection.reason, "confidence_out_of_range");
+        }
     }
 
     #[test]

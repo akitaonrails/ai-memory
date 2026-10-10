@@ -7,7 +7,8 @@
 //! cleanup pass before fetching handoff context. `session-end` returns quickly:
 //! after enqueue it spawns a detached `hook-drain` process, whose stdout/stderr
 //! are redirected away from the agent, and that process drains under an
-//! exclusive spool lock with a longer bounded budget.
+//! exclusive spool lock with a longer bounded budget. Zero, whose hook sandbox
+//! kills detached children, drains in-process within a short fixed budget.
 //!
 //! See `docs/windows.md#native-hook-command-claude-code-on-windows`.
 
@@ -66,6 +67,18 @@ const MAX_BRIEFED_MARKERS: usize = 512;
 /// well under a second so a `post-tool-use` hook never stalls a tool call (one
 /// in-flight POST against a slow server is bounded by this too).
 const INCREMENTAL_DRAIN_BUDGET: Duration = Duration::from_millis(250);
+/// Total budget, lock wait included, for a `session-end` drained in-process
+/// ([`session_end_drains_in_process`]). Fixed rather than env-overridable:
+/// together with [`IN_PROCESS_SESSION_END_DEADLINE`] it has to stay inside
+/// Zero's 30-second hook timeout.
+const IN_PROCESS_SESSION_END_DRAIN_BUDGET: Duration = Duration::from_secs(10);
+/// Hard stop for that drain, the request in flight at the budget included.
+const IN_PROCESS_SESSION_END_DEADLINE: Duration = Duration::from_secs(20);
+// Zero kills a hook after 30 seconds; the hard stop must land first.
+const _: () = assert!(
+    IN_PROCESS_SESSION_END_DRAIN_BUDGET.as_secs() < IN_PROCESS_SESSION_END_DEADLINE.as_secs()
+        && IN_PROCESS_SESSION_END_DEADLINE.as_secs() < 30
+);
 
 /// Per-event POST timeout during a drain. Env: `AI_MEMORY_HOOK_DRAIN_TIMEOUT_MINUTES`.
 fn drain_event_timeout() -> Duration {
@@ -134,6 +147,34 @@ fn spawn_background_drainer(data_dir: &Path, live_token: Option<&str>) -> std::i
 
 fn should_spawn_background_drainer(event: &str) -> bool {
     matches!(event, "session-end" | "stop" | "pre-compact")
+}
+
+/// Zero runs hooks in a sandbox started with `--die-with-parent`, which kills
+/// a detached drainer the moment the hook exits, so its `session-end` drains
+/// in-process within [`IN_PROCESS_SESSION_END_DRAIN_BUDGET`] instead (#1172).
+fn session_end_drains_in_process(agent: AgentKind, event: &str) -> bool {
+    agent == AgentKind::Zero && event == "session-end"
+}
+
+/// Drain the spool from the hook process itself, for a harness that kills the
+/// detached drainer. Undelivered events stay spooled for the next boundary.
+async fn drain_session_end_in_process(
+    spool: &Path,
+    data_dir: &Path,
+    max_attempts: hook_spool::MaxAttempts,
+) {
+    let drain = hook_spool::drain_exclusive_within_budget(
+        spool,
+        data_dir,
+        IN_PROCESS_SESSION_END_DRAIN_BUDGET,
+        drain_event_timeout().min(IN_PROCESS_SESSION_END_DRAIN_BUDGET),
+        max_attempts,
+    );
+    // The budget stops new requests; this also stops one already in flight
+    // (an old server's per-event fallback, a token refresh). Cancelling only
+    // at an await point leaves every spool file whole: at worst an accepted
+    // event is re-sent and the server's ingest key skips it.
+    let _ = tokio::time::timeout(IN_PROCESS_SESSION_END_DEADLINE, drain).await;
 }
 
 fn session_id_state_path(data_dir: &Path, agent: AgentKind) -> PathBuf {
@@ -1131,7 +1172,9 @@ where
     // to flush the shared spool. `session-end` remains the primary close path,
     // but `stop` and `pre-compact` also trigger the helper so delivery does not
     // rely on the single hook most likely to be cancelled during agent shutdown.
-    if !external_capture
+    if !external_capture && session_end_drains_in_process(agent_kind, &args.event) {
+        drain_session_end_in_process(&spool, &dd, max_attempts).await;
+    } else if !external_capture
         && should_spawn_background_drainer(&args.event)
         && let Err(err) = after_background_drain_event_enqueue(
             &dd,
@@ -1547,6 +1590,26 @@ mod tests {
         assert!(!should_spawn_background_drainer("post-tool-use"));
         assert!(!should_spawn_background_drainer("pre-tool-use"));
         assert!(!should_spawn_background_drainer("user-prompt"));
+    }
+
+    #[test]
+    fn only_zero_session_end_drains_in_process() {
+        assert!(session_end_drains_in_process(
+            AgentKind::Zero,
+            "session-end"
+        ));
+        for event in ["session-start", "post-tool-use", "subagent-stop"] {
+            assert!(
+                !session_end_drains_in_process(AgentKind::Zero, event),
+                "{event}"
+            );
+        }
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Zcode] {
+            assert!(
+                !session_end_drains_in_process(agent, "session-end"),
+                "{agent:?}"
+            );
+        }
     }
 
     #[test]
@@ -2366,6 +2429,83 @@ mod tests {
                 "{event} must not drain inline"
             );
         }
+    }
+
+    fn zero_hook_args(event: &str, server_url: &str) -> HookArgs {
+        HookArgs {
+            event: event.into(),
+            agent: "zero".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        }
+    }
+
+    /// Zero's sandbox kills the detached drainer with the hook (#1172), so its
+    /// session-end must deliver before the hook returns.
+    #[tokio::test]
+    async fn zero_session_end_delivers_in_process_without_a_detached_drainer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let (base, mut requests) = serve_requests("200 OK", r#"{"accepted":1}"#).await;
+        let mut stdout = Vec::new();
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            zero_hook_args("session-end", &base),
+            r#"{"sessionId":"s","cwd":"/tmp"}"#.into(),
+            &mut stdout,
+            |_, _| panic!("zero's session-end must not spawn a detached drainer"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        let request = first_request(&mut requests)
+            .await
+            .expect("drained in-process");
+        assert!(request.starts_with("POST /hook/batch"), "{request}");
+        assert_eq!(
+            hook_spool::spool_len(&spool),
+            0,
+            "delivered event left the spool"
+        );
+    }
+
+    /// With the sandbox's network denied the in-process drain fails fast and
+    /// the event stays spooled for `hook-drain` or the next session.
+    #[tokio::test]
+    async fn zero_session_end_without_network_keeps_the_event_spooled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let mut stdout = Vec::new();
+
+        run_with_payload(
+            Some(data_dir.clone()),
+            zero_hook_args("session-end", &refused),
+            r#"{"sessionId":"s","cwd":"/tmp"}"#.into(),
+            &mut stdout,
+            |_, _| panic!("zero's session-end must not spawn a detached drainer"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].attempts, 0,
+            "an unreachable server costs no retry"
+        );
     }
 
     #[tokio::test]

@@ -154,7 +154,8 @@ pub struct IngestMetricsSnapshot {
     pub dropped_by_policy: u64,
     /// Captures dropped because their author may not write that repository.
     pub dropped_unauthorized: u64,
-    /// Batch items dropped because they can never be stored (no session id).
+    /// Batch items dropped because they can never be stored (no session id,
+    /// or a purged session).
     pub dropped_invalid: u64,
     /// Events shed because ingest capacity was exhausted.
     pub shed_saturated: u64,

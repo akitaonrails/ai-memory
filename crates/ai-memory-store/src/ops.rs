@@ -2359,8 +2359,8 @@ fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()>
     // be sitting undelivered in a client hook spool; without this check the
     // next drain recreates the session row and the observations land again,
     // silently undoing a deletion an application already promised its user
-    // (#387). Every ingest path funnels through here, so this is the one
-    // place the guard has to live.
+    // (#387). The other place a session row is created, hook admission in
+    // `admit_hook_session_event`, repeats the guard.
     if session_is_purged(conn, session)? {
         return Err(StoreError::SessionPurged(session.id.to_string()));
     }
@@ -3023,6 +3023,13 @@ pub fn admit_hook_session_event(
             validate_identity_storage_key(session.actor_user.as_deref(), "session owner")?;
             if !owner_filter.admits(session.actor_user.as_deref()) {
                 return Err(StoreError::SessionCollision);
+            }
+            // Hook ingest creates its session row here rather than through
+            // `begin_session_row`, so a purge must hold against it too: a
+            // late delivery for a purged session would otherwise bring the
+            // session back (#387).
+            if session_is_purged(&tx, session)? {
+                return Err(StoreError::SessionPurged(session.id.to_string()));
             }
             // `now` is also the ingest-key TTL clock above; started_at honors
             // the caller's original event time (backfill) and only falls
@@ -6182,6 +6189,19 @@ pub fn purge_session(
         rusqlite::params![&sid[..], &wid[..], &pid[..]],
     )? as u64;
 
+    // Profile evidence harvested from this session's prompts. A candidate
+    // keeps the user's own sentence (`statement`, `quote`), so one left behind
+    // would let a later convergence write that sentence into a profile page.
+    // Not scoped to this project: the harvest files a candidate under the
+    // project of the prompt it came from, and a prompt this session recorded
+    // in another project is deleted with it by the `observations` cascade
+    // (`collateral_observations_deleted`). A session id names one session, so
+    // `session:<id>` matches only this session's evidence.
+    tx.execute(
+        "DELETE FROM profile_candidates WHERE source_kind = 'prompt' AND source_ref = ?1",
+        rusqlite::params![format!("session:{session_id}")],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).
@@ -7001,6 +7021,37 @@ pub fn move_project_workspace(
         "UPDATE workstreams SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
+    // The remaining tables that carry the workspace beside the project id.
+    // Left behind, an entity or a feedback row stops matching reads keyed on
+    // the new workspace, and a purge tombstone stops matching the moved
+    // project's session ids, so a purged session could be recreated.
+    for table in [
+        "entities",
+        "page_feedback",
+        "purged_sessions",
+        "profile_candidates",
+        "profile_entry_ledger",
+        "profile_harvest_marks",
+    ] {
+        tx.execute(
+            &format!(
+                "UPDATE {table} SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3"
+            ),
+            params![&to[..], &pid[..], &from[..]],
+        )?;
+    }
+    // A message names the project on both ends: pending mail addressed to the
+    // moved project and mail it sent, which it can still cancel.
+    tx.execute(
+        "UPDATE agent_messages SET to_workspace_id = ?1 \
+          WHERE to_project_id = ?2 AND to_workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )?;
+    tx.execute(
+        "UPDATE agent_messages SET from_workspace_id = ?1 \
+          WHERE from_project_id = ?2 AND from_workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )?;
 
     let projects_updated = tx.execute(
         "UPDATE projects SET workspace_id = ?1 WHERE id = ?2 AND workspace_id = ?3",
@@ -10256,6 +10307,71 @@ pub(crate) mod tests {
         );
     }
 
+    /// The cross-project profile keeps the user's own sentence from a prompt
+    /// in `profile_candidates`, keyed `session:<id>`. Purging the session must
+    /// take that evidence with it, including the candidate harvested from a
+    /// prompt the session recorded in another project: the purge deletes that
+    /// observation through the cascade, so its sentence must not outlive it.
+    /// A sibling session's candidates (in both projects) and a page candidate
+    /// are the controls.
+    #[test]
+    fn purge_session_deletes_the_profile_candidates_harvested_from_it() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let (purged, _) = seed_session(&mut conn, ws, proj, "target");
+        let (sibling, _) = seed_session(&mut conn, ws, proj, "sibling");
+        // A prompt the purged session recorded in `other` (follow-cwd routing).
+        let mut stray = hook_observation(&hook_session(purged, ws, proj, None));
+        stray.project_id = other;
+        stray.body = "obs-in-other-project".into();
+        insert_observation(&mut conn, &stray).unwrap();
+        let candidate = |project: ProjectId, kind: &str, source_ref: String| {
+            conn.execute(
+                "INSERT INTO profile_candidates \
+                 (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+                  statement, quote, observed_at, generality) \
+                 VALUES (?1, ?2, ?3, ?4, 'topic', 'workflow', 'statement', 'quote', 1, 'general')",
+                params![ws.as_bytes(), project.as_bytes(), kind, source_ref],
+            )
+            .unwrap();
+        };
+        candidate(proj, "prompt", format!("session:{purged}"));
+        candidate(proj, "prompt", format!("session:{sibling}"));
+        candidate(proj, "page", "page:_rules/keep.md".into());
+        candidate(other, "prompt", format!("session:{purged}"));
+        candidate(other, "prompt", format!("session:{sibling}"));
+
+        let summary = purge_session(
+            &mut conn,
+            ws,
+            proj,
+            purged,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+        assert_eq!(summary.collateral_observations_deleted, 1);
+
+        let remaining: Vec<(Vec<u8>, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT project_id, source_ref FROM profile_candidates ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            remaining,
+            [
+                (proj.as_bytes().to_vec(), format!("session:{sibling}")),
+                (proj.as_bytes().to_vec(), "page:_rules/keep.md".to_owned()),
+                (other.as_bytes().to_vec(), format!("session:{sibling}")),
+            ]
+        );
+    }
+
     /// A purge must be terminal. The events that produced a session can sit
     /// undelivered in a client hook spool for days (#493 measured spools with
     /// thousands), so without a tombstone the next drain recreates the session
@@ -10288,6 +10404,52 @@ pub(crate) mod tests {
             "still gone"
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 0);
+    }
+
+    /// `begin_session` is not the only way a hook event creates a session:
+    /// live ingest goes through `admit_hook_session_event`, which inserts the
+    /// row itself. The purge must hold against it as well (#387). A sibling
+    /// session and the same id in another project are the controls.
+    #[test]
+    fn a_purged_session_is_not_recreated_by_hook_admission() {
+        let admit = |conn: &mut Connection, session: &NewSession| {
+            admit_hook_session_event(
+                conn,
+                session,
+                &hook_observation(session),
+                &OwnerFilter::Any,
+                None,
+                None,
+            )
+        };
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let (purged, _) = seed_session(&mut conn, ws, proj, "target");
+        let (sibling, _) = seed_session(&mut conn, ws, proj, "sibling");
+        purge_session(
+            &mut conn,
+            ws,
+            proj,
+            purged,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        let session = hook_session(purged, ws, proj, None);
+        let err = admit(&mut conn, &session).expect_err("must stay purged");
+        assert!(matches!(err, StoreError::SessionPurged(_)), "got {err:?}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM observations"), 1);
+
+        let sibling_session = hook_session(sibling, ws, proj, None);
+        let admitted = admit(&mut conn, &sibling_session).unwrap();
+        assert!(matches!(admitted, HookSessionAdmission::Observation { .. }));
+
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let elsewhere = hook_session(purged, ws, other, None);
+        let admitted = admit(&mut conn, &elsewhere).unwrap();
+        assert!(matches!(admitted, HookSessionAdmission::Observation { .. }));
     }
 
     /// The tombstone is scoped: purging a session id in one project must not
@@ -13377,6 +13539,148 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(still_there, 1);
+    }
+
+    /// Tables that carry the workspace beside the project id must follow a
+    /// move too: pending mail on both ends, entities, page feedback, the purge
+    /// tombstone and the profile evidence. The other project's side of a
+    /// message stays where it is.
+    #[test]
+    fn move_project_workspace_restamps_the_remaining_workspace_columns() {
+        let (_tmp, mut conn, src_ws, proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "djalmajr").unwrap();
+        let other = get_or_create_project(&mut conn, &src_ws, "other", None).unwrap();
+
+        let mut with_entity = page(src_ws, proj, "notes/e.md", "body");
+        with_entity.entities = vec!["postgres".into()];
+        let page_id = upsert_page(&mut conn, &with_entity).unwrap();
+        conn.execute(
+            "INSERT INTO page_feedback \
+             (id, page_id, workspace_id, project_id, kind, salience_after, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'stale', 1.0, 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                &page_id.as_bytes()[..],
+                src_ws.as_bytes(),
+                proj.as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO purged_sessions (session_id, workspace_id, project_id, purged_at) \
+             VALUES (?1, ?2, ?3, 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                src_ws.as_bytes(),
+                proj.as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_candidates \
+             (workspace_id, project_id, source_kind, source_ref, topic_key, category, \
+              statement, quote, observed_at, generality) \
+             VALUES (?1, ?2, 'page', 'page:_rules/a.md', 'topic', 'workflow', 's', 'q', 1, 'general')",
+            params![src_ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_entry_ledger (workspace_id, project_id, path, topic_key, written_at) \
+             VALUES (?1, ?2, 'profile/a.md', 'topic', 1)",
+            params![src_ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO profile_harvest_marks (workspace_id, project_id) VALUES (?1, ?2)",
+            params![src_ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+        let message = |from: ProjectId, to: ProjectId| {
+            conn.execute(
+                "INSERT INTO agent_messages \
+                 (id, from_workspace_id, from_project_id, from_agent, \
+                  to_workspace_id, to_project_id, body, created_at) \
+                 VALUES (?1, ?2, ?3, 'other', ?2, ?4, 'hello', 1)",
+                params![
+                    uuid::Uuid::new_v4().as_bytes(),
+                    src_ws.as_bytes(),
+                    from.as_bytes(),
+                    to.as_bytes(),
+                ],
+            )
+            .unwrap();
+        };
+        message(other, proj);
+        message(proj, other);
+
+        move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
+
+        let in_workspace = |table: &str, ws: &ai_memory_core::WorkspaceId| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id = ?1"),
+                params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for table in [
+            "entities",
+            "page_feedback",
+            "purged_sessions",
+            "profile_candidates",
+            "profile_entry_ledger",
+            "profile_harvest_marks",
+        ] {
+            assert_eq!(in_workspace(table, &dst_ws), 1, "{table} must follow");
+            assert_eq!(in_workspace(table, &src_ws), 0, "{table} must leave");
+        }
+        let side = |column: &str, ws: &ai_memory_core::WorkspaceId| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM agent_messages WHERE {column} = ?1"),
+                params![ws.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // One message is addressed to the moved project, the other sent by it;
+        // the `other` project's end of each stays in the source workspace.
+        assert_eq!(side("to_workspace_id", &dst_ws), 1);
+        assert_eq!(side("from_workspace_id", &dst_ws), 1);
+        assert_eq!(side("to_workspace_id", &src_ws), 1);
+        assert_eq!(side("from_workspace_id", &src_ws), 1);
+    }
+
+    /// The purge tombstone is keyed on `(session, workspace, project)`, so it
+    /// has to follow a move or a late event recreates the purged session in
+    /// the destination (#387). A session that was never purged is the control.
+    #[test]
+    fn a_purged_session_stays_purged_after_its_project_moves() {
+        let (_tmp, mut conn, src_ws, proj) = fresh_db();
+        let dst_ws = get_or_create_workspace(&mut conn, "destination").unwrap();
+        let (purged, _) = seed_session(&mut conn, src_ws, proj, "target");
+        purge_session(
+            &mut conn,
+            src_ws,
+            proj,
+            purged,
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .unwrap();
+
+        move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
+
+        let err = begin_session(&mut conn, &hook_session(purged, dst_ws, proj, None))
+            .expect_err("the purge must survive the move");
+        assert!(matches!(err, StoreError::SessionPurged(_)), "got {err:?}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 0);
+        begin_session(
+            &mut conn,
+            &hook_session(SessionId::new(), dst_ws, proj, None),
+        )
+        .unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sessions"), 1);
     }
 
     /// A same-named project already in the destination workspace makes the

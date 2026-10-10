@@ -49,7 +49,9 @@ from hook paths.
    with a short timeout. Native `ai-memory hook --event ...` commands spool
    events locally with a stable per-entry idempotency key, do a short bounded
    cleanup at session start, and hand
-   session-end delivery to a detached lock-aware `hook-drain` helper;
+   session-end delivery to a detached lock-aware `hook-drain` helper (Zero,
+   whose hook sandbox kills detached children, drains in-process within a
+   fixed 10-second budget instead);
    high-latency operators can raise the drain/handoff/background caps with
    minute-based env vars.
    Agent hot paths never block on the network; saturated servers return HTTP

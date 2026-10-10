@@ -4578,10 +4578,10 @@ fn add_hook_spooling(source: String) -> Result<String> {
           body: JSON.stringify(item.payload),
           signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS),
         }).catch(() => undefined);
-        // Unreachable server or 5xx: keep the event on disk for a later
-        // drain (#580). 4xx is permanent - spooling it would retry a
-        // rejection forever.
-        if (!resp || resp.status >= 500) spoolFailedHook(item.url, item.payload);
+        // Unreachable server, 5xx or a transient 4xx (408, 425, 429): keep the
+        // event on disk for a later drain (#580). Any other 4xx is permanent -
+        // spooling it would retry a rejection forever.
+        if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(item.url, item.payload);
       } catch (_e) {
         try { spoolFailedHook(item.url, item.payload); } catch (_e2) {}
       }"#;
@@ -6368,8 +6368,10 @@ pub(crate) fn zero_install_notes(data_dir: impl std::fmt::Display) -> String {
          #         \"sandbox\": {{\"network\": \"allow\",\n\
          #                     \"additionalWriteRoots\": [\"{}\"]}}\n\
          #       (network allow applies to every Zero shell command), or\n\
-         #       \"sandbox\": {{\"enabled\": false}}. Otherwise run `ai-memory\n\
-         #       hook-drain` from a normal shell to deliver spooled events.\n",
+         #       \"sandbox\": {{\"enabled\": false}}. With network allowed,\n\
+         #       sessionEnd delivers in-process (the sandbox kills detached\n\
+         #       drainers). Otherwise run `ai-memory hook-drain` from a\n\
+         #       normal shell to deliver spooled events.\n",
         data_dir
     )
 }
@@ -8318,6 +8320,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         );
         assert!(notes.contains(r#""enabled": false"#), "{notes}");
         assert!(notes.contains("hook-drain"), "{notes}");
+        assert!(notes.contains("sessionEnd delivers in-process"), "{notes}");
         assert!(notes.lines().all(|l| l.starts_with('#')), "{notes}");
     }
 
@@ -9954,10 +9957,10 @@ model = "gpt-5"
                 !source.contains("}).catch(() => undefined);\n      } catch (_e) {"),
                 "{name}: still fire-and-forgets failed deliveries"
             );
-            // ...replaced by capture + spool of network failures and 5xx.
+            // ...replaced by capture + spool of network failures, 5xx and transient 4xx.
             assert!(
                 source.contains(
-                    "if (!resp || resp.status >= 500) spoolFailedHook(item.url, item.payload);"
+                    "if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(item.url, item.payload);"
                 ),
                 "{name}: missing spool-on-failure"
             );

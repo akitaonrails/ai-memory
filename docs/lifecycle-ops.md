@@ -501,8 +501,10 @@ a low-level re-stamp:
 6. Re-stamp `workspace_id` across every domain table for the project in
    **one transaction**, keeping the same `project_id`
    (`projects`, `pages`, `sessions`, `observations`, `handoffs`, `audit_log`,
-   auto-improvement state, SessionEnd consolidation jobs, and managed
-   `workstreams`). Native workstream sessions, runs, and events remain attached
+   auto-improvement state, SessionEnd consolidation jobs, managed
+   `workstreams`, pending cross-project messages on both ends, entities, page
+   feedback, purge tombstones, and the profile evidence). Native workstream
+   sessions, runs, and events remain attached
    through `workstream_id`; `page_embeddings` and `links` remain attached
    through `page_id`, so none of those rows need a direct re-stamp.
 
@@ -678,7 +680,8 @@ project, since new sessions started there still resolve by basename unless a
 session (decisions, gotchas: pages are not tracked per session), handoffs the
 session *accepted*, and `auto_improve_proposals` (they have no `session_id`;
 they target pages in the scope they were staged in). `entities` and
-`page_feedback` are not re-stamped either, the same gap `move-project` has.
+`page_feedback` are not re-stamped either, unlike `move-project`, which
+moves the whole project and re-stamps both.
 
 **Order of operations (per session):** validate the destination (404 unless
 `create`), reject a batch whose source is the destination (422; the single
