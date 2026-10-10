@@ -590,6 +590,179 @@ async fn a_second_accept_cannot_steal_an_accepted_handoff() {
     );
 }
 
+/// The receiver named in a claim must be a real session of the claim's own
+/// workspace, project and agent kind. A session from a sibling project, from
+/// another workspace (even one using the same project name), of a different
+/// agent kind, or one that does not exist must be refused with `InvalidState`
+/// and must leave the baton open and untouched; a matching receiver still
+/// claims it, and nobody can claim it a second time.
+#[tokio::test]
+async fn handoff_accept_rejects_foreign_or_missing_receiver_session() {
+    /// The columns a claim writes, read straight from the row.
+    #[derive(Debug, PartialEq)]
+    struct ClaimColumns {
+        state: HandoffState,
+        accepted_by: Option<String>,
+        accepted_at: Option<i64>,
+        accepted_by_session: Option<Vec<u8>>,
+        accepted_by_user: Option<String>,
+    }
+
+    async fn claim_columns(store: &Store, id: ai_memory_core::HandoffId) -> ClaimColumns {
+        let handoff_bytes = id.as_bytes().to_vec();
+        store
+            .reader
+            .with_conn(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT state, accepted_by, accepted_at, accepted_by_session, \
+                            accepted_by_user \
+                     FROM handoffs WHERE id = ?1",
+                    rusqlite::params![handoff_bytes],
+                    |r| {
+                        Ok(ClaimColumns {
+                            state: r.get::<_, String>(0)?.parse().unwrap(),
+                            accepted_by: r.get(1)?,
+                            accepted_at: r.get(2)?,
+                            accepted_by_session: r.get(3)?,
+                            accepted_by_user: r.get(4)?,
+                        })
+                    },
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let sibling_proj = store
+        .writer
+        .get_or_create_project(ws, "sibling-app".to_string(), None)
+        .await
+        .unwrap();
+    let rival_ws = store
+        .writer
+        .get_or_create_workspace("rival".to_string())
+        .await
+        .unwrap();
+    // Same project name as the real one, in another workspace: a lookup by
+    // name alone would conflate the two.
+    let rival_proj = store
+        .writer
+        .get_or_create_project(rival_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+
+    let id = store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            from_session_id: None,
+            summary: "pick this up".into(),
+            next_steps: Vec::new(),
+            open_questions: Vec::new(),
+            files_touched: Vec::new(),
+            cwd: None,
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    // Every claim names the handoff's own scope and `ClaudeCode`; only the
+    // receiver session varies.
+    let claim = |session: SessionId| HandoffAcceptance {
+        handoff_id: id,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::ClaudeCode,
+        accepting_session: Some(session),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: None,
+    };
+
+    let valid = open_session(&store, ws, proj, AgentKind::ClaudeCode).await;
+    let other_project = open_session(&store, ws, sibling_proj, AgentKind::ClaudeCode).await;
+    let other_workspace = open_session(&store, rival_ws, rival_proj, AgentKind::ClaudeCode).await;
+    let wrong_agent = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let missing = SessionId::new();
+
+    let open = ClaimColumns {
+        state: HandoffState::Open,
+        accepted_by: None,
+        accepted_at: None,
+        accepted_by_session: None,
+        accepted_by_user: None,
+    };
+    assert_eq!(claim_columns(&store, id).await, open, "fixture starts open");
+
+    for (label, receiver) in [
+        ("a session of a sibling project", other_project),
+        ("a session of another workspace", other_workspace),
+        ("a session of a different agent kind", wrong_agent),
+        ("a session that does not exist", missing),
+    ] {
+        let err = store
+            .writer
+            .accept_handoff(claim(receiver))
+            .await
+            .expect_err(label);
+        assert!(
+            matches!(&err, StoreError::InvalidState(_)),
+            "{label} must be refused as InvalidState, got {err:?}"
+        );
+        assert_eq!(
+            claim_columns(&store, id).await,
+            open,
+            "{label} must leave the handoff open and unclaimed"
+        );
+    }
+
+    // Control: the matching receiver takes the baton.
+    assert!(
+        store.writer.accept_handoff(claim(valid)).await.unwrap(),
+        "a receiver in the handoff's own workspace, project and agent kind claims it"
+    );
+    let accepted = claim_columns(&store, id).await;
+    assert_eq!(accepted.state, HandoffState::Accepted);
+    assert_eq!(
+        accepted.accepted_by.as_deref(),
+        Some(AgentKind::ClaudeCode.as_str())
+    );
+    assert_eq!(
+        accepted.accepted_by_session.as_deref(),
+        Some(&valid.as_bytes()[..])
+    );
+    assert!(accepted.accepted_at.is_some(), "the claim is timestamped");
+    assert_eq!(
+        accepted.accepted_by_user, None,
+        "the claim named no operator"
+    );
+
+    // Nobody claims it twice: neither the same receiver retrying nor another
+    // matching session (the latter reaches the `state = 'open'` guards rather
+    // than the per-receiver early return).
+    let second_match = open_session(&store, ws, proj, AgentKind::ClaudeCode).await;
+    for (label, receiver) in [
+        ("the same receiver retrying", valid),
+        ("a second matching session", second_match),
+    ] {
+        assert!(
+            !store.writer.accept_handoff(claim(receiver)).await.unwrap(),
+            "{label} must not claim an accepted handoff"
+        );
+        assert_eq!(
+            claim_columns(&store, id).await,
+            accepted,
+            "{label} must leave the first claim intact"
+        );
+    }
+}
+
 /// Ownership still applies to batons even though pages are shared: the two
 /// halves of the model must not collapse into each other.
 #[tokio::test]
