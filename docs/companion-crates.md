@@ -247,8 +247,8 @@ root `cargo test --workspace`.
 
 Mirror a team's shared ai-memory pages into a project repository as
 reviewable markdown, so the wiki a team actually maintains can travel with
-the code it documents, and let reviewed repository edits flow back —
-family-scoped and dry-run by default.
+the code it documents, and let reviewed repository edits flow back. Both
+directions are family-scoped and dry-run by default.
 
 ### How it talks to ai-memory
 
@@ -288,7 +288,7 @@ family-scoped and dry-run by default.
   reported with a diff summary and the whole batch is refused without
   `--force`.
 - `plan` and `export` never delete; `sync` deletes only with
-  `--propagate-deletes`. It never runs git, commits, or pushes — it prints
+  `--propagate-deletes`. It never runs git, commits, or pushes; it prints
   the commands (`git add`, `git rm`) the operator may run.
 - Destination-path safety: traversal, dotfiles, reserved Windows names,
   non-portable characters, case-fold collisions, oversized bodies,

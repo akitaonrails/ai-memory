@@ -502,16 +502,16 @@ Sources: <https://dev.meta.ai/docs/muse-code/configuration>,
 
 DSH has no fixed JSON/TOML MCP config: the MCP client is a Cordis plugin entry
 (`@deepseek-ai/dsh-mcp-client`) inside a profile's `cordis.patch.yml`.
-`install-mcp` therefore prints a ready-to-merge patch fragment and **refuses
-`--apply`**:
+`install-mcp` therefore prints a ready-to-merge patch fragment and refuses
+`--apply`:
 
 ```bash
 ai-memory install-mcp --client dsh
 ```
 
 Merge the printed `- insert:` item into
-`$DSH_HOME/profiles/<profile>/cordis.patch.yml` — the `web` profile
-reloads its patch live — then reload or restart the profile. The fragment registers
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml` (the `web` profile
+reloads its patch live), then reload or restart the profile. The fragment registers
 the default stateless HTTP endpoint and carries `Authorization: Bearer <token>`
 when `--auth-token` (or a configured server token) is present.
 
@@ -521,7 +521,7 @@ Code hooks is not a supported capture path: those hooks report every event as
 `agent=claude-code`, so DSH sessions would be stored as Claude Code sessions.
 ai-memory does not install or manage the bridge, and it delivers only seven Claude Code events
 (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-`Stop`, `SubagentStart`, `SubagentStop`) — `PreCompact` and
+`Stop`, `SubagentStart`, `SubagentStop`). `PreCompact` and
 `SessionEnd` are not delivered, and its `SessionStart` injection runs
 detached. Treat DSH as MCP-only here and recover handoffs explicitly with
 `memory_handoff_list` then `memory_handoff_accept` when continuity matters.

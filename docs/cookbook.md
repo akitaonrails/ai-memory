@@ -146,7 +146,7 @@ needs ai-memory 2.7+), and deletes travel only with `--propagate-deletes`.
 ### Keep it in step after merges and in CI
 
 `install-hook` writes a git `post-merge` hook that runs `sync` after every
-merge or pull — a dry-run report by default, `--on-merge apply` to write. It
+merge or pull: a dry-run report by default, or a write with `--on-merge apply`. It
 never stores a token (the hook reads `AI_MEMORY_AUTH_TOKEN` when it runs) and
 never passes `--prefer`, so conflicts still wait for a person:
 

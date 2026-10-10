@@ -192,7 +192,7 @@ options:
 > is `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING=true` (it sends
 > `chat_template_kwargs: {"enable_thinking": false}` on every openai-compat
 > request); if the engine still truncates the structured payload or returns empty
-> content, the job now fails fast with a terminal `truncated-response` /
+> content, the job fails fast with a terminal `truncated-response` /
 > `empty-content` error instead of retrying.
 
 ai-memory's hosted OpenAI-family providers use `json_schema` strict mode for

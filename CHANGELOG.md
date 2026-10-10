@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drift and 4 on conflicts or refusals (a clone without sync state compares
   the repository with the server directly), and `install-hook` /
   `uninstall-hook` manage a marked git `post-merge` block that runs `sync`
-  after each merge — a dry-run report unless `--on-merge apply`, never with
+  after each merge: a dry-run report unless `--on-merge apply`, never with
   `--prefer`, and never with a stored token. The cookbook has a GitHub
   Actions recipe. (#986)
 - The `ai-memory-wikisync` companion now propagates deletes with
@@ -60,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-reads each page right before writing it. (#1164)
 - `finalize-session --agent antigravity-cli` now replays the session's typed
   prompts from `agy`'s `history.jsonl` before its synthetic session-end, so
-  live Antigravity sessions — whose hooks carry no prompt event — get a summary
+  live Antigravity sessions, whose hooks carry no prompt event, get a summary
   page titled by the first prompt, a handoff with "Started/Last", and prompts
   that `memory_query` and `memory_recent` can find. Only lines whose
   conversation and workspace match the session are read; each prompt carries

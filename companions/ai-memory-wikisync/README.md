@@ -1,6 +1,6 @@
 # ai-memory-wikisync
 
-**Team-wiki sync** companion for
+Team-wiki sync companion for
 [ai-memory](https://github.com/akitaonrails/ai-memory) (issue #986, slices
 1, 3, 4 and 5). It keeps explicitly allowlisted page families of a running
 ai-memory server in step with a directory inside a project repository, so a
@@ -84,7 +84,7 @@ All local bookkeeping lives in one state file,
 `.ai-memory-wikisync/state.json` (mode 0600, atomically replaced after
 each successful write batch): per page, the SHA-256 of the bytes last
 written plus the server `ETag` and version id observed at that write.
-Nothing else is stored — no tokens, no server credentials.
+Nothing else is stored: no tokens and no server credentials.
 
 The state is per clone. The state directory carries a `.gitignore` of `*`,
 so committing the destination never commits the state: two clones that
@@ -178,7 +178,7 @@ Safety rules:
 
 ## CI and post-merge
 
-`sync --check` writes nothing — no files, no state — and reports through its
+`sync --check` writes nothing (no files, no state) and reports through its
 exit code:
 
 | Exit | Meaning |
@@ -235,5 +235,5 @@ ai-memory-wikisync uninstall-hook --dest docs/wiki [--hooks-dir DIR]
    write tool.
 4. Deletes and conflict reporting (`--propagate-deletes`, conditional
    writes).
-5. **This release — post-merge hook and CI integration** (`install-hook`,
+5. This release: post-merge hook and CI integration (`install-hook`,
    `sync --check`).

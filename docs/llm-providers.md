@@ -375,12 +375,12 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING=true` to send
 > `chat_template_kwargs: {"enable_thinking": false}` on every openai-compat
 > request so the engine spends the budget on the payload instead. The knob is
-> opt-in, openai-compat only, and off by default — existing vLLM / Ollama /
+> opt-in, openai-compat only, and off by default: existing vLLM / Ollama /
 > LM Studio setups are unchanged unless it is set, and every other provider
 > ignores it. When the engine still truncates a structured response, or
-> returns HTTP 2xx with an empty `message.content`, the call now fails fast
-> with the terminal errors `truncated-response` / `empty-content` — no
-> retry, no second HTTP call, and the error text carries no response
+> returns HTTP 2xx with an empty `message.content`, the call fails fast
+> with the terminal errors `truncated-response` / `empty-content`. There is
+> no retry and no second HTTP call, and the error text carries no response
 > content.
 
 For small-context local models, configure both consolidation limits. The input
