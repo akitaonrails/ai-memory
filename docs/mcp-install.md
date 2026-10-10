@@ -516,9 +516,10 @@ the default stateless HTTP endpoint and carries `Authorization: Bearer <token>`
 when `--auth-token` (or a configured server token) is present.
 
 DSH ships a bridge that runs an existing Claude Code `hooks.json` or settings
-file (`@deepseek-ai/dsh-hooks-claude-code`), so lifecycle capture for a DSH
-session is possible by pointing that bridge at a Claude Code hook config. ai-memory
-does not install or manage it, and the bridge delivers only seven Claude Code events
+file (`@deepseek-ai/dsh-hooks-claude-code`). Pointing it at ai-memory's Claude
+Code hooks is not a supported capture path: those hooks report every event as
+`agent=claude-code`, so DSH sessions would be stored as Claude Code sessions.
+ai-memory does not install or manage the bridge, and it delivers only seven Claude Code events
 (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `Stop`, `SubagentStart`, `SubagentStop`) — `PreCompact` and
 `SessionEnd` are not delivered, and its `SessionStart` injection runs

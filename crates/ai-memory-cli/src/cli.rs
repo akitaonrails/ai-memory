@@ -2680,8 +2680,8 @@ pub enum McpClient {
     /// config: the client is a Cordis plugin entry
     /// (@deepseek-ai/dsh-mcp-client) inside a profile's cordis.patch.yml.
     /// This integration is print-only (--apply is refused); merge the
-    /// rendered insert list into the profile patch. Pair it with DSH's
-    /// @deepseek-ai/dsh-hooks-claude-code bridge for lifecycle capture.
+    /// rendered insert list into the profile patch. No lifecycle capture is
+    /// claimed.
     #[value(alias = "deepseek-harness", alias = "deepseek_harness")]
     Dsh,
 }
