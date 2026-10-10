@@ -138,6 +138,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+
+## [2.6.3] - 2026-10-09
+
+### Fixed
 - Fixed cross-project message tools acting on another project's mailbox. A
   static MCP client (one that does not forward its lifecycle-hook session id,
   such as Claude Code's MCP connection) that called `memory_message_pop`,
@@ -8840,7 +8844,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.3...HEAD
+[2.6.3]: https://github.com/akitaonrails/ai-memory/compare/v2.6.2...v2.6.3
 [2.6.2]: https://github.com/akitaonrails/ai-memory/compare/v2.6.1...v2.6.2
 [2.6.1]: https://github.com/akitaonrails/ai-memory/compare/v2.6.0...v2.6.1
 [2.6.0]: https://github.com/akitaonrails/ai-memory/compare/v2.5.2...v2.6.0
