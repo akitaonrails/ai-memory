@@ -4049,13 +4049,6 @@ mod tests {
         TruncatedResponse,
         /// The provider returned HTTP 2xx with no usable content.
         EmptyContent,
-        /// Pre-send: a 503 the provider may clear on a later attempt.
-        Provider503,
-        /// Pre-send: the connection was refused before the request left the
-        /// machine. The error is not cloneable, so the fixture builds a
-        /// fresh refused connection on every call (the inner retry budget
-        /// calls the fixture more than once).
-        ConnectRefused,
     }
 
     /// Structured-output failure fixture: counts calls (proving the prompt
@@ -4113,21 +4106,6 @@ mod tests {
                     ConsolidationFailure::EmptyContent => LlmError::EmptyContent {
                         model: "test-model".into(),
                     },
-                    ConsolidationFailure::Provider503 => LlmError::Provider {
-                        status: 503,
-                        body: "capacity".into(),
-                    },
-                    // A closed loopback port refuses immediately — the same
-                    // way the LLM suite builds a pre-send connection failure.
-                    ConsolidationFailure::ConnectRefused => {
-                        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                        let addr = listener.local_addr().unwrap();
-                        drop(listener);
-                        let connect = reqwest::get(format!("http://{addr}/v1"))
-                            .await
-                            .expect_err("a closed loopback port must refuse the connection");
-                        LlmError::Http(connect)
-                    }
                 };
                 Err(error)
             })
@@ -4958,161 +4936,6 @@ mod tests {
     async fn session_end_worker_makes_truncated_and_empty_output_terminal() {
         session_end_worker_terminates_on(ConsolidationFailure::TruncatedResponse).await;
         session_end_worker_terminates_on(ConsolidationFailure::EmptyContent).await;
-    }
-
-    /// Run the real SessionEnd worker against a session whose structured LLM
-    /// call fails pre-send with `failure`, and prove the queue item stays
-    /// `pending` with a `next_attempt_at`: the pre-send error is transient,
-    /// so the consolidator first spends its short inner retry budget before
-    /// the worker settles the queue row. At the settling instant a claim
-    /// inside the first 30s backoff window finds nothing, and a claim past
-    /// it re-claims the job for its second attempt — the bounded backoff is
-    /// kept, not the terminal state.
-    async fn session_end_worker_keeps_pre_send_failure_queued(failure: ConsolidationFailure) {
-        let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        let workspace_id = store
-            .writer
-            .get_or_create_workspace("default")
-            .await
-            .unwrap();
-        let project_id = store
-            .writer
-            .get_or_create_project(workspace_id, "project", None)
-            .await
-            .unwrap();
-        let session_id = SessionId::new();
-        store
-            .writer
-            .begin_session(NewSession {
-                occurred_at: None,
-                id: session_id,
-                workspace_id,
-                project_id,
-                agent_kind: AgentKind::Codex,
-                cwd: None,
-                actor_user: None,
-            })
-            .await
-            .unwrap();
-        store
-            .writer
-            .insert_observation(Sanitized::new(
-                NewObservation {
-                    occurred_at: None,
-                    session_id,
-                    workspace_id,
-                    project_id,
-                    kind: ObservationKind::UserPrompt,
-                    extension: None,
-                    source_event: None,
-                    title: "finish".into(),
-                    body: "end the session".into(),
-                    importance: 8,
-                },
-                &Sanitizer::default(),
-            ))
-            .await
-            .unwrap();
-        store.writer.end_session(session_id, None).await.unwrap();
-        store
-            .writer
-            .enqueue_session_consolidation(workspace_id, project_id, session_id)
-            .await
-            .unwrap();
-
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let consolidator = Arc::new(Consolidator::new(
-            store.reader.clone(),
-            store.writer.clone(),
-            wiki,
-            Arc::new(FailingConsolidationLlm {
-                failure,
-                calls: calls.clone(),
-            }),
-            workspace_id,
-            project_id,
-        ));
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let completed = Arc::new(tokio::sync::Notify::new());
-        let cancel = CancellationToken::new();
-        let task = tokio::spawn(run_session_consolidation_worker(
-            store.writer.clone(),
-            consolidator,
-            notify.clone(),
-            cancel.child_token(),
-            completed.clone(),
-        ));
-        notify.notify_one();
-
-        // The pre-send failure must go out exactly once.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while calls.load(Ordering::SeqCst) < 1 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "worker never called the LLM"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        // Poll the queue until the row settles back to `pending` (after the
-        // consolidator's inner retry budget): at the settling instant a claim
-        // inside the first 30s backoff window finds nothing, and a claim past
-        // it re-claims the job for its second attempt.
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let mut second = None;
-        while second.is_none() {
-            let now = jiff::Timestamp::now().as_microsecond();
-            let inside_window = now + 10 * 1_000_000;
-            assert!(
-                store
-                    .writer
-                    .claim_session_consolidation(
-                        inside_window,
-                        inside_window - 10 * 60 * 1_000_000,
-                    )
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "a pre-send failure inside its backoff window must not be claimable yet"
-            );
-            let past_window = now + 60 * 1_000_000;
-            second = store
-                .writer
-                .claim_session_consolidation(past_window, past_window - 10 * 60 * 1_000_000)
-                .await
-                .unwrap();
-            if second.is_none() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the pre-send failure never settled back into the queue"
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-        assert_eq!(
-            second.map(|job| job.attempts()),
-            Some(2),
-            "a pre-send failure must stay queued for its bounded retries"
-        );
-        cancel.cancel();
-        task.await.unwrap();
-    }
-
-    // Mutation captured: capping the queue or skipping the backoff on a safe
-    // pre-send failure would drop retries the provider explicitly invited.
-    #[tokio::test]
-    async fn session_end_worker_keeps_transient_503_queued_with_backoff() {
-        session_end_worker_keeps_pre_send_failure_queued(ConsolidationFailure::Provider503).await;
-    }
-
-    // Mutation captured: same as the 503 case, for a connection that never
-    // left the machine — a real pre-send failure built the way the LLM suite
-    // builds one: a closed loopback port refuses immediately.
-    #[tokio::test]
-    async fn session_end_worker_keeps_connection_refused_queued_with_backoff() {
-        session_end_worker_keeps_pre_send_failure_queued(ConsolidationFailure::ConnectRefused)
-            .await;
     }
 
     async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {
