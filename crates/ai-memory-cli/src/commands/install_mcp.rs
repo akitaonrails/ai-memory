@@ -31,6 +31,10 @@ use crate::config::{Config, DEFAULT_MCP_URL};
 
 const GEMINI_MCP_TIMEOUT_MS: u64 = 5000;
 
+/// The variable a Prime Agent entry names in `bearerTokenEnvVar`: the same one
+/// ai-memory's own hooks and CLI read the server token from.
+const PRIME_AGENT_TOKEN_ENV: &str = "AI_MEMORY_AUTH_TOKEN";
+
 #[derive(Clone, Copy)]
 enum JsonMcpLocation {
     RootMcpServers,
@@ -136,6 +140,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::Zed => render_zed(&args)?,
         McpClient::Muse => render_muse(&args)?,
         McpClient::Dsh => render_dsh(&args)?,
+        McpClient::PrimeAgent => render_prime_agent(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -176,6 +181,9 @@ fn validate_args(args: &InstallMcpArgs) -> Result<()> {
     if matches!(args.client, McpClient::Dsh) {
         validate_dsh_server_name(&args.name)?;
     }
+    if matches!(args.client, McpClient::PrimeAgent) {
+        validate_prime_agent_server_name(&args.name)?;
+    }
     Ok(())
 }
 
@@ -190,6 +198,26 @@ fn validate_dsh_server_name(name: &str) -> Result<()> {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
     if !valid {
         bail!("DSH serverName must be 1-32 characters of [A-Za-z0-9_-]; got {name:?}");
+    }
+    Ok(())
+}
+
+/// Prime Agent resolves a user MCP server only when its name is 1-64
+/// characters of `[A-Za-z0-9_-]` starting with a letter or digit; any other
+/// name is never connected, so refuse it before writing the entry.
+fn validate_prime_agent_server_name(name: &str) -> Result<()> {
+    let valid = name.len() <= 64
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !valid {
+        bail!(
+            "Prime Agent MCP server names must be 1-64 characters of [A-Za-z0-9_-] starting with a letter or digit; got {name:?}"
+        );
     }
     Ok(())
 }
@@ -230,7 +258,8 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
 }
 
 /// [`mcp_config_path`] with the relocation variables (`CLAUDE_CONFIG_DIR`,
-/// `CODEX_HOME`, `COPILOT_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`, and OMP's
+/// `CODEX_HOME`, `COPILOT_HOME`, `GROK_HOME`, `KIMI_CODE_HOME`, `KIRO_HOME`,
+/// `PRIME_AGENT_CODING_AGENT_DIR`, and OMP's
 /// `OMP_PROFILE`, `PI_PROFILE`, `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR`) read
 /// through `env`,
 /// so `ai-memory run --env` can point auto-wire at the same config home
@@ -361,6 +390,13 @@ pub(crate) fn mcp_config_path_with(
         // $XDG_CONFIG_HOME for its skill roots, so --config-file covers
         // non-default XDG setups (same policy as Zero above).
         McpClient::Muse => home()?.join(".config").join("muse").join("settings.json"),
+        // Prime Agent's agent dir is $PRIME_AGENT_CODING_AGENT_DIR when set,
+        // else ~/.prime/agent; user MCP servers live in its settings.json
+        // (a project's `.prime/agent/settings.json` overrides it: pass that
+        // path via --config-file).
+        McpClient::PrimeAgent => {
+            prime_agent_dir_in(env("PRIME_AGENT_CODING_AGENT_DIR"))?.join("settings.json")
+        }
     })
 }
 
@@ -548,6 +584,19 @@ pub(crate) fn copilot_home_in(env_override: Option<std::ffi::OsString>) -> Resul
         .join(".copilot"))
 }
 
+/// Prime Agent's agent directory: `$PRIME_AGENT_CODING_AGENT_DIR` when set and
+/// not blank, otherwise `~/.prime/agent`. The override is injected to keep
+/// path tests process-local.
+fn prime_agent_dir_in(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
+        return Ok(dir);
+    }
+    Ok(home_dir()
+        .context("could not locate $HOME for Prime Agent configuration")?
+        .join(".prime")
+        .join("agent"))
+}
+
 /// Resolve Grok Build CLI's user configuration root. Grok honours
 /// `GROK_HOME`; otherwise it uses `~/.grok`.
 pub(crate) fn grok_home() -> Result<PathBuf> {
@@ -648,6 +697,11 @@ fn apply_to_config_file(args: &InstallMcpArgs) -> Result<()> {
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    if matches!(args.client, McpClient::PrimeAgent) && args.auth_token.is_some() {
+        println!(
+            "  Prime Agent reads the token from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch prime-agent."
+        );
+    }
     Ok(())
 }
 
@@ -702,7 +756,8 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::KiroCli
         | McpClient::CommandCode
         | McpClient::CopilotCli
-        | McpClient::Swival => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::Swival
+        | McpClient::PrimeAgent => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // V2 nests servers under `mcp.servers` — the same shape OpenClaw,
         // Zero, and ZCode use.
@@ -1262,6 +1317,21 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             }
             entry.insert("tools".into(), json!(["*"]));
         }
+        McpClient::PrimeAgent => {
+            // Prime Agent 0.10 counts a user HTTP server as connected, and
+            // names it to the model, only with an OAuth grant or a
+            // `bearerTokenEnvVar` whose variable is set; a literal
+            // `headers.Authorization` still dispatches but stays unlisted.
+            // So the token is referenced by variable, which also keeps it
+            // out of settings.json. The camelCase key is the one Prime
+            // Agent's loader reads (its own `mcp add` writes snake_case,
+            // which is ignored).
+            entry.insert("type".into(), json!("http"));
+            entry.insert("url".into(), json!(server_url));
+            if args.auth_token.is_some() {
+                entry.insert("bearerTokenEnvVar".into(), json!(PRIME_AGENT_TOKEN_ENV));
+            }
+        }
         _ => bail!("internal: build_mcp_entry called for unsupported client"),
     }
     Ok(serde_json::Value::Object(entry))
@@ -1726,6 +1796,39 @@ fn render_muse(args: &InstallMcpArgs) -> Result<String> {
          # \"required\", which aborts the whole run when the server is\n\
          # unreachable. Auth goes in the headers map.\n\
          {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
+fn render_prime_agent(args: &InstallMcpArgs) -> Result<String> {
+    let auth = if args.auth_token.is_some() {
+        format!(
+            "# The token is not written: the entry names ${PRIME_AGENT_TOKEN_ENV}\n\
+             # (bearerTokenEnvVar), so export it where you launch prime-agent.\n\
+             # Without it the server is disconnected and calls fail.\n"
+        )
+    } else {
+        format!(
+            "# Without a token Prime Agent 0.10 lists the server as not connected\n\
+             # and leaves it out of the model's MCP prompt, though\n\
+             # mcp.call_tool(\"{name}\", ...) still reaches it. Run the server\n\
+             # with {PRIME_AGENT_TOKEN_ENV} and pass --auth-token to list it.\n",
+            name = args.name,
+        )
+    };
+    Ok(format!(
+        "# Prime Agent - merge into $PRIME_AGENT_CODING_AGENT_DIR/settings.json\n\
+         # (default ~/.prime/agent/settings.json), or re-run with --apply to\n\
+         # merge it in place preserving other settings. A project's\n\
+         # .prime/agent/settings.json also works: pass it via --config-file.\n\
+         #\n\
+         {auth}\
+         #\n\
+         # The model calls tools from its Python REPL:\n\
+         #   await mcp.call_tool(\"{name}\", \"memory_query\", {{...}})\n\
+         # MCP-only: Prime Agent has no lifecycle hooks to capture sessions.\n\
+         {snippet}\n",
+        name = args.name,
         snippet = render_json_mcp_fragment(args)?,
     ))
 }
@@ -2534,6 +2637,11 @@ mod tests {
             (McpClient::KimiCode, "KIMI_CODE_HOME", "mcp.json"),
             (McpClient::KiroCli, "KIRO_HOME", "settings/mcp.json"),
             (McpClient::Omp, "PI_CODING_AGENT_DIR", "mcp.json"),
+            (
+                McpClient::PrimeAgent,
+                "PRIME_AGENT_CODING_AGENT_DIR",
+                "settings.json",
+            ),
         ] {
             let env = |name: &str| (name == var).then(|| root.as_os_str().to_owned());
             assert_eq!(
@@ -3028,6 +3136,7 @@ mod tests {
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
             McpClient::Dsh => render_dsh(&args).unwrap(),
+            McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
         }
     }
 
@@ -3103,6 +3212,7 @@ mod tests {
             McpClient::Zed,
             McpClient::Muse,
             McpClient::Dsh,
+            McpClient::PrimeAgent,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -3141,6 +3251,7 @@ mod tests {
             McpClient::Zed => render_zed(&args).unwrap(),
             McpClient::Muse => render_muse(&args).unwrap(),
             McpClient::Dsh => render_dsh(&args).unwrap(),
+            McpClient::PrimeAgent => render_prime_agent(&args).unwrap(),
         }
     }
 
@@ -3648,6 +3759,141 @@ mod tests {
             "Bearer test-token-deadbeef"
         );
         assert_eq!(ours["tools"], json!(["*"]));
+    }
+
+    /// Prime Agent 0.10 lists a user HTTP server to the model only when its
+    /// `bearerTokenEnvVar` is set, so a token is referenced by variable and
+    /// never written into settings.json.
+    #[test]
+    fn prime_agent_entry_names_the_token_variable_never_the_token() {
+        let fragment = render_json_mcp_fragment(&args_with_token(McpClient::PrimeAgent)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&fragment).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "mcpServers": {
+                    "ai-memory": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:49374/mcp",
+                        "bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"
+                    }
+                }
+            })
+        );
+
+        let rendered = render_prime_agent(&args_with_token(McpClient::PrimeAgent)).unwrap();
+        assert!(!rendered.contains("test-token-deadbeef"), "{rendered}");
+        assert!(rendered.contains("export it where you launch prime-agent"));
+        assert!(rendered.contains("~/.prime/agent/settings.json"));
+        assert!(rendered.contains(r#"await mcp.call_tool("ai-memory", "memory_query""#));
+    }
+
+    #[test]
+    fn prime_agent_entry_without_a_token_is_bare_http_and_says_it_is_unlisted() {
+        let entry = build_json_mcp_entry(&args_for(McpClient::PrimeAgent)).unwrap();
+        assert_eq!(
+            entry,
+            json!({"type": "http", "url": "http://127.0.0.1:49374/mcp"})
+        );
+        let rendered = render_prime_agent(&args_for(McpClient::PrimeAgent)).unwrap();
+        assert!(rendered.contains("not connected"), "{rendered}");
+        assert!(
+            !rendered.contains("export it where you launch"),
+            "{rendered}"
+        );
+    }
+
+    /// Prime Agent fronts several model vendors, so it has no default schema
+    /// flavor, but an explicit `--flavor` reaches the URL it lists tools from.
+    #[test]
+    fn prime_agent_entry_carries_an_explicit_flavor_only() {
+        let mut args = args_for(McpClient::PrimeAgent);
+        assert_eq!(
+            build_json_mcp_entry(&args).unwrap()["url"],
+            "http://127.0.0.1:49374/mcp"
+        );
+        args.flavor = Some(SchemaFlavor::Gemini);
+        assert_eq!(
+            build_json_mcp_entry(&args).unwrap()["url"],
+            "http://127.0.0.1:49374/mcp?flavor=gemini"
+        );
+    }
+
+    #[test]
+    fn prime_agent_apply_preserves_settings_and_siblings_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        fs::write(
+            &config_path,
+            r#"{"defaultModel":"glm","mcpServers":{"search":{"type":"http","url":"https://search.example/mcp","bearerTokenEnvVar":"SEARCH_TOKEN"}}}"#,
+        )
+        .unwrap();
+        let mut args = args_with_token(McpClient::PrimeAgent);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.config_file = Some(config_path.clone());
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(first, second);
+        assert!(!second.contains("test-token-deadbeef"), "{second}");
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(value["defaultModel"], "glm");
+        assert_eq!(
+            value["mcpServers"]["search"]["bearerTokenEnvVar"],
+            "SEARCH_TOKEN"
+        );
+        assert_eq!(
+            value["mcpServers"]["ai-memory"],
+            json!({
+                "type": "http",
+                "url": "https://memory.example/mcp",
+                "bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"
+            })
+        );
+    }
+
+    /// A name Prime Agent would never connect is refused before any write.
+    #[test]
+    fn prime_agent_rejects_server_names_it_cannot_resolve() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("settings.json");
+        for name in [
+            "",
+            "-memory",
+            "_memory",
+            "ai memory",
+            "ai.memory",
+            &"m".repeat(65),
+        ] {
+            let mut args = args_for(McpClient::PrimeAgent);
+            args.name = name.to_string();
+            args.config_file = Some(config_path.clone());
+            let error = apply_to_config_file(&args).unwrap_err();
+            assert!(
+                error.to_string().contains("Prime Agent MCP server names"),
+                "{name:?}: {error:#}"
+            );
+            assert!(!config_path.exists(), "{name:?} must not write the file");
+        }
+        for name in ["ai-memory", "memory_2", "M", &"m".repeat(64)] {
+            let mut args = args_for(McpClient::PrimeAgent);
+            args.name = name.to_string();
+            validate_args(&args).unwrap_or_else(|error| panic!("{name:?}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn prime_agent_dir_honours_env_override() {
+        assert_eq!(
+            prime_agent_dir_in(Some("/tmp/custom-prime-agent".into())).unwrap(),
+            PathBuf::from("/tmp/custom-prime-agent")
+        );
+        let default = home_dir().unwrap().join(".prime").join("agent");
+        assert_eq!(prime_agent_dir_in(Some("".into())).unwrap(), default);
+        assert_eq!(prime_agent_dir_in(None).unwrap(), default);
     }
 
     #[test]

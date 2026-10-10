@@ -1530,6 +1530,14 @@ fn infer_installed_mcp_config(
             &["mcp_servers", "ai-memory"],
             "url",
         )),
+        // MCP-only client: no AgentChoice counterpart routes here. Prime
+        // Agent 0.10 has no lifecycle hooks, and its entry names the token
+        // variable rather than carrying a bearer, so only the URL is there.
+        McpClient::PrimeAgent => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
     }
 }
 

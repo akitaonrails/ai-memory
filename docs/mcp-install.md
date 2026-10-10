@@ -152,7 +152,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse / dsh
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro-cli / command-code / swival / devin / zero / zcode / copilot-cli / vscode-copilot / zed / muse / dsh / prime-agent
 > ```
 
 ---
@@ -525,6 +525,76 @@ ai-memory does not install or manage the bridge, and it delivers only seven Clau
 `SessionEnd` are not delivered, and its `SessionStart` injection runs
 detached. Treat DSH as MCP-only here and recover handoffs explicitly with
 `memory_handoff_list` then `memory_handoff_accept` when continuity matters.
+
+---
+
+## Prime Agent
+
+**Status:** MCP supported. No lifecycle hooks or managed workstream claimed.
+
+[Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) reads user MCP
+servers from the `mcpServers` map of its agent dir's `settings.json`:
+`$PRIME_AGENT_CODING_AGENT_DIR/settings.json`, default
+`~/.prime/agent/settings.json`. A project's `.prime/agent/settings.json`
+overrides it; pass that path with `--config-file`.
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:49374/mcp",
+      "bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"
+    }
+  }
+}
+```
+
+```bash
+ai-memory install-mcp --client prime-agent --apply \
+  --server-url "http://homelab:49374/mcp" \
+  --auth-token "$TOKEN"
+export AI_MEMORY_AUTH_TOKEN="$TOKEN"   # in the shell you launch prime-agent from
+```
+
+How Prime Agent 0.10 treats the entry shapes the generated one:
+
+- **The token is referenced, not written.** Prime Agent counts a user HTTP
+  server as connected, and names it in the model's prompt
+  (`Enabled generic MCP servers: ai-memory`), only when the variable in
+  `bearerTokenEnvVar` is set or an OAuth grant exists. A literal
+  `headers.Authorization` still reaches the server but leaves it unlisted, so
+  `install-mcp` writes `"bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"` and the
+  token stays out of `settings.json`. If the variable is unset, Prime Agent
+  shows the server as disconnected and calls fail.
+- **Without a token** the entry is just `type` + `url`. Calls through
+  `mcp.call_tool("ai-memory", ...)` still work, but the server is not listed in
+  the prompt or shown as connected in `/mcp`. Run the server with
+  `AI_MEMORY_AUTH_TOKEN` and pass `--auth-token` to get it listed.
+- **Use the camelCase key.** Prime Agent 0.10.0's own
+  `prime-agent mcp add --bearer-token-env-var` writes `bearer_token_env_var`,
+  which its settings loader ignores. Use `install-mcp` or edit the file.
+
+Prime Agent does not expose MCP tools as native tools. The model calls them
+from its persistent Python REPL:
+`await mcp.list_tools("ai-memory")`, then
+`await mcp.call_tool("ai-memory", "memory_query", {...})`. Requests carry no
+session id or working directory, so Prime Agent is a static client: pass
+`workspace` and `project` on project-scoped calls (the routing snippet from
+`ai-memory install-instructions --target AGENTS.md` says so, and Prime Agent
+loads `AGENTS.md`).
+
+Prime Agent 0.10 is a Rust rewrite: the TypeScript extensions of its 0.9
+releases, which were built on Pi, are gone, and it has no lifecycle hook
+surface. Automatic capture and handoff
+injection are therefore not claimed, and `install-hooks --agent pi` does not
+apply. Ask the agent to call `memory_handoff_begin` before leaving and
+`memory_handoff_accept` when resuming.
+
+Verified against Prime Agent 0.10.0. Sources:
+<https://github.com/PrimeIntellect-ai/prime-agent> (`crates/pa-core/src/mcp/mod.rs`,
+`crates/pa-cli/src/mcp_command.rs`, `prime-agent-runtime/src/rlm/mcp.py`,
+`skills/mcp/SKILL.md`).
 
 ---
 

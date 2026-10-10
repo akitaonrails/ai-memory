@@ -144,6 +144,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Zed | MCP-only |
 | Muse Code | MCP-only |
 | DeepSeek Harness (DSH) | MCP-only |
+| Prime Agent | MCP-only |
 | Hermes Agent | Supported |
 | GrizzyBot | Supported |
 | LLM/auth providers | Supported |

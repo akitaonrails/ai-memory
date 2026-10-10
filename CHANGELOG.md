@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `install-mcp --client prime-agent` registers ai-memory with Prime Agent
+  (PrimeIntellect-ai/prime-agent), merging an HTTP entry into the `mcpServers`
+  map of `$PRIME_AGENT_CODING_AGENT_DIR/settings.json` (default
+  `~/.prime/agent/settings.json`) and preserving other settings and servers.
+  With a token the entry names `"bearerTokenEnvVar": "AI_MEMORY_AUTH_TOKEN"`
+  and the token is not written; Prime Agent 0.10 counts a user HTTP server as
+  connected, and lists it to the model, only with that variable set (or an
+  OAuth grant), so export it where you launch `prime-agent`. Without a token
+  the server is still callable through `mcp.call_tool("ai-memory", ...)` but is
+  not listed. MCP-only: Prime Agent 0.10 has no lifecycle hooks. (#1163)
 - `memory_write_page` accepts `expected_page_id` (write only if that is still
   the page's latest version) or `create_only` (write only if the page does not
   exist), and `memory_delete_page` accepts `expected_page_id`. A precondition
