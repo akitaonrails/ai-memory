@@ -22,6 +22,7 @@ mod admin_repair_session_times;
 mod admin_status_search;
 mod admin_write_page;
 mod agent_messages_briefing;
+mod agent_messages_scope;
 mod agent_messages_tools;
 mod autoscope_multiuser;
 mod dual_key_scope;

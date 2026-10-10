@@ -138,6 +138,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+- Fixed cross-project message tools acting on another project's mailbox. A
+  static MCP client (one that does not forward its lifecycle-hook session id,
+  such as Claude Code's MCP connection) that called `memory_message_pop`,
+  `memory_message_cancel` or `memory_message_send` without `workspace` and
+  `project` got whichever project published to the shared active-project slot
+  last, often one open in another harness: the pop claimed that project's
+  message, a cancel without an id cleared its whole outbox, and a send went out
+  under its name as the sender the recipient judges trust by. The three tools
+  now refuse a scope the server inferred, naming the project it would have used
+  and how, and change nothing; an explicit scope or a caller bound to its own
+  hook session proceeds. `memory_message_list` always reports `resolved_scope`,
+  `scope_source` and a hint when it inferred the project, and the SessionStart
+  inbox notice and `memory_briefing` (new `scope` field) name the inbox to pass.
+  (#1197)
 - Fixed a purged session coming back. `purge-session` leaves a tombstone so a
   late event cannot recreate the session, but live hook ingest creates its
   session row on a path that never checked it, so the next event for a purged

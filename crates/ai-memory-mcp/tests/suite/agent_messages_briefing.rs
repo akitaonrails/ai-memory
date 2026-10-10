@@ -108,6 +108,33 @@ async fn call(router: &Router, name: &str, arguments: Value) -> Value {
     serde_json::from_str(&joined).unwrap_or_else(|e| panic!("tool text not JSON: {joined}: {e}"))
 }
 
+/// Drive one `tools/call` that must fail, returning the JSON-RPC error message.
+async fn call_err(router: &Router, name: &str, arguments: Value) -> String {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments },
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(body.to_string()))
+        .expect("mcp req");
+    let resp = router.clone().oneshot(req).await.expect("oneshot");
+    let bytes = axum::body::to_bytes(resp.into_body(), 4_000_000)
+        .await
+        .expect("body");
+    let v: Value = serde_json::from_slice(&bytes).expect("JSON-RPC response");
+    v.pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{name} was expected to fail: {v}"))
+        .to_owned()
+}
+
 /// `memory_message_send` from `project-a` to `project-b`.
 async fn send_to_b(router: &Router, subject: &str, body: &str) {
     let sent = call(
@@ -207,84 +234,59 @@ async fn briefing_pending_message_count_tracks_the_recipient_inbox() {
 
 /// Regression for the field-reported dead-end (cross-project mail on the
 /// homeserver): the on-start notice / `memory_briefing` counts one project's
-/// inbox, but a *no-scope* `memory_message_pop` resolves the shared
-/// active-project slot to a DIFFERENT project whose inbox is empty, and used to
-/// return a bare `{"message": null}` — "you have mail" followed by an empty
-/// fetch, with no way to tell they were looking at the wrong inbox.
-///
-/// The mail must stay put (the mis-scoped pop consumes nothing), the empty
-/// result must NAME the inbox it actually resolved and how it was inferred, and
-/// an explicit-scope pop must still deliver.
+/// inbox, but a *no-scope* `memory_message_pop` resolved a DIFFERENT project
+/// from the server's guess — an empty inbox gave a bare null, and a non-empty
+/// one would have been claimed. The briefing names the scope it counted, and a
+/// pop whose inbox would be guessed is refused naming that guess, consuming
+/// nothing; the explicit-scope pop the briefing points at still delivers.
 #[tokio::test]
-async fn no_scope_pop_that_misses_the_mail_is_diagnosed_not_a_silent_null() {
+async fn no_scope_pop_is_refused_and_the_briefing_names_the_inbox_to_pop() {
     let h = harness().await;
 
-    // Mail lands in project-b's inbox; the notice/briefing for B reports it.
     send_to_b(&h.router, "export", "please add the /v1/export endpoint").await;
+    let brief = call(
+        &h.router,
+        "memory_briefing",
+        json!({ "workspace": WS, "project": B }),
+    )
+    .await;
+    assert_eq!(brief["pending_message_count"], 1);
+    assert_eq!(
+        brief["scope"],
+        json!({ "workspace": WS, "project": B, "resolved_by": "explicit" }),
+        "the briefing must name the inbox its count is for: {brief}",
+    );
+
+    // A no-scope pop resolves the baked default (project-a): a guess, refused.
+    let refused = call_err(&h.router, "memory_message_pop", json!({})).await;
+    assert!(
+        refused.contains("refusing to pop from default/project-a")
+            && refused.contains("resolved by default"),
+        "the refusal must name the inbox it would have used and how: {refused}",
+    );
     assert_eq!(pending_count(&h.router, B).await, 1);
 
-    // A no-scope pop resolves the baked "current project" (project-a), whose
-    // inbox is empty. It must not be a bare null: it names the resolved scope
-    // and flags that the scope was inferred, not stated.
-    let missed = call(&h.router, "memory_message_pop", json!({})).await;
-    assert!(
-        missed["message"].is_null(),
-        "the wrong (inferred) inbox has no mail: {missed}",
-    );
-    assert_eq!(
-        missed["resolved_scope"]["project"].as_str(),
-        Some(A),
-        "an empty inferred-scope pop must name the inbox it resolved: {missed}",
-    );
-    let src = missed["scope_source"].as_str().unwrap_or_default();
-    assert!(
-        !src.is_empty() && src != "explicit" && src != "session",
-        "the miss must report an inferred (non-explicit, non-session) scope source, got {src:?}: {missed}",
-    );
-    assert!(
-        missed["hint"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("explicit"),
-        "the hint must steer the caller to re-run with explicit scope: {missed}",
-    );
-
-    // The mis-scoped pop consumed nothing: B still has its message.
-    assert_eq!(
-        pending_count(&h.router, B).await,
-        1,
-        "a pop that resolved the wrong inbox must not consume B's mail",
-    );
-
-    // Popping with explicit scope delivers it.
+    // Popping with the scope the briefing named delivers it.
     let got = call(
         &h.router,
         "memory_message_pop",
-        json!({ "workspace": WS, "project": B }),
+        json!({ "workspace": brief["scope"]["workspace"], "project": brief["scope"]["project"] }),
     )
     .await;
     assert_eq!(
         got["message"]["body"], "please add the /v1/export endpoint",
         "an explicit-scope pop of B delivers the message: {got}",
     );
-    assert!(
-        got.get("hint").is_none(),
-        "a successful pop carries no scope hint: {got}",
-    );
     assert_eq!(pending_count(&h.router, B).await, 0);
 
-    // An EXPLICIT pop of an empty inbox is unambiguous — no hint.
+    // An EXPLICIT pop of an empty inbox is unambiguous: a plain null.
     let empty_explicit = call(
         &h.router,
         "memory_message_pop",
         json!({ "workspace": WS, "project": C }),
     )
     .await;
-    assert!(empty_explicit["message"].is_null());
-    assert!(
-        empty_explicit.get("hint").is_none(),
-        "an explicitly-scoped empty pop is not ambiguous and must not add a hint: {empty_explicit}",
-    );
+    assert_eq!(empty_explicit, json!({ "message": null }));
 }
 
 /// The same divergence via `memory_message_list`: a no-scope inbox listing that
