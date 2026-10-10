@@ -805,6 +805,7 @@ mod tests {
                     ),
                     base_url: Some(base),
                     compat_strict: false,
+                    compat_disable_thinking: false,
                     request_timeout_secs: 5,
                     reasoning_effort: Some(ReasoningEffort::High),
                     extra_headers: ExtraHeaders::parse(["x-test: routed"]).unwrap(),

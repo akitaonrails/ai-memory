@@ -78,7 +78,9 @@ say nothing. A brand-new repository gets the whole baseline, plus a pointer to
   forget tools/pnpm.md` (it stays dropped until you say it again).
 - Keep a client project out of it: `[profile] contribute = false` in that
   repository's `.ai-memory.toml`; keep the digest out of one: `consume = false`.
-- Scope an entry to a stack with frontmatter `applies_to: [rust]`.
+- Scope an entry to a stack with `applies_to: ["rust"]` on `memory_write_page`
+  (`--applies-to rust` on `write-page`), or mark it `enforced_by` to keep it
+  out of the digest.
 - On by default for a single user (one profile across every workspace). On a
   shared server it is off until the operator sets `[profile] enabled = true`,
   and then each person gets a private profile.
@@ -136,10 +138,53 @@ ai-memory-wikisync export ...same args... --apply   # writes; prints the git com
 
 Everything is opt-in and fail-safe: the family allowlist must be explicit
 (`*` is refused), files edited locally since the last export are reported
-with a diff summary and refused without `--force`, nothing is ever deleted
-(that is a later slice), no frontmatter is forged, and the tool never runs
-git itself. Slice 1 is read-only export; bidirectional sync, deletes and
-conflict handling are tracked in #986.
+with a diff summary and refused without `--force`, no frontmatter is forged,
+and the tool never runs git itself. `sync` sends reviewed repository edits
+back through MCP (each write conditional on the version it planned against;
+needs ai-memory 2.7+), and deletes travel only with `--propagate-deletes`.
+
+### Keep it in step after merges and in CI
+
+`install-hook` writes a git `post-merge` hook that runs `sync` after every
+merge or pull — a dry-run report by default, `--on-merge apply` to write. It
+never stores a token (the hook reads `AI_MEMORY_AUTH_TOKEN` when it runs) and
+never passes `--prefer`, so conflicts still wait for a person:
+
+```bash
+ai-memory-wikisync install-hook --workspace demo --project app \
+    --dest docs/wiki --include _rules --include decisions
+ai-memory-wikisync uninstall-hook --dest docs/wiki   # removes only its block
+```
+
+In CI, `sync --check` writes nothing and exits `0` in sync, `3` when the
+repository and the server differ, and `4` on conflicts or refusals. A CI
+checkout has no sync state, so it compares the repository with the server
+directly. A GitHub Actions job that flags drift on wiki pull requests:
+
+```yaml
+name: team-wiki
+on:
+  pull_request:
+    paths: ["docs/wiki/**"]
+jobs:
+  wiki-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install --locked --git https://github.com/akitaonrails/ai-memory ai-memory-wikisync
+      - name: Compare docs/wiki with the team's ai-memory server
+        env:
+          AI_MEMORY_SERVER_URL: ${{ secrets.AI_MEMORY_SERVER_URL }}
+          AI_MEMORY_AUTH_TOKEN: ${{ secrets.AI_MEMORY_AUTH_TOKEN }}
+        run: |
+          ai-memory-wikisync sync --check \
+            --workspace demo --project app --dest docs/wiki \
+            --include _rules --include decisions
+```
+
+The server must be reachable from the runner (`serve --enable-api` behind a
+token). To tolerate drift and fail only on refusals, end the command with
+`|| [ $? -eq 3 ]`.
 
 ## Recipe: control what gets kept, aged, or consolidated
 
@@ -387,6 +432,7 @@ ai-memory resume --search auth       # pick a matching workstream in this checko
 ai-memory resume --all               # pick from every linked checkout on this machine
 ai-memory workstreams                # list this checkout's managed workstreams
 ai-memory status                     # counts, paths, health
+ai-memory recover                    # replay outage spool/transcripts safely
 ai-memory list-projects              # every workspace/project the server knows about
 ai-memory doctor                     # is every harness that ran here captured?
 ai-memory backfill                   # import prior local history into an empty store
@@ -406,9 +452,23 @@ ai-memory serve                      # run the server
   automatically when the server returns), an existing MCP registration
   degrades to no-recall for the session, and the child's exit code is
   returned. What you lose for that run is the workstream lease/context,
-  transcript import, and handoff delivery; sessions resume only through an
-  explicit native selector because no lease means no mutual exclusion. See
-  [Degraded offline
+  immediate transcript import, and handoff delivery; sessions resume only
+  through an explicit native selector because no lease means no mutual
+  exclusion. An explicit resume is journaled with its exact pre-launch native
+  cursor and recovery imports only the appended delta; a cursor that cannot be
+  proven requires manual repair. A fresh run is journaled only when one new
+  native session can be correlated; ambiguity prints a manual backfill action.
+  Once the server returns, run `ai-memory recover`: for transcript-capable
+  harnesses it quarantines correlated spool entries, drains unrelated events,
+  and replays the bounded exact transcript through sanitized `/hook/batch`;
+  Antigravity has no supported transcript exporter, so its degraded run is
+  journaled as spool-only and clears only after correlated hook evidence has a
+  durable-delivery confirmation; recovery never calls its exporter. Empty or
+  previously correlated-loss spool state stays journaled for manual repair. Owner-authorized recovery
+  finishes an expired original managed run only when it was not superseded. A full journal refuses
+  new entries instead of evicting old work, and dropped spool events make the
+  command fail while retaining every journal entry for a later clean pass.
+  Re-running is safe. See [Degraded offline
   launches](managed-workstreams.md#degraded-offline-launches). To fail instead
   of degrading, pass `--require-server` (or set `run.require_server = true` /
   `AI_MEMORY_RUN_REQUIRE_SERVER=true`). For a planned outage, consider
@@ -443,6 +503,13 @@ ai-memory serve                      # run the server
   and is not reported. An `excluded` verdict applies only to native/generated
   hooks; shell and PowerShell compatibility hooks do not enforce capture-policy
   exclusions.
+- **Nothing new is being remembered at all**: run `ai-memory doctor`. It works
+  with the server down and says so; it reports the local hook spool (events
+  waiting for the server, and a warning once it is full and each new event
+  evicts the oldest undelivered one); and when ai-memory's Codex hooks are
+  installed, it asks Codex whether it will run them. Codex skips a hook you
+  have not trusted, and skips it again after its command changes, without
+  telling you: open Codex, run `/hooks`, and trust them.
 - **I just installed hooks in a project I've worked in for a while**: the first
   time you open the project after installing, ai-memory imports your existing
   local session history once (bounded, sanitized on the server, only into an

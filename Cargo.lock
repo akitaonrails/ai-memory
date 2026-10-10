@@ -57,6 +57,7 @@ dependencies = [
  "fs2",
  "jiff",
  "jsonc-parser",
+ "libc",
  "reqwest 0.12.28",
  "rmcp",
  "rstest",

@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ai_memory_core::routing_skills::{
-    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, DEVIN_SKILL_DIR, GROK_SKILL_DIR, HERMES_SKILL_DIR,
-    MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill, SKILLS_DIR,
+    AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
+    GROK_SKILL_DIR, HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill, SKILLS_DIR,
 };
 use anyhow::{Context, Result, bail};
 
@@ -89,17 +89,22 @@ fn resolve_target_roots_from_env(args: &InstallSkillsArgs) -> Result<Vec<TargetR
     let cwd = std::env::current_dir().context("getting CWD for install-skills target")?;
     let home = home_dir();
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-    let grok_home = (args.scope == InstallSkillsScope::Global
-        && args.agent == InstallSkillsAgent::Grok)
-        .then(install_mcp::grok_home)
-        .transpose()?;
+    // Grok and Copilot CLI relocate their whole config home, global skills
+    // included, through GROK_HOME / COPILOT_HOME.
+    let agent_home = match (args.scope, args.agent) {
+        (InstallSkillsScope::Global, InstallSkillsAgent::Grok) => Some(install_mcp::grok_home()?),
+        (InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli) => Some(
+            install_mcp::copilot_home_in(std::env::var_os("COPILOT_HOME"))?,
+        ),
+        _ => None,
+    };
     let claude_config_dir = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
     resolve_target_roots_for_platform(
         args,
         &cwd,
         home.as_deref(),
         appdata.as_deref(),
-        grok_home.as_deref(),
+        agent_home.as_deref(),
         claude_config_dir.as_deref(),
         SkillHostPlatform::current(),
     )
@@ -119,7 +124,7 @@ fn resolve_target_roots_for_platform(
     cwd: &Path,
     home: Option<&Path>,
     appdata: Option<&Path>,
-    grok_home: Option<&Path>,
+    agent_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
     platform: SkillHostPlatform,
 ) -> Result<Vec<TargetRoot>> {
@@ -135,7 +140,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -147,7 +152,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -159,7 +164,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -171,7 +176,19 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
+                claude_config_dir,
+                platform,
+            )?]
+        }
+        InstallSkillsAgent::CopilotCli => {
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::CopilotCli,
+                cwd,
+                home,
+                appdata,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -183,7 +200,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?]
@@ -195,7 +212,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?,
@@ -205,7 +222,7 @@ fn resolve_target_roots_for_platform(
                 cwd,
                 home,
                 appdata,
-                grok_home,
+                agent_home,
                 claude_config_dir,
                 platform,
             )?,
@@ -237,6 +254,7 @@ enum SkillRootKind {
     Agents,
     Devin,
     Grok,
+    CopilotCli,
     Hermes,
 }
 
@@ -247,7 +265,7 @@ fn agent_root(
     cwd: &Path,
     home: Option<&Path>,
     appdata: Option<&Path>,
-    grok_home: Option<&Path>,
+    agent_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
     platform: SkillHostPlatform,
 ) -> Result<PathBuf> {
@@ -261,10 +279,10 @@ fn agent_root(
     }
 
     if scope == InstallSkillsScope::Global
-        && kind == SkillRootKind::Grok
-        && let Some(grok_home) = grok_home
+        && matches!(kind, SkillRootKind::Grok | SkillRootKind::CopilotCli)
+        && let Some(agent_home) = agent_home
     {
-        return Ok(grok_home.join(SKILLS_DIR));
+        return Ok(agent_home.join(SKILLS_DIR));
     }
 
     // Claude Code relocates its whole config dir under $CLAUDE_CONFIG_DIR;
@@ -288,6 +306,12 @@ fn agent_root(
         SkillRootKind::Agents => AGENTS_SKILL_DIR,
         SkillRootKind::Devin => DEVIN_SKILL_DIR,
         SkillRootKind::Grok => GROK_SKILL_DIR,
+        // Copilot CLI reads project skills from the repository's `.github`
+        // and personal skills from `~/.copilot`.
+        SkillRootKind::CopilotCli => match scope {
+            InstallSkillsScope::Project => GITHUB_SKILL_DIR,
+            InstallSkillsScope::Global => COPILOT_SKILL_DIR,
+        },
         SkillRootKind::Hermes => HERMES_SKILL_DIR,
     };
     Ok(base.join(agent_dir).join(SKILLS_DIR))
@@ -544,6 +568,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(root_names(&roots), ["/custom/grok/skills"]);
+    }
+
+    #[test]
+    fn copilot_cli_skill_roots_split_project_github_and_global_copilot_home() {
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+        let project = resolve_target_roots(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::CopilotCli),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&project), ["/repo/.github/skills"]);
+
+        let global = resolve_target_roots(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&global), ["/home/alice/.copilot/skills"]);
+
+        let relocated = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli),
+            cwd,
+            Some(home),
+            None,
+            Some(Path::new("/custom/copilot")),
+            None,
+            SkillHostPlatform::Other,
+        )
+        .unwrap();
+        assert_eq!(root_names(&relocated), ["/custom/copilot/skills"]);
+
+        // COPILOT_HOME never moves project skills out of the repository.
+        let project_relocated = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::CopilotCli),
+            cwd,
+            Some(home),
+            None,
+            Some(Path::new("/custom/copilot")),
+            None,
+            SkillHostPlatform::Other,
+        )
+        .unwrap();
+        assert_eq!(root_names(&project_relocated), ["/repo/.github/skills"]);
     }
 
     #[test]

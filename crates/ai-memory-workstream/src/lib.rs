@@ -6,7 +6,7 @@ mod repository;
 mod transcript;
 
 pub use harness::{
-    LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness, OpenCodeDialect,
+    LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness, OpenCodeDialect, TranscriptCapability,
     allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_launch_plan,
     build_launch_plan_with_env, build_launch_plan_with_env_lookup, clean_path, crush_data_dir,
     crush_global_config_path, env_dir_override, has_native_session_selector,
@@ -27,8 +27,8 @@ pub use repository::{
 pub use transcript::{
     AmbiguousNativeSession, ClaudeContinuation, ExportedTranscript, NativeSessionCandidate,
     claude_continued_session, claude_live_background_attach_id, claude_session_ran_in_background,
-    discover_native_session, export_transcript, kiro_harness_from_source_cursor,
-    kiro_v3_resume_uses_default_store, list_native_sessions, native_memory_dir,
-    native_session_exists, native_session_in_checkout, native_store_root,
-    wait_for_transcript_flush,
+    discover_native_session, export_transcript, export_transcript_delta, export_transcript_range,
+    kiro_harness_from_source_cursor, kiro_v3_resume_uses_default_store, list_native_sessions,
+    native_memory_dir, native_session_exists, native_session_in_checkout, native_store_root,
+    transcript_baseline, transcript_interval_digests, wait_for_transcript_flush,
 };

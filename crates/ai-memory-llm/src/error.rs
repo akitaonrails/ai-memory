@@ -31,6 +31,32 @@ pub enum LlmError {
     #[error("unexpected response shape: {0}")]
     UnexpectedShape(String),
 
+    /// Structured response stopped at the provider's token budget
+    /// (`finish_reason = "length"`): the engine ran out of output budget
+    /// before finishing the JSON. Terminal — a retry reproduces the same
+    /// truncation and doubles the spend. Carries only the configured
+    /// model label and the provider-reported completion token count —
+    /// never response content, prompt text, or secrets.
+    #[error(
+        "structured response truncated at token budget (finish_reason=length) for model {model}"
+    )]
+    TruncatedResponse {
+        /// Configured model label.
+        model: String,
+        /// `usage.completion_tokens` when the provider reported it.
+        completion_tokens: Option<u32>,
+    },
+
+    /// Structured request got HTTP 2xx but no usable message content
+    /// (`message.content` missing, empty, or whitespace-only). Terminal
+    /// and distinct from [`Self::TruncatedResponse`] and from a JSON
+    /// parse error: nothing was produced to parse.
+    #[error("provider returned no message content for model {model}")]
+    EmptyContent {
+        /// Configured model label.
+        model: String,
+    },
+
     /// Configured provider lacks the env var we need.
     #[error("provider not configured: {0}")]
     NotConfigured(String),
@@ -97,6 +123,8 @@ impl LlmError {
             Self::Provider { .. } => "provider",
             Self::Serde(_) => "serde",
             Self::UnexpectedShape(_) => "unexpected-shape",
+            Self::TruncatedResponse { .. } => "truncated-response",
+            Self::EmptyContent { .. } => "empty-content",
             Self::NotConfigured(_) => "not-configured",
             Self::Auth(_) => "auth",
             Self::Schema(_) => "schema",
@@ -156,6 +184,43 @@ mod tests {
         assert!(!LlmError::NotConfigured("no key".into()).is_transient());
     }
 
+    // A `length` stop or an empty 2xx is a definitive answer about this
+    // response: it is not transient, and the error must carry no response
+    // content in its message.
+    #[test]
+    fn truncated_and_empty_content_are_terminal_and_content_free() {
+        let truncated = LlmError::TruncatedResponse {
+            model: "qwen3.8-27b".into(),
+            completion_tokens: Some(4096),
+        };
+        assert_eq!(truncated.class(), "truncated-response");
+        assert!(!truncated.is_transient());
+        assert_eq!(truncated.http_status(), None);
+        let rendered = truncated.to_string();
+        assert!(rendered.contains("finish_reason=length"), "{rendered}");
+        assert!(rendered.contains("qwen3.8-27b"), "{rendered}");
+
+        let empty = LlmError::EmptyContent {
+            model: "qwen3.8-27b".into(),
+        };
+        assert_eq!(empty.class(), "empty-content");
+        assert!(!empty.is_transient());
+        assert_eq!(empty.http_status(), None);
+    }
+
+    #[test]
+    fn truncated_response_message_carries_no_content() {
+        let err = LlmError::TruncatedResponse {
+            model: "qwen3.8-27b".into(),
+            completion_tokens: None,
+        };
+        let rendered = err.to_string();
+        // Only the class, the wire fact, and the operator's own model
+        // label may appear — never the (truncated) completion text.
+        assert!(!rendered.contains('{'), "{rendered}");
+        assert_eq!(rendered.matches('"').count(), 0, "{rendered}");
+    }
+
     #[test]
     fn all_candidates_failed_is_not_transient() {
         // The aggregate error is terminal: nothing is left to advance to.
@@ -195,6 +260,17 @@ mod tests {
             (
                 LlmError::UnexpectedShape("no tool block".into()),
                 "unexpected-shape",
+            ),
+            (
+                LlmError::TruncatedResponse {
+                    model: "qwen3.8-27b".into(),
+                    completion_tokens: Some(4096),
+                },
+                "truncated-response",
+            ),
+            (
+                LlmError::EmptyContent { model: "m".into() },
+                "empty-content",
             ),
             (LlmError::NotConfigured("no key".into()), "not-configured"),
             (LlmError::Auth("expired".into()), "auth"),

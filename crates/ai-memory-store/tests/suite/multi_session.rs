@@ -22,8 +22,8 @@ use ai_memory_core::{
     owner_stamp,
 };
 use ai_memory_store::{
-    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun, Store, StoreError,
-    WorkstreamSelection,
+    ConditionalUpsert, LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PagePrecondition,
+    PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
 };
 
 fn operator(name: &str) -> String {
@@ -85,6 +85,103 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
         entities: Vec::new(),
         evidence: Vec::new(),
     }
+}
+
+/// #986 slice 2 under invariant #16: two harnesses edit one page from the
+/// same version with a precondition. Exactly one wins; the loser writes
+/// nothing, and the version both started from stays reachable as superseded.
+/// Without the in-transaction check both would supersede it and the first
+/// winner's text would be buried under the second.
+#[tokio::test]
+async fn conditional_writers_on_one_base_exactly_one_wins_and_nothing_is_destroyed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "shared", None)
+        .await
+        .unwrap();
+    let base = store
+        .writer
+        .upsert_page(page(ws, proj, "notes/plan.md", "Plan", "# Plan\n\nbase"))
+        .await
+        .unwrap();
+
+    let (a, b) = tokio::join!(
+        store.writer.upsert_page_if(
+            page(
+                ws,
+                proj,
+                "notes/plan.md",
+                "Plan",
+                "# Plan\n\nfrom harness A"
+            ),
+            PagePrecondition::Latest(base),
+        ),
+        store.writer.upsert_page_if(
+            page(
+                ws,
+                proj,
+                "notes/plan.md",
+                "Plan",
+                "# Plan\n\nfrom harness B"
+            ),
+            PagePrecondition::Latest(base),
+        ),
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    let winners: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            ConditionalUpsert::Upserted(id) => Some(*id),
+            ConditionalUpsert::Mismatch { .. } => None,
+        })
+        .collect();
+    assert_eq!(winners.len(), 1, "{outcomes:?}");
+    assert!(
+        outcomes.contains(&ConditionalUpsert::Mismatch {
+            current: Some(winners[0])
+        }),
+        "the loser is told the winner's version: {outcomes:?}"
+    );
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let rows: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT body, is_latest FROM pages WHERE path = 'notes/plan.md' ORDER BY created_at",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "base plus one winner, no loser row: {rows:?}"
+    );
+    assert_eq!((rows[0].0.as_str(), rows[0].1), ("# Plan\n\nbase", 0));
+    assert_eq!(rows[1].1, 1);
+
+    // A precondition naming no page, against an existing page, writes nothing.
+    assert_eq!(
+        store
+            .writer
+            .upsert_page_if(
+                page(ws, proj, "notes/plan.md", "Plan", "# Plan\n\nfresh"),
+                PagePrecondition::Absent,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpsert::Mismatch {
+            current: Some(winners[0])
+        }
+    );
 }
 
 /// #1033 under invariant #16: two operators on two clones of one repository,
@@ -1582,6 +1679,37 @@ async fn owner_finish_store_refuses_another_writer_including_finished_retry() {
     assert_eq!(retry.imported_events, 0);
     assert_eq!(retry.latest_sequence, result.latest_sequence);
     assert_eq!(finish_snapshot(&f.store).await, before);
+    for mutate in ["event-id", "content", "cursor", "exit-code"] {
+        let mut changed = finish_input(run.run_id);
+        match mutate {
+            "event-id" => changed.events[0].event_id = "losing-event".into(),
+            "content" => changed.events[0].content = "losing payload".into(),
+            "cursor" => changed.source_cursor = Some("uncommitted-cursor".into()),
+            "exit-code" => changed.exit_code = Some(9),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                f.store
+                    .writer
+                    .recover_expired_workstream_run(f.alice(), changed)
+                    .await,
+                Err(StoreError::InvalidState(_))
+            ),
+            "finished recovery must reject changed {mutate}"
+        );
+        assert_eq!(finish_snapshot(&f.store).await, before);
+    }
+    assert_eq!(
+        f.store
+            .writer
+            .recover_expired_workstream_run(f.alice(), finish_input(run.run_id))
+            .await
+            .unwrap()
+            .imported_events,
+        0,
+        "an exact owner retry remains idempotent"
+    );
     for (name, auth) in [
         (
             "root-shared",
@@ -1947,7 +2075,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
         .authorize_managed_run(run.run_id, anonymous.clone())
         .await
         .unwrap();
-    store
+    let owner_user = store
         .writer
         .create_human_user(
             NewUser {
@@ -2038,6 +2166,92 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
         0
     );
     assert_eq!(finish_snapshot(&store).await, before);
+    // Explicit recovery admits the original owner only when no newer run exists.
+    store
+        .writer
+        .grant_memory(
+            owner_user,
+            project,
+            ai_memory_store::GrantLevel::Write,
+            None,
+        )
+        .await
+        .unwrap();
+    let recoverable = store
+        .writer
+        .prepare_workstream_run_owned(
+            PrepareWorkstreamRun {
+                workspace_id: ws,
+                project_id: project,
+                repo_fingerprint: "recoverable".into(),
+                worktree_fingerprint: "recoverable".into(),
+                cwd: "/repo".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::New("recoverable".into()),
+                lease_owner: "reload".into(),
+            },
+            Some("user:new-user".into()),
+        )
+        .await
+        .unwrap();
+    store
+        .writer
+        .cancel_managed_run(recoverable.run_id)
+        .await
+        .unwrap();
+    let foreign_user = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "foreign-recovery".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .writer
+        .grant_memory(
+            foreign_user,
+            project,
+            ai_memory_store::GrantLevel::Write,
+            None,
+        )
+        .await
+        .unwrap();
+    let foreign = finish_authority(
+        ai_memory_core::AuthLevel::User,
+        Some(foreign_user),
+        Some("foreign-recovery"),
+    );
+    assert!(matches!(
+        store
+            .writer
+            .recover_expired_workstream_run(foreign, finish_input(recoverable.run_id))
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    let owner = finish_authority(
+        ai_memory_core::AuthLevel::User,
+        Some(owner_user),
+        Some("new-user"),
+    );
+    assert_eq!(
+        store
+            .writer
+            .recover_expired_workstream_run(owner, finish_input(recoverable.run_id))
+            .await
+            .unwrap()
+            .imported_events,
+        1
+    );
+
     // Cancel and replacement both store the existing expired phase.
     for replaced in [false, true] {
         let old = store
@@ -2062,7 +2276,7 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
                 [old.run_id.as_bytes()],
             )
             .unwrap();
-            store
+            let replacement = store
                 .writer
                 .prepare_workstream_run(PrepareWorkstreamRun {
                     workspace_id: ws,
@@ -2078,6 +2292,11 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
                 })
                 .await
                 .unwrap();
+            conn.execute(
+                "UPDATE managed_runs SET started_at = 7 WHERE id IN (?1, ?2)",
+                rusqlite::params![old.run_id.as_bytes(), replacement.run_id.as_bytes()],
+            )
+            .unwrap();
         } else {
             store.writer.cancel_managed_run(old.run_id).await.unwrap();
         }
@@ -2089,7 +2308,29 @@ async fn owner_finish_store_topology_reload_and_phase_controls() {
                 .await,
             Err(StoreError::InvalidState(_))
         ));
-        assert_eq!(finish_snapshot(&store).await, before);
+        if replaced {
+            assert!(matches!(
+                store
+                    .writer
+                    .recover_expired_workstream_run(root.clone(), finish_input(old.run_id))
+                    .await,
+                Err(StoreError::InvalidState(_))
+            ));
+        } else {
+            assert_eq!(
+                store
+                    .writer
+                    .recover_expired_workstream_run(root.clone(), finish_input(old.run_id))
+                    .await
+                    .unwrap()
+                    .imported_events,
+                0,
+                "the unsuperseded expired run is recoverable and stable event ids remain idempotent"
+            );
+        }
+        if replaced {
+            assert_eq!(finish_snapshot(&store).await, before);
+        }
     }
     let before = finish_snapshot(&store).await;
     assert!(matches!(

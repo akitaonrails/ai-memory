@@ -38,12 +38,27 @@ pub struct PageSummary {
 }
 
 /// The canonical single-page projection. Only the fields this tool
-/// transports are decoded; everything else the server returns is ignored
-/// rather than stored, and nothing is forged locally.
+/// transports, or checks before an import, are decoded; everything else the
+/// server returns is ignored rather than stored, and nothing is forged
+/// locally.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiPage {
+    /// Latest version id, the token a conditional MCP write or delete
+    /// passes back. Servers older than 2.7 do not send it.
+    #[serde(default)]
+    pub id: Option<String>,
     pub path: String,
     pub body_markdown: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub tier: String,
+    #[serde(default)]
+    pub pinned: bool,
+    /// The page's parsed frontmatter: `tags` live here, and so does any
+    /// metadata an import would clear.
+    #[serde(default)]
+    pub frontmatter: serde_json::Value,
 }
 
 /// Result of one page read: the body on `200`, or `None` on `304 Not
@@ -145,24 +160,7 @@ impl ApiClient {
             .send()
             .await
             .map_err(|e| anyhow!("request to {} failed: {e}", url.as_str()))?;
-        match response.status() {
-            StatusCode::OK | StatusCode::NOT_MODIFIED => Ok(response),
-            StatusCode::UNAUTHORIZED => bail!(
-                "GET {} returned 401 Unauthorized — the server requires a bearer token \
-                 (pass --token or set AI_MEMORY_AUTH_TOKEN)",
-                url.as_str()
-            ),
-            StatusCode::FORBIDDEN => bail!(
-                "GET {} returned 403 Forbidden — the token was rejected, the caller lacks \
-                 access to this scope, or the server's host allowlist refused the request",
-                url.as_str()
-            ),
-            StatusCode::NOT_FOUND => bail!(
-                "GET {} returned 404 Not Found — {not_found_hint}",
-                url.as_str()
-            ),
-            status => bail!("GET {} returned unexpected status {status}", url.as_str()),
-        }
+        check_status(response, url, not_found_hint)
     }
 
     /// List the project's latest pages via incremental `recent` paging from
@@ -289,6 +287,31 @@ impl ApiClient {
             }
         }
         Ok(url)
+    }
+}
+
+fn check_status(
+    response: reqwest::Response,
+    url: &Url,
+    not_found_hint: &str,
+) -> Result<reqwest::Response> {
+    match response.status() {
+        StatusCode::OK | StatusCode::NOT_MODIFIED => Ok(response),
+        StatusCode::UNAUTHORIZED => bail!(
+            "GET {} returned 401 Unauthorized — the server requires a bearer token \
+             (pass --token or set AI_MEMORY_AUTH_TOKEN)",
+            url.as_str()
+        ),
+        StatusCode::FORBIDDEN => bail!(
+            "GET {} returned 403 Forbidden — the token was rejected, the caller lacks \
+             access to this scope, or the server's host allowlist refused the request",
+            url.as_str()
+        ),
+        StatusCode::NOT_FOUND => bail!(
+            "GET {} returned 404 Not Found — {not_found_hint}",
+            url.as_str()
+        ),
+        status => bail!("GET {} returned unexpected status {status}", url.as_str()),
     }
 }
 

@@ -38,6 +38,7 @@ Project-local targets:
 - `.claude/skills/<skill>/SKILL.md` for Claude-compatible installs.
 - `.agents/skills/<skill>/SKILL.md` for cross-client installs.
 - `.grok/skills/<skill>/SKILL.md` for Grok Build CLI installs.
+- `.github/skills/<skill>/SKILL.md` for GitHub Copilot CLI installs.
 
 Global targets:
 
@@ -45,11 +46,13 @@ Global targets:
 - `~/.agents/skills/<skill>/SKILL.md` for cross-client installs.
 - `$GROK_HOME/skills/<skill>/SKILL.md` for Grok Build CLI installs (default:
   `~/.grok/skills/<skill>/SKILL.md`).
+- `$COPILOT_HOME/skills/<skill>/SKILL.md` for GitHub Copilot CLI installs
+  (default: `~/.copilot/skills/<skill>/SKILL.md`).
 
 Use platform-aware path joining. Do not build paths by string concatenation.
 
 ## Refresh guidance
 
-For an agent-side refresh, call the install-routing tool (pass `compact: true` if the target file already uses the compact snippet or if managed Agent Skills handle detailed routing). Its returned `target_hints` are authoritative for skill roots: choose the right instruction filename from `agent_filenames`, write the markered block with the agent's file-edit tool, and write each managed skill file below the selected hint using its `relative_path`. Claude Code normally uses `CLAUDE.md` and `.claude/skills`; Codex, OpenCode, Cursor, Gemini CLI, and AGENTS-aware clients normally use `AGENTS.md` and `.agents/skills`; Grok Build CLI uses `AGENTS.md` and `.grok/skills` unless the project says otherwise.
+For an agent-side refresh, call the install-routing tool (pass `compact: true` if the target file already uses the compact snippet or if managed Agent Skills handle detailed routing). Its returned `target_hints` are authoritative for skill roots: choose the right instruction filename from `agent_filenames`, write the markered block with the agent's file-edit tool, and write each managed skill file below the selected hint using its `relative_path`. Claude Code normally uses `CLAUDE.md` and `.claude/skills`; Codex, OpenCode, Cursor, Gemini CLI, and AGENTS-aware clients normally use `AGENTS.md` and `.agents/skills`; Grok Build CLI uses `AGENTS.md` and `.grok/skills`; GitHub Copilot CLI uses `AGENTS.md` and `.github/skills` unless the project says otherwise.
 
 For a CLI refresh, prefer the canonical install command. The snippet and skills must be updated from the same core-owned assets so they do not drift.

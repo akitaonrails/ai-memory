@@ -236,9 +236,10 @@ fn emit_zero(args: &SetupAgentArgs) -> Result<()> {
     if args.auth_token.is_some() {
         println!("#       Treat hooks.json as sensitive (chmod 600).");
     }
-    println!("# NOTE: Zero discards sessionStart stdout, so this config captures");
-    println!("#       but does not inject handoffs; recover them via the MCP");
-    println!("#       `memory_handoff_accept` tool.");
+    print!(
+        "{}",
+        super::install_hooks::zero_install_notes("<ai-memory data dir>")
+    );
     println!();
     println!("{serialized}");
     Ok(())

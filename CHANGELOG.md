@@ -8,13 +8,175 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `memory_write_page` accepts `expected_page_id` (write only if that is still
+  the page's latest version) or `create_only` (write only if the page does not
+  exist), and `memory_delete_page` accepts `expected_page_id`. A precondition
+  that no longer holds fails with `reason: "precondition_failed"` and the
+  current version, and changes nothing. `memory_read_page` returns the version
+  as `page_id` and `/api/v1` pages as `id`. This is the compare-and-write the
+  team-wiki sync needed (#986).
+- The `ai-memory-wikisync` companion gained CI and post-merge integration
+  (#986, slice 5): `sync --check` writes nothing and exits 0 in sync, 3 on
+  drift and 4 on conflicts or refusals (a clone without sync state compares
+  the repository with the server directly), and `install-hook` /
+  `uninstall-hook` manage a marked git `post-merge` block that runs `sync`
+  after each merge — a dry-run report unless `--on-merge apply`, never with
+  `--prefer`, and never with a stored token. The cookbook has a GitHub
+  Actions recipe. (#986)
+- The `ai-memory-wikisync` companion now propagates deletes with
+  `sync --propagate-deletes` (#986, slice 4): a file deleted in the repository
+  deletes its server page through `memory_delete_page`, and a page deleted on
+  the server deletes its file, when the other side is unchanged since the last
+  sync. A delete against an edit is a conflict that `--prefer` resolves, more
+  than `--max-deletes` (default 10) refuses the run, and a pinned page is
+  deleted only with `--prefer repo`. Every sync write and delete now carries
+  the page version it was planned against, so a page changed during the run is
+  reported and left alone while the rest apply, and `sync --apply` refuses a
+  server older than 2.7. Without the flag deletes are still only reported.
+  (#986)
+- `ai-memory doctor` now reports three silent capture failures: an unreachable
+  server (reported instead of aborting the check), a hook spool that is full and
+  evicting undelivered events, and installed ai-memory Codex hooks that Codex
+  skips because they are untrusted or changed since they were trusted (asked
+  of Codex itself through `codex app-server`). `ai-memory status` no longer says
+  queued events will be delivered once the spool has started evicting them.
+- Added two-way sync to the `ai-memory-wikisync` companion (#986, slice 3):
+  `sync` imports repository edits and new pages through the public
+  `memory_write_page` MCP tool and exports server edits, comparing each
+  page with the last sync. A page changed on both sides is a conflict until
+  `--prefer repo` or `--prefer server`; deletes are reported, not synced.
+  It is a dry-run without `--apply`, refuses files without frontmatter,
+  refuses to overwrite server pages whose metadata a write would clear, and
+  re-reads each page right before writing it. (#1164)
+- `finalize-session --agent antigravity-cli` now replays the session's typed
+  prompts from `agy`'s `history.jsonl` before its synthetic session-end, so
+  live Antigravity sessions — whose hooks carry no prompt event — get a summary
+  page titled by the first prompt, a handoff with "Started/Last", and prompts
+  that `memory_query` and `memory_recent` can find. Only lines whose
+  conversation and workspace match the session are read; each prompt carries
+  the key `backfill` mints for it, so a repeated `--reopen` stores it once and a
+  prompt typed after the first finalize arrives with the next one. A checkout
+  the capture allowlist does not admit and `--all-owners` runs replay nothing,
+  and a missing `history.jsonl` only warns. (#1160)
+- `ai-memory run` accepts `copilot` (alias `copilot-cli`) and manages GitHub
+  Copilot CLI as a workstream harness: a fresh session gets a generated
+  `--session-id`, a returning one is resumed with `--resume=<id>`, user
+  selectors (`--resume`, `--continue`, `--session-id`, `--connect`) win,
+  utility subcommands pass through, and `--yolo` maps to Copilot's native
+  `--yolo`. Visible messages, tool calls and results, and compaction summaries
+  are imported read-only from `$COPILOT_HOME/session-state/<uuid>/events.jsonl`
+  (system prompts, hidden reasoning, hook output, and telemetry are excluded),
+  and the existing SessionStart hook delivers the workstream context. The
+  first managed launch auto-wires Copilot's hooks and MCP, and `doctor` now
+  counts its local sessions. Verified against Copilot CLI 1.0.92. (#1040)
+- GitHub Copilot CLI is now a first-class routing target:
+  `install-skills --agent copilot-cli` (and `install-instructions
+  --skills-agent copilot-cli`) writes the managed Agent Skills to the
+  repository's `.github/skills` or, globally, to `$COPILOT_HOME/skills`
+  (default `~/.copilot/skills`); `memory_install_self_routing` returns
+  `copilot_cli` filename and skill-root hints; the routing snippet, the
+  routing-install skill, and the MCP instructions name Copilot CLI with
+  `AGENTS.md`; and `uninstall` sweeps both Copilot roots, removing only
+  marker-bearing ai-memory skills. (#1040)
+- Added `ai-memory recover` and a bounded local recovery journal for server
+  outages. Offline managed launches now record only uniquely correlated native
+  session locators; recovery quarantines overlapping spool entries before exact
+  `/hook/batch` transcript replay, journals harnesses without transcript export
+  as spool-only without calling their exporter, retains bounded recovery dedup
+  keys with their sessions,
+  fails closed on terminal drops, and lets only the original owner finish an
+  expired unsuperseded managed run through exact idempotent replay. Backfill
+  and recovery replay now use reserved `recovery_*` idempotency keys, so
+  re-running `backfill --force` over sessions imported by ai-memory ≤2.6.0 (or
+  plain-backfilling a recovery-replayed session) can duplicate those older
+  observations. (#1125)
+- Added `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` for the `openai-compat`
+  provider (opt-in, off by default, ignored by every other provider): when
+  set, every chat request carries
+  `chat_template_kwargs: {"enable_thinking": false}`, so thinking-capable
+  local engines (vLLM / SGLang serving Qwen3-class models) spend the output
+  budget on the structured payload instead of a reasoning pass. (#1130)
+- Added the `cursor` LLM provider. Consolidation calls the logged-in Cursor
+  Agent CLI (`agent --print --mode ask`) so a Cursor subscription can drive
+  summaries without an API key. The default model is `cursor-grok-4.6-high`
+  ("Grok 4.6"). `AI_MEMORY_CURSOR_AGENT` overrides the binary. The provider never passes
+  `--yolo` or `--force`, because the prompt is captured session text. (#1127)
+- Added `applies_to` and `enforced_by` arguments to `memory_write_page`, and
+  `--applies-to` / `--enforced-by` to `ai-memory write-page`, for profile
+  entries. Both fields were documented as profile-entry frontmatter, but no
+  tool could set them, so scoping an entry to a stack or keeping it out of the
+  digest meant editing the wiki file by hand, and the next tool rewrite of the
+  entry dropped the value. A tag the profile cannot detect in any project
+  (`typscript`) is refused instead of silently hiding the entry, and both
+  arguments are refused on any page the digest does not read: one outside
+  `profile/`, or a `profile/` path in an ordinary project. (#1178)
+
+- Added the server version to the footer of every signed-in `/web` page (the
+  public login and change-password pages leave it out), on the right
+  side opposite "ai-memory · read-only", so you can tell which build a browser
+  tab is talking to without running `ai-memory status`. (#1171)
+
 - Added `install-mcp --client dsh` for the DeepSeek Harness (aliases
   `deepseek-harness` and `deepseek_harness`). DSH keeps its MCP client in
   a Cordis profile patch rather than a fixed config file, so the command prints a
   ready-to-merge `- insert:` fragment for `@deepseek-ai/dsh-mcp-client` and
   refuses `--apply`.
 
+### Changed
+- Changed `ai-memory-wikisync` files to carry a small frontmatter (`title`,
+  plus `tags`, `pinned` and a non-default `tier` when set) above the body,
+  so metadata survives a round trip. The first run after upgrading rewrites
+  unedited files of an earlier export in place. (#1164)
+
 ### Fixed
+- Fixed structured LLM responses stopped at the output budget
+  (`finish_reason = "length"`) or returned without usable content: they now
+  fail with redacted terminal errors, without copying the response. (#1130)
+- Fixed generated TypeScript integrations (OpenCode, OpenCode 2, OMP,
+  Pi, OpenClaw) flashing a console window on Windows.
+  `discoverRemoteIdentity` spawned `git config --get remote.<name>.url`
+  without `windowsHide`. The spawn now passes `windowsHide: true`, as
+  the repo-root probe's two git spawns already do (#1169).
+- Fixed `AI_MEMORY_LLM_REASONING_EFFORT` being ignored for
+  `claude-haiku-5-5`: the Anthropic provider dropped effort and thinking
+  fields for every Haiku model because Haiku 4.5 rejects them, so Haiku 5.5
+  always ran adaptive thinking at its default `medium` effort. Haiku 5.5 and
+  later now receive `output_config.effort`, adaptive thinking, and
+  `thinking: disabled` for `none`, like the other current Claude models
+  (#1180).
+- Documented that Anthropic currently refuses Claude Free/Pro/Max subscription
+  tokens from third-party apps, so `anthropic-oauth` usually fails with a
+  `429 rate_limit_error` on every request. That is a policy refusal, not a
+  real rate limit; the docs now point to the `anthropic` provider with a
+  Console API key or another provider. Also corrected the claim that
+  `claude setup-token` writes `CLAUDE_CODE_OAUTH_TOKEN`: it only prints the
+  token, which you export yourself. (#1170)
+- Documented that Zero runs hook commands inside its sandbox, whose default
+  policy blocks network (loopback included) and writes outside the
+  workspace, so hook events stay in the spool instead of reaching the
+  server. The `install-hooks --agent zero` and `setup-agent` notes and the
+  Zero install docs now name the global `~/.config/zero/config.json`
+  `sandbox` keys that allow delivery, their tradeoff, and the
+  `ai-memory hook-drain` fallback. (#1172)
+- Fixed a global `~/.codex/AGENTS.md` reaching the cross-project profile as
+  the user's own words. Codex injects its instruction files as a user message
+  headed `# AGENTS.md instructions for <cwd>` when a project `AGENTS.md`
+  contributes, and `# AGENTS.md instructions` with no directory when only the
+  global file does. The transcript import recognized only the first heading,
+  so `backfill` stored the global file as a user prompt in every project, and
+  the profile harvest admitted its "always"/"never" lines, which repeat across
+  projects by construction. The import now recognizes both headings. (#1173)
+- Fixed the profile harvest reading text the user did not write as the
+  user's words: a user-prompt observation that is a harness turn, such as
+  Claude Code's `<task-notification>` blocks or Codex's injected
+  instructions, is now skipped, and ai-memory's own routing and
+  recalled-history blocks inside a prompt are left out, including a block the
+  16 KiB prompt cap cut before its end marker. `profile rebuild` also skips
+  Codex instructions an earlier version stored as prompts, but it keeps the
+  candidates already harvested from them, so those lines can still show as
+  waiting in `profile review`. An entry an earlier version already admitted,
+  or one those candidates reach later, stays until `ai-memory profile forget`
+  removes it. (#1173)
 - Fixed Cursor tool calls being stored with no title or content: Cursor's own
   hooks, and the Claude Code hooks Cursor also runs, send Claude's
   `tool_name`/`tool_input` fields, but Cursor was missing from the tool-capture
@@ -25,6 +187,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the placeholder id `empty-state-draft` and no workspace, and each launch
   appended another observation to that one empty session. The server now
   acknowledges and drops that placeholder.
+- Fixed `profile review` listing page metadata such as `Status:** Accepted` as
+  habits waiting for promotion: a curated page's statement was its first line
+  of prose, which on an ADR-style page is a `**Status:** Accepted` or
+  `**Date:**` field. Statements now skip fields with an ADR metadata label
+  (Status, Date, Deciders, Supersedes and the like) whatever their value; a
+  labelled rule such as `**Package manager:** pnpm` is still a statement.
+  Fields harvested before the fix no longer reach `profile review`; an entry already admitted to the
+  profile stays until `ai-memory profile forget`. (#1175)
 - Fixed `install-mcp --client claude-desktop` refusing to run on Linux:
   Anthropic ships Claude Desktop for Linux as a beta, and the command now
   writes `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (default
@@ -62,6 +232,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Settings window behind the frontmost app, so clicking it appeared to do
   nothing. The item now activates the app before opening the window, as
   **Show Status…** already did. (#1161)
+- Fixed `ai-memory run` creating an empty twin project when a repository's
+  folder name differs from its git remote (a `new-space-game` checkout of
+  `github.com/acme/unknown-system`) and its project predates recorded
+  identities: the run asked for the remote-derived name alone, so it missed
+  the folder-named project, and once hook capture claimed that project every
+  later run failed with `project '…' is ambiguous`. The launcher now sends the
+  checkout's remote identity with the derived name and the server routes the
+  run by identity, as capture does — which also lets runs in an
+  already-affected repository open again. A user whose run cwd sat inside a
+  project they could not write got a silently created twin project; they now
+  get a 403. (#1182)
 
 ## [2.6.2] - 2026-10-08
 

@@ -1,4 +1,4 @@
-//! Destination-path safety for the read-only export.
+//! Destination-path safety for export and sync.
 //!
 //! Page paths arrive from the server as untrusted data. Every relative wiki
 //! path is validated into a portable shape before it is ever joined onto the

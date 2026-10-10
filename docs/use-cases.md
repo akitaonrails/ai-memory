@@ -82,7 +82,7 @@
   ai-memory detects the orphan before launch and starts fresh; `--fresh` forces
   that recovery for one harness. Managed mode currently covers Claude Code,
   Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP,
-  Grok Build CLI, and Antigravity CLI; direct harness launches remain unchanged. See
+  Grok Build CLI, Antigravity CLI, and GitHub Copilot CLI; direct harness launches remain unchanged. See
   [Managed cross-harness workstreams](managed-workstreams.md).
 - **"Just put me back where I was."** From any directory, with no name to
   type and no list to read:

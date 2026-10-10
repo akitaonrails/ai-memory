@@ -577,6 +577,7 @@ async fn ttl_expiry_lifecycle_end_to_end() {
                 proj,
                 &PagePath::new("notes/refreshed.md").unwrap(),
                 stale_expired_id,
+                None,
                 None
             )
             .await

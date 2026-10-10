@@ -258,6 +258,10 @@ pub enum Command {
     AutoImprove(AutoImproveArgs),
     /// Manually finalize the latest open session for one agent in this project.
     FinalizeSession(FinalizeSessionArgs),
+    /// Recover history a server outage missed: drain the local hook spool,
+    /// replay degraded-run transcripts through the hook backfill path, and
+    /// finish managed runs whose transcript import failed. Safe to re-run.
+    Recover(RecoverArgs),
     /// Review, approve, or reject staged auto-improvement proposals.
     PendingWrites(PendingWritesArgs),
     /// Compute + store embeddings for every latest page (M9).
@@ -516,6 +520,11 @@ pub enum RunHarnessChoice {
     /// Google Antigravity CLI (`agy`).
     #[value(name = "antigravity", alias = "antigravity-cli", alias = "agy")]
     Antigravity,
+    /// GitHub Copilot CLI (`copilot`). `run`'s positional names only
+    /// command-line harnesses, so the bare name cannot mean VS Code Copilot
+    /// here the way `install-mcp --client copilot` does.
+    #[value(name = "copilot", alias = "copilot-cli")]
+    Copilot,
 }
 
 /// Parses the `run` harness positional, additionally wildcarding every
@@ -1756,6 +1765,9 @@ pub enum InstallSkillsAgent {
     Devin,
     /// Grok Build CLI's `.grok/skills` directory.
     Grok,
+    /// GitHub Copilot CLI's `.github/skills` (project) or
+    /// `$COPILOT_HOME/skills` (global, default `~/.copilot/skills`) directory.
+    CopilotCli,
     /// Hermes Agent's `.hermes/skills` directory.
     Hermes,
     /// Install into both Claude Code and `.agents` skill directories.
@@ -2454,6 +2466,14 @@ fn parse_finalizable_agent(s: &str) -> Result<ai_memory_core::AgentKind, String>
     Ok(kind)
 }
 
+/// Arguments for `recover`.
+#[derive(Debug, Args)]
+pub struct RecoverArgs {
+    /// Print the machine-readable report as JSON on stdout.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Arguments for `finalize-session`.
 #[derive(Debug, Args)]
 pub struct FinalizeSessionArgs {
@@ -2695,6 +2715,8 @@ pub enum LlmProviderChoice {
     Copilot,
     /// OpenCode cloud API (Go by default; AI_MEMORY_LLM_BASE_URL selects Zen).
     Opencode,
+    /// Cursor subscription via the logged-in `agent` CLI (`--print --mode ask`).
+    Cursor,
 }
 
 /// Arguments for `embed`.
@@ -3298,6 +3320,15 @@ pub struct WritePageArgs {
     /// Pin the page so the future decay sweep skips it.
     #[arg(long)]
     pub pinned: bool,
+    /// Profile entries only (`profile/...` paths): repeatable stack tag
+    /// (`rust`, `typescript`, ...) limiting the entry to projects on that
+    /// stack.
+    #[arg(long = "applies-to")]
+    pub applies_to: Vec<String>,
+    /// Profile entries only: what already enforces the entry (e.g.
+    /// `pre-push hook`), which keeps it out of the session-start digest.
+    #[arg(long = "enforced-by")]
+    pub enforced_by: Option<String>,
     /// Workspace name (auto-created if absent).
     #[arg(long)]
     pub workspace: Option<String>,
@@ -3312,6 +3343,30 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn write_page_takes_the_profile_entry_fields() {
+        let parsed = Cli::try_parse_from([
+            "ai-memory",
+            "write-page",
+            "--path",
+            "profile/style/types.md",
+            "--body",
+            "Never cast.",
+            "--applies-to",
+            "rust",
+            "--applies-to",
+            "typescript",
+            "--enforced-by",
+            "pre-push hook",
+        ])
+        .expect("write-page profile args parse");
+        let Command::WritePage(args) = parsed.command else {
+            panic!("expected write-page command");
+        };
+        assert_eq!(args.applies_to, ["rust", "typescript"]);
+        assert_eq!(args.enforced_by.as_deref(), Some("pre-push hook"));
+    }
 
     #[test]
     fn serve_api_only_flag_does_not_enable_the_web_ui() {

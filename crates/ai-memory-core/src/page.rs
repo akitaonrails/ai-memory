@@ -168,6 +168,12 @@ pub const MAX_PAGE_ABSTRACT_LEN: usize = 1024;
 pub const MAX_PAGE_RELATIONS: usize = 32;
 /// Maximum raw characters in one relation target, including its scope qualifier.
 pub const MAX_PAGE_RELATION_TARGET_LEN: usize = 1024;
+/// Maximum `applies_to` tags in one write.
+pub const MAX_PAGE_APPLIES_TO: usize = 16;
+/// Maximum raw characters in one `applies_to` tag, before trimming.
+pub const MAX_PAGE_APPLIES_TO_TAG_LEN: usize = 32;
+/// Maximum raw characters in `enforced_by`, before trimming.
+pub const MAX_PAGE_ENFORCED_BY_LEN: usize = 256;
 
 /// Editable metadata shared by public page-write surfaces.
 ///
@@ -196,6 +202,18 @@ pub struct PageWriteMetadata {
     /// `workspace/project:path`) requires already-trimmed scope components.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub relations: std::collections::BTreeMap<Relation, Vec<String>>,
+    /// Profile entries only: stack tags (`rust`, `typescript`, ...) that limit
+    /// the entry to projects on that stack. Up to 16, each a tag the profile
+    /// detects; lowercased and deduplicated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
+    pub applies_to: Vec<String>,
+    /// Profile entries only: what already enforces the entry (`pre-push
+    /// hook`), which keeps it out of the session-start digest. At most 256 raw
+    /// characters, then trimmed. Empty means absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256))]
+    pub enforced_by: Option<String>,
 }
 
 impl PageWriteMetadata {
@@ -219,6 +237,7 @@ impl PageWriteMetadata {
         for (key, value, max) in [
             ("kind", self.kind, MAX_PAGE_KIND_LEN),
             ("abstract", self.abstract_text, MAX_PAGE_ABSTRACT_LEN),
+            ("enforced_by", self.enforced_by, MAX_PAGE_ENFORCED_BY_LEN),
         ] {
             if let Some(value) = value {
                 if !valid_text(&value, max) {
@@ -288,7 +307,71 @@ impl PageWriteMetadata {
         if !self.relations.is_empty() {
             fm.insert("relations".into(), serde_json::json!(self.relations));
         }
+        if self.applies_to.len() > MAX_PAGE_APPLIES_TO
+            || self
+                .applies_to
+                .iter()
+                .any(|tag| !valid_text(tag, MAX_PAGE_APPLIES_TO_TAG_LEN))
+        {
+            return Err(invalid("applies_to"));
+        }
+        // The same normalization `ProfileEntry::from_page` applies on read,
+        // plus a check the reader cannot make: a tag no project can be
+        // detected with would hide the entry from every project with activity.
+        let known = crate::profile::detectable_stack_tags();
+        let mut applies_to = std::collections::BTreeSet::new();
+        for tag in &self.applies_to {
+            let tag = tag.trim().to_ascii_lowercase();
+            if tag.is_empty() {
+                continue;
+            }
+            if !known.contains(tag.as_str()) {
+                return Err(crate::MemoryError::MalformedRecord(format!(
+                    "unknown applies_to tag '{tag}'; known stack tags: {}",
+                    known.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
+            applies_to.insert(tag);
+        }
+        if !applies_to.is_empty() {
+            fm.insert("applies_to".into(), serde_json::json!(applies_to));
+        }
         Ok(fm)
+    }
+}
+
+/// Refuse the profile-only keys (`applies_to`, `enforced_by`) on a page the
+/// digest never reads, where the caller's intent would silently do nothing:
+/// one outside `profile/`, or one written to a project that cannot hold a
+/// profile. `profile_scope` says whether the write targets the profile
+/// (`scope: "profile"` or `"global"`, or `_global` or a reserved profile
+/// project by name); the caller decides it from the request, before any
+/// scope is created. It looks at the project name only, not the workspace
+/// or share mode, so it errs lenient.
+///
+/// # Errors
+/// Returns `MalformedRecord` naming the first such key.
+pub fn ensure_profile_metadata_placement(
+    frontmatter: &serde_json::Map<String, serde_json::Value>,
+    path: &PagePath,
+    profile_scope: bool,
+) -> Result<(), crate::MemoryError> {
+    if profile_scope
+        && path
+            .as_str()
+            .starts_with(crate::profile::PROFILE_PATH_PREFIX)
+    {
+        return Ok(());
+    }
+    match ["applies_to", "enforced_by"]
+        .into_iter()
+        .find(|key| frontmatter.contains_key(*key))
+    {
+        Some(key) => Err(crate::MemoryError::MalformedRecord(format!(
+            "{key} applies only to profile entries: write with scope \"profile\", \
+             or under a `profile/` path in `_global` or a profile project"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -700,6 +783,90 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn page_write_metadata_profile_fields_normalize_like_the_digest_reads_them() {
+        let metadata: PageWriteMetadata = serde_json::from_value(serde_json::json!({
+            "applies_to": [" TypeScript ", "rust", "typescript", ""],
+            "enforced_by": "  pre-push hook ",
+        }))
+        .unwrap();
+        let fm = metadata.into_frontmatter().unwrap();
+        assert_eq!(fm["applies_to"], serde_json::json!(["rust", "typescript"]));
+        assert_eq!(fm["enforced_by"], "pre-push hook");
+        // What the write stores, the digest reads back unchanged.
+        let entry = crate::profile::ProfileEntry::from_page(
+            "profile/style/types.md",
+            "Types",
+            "Never cast.",
+            &serde_json::Value::Object(fm),
+        )
+        .unwrap();
+        assert_eq!(entry.applies_to, ["rust", "typescript"]);
+        assert!(entry.enforced_by);
+
+        let blank: PageWriteMetadata = serde_json::from_value(serde_json::json!({
+            "applies_to": ["  "], "enforced_by": "   ",
+        }))
+        .unwrap();
+        assert!(blank.into_frontmatter().unwrap().is_empty());
+    }
+
+    #[test]
+    fn page_write_metadata_profile_fields_refuse_unknown_and_oversized_input() {
+        for bad in [
+            serde_json::json!({"applies_to": ["rsut"]}),
+            serde_json::json!({"applies_to": ["rust", "react"]}),
+            serde_json::json!({"applies_to": ["x".repeat(MAX_PAGE_APPLIES_TO_TAG_LEN + 1)]}),
+            serde_json::json!({"applies_to": vec!["rust"; MAX_PAGE_APPLIES_TO + 1]}),
+            serde_json::json!({"applies_to": ["ru\0st"]}),
+            serde_json::json!({"enforced_by": "x".repeat(MAX_PAGE_ENFORCED_BY_LEN + 1)}),
+            serde_json::json!({"enforced_by": "hook\u{7}"}),
+        ] {
+            let metadata: PageWriteMetadata = serde_json::from_value(bad.clone()).unwrap();
+            assert!(metadata.into_frontmatter().is_err(), "{bad}");
+        }
+        for bad in [
+            serde_json::json!({"applies_to": "rust"}),
+            serde_json::json!({"enforced_by": true}),
+        ] {
+            assert!(
+                serde_json::from_value::<PageWriteMetadata>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_metadata_is_refused_outside_profile_pages() {
+        let fm = serde_json::from_value::<PageWriteMetadata>(serde_json::json!({
+            "applies_to": ["rust"]
+        }))
+        .unwrap()
+        .into_frontmatter()
+        .unwrap();
+        let profile = PagePath::new("profile/tools/cargo.md").unwrap();
+        let note = PagePath::new("notes/cargo.md").unwrap();
+        assert!(ensure_profile_metadata_placement(&fm, &profile, true).is_ok());
+        assert!(ensure_profile_metadata_placement(&fm, &note, true).is_err());
+        // A `profile/` path in an ordinary project is never read either.
+        assert!(ensure_profile_metadata_placement(&fm, &profile, false).is_err());
+        let enforced = serde_json::from_value::<PageWriteMetadata>(serde_json::json!({
+            "enforced_by": "hook"
+        }))
+        .unwrap()
+        .into_frontmatter()
+        .unwrap();
+        assert!(ensure_profile_metadata_placement(&enforced, &note, true).is_err());
+        // Ordinary metadata stays allowed everywhere.
+        let plain = serde_json::from_value::<PageWriteMetadata>(serde_json::json!({
+            "kind": "rule"
+        }))
+        .unwrap()
+        .into_frontmatter()
+        .unwrap();
+        assert!(ensure_profile_metadata_placement(&plain, &note, false).is_ok());
     }
 
     #[test]

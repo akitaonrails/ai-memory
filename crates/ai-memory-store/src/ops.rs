@@ -203,6 +203,66 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
+/// What a conditional page write requires of the current latest version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagePrecondition {
+    /// No latest version exists at the path: the write creates the page.
+    Absent,
+    /// The latest version at the path is this one.
+    Latest(PageId),
+}
+
+/// The outcome of [`upsert_page_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalUpsert {
+    /// The precondition held and the page was written; the id is current.
+    Upserted(PageId),
+    /// The precondition did not hold and nothing was written.
+    Mismatch {
+        /// The latest version id at the path, `None` when there is none.
+        current: Option<PageId>,
+    },
+}
+
+/// [`upsert_page`] only when `precondition` holds, checked in the same
+/// transaction as the write so no other writer can land in between.
+pub fn upsert_page_if(
+    conn: &mut Connection,
+    page: &NewPage,
+    precondition: PagePrecondition,
+) -> StoreResult<ConditionalUpsert> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let current = latest_page_id_in_tx(&tx, page)?;
+    let holds = match precondition {
+        PagePrecondition::Absent => current.is_none(),
+        PagePrecondition::Latest(expected) => current == Some(expected),
+    };
+    if !holds {
+        return Ok(ConditionalUpsert::Mismatch { current });
+    }
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(ConditionalUpsert::Upserted(id))
+}
+
+fn latest_page_id_in_tx(tx: &Transaction<'_>, page: &NewPage) -> StoreResult<Option<PageId>> {
+    let raw: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    raw.map(|bytes| PageId::from_slice(&bytes).map_err(StoreError::from))
+        .transpose()
+}
+
 /// Resolve a workspace by name, creating it if missing. Atomic.
 pub fn get_or_create_workspace(
     conn: &mut Connection,
@@ -2744,9 +2804,38 @@ pub fn insert_observation(
 }
 
 /// Ingest-keys older than this are swept opportunistically on every keyed
-/// insert. Keys only need to outlive the client spool (7 days + retry
-/// backoff); 30 days is a generous margin.
+/// insert. Ordinary keys only need to outlive the client spool (7 days + retry
+/// backoff); recovery keys remain tied to their stored session until it is purged.
 const INGEST_KEY_TTL_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+
+fn recovery_ingest_key(key: &str) -> bool {
+    key.strip_prefix("recovery_").is_some_and(|digest| {
+        digest.len() == 55 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn recovery_event_identity(obs: &NewObservation, agent: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    let session_id = obs.session_id.to_string();
+    for value in [
+        Some(session_id.as_str()),
+        agent,
+        Some(obs.kind.as_str()),
+        obs.extension.as_deref(),
+        obs.source_event.as_deref(),
+        Some(obs.title.as_str()),
+        Some(obs.body.as_str()),
+    ] {
+        if let Some(value) = value {
+            hasher.update(value.len().to_be_bytes());
+            hasher.update(value.as_bytes());
+        } else {
+            hasher.update(usize::MAX.to_be_bytes());
+        }
+    }
+    hasher.update(obs.occurred_at.unwrap_or_default().to_be_bytes());
+    format!("{digest:x}", digest = hasher.finalize())
+}
 
 /// Claim a project-scoped ingest key and append its observation atomically.
 ///
@@ -2766,18 +2855,48 @@ pub fn insert_observation_keyed(
     // Sweep before looking up the current key so an expired key can be reused
     // even when no unrelated keyed event arrived in the meantime.
     tx.execute(
-        "DELETE FROM ingest_keys WHERE seen_at < ?1",
+        "DELETE FROM ingest_keys WHERE recovery_retained = 0 AND seen_at < ?1",
         params![now - INGEST_KEY_TTL_MICROS],
     )?;
-    let existing: Option<Option<i64>> = tx
+    let recovery = recovery_ingest_key(ingest_key);
+    let session_agent = if recovery {
+        tx.query_row(
+            "SELECT agent_kind FROM sessions WHERE id = ?1",
+            params![obs.session_id.as_bytes()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    let event_identity = recovery.then(|| recovery_event_identity(obs, session_agent.as_deref()));
+    type IngestKeyRow = (
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    if recovery && session_agent.is_none() {
+        return Err(StoreError::SessionCollision);
+    }
+    let existing: Option<IngestKeyRow> = tx
         .query_row(
-            "SELECT completed_at FROM ingest_keys \
+            "SELECT completed_at, session_id, agent_kind, observation_kind, event_identity FROM ingest_keys \
              WHERE project_id = ?1 AND key = ?2",
             params![obs.project_id.as_bytes(), ingest_key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    if let Some(completed_at) = existing {
+    if let Some((completed_at, session_id, agent, kind, identity)) = existing {
+        if recovery
+            && (session_id.as_deref() != Some(obs.session_id.as_bytes())
+                || agent.as_deref() != session_agent.as_deref()
+                || kind.as_deref() != Some(obs.kind.as_str())
+                || identity.as_deref() != event_identity.as_deref())
+        {
+            return Err(StoreError::SessionCollision);
+        }
         tx.commit()?;
         return Ok(if completed_at.is_some() {
             IngestObservationOutcome::AlreadyComplete
@@ -2787,9 +2906,18 @@ pub fn insert_observation_keyed(
     }
 
     tx.execute(
-        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) \
-         VALUES (?1, ?2, ?3, NULL)",
-        params![obs.project_id.as_bytes(), ingest_key, now],
+        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id, agent_kind, observation_kind, event_identity, recovery_retained) \
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            obs.project_id.as_bytes(),
+            ingest_key,
+            now,
+            recovery.then_some(obs.session_id.as_bytes()),
+            session_agent,
+            recovery.then_some(obs.kind.as_str()),
+            event_identity,
+            i64::from(recovery)
+        ],
     )?;
     let id = insert_observation_row(&tx, obs)?;
     tx.commit()?;
@@ -2945,18 +3073,36 @@ pub fn admit_hook_session_event(
     }
     let ingest = if let Some(key) = ingest_key {
         tx.execute(
-            "DELETE FROM ingest_keys WHERE seen_at < ?1",
+            "DELETE FROM ingest_keys WHERE recovery_retained = 0 AND seen_at < ?1",
             params![now - INGEST_KEY_TTL_MICROS],
         )?;
-        let old: Option<Option<i64>> = tx
+        let recovery = recovery_ingest_key(key);
+        let event_identity =
+            recovery.then(|| recovery_event_identity(obs, Some(session.agent_kind.as_str())));
+        type IngestKeyRow = (
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let old: Option<IngestKeyRow> = tx
             .query_row(
-                "SELECT completed_at FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
+                "SELECT completed_at, session_id, agent_kind, observation_kind, event_identity FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
                 params![obs.project_id.as_bytes(), key],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         match old {
-            Some(done) => {
+            Some((done, keyed_session, keyed_agent, keyed_kind, keyed_identity)) => {
+                if recovery
+                    && (keyed_session.as_deref() != Some(obs.session_id.as_bytes())
+                        || keyed_agent.as_deref() != Some(session.agent_kind.as_str())
+                        || keyed_kind.as_deref() != Some(obs.kind.as_str())
+                        || keyed_identity.as_deref() != event_identity.as_deref())
+                {
+                    return Err(StoreError::SessionCollision);
+                }
                 if done.is_some() {
                     IngestObservationOutcome::AlreadyComplete
                 } else {
@@ -2964,7 +3110,20 @@ pub fn admit_hook_session_event(
                 }
             }
             None => {
-                tx.execute("INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) VALUES (?1, ?2, ?3, NULL)", params![obs.project_id.as_bytes(), key, now])?;
+                tx.execute(
+                    "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at, session_id, agent_kind, observation_kind, event_identity, recovery_retained) \
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        obs.project_id.as_bytes(),
+                        key,
+                        now,
+                        recovery.then_some(obs.session_id.as_bytes()),
+                        recovery.then_some(session.agent_kind.as_str()),
+                        recovery.then_some(obs.kind.as_str()),
+                        event_identity,
+                        i64::from(recovery)
+                    ],
+                )?;
                 IngestObservationOutcome::Inserted(insert_observation_row(&tx, obs)?)
             }
         }
@@ -8732,6 +8891,14 @@ pub(crate) mod tests {
     fn purge_session_removes_the_session_and_everything_derived_from_it() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let (sid, _page) = seed_session(&mut conn, ws, proj, "target");
+        let recovery_key = format!("recovery_{}", "a".repeat(55));
+        conn.execute(
+            "INSERT INTO ingest_keys \
+             (project_id, key, seen_at, completed_at, session_id, recovery_retained) \
+             VALUES (?1, ?2, 1, 1, ?3, 1)",
+            params![proj.as_bytes(), recovery_key, sid.as_bytes()],
+        )
+        .unwrap();
 
         let summary = purge_session(
             &mut conn,
@@ -8755,6 +8922,11 @@ pub(crate) mod tests {
             "observations=0"
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0, "pages=0");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM ingest_keys"),
+            0,
+            "session-bound recovery keys cascade with the purged session"
+        );
         assert_eq!(summary.observations_deleted, 1);
         assert_eq!(summary.pages_deleted, 1);
         assert_eq!(

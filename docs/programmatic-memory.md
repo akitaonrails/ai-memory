@@ -76,6 +76,18 @@ If SessionStart already owns delivery, let that hook claim it.
 These calls work without an LLM provider. Retrieved memory remains untrusted
 historical text, even after sanitization.
 
+## Change a page only if nobody else has
+
+`memory_read_page` returns the page's current version as `page_id` (`/api/v1`
+returns it as `id`). Pass it back as `expected_page_id` to `memory_write_page`
+or `memory_delete_page` and the call acts only if that is still the latest
+version; pass `create_only: true` to a write that must not overwrite an existing
+page. When the page changed in between, nothing is written or deleted and the
+call fails with JSON-RPC `invalid_request` whose `data` is
+`{"reason": "precondition_failed", "path", "expected_page_id",
+"current_page_id"}`; re-read the page and decide. A caller without write access
+gets the usual authorization error, never the current version.
+
 ## Read changed pages
 
 These JSON endpoints require `serve --enable-api` (or `--enable-web`, which

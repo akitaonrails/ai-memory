@@ -335,7 +335,10 @@ exists, both when both exist, or creates `CLAUDE.md` when neither exists. Use
 instruction target unless you override it: `CLAUDE.md` implies
 `.claude/skills`, `AGENTS.md` implies `.agents/skills`, and both files imply
 both skill roots. For Grok Build CLI, select `--skills-agent grok` so skills
-install under its `.grok/skills` root; for Hermes Agent, `--skills-agent hermes`
+install under its `.grok/skills` root; for GitHub Copilot CLI, select
+`--skills-agent copilot-cli` so skills install under `.github/skills` (project)
+or `$COPILOT_HOME/skills` (global, default `~/.copilot/skills`); for Hermes
+Agent, `--skills-agent hermes`
 installs under `.hermes/skills` (project) or `~/.hermes/skills` (global).
 
 When a project keeps `AGENTS.md` as its canonical instruction file, give it a
@@ -354,6 +357,7 @@ ai-memory install-skills
 ai-memory install-skills --scope global --agent agents
 ai-memory install-skills --scope global --agent devin
 ai-memory install-skills --scope global --agent grok
+ai-memory install-skills --scope global --agent copilot-cli
 ai-memory install-skills --scope global --agent hermes
 ai-memory install-skills --agent both --print
 ai-memory install-skills --target-dir .custom/skills --force
@@ -363,13 +367,20 @@ For Devin, project-local skills are installed under `.devin/skills`. Global
 Devin installs use `%APPDATA%\devin\skills` on Windows and `~/.devin/skills`
 on non-Windows systems. For Grok Build CLI, project-local skills go under
 `.grok/skills` and global under `$GROK_HOME/skills` (default
-`~/.grok/skills`).
+`~/.grok/skills`). For GitHub Copilot CLI, project-local skills go under the
+repository's `.github/skills` and global under `$COPILOT_HOME/skills` (default
+`~/.copilot/skills`); Copilot CLI already loads `AGENTS.md`, so it shares the
+`AGENTS.md` instruction target.
 
 Project-local skill roots are `.claude/skills` for Claude-compatible installs,
 `.agents/skills` for cross-client installs, `.devin/skills` for Devin, and
-`.grok/skills` for Grok. Global Claude/Agents roots are `~/.claude/skills` and
-`~/.agents/skills`; global Devin roots are platform-specific as described
-above; global Grok is `$GROK_HOME/skills` (default `~/.grok/skills`).
+`.grok/skills` for Grok, and `.github/skills` for GitHub Copilot CLI. Global
+Claude/Agents roots are `~/.claude/skills` and `~/.agents/skills`; global Devin
+roots are platform-specific as described above; global Grok is
+`$GROK_HOME/skills` (default `~/.grok/skills`); global Copilot CLI is
+`$COPILOT_HOME/skills` (default `~/.copilot/skills`). `uninstall` sweeps both
+Copilot CLI roots and removes only files carrying the ai-memory managed marker,
+so team-authored skills in `.github/skills` are never touched.
 `--target-dir` points at an explicit skill root and bypasses scope/agent
 inference. `--print` previews target paths and `SKILL.md` contents. `--force`
 allows replacement of unmanaged same-name skills; without it, user-authored

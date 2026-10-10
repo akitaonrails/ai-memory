@@ -41,7 +41,8 @@ use serde::{Deserialize, Serialize};
 use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
 use ai_memory_workstream::{
     LaunchRoots, ManagedHarness, build_launch_plan_with_env, export_transcript,
-    list_native_sessions, wait_for_transcript_flush,
+    export_transcript_delta, export_transcript_range, list_native_sessions,
+    wait_for_transcript_flush,
 };
 
 use super::doctor::{SCANNED_HARNESSES, relocated_session_dir};
@@ -60,6 +61,7 @@ const PER_HARNESS_SCAN_LIMIT: usize = 200;
 /// One `POST /hook/batch` request carries at most this many events — matches the
 /// server's `MAX_HOOK_BATCH_ITEMS` so a batch is never rejected for size.
 const HOOK_BATCH_ITEMS: usize = 256;
+const HOOK_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// The extension label backfilled non-user events (assistant/tool) are recorded
 /// under, mirroring the companion importer's replay-through-`/hook` mechanism.
@@ -430,7 +432,7 @@ pub(crate) async fn collect_local_sessions_with(
 
 /// One item in a `POST /hook/batch` request: the full hook URL (whose query the
 /// server parses for event/agent/scope/session) plus the JSON body.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct HookItem {
     url: String,
     body: serde_json::Value,
@@ -439,8 +441,61 @@ struct HookItem {
 /// The server's `/hook/batch` acknowledgement (subset we act on).
 #[derive(Debug, Deserialize)]
 struct HookBatchAck {
-    /// Contiguous leading prefix committed, oldest-first.
     accepted: usize,
+    results: Vec<HookBatchResult>,
+    #[serde(default)]
+    accepted_indices: Option<Vec<usize>>,
+    #[serde(default)]
+    failed_index: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HookBatchResult {
+    index: usize,
+    outcome: String,
+}
+
+fn acknowledged_items(ack: &HookBatchAck, items: &[&HookItem]) -> Result<Vec<usize>> {
+    let indices = ack
+        .accepted_indices
+        .clone()
+        .unwrap_or_else(|| (0..ack.accepted).collect());
+    if ack.accepted > items.len()
+        || indices.iter().any(|index| *index >= items.len())
+        || indices.windows(2).any(|pair| pair[0] >= pair[1])
+        || ack.accepted
+            != indices
+                .iter()
+                .enumerate()
+                .take_while(|(pos, index)| *pos == **index)
+                .count()
+        || ack.results.len() != indices.len()
+        || ack
+            .failed_index
+            .is_some_and(|index| index >= items.len() || indices.contains(&index))
+    {
+        bail!("invalid hook acknowledgement; keeping transcript for retry");
+    }
+    for (result, index) in ack.results.iter().zip(&indices) {
+        if result.index != *index {
+            bail!("hook acknowledgement result indices disagree");
+        }
+        let is_end = reqwest::Url::parse(&items[*index].url)?
+            .query_pairs()
+            .any(|(key, value)| key == "event" && value == "session-end");
+        match result.outcome.as_str() {
+            "stored" | "replayed" => {}
+            "ignored_end" if is_end => {}
+            "resumed" => bail!("hook processing resumed; rerun to confirm durable replay"),
+            outcome => {
+                bail!("hook item {index} was not durably stored ({outcome}); keeping transcript")
+            }
+        }
+    }
+    if let Some(index) = ack.failed_index {
+        bail!("hook processing failed at item {index}; keeping transcript for retry");
+    }
+    Ok(indices)
 }
 
 /// Import one native session by replaying its transcript through `/hook`, the
@@ -463,29 +518,105 @@ async fn import_one(
         build_launch_plan_with_env(session.harness, None, Vec::new(), None, &[], Some(roots))
             .ok()
             .and_then(|plan| plan.session_dir);
-    // These are historical sessions, so the flush wait is a quick no-op; ignore
-    // its result and read whatever is on disk.
-    let _ = wait_for_transcript_flush(
-        session.harness,
+    import_exact_session(
+        endpoint,
+        workspace,
+        project,
         home,
         cwd,
-        session_dir.as_deref(),
-        &session.native_session_id,
-    )
-    .await;
-    let transcript = export_transcript(
         session.harness,
-        home,
-        cwd,
-        session_dir.as_deref(),
         &session.native_session_id,
+        session_dir.as_deref(),
         None,
     )
     .await
-    .with_context(|| format!("reading the {} transcript", session.harness.as_str()))?;
+}
 
-    let sid = &session.native_session_id;
-    let agent = session.harness.agent_kind().as_str();
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn import_exact_session_range(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    recovery_interval_id: &str,
+    session_dir: Option<&Path>,
+    source_cursor: Option<&str>,
+    final_cursor: &str,
+    expected_digests: &[String],
+) -> Result<usize> {
+    let _ = wait_for_transcript_flush(harness, home, cwd, session_dir, native_session_id).await;
+    let transcript = export_transcript_range(
+        harness,
+        home,
+        cwd,
+        session_dir,
+        native_session_id,
+        source_cursor,
+        final_cursor,
+    )
+    .await
+    .with_context(|| format!("reading the {} transcript", harness.as_str()))?;
+    let actual = ai_memory_workstream::transcript_interval_digests(&transcript.events);
+    if actual != expected_digests {
+        bail!("native transcript range no longer matches its exact ordered semantic identity");
+    }
+    import_exported_transcript(
+        endpoint,
+        workspace,
+        project,
+        harness,
+        native_session_id,
+        Some(recovery_interval_id),
+        transcript,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn import_exact_session(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    session_dir: Option<&Path>,
+    source_cursor: Option<&str>,
+) -> Result<usize> {
+    let _ = wait_for_transcript_flush(harness, home, cwd, session_dir, native_session_id).await;
+    let transcript = if let Some(cursor) = source_cursor {
+        export_transcript_delta(harness, home, cwd, session_dir, native_session_id, cursor).await
+    } else {
+        export_transcript(harness, home, cwd, session_dir, native_session_id, None).await
+    }
+    .with_context(|| format!("reading the {} transcript", harness.as_str()))?;
+    import_exported_transcript(
+        endpoint,
+        workspace,
+        project,
+        harness,
+        native_session_id,
+        None,
+        transcript,
+    )
+    .await
+}
+
+async fn import_exported_transcript(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    recovery_interval_id: Option<&str>,
+    transcript: ai_memory_workstream::ExportedTranscript,
+) -> Result<usize> {
+    let sid = native_session_id;
+    let agent = harness.agent_kind().as_str();
     let resolved = resolve_occurred_at(&transcript.events);
     let mut items = Vec::with_capacity(transcript.events.len() + 2);
     items.push(hook_item(
@@ -495,13 +626,13 @@ async fn import_one(
         agent,
         "session-start",
         sid,
-        &format!("{sid}:session-start"),
+        &replay_ingest_key(recovery_interval_id, sid, "session-start", "boundary"),
         None,
         serde_json::json!({ "session_id": sid, "occurred_at": resolved.earliest }),
     )?);
     let mut content = 0usize;
     for (event, occurred_at) in transcript.events.iter().zip(&resolved.per_event) {
-        if let Some(mapped) = map_event(sid, event, occurred_at.as_deref()) {
+        if let Some(mapped) = map_event(recovery_interval_id, sid, event, occurred_at.as_deref()) {
             items.push(hook_item(
                 endpoint,
                 workspace,
@@ -523,13 +654,86 @@ async fn import_one(
         agent,
         "session-end",
         sid,
-        &format!("{sid}:session-end"),
+        &replay_ingest_key(recovery_interval_id, sid, "session-end", "boundary"),
         None,
         serde_json::json!({ "session_id": sid, "occurred_at": resolved.latest }),
     )?);
 
     post_hook_items(endpoint, &items).await?;
     Ok(content)
+}
+
+/// Replay only the user prompts of one session the server already knows,
+/// for harnesses whose live hooks carry no prompt event (Antigravity CLI).
+/// `finalize-session` sends these before its synthetic `session-end`, so the
+/// summary page and the automatic handoff are built with the prompts.
+///
+/// No session boundaries are sent: the caller owns the `session-end`, and a
+/// keyed one would be deduplicated on a later `--reopen`. Each prompt carries
+/// the same [`replay_ingest_key`] that `backfill` mints for that event, so
+/// repeated finalizes (and a backfill of the same session) store it once.
+/// Returns the number of prompts sent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replay_session_prompts(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    home: &Path,
+    cwd: &Path,
+    harness: ManagedHarness,
+    native_session_id: &str,
+) -> Result<usize> {
+    let transcript = export_transcript(harness, home, cwd, None, native_session_id, None)
+        .await
+        .with_context(|| format!("reading the {} transcript", harness.as_str()))?;
+    let items = prompt_hook_items(
+        endpoint,
+        workspace,
+        project,
+        harness,
+        native_session_id,
+        &transcript.events,
+    )?;
+    if !items.is_empty() {
+        post_hook_items(endpoint, &items).await?;
+    }
+    Ok(items.len())
+}
+
+/// The `user-prompt` hook items of a transcript, in transcript order, each
+/// dated at its own event time and keyed with [`replay_ingest_key`]. Every
+/// other event kind is dropped.
+fn prompt_hook_items(
+    endpoint: &ServerEndpoint,
+    workspace: &str,
+    project: &str,
+    harness: ManagedHarness,
+    native_session_id: &str,
+    events: &[NewWorkstreamEvent],
+) -> Result<Vec<HookItem>> {
+    let agent = harness.agent_kind().as_str();
+    let resolved = resolve_occurred_at(events);
+    let mut items = Vec::new();
+    for (event, occurred_at) in events.iter().zip(&resolved.per_event) {
+        let Some(mapped) = map_event(None, native_session_id, event, occurred_at.as_deref()) else {
+            continue;
+        };
+        if mapped.event != "user-prompt" {
+            continue;
+        }
+        items.push(hook_item(
+            endpoint,
+            workspace,
+            project,
+            agent,
+            &mapped.event,
+            native_session_id,
+            &mapped.ingest_key,
+            None,
+            mapped.body,
+        )?);
+    }
+    Ok(items)
 }
 
 /// Per-event `occurred_at` resolution for one transcript, plus the session's
@@ -621,6 +825,7 @@ struct MappedEvent {
 /// body so the imported observation is dated at the transcript's own event
 /// time rather than at import time.
 fn map_event(
+    recovery_interval_id: Option<&str>,
     session_id: &str,
     event: &NewWorkstreamEvent,
     occurred_at: Option<&str>,
@@ -630,7 +835,12 @@ fn map_event(
         return None;
     }
     let role = event.role.as_deref().unwrap_or("");
-    let ingest_key = format!("{session_id}:{}", event.event_id);
+    let ingest_key = replay_ingest_key(
+        recovery_interval_id,
+        session_id,
+        event.kind.as_str(),
+        &event.event_id,
+    );
     match event.kind {
         WorkstreamEventKind::Message if role == "user" || role == "human" => Some(MappedEvent {
             event: "user-prompt".to_string(),
@@ -680,6 +890,27 @@ fn first_line(content: &str) -> String {
     }
 }
 
+fn replay_ingest_key(
+    recovery_interval_id: Option<&str>,
+    session_id: &str,
+    kind: &str,
+    event_id: &str,
+) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    for value in [
+        recovery_interval_id.unwrap_or_default(),
+        session_id,
+        kind,
+        event_id,
+    ] {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("recovery_{}", &digest[..55])
+}
+
 /// Build a `/hook` URL whose query the server parses for event/agent/scope. The
 /// URL is data the batch item carries, not the request target (that is
 /// `/hook/batch`), so it is built against this server's origin exactly as a live
@@ -720,32 +951,58 @@ fn hook_item(
     })
 }
 
-/// POST the events in server-sized batches, retrying the unaccepted suffix of a
-/// partially accepted batch (per-source rate limiting can skip a tail) before
-/// failing. Events are oldest-first, so a leading-prefix ack is safe to resume.
+/// POST events in server-sized batches. Recovery requires a modern per-item
+/// acknowledgement and fails closed on partial or terminal-drop outcomes.
+fn hook_batch_end(items: &[HookItem], offset: usize) -> Result<usize> {
+    let mut end = offset;
+    let mut bytes = 2_usize;
+    while end < items.len() && end - offset < HOOK_BATCH_ITEMS {
+        let item_bytes = serde_json::to_vec(&items[end])?.len().saturating_add(1);
+        if item_bytes > HOOK_BATCH_BYTES {
+            bail!("one sanitized hook item exceeds the recovery request byte limit");
+        }
+        if end > offset && bytes.saturating_add(item_bytes) > HOOK_BATCH_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(item_bytes);
+        end += 1;
+    }
+    Ok(end)
+}
+
 async fn post_hook_items(endpoint: &ServerEndpoint, items: &[HookItem]) -> Result<()> {
-    for chunk in items.chunks(HOOK_BATCH_ITEMS) {
-        let mut offset = 0usize;
+    let mut offset = 0_usize;
+    while offset < items.len() {
+        let end = hook_batch_end(items, offset)?;
+        let chunk = &items[offset..end];
         let mut stalled = 0u32;
-        while offset < chunk.len() {
-            let batch: Vec<&HookItem> = chunk[offset..].iter().collect();
+        loop {
+            let batch: Vec<&HookItem> = chunk.iter().collect();
             let ack: HookBatchAck = post_json(endpoint, "/hook/batch", &batch)
                 .await
                 .context("replaying transcript events through /hook/batch")?;
-            if ack.accepted == 0 {
+            let accepted = acknowledged_items(&ack, &batch)?;
+            if accepted.len() == batch.len() {
+                break;
+            }
+            if accepted.is_empty() {
                 stalled += 1;
                 if stalled >= 5 {
                     bail!(
-                        "server accepted none of a hook batch after {stalled} attempts \
+                        "server acknowledged none of a hook batch after {stalled} attempts \
                          (rate limited or saturated); rerun to resume"
                     );
                 }
                 tokio::time::sleep(Duration::from_millis(200 * u64::from(stalled))).await;
                 continue;
             }
-            stalled = 0;
-            offset += ack.accepted.min(chunk.len() - offset);
+            bail!(
+                "server acknowledged only {} of {} transcript items; keeping transcript for a safe retry",
+                accepted.len(),
+                batch.len()
+            );
         }
+        offset = end;
     }
     Ok(())
 }
@@ -888,6 +1145,7 @@ mod tests {
     #[test]
     fn user_message_maps_to_the_canonical_user_prompt() {
         let m = map_event(
+            None,
             "sid",
             &event(WorkstreamEventKind::Message, Some("user"), "do the thing"),
             Some("2026-09-10T12:00:00Z"),
@@ -901,14 +1159,606 @@ mod tests {
         assert_eq!(m.body["prompt"], "do the thing");
         assert_eq!(m.body["occurred_at"], "2026-09-10T12:00:00Z");
         assert_eq!(
-            m.ingest_key, "sid:evt-1",
+            m.ingest_key,
+            replay_ingest_key(None, "sid", "message", "evt-1"),
             "ingest key is stable per source event"
         );
+        assert_eq!(m.ingest_key.len(), 64);
+        assert!(
+            m.ingest_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+    }
+
+    #[test]
+    fn replay_keys_are_deterministic_valid_and_bounded_for_long_native_ids() {
+        let session = "native:".repeat(200);
+        let event = "event/with spaces:".repeat(200);
+        let first = replay_ingest_key(None, &session, "message", &event);
+        let second = replay_ingest_key(None, &session, "message", &event);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.starts_with("recovery_"));
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+        assert_ne!(
+            first,
+            replay_ingest_key(None, &session, "tool_call", &event)
+        );
+        let other_interval = replay_ingest_key(Some("journal-2"), &session, "message", &event);
+        assert_ne!(first, other_interval);
+        assert_eq!(
+            other_interval,
+            replay_ingest_key(Some("journal-2"), &session, "message", &event),
+            "one journal interval must replay stably"
+        );
+    }
+
+    #[test]
+    fn prompt_replay_keeps_only_user_prompts_with_backfill_keys() {
+        let endpoint = ServerEndpoint::for_hook_target("http://127.0.0.1:1".into(), None);
+        let with_id = |id: &str, mut e: NewWorkstreamEvent| {
+            e.event_id = id.to_string();
+            e
+        };
+        let events = [
+            with_id(
+                "p1",
+                event(WorkstreamEventKind::Message, Some("user"), "first ask"),
+            ),
+            with_id(
+                "a1",
+                event(WorkstreamEventKind::Message, Some("assistant"), "an answer"),
+            ),
+            with_id(
+                "t1",
+                event(WorkstreamEventKind::ToolCall, None, "run tests"),
+            ),
+            with_id(
+                "p2",
+                event(WorkstreamEventKind::Message, Some("user"), "second ask"),
+            ),
+        ];
+        let items = prompt_hook_items(
+            &endpoint,
+            "ws",
+            "proj",
+            ManagedHarness::Antigravity,
+            "sid",
+            &events,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 2, "only the two user prompts are replayed");
+        for (item, (id, prompt)) in items
+            .iter()
+            .zip([("p1", "first ask"), ("p2", "second ask")])
+        {
+            let url = reqwest::Url::parse(&item.url).unwrap();
+            let query = |name: &str| {
+                url.query_pairs()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.into_owned())
+            };
+            assert_eq!(query("event").as_deref(), Some("user-prompt"));
+            assert_eq!(query("agent").as_deref(), Some("antigravity-cli"));
+            assert_eq!(
+                query("extension"),
+                None,
+                "a prompt is not a backfill extension"
+            );
+            assert_eq!(
+                query("ingest_key"),
+                Some(replay_ingest_key(None, "sid", "message", id)),
+                "the key matches what backfill mints for the same event"
+            );
+            assert_eq!(item.body["prompt"], prompt);
+        }
+    }
+
+    #[test]
+    fn recovery_hook_batches_respect_count_and_serialized_byte_limits() {
+        let endpoint = ServerEndpoint::for_hook_target("http://127.0.0.1:1".into(), None);
+        let make = |size| HookItem {
+            url: endpoint.build_url("/hook?event=user-prompt"),
+            body: serde_json::json!({"prompt": "x".repeat(size)}),
+        };
+        let items = (0..HOOK_BATCH_ITEMS + 1)
+            .map(|_| make(1))
+            .collect::<Vec<_>>();
+        assert_eq!(hook_batch_end(&items, 0).unwrap(), HOOK_BATCH_ITEMS);
+
+        let large = vec![make(HOOK_BATCH_BYTES / 2), make(HOOK_BATCH_BYTES / 2)];
+        assert_eq!(hook_batch_end(&large, 0).unwrap(), 1);
+        assert!(
+            hook_batch_end(&[make(HOOK_BATCH_BYTES)], 0)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+
+    #[test]
+    fn acknowledgement_requires_results_and_rejects_terminal_drops() {
+        let endpoint = ServerEndpoint::for_hook_target("http://127.0.0.1:1".into(), None);
+        let item = hook_item(
+            &endpoint,
+            "ws",
+            "project",
+            "claude-code",
+            "user-prompt",
+            "sid",
+            "key",
+            None,
+            serde_json::json!({"session_id": "sid", "prompt": "hello"}),
+        )
+        .unwrap();
+        let items = [&item];
+        for outcome in [
+            "dropped_policy",
+            "dropped_subagent",
+            "dropped_unauthorized",
+            "dropped_collision",
+            "dropped_invalid",
+            "resumed",
+        ] {
+            let ack = HookBatchAck {
+                accepted: 1,
+                results: vec![HookBatchResult {
+                    index: 0,
+                    outcome: outcome.into(),
+                }],
+                accepted_indices: None,
+                failed_index: None,
+            };
+            assert!(acknowledged_items(&ack, &items).is_err(), "{outcome}");
+        }
+        let legacy = HookBatchAck {
+            accepted: 1,
+            results: Vec::new(),
+            accepted_indices: None,
+            failed_index: None,
+        };
+        assert!(acknowledged_items(&legacy, &items).is_err());
+    }
+
+    #[test]
+    fn acknowledgement_allows_stored_replayed_and_only_terminal_ignored_end() {
+        let endpoint = ServerEndpoint::for_hook_target("http://127.0.0.1:1".into(), None);
+        let make = |event| {
+            hook_item(
+                &endpoint,
+                "ws",
+                "project",
+                "claude-code",
+                event,
+                "sid",
+                "key",
+                None,
+                serde_json::json!({"session_id": "sid"}),
+            )
+            .unwrap()
+        };
+        let prompt = make("user-prompt");
+        let end = make("session-end");
+        for outcome in ["stored", "replayed"] {
+            let ack = HookBatchAck {
+                accepted: 1,
+                results: vec![HookBatchResult {
+                    index: 0,
+                    outcome: outcome.into(),
+                }],
+                accepted_indices: Some(vec![0]),
+                failed_index: None,
+            };
+            assert_eq!(acknowledged_items(&ack, &[&prompt]).unwrap(), vec![0]);
+        }
+        let ignored = HookBatchAck {
+            accepted: 1,
+            results: vec![HookBatchResult {
+                index: 0,
+                outcome: "ignored_end".into(),
+            }],
+            accepted_indices: Some(vec![0]),
+            failed_index: None,
+        };
+        assert!(acknowledged_items(&ignored, &[&prompt]).is_err());
+        assert_eq!(acknowledged_items(&ignored, &[&end]).unwrap(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn real_hook_router_replay_is_idempotent_and_reports_outcomes() {
+        use ai_memory_core::{ActiveProject, IngestMetrics, Sanitizer, SessionId};
+        use ai_memory_hooks::{
+            HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SubagentSessionSet,
+            hook_router,
+        };
+        use ai_memory_store::Store;
+        use ai_memory_wiki::Wiki;
+        use std::sync::Arc;
+        use tower::ServiceExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let workspace_id = store.writer.get_or_create_workspace("ws").await.unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let state = HookState {
+            workspace_id,
+            project_id,
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki: Wiki::new(temp.path(), store.writer.clone()).unwrap(),
+            consolidator: None,
+            sanitizer: Sanitizer::default(),
+            project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
+            active_project: ActiveProject::new(),
+            ingest_metrics: Arc::new(IngestMetrics::default()),
+            ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+            ingest_gates: IngestGates::default(),
+            ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
+            consolidate_on_session_end: false,
+            session_consolidation_notify: None,
+            profile_notify: None,
+            capture_assistant_enabled: false,
+            claim_handoff_on_session_start: true,
+            create_handoff_on_session_end: false,
+            subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
+            home_dir: None,
+            trusted_proxy_identity: false,
+            per_user_slots: false,
+            mid_session_routing: ai_memory_core::MidSessionRouting::default(),
+            profile: ai_memory_core::profile::ProfileSettings::default(),
+        };
+        let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
+        let sid = "native-session-with-a-very-long-identifier-that-would-break-the-old-key";
+        let recovery_interval_id = Some("journal");
+        let items = vec![
+            hook_item(
+                &endpoint,
+                "ws",
+                "project",
+                "claude-code",
+                "session-start",
+                sid,
+                &replay_ingest_key(recovery_interval_id, sid, "session-start", "boundary"),
+                None,
+                serde_json::json!({"session_id": sid, "cwd": "/repo"}),
+            )
+            .unwrap(),
+            hook_item(
+                &endpoint,
+                "ws",
+                "project",
+                "claude-code",
+                "user-prompt",
+                sid,
+                &replay_ingest_key(recovery_interval_id, sid, "message", "event-1"),
+                None,
+                serde_json::json!({"session_id": sid, "cwd": "/repo", "prompt": "same prompt"}),
+            )
+            .unwrap(),
+            hook_item(
+                &endpoint,
+                "ws",
+                "project",
+                "claude-code",
+                "session-end",
+                sid,
+                &replay_ingest_key(recovery_interval_id, sid, "session-end", "boundary"),
+                None,
+                serde_json::json!({"session_id": sid, "cwd": "/repo"}),
+            )
+            .unwrap(),
+        ];
+        let spool = crate::commands::hook_spool::spool_dir(temp.path());
+        let overlapping = hook_item(
+            &endpoint,
+            "ws",
+            "project",
+            "claude-code",
+            "user-prompt",
+            sid,
+            "random_live_key",
+            None,
+            serde_json::json!({"session_id": sid, "cwd": "/repo", "prompt": "same prompt"}),
+        )
+        .unwrap();
+        crate::commands::hook_spool::enqueue(
+            &spool,
+            &crate::commands::hook_spool::entry_for(
+                overlapping.url,
+                overlapping.body.to_string(),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        let quarantine = crate::commands::hook_spool::quarantine_session_entries(
+            &Config::default(),
+            &spool,
+            "journal",
+            0,
+            u64::MAX,
+            &endpoint.identity(),
+            "claude-code",
+            "ws",
+            "project",
+            Path::new("/repo"),
+            sid,
+        )
+        .unwrap();
+        assert_eq!(crate::commands::hook_spool::spool_len(&spool), 0);
+
+        let body = serde_json::to_vec(&items).unwrap();
+        let first = hook_router(state.clone())
+            .oneshot(
+                axum::http::Request::post("/hook/batch")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        let first: HookBatchAck = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            acknowledged_items(&first, &items.iter().collect::<Vec<_>>())
+                .unwrap()
+                .len(),
+            3
+        );
+        let second = hook_router(state.clone())
+            .oneshot(
+                axum::http::Request::post("/hook/batch")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let second: HookBatchAck = serde_json::from_slice(
+            &axum::body::to_bytes(second.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            second
+                .results
+                .iter()
+                .any(|result| result.outcome == "replayed")
+        );
+        assert!(
+            second
+                .results
+                .iter()
+                .any(|result| result.outcome == "ignored_end")
+        );
+        let observations = store
+            .reader
+            .observations_for_session(SessionId::from_native(sid))
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 3);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.body == "same prompt")
+                .count(),
+            1
+        );
+        quarantine.complete().unwrap();
+    }
+
+    /// Two sequential offline intervals on one resumed native session: the
+    /// second interval's journal id gives its boundary and content keys their
+    /// own identity, so its session-end is STORED (re-closing the session with
+    /// its end-of-session effects) instead of being short-circuited as a
+    /// replay of the first interval's end, while re-running either interval
+    /// stays a pure replay.
+    #[tokio::test]
+    async fn two_sequential_recovery_intervals_on_one_resumed_session_replay_exactly_once() {
+        use ai_memory_core::{ActiveProject, IngestMetrics, ObservationKind, Sanitizer, SessionId};
+        use ai_memory_hooks::{
+            HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SubagentSessionSet,
+            hook_router,
+        };
+        use ai_memory_store::Store;
+        use ai_memory_wiki::Wiki;
+        use std::sync::Arc;
+        use tower::ServiceExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let workspace_id = store.writer.get_or_create_workspace("ws").await.unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let state = HookState {
+            workspace_id,
+            project_id,
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki: Wiki::new(temp.path(), store.writer.clone()).unwrap(),
+            consolidator: None,
+            sanitizer: Sanitizer::default(),
+            project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
+            active_project: ActiveProject::new(),
+            ingest_metrics: Arc::new(IngestMetrics::default()),
+            ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+            ingest_gates: IngestGates::default(),
+            ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
+            consolidate_on_session_end: false,
+            session_consolidation_notify: None,
+            profile_notify: None,
+            capture_assistant_enabled: false,
+            claim_handoff_on_session_start: true,
+            create_handoff_on_session_end: false,
+            subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
+            home_dir: None,
+            trusted_proxy_identity: false,
+            per_user_slots: false,
+            mid_session_routing: ai_memory_core::MidSessionRouting::default(),
+            profile: ai_memory_core::profile::ProfileSettings::default(),
+        };
+        let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
+        let sid = "native-session-resumed-across-two-offline-intervals";
+        let interval_items = |journal: &str, prompt: &str, event_id: &str| {
+            vec![
+                hook_item(
+                    &endpoint,
+                    "ws",
+                    "project",
+                    "claude-code",
+                    "session-start",
+                    sid,
+                    &replay_ingest_key(Some(journal), sid, "session-start", "boundary"),
+                    None,
+                    serde_json::json!({"session_id": sid, "cwd": "/repo"}),
+                )
+                .unwrap(),
+                hook_item(
+                    &endpoint,
+                    "ws",
+                    "project",
+                    "claude-code",
+                    "user-prompt",
+                    sid,
+                    &replay_ingest_key(Some(journal), sid, "message", event_id),
+                    None,
+                    serde_json::json!({"session_id": sid, "cwd": "/repo", "prompt": prompt}),
+                )
+                .unwrap(),
+                hook_item(
+                    &endpoint,
+                    "ws",
+                    "project",
+                    "claude-code",
+                    "session-end",
+                    sid,
+                    &replay_ingest_key(Some(journal), sid, "session-end", "boundary"),
+                    None,
+                    serde_json::json!({"session_id": sid, "cwd": "/repo"}),
+                )
+                .unwrap(),
+            ]
+        };
+        let router_state = state.clone();
+        let post = move |items: Vec<HookItem>| {
+            let state = router_state.clone();
+            async move {
+                let response = hook_router(state)
+                    .oneshot(
+                        axum::http::Request::post("/hook/batch")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(serde_json::to_vec(&items).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                let ack: HookBatchAck = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    acknowledged_items(&ack, &items.iter().collect::<Vec<_>>())
+                        .unwrap()
+                        .len(),
+                    items.len()
+                );
+                ack.results
+                    .into_iter()
+                    .map(|result| result.outcome)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let first = interval_items("journal-a", "first interval prompt", "event-1");
+        assert_eq!(
+            post(first.clone()).await,
+            vec!["stored", "stored", "stored"],
+            "the first offline interval recovers exactly once"
+        );
+        let second = interval_items("journal-b", "second interval prompt", "event-2");
+        assert_eq!(
+            post(second.clone()).await,
+            vec!["stored", "stored", "stored"],
+            "the resumed interval's content and session-end must be stored, not replayed"
+        );
+
+        let observations = store
+            .reader
+            .observations_for_session(SessionId::from_native(sid))
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 6, "two start/end pairs and two prompts");
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.body == "first interval prompt")
+                .count(),
+            1
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.body == "second interval prompt")
+                .count(),
+            1
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.kind == ObservationKind::SessionEnd)
+                .count(),
+            2,
+            "each interval's session-end is its own stored observation"
+        );
+
+        for rerun in [first, second] {
+            assert!(
+                rerun
+                    .iter()
+                    .zip(post(rerun.clone()).await)
+                    .all(|(item, outcome)| {
+                        let is_end = reqwest::Url::parse(&item.url)
+                            .unwrap()
+                            .query_pairs()
+                            .any(|(key, value)| key == "event" && value == "session-end");
+                        outcome == "replayed" || (is_end && outcome == "ignored_end")
+                    }),
+                "re-running a recovered interval is a pure replay"
+            );
+        }
+        let observations = store
+            .reader
+            .observations_for_session(SessionId::from_native(sid))
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 6, "replays add no observations");
     }
 
     #[test]
     fn assistant_and_tool_events_map_to_backfill_extension_observations() {
         let a = map_event(
+            None,
             "sid",
             &event(
                 WorkstreamEventKind::Message,
@@ -931,6 +1781,7 @@ mod tests {
         );
 
         let t = map_event(
+            None,
             "sid",
             &event(WorkstreamEventKind::ToolCall, None, "grep foo"),
             None,
@@ -1050,6 +1901,7 @@ mod tests {
     fn empty_and_boundary_events_are_dropped() {
         assert!(
             map_event(
+                None,
                 "sid",
                 &event(WorkstreamEventKind::Message, Some("user"), "   "),
                 None,
@@ -1063,7 +1915,7 @@ mod tests {
             WorkstreamEventKind::Annotation,
         ] {
             assert!(
-                map_event("sid", &event(kind, None, "boundary"), None).is_none(),
+                map_event(None, "sid", &event(kind, None, "boundary"), None).is_none(),
                 "{kind:?} is not session content"
             );
         }

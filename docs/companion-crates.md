@@ -79,8 +79,10 @@ the public MCP write/delete tools. It must never open the wiki directory or
 SQLite directly. The core read seam is `/api/v1` in API-only mode; the supported
 MCP page arguments are documented in [programmatic memory](programmatic-memory.md).
 
-Slice 1 (read-only export) shipped as
-[`ai-memory-wikisync`](#ai-memory-wikisync-read-only-team-wiki-export)
+Slice 1 (read-only export), slice 3 (two-way sync through the MCP write
+tool), slice 4 (conditional writes and opt-in deletes) and slice 5 (the CI
+check and post-merge hook) ship as
+[`ai-memory-wikisync`](#ai-memory-wikisync-team-wiki-export-and-sync)
 below; the remaining slices are tracked in #986.
 
 ## `ai-memory-client`: shared private capture privacy
@@ -234,9 +236,9 @@ Re-home by kind:
 6. Only after repeated usage, consider whether ai-memory core lacks a small,
    generic API seam; do not start by patching core endpoints.
 
-## `ai-memory-wikisync`: read-only team-wiki export
+## `ai-memory-wikisync`: team-wiki export and sync
 
-Slice 1 of the accepted [team-wiki sync](#proposed-team-wiki-sync-986)
+Slices 1, 3, 4 and 5 of the accepted [team-wiki sync](#proposed-team-wiki-sync-986)
 shape, implemented at [`companions/ai-memory-wikisync`](../companions/ai-memory-wikisync)
 as a standalone Cargo package with its own `[workspace]` (mirroring the
 importer): it is not a member of the root workspace and is not covered by
@@ -246,21 +248,35 @@ root `cargo test --workspace`.
 
 Mirror a team's shared ai-memory pages into a project repository as
 reviewable markdown, so the wiki a team actually maintains can travel with
-the code it documents — read-only, family-scoped, and dry-run by default.
+the code it documents, and let reviewed repository edits flow back —
+family-scoped and dry-run by default.
 
 ### How it talks to ai-memory
 
 - `plan` (always dry-run) and `export` (dry-run unless `--apply`) against
   the documented read-only `/api/v1` surface: incremental `recent` listing
   with cursor paging (legacy array accepted) plus single-page reads with
-  `ETag` / `If-None-Match` revalidation. No MCP, no admin routes, no
-  writes to the server.
+  `ETag` / `If-None-Match` revalidation. No admin routes.
+- `sync` (dry-run unless `--apply`) also writes to the server, and only
+  through the public `memory_write_page` and `memory_delete_page` MCP tools
+  with explicit `workspace` and `project`, so sanitization, admission and
+  attribution apply. Every call carries the classified page version
+  (`expected_page_id`, or `create_only` for a new page). It never opens the
+  wiki directory or SQLite, and refuses to write to a server older than 2.7,
+  which would ignore the precondition.
+- `sync --check` is read-only (no files, no state) and exits 0 in sync,
+  3 on drift, 4 on conflicts or refusals; a clone without state compares
+  the repository with the server directly. `install-hook` writes a marked
+  git `post-merge` block that runs `sync` (a dry-run report unless
+  `--on-merge apply`; never `--prefer`) and `uninstall-hook` removes only
+  that block.
 - `--include FAMILY` is an explicit, repeatable allowlist of top-level
   wiki directories; at least one is required and a bare `*` is refused.
 - Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` only;
   tokens are never logged or persisted.
-- Writes exactly the server's canonical projection (path, title, body)
-  with no forged attribution/generated frontmatter. All local bookkeeping
+- Each file is the server body under a fixed frontmatter of the fields a
+  write round-trips (`title`, `tags`, `pinned`, and `tier` when not the
+  default), never server-generated or attribution keys. All local bookkeeping
   lives in one state file under the destination
   (`.ai-memory-wikisync/state.json`, 0600, atomically replaced after each
   successful write batch). The directory ignores itself with a `.gitignore`
@@ -272,8 +288,9 @@ the code it documents — read-only, family-scoped, and dry-run by default.
   state, server body): files edited locally since the last export are
   reported with a diff summary and the whole batch is refused without
   `--force`.
-- Never deletes anything (deletes are slice 4); never runs git, commits,
-  or pushes — it prints the commands the operator may run.
+- `plan` and `export` never delete; `sync` deletes only with
+  `--propagate-deletes`. It never runs git, commits, or pushes — it prints
+  the commands (`git add`, `git rm`) the operator may run.
 - Destination-path safety: traversal, dotfiles, reserved Windows names,
   non-portable characters, case-fold collisions, oversized bodies,
   symlinked destinations/components/state directories, and unknown page
@@ -281,6 +298,32 @@ the code it documents — read-only, family-scoped, and dry-run by default.
   (tmp + rename + fsync).
 - Page bodies are untrusted data, transported verbatim and never executed
   or rendered.
+- `sync` changes one side only when the other is unchanged since the last
+  sync; a page changed on both sides is refused until `--prefer repo` or
+  `--prefer server`. Deletes are reported unless `--propagate-deletes` is
+  passed; then a side unchanged since the last sync is deleted, and a delete
+  against an edit is a conflict that `--prefer` resolves (`repo`: delete the
+  page or re-create it with `create_only`; `server`: re-export or delete the
+  file). More than `--max-deletes` (default 10) refuses the whole run; a
+  pinned server page is deleted only with `--prefer repo`; a file is deleted
+  only through the write path checks (no symlinks, confined to `--dest`) and
+  only if it still holds the classified bytes. A delete that is not
+  propagated keeps its state entry.
+- The post-merge hook never stores a token (`--token` is refused; the hook
+  reads `AI_MEMORY_AUTH_TOKEN` at merge time), single-quotes every argument
+  and refuses newlines or NUL, is written atomically with mode 0755, refuses
+  a symlinked hook, appends to a foreign hook only with `--append` and a
+  POSIX shell shebang, and refuses a repository whose config sets
+  `core.hooksPath` (use `--hooks-dir` or `--print`). The hooks directory is
+  found by reading `.git` (worktree `gitdir:` and `commondir` included); git
+  is never run.
+- An import requires the file's frontmatter (a write clears what it omits),
+  and is refused for a server page carrying any metadata the write cannot
+  carry (`summary`, `sources`, `kind`, …), naming the keys.
+- Every import and delete is conditional on the page version the plan
+  classified, so the server refuses one that changed in between. That page
+  is reported as changed during the run and keeps its state; the other pages
+  still sync and the run exits non-zero.
 
 ### Validation
 
@@ -293,16 +336,32 @@ cargo clippy --manifest-path companions/ai-memory-wikisync/Cargo.toml --all-targ
 Unit tests cover the path-safety matrix, the allowlist rules, state
 hash/crash behavior and local-edit refusal; integration tests run the
 full plan/export flow against a fixture axum server serving `/api/v1`
-responses (200/ETag/304/401/404 and cursor pagination).
+responses (200/ETag/304/401/404 and cursor pagination), and the sync flow
+against the same fixture's `POST /mcp` with the server's replace semantics:
+imports with metadata, creates, conflicts and `--prefer`, the
+metadata-loss refusal, the version preconditions the fixture enforces (a
+stale version is reported while the other pages apply), the old-server
+refusal, delete notices and propagated deletes with each `--prefer`, the
+delete ceiling, the pinned-page and symlink refusals, sanitizer rewrites and
+the upgrade of a slice 1 export. Binary-level tests check the `--check` exit
+codes, that it leaves the destination untouched, and drift in a clone without
+state; hook tests cover fresh install, reinstall, foreign hooks and
+`--append`, shebangs, `core.hooksPath`, worktrees, a `$(…)` workspace name
+that stays inert when the hook runs, and that a token in the environment
+never reaches the hook file.
 
 ### Roadmap (#986)
 
-1. This slice — read-only export into a project repository.
-2. Conditional mutation seam (compare-and-write) in core, if independently
-   justified.
-3. Bidirectional apply through public write tools.
-4. Deletes and conflict reporting.
-5. Post-merge hook / CI integration.
+1. Read-only export into a project repository (shipped).
+2. Conditional mutation seam in core (shipped in 2.7: `expected_page_id` /
+   `create_only` on `memory_write_page`, `expected_page_id` on
+   `memory_delete_page`, and the version id on `memory_read_page` and
+   `/api/v1` pages).
+3. Bidirectional apply through public write tools (shipped as `sync`).
+4. Deletes and conflict reporting (shipped: `sync --propagate-deletes`,
+   `--max-deletes`, conditional writes and deletes).
+5. Post-merge hook / CI integration (shipped: `install-hook`,
+   `uninstall-hook`, `sync --check`).
 
 ## `ai-memory-macos`: menu bar wrapper
 

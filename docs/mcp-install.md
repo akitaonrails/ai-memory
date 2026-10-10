@@ -237,9 +237,10 @@ native HTTP or generated bridge paths.
 
 ## GitHub Copilot CLI
 
-**Status:** MCP and lifecycle hooks are supported. Handoffs are not injected
-at `SessionStart` yet (see below), and there is no managed workstream
-(`ai-memory run copilot`).
+**Status:** MCP and lifecycle hooks are supported, the `SessionStart` hook
+injects the pending handoff (see below), and `ai-memory run copilot` launches
+Copilot CLI as a managed workstream harness (see
+[managed workstreams](managed-workstreams.md)).
 
 **Config files:** `$COPILOT_HOME/mcp-config.json` for MCP and
 `$COPILOT_HOME/hooks/ai-memory.json` for lifecycle hooks (`COPILOT_HOME`
@@ -816,6 +817,28 @@ ai-memory's subagent events). Zero discards `sessionStart` hook stdout, so
 capture and session-end handoff *creation* work, but handoff *injection*
 does not — ask Zero to call `memory_handoff_accept` at the start of a
 resumed session.
+
+Zero runs hook commands inside its execution sandbox. The default policy
+denies all network, loopback included (a separate network namespace on
+Linux, `(deny network*)` on macOS), mounts `/` read-only with writes limited
+to the workspace and temp, and kills a hook's detached children when the
+hook exits. Hooks therefore cannot reach `server_url`: events land in
+`<data_dir>/hook-spool/` and stay there. Zero only lets the user's global
+`~/.config/zero/config.json` relax this (a project config can only tighten
+it), and ai-memory does not edit that file. Either add
+
+```json
+"sandbox": {
+  "network": "allow",
+  "additionalWriteRoots": ["<ai-memory data dir>"]
+}
+```
+
+(network access is all-or-nothing and applies to every shell command Zero
+runs, not only hooks), or set `"sandbox": {"enabled": false}`. Without
+either, run `ai-memory hook-drain` from a normal shell to deliver the
+spooled events. A leftover empty `hook-spool/.drain.lock` does not block
+that drain: the lock is an OS file lock released when its holder exits.
 
 ## ZCode (z.ai)
 
@@ -1492,8 +1515,9 @@ managed routing package. The `memory_install_self_routing` tool is read-only:
 it returns the slim markered instruction block, marker strings, agent filename
 hints, managed skill payloads (`name`, `description`, `relative_path`,
 `content`), and authoritative project/global target hints for `.claude/skills`,
-`.agents/skills`, `.grok/skills`, and `$GROK_HOME/skills` (default
-`~/.grok/skills`), plus overwrite guidance. Agents should use their own file
+`.agents/skills`, `.grok/skills`, `$GROK_HOME/skills` (default
+`~/.grok/skills`), GitHub Copilot CLI's `.github/skills` and
+`$COPILOT_HOME/skills` (default `~/.copilot/skills`), plus overwrite guidance. Agents should use their own file
 editing tools to write those artifacts while preserving unrelated user content.
 
 If the model doesn't see any of those tools, the MCP registration

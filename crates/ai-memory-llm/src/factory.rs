@@ -11,6 +11,7 @@ use crate::AnthropicProvider;
 use crate::CodexProvider;
 use crate::CopilotEmbedder;
 use crate::CopilotProvider;
+use crate::CursorAgentProvider;
 use crate::GeminiProvider;
 use crate::OpenAiCompatProvider;
 use crate::OpenAiOAuthProvider;
@@ -45,6 +46,8 @@ pub enum ProviderChoice {
     /// OpenCode cloud API (OpenAI-compatible endpoint). Defaults to the Go
     /// endpoint; `base_url` selects Zen's general catalogue instead.
     OpenCode,
+    /// Cursor subscription via the logged-in `agent` CLI (`--print --mode ask`).
+    Cursor,
 }
 
 impl ProviderChoice {
@@ -61,6 +64,7 @@ impl ProviderChoice {
             Self::Copilot => "copilot",
             Self::AnthropicOAuth => "anthropic-oauth",
             Self::OpenCode => "opencode",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -87,6 +91,7 @@ impl ProviderChoice {
             Self::OpenCode => AuthRequirement::RequiredApiKey {
                 env_var: "OPENCODE_API_KEY",
             },
+            Self::Cursor => AuthRequirement::CursorCli,
         }
     }
 
@@ -123,6 +128,14 @@ pub struct ProviderConfig {
     /// parser. Enabled by default and ignored by every other provider.
     /// Sourced once from `AI_MEMORY_LLM_COMPAT_STRICT` by `Config::load`.
     pub compat_strict: bool,
+    /// OpenAI-compat only: send
+    /// `chat_template_kwargs: {"enable_thinking": false}` with every chat
+    /// request, for thinking-capable local engines (vLLM / SGLang serving
+    /// Qwen3-class models) that would otherwise spend the output budget on
+    /// a reasoning pass and truncate the structured payload. Opt-in, off
+    /// by default, ignored by every other provider. Sourced once from
+    /// `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` by `Config::load`.
+    pub compat_disable_thinking: bool,
     /// Per-request timeout for every chat provider, in seconds.
     /// Sourced once from `AI_MEMORY_LLM_TIMEOUT_SECS` by `Config::load`;
     /// defaults to [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`].
@@ -419,6 +432,7 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
                     .with_strict(config.compat_strict)
+                    .with_disable_thinking(config.compat_disable_thinking)
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers)
@@ -464,6 +478,12 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                     .with_extra_headers(extra_headers),
             ))
         }
+        ProviderChoice::Cursor => {
+            let auth = config.auth.require_cursor_auth()?;
+            Ok(Arc::new(
+                CursorAgentProvider::new(auth, config.model).with_timeout_secs(timeout),
+            ))
+        }
         ProviderChoice::OpenCode => {
             let key = config.auth.require_api_key()?;
             // Defaults to Go; an operator reaches Zen's general catalogue
@@ -506,6 +526,8 @@ mod tests {
             ProviderChoice::OpenAiOAuth,
             ProviderChoice::Copilot,
             ProviderChoice::AnthropicOAuth,
+            ProviderChoice::Codex,
+            ProviderChoice::Cursor,
         ] {
             assert!(
                 !choice.endpoint_is_operator_chosen(),
@@ -557,6 +579,11 @@ mod tests {
         assert_eq!(
             ProviderChoice::AnthropicOAuth.auth_requirement(),
             AuthRequirement::AnthropicOAuthToken
+        );
+        assert_eq!(ProviderChoice::Cursor.name(), "cursor");
+        assert_eq!(
+            ProviderChoice::Cursor.auth_requirement(),
+            AuthRequirement::CursorCli
         );
     }
 
@@ -639,6 +666,7 @@ mod tests {
             auth: ProviderAuth::required_api_key_from_env("OPENAI_API_KEY", None),
             base_url: None,
             compat_strict: false,
+            compat_disable_thinking: false,
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers: crate::ExtraHeaders::default(),
@@ -658,6 +686,7 @@ mod tests {
             auth: ProviderAuth::optional_api_key_from_env("LLM_API_KEY", None),
             base_url: Some("http://127.0.0.1:11434/v1".into()),
             compat_strict: true,
+            compat_disable_thinking: false,
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers,
@@ -706,6 +735,7 @@ mod tests {
             ),
             base_url: None,
             compat_strict: false,
+            compat_disable_thinking: false,
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers: headers,

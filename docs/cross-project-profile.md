@@ -99,6 +99,17 @@ folder: `stack`, `architecture`, `workflow`, `testing`, `tools`, `style` or
 | `applies_to` | Stack tags the entry is scoped to, e.g. `[rust]` or `typescript`. |
 | `enforced_by` | Something already enforces it (e.g. `pre-push hook`); kept out of the digest. |
 
+`memory_write_page` and `ai-memory write-page` set the last two directly:
+`applies_to: ["rust"]` and `enforced_by: "pre-push hook"` in the tool call,
+or `--applies-to rust --enforced-by "pre-push hook"` on the command line
+(with `--workspace default --project _global --path profile/...` in the
+default deployment). A tag must be one the profile detects in a project
+(`rust`, `typescript`, `python`, ...); an unknown tag is refused rather than
+silently hiding the entry. Like the other metadata, a rewrite that omits them
+clears them. Both are refused on a page the digest does not read: one outside
+`profile/`, or a `profile/` path in a project other than `_global` or a
+profile project.
+
 Entries are ordinary wiki pages, markdown in git: edit them by hand, and every
 change is versioned. `memory_delete_page` with `scope: "profile"` removes one
 (git keeps its history). Most entries, though, are learned on their own; see
@@ -172,10 +183,16 @@ is new since the last one.
   code blocks never are. A sentence that reads like agent output (markdown
   bold, or a `file.ext:line` reference) is skipped too: on hosts where agents
   brief each other through the prompt channel, that text is a lead agent's
-  task brief or a pasted review, not you. Your verbatim words are kept as
-  evidence.
+  task brief or a pasted review, not you. Text you did not write is skipped
+  as well: a harness turn stored as a prompt (Claude Code's
+  `<task-notification>` blocks), the instruction files Codex injects as a user
+  message, and ai-memory's own routing snippet or recalled-history digest
+  pasted into a prompt (only that block; your sentences around it still
+  count). Your verbatim words are kept as evidence.
 - **Curated pages** of the project: `_rules/`, `decisions/`, `gotchas/` and
-  `procedures/`.
+  `procedures/`. A page contributes its `summary`, or else its first line of
+  prose; metadata fields such as `**Status:** Accepted` or `**Date:**` at the
+  top of an ADR are skipped.
 - **Stack signals**: the languages the project's activity shows (from file
   names such as `Cargo.toml` and source extensions).
 

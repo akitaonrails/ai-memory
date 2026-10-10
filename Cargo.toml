@@ -126,6 +126,7 @@ notify = "8"
 notify-debouncer-full = "0.6"
 sysinfo = "0.32"
 fs2 = "0.4"
+libc = "0.2"
 
 # Windows NTFS file-index (inode equivalent) for own-write detection.
 winapi-util = "0.1"

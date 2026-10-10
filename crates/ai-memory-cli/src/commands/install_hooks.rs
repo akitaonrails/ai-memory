@@ -1625,6 +1625,7 @@ pub(crate) fn hook_config_target_with(
         }
         AgentChoice::Grok => grok_hooks_path_in(env("GROK_HOME")),
         AgentChoice::AntigravityCli => antigravity_hooks_path(),
+        AgentChoice::CopilotCli => copilot_cli_hooks_path_in(env("COPILOT_HOME")),
         other => anyhow::bail!(
             "{} is not auto-wired by `ai-memory run`",
             other.kind().as_str()
@@ -4317,6 +4318,7 @@ function discoverRemoteIdentity(cwd: string | undefined): string | undefined {
       const remote = execFileSync("git", ["-C", cwd, "config", "--get", `remote.${name}.url`], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
       });
       const identity = normalizeRemote(remote);
       if (identity) return identity;
@@ -6344,10 +6346,32 @@ fn apply_to_zero_hooks(
              re-enable them."
         );
     }
-    println!("# NOTE: Zero discards sessionStart hook stdout — capture works, but");
-    println!("#       handoff injection does not. Recover a prior session's handoff");
-    println!("#       via the MCP `memory_handoff_accept` tool.");
+    print!("{}", zero_install_notes(data_dir.display()));
     Ok(())
+}
+
+/// Caveats printed after both the Zero dry-run and `--apply` (#1172).
+/// Zero runs hook commands inside its execution sandbox, which by
+/// default denies all network (loopback included), keeps `/` read-only
+/// outside the workspace and temp, and kills a hook's detached children
+/// when it exits. Only the user's global Zero config can relax that, and
+/// ai-memory must not edit it, so the note names the keys instead.
+pub(crate) fn zero_install_notes(data_dir: impl std::fmt::Display) -> String {
+    format!(
+        "# NOTE: Zero discards sessionStart hook stdout — capture works, but\n\
+         #       handoff injection does not. Recover a prior session's handoff\n\
+         #       via the MCP `memory_handoff_accept` tool.\n\
+         # NOTE: Zero runs hooks inside its sandbox, which by default blocks all\n\
+         #       network (127.0.0.1 too) and writes outside the workspace, so\n\
+         #       events stay in the hook spool instead of reaching the server.\n\
+         #       To deliver live, set in the global ~/.config/zero/config.json:\n\
+         #         \"sandbox\": {{\"network\": \"allow\",\n\
+         #                     \"additionalWriteRoots\": [\"{}\"]}}\n\
+         #       (network allow applies to every Zero shell command), or\n\
+         #       \"sandbox\": {{\"enabled\": false}}. Otherwise run `ai-memory\n\
+         #       hook-drain` from a normal shell to deliver spooled events.\n",
+        data_dir
+    )
 }
 
 /// Print Zero's hooks.json to stdout (dry-run counterpart of
@@ -6374,9 +6398,7 @@ fn render_zero(
         println!("# Auth: token embedded in each hook's args below.");
         println!("#       Treat hooks.json as sensitive (chmod 600).");
     }
-    println!("# NOTE: Zero discards sessionStart hook stdout — capture works, but");
-    println!("#       handoff injection does not. Recover a prior session's handoff");
-    println!("#       via the MCP `memory_handoff_accept` tool.");
+    print!("{}", zero_install_notes(data_dir.display()));
     println!();
     println!("{serialized}");
     Ok(())
@@ -8279,6 +8301,24 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
                 .all(|h| h["command"] != serde_json::json!("/old/ai-memory")),
             "the stale command path must be replaced"
         );
+    }
+
+    // Issue #1172: Zero runs hooks in its sandbox (no network, read-only
+    // `/`), so the install note must say how events get delivered.
+    #[test]
+    fn zero_install_notes_explain_the_hook_sandbox() {
+        let notes = zero_install_notes(Path::new("/data/ai-memory").display());
+        assert!(notes.contains("sessionStart"), "{notes}");
+        assert!(notes.contains("sandbox"), "{notes}");
+        assert!(notes.contains("~/.config/zero/config.json"), "{notes}");
+        assert!(notes.contains(r#""network": "allow""#), "{notes}");
+        assert!(
+            notes.contains(r#""additionalWriteRoots": ["/data/ai-memory"]"#),
+            "{notes}"
+        );
+        assert!(notes.contains(r#""enabled": false"#), "{notes}");
+        assert!(notes.contains("hook-drain"), "{notes}");
+        assert!(notes.lines().all(|l| l.starts_with('#')), "{notes}");
     }
 
     #[test]
@@ -10260,7 +10300,7 @@ model = "gpt-5"
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(plugin.matches("windowsHide: true").count(), 2);
+        assert_eq!(plugin.matches("windowsHide: true").count(), 3);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -10691,7 +10731,7 @@ model = "gpt-5"
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(extension.contains("function repoRootProject"));
         assert!(extension.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(extension.matches("windowsHide: true").count(), 2);
+        assert_eq!(extension.matches("windowsHide: true").count(), 3);
         assert!(extension.contains("--git-common-dir"));
         assert!(
             extension
@@ -11423,7 +11463,7 @@ model = "gpt-5"
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(!extension.contains(".omp"));
         assert!(extension.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(extension.matches("windowsHide: true").count(), 2);
+        assert_eq!(extension.matches("windowsHide: true").count(), 3);
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
         // #676: the pi string-transform (api.on( -> pi.on() must still

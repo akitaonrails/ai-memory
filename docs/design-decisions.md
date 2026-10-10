@@ -325,7 +325,7 @@ Top-line rules carved into the codebase:
 
 Managed cross-harness continuity is explicitly opt-in through `ai-memory run`.
 Direct Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
-CLI, OMP, Grok Build CLI, and Antigravity CLI launches retain the existing hook
+CLI, OMP, Grok Build CLI, Antigravity CLI, and GitHub Copilot CLI launches retain the existing hook
 and single-use handoff behavior. There is
 no process-global mode or manual harness switch: the wrapper selects the
 current repository/worktree workstream and each adapter applies that harness's

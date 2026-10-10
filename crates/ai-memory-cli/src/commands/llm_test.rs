@@ -24,6 +24,7 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         auth: config.provider_auth(provider, api_key_override),
         base_url: args.base_url.or_else(|| config.llm_test_base_url(provider)),
         compat_strict: config.llm_compat_strict,
+        compat_disable_thinking: config.llm_compat_disable_thinking,
         request_timeout_secs: config.llm_timeout_secs,
         reasoning_effort: config.llm_reasoning_effort,
         extra_headers: config
@@ -86,6 +87,7 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::Codex => Self::Codex,
             LlmProviderChoice::Copilot => Self::Copilot,
             LlmProviderChoice::Opencode => Self::OpenCode,
+            LlmProviderChoice::Cursor => Self::Cursor,
         }
     }
 }
@@ -99,6 +101,14 @@ mod tests {
         assert_eq!(
             ProviderChoice::from(LlmProviderChoice::AnthropicOauth),
             ProviderChoice::AnthropicOAuth
+        );
+    }
+
+    #[test]
+    fn cursor_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::Cursor),
+            ProviderChoice::Cursor
         );
     }
 

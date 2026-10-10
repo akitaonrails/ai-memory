@@ -1642,6 +1642,9 @@ pub struct PageAuthor {
 /// Returned by [`ReaderPool::page_meta`].
 #[derive(Debug, Clone, Serialize)]
 pub struct PageMeta {
+    /// Id of this (latest) version: the token a conditional write or delete
+    /// passes back to act only on the version it saw.
+    pub id: PageId,
     /// Name of the workspace.
     pub workspace_name: String,
     /// Name of the project.
@@ -7480,7 +7483,7 @@ impl ReaderPool {
                         {kind_expr}, \
                         pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                         sp.path AS supersedes_path, \
-                        au.username, au.name, au.email, pg.expires_at \
+                        au.username, au.name, au.email, pg.expires_at, pg.id \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
@@ -7513,7 +7516,7 @@ impl ReaderPool {
                         {kind_expr}, \
                         pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                         sp.path AS supersedes_path, \
-                        au.username, au.name, au.email, pg.expires_at \
+                        au.username, au.name, au.email, pg.expires_at, pg.id \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
@@ -8412,7 +8415,7 @@ impl ReaderPool {
                         {kind_expr}, \
                         pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                         sp.path AS supersedes_path, \
-                        au.username, au.name, au.email, pg.expires_at \
+                        au.username, au.name, au.email, pg.expires_at, pg.id \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
@@ -10397,6 +10400,7 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
     let author_name: Option<String> = row.get(13)?;
     let author_email: Option<String> = row.get(14)?;
     let expires_us: Option<i64> = row.get(15)?;
+    let id_bytes: Vec<u8> = row.get(16)?;
     let author = author_username.map(|username| PageAuthor {
         username,
         name: author_name,
@@ -10407,6 +10411,8 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, 0))?;
     let project_id = ProjectId::from_slice(&proj_id_bytes)
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, 0))?;
+    let id = PageId::from_slice(&id_bytes)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(16, 0))?;
 
     let created_at = jiff::Timestamp::from_microsecond(created_us)
         .map(|ts| ts.to_string())
@@ -10420,6 +10426,7 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
         .map(|ts| ts.to_string());
 
     Ok(Ok(PageMeta {
+        id,
         workspace_name,
         project_name,
         workspace_id,

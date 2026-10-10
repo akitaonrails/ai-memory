@@ -53,6 +53,7 @@ pub(crate) const SCANNED_HARNESSES: &[ManagedHarness] = &[
     ManagedHarness::KiroV3,
     ManagedHarness::Grok,
     ManagedHarness::Antigravity,
+    ManagedHarness::Copilot,
 ];
 
 /// Cap the per-harness enumeration. A project with more local sessions than
@@ -168,6 +169,16 @@ struct DoctorReport {
     /// #1003). Only Claude Code's location is known today; harnesses with no
     /// established convention are simply absent from this list.
     native_memory: Vec<NativeMemoryReport>,
+    /// The local hook spool: events waiting for the server, and whether it is
+    /// full and evicting undelivered ones.
+    spool: super::hook_spool::SpoolHealth,
+    /// Nothing answered at the server URL; capture counts are unavailable and
+    /// hook events are being spooled.
+    server_unreachable: bool,
+    /// Whether Codex will run the installed ai-memory hooks, from Codex
+    /// itself. `None` when no ai-memory Codex hook is installed or Codex could
+    /// not be asked.
+    codex_hooks: Option<super::codex_hook_trust::CodexHookTrust>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -496,6 +507,8 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         )
         .await,
     );
+    let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&config.data_dir));
+    let mut server_unreachable = false;
     let mut capture_coverage_problem = None;
     let captured = match get_json::<ByAgentResponse>(
         &ep,
@@ -509,6 +522,13 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     {
         Ok(response) => response.by_agent,
         Err(error) if super::is_scope_not_found(&error) => Vec::new(),
+        Err(error) if crate::http_client::server_unreachable(&error) => {
+            server_unreachable = true;
+            capture_coverage_problem = Some(CaptureCoverageProblem {
+                reason: "the server did not answer; captured counts are unavailable".to_owned(),
+            });
+            Vec::new()
+        }
         Err(error) if super::is_scope_ambiguous(&error) => {
             capture_coverage_problem = Some(CaptureCoverageProblem {
                 reason: "server scope is ambiguous; captured counts are unavailable".to_owned(),
@@ -553,6 +573,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     });
 
     let native_memory = native_memory_reports(&home, &cwd);
+    let codex_hooks = codex_hook_trust(&cwd).await;
 
     let report = DoctorReport {
         workspace,
@@ -567,6 +588,9 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         identity,
         project_coordinate,
         native_memory,
+        spool,
+        server_unreachable,
+        codex_hooks,
     };
 
     if args.json {
@@ -575,6 +599,75 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         render_human(&report);
     }
     Ok(())
+}
+
+/// The trust state of the installed ai-memory Codex hooks, when there are
+/// any: asking Codex starts it, so a machine without ai-memory's Codex hooks
+/// is left alone.
+async fn codex_hook_trust(cwd: &Path) -> Option<super::codex_hook_trust::CodexHookTrust> {
+    let hooks_file = super::install_hooks::codex_hooks_path().ok()?;
+    let installed = std::fs::read_to_string(&hooks_file).ok()?;
+    if !installed.contains("ai-memory") {
+        return None;
+    }
+    super::codex_hook_trust::probe(Path::new("codex"), &hooks_file, cwd).await
+}
+
+/// Human lines for the spool, the server and the Codex hook trust; empty
+/// when there is nothing to warn about.
+fn render_capture_health(report: &DoctorReport) -> String {
+    let mut out = String::new();
+    if report.server_unreachable {
+        out.push_str(&format!(
+            "⚠ The server at {} did not answer. Hook events are being spooled locally.\n",
+            report.server
+        ));
+    }
+    let spool = &report.spool;
+    if spool.evicting() {
+        out.push_str(&format!(
+            "⚠ The hook spool is full ({} events, oldest {}): each new event evicts the \
+             oldest undelivered one, which is lost until the server is back.\n",
+            spool.pending,
+            spool_age(spool.oldest_age_ms),
+        ));
+    } else if spool.pending > 0 {
+        out.push_str(&format!(
+            "  hook spool: {} event(s) waiting for the server (oldest {}).\n",
+            spool.pending,
+            spool_age(spool.oldest_age_ms),
+        ));
+    }
+    if let Some(trust) = &report.codex_hooks
+        && !trust.skipped.is_empty()
+    {
+        let skipped: Vec<String> = trust
+            .skipped
+            .iter()
+            .map(|(event, status)| format!("{event} ({status})"))
+            .collect();
+        out.push_str(&format!(
+            "⚠ Codex skips {} ai-memory hook(s): {}. Codex runs a hook only after you \
+             trust it, and again after its command changes. Open Codex, run /hooks, and \
+             trust them; until then Codex sessions are not captured.\n",
+            trust.skipped.len(),
+            skipped.join(", "),
+        ));
+    }
+    out
+}
+
+fn spool_age(age_ms: Option<u64>) -> String {
+    let Some(ms) = age_ms else {
+        return "n/a".to_owned();
+    };
+    let secs = ms / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
 }
 
 fn render_project_coordinate(coordinate: &ProjectCoordinateReport) -> String {
@@ -661,6 +754,7 @@ fn render_human(report: &DoctorReport) {
     if let Some(problem) = &report.capture_coverage_problem {
         println!("  capture coverage: unavailable ({})", problem.reason);
     }
+    print!("{}", render_capture_health(report));
     if report.since_days == 0 {
         println!("  recent window: all on-disk sessions\n");
     } else {
@@ -763,6 +857,78 @@ fn render_human(report: &DoctorReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn health_report(
+        spool: super::super::hook_spool::SpoolHealth,
+        server_unreachable: bool,
+        codex_hooks: Option<super::super::codex_hook_trust::CodexHookTrust>,
+    ) -> DoctorReport {
+        DoctorReport {
+            workspace: "ws".into(),
+            project: "proj".into(),
+            server: "http://192.0.2.1:49374".into(),
+            since_days: 7,
+            rows: Vec::new(),
+            capture_coverage_problem: None,
+            uncaptured: Vec::new(),
+            marker_capture_problem: None,
+            capture_owner_active: false,
+            identity: None,
+            project_coordinate: None,
+            native_memory: Vec::new(),
+            spool,
+            server_unreachable,
+            codex_hooks,
+        }
+    }
+
+    /// A dead server, a full spool and Codex hooks Codex skips are each silent
+    /// today; doctor names every one, and stays quiet when all is well.
+    #[test]
+    fn capture_health_names_silent_failures() {
+        use super::super::codex_hook_trust::CodexHookTrust;
+        use super::super::hook_spool::SpoolHealth;
+        let full = SpoolHealth {
+            pending: 10_000,
+            oldest_age_ms: Some(30 * 3600 * 1000),
+            retries_total: 0,
+            capacity: 10_000,
+        };
+        let skipped = CodexHookTrust {
+            trusted: vec!["sessionStart".into()],
+            skipped: vec![("stop".into(), "modified".into())],
+        };
+        let out = render_capture_health(&health_report(full, true, Some(skipped)));
+        assert!(out.contains("did not answer"), "{out}");
+        assert!(
+            out.contains("spool is full (10000 events, oldest 1d)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Codex skips 1 ai-memory hook(s): stop (modified)"),
+            "{out}"
+        );
+
+        let waiting = SpoolHealth {
+            pending: 4,
+            oldest_age_ms: Some(90_000),
+            retries_total: 1,
+            capacity: 10_000,
+        };
+        let out = render_capture_health(&health_report(waiting, false, None));
+        assert_eq!(
+            out,
+            "  hook spool: 4 event(s) waiting for the server (oldest 1m).\n"
+        );
+
+        let trusted = CodexHookTrust {
+            trusted: vec!["sessionStart".into()],
+            skipped: Vec::new(),
+        };
+        let quiet =
+            render_capture_health(&health_report(SpoolHealth::default(), false, Some(trusted)));
+        assert_eq!(quiet, "");
+    }
 
     fn server_coordinate(
         status: ai_memory_store::ProjectCoordinateStatus,

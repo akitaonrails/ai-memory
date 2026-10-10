@@ -391,6 +391,18 @@ const EXTENSION_TAGS: &[(&str, &str)] = &[
     (".dart", "dart"),
 ];
 
+/// Every stack tag [`stack_tags_in`] can detect in a project. An entry's
+/// `applies_to` tag outside this set matches no project that has activity, so
+/// the entry would only ever show in projects with none.
+#[must_use]
+pub fn detectable_stack_tags() -> BTreeSet<&'static str> {
+    MANIFEST_TAGS
+        .iter()
+        .flat_map(|(_, tags)| tags.iter().copied())
+        .chain(EXTENSION_TAGS.iter().map(|(_, tag)| *tag))
+        .collect()
+}
+
 /// Stack tags named by the file paths mentioned in `text` (observation
 /// titles, tool summaries). Tokens are split on whitespace and punctuation
 /// that never appears inside a path, and only a token's file name is
@@ -538,9 +550,74 @@ impl ProfileEntry {
 fn first_prose_line(body: &str) -> Option<String> {
     body.lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#') && *line != "---")
-        .map(|line| line.trim_start_matches(['-', '*', ' ']).trim().to_owned())
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && *line != "---")
+        .filter(|line| !is_metadata_field(line))
+        .map(|line| match labelled_field(line) {
+            Some((_, value)) if is_sentence(value) => value.to_owned(),
+            Some((label, value)) if !value.is_empty() => format!("{label}: {value}"),
+            Some(_) => String::new(),
+            None => line.trim_start_matches(['-', '*', ' ']).trim().to_owned(),
+        })
+        .find(|line| !line.is_empty())
+}
+
+/// The most words a field label has (`Status`, `Package manager`).
+const FIELD_LABEL_MAX_WORDS: usize = 3;
+
+/// The most words a terse field value has (`pnpm`, `run cargo fmt`). A
+/// longer value is a sentence that reads on its own without its label.
+const FIELD_VALUE_MAX_WORDS: usize = 4;
+
+/// The labels ADR templates (MADR, Nygard, ai-memory's own durable-pages
+/// skill) put on a page's metadata, lowercase.
+const ADR_METADATA_LABELS: &[&str] = &[
+    "status",
+    "date",
+    "deciders",
+    "decision-makers",
+    "authors",
+    "author",
+    "owner",
+    "owners",
+    "supersedes",
+    "superseded by",
+    "consulted",
+    "informed",
+    "tags",
+    "last updated",
+    "reviewers",
+];
+
+/// Whether `line` is a page metadata field such as `**Status:** Accepted`
+/// or `**Date**: 2026-10-01`. It describes the page, so it is never the
+/// page's statement. Only the label decides: a terse labelled rule
+/// (`**Package manager:** pnpm`) is a statement, and a metadata value of
+/// any length (`**Status:** accepted <!-- proposed | ... -->`) is not. The
+/// form with the leading `**` already trimmed (`Status:** Accepted`), which
+/// candidates harvested before this check still carry, counts too.
+#[must_use]
+pub fn is_metadata_field(line: &str) -> bool {
+    labelled_field(line).is_some_and(|(label, _)| {
+        let label = collapse_whitespace(label).to_ascii_lowercase();
+        ADR_METADATA_LABELS.contains(&label.as_str())
+    })
+}
+
+fn is_sentence(value: &str) -> bool {
+    value.split_whitespace().count() > FIELD_VALUE_MAX_WORDS || value.ends_with(['.', '!'])
+}
+
+/// The label and value of a line that opens with an emphasized label,
+/// `None` for any other line.
+fn labelled_field(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim().trim_start_matches(['-', '*', '_', ' ']);
+    [":**", "**:", ":__", "__:"].iter().find_map(|close| {
+        let (label, value) = rest.split_once(close)?;
+        let words = label.split_whitespace().count();
+        let plain = !label.contains(['*', '_', '.', '!', '?', ':', '`']);
+        ((1..=FIELD_LABEL_MAX_WORDS).contains(&words) && plain)
+            .then(|| (label.trim(), value.trim_start_matches(['*', '_']).trim()))
+    })
 }
 
 fn collapse_whitespace(text: &str) -> String {
@@ -972,11 +1049,97 @@ mod tests {
         assert_eq!(e.applies_to, vec!["rust"]);
         assert!(e.enforced_by);
 
+        // An ADR opens with metadata fields; the statement is the first
+        // sentence after them, and a labelled sentence keeps its words.
+        let e = ProfileEntry::from_page(
+            "decisions/wal.md",
+            "Use WAL mode",
+            "# Use WAL mode\n\n**Status:** Accepted\n**Date**: 2026-10-01\n\
+             - **Deciders:** Alice, Bob\n**Context:**\n\n\
+             **Decision:** Every store opens SQLite in WAL mode.\n",
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        assert_eq!(e.statement, "Every store opens SQLite in WAL mode.");
+        // Nothing but metadata: the title states the page.
+        let e = ProfileEntry::from_page(
+            "decisions/wal.md",
+            "Use WAL mode",
+            "**Status:** Accepted\n**Date:** 2026-10-01\n\n## Context\n",
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        assert_eq!(e.statement, "Use WAL mode");
+        // ai-memory's own ADR template: the field carries an HTML comment
+        // listing the allowed values.
+        let e = ProfileEntry::from_page(
+            "decisions/wal.md",
+            "Use WAL mode",
+            "# Use WAL mode\n\n**Status:** accepted   \
+             <!-- proposed | accepted | superseded by [[decisions/other]] -->\n\n\
+             ## Context\n\nReaders blocked the writer under load.\n",
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        assert_eq!(e.statement, "Readers blocked the writer under load.");
+        // A terse labelled rule is the rule, not page metadata.
+        for (body, statement) in [
+            ("**Package manager:** pnpm", "Package manager: pnpm"),
+            ("- **Always:** run cargo fmt", "Always: run cargo fmt"),
+            ("**Rule:** Never use npm", "Rule: Never use npm"),
+            (
+                "**Prefer:** composition over inheritance",
+                "Prefer: composition over inheritance",
+            ),
+        ] {
+            let e = ProfileEntry::from_page(
+                "_rules/tooling.md",
+                "Tooling",
+                &format!("# Tooling\n\n{body}\n"),
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+            assert_eq!(e.statement, statement, "{body}");
+        }
+
         let long = "x".repeat(600);
         let e =
             ProfileEntry::from_page("profile/a.md", "A", &long, &serde_json::Value::Null).unwrap();
         assert_eq!(e.statement.len(), ENTRY_STATEMENT_MAX_BYTES);
         assert_eq!(e.category(), "");
+    }
+
+    #[test]
+    fn metadata_fields_are_told_from_sentences() {
+        for line in [
+            "**Status:** Accepted",
+            "Status:** Accepted",
+            "**Date**: 2026-10-01",
+            "- **Deciders:** Alice, Bob",
+            "__Owner:__ platform team",
+            "**Status:** accepted   <!-- proposed | accepted | superseded by [[decisions/other]] -->",
+            "Status:** accepted <!-- proposed | accepted | superseded by [[decisions/other]] -->",
+            "**Last updated:** 2026-10-01, after the platform team reviewed it.",
+            "**SUPERSEDED BY:** decisions/queue-v2",
+        ] {
+            assert!(is_metadata_field(line), "{line}");
+        }
+        for line in [
+            "**Rule:** Never use npm.",
+            "**Decision:** Every store opens SQLite in WAL mode",
+            "Always use pnpm for installs.",
+            "Use **pnpm**: it is faster.",
+            "Status: Accepted",
+            "Note: see the ADR for details.",
+            "**Context:**",
+            "**Package manager:** pnpm",
+            "Package manager:** pnpm",
+            "- **Always:** run cargo fmt",
+            "**Rule:** Never use npm",
+            "**Prefer:** composition over inheritance",
+        ] {
+            assert!(!is_metadata_field(line), "{line}");
+        }
     }
 
     #[test]

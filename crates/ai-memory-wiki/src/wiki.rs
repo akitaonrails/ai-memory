@@ -11,8 +11,9 @@ use ai_memory_core::{
 use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagesMode, PurgeSessionSummary,
-    ReaderPool, ScopeRow, WriterHandle, artifact_path_for, f32_vec_to_bytes,
+    ConditionalUpsert, FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagePrecondition,
+    PagesMode, PurgeSessionSummary, ReaderPool, ScopeRow, WriterHandle, artifact_path_for,
+    f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
@@ -1020,6 +1021,7 @@ impl Wiki {
         path: &PagePath,
         expected_latest_id: PageId,
         admission_ctx: Option<AdmissionContext>,
+        author_id: Option<UserId>,
     ) -> WikiResult<bool> {
         self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.write().await;
@@ -1040,7 +1042,7 @@ impl Wiki {
             path,
             admission_ctx,
             PageStoreRemoval::Delete {
-                author_id: None,
+                author_id,
                 expected_latest_id: Some(expected_latest_id),
             },
         )
@@ -1215,11 +1217,17 @@ impl Wiki {
 
         let delete_result = match removal {
             PageStoreRemoval::Delete {
+                author_id,
                 expected_latest_id: Some(expected),
-                ..
             } => {
                 self.writer
-                    .delete_page_if_latest(workspace_id, project_id, path.clone(), expected)
+                    .delete_page_if_latest(
+                        workspace_id,
+                        project_id,
+                        path.clone(),
+                        expected,
+                        author_id,
+                    )
                     .await
             }
             PageStoreRemoval::Delete {
@@ -2640,6 +2648,39 @@ impl Wiki {
     /// # Errors
     /// Returns [`WikiError`] for any filesystem, parsing, or store error.
     pub async fn write_page(&self, req: WritePageRequest) -> WikiResult<PageId> {
+        match self.write_page_inner(req, None).await? {
+            ConditionalWrite::Written(id) => Ok(id),
+            ConditionalWrite::Mismatch { .. } => Err(ai_memory_wiki_error(
+                "an unconditional page write reported a precondition mismatch",
+            )),
+        }
+    }
+
+    /// [`Self::write_page`] only when `precondition` holds for the page's
+    /// latest version. A mismatch writes nothing: no file change, no new
+    /// version, no webhook dispatch.
+    ///
+    /// Checked twice under the page lock: before the file is replaced, so a
+    /// normal mismatch never touches disk, and again in the store transaction
+    /// that writes the version, which is the authority (a plain delete takes
+    /// only the shared mutation lock and can land between the two); a
+    /// mismatch there restores the file.
+    ///
+    /// # Errors
+    /// As [`Self::write_page`].
+    pub async fn write_page_if(
+        &self,
+        req: WritePageRequest,
+        precondition: PagePrecondition,
+    ) -> WikiResult<ConditionalWrite> {
+        self.write_page_inner(req, Some(precondition)).await
+    }
+
+    async fn write_page_inner(
+        &self,
+        req: WritePageRequest,
+        precondition: Option<PagePrecondition>,
+    ) -> WikiResult<ConditionalWrite> {
         self.confined_page_path(
             req.workspace_id,
             req.project_id,
@@ -2762,30 +2803,51 @@ impl Wiki {
             self.confined_page_path(workspace_id, project_id, &path, Prepare::Inspect)?;
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
+            if let (Some(precondition), Some(reader)) = (precondition, &self.store_reader) {
+                let current = reader
+                    .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+                    .await?;
+                if !precondition_holds(precondition, current) {
+                    return Ok(ConditionalWrite::Mismatch { current });
+                }
+            }
             let abs = self.confined_page_path(workspace_id, project_id, &path, Prepare::Parents)?;
             let installed =
                 replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?; // lgtm [rust/path-injection]
 
-            match self
-                .writer
-                .upsert_page(NewPage {
-                    workspace_id,
-                    project_id,
-                    path,
-                    title,
-                    body: final_body.clone(),
-                    tier,
-                    frontmatter_json: final_frontmatter,
-                    pinned,
-                    links,
-                    author_id,
-                    expires_at,
-                    entities,
-                    evidence,
-                })
-                .await
-            {
-                Ok(id) => id,
+            let page = NewPage {
+                workspace_id,
+                project_id,
+                path,
+                title,
+                body: final_body.clone(),
+                tier,
+                frontmatter_json: final_frontmatter,
+                pinned,
+                links,
+                author_id,
+                expires_at,
+                entities,
+                evidence,
+            };
+            let written = match precondition {
+                None => self
+                    .writer
+                    .upsert_page(page)
+                    .await
+                    .map(ConditionalUpsert::Upserted),
+                Some(precondition) => self.writer.upsert_page_if(page, precondition).await,
+            };
+            match written {
+                Ok(ConditionalUpsert::Upserted(id)) => id,
+                Ok(ConditionalUpsert::Mismatch { current }) => {
+                    rollback_or_inconsistent(
+                        &self.git,
+                        std::slice::from_ref(&installed),
+                        &"a page write precondition no longer held",
+                    )?;
+                    return Ok(ConditionalWrite::Mismatch { current });
+                }
                 Err(e) => {
                     rollback_or_inconsistent(&self.git, std::slice::from_ref(&installed), &e)?;
                     return Err(e.into());
@@ -2810,7 +2872,7 @@ impl Wiki {
                 ctx,
             );
         }
-        Ok(page_id)
+        Ok(ConditionalWrite::Written(page_id))
     }
 
     /// Embed `body` (and its L0 `abstract:` line, if present) into
@@ -2911,6 +2973,18 @@ impl Wiki {
         }
         Ok(())
     }
+}
+
+/// The outcome of [`Wiki::write_page_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalWrite {
+    /// The precondition held and the page was written; the id is current.
+    Written(PageId),
+    /// The precondition did not hold and nothing was written.
+    Mismatch {
+        /// The latest version id at the path, `None` when there is none.
+        current: Option<PageId>,
+    },
 }
 
 /// Input bundle for [`Wiki::write_page`]. Carries the full 3-tuple
@@ -3252,6 +3326,13 @@ fn rollback_installed_files(git: &GitAdapter, installed: &[InstalledFile]) -> Wi
         }
     }
     Ok(())
+}
+
+fn precondition_holds(precondition: PagePrecondition, current: Option<PageId>) -> bool {
+    match precondition {
+        PagePrecondition::Absent => current.is_none(),
+        PagePrecondition::Latest(expected) => current == Some(expected),
+    }
 }
 
 fn rollback_or_inconsistent<E: std::fmt::Display>(

@@ -98,6 +98,10 @@ async fn smoke_index_returns_200() {
         text.contains("scratch"),
         "expected project name in index response"
     );
+    assert!(
+        text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "expected server version in footer"
+    );
 }
 
 #[tokio::test]
@@ -769,7 +773,8 @@ async fn api_page_returns_markdown_and_metadata() {
         .get_or_create_project(ws, "scratch", None)
         .await
         .unwrap();
-    wiki.write_page(wiki_req(ws, proj, "foo.md", "# Foo\n\nHello world"))
+    let page_id = wiki
+        .write_page(wiki_req(ws, proj, "foo.md", "# Foo\n\nHello world"))
         .await
         .unwrap();
 
@@ -785,6 +790,8 @@ async fn api_page_returns_markdown_and_metadata() {
         .await
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
+    // The latest version id: the token a conditional MCP write passes back.
+    assert_eq!(json["id"], page_id.to_string());
     assert_eq!(json["workspace"], "default");
     assert_eq!(json["project"], "scratch");
     assert_eq!(json["path"], "foo.md");

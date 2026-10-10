@@ -259,6 +259,13 @@ pub struct PrepareManagedRunRequest {
     pub force_unlock: bool,
     /// Diagnostic owner label (host and process id), not an authorization key.
     pub lease_owner: String,
+    /// The checkout's git-remote identity (`github.com/acme/api`), sent only
+    /// when `project` is the name that identity derives. The server then
+    /// routes by identity, as hook capture does, so a project created from the
+    /// folder name before identities were recorded is claimed instead of
+    /// twinned under the derived name. Old servers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_identity: Option<String>,
 }
 
 /// Result of preparing a managed invocation.

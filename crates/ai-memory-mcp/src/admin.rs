@@ -7984,6 +7984,17 @@ async fn handle_write_page(
             Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
         )
     })?;
+    ai_memory_core::page::ensure_profile_metadata_placement(
+        &metadata,
+        &path,
+        ai_memory_core::profile::is_reserved_scope_project(req.project.trim()),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
 
     let target = create_ws_proj(&state, &req.workspace, &req.project).await?;
     let (ws, proj) = target.scope.as_tuple();

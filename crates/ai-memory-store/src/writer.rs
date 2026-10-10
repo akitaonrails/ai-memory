@@ -174,6 +174,11 @@ pub(crate) enum WriteCmd {
         page: NewPage,
         reply: oneshot::Sender<StoreResult<PageId>>,
     },
+    UpsertPageIf {
+        page: NewPage,
+        precondition: ops::PagePrecondition,
+        reply: oneshot::Sender<StoreResult<ops::ConditionalUpsert>>,
+    },
     UpsertPageBatch {
         pages: Vec<NewPage>,
         reply: oneshot::Sender<StoreResult<Vec<PageId>>>,
@@ -192,6 +197,7 @@ pub(crate) enum WriteCmd {
         project_id: ProjectId,
         path: PagePath,
         expected_latest_id: PageId,
+        author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     BeginSession {
@@ -795,6 +801,7 @@ pub(crate) enum WriteCmd {
     FinishWorkstreamRun {
         authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
+        recover_expired: bool,
         reply: oneshot::Sender<StoreResult<FinishedWorkstreamRun>>,
     },
     RenameWorkstream {
@@ -2664,6 +2671,27 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// [`Self::upsert_page`] only when `precondition` holds for the latest
+    /// version at the page's path, checked in the write's own transaction.
+    ///
+    /// # Errors
+    /// As [`Self::upsert_page`]. A precondition that does not hold is not an
+    /// error: it returns [`ops::ConditionalUpsert::Mismatch`] and writes nothing.
+    pub async fn upsert_page_if(
+        &self,
+        page: NewPage,
+        precondition: ops::PagePrecondition,
+    ) -> StoreResult<ops::ConditionalUpsert> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertPageIf {
+            page,
+            precondition,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Delete every version of a page (by path) from the index. The wiki file
     /// removal is the caller's concern; this drops the derived rows so the
     /// page stops appearing in search/recent (the watcher does NOT reconcile
@@ -2704,6 +2732,7 @@ impl WriterHandle {
         project_id: ProjectId,
         path: PagePath,
         expected_latest_id: PageId,
+        author_id: Option<ai_memory_core::UserId>,
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeletePageIfLatest {
@@ -2711,6 +2740,7 @@ impl WriterHandle {
             project_id,
             path,
             expected_latest_id,
+            author_id,
             reply: tx,
         })
         .await?;
@@ -3402,10 +3432,31 @@ impl WriterHandle {
         authority: crate::ManagedRunAuthority,
         input: FinishWorkstreamRun,
     ) -> StoreResult<FinishedWorkstreamRun> {
+        self.finish_workstream_run_inner(authority, input, false)
+            .await
+    }
+
+    /// Finish an expired run for its original owner when it was not superseded.
+    pub async fn recover_expired_workstream_run(
+        &self,
+        authority: crate::ManagedRunAuthority,
+        input: FinishWorkstreamRun,
+    ) -> StoreResult<FinishedWorkstreamRun> {
+        self.finish_workstream_run_inner(authority, input, true)
+            .await
+    }
+
+    async fn finish_workstream_run_inner(
+        &self,
+        authority: crate::ManagedRunAuthority,
+        input: FinishWorkstreamRun,
+        recover_expired: bool,
+    ) -> StoreResult<FinishedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::FinishWorkstreamRun {
             authority,
             input,
+            recover_expired,
             reply: tx,
         })
         .await?;
@@ -3726,6 +3777,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::upsert_page(&mut conn, &page);
                 send_or_warn(reply, result, "upsert_page");
             }
+            WriteCmd::UpsertPageIf {
+                page,
+                precondition,
+                reply,
+            } => {
+                let result = ops::upsert_page_if(&mut conn, &page, precondition);
+                send_or_warn(reply, result, "upsert_page_if");
+            }
             WriteCmd::DeletePage {
                 workspace_id,
                 project_id,
@@ -3742,6 +3801,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 project_id,
                 path,
                 expected_latest_id,
+                author_id,
                 reply,
             } => {
                 let result = ops::delete_page_if_latest(
@@ -3750,7 +3810,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     project_id,
                     &path,
                     expected_latest_id,
-                    None,
+                    author_id,
                 );
                 send_or_warn(reply, result, "delete_page_if_latest");
             }
@@ -4758,9 +4818,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::FinishWorkstreamRun {
                 authority,
                 input,
+                recover_expired,
                 reply,
             } => {
-                let result = crate::workstream::finish_run(&mut conn, &authority, &input);
+                let result = if recover_expired {
+                    crate::workstream::recover_run(&mut conn, &authority, &input)
+                } else {
+                    crate::workstream::finish_run(&mut conn, &authority, &input)
+                };
                 send_or_warn(reply, result, "finish_workstream_run");
             }
             WriteCmd::RenameWorkstream { input, reply } => {

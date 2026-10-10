@@ -37,6 +37,7 @@ pub mod backup;
 pub mod backup_agents;
 pub mod bootstrap;
 pub mod checkpoints;
+pub mod codex_hook_trust;
 pub mod commit;
 pub mod compact;
 pub mod completions;
@@ -80,6 +81,7 @@ pub mod purge_project;
 pub mod purge_session;
 pub mod read_page;
 pub mod reclaim_ledger_versions;
+pub mod recovery;
 pub mod reindex;
 pub mod rename_project;
 pub mod rename_workstream;
@@ -159,18 +161,31 @@ pub(crate) fn resolve_scope(
     explicit_ws: Option<&str>,
     explicit_proj: Option<&str>,
 ) -> Result<(String, String)> {
+    resolve_scope_noting_marker_project(config, explicit_ws, explicit_proj)
+        .map(|(workspace, project, _)| (workspace, project))
+}
+
+/// [`resolve_scope`], also reporting whether a marker's `project` key named
+/// the project. Hook capture routes such a project by name and never reads the
+/// remote, so a caller mirroring capture needs that fact.
+pub(crate) fn resolve_scope_noting_marker_project(
+    config: &Config,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+) -> Result<(String, String, bool)> {
     let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
     let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
     if let (Some(workspace), Some(project)) = (explicit_ws, explicit_proj) {
-        return Ok((workspace.to_string(), project.to_string()));
+        return Ok((workspace.to_string(), project.to_string(), false));
     }
-    resolve_scope_with_marker(
-        config,
-        explicit_ws,
-        explicit_proj,
-        marker_scope(config)?,
-        true,
-    )
+    let marker = marker_scope(config)?;
+    let marker_project = explicit_proj.is_none()
+        && marker
+            .as_ref()
+            .is_some_and(|(scope, _, _)| scope.project.is_some());
+    let (workspace, project) =
+        resolve_scope_with_marker(config, explicit_ws, explicit_proj, marker, true)?;
+    Ok((workspace, project, marker_project))
 }
 
 pub(crate) fn resolve_scope_with_marker(
@@ -257,6 +272,15 @@ pub(crate) fn resolve_scope_for_path(
     config: &Config,
     cwd: &std::path::Path,
 ) -> Result<(String, String)> {
+    resolve_scope_for_path_with_explicit(config, cwd, None, None)
+}
+
+pub(crate) fn resolve_scope_for_path_with_explicit(
+    config: &Config,
+    cwd: &std::path::Path,
+    explicit_ws: Option<&str>,
+    explicit_proj: Option<&str>,
+) -> Result<(String, String)> {
     if !cwd.exists() {
         return Err(anyhow!(
             "project candidate does not exist: {}",
@@ -266,39 +290,44 @@ pub(crate) fn resolve_scope_for_path(
     let cwd = crate::marker::absolute_normalized(cwd);
     let identity = cwd.to_string_lossy().into_owned();
     let marker = crate::marker::read_scope(&identity, &config.runtime_env)?;
-    let workspace = marker
-        .as_ref()
-        .and_then(|scope| scope.workspace.clone())
+    let workspace = explicit_ws
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| marker.as_ref().and_then(|scope| scope.workspace.clone()))
         .unwrap_or_else(|| crate::config::DEFAULT_WORKSPACE.to_string());
-    let project = match marker.as_ref() {
-        Some(scope) => scope
-            .project
-            .clone()
-            .or_else(|| scope.canonical_remote_project())
-            .or_else(|| {
-                if scope.is_repo_root() {
-                    crate::marker::repo_root_project(&identity)
-                } else {
+    let project = if let Some(project) = explicit_proj.filter(|value| !value.is_empty()) {
+        project.to_owned()
+    } else {
+        match marker.as_ref() {
+            Some(scope) => scope
+                .project
+                .clone()
+                .or_else(|| scope.canonical_remote_project())
+                .or_else(|| {
+                    if scope.is_repo_root() {
+                        crate::marker::repo_root_project(&identity)
+                    } else {
+                        ai_memory_consolidate::derive_project_name(
+                            &cwd,
+                            ai_memory_consolidate::ProjectNameStrategy::Basename,
+                        )
+                        .map(|(name, _)| name)
+                    }
+                })
+                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+            None => crate::marker::discover_remote_identity(&identity)
+                .and_then(|repository| {
+                    ai_memory_core::repository_identity::path_style_name(&repository)
+                })
+                .or_else(|| {
                     ai_memory_consolidate::derive_project_name(
                         &cwd,
                         ai_memory_consolidate::ProjectNameStrategy::Basename,
                     )
                     .map(|(name, _)| name)
-                }
-            })
-            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
-        None => crate::marker::discover_remote_identity(&identity)
-            .and_then(|repository| {
-                ai_memory_core::repository_identity::path_style_name(&repository)
-            })
-            .or_else(|| {
-                ai_memory_consolidate::derive_project_name(
-                    &cwd,
-                    ai_memory_consolidate::ProjectNameStrategy::Basename,
-                )
-                .map(|(name, _)| name)
-            })
-            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+                })
+                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+        }
     };
     Ok((workspace, project))
 }

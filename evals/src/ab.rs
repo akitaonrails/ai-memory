@@ -328,6 +328,7 @@ fn resolve_provider(side: &str, args: &AbArgs) -> Result<ResolvedConfig> {
             base_url.clone(),
         ),
         AuthRequirement::AnthropicOAuthToken => ProviderAuth::anthropic_oauth_token(api_key),
+        AuthRequirement::CursorCli => ProviderAuth::cursor("agent"),
     };
 
     Ok(ResolvedConfig {
@@ -364,6 +365,9 @@ impl From<ResolvedConfig> for ProviderConfig {
             // Match the product default so provider comparisons exercise the
             // same schema-constrained path operators receive.
             compat_strict: true,
+            // Comparisons must not differ by engine-side thinking behaviour;
+            // keep the product default (off) for every candidate.
+            compat_disable_thinking: false,
             request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             // The A/B harness compares consolidation quality; reasoning
             // effort stays at each model's own default unless a future

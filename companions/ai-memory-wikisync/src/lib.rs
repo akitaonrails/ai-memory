@@ -1,16 +1,22 @@
-//! `ai-memory-wikisync`: read-only team-wiki export companion (#986, slice 1).
+//! `ai-memory-wikisync`: team-wiki sync companion (#986, slices 1, 3, 4 and 5).
 //!
-//! Pulls explicitly allowlisted page families from a running ai-memory server
-//! through the public, read-only `/api/v1` surface into a directory inside a
-//! project repository. The tool never mutates the server, never deletes local
-//! files (deletes are slice 4), never forges page frontmatter, and never runs
-//! git on the operator's behalf.
+//! Keeps explicitly allowlisted page families of a running ai-memory server
+//! in step with a directory inside a project repository. Reads go through
+//! the public, read-only `/api/v1` surface; the only writes to the server are
+//! the public `memory_write_page` and `memory_delete_page` MCP tools, used by
+//! `sync` with a version precondition on every call. The tool never opens
+//! the wiki directory or SQLite, deletes nothing unless `--propagate-deletes`
+//! asks for it, and never runs git on the operator's behalf.
 //!
 //! Page bodies are untrusted data: they are transported verbatim into files
 //! whose validated paths cannot escape the destination directory, and are
 //! never executed or rendered.
 
+pub mod bidi;
 pub mod client;
+pub mod hook;
+pub mod mcp;
+pub mod page_file;
 pub mod paths;
 pub mod state;
 pub mod sync;
