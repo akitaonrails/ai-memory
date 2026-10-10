@@ -2872,7 +2872,7 @@ mod tests {
     async fn hermes_tool_location_finds_the_marker_the_process_cwd_lacks() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
-        let repo = home.join("dev/some-repo");
+        let repo = home.join("dev").join("some-repo");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(
             repo.join(".ai-memory.toml"),
