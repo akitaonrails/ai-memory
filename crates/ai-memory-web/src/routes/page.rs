@@ -155,6 +155,8 @@ pub(crate) fn refusal_response(refusal: &ai_memory_store::ScopeResolutionError) 
         (StatusCode::FORBIDDEN, refusal.to_string()).into_response()
     } else if refusal.is_not_found() {
         not_found_response()
+    } else if refusal.is_bad_request() {
+        (StatusCode::BAD_REQUEST, refusal.to_string()).into_response()
     } else {
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     }
