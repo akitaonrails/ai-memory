@@ -8,6 +8,14 @@
   <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">All workspaces and projects in your wiki.</p>
 </div>
 
+{% if mail_total > 0 %}
+<div class="mb-6 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
+  <span class="font-medium">{{ mail_total }} message{% if mail_total != 1 %}s{% endif %} waiting for agents</span>
+  <span class="text-amber-800 dark:text-amber-300/90">in
+  {% for item in mail_projects %}<a href="{{ item.href }}" class="font-medium underline hover:text-amber-950 dark:hover:text-amber-100">{{ item.label }}</a> ({{ item.pending }}){% if !loop.last %}, {% endif %}{% endfor %}{% if mail_hidden > 0 %} and {{ mail_hidden }} more project{% if mail_hidden != 1 %}s{% endif %}{% endif %}.</span>
+</div>
+{% endif %}
+
 <div id="llm-notice" class="mb-6 hidden relative rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 p-4 pr-10 text-sm text-amber-900 dark:text-amber-200">
   <button id="llm-notice-close" type="button" aria-label="Dismiss permanently" title="Don't show this again"
           class="absolute top-2 right-2 rounded p-1 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40">
@@ -120,7 +128,12 @@
 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
   {% for card in projects %}
   <a href="{{ card.href }}" class="block rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 hover:border-blue-400 dark:hover:border-blue-600 hover:shadow-sm transition-all">
-    <div class="text-xs font-medium text-slate-400 dark:text-slate-500 mb-1">{{ card.workspace }}</div>
+    <div class="flex items-center justify-between gap-2 h-5 mb-1">
+      <div class="min-w-0 truncate text-xs font-medium text-slate-400 dark:text-slate-500">{{ card.workspace }}</div>
+      {% if card.pending_inbox > 0 %}
+      <span class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300" title="Messages from other projects waiting for an agent here">{{ card.pending_inbox }} inbox</span>
+      {% endif %}
+    </div>
     <div class="text-base font-semibold text-slate-800 dark:text-slate-100 truncate">{{ card.project }}</div>
     <div class="mt-3 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
       <span>{{ card.page_count }} page{% if card.page_count != 1 %}s{% endif %}</span>

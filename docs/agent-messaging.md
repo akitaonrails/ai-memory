@@ -130,6 +130,25 @@ is a bounded, best-effort signal, not a durable queue, processing acknowledgment
 or automatic agent wakeup. Consumers still need their own deduplication and
 recovery policy. This does not add a notification for raw Stop observations.
 
+## In the web UI
+
+The `/web` UI is read-only here too. A project card shows an amber `N inbox`
+badge when messages are pending for that project, and nothing when there are
+none. The home page adds a one-line summary of the total with links to the
+projects holding mail. The project page has a Mailbox section above Recent
+Activity listing up to five pending messages, oldest first, with the subject,
+the sender, a 160-character snippet and the age; when more are pending it says
+"5 of N" and points at `ai-memory message list`, and when none are waiting it
+says so. The section never pops or cancels: consuming a message stays an agent
+action (`memory_message_pop`), so the claim-once queue is not reachable from a
+browser. Only the inbox is shown; sent mail is still `memory_message_list`
+with `box=outbox`.
+
+A message is addressed to a project, so anyone who can read that project sees
+it. The sender's name is a separate matter: if the viewer may not read the
+sender's repository the page shows "a project you cannot read" instead of its
+name and does not link it.
+
 ## Security — a popped message is untrusted input
 
 A popped message was composed by an agent in **another** project. Treat the body

@@ -9,7 +9,15 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 
 use crate::state::WebState;
-use crate::templates::{Folder, PageRow, ProjectView, humanize, page_href};
+use crate::templates::{
+    Folder, MailboxRow, PageRow, ProjectView, humanize, page_href, project_href,
+};
+
+/// Pending messages listed on the project page before it says there are more.
+const MAILBOX_LIMIT: usize = 5;
+
+/// Leading body characters shown per message.
+const SNIPPET_CHARS: usize = 160;
 
 /// Handler for `GET /w/:workspace/:project`.
 pub(crate) async fn handler(
@@ -17,16 +25,20 @@ pub(crate) async fn handler(
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
 ) -> Response {
+    let viewer_id = viewer.as_ref().map(|axum::Extension(viewer)| viewer.user());
     if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
         return super::page::refusal_response(&refusal);
     }
-    render(&state, workspace, project).await.into_response()
+    render(&state, workspace, project, viewer_id)
+        .await
+        .into_response()
 }
 
 async fn render(
     state: &WebState,
     workspace: String,
     project: String,
+    viewer: Option<ai_memory_core::UserId>,
 ) -> Result<Html<String>, StatusCode> {
     let pages = state
         .reader
@@ -100,16 +112,85 @@ async fn render(
         })
         .collect();
 
+    let (mailbox, mailbox_total) = mailbox(state, &workspace, &project, viewer).await?;
+
+    let mailbox_capped = mailbox_total > mailbox.len() as u64;
     let html = ProjectView {
         workspace,
         project,
         folders,
         system,
         recent,
+        mailbox,
+        mailbox_total,
+        mailbox_capped,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Html(html))
+}
+
+/// The project's pending inbox, read-only: this page never pops or cancels,
+/// so the claim-once queue stays the agents' alone.
+///
+/// Returns the rows to list and how many messages are pending in all, so the
+/// page can say "5 of 12" rather than hide the rest. The route has
+/// already authorized the viewer for this project; sender names are filtered
+/// again per row in the store.
+async fn mailbox(
+    state: &WebState,
+    workspace: &str,
+    project: &str,
+    viewer: Option<ai_memory_core::UserId>,
+) -> Result<(Vec<MailboxRow>, u64), StatusCode> {
+    let scope = ai_memory_store::lookup_existing_scope(&state.reader, workspace, project)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let entries = state
+        .reader
+        .list_inbox_with_senders(scope.workspace_id, scope.project_id, viewer, MAILBOX_LIMIT)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let total = state
+        .reader
+        .pending_message_count(scope.workspace_id, scope.project_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .max(entries.len() as u64);
+    let rows = entries
+        .into_iter()
+        .map(|entry| {
+            let (sender, sender_href) = match entry.sender {
+                Some((workspace, project)) => (
+                    format!("{workspace}/{project}"),
+                    Some(project_href(&workspace, &project)),
+                ),
+                None => ("a project you cannot read".to_owned(), None),
+            };
+            MailboxRow {
+                subject: entry
+                    .message
+                    .subject
+                    .filter(|subject| !subject.trim().is_empty())
+                    .unwrap_or_else(|| "(no subject)".to_owned()),
+                sender,
+                sender_href,
+                snippet: snippet(&entry.message.body),
+                created_relative: humanize(&entry.message.created_at.to_string()),
+            }
+        })
+        .collect();
+    Ok((rows, total))
+}
+
+/// First [`SNIPPET_CHARS`] characters of `body` on one line.
+fn snippet(body: &str) -> String {
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= SNIPPET_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(SNIPPET_CHARS).collect();
+    format!("{cut}…")
 }
 
 /// Machinery rather than knowledge: hidden from Recent Activity and

@@ -1462,6 +1462,31 @@ pub struct ProjectSummary {
     pub last_updated: Option<String>,
 }
 
+/// Pending inbox depth for one recipient project. Returned by
+/// [`ReaderPool::pending_inbox_counts`]; projects with nothing pending have no
+/// row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxCount {
+    /// Name of the recipient workspace.
+    pub workspace_name: String,
+    /// Name of the recipient project.
+    pub project_name: String,
+    /// Number of `pending` messages addressed to it.
+    pub pending: u64,
+}
+
+/// A pending inbox message with its sender named for display. Returned by
+/// [`ReaderPool::list_inbox_with_senders`].
+#[derive(Debug, Clone)]
+pub struct InboxEntry {
+    /// The message row.
+    pub message: AgentMessage,
+    /// `(workspace, project)` names of the sender, or `None` when the viewer
+    /// may not read the sender's repository (or it no longer exists). A
+    /// repository's name is itself what a restricted project hides.
+    pub sender: Option<(String, String)>,
+}
+
 /// One workspace scope with the id + name needed to write its
 /// self-describing `_meta.md` manifest. Returned by
 /// [`ReaderPool::list_all_workspace_scopes`].
@@ -6142,6 +6167,102 @@ impl ReaderPool {
             let mut out = Vec::new();
             for row in rows {
                 out.push(row??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Count pending messages per recipient project, in one grouped query.
+    ///
+    /// Backs the web project cards, which would otherwise pay one
+    /// [`Self::pending_message_count`] per card. `viewer` filters recipients
+    /// like [`Self::list_projects_with_stats`], so a repository the viewer may
+    /// not read gets no row either.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn pending_inbox_counts(
+        &self,
+        viewer: Option<UserId>,
+    ) -> StoreResult<Vec<InboxCount>> {
+        self.with_conn(move |conn| {
+            let visible = readable_repository_predicate("p.id", viewer);
+            let mut stmt = conn.prepare(&format!(
+                "SELECT w.name, p.name, COUNT(*) \
+                 FROM agent_messages m \
+                 JOIN projects p ON p.id = m.to_project_id AND p.workspace_id = m.to_workspace_id \
+                 JOIN workspaces w ON w.id = p.workspace_id \
+                 WHERE m.state = 'pending'{visible} \
+                 GROUP BY p.id"
+            ))?;
+            let rows = stmt.query_map([], |row| {
+                let pending: i64 = row.get(2)?;
+                Ok(InboxCount {
+                    workspace_name: row.get(0)?,
+                    project_name: row.get(1)?,
+                    pending: u64::try_from(pending).unwrap_or(0),
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// List a project's pending inbox with each sender named for display,
+    /// oldest first, capped at `limit`.
+    ///
+    /// The sender's names come back only when `viewer` may read the sender's
+    /// repository: the recipient is entitled to the message, not to learn the
+    /// name of a restricted project it came from. See
+    /// [`Self::list_messages`] for the unnamed form agents use.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_inbox_with_senders(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        viewer: Option<UserId>,
+        limit: usize,
+    ) -> StoreResult<Vec<InboxEntry>> {
+        let limit = limit.clamp(1, 200);
+        self.with_conn(move |conn| {
+            let sender_visible = readable_repository_predicate("sp.id", viewer);
+            let columns = crate::ops::MESSAGE_COLUMNS
+                .split(',')
+                .map(|column| format!("m.{}", column.trim()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {columns}, sw.name, sp.name \
+                 FROM agent_messages m \
+                 LEFT JOIN projects sp ON sp.id = m.from_project_id \
+                                      AND sp.workspace_id = m.from_workspace_id{sender_visible} \
+                 LEFT JOIN workspaces sw ON sw.id = sp.workspace_id \
+                 WHERE m.to_workspace_id = ?1 AND m.to_project_id = ?2 AND m.state = 'pending' \
+                 ORDER BY m.created_at ASC LIMIT {limit}"
+            ))?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let message = crate::ops::row_to_agent_message(row)?;
+                    let workspace: Option<String> = row.get(12)?;
+                    let project: Option<String> = row.get(13)?;
+                    Ok((message, workspace.zip(project)))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (message, sender) = row?;
+                out.push(InboxEntry {
+                    message: message?,
+                    sender,
+                });
             }
             Ok(out)
         })

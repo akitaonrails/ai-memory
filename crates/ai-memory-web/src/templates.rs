@@ -112,8 +112,21 @@ pub(crate) struct ProjectCard {
     pub page_count: u64,
     /// Humanised timestamp (e.g. "3 hours ago"), or empty string.
     pub last_updated_relative: String,
+    /// Messages from other projects waiting for an agent here; `0` hides the
+    /// badge.
+    pub pending_inbox: u64,
     /// Link target (`w/{ws}/{proj}`, relative to `<base href>`).
     pub href: String,
+}
+
+/// One project named in the home page's pending-mail summary.
+pub(crate) struct MailSummaryItem {
+    /// `workspace/project`.
+    pub label: String,
+    /// Link target (`w/{ws}/{proj}`, relative to `<base href>`).
+    pub href: String,
+    /// Pending messages waiting there.
+    pub pending: u64,
 }
 
 /// The one-time 2.0 migration explainer dialog (docs/okf.md): shown
@@ -140,6 +153,13 @@ pub(crate) struct ProjectsView {
     /// Present whenever a migration receipt exists (dialog dismissal is
     /// client-side, per browser).
     pub okf_dialog: Option<OkfDialog>,
+    /// Pending messages across the projects listed in `projects`; `0` hides
+    /// the summary strip.
+    pub mail_total: u64,
+    /// Projects the strip names, most mail first, capped.
+    pub mail_projects: Vec<MailSummaryItem>,
+    /// Projects with mail beyond the ones `mail_projects` names.
+    pub mail_hidden: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +178,22 @@ pub(crate) struct PageRow {
     pub kind: String,
     /// Humanised updated timestamp.
     pub updated_relative: String,
+}
+
+/// One pending inbox message on the project page.
+pub(crate) struct MailboxRow {
+    /// Subject line, or a placeholder when the sender gave none.
+    pub subject: String,
+    /// `workspace/project` of the sender, or a neutral label when the viewer
+    /// may not read it.
+    pub sender: String,
+    /// Link to the sender's project; `None` when the viewer may not read it.
+    pub sender_href: Option<String>,
+    /// Leading characters of the body. Untrusted cross-project text: the
+    /// template escapes it and never renders it as markup.
+    pub snippet: String,
+    /// Humanised creation timestamp.
+    pub created_relative: String,
 }
 
 /// A folder in the sidebar tree (groups pages by first path segment).
@@ -183,6 +219,13 @@ pub(crate) struct ProjectView {
     pub system: Vec<Folder>,
     /// N most-recent knowledge pages for the right column.
     pub recent: Vec<PageRow>,
+    /// Pending inbox messages, oldest first, capped at the route's limit.
+    pub mailbox: Vec<MailboxRow>,
+    /// All pending messages for the project; exceeds `mailbox.len()` when the
+    /// list is capped.
+    pub mailbox_total: u64,
+    /// `mailbox` lists fewer messages than are pending.
+    pub mailbox_capped: bool,
 }
 
 /// View-model for a namespace (directory) listing — `GET
