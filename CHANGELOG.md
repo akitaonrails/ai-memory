@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the web UI answering HTTP 500 when a signed-in viewer opened a project
+  or page by a name that two projects answer to. The page and project routes
+  now return a 400 that names the clash, matching the API and MCP surfaces.
+  (#1204)
 - Fixed the Jev choice reranker adapter silently fabricating scores from a
   malformed judge response: `docs/examples/jev-reranker-adapter/jev_rerank_shim_choice.py`
   defaulted missing or misnamed `probabilities` entries to `0.0`, so an HTTP

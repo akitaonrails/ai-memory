@@ -3463,6 +3463,94 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
     }
 }
 
+/// A project name that two projects answer to is the caller's ambiguity, not
+/// a server fault: a viewer opening it gets a 400 naming the clash, where the
+/// refusal mapping used to fall through to a bare 500.
+#[tokio::test]
+async fn web_read_of_an_ambiguous_project_name_is_a_400() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+    use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let declared = store
+        .writer
+        .get_or_create_project(ws, "widget", None)
+        .await
+        .unwrap();
+    let (clone, _) = store
+        .writer
+        .resolve_project_by_identity_for_capture(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/widget".to_owned(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::Path,
+            "acme-widget",
+            Some("/work/widget".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(declared, clone);
+    let viewer = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "carol".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let web = router(store.reader.clone(), wiki.clone());
+
+    for uri in ["/w/default/widget", "/w/default/widget/p/notes.md"] {
+        let resp = web
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .extension(AuthorizedViewer(viewer))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("is ambiguous in workspace 'default'"),
+            "{uri}: {body:?}"
+        );
+    }
+
+    // The unambiguous name still opens.
+    let ok = web
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/acme-widget")
+                .extension(AuthorizedViewer(viewer))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
 /// Pins a documented, by-design boundary (see `docs/users.md`): under a
 /// trusted-proxy deployment, a proxied non-root end-user is authenticated as
 /// [`ai_memory_core::AuthLevel::User`] with an [`ai_memory_core::ActorContext`]
