@@ -23,16 +23,17 @@ mod statics;
 /// first — the page views and the project listing. Those went straight from a
 /// URL to the page body, so the guard never saw them.
 ///
-/// No viewer — an install with no database users, or root — returns `Ok`
-/// without a lookup, so these routes behave exactly as they did before.
+/// No viewer — an install with no database users, or root — returns
+/// `Ok(None)` without a lookup, so these routes behave exactly as they did
+/// before. Otherwise returns the scope the check resolved.
 pub(crate) async fn authorize_read(
     state: &WebState,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     workspace: &str,
     project: &str,
-) -> Result<(), ai_memory_store::ScopeResolutionError> {
+) -> Result<Option<ai_memory_store::ResolvedScope>, ai_memory_store::ScopeResolutionError> {
     let Some(axum::Extension(viewer)) = viewer else {
-        return Ok(());
+        return Ok(None);
     };
     ai_memory_store::lookup_existing_scope_guarded(
         &state.reader,
@@ -42,7 +43,7 @@ pub(crate) async fn authorize_read(
         ai_memory_store::ProjectAccess::Read,
     )
     .await
-    .map(|_| ())
+    .map(Some)
 }
 
 /// Build the read-only wiki page router (no static assets — those are public).

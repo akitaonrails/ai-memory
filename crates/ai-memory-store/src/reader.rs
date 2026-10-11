@@ -6233,26 +6233,25 @@ impl ReaderPool {
         let limit = limit.clamp(1, 200);
         self.with_conn(move |conn| {
             let sender_visible = readable_repository_predicate("sp.id", viewer);
-            let columns = crate::ops::MESSAGE_COLUMNS
-                .split(',')
-                .map(|column| format!("m.{}", column.trim()))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let columns = crate::ops::MESSAGE_COLUMNS;
+            // The sender names follow the message columns.
+            let sender_at = columns.split(',').count();
             let mut stmt = conn.prepare(&format!(
-                "SELECT {columns}, sw.name, sp.name \
-                 FROM agent_messages m \
+                "SELECT m.*, sw.name, sp.name \
+                 FROM (SELECT {columns} FROM agent_messages \
+                       WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending' \
+                       ORDER BY created_at ASC LIMIT {limit}) m \
                  LEFT JOIN projects sp ON sp.id = m.from_project_id \
                                       AND sp.workspace_id = m.from_workspace_id{sender_visible} \
                  LEFT JOIN workspaces sw ON sw.id = sp.workspace_id \
-                 WHERE m.to_workspace_id = ?1 AND m.to_project_id = ?2 AND m.state = 'pending' \
-                 ORDER BY m.created_at ASC LIMIT {limit}"
+                 ORDER BY m.created_at ASC"
             ))?;
             let rows = stmt.query_map(
                 params![workspace_id.as_bytes(), project_id.as_bytes()],
                 |row| {
                     let message = crate::ops::row_to_agent_message(row)?;
-                    let workspace: Option<String> = row.get(12)?;
-                    let project: Option<String> = row.get(13)?;
+                    let workspace: Option<String> = row.get(sender_at)?;
+                    let project: Option<String> = row.get(sender_at + 1)?;
                     Ok((message, workspace.zip(project)))
                 },
             )?;

@@ -26,21 +26,19 @@ pub(crate) async fn handler(
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
 ) -> Result<Html<String>, StatusCode> {
     let viewer_id = viewer.map(|axum::Extension(viewer)| viewer.user());
-    let summaries = state
-        .reader
-        .list_projects_with_stats(viewer_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // One grouped query for every card; the badge shows only where mail waits.
-    let pending: HashMap<(String, String), u64> = state
-        .reader
-        .pending_inbox_counts(viewer_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .into_iter()
-        .map(|c| ((c.workspace_name, c.project_name), c.pending))
-        .collect();
+    let (summaries, counts) = tokio::try_join!(
+        state.reader.list_projects_with_stats(viewer_id),
+        // One grouped query for every card; the badge shows only where mail waits.
+        state.reader.pending_inbox_counts(viewer_id),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut pending: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    for c in counts {
+        pending
+            .entry(c.workspace_name)
+            .or_default()
+            .insert(c.project_name, c.pending);
+    }
 
     let projects: Vec<ProjectCard> = summaries
         .into_iter()
@@ -48,7 +46,8 @@ pub(crate) async fn handler(
             let last_updated_relative = s.last_updated.as_deref().map(humanize).unwrap_or_default();
             let href = project_href(&s.workspace_name, &s.project_name);
             let pending_inbox = pending
-                .get(&(s.workspace_name.clone(), s.project_name.clone()))
+                .get(&s.workspace_name)
+                .and_then(|projects| projects.get(&s.project_name))
                 .copied()
                 .unwrap_or(0);
             ProjectCard {
@@ -71,6 +70,7 @@ pub(crate) async fn handler(
     with_mail.sort_by(|a, b| {
         b.pending_inbox
             .cmp(&a.pending_inbox)
+            .then_with(|| a.workspace.cmp(&b.workspace))
             .then_with(|| a.project.cmp(&b.project))
     });
     let mail_total: u64 = with_mail.iter().map(|card| card.pending_inbox).sum();

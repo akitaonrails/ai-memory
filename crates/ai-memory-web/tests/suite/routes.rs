@@ -4366,4 +4366,77 @@ async fn web_mailbox_says_how_many_pending_messages_it_does_not_list() {
     assert!(body.contains("request 1"), "oldest first: {body}");
     assert!(body.contains("request 5"), "{body}");
     assert!(!body.contains("request 6"), "capped at five: {body}");
+    assert!(
+        body.contains("ai-memory message list --workspace default --project recipient --limit 200"),
+        "the hint names this project's inbox: {body}"
+    );
+}
+
+/// With no auth, a project URL that names nothing renders the empty page
+/// (200) as before the mailbox existed, not a 500.
+#[tokio::test]
+async fn web_project_page_without_a_project_renders_an_empty_mailbox() {
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let web = router(store.reader.clone(), wiki.clone());
+
+    for uri in ["/w/default/typo-project", "/w/no-such-workspace/api"] {
+        let (status, body) = get_text(&web, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(
+            body.contains("No pending messages for this project."),
+            "{uri}: {body}"
+        );
+    }
+}
+
+/// The mailbox matches the URL's exact project name, as the page list does,
+/// so a legacy alias never shows another project's mail beside no pages.
+#[tokio::test]
+async fn web_mailbox_does_not_follow_a_project_alias() {
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let sender = store
+        .writer
+        .get_or_create_project(ws, "sender", None)
+        .await
+        .unwrap();
+    let acme = store
+        .writer
+        .get_or_create_project(ws, "acme-api", None)
+        .await
+        .unwrap();
+    send_mail(&store, (ws, sender), (ws, acme), "Aliased mail", "body").await;
+    rusqlite::Connection::open(tmp.path().join("db").join(ai_memory_store::DB_FILENAME))
+        .unwrap()
+        .execute(
+            "UPDATE projects SET legacy_name = 'api' WHERE id = ?1",
+            [acme.as_bytes().to_vec()],
+        )
+        .unwrap();
+    // Control: the alias does resolve, so the test bites without the fix.
+    let resolved = ai_memory_store::lookup_existing_scope(&store.reader, "default", "api")
+        .await
+        .unwrap();
+    assert_eq!(resolved.project_id, acme);
+
+    let web = router(store.reader.clone(), wiki.clone());
+    let (status, body) = get_text(&web, "/w/default/api", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("Aliased mail"), "{body}");
+    assert!(
+        body.contains("No pending messages for this project."),
+        "{body}"
+    );
+
+    let (_, body) = get_text(&web, "/w/default/acme-api", None).await;
+    assert!(body.contains("Aliased mail"), "{body}");
 }

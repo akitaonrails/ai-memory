@@ -138,8 +138,10 @@ none. The home page adds a one-line summary of the total with links to the
 projects holding mail. The project page has a Mailbox section above Recent
 Activity listing up to five pending messages, oldest first, with the subject,
 the sender, a 160-character snippet and the age; when more are pending it says
-"5 of N" and points at `ai-memory message list`, and when none are waiting it
-says so. The section never pops or cancels: consuming a message stays an agent
+"5 of N" and gives the `ai-memory message list --workspace W --project P
+--limit 200` command for that project (the CLI lists at most 200 at a time),
+and when none are waiting it says so. A URL that names no project shows an
+empty mailbox, as it shows no pages. The section never pops or cancels: consuming a message stays an agent
 action (`memory_message_pop`), so the claim-once queue is not reachable from a
 browser. Only the inbox is shown; sent mail is still `memory_message_list`
 with `box=outbox`.

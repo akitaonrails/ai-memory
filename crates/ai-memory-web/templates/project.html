@@ -93,7 +93,7 @@
         {% endfor %}
       </ul>
       <p class="mt-2 text-xs text-slate-400 dark:text-slate-500">
-        {% if mailbox_capped %}Showing the oldest {{ mailbox.len() }} of {{ mailbox_total }}; <code class="font-mono">ai-memory message list</code> shows the rest. {% endif %}An agent in this project reads them with <code class="font-mono">memory_message_pop</code>.
+        {% if mailbox_capped %}Showing the oldest {{ mailbox.len() }} of {{ mailbox_total }}; <code class="font-mono">ai-memory message list --workspace {{ workspace }} --project {{ project }} --limit 200</code> lists up to 200. {% endif %}An agent in this project reads them with <code class="font-mono">memory_message_pop</code>.
       </p>
       {% endif %}
     </section>
