@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The web UI shows pending cross-project mail. Project cards carry an amber
+  `N inbox` badge when messages are waiting for an agent in that project, the
+  home page summarises the total and links the projects holding mail, and the
+  project page gains a read-only Mailbox section listing up to five of them
+  (subject, sender, a snippet, age; "5 of N" when more are waiting), with an
+  empty state when there are none. A sender the viewer may not read is shown as
+  "a project you cannot read", and the page never pops or cancels a message.
+  (#1202)
 - `install-mcp --client prime-agent` registers ai-memory with Prime Agent
   (PrimeIntellect-ai/prime-agent), merging an HTTP entry into the `mcpServers`
   map of `$PRIME_AGENT_CODING_AGENT_DIR/settings.json` (default

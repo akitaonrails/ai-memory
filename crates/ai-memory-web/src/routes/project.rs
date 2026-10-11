@@ -8,8 +8,18 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 
+use ai_memory_store::ResolvedScope;
+
 use crate::state::WebState;
-use crate::templates::{Folder, PageRow, ProjectView, humanize, page_href};
+use crate::templates::{
+    Folder, MailboxRow, PageRow, ProjectView, humanize, page_href, project_href,
+};
+
+/// Pending messages listed on the project page before it says there are more.
+const MAILBOX_LIMIT: usize = 5;
+
+/// Leading body characters shown per message.
+const SNIPPET_CHARS: usize = 160;
 
 /// Handler for `GET /w/:workspace/:project`.
 pub(crate) async fn handler(
@@ -17,22 +27,33 @@ pub(crate) async fn handler(
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
 ) -> Response {
-    if let Err(refusal) = super::authorize_read(&state, viewer, &workspace, &project).await {
-        return super::page::refusal_response(&refusal);
-    }
-    render(&state, workspace, project).await.into_response()
+    let viewer_id = viewer.as_ref().map(|axum::Extension(viewer)| viewer.user());
+    let authorized = match super::authorize_read(&state, viewer, &workspace, &project).await {
+        Ok(authorized) => authorized,
+        Err(refusal) => return super::page::refusal_response(&refusal),
+    };
+    render(&state, workspace, project, viewer_id, authorized)
+        .await
+        .into_response()
 }
 
 async fn render(
     state: &WebState,
     workspace: String,
     project: String,
+    viewer: Option<ai_memory_core::UserId>,
+    authorized: Option<ResolvedScope>,
 ) -> Result<Html<String>, StatusCode> {
-    let pages = state
-        .reader
-        .list_pages(&workspace, &project)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let (pages, (mailbox, mailbox_total)) = tokio::try_join!(
+        async {
+            state
+                .reader
+                .list_pages(&workspace, &project)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        },
+        mailbox(state, &workspace, &project, viewer, authorized),
+    )?;
 
     // Build sidebar folder trees (group by first path segment), split
     // into knowledge and machinery. A store accumulates far more
@@ -100,16 +121,121 @@ async fn render(
         })
         .collect();
 
+    let mailbox_capped = mailbox_total > mailbox.len() as u64;
     let html = ProjectView {
         workspace,
         project,
         folders,
         system,
         recent,
+        mailbox,
+        mailbox_total,
+        mailbox_capped,
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Html(html))
+}
+
+/// The project's pending inbox, read-only: this page never pops or cancels,
+/// so the claim-once queue stays the agents' alone.
+///
+/// Returns the rows to list and how many messages are pending in all, so the
+/// page can say "5 of 12" rather than hide the rest. The route has
+/// already authorized the viewer for this project; sender names are filtered
+/// again per row in the store.
+async fn mailbox(
+    state: &WebState,
+    workspace: &str,
+    project: &str,
+    viewer: Option<ai_memory_core::UserId>,
+    authorized: Option<ResolvedScope>,
+) -> Result<(Vec<MailboxRow>, u64), StatusCode> {
+    let Some(scope) = mailbox_scope(state, workspace, project, authorized).await? else {
+        return Ok((Vec::new(), 0));
+    };
+    let (entries, total) = tokio::try_join!(
+        state.reader.list_inbox_with_senders(
+            scope.workspace_id,
+            scope.project_id,
+            viewer,
+            MAILBOX_LIMIT
+        ),
+        state
+            .reader
+            .pending_message_count(scope.workspace_id, scope.project_id),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let total = total.max(entries.len() as u64);
+    let rows = entries
+        .into_iter()
+        .map(|entry| {
+            let (sender, sender_href) = match entry.sender {
+                Some((workspace, project)) => (
+                    format!("{workspace}/{project}"),
+                    Some(project_href(&workspace, &project)),
+                ),
+                None => ("a project you cannot read".to_owned(), None),
+            };
+            MailboxRow {
+                subject: entry
+                    .message
+                    .subject
+                    .filter(|subject| !subject.trim().is_empty())
+                    .unwrap_or_else(|| "(no subject)".to_owned()),
+                sender,
+                sender_href,
+                snippet: snippet(&entry.message.body),
+                created_relative: humanize(&entry.message.created_at.to_string()),
+            }
+        })
+        .collect();
+    Ok((rows, total))
+}
+
+/// The project whose pages this page lists, or `None` when there is none.
+///
+/// Matches the exact name, as `list_pages` does, so an alias that resolves to
+/// another project cannot put that project's mail beside these pages. A URL
+/// that names no project renders an empty mailbox, as it renders no pages.
+async fn mailbox_scope(
+    state: &WebState,
+    workspace: &str,
+    project: &str,
+    authorized: Option<ResolvedScope>,
+) -> Result<Option<ResolvedScope>, StatusCode> {
+    let workspace_id = match authorized {
+        Some(scope) => scope.workspace_id,
+        None => match ai_memory_store::lookup_existing_workspace(&state.reader, workspace).await {
+            Ok(workspace_id) => workspace_id,
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+        },
+    };
+    let project_id = state
+        .reader
+        .find_project(workspace_id, project.to_owned())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(project_id.map(|project_id| ResolvedScope {
+        workspace_id,
+        project_id,
+    }))
+}
+
+/// First [`SNIPPET_CHARS`] characters of `body` on one line.
+fn snippet(body: &str) -> String {
+    // Lazy, so a large body is read only up to the cut.
+    let mut flat = body
+        .split_whitespace()
+        .flat_map(|word| std::iter::once(' ').chain(word.chars()))
+        .skip(1);
+    let cut: String = flat.by_ref().take(SNIPPET_CHARS).collect();
+    if flat.next().is_some() {
+        format!("{cut}…")
+    } else {
+        cut
+    }
 }
 
 /// Machinery rather than knowledge: hidden from Recent Activity and

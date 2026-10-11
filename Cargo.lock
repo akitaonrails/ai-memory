@@ -282,6 +282,7 @@ dependencies = [
  "base64 0.22.1",
  "jiff",
  "pulldown-cmark",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

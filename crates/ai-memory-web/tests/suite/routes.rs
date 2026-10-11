@@ -4064,3 +4064,379 @@ async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
         "a cursor cannot retain access after its user's grant is revoked"
     );
 }
+
+/// Send one pending message `from` -> `to` through the writer, as an agent would.
+async fn send_mail(
+    store: &Store,
+    from: (ai_memory_core::WorkspaceId, ai_memory_core::ProjectId),
+    to: (ai_memory_core::WorkspaceId, ai_memory_core::ProjectId),
+    subject: &str,
+    body: &str,
+) {
+    store
+        .writer
+        .insert_message(ai_memory_core::NewAgentMessage {
+            from_workspace_id: from.0,
+            from_project_id: from.1,
+            from_agent: AgentKind::Other,
+            from_session_id: None,
+            from_owner_user: None,
+            to_workspace_id: to.0,
+            to_project_id: to.1,
+            subject: Some(subject.to_owned()),
+            body: body.to_owned(),
+        })
+        .await
+        .unwrap();
+}
+
+async fn get_text(
+    app: &axum::Router,
+    uri: &str,
+    viewer: Option<ai_memory_core::UserId>,
+) -> (StatusCode, String) {
+    let mut req = Request::builder().uri(uri);
+    if let Some(viewer) = viewer {
+        req = req.extension(ai_memory_core::AuthorizedViewer(viewer));
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The mailbox shows a project only mail addressed TO it, escapes the
+/// untrusted body, and viewing it never consumes the message.
+#[tokio::test]
+async fn web_mailbox_lists_only_this_projects_inbox_and_never_consumes_it() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for name in ["sender", "recipient", "bystander"] {
+        let id = store
+            .writer
+            .get_or_create_project(ws, name, None)
+            .await
+            .unwrap();
+        ids.push((ws, id));
+    }
+    let (sender, recipient) = (ids[0], ids[1]);
+    send_mail(
+        &store,
+        sender,
+        recipient,
+        "Add retry to relay",
+        "please <script>alert(1)</script> retry on 429",
+    )
+    .await;
+
+    let web = router(store.reader.clone(), wiki.clone());
+
+    let (status, body) = get_text(&web, "/w/default/recipient", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Add retry to relay"), "{body}");
+    assert!(body.contains("from default/sender"), "{body}");
+    assert!(body.contains("1 pending"), "{body}");
+    assert!(
+        body.contains("&lt;script&gt;") || body.contains("&#60;script&#62;"),
+        "message body must be escaped: {body}"
+    );
+    assert!(!body.contains("<script>alert(1)"), "{body}");
+
+    // Mail addressed to `recipient` is invisible on the sender's and on an
+    // uninvolved project's page; each shows the empty state instead.
+    for project in ["sender", "bystander"] {
+        let (status, body) = get_text(&web, &format!("/w/default/{project}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{project}");
+        assert!(!body.contains("Add retry to relay"), "{project}: {body}");
+        assert!(
+            body.contains("No pending messages for this project."),
+            "{project}: {body}"
+        );
+    }
+
+    // Only the recipient's card carries the badge.
+    let (_, index) = get_text(&web, "/", None).await;
+    assert_eq!(index.matches("1 inbox").count(), 1, "{index}");
+    assert!(
+        index.contains("1 message waiting for agents"),
+        "summary strip missing: {index}"
+    );
+    assert!(index.contains("default/recipient"), "{index}");
+
+    // Read-only: no write verb reaches the page, and the message is still
+    // there for the agent to pop.
+    let resp = web
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/w/default/recipient")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let still = store
+        .reader
+        .list_messages(
+            recipient.0,
+            recipient.1,
+            ai_memory_core::MessageBox::Inbox,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(still.len(), 1);
+}
+
+/// A recipient is entitled to its mail, not to the name of a restricted
+/// project it came from, and a card the viewer may not read carries no count.
+#[tokio::test]
+async fn web_mailbox_hides_restricted_sender_names_and_cards() {
+    use ai_memory_core::{NewUser, UserRole};
+    use ai_memory_store::GrantLevel;
+
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let inbox = store
+        .writer
+        .get_or_create_project(ws, "shared-tools", None)
+        .await
+        .unwrap();
+    let secret = store
+        .writer
+        .get_or_create_project(ws, "acme-client-work", None)
+        .await
+        .unwrap();
+    let human = |name: &'static str| {
+        let writer = store.writer.clone();
+        async move {
+            writer
+                .create_human_user(
+                    NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let alice = human("alice").await;
+    let bob = human("bob").await;
+    for (user, project) in [(alice, inbox), (alice, secret), (bob, inbox)] {
+        store
+            .writer
+            .grant_memory(user, project, GrantLevel::Read, None)
+            .await
+            .unwrap();
+    }
+    send_mail(
+        &store,
+        (ws, secret),
+        (ws, inbox),
+        "Rotate the shared token",
+        "from the client project",
+    )
+    .await;
+    send_mail(
+        &store,
+        (ws, inbox),
+        (ws, secret),
+        "Confidential reply",
+        "to the client project",
+    )
+    .await;
+
+    let web = router(store.reader.clone(), wiki.clone());
+
+    // Bob reads the message addressed to a project he may read, but is not
+    // told which restricted project it came from.
+    let (status, body) = get_text(&web, "/w/default/shared-tools", Some(bob)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Rotate the shared token"), "{body}");
+    assert!(body.contains("a project you cannot read"), "{body}");
+    assert!(!body.contains("acme-client-work"), "{body}");
+    assert!(!body.contains("w/default/acme-client-work"), "{body}");
+
+    // Control: alice may read the sender, so it is named.
+    let (_, body) = get_text(&web, "/w/default/shared-tools", Some(alice)).await;
+    assert!(body.contains("from default/acme-client-work"), "{body}");
+    assert!(
+        body.contains("href=\"w/default/acme-client-work\""),
+        "{body}"
+    );
+
+    // Bob's card grid has no trace of the restricted project, nor of the
+    // mail waiting in it; his own card still shows its count.
+    let (_, index) = get_text(&web, "/", Some(bob)).await;
+    assert!(!index.contains("acme-client-work"), "{index}");
+    assert_eq!(index.matches("1 inbox").count(), 1, "{index}");
+
+    // The count query applies the same filter itself, rather than leaning on
+    // the card list: bob's counts name only the project he may read.
+    let counts = store.reader.pending_inbox_counts(Some(bob)).await.unwrap();
+    assert_eq!(
+        counts
+            .iter()
+            .map(|c| c.project_name.as_str())
+            .collect::<Vec<_>>(),
+        ["shared-tools"]
+    );
+    assert_eq!(
+        store
+            .reader
+            .pending_inbox_counts(Some(alice))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Control: alice sees both cards and both counts.
+    let (_, index) = get_text(&web, "/", Some(alice)).await;
+    assert!(index.contains("acme-client-work"), "{index}");
+    assert_eq!(index.matches("1 inbox").count(), 2, "{index}");
+    assert!(index.contains("2 messages waiting for agents"), "{index}");
+
+    // And bob is still refused the restricted project's own page.
+    let (status, body) = get_text(&web, "/w/default/acme-client-work", Some(bob)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!body.contains("Confidential reply"), "{body}");
+}
+
+/// A long inbox is capped on the page, and the page says how many it hides.
+#[tokio::test]
+async fn web_mailbox_says_how_many_pending_messages_it_does_not_list() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let sender = store
+        .writer
+        .get_or_create_project(ws, "sender", None)
+        .await
+        .unwrap();
+    let recipient = store
+        .writer
+        .get_or_create_project(ws, "recipient", None)
+        .await
+        .unwrap();
+    for n in 1..=7 {
+        send_mail(
+            &store,
+            (ws, sender),
+            (ws, recipient),
+            &format!("request {n}"),
+            "body",
+        )
+        .await;
+    }
+
+    let web = router(store.reader.clone(), wiki.clone());
+    let (_, body) = get_text(&web, "/w/default/recipient", None).await;
+    assert!(body.contains("5 of 7 pending"), "{body}");
+    assert!(body.contains("request 1"), "oldest first: {body}");
+    assert!(body.contains("request 5"), "{body}");
+    assert!(!body.contains("request 6"), "capped at five: {body}");
+    assert!(
+        body.contains("ai-memory message list --workspace default --project recipient --limit 200"),
+        "the hint names this project's inbox: {body}"
+    );
+}
+
+/// With no auth, a project URL that names nothing renders the empty page
+/// (200) as before the mailbox existed, not a 500.
+#[tokio::test]
+async fn web_project_page_without_a_project_renders_an_empty_mailbox() {
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let web = router(store.reader.clone(), wiki.clone());
+
+    for uri in ["/w/default/typo-project", "/w/no-such-workspace/api"] {
+        let (status, body) = get_text(&web, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(
+            body.contains("No pending messages for this project."),
+            "{uri}: {body}"
+        );
+    }
+}
+
+/// The mailbox matches the URL's exact project name, as the page list does,
+/// so a legacy alias never shows another project's mail beside no pages.
+#[tokio::test]
+async fn web_mailbox_does_not_follow_a_project_alias() {
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let sender = store
+        .writer
+        .get_or_create_project(ws, "sender", None)
+        .await
+        .unwrap();
+    let acme = store
+        .writer
+        .get_or_create_project(ws, "acme-api", None)
+        .await
+        .unwrap();
+    send_mail(&store, (ws, sender), (ws, acme), "Aliased mail", "body").await;
+    rusqlite::Connection::open(tmp.path().join("db").join(ai_memory_store::DB_FILENAME))
+        .unwrap()
+        .execute(
+            "UPDATE projects SET legacy_name = 'api' WHERE id = ?1",
+            [acme.as_bytes().to_vec()],
+        )
+        .unwrap();
+    // Control: the alias does resolve, so the test bites without the fix.
+    let resolved = ai_memory_store::lookup_existing_scope(&store.reader, "default", "api")
+        .await
+        .unwrap();
+    assert_eq!(resolved.project_id, acme);
+
+    let web = router(store.reader.clone(), wiki.clone());
+    let (status, body) = get_text(&web, "/w/default/api", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("Aliased mail"), "{body}");
+    assert!(
+        body.contains("No pending messages for this project."),
+        "{body}"
+    );
+
+    let (_, body) = get_text(&web, "/w/default/acme-api", None).await;
+    assert!(body.contains("Aliased mail"), "{body}");
+}

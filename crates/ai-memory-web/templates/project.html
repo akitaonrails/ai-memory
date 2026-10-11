@@ -64,6 +64,39 @@
 
   <!-- Main: recent pages -->
   <div class="flex-1 min-w-0">
+    <section class="mb-8" aria-labelledby="mailbox-heading">
+      <div class="flex items-center gap-2 mb-3">
+        <h2 id="mailbox-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">Mailbox</h2>
+        {% if !mailbox.is_empty() %}
+        <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300">{% if mailbox_capped %}{{ mailbox.len() }} of {{ mailbox_total }}{% else %}{{ mailbox_total }}{% endif %} pending</span>
+        {% endif %}
+      </div>
+      {% if mailbox.is_empty() %}
+      <p class="text-sm text-slate-400 dark:text-slate-600">No pending messages for this project.</p>
+      {% else %}
+      <ul class="divide-y divide-slate-100 dark:divide-slate-800">
+        {% for message in mailbox %}
+        <li class="py-3 flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <div class="text-sm font-medium text-slate-800 dark:text-slate-100 truncate">{{ message.subject }}</div>
+            <div class="flex items-center gap-2 mt-1">
+              {% if let Some(href) = message.sender_href %}
+              <a href="{{ href }}" class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 shrink-0">from {{ message.sender }}</a>
+              {% else %}
+              <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 shrink-0">from {{ message.sender }}</span>
+              {% endif %}
+              <span class="text-xs text-slate-400 dark:text-slate-500 truncate">{{ message.snippet }}</span>
+            </div>
+          </div>
+          <span class="text-xs text-slate-400 dark:text-slate-500 whitespace-nowrap shrink-0">{{ message.created_relative }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+      <p class="mt-2 text-xs text-slate-400 dark:text-slate-500">
+        {% if mailbox_capped %}Showing the oldest {{ mailbox.len() }} of {{ mailbox_total }}; <code class="font-mono">ai-memory message list --workspace {{ workspace }} --project {{ project }} --limit 200</code> lists up to 200. {% endif %}An agent in this project reads them with <code class="font-mono">memory_message_pop</code>.
+      </p>
+      {% endif %}
+    </section>
     <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500 mb-3">Recent Activity</h2>
     {% if recent.is_empty() %}
     <p class="text-sm text-slate-400 dark:text-slate-600">No pages yet.</p>
