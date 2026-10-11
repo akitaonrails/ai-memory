@@ -412,6 +412,17 @@ override is written only into the rendered LaunchAgent plist
 
 See [`docs/macos.md`](macos.md#scenario-d-menu-bar-app).
 
+## Planned: client SDK
+
+Issue #1165 asks for a typed client for programs that are not coding-agent
+harnesses: custom agents and bots, editor and app extensions (RFC #1166) and
+automation scripts. The plan is a TypeScript companion at
+`companions/ai-memory-ts`, with Python as a later decision. It wraps the
+existing MCP tools, `/api/v1` reads and `GET /identity`, adds no core surface,
+and is never bundled in the server's tarballs, Docker image, AUR, Homebrew or
+Nix packages. Nothing is implemented yet; the design, test plan and the
+maintainer decisions per phase are in [design-client-sdk.md](design-client-sdk.md).
+
 ## `ai-memory-web-editor`: browser chat/editor companion
 
 This is the companion shape for PR #123.
