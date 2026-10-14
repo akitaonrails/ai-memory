@@ -183,6 +183,13 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Set the optional Chat Completions `stream` request field.
+    #[must_use]
+    pub fn with_stream(mut self, stream: Option<bool>) -> Self {
+        self.inner = self.inner.with_stream(stream);
+        self
+    }
+
     /// Forward reasoning effort to the inner Chat Completions client.
     /// OpenRouter and xAI hosts use their native request shapes.
     #[must_use]

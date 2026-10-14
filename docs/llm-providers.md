@@ -183,6 +183,8 @@ AI_MEMORY_LLM_PROVIDER=openai-compat
 AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1
 AI_MEMORY_LLM_MODEL=deepseek/deepseek-v4-flash
 AI_MEMORY_LLM_COMPAT_STRICT=true
+# Set only when the endpoint defaults an omitted field to SSE:
+AI_MEMORY_LLM_COMPAT_STREAM=false
 ```
 
 Then verify:
@@ -200,6 +202,12 @@ strip, which occasionally drops a field. Setting it to `true` at the
 env-file level is safer for consolidation reliability. Turn it off
 (`AI_MEMORY_LLM_COMPAT_STRICT=false`) only for a specific model backend that
 explicitly rejects the schema-constrained shape.
+
+`AI_MEMORY_LLM_COMPAT_STREAM` controls the `stream` field on
+`openai-compat` Chat Completions requests. Leave it unset to omit the field,
+preserving the existing request shape. Set it to `false` when an endpoint
+defaults an omitted field to Server-Sent Events. The value is passed through
+verbatim; this transport expects one JSON response and does not decode SSE.
 
 The `docker/.env.production.example` file in the repo ships with an OpenRouter
 setup pre-filled, with `moonshotai/kimi-k2.6` as the sample model (see the

@@ -130,6 +130,12 @@ log_level = "info"
 # it. Off by default. Env equivalent: `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING`.
 # llm_compat_disable_thinking = false
 
+# openai-compat only: explicitly set the `stream` field on Chat Completions
+# requests (e.g. `stream = false` to prevent gateways defaulting to SSE).
+# Unset by default (omits the field). Env equivalent:
+# `AI_MEMORY_LLM_COMPAT_STREAM`.
+#   llm_compat_stream = false
+
 # Per-request timeout in seconds for every chat completion and for the Copilot
 # token exchange. The openai-oauth token refresh keeps its own built-in ceiling.
 # The default tolerates a local engine cold-loading a large model. Raise it for

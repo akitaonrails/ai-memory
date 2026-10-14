@@ -369,6 +369,10 @@ pub struct Config {
     /// with `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` (or
     /// `llm_compat_disable_thinking = true` in `config.toml`).
     pub llm_compat_disable_thinking: bool,
+    /// Optional `stream` field sent by the `openai-compat` Chat Completions
+    /// transport. Unset preserves omission. Set with
+    /// `AI_MEMORY_LLM_COMPAT_STREAM`.
+    pub llm_compat_stream: Option<bool>,
     /// Per-request timeout (seconds) applied to every chat
     /// completion request and to the Copilot token exchange; the
     /// openai-oauth token refresh keeps the built-in default ceiling
@@ -1427,6 +1431,7 @@ impl Default for Config {
             llm_base_url: None,
             llm_compat_strict: true,
             llm_compat_disable_thinking: false,
+            llm_compat_stream: None,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
@@ -2858,6 +2863,7 @@ impl Config {
             base_url: self.resolve_base_url(provider),
             compat_strict: self.llm_compat_strict,
             compat_disable_thinking: self.llm_compat_disable_thinking,
+            compat_stream: self.llm_compat_stream,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -2915,6 +2921,7 @@ impl Config {
             base_url: non_empty(profile.base_url.as_deref()).map(str::to_string),
             compat_strict: self.llm_compat_strict,
             compat_disable_thinking: self.llm_compat_disable_thinking,
+            compat_stream: self.llm_compat_stream,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
@@ -6654,7 +6661,7 @@ input_token_safety_margin = {margin}
     }
 
     #[test]
-    fn openai_compat_provider_defaults_strict_and_allows_opt_out() {
+    fn openai_compat_provider_forwards_strict_and_stream_settings() {
         let mut cfg = Config {
             llm_provider: Some("openai-compat".into()),
             llm_model: Some("qwen3:32b".into()),
@@ -6671,10 +6678,13 @@ input_token_safety_margin = {margin}
             Some("http://localhost:11434/v1")
         );
         assert!(provider.compat_strict);
+        assert_eq!(provider.compat_stream, None);
 
         cfg.llm_compat_strict = false;
+        cfg.llm_compat_stream = Some(false);
         let provider = cfg.llm_provider_config().unwrap().unwrap();
         assert!(!provider.compat_strict);
+        assert_eq!(provider.compat_stream, Some(false));
     }
 
     /// The thinking switch is opt-in: off by default (existing vLLM /
@@ -6714,6 +6724,15 @@ input_token_safety_margin = {margin}
         let tmp = TempDir::new().unwrap();
         let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
         assert!(!cfg.llm_compat_disable_thinking);
+    }
+
+    #[test]
+    fn load_accepts_llm_compat_stream_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_compat_stream = false\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(cfg.llm_compat_stream, Some(false));
     }
 
     #[test]

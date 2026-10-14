@@ -1238,6 +1238,7 @@ fn run_wrapper_with_fake_docker_env(
         .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("AI_MEMORY_LLM_COMPAT_STREAM")
         // Guarantees the "unset" case in
         // `posix_wrapper_forwards_embedding_prefixes_by_presence_not_non_emptiness`
         // is actually unset rather than silently inheriting whatever the
@@ -1287,6 +1288,43 @@ fn powershell_wrapper_lists_subscription_oauth_tokens_in_its_env_allowlist() {
                 .lines()
                 .any(|line| line.trim() == format!("\"{name}\",")),
             "PowerShell wrapper must list {name} in the helper env allowlist"
+        );
+    }
+}
+
+#[test]
+fn powershell_wrapper_forwards_compat_stream_setting() {
+    let wrapper = read_repo("bin/ai-memory.ps1");
+    let allowlist = wrapper
+        .split_once("foreach ($Name in @(")
+        .and_then(|(_, rest)| rest.split_once(")) {"))
+        .map(|(allowlist, _)| allowlist)
+        .expect("PowerShell wrapper env allowlist");
+    assert!(
+        allowlist
+            .lines()
+            .any(|line| line.trim() == "\"AI_MEMORY_LLM_COMPAT_STREAM\","),
+        "PowerShell wrapper must forward AI_MEMORY_LLM_COMPAT_STREAM"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_wrapper_forwards_compat_stream_setting() {
+    const STREAM: &str = "AI_MEMORY_LLM_COMPAT_STREAM";
+    for stream in [None, Some("false")] {
+        let forwarded: Vec<(&str, &str)> =
+            stream.map(|value| (STREAM, value)).into_iter().collect();
+        let args = run_wrapper_with_fake_docker_and_forwarded_env(
+            &["llm-test"],
+            "[name=seccomp]",
+            &forwarded,
+        );
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(
+            args.windows(2).any(|pair| pair == ["-e", STREAM]),
+            stream.is_some(),
+            "wrapper must forward the configured stream setting by name"
         );
     }
 }

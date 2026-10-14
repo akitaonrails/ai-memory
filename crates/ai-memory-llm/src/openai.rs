@@ -104,6 +104,7 @@ pub struct OpenAiProvider {
     model: String,
     dialect: RequestDialect,
     timeout: Duration,
+    stream: Option<bool>,
     reasoning_effort: Option<ReasoningEffort>,
     /// Operator-configured headers from `AI_MEMORY_LLM_HEADERS`. Applied
     /// last, so an explicit entry wins over any default below.
@@ -148,6 +149,7 @@ impl OpenAiProvider {
             model: model.into(),
             dialect: RequestDialect::Official,
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            stream: None,
             reasoning_effort: None,
             extra_headers: ExtraHeaders::default(),
             client_headers: None,
@@ -170,6 +172,13 @@ impl OpenAiProvider {
     #[must_use]
     pub fn with_timeout_secs(mut self, secs: u64) -> Self {
         self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Set the optional Chat Completions `stream` request field.
+    #[must_use]
+    pub(crate) fn with_stream(mut self, stream: Option<bool>) -> Self {
+        self.stream = stream;
         self
     }
 
@@ -269,6 +278,8 @@ impl OpenAiProvider {
 struct OpenAiRequest<'a> {
     model: &'a str,
     messages: Vec<OpenAiMsg<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -542,6 +553,7 @@ impl OpenAiProvider {
         OpenAiRequest {
             model: &self.model,
             messages,
+            stream: self.stream,
             max_tokens,
             max_completion_tokens,
             temperature,
@@ -1452,6 +1464,30 @@ mod tests {
         let finish_reason = resp.choices.first().and_then(|c| c.finish_reason.clone());
         assert_eq!(finish_reason, None);
         assert!(!is_length_truncated(finish_reason.as_deref()));
+    }
+
+    #[test]
+    fn build_request_omits_stream_by_default() {
+        let request = chat_request();
+        let default_provider = provider_for("gpt-4o-mini");
+        let omitted = default_provider.build_request(&request, None);
+        assert!(
+            serde_json::to_value(omitted)
+                .unwrap()
+                .get("stream")
+                .is_none(),
+            "stream must remain omitted when the operator did not configure it"
+        );
+    }
+
+    #[test]
+    fn build_request_forwards_configured_stream() {
+        for stream in [false, true] {
+            let provider = provider_for("gpt-4o-mini").with_stream(Some(stream));
+            let chat = chat_request();
+            let request = provider.build_request(&chat, None);
+            assert_eq!(serde_json::to_value(request).unwrap()["stream"], stream);
+        }
     }
 
     #[test]
