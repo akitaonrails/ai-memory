@@ -373,6 +373,8 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
     let mut out = Vec::new();
     let mut titles: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    let mut tickets: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     for c in candidates {
         if candidate_is_expired(c, now_us) {
@@ -436,6 +438,30 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
                 .or_default()
                 .push(c.path.as_str().to_string());
         }
+        // Duplicate business key: two live pages naming the same external
+        // id (`ticket: "#123"` or `ticket: ["#1", "#2"]`) usually record the
+        // same decision twice, even when their wording shares too little
+        // for the title/similarity checks to notice. Blank ids are ignored.
+        if let Some(fm) = frontmatter.as_ref()
+            && let Some(v) = fm.get("ticket")
+        {
+            let ids: Vec<&str> = match v {
+                serde_json::Value::String(s) => vec![s.as_str()],
+                serde_json::Value::Array(a) => {
+                    a.iter().filter_map(serde_json::Value::as_str).collect()
+                }
+                _ => Vec::new(),
+            };
+            for id in ids {
+                let id = id.trim();
+                if !id.is_empty() {
+                    tickets
+                        .entry(id.to_lowercase())
+                        .or_default()
+                        .push(c.path.as_str().to_string());
+                }
+            }
+        }
         // Pinned + expiring is contradictory: the pin says "never
         // decay" but the TTL hard-deletes regardless of pin (an
         // explicit expiry is the more explicit statement). Surface the
@@ -467,6 +493,20 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
                 kind: "duplicate".into(),
                 severity: "warning".into(),
                 message: format!("Multiple pages share title {title:?}"),
+                pages: paths,
+                detail: None,
+            });
+        }
+    }
+
+    for (ticket, mut paths) in tickets {
+        paths.sort();
+        paths.dedup();
+        if paths.len() > 1 {
+            out.push(LintFinding {
+                kind: "duplicate_business_key".into(),
+                severity: "warning".into(),
+                message: format!("Multiple live pages share ticket {ticket:?}"),
                 pages: paths,
                 detail: None,
             });
@@ -991,6 +1031,40 @@ mod tests {
         let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
         assert_eq!(dupes.len(), 1);
         assert_eq!(dupes[0].pages.len(), 2);
+    }
+
+    #[test]
+    fn rule_pass_flags_duplicate_business_key() {
+        let a = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("decisions/a.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Pricing rule", "ticket": "#101"}"#.into(),
+            expires_at_us: None,
+            salience: None,
+            compacted_at_us: None,
+        };
+        let b = DecayCandidate {
+            path: ai_memory_core::PagePath::new("decisions/b.md").unwrap(),
+            frontmatter_json: r#"{"title": "Contract scope", "ticket": ["#102", "#101"]}"#.into(),
+            ..a.clone()
+        };
+        let c = DecayCandidate {
+            path: ai_memory_core::PagePath::new("decisions/c.md").unwrap(),
+            frontmatter_json: r#"{"title": "Other", "ticket": "  "}"#.into(),
+            ..a.clone()
+        };
+        let findings = rule_based_findings(&[a, b, c], STALE_DAYS);
+        let dupes: Vec<_> = findings
+            .iter()
+            .filter(|f| f.kind == "duplicate_business_key")
+            .collect();
+        assert_eq!(dupes.len(), 1);
+        assert_eq!(dupes[0].pages, vec!["decisions/a.md", "decisions/b.md"]);
     }
 
     #[test]
