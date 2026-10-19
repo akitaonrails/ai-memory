@@ -424,11 +424,15 @@ phase, and encodes the lessons from that incident.
 New migrations start at **V65** and are additive. A2's `compacted_at` is an
 `ADD COLUMN` (nullable): instant, no table rewrite, no lock on a large store.
 No shipped migration's SQL is ever edited in place: doing so trips refinery's
-divergence check, which is exactly why `migrations.rs:33-34` sets
-`set_abort_divergent(false)` (a hash mismatch on an already-applied migration is
-tolerated) while keeping `set_abort_missing(true)` (a store *ahead* of the binary
-fails closed). Any change to a shipped migration must preserve that
-divergence-tolerance handling.
+divergence check, which `migrations.rs:24-25` keeps strict
+(`set_abort_divergent(true)`, `set_abort_missing(true)`), so a hash mismatch on
+an already-applied migration or a store *ahead* of the binary fails closed. The
+one historical reshape (V62, #776) is repaired instead of tolerated: startup
+rewrites only the exact checksum v2.2.1 shipped for V62 (#1443) to the
+embedded migration's value before the strict runner sees it, and
+`scripts/check-migrations-immutable.sh` rejects edits to released migration
+files in CI. Any change to a shipped migration must go through that guard, not
+around it.
 
 **Any data backfill runs on the boot path, not inside the migration
 transaction**: chunked, resumable, and WAL-checkpointed, mirroring the #776
@@ -495,9 +499,9 @@ content.
 
 ### 4. Downgrade note
 
-Additive columns plus `set_abort_missing(true)` (`migrations.rs:34`) mean an older
+Additive columns plus `set_abort_missing(true)` (`migrations.rs:25`) mean an older
 binary opening a newer store **fails closed** with the actionable
-`StoreError::DataSchemaAhead` (`error.rs:36`, raised at `migrations.rs:55`). It
+`StoreError::DataSchemaAhead` (`error.rs:87`, raised at `migrations.rs:87`). It
 names the applied-vs-supported versions and refuses to open, rather than silently
 corrupting a store it doesn't understand. That guarantee must be preserved by
 every new migration.

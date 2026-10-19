@@ -1681,6 +1681,33 @@ mod tests {
         assert_eq!(summary, crate::ops::PageWindowBackfillSummary::default());
     }
 
+    /// The constant the startup repair matches on must be the refinery
+    /// checksum of the SQL actually shipped in v2.2.1 (git blob `28917fb…`),
+    /// recomputed here through refinery's own hasher rather than restated,
+    /// and it must still differ from the embedded V62 or the repair is dead
+    /// weight.
+    #[test]
+    fn original_v62_checksum_is_pinned_to_the_shipped_v2_2_1_sql() {
+        let shipped = include_str!("testdata/V62__page_ingestion_windows.pre776.sql");
+        let from_shipped = refinery::Migration::unapplied("V62__page_ingestion_windows", shipped)
+            .expect("the v2.2.1 fixture SQL must parse as a migration")
+            .checksum();
+        assert_eq!(
+            from_shipped, ORIGINAL_V62_CHECKSUM,
+            "repair constant no longer matches the v2.2.1 V62 SQL"
+        );
+        let embedded = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.version() == V62_VERSION)
+            .unwrap()
+            .checksum();
+        assert_ne!(
+            embedded, from_shipped,
+            "embedded V62 must still differ from v2.2.1, or the repair is a no-op"
+        );
+    }
+
     #[test]
     fn v48_to_v49_replaces_the_decay_tombstone_index_predicate() {
         let mut conn = Connection::open_in_memory().unwrap();

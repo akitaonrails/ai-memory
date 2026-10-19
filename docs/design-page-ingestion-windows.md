@@ -22,9 +22,12 @@ invoked from `Store::open` next to the entity-index backfill) that
 reproduces the identical end state in bounded batches, checkpoints the
 WAL (`TRUNCATE`) between each, logs progress, resumes rather than
 restarts if interrupted, and no-ops on a store already backfilled. The
-in-place reshape changes V62's checksum, so the migration runner now
-tolerates a divergent checksum on an already-applied migration
-(`abort_divergent = false`, `abort_missing` unchanged) so
+in-place reshape changed V62's checksum, so `migrations::run` repairs that
+one known divergence (the exact checksum v2.2.1 shipped for V62, #1443)
+before the runner verifies it, and is strict on everything else:
+`abort_divergent` is back to true (the tolerance that #776 relied on was
+retired once the repair landed) and `abort_missing` is unchanged, so an
+unknown mismatch or a store ahead of the binary fails closed while
 correctly-migrated stores still open.*
 
 ## 1. The problem, and why entity-link windows are not enough
