@@ -2463,7 +2463,9 @@ fn powershell_call_operator(agent: &str) -> &'static str {
     // Grok 1.0.41: every ai-memory hook failed with a ParserError in the
     // session's `hook_execution` updates, and its hooks guide documents the
     // PowerShell `$VAR` rewrite).
-    if matches!(agent, "codex" | "grok") {
+    // Copilot CLI evaluates its Windows hook command with PowerShell as well
+    // (#1462), causing a ParserError and tool denial when omitting `&`.
+    if matches!(agent, "codex" | "grok" | "copilot-cli") {
         "& "
     } else {
         ""
@@ -2506,6 +2508,22 @@ fn grok_windows_command_invokes_rather_than_quotes() {
     assert!(
         cmd.starts_with("& \""),
         "grok must use the call operator: {cmd}"
+    );
+}
+
+/// #1462: Copilot CLI evaluates its Windows hooks with PowerShell, where a
+/// quoted path in command position causes a ParserError without `&`.
+#[test]
+fn copilot_cli_windows_command_invokes_rather_than_quotes() {
+    let cmd = hook_command(
+        Path::new("stop.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(HookCommandPlatform::WindowsNative, "copilot-cli", None, None),
+    );
+    assert!(
+        cmd.starts_with("& \""),
+        "copilot-cli must use the call operator: {cmd}"
     );
 }
 
