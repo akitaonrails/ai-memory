@@ -25,7 +25,12 @@ restarts if interrupted, and no-ops on a store already backfilled. The
 in-place reshape changes V62's checksum, so the migration runner now
 tolerates a divergent checksum on an already-applied migration
 (`abort_divergent = false`, `abort_missing` unchanged) so
-correctly-migrated stores still open.*
+correctly-migrated stores still open. Because a tolerated divergence
+still logs refinery's `ERROR …divergent` on every start, the one
+shipped pre-#776 checksum is now rewritten to the embedded value on
+open (`migrations::repair_v62_divergence`, matched exactly against the
+known value only, #1443); any other divergence stays
+tolerated-and-loud.*
 
 ## 1. The problem, and why entity-link windows are not enough
 

@@ -12,6 +12,13 @@ version in [`docs/changelog/`](docs/changelog/):
 ## [Unreleased]
 
 ### Fixed
+- Repaired the known pre-#776 V62 migration checksum on open (matched exactly
+  against the shipped value, then rewritten to the embedded migration's
+  checksum), so stores that applied the original V62 no longer log refinery's
+  `ERROR …divergent` on every start. Unknown checksum divergences are never
+  rewritten and stay tolerated-but-loud, and a store ahead of the binary still
+  fails closed as before.
+  ([#1443](https://github.com/akitaonrails/ai-memory/issues/1443))
 - Model-produced page paths are now cleaned of the remaining shapes `ensure_portable`
   refuses, a component ending in a dot or space and a DOS device name like `aux.md`,
   so one such path no longer aborts every page in a consolidation or bootstrap batch.

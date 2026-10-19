@@ -4,6 +4,69 @@ use crate::error::{StoreError, StoreResult};
 
 refinery::embed_migrations!("migrations");
 
+/// Checksum refinery recorded for the ORIGINAL V62 (`V62__page_ingestion_windows`,
+/// pre-#776): the in-migration backfill shape shipped in v2.2.1 (git blob
+/// `28917fb7233b290aa1d0bd70477fb63966977df4`, pinned to the fixture copy in
+/// `src/testdata/`). #776 reshaped the file in place (blob
+/// `d826cca28fbc295372810918d3882d22dbf1d94e`), so every store that applied
+/// V62 before that fix carries this value while every later binary embeds the
+/// reshaped content — refinery compares name+version+checksum on every run
+/// and logged `ERROR refinery_core::traits::divergent` on each start until
+/// [`repair_v62_divergence`] rewrites this known pair first.
+const V62_PRE_776_CHECKSUM: u64 = 16_518_128_245_137_964_566;
+
+/// Checksum the embedded migration with this version currently hashes to.
+///
+/// Read from the runner so the repair target can never drift from the
+/// compiled-in file: if V62 is ever reshaped again, the embedded value is
+/// whatever that reshape produced.
+fn embedded_checksum(version: u32) -> Option<u64> {
+    migrations::runner()
+        .get_migrations()
+        .iter()
+        .find(|migration| migration.version() == version)
+        .map(refinery::Migration::checksum)
+}
+
+/// Rewrite the one KNOWN tolerated divergence — a pre-#776 V62 history row —
+/// to the embedded checksum, before refinery verifies.
+///
+/// Only the exact shipped pre-#776 value is matched (`WHERE checksum = ?2`):
+/// an edited or otherwise unknown history row is never blessed and keeps the
+/// existing tolerate-but-loud behaviour from [`run`]. Metadata only — the
+/// pre-#776 install already ran the original V62's full in-transaction
+/// backfill, and the post-#776 boot backfill is idempotent and inert on it.
+///
+/// # Errors
+/// Propagates the SQL error; a store with no history table yet (a fresh
+/// database, where refinery would create it during this same run) is not
+/// an error and simply has nothing to repair.
+fn repair_v62_divergence(conn: &rusqlite::Connection) -> StoreResult<usize> {
+    let history_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+         AND name = 'refinery_schema_history'",
+        [],
+        |row| row.get(0),
+    )?;
+    if history_exists == 0 {
+        return Ok(0);
+    }
+    let Some(current) = embedded_checksum(62) else {
+        return Ok(0);
+    };
+    let changed = conn.execute(
+        "UPDATE refinery_schema_history SET checksum = ?1 \
+         WHERE version = 62 AND checksum = ?2",
+        rusqlite::params![current.to_string(), V62_PRE_776_CHECKSUM.to_string()],
+    )?;
+    if changed > 0 {
+        tracing::info!(
+            "repaired pre-#776 V62 migration checksum (V62 history row now matches the embedded migration)"
+        );
+    }
+    Ok(changed)
+}
+
 /// Run all pending migrations against an open connection.
 ///
 /// # Errors
@@ -14,6 +77,11 @@ refinery::embed_migrations!("migrations");
 /// is remapped to [`StoreError::DataSchemaAhead`], which names the offending
 /// migration and points the operator at the fix.
 pub fn run(conn: &mut rusqlite::Connection) -> StoreResult<()> {
+    // Silence the one known tolerated divergence (see `V62_PRE_776_CHECKSUM`)
+    // before refinery verifies, so an upgrade past #776 stops logging the
+    // scary per-start ERROR. Unknown divergences are not touched here: they
+    // fall through to the tolerant runner below and stay loud.
+    repair_v62_divergence(conn)?;
     migrations::runner()
         // Tolerate a divergent checksum on an already-applied migration.
         //
@@ -1583,6 +1651,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(previous, ("claude-code".into(), "native-1".into()));
+    }
+
+    /// The pinned pre-#776 checksum is the checksum of the SHIPPED content,
+    /// not a remembered number: recomputing it through refinery's own hasher
+    /// from the fixture copy of v2.2.1's V62 (git blob `28917fb…`) must equal
+    /// the constant [`repair_v62_divergence`] matches on, and the embedded
+    /// migration must still hash differently — otherwise the repair is dead
+    /// code against a store that still needs it.
+    #[test]
+    fn pre_776_v62_checksum_is_pinned_to_shipped_content() {
+        let fixture = include_str!("testdata/V62__page_ingestion_windows.pre776.sql");
+        let recomputed = refinery::Migration::unapplied("V62__page_ingestion_windows", fixture)
+            .expect("the fixture parses as V62")
+            .checksum();
+        assert_eq!(recomputed, V62_PRE_776_CHECKSUM);
+        assert_ne!(
+            Some(recomputed),
+            embedded_checksum(62),
+            "V62 must still embed reshaped content, or there is no divergence to repair"
+        );
+    }
+
+    /// A store carrying the shipped pre-#776 V62 row is repaired to the
+    /// embedded checksum by the next `run`, while an unknown divergence on a
+    /// different row is left alone (still tolerated, still loud) — only the
+    /// exact known pair is ever rewritten — and the repair is idempotent.
+    #[test]
+    fn pre_776_v62_divergence_is_repaired_but_unknown_divergence_is_not() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+
+        // The exact state #1443 describes: V62 recorded with the shipped
+        // pre-#776 checksum, plus an unrelated row that must never match.
+        conn.execute(
+            "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = 62",
+            params![V62_PRE_776_CHECKSUM.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE refinery_schema_history SET checksum = '999999' WHERE version = 61",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn).expect("the known divergence must be repaired before refinery verifies");
+
+        let current = embedded_checksum(62).expect("V62 is embedded").to_string();
+        fn checksum_of(conn: &Connection, version: i64) -> String {
+            conn.query_row(
+                "SELECT checksum FROM refinery_schema_history WHERE version = ?1",
+                params![version],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+        assert_eq!(
+            checksum_of(&conn, 62),
+            current,
+            "the pre-#776 row must match the embedded migration"
+        );
+        assert_eq!(
+            checksum_of(&conn, 61),
+            "999999",
+            "an unknown divergence must never be rewritten"
+        );
+
+        // Idempotent: the repaired row no longer matches the pre-#776 value.
+        run(&mut conn).expect("a repaired store keeps opening");
+        assert_eq!(checksum_of(&conn, 62), current);
+        assert_eq!(checksum_of(&conn, 61), "999999");
     }
 
     /// V62 was reshaped in place (#776) from an in-migration backfill to
