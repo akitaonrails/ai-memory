@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use git2::{ErrorCode, IndexAddOption, ObjectType, Repository, Signature};
+use git2::{ConfigLevel, ErrorCode, IndexAddOption, ObjectType, Repository, Signature};
 use tracing::{debug, warn};
 
 use crate::error::{WikiError, WikiResult};
@@ -175,7 +175,27 @@ fn open_validated_repository(root: &Path) -> Result<Repository, OpenRepositoryEr
             reason: "wiki repository metadata escapes the in-root .git directory",
         }));
     }
+    ensure_gitdir_fsync(&repo).map_err(OpenRepositoryError::Git)?;
     Ok(repo)
+}
+
+/// libgit2 fsyncs loose objects and refs only when `core.fsyncObjectFiles` is
+/// set; without it a crash can leave a ref pointing at a zero-length object.
+/// git2 0.21 does not wrap the process-wide `GIT_OPT_ENABLE_FSYNC_GITDIR`, and
+/// this crate forbids `unsafe`, so the repo-scoped key is set instead. It is
+/// written on every open of a repo that lacks it, so pre-existing wikis are
+/// covered too.
+fn ensure_gitdir_fsync(repo: &Repository) -> Result<(), git2::Error> {
+    if repo
+        .config()?
+        .get_bool("core.fsyncObjectFiles")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    repo.config()?
+        .open_level(ConfigLevel::Local)?
+        .set_bool("core.fsyncObjectFiles", true)
 }
 
 fn map_open_error(error: OpenRepositoryError) -> WikiError {
@@ -1734,6 +1754,31 @@ mod tests {
                 Err(WikiError::Confinement { .. })
             ));
         }
+    }
+
+    #[test]
+    fn wiki_gitdir_enables_fsync_on_init_and_on_pre_existing_repos() {
+        let tmp = tempdir();
+        let fresh = tmp.path().join("fresh");
+        GitAdapter::open_or_init(&fresh).unwrap();
+        let fsync = |root: &Path| {
+            Repository::open(root)
+                .unwrap()
+                .config()
+                .unwrap()
+                .open_level(ConfigLevel::Local)
+                .unwrap()
+                .get_bool("core.fsyncObjectFiles")
+                .unwrap_or(false)
+        };
+        assert!(fsync(&fresh));
+
+        let existing = tmp.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        Repository::init(&existing).unwrap();
+        assert!(!fsync(&existing));
+        GitAdapter::open_or_init(&existing).unwrap();
+        assert!(fsync(&existing));
     }
 
     #[test]

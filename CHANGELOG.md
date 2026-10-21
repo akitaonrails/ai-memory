@@ -223,6 +223,12 @@ version in [`docs/changelog/`](docs/changelog/):
   relay and wiki sync companions take the same `rustls-webpki` bump.
 
 ### Fixed
+- Enabled fsync for the wiki git repository's `.git` directory, so a crash or
+  power loss can no longer leave a ref pointing at a zero-length loose object.
+  Every wiki repository now carries `core.fsyncObjectFiles = true`, set when it
+  is initialised and on each open of a repository that lacks it, which covers
+  pre-existing wikis. Self-healing a corrupted wiki repository and escalating
+  failed auto-commits to an error are still open. ([#1511](https://github.com/akitaonrails/ai-memory/issues/1511))
 - Reserved local-embedding capacity for interactive search queries instead of
   allowing concurrent page writes and backfill work to occupy every inference
   slot. Excess queries fall back immediately to non-vector retrieval, and a
