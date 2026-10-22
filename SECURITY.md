@@ -37,7 +37,9 @@ what the project is and is not designed to defend against.
   `ai-memory serve --bind 0.0.0.0:…` you are exposing the MCP and admin
   routes to your local network. Protect this with:
   - `AI_MEMORY_AUTH_TOKEN` / `ai-memory generate-auth-token` (bearer token
-    checked on every request).
+    checked on every authenticated request; `/healthz`, `/auth/login`,
+    `/auth/recovery`, the static web assets and `/favicon.ico` are
+    unauthenticated by design).
   - Firewall rules or a reverse proxy with TLS.
 
   The server fails closed before serving unauthenticated non-loopback HTTP.
@@ -63,16 +65,20 @@ what the project is and is not designed to defend against.
 
 - **Host-header DNS rebinding.** The HTTP server enforces an
   `AI_MEMORY_ALLOWED_HOSTS` allowlist (defaulting to `127.0.0.1` and
-  `localhost`). Requests with a `Host` header not in the list are rejected
-  with 403.
+  `localhost` plus the IPv6 loopback `::1`). Requests with a `Host` header
+  not in the list are rejected with 403.
 
-- **Request body size.** Inbound HTTP bodies are capped at 10 MB to prevent
-  trivial memory exhaustion.
+- **Request body size.** Inbound HTTP bodies on `/mcp` and `/hook` are capped
+  at 10 MB to prevent trivial memory exhaustion; the `/admin/*` bootstrap
+  routes accept up to 32 MB (`BOOTSTRAP_MAX_BODY_BYTES`).
 
 - **Authentication and administrative authorization.** A static root bearer
-  token, database-user tokens, and optional OIDC hook-edge tokens form the
-  documented auth ladder. The first database user makes every `/admin/*`
-  route root-only; DB-user tokens provide attribution but never admin access.
+  token and database-user tokens form the documented auth ladder. OIDC
+  identifies the human developer to the CLI and hooks only; the server does
+  not validate OIDC tokens (see [`docs/sso.md`](docs/sso.md)), so an
+  OIDC-aware gateway must translate accepted identity into these tokens. The
+  first database user makes every `/admin/*` route root-only; DB-user tokens
+  provide attribution but never admin access.
 
 - **Per-project isolation.** Wiki files and SQLite rows are namespaced by
   `(workspace_id, project_id)`. A purge operation for project A cannot
@@ -148,7 +154,12 @@ what the project is and is not designed to defend against.
 ### Out of scope for v1
 
 - **Tenant isolation and per-user ACLs.** Database users provide attribution,
-  not private memory. There are no per-user or per-project ACLs; run separate
+  not private memory. Per-project authorization exists for database users
+  (`project_grants` with `projects.access_mode = 'restricted'`; see
+  [`docs/design-per-project-authz.md`](docs/design-per-project-authz.md)),
+  but it is not applied to a proxy-asserted user
+  (`actor_proxy_bearer_token`), whose identity has no database `UserId` to
+  key grants on (see [`docs/users.md`](docs/users.md)). Run separate
   servers/data directories for users who must not see one another's data.
 - **Encryption at rest.** The data directory is a plain filesystem tree.
 - **Remote sync security.** If you push the wiki git repository to a remote,
