@@ -383,7 +383,7 @@ fn is_parse_shape_error(err: &LlmError) -> bool {
 /// before generation. Generic 4xx errors are deliberately excluded so auth,
 /// quota, model, and malformed-request failures retain their original cause.
 fn is_response_format_rejection(err: &LlmError) -> bool {
-    let LlmError::Provider { status, body } = err else {
+    let LlmError::Provider { status, body, .. } = err else {
         return false;
     };
     if !matches!(status, 400 | 422) {
@@ -655,18 +655,22 @@ mod tests {
         assert!(is_response_format_rejection(&LlmError::Provider {
             status: 400,
             body: "unsupported parameter: response_format".into(),
+            retry_after: None
         }));
         assert!(is_response_format_rejection(&LlmError::Provider {
             status: 422,
             body: "json_schema is not supported".into(),
+            retry_after: None
         }));
         assert!(!is_response_format_rejection(&LlmError::Provider {
             status: 400,
             body: "unknown model".into(),
+            retry_after: None
         }));
         assert!(!is_response_format_rejection(&LlmError::Provider {
             status: 401,
             body: "response_format requires authentication".into(),
+            retry_after: None
         }));
     }
 
@@ -684,15 +688,18 @@ mod tests {
         // Transport / HTTP / auth → propagate.
         assert!(!is_parse_shape_error(&LlmError::Provider {
             status: 500,
-            body: "engine boom".into()
+            body: "engine boom".into(),
+            retry_after: None
         }));
         assert!(!is_parse_shape_error(&LlmError::Provider {
             status: 401,
-            body: "unauthorized".into()
+            body: "unauthorized".into(),
+            retry_after: None
         }));
         assert!(!is_parse_shape_error(&LlmError::Provider {
             status: 429,
-            body: "rate limited".into()
+            body: "rate limited".into(),
+            retry_after: None
         }));
     }
 

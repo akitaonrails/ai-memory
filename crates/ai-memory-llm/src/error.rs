@@ -20,6 +20,13 @@ pub enum LlmError {
         status: u16,
         /// Response body (truncated).
         body: String,
+        /// How long the provider asked callers to wait before retrying,
+        /// from a `Retry-After` header or a Google `RetryInfo` detail.
+        /// Read from the full body before it is cut to the display size,
+        /// because Google puts `RetryInfo` after the other details, well
+        /// past the cut. The fallback chain uses it to keep a candidate's
+        /// circuit open (see `fallback::circuit_cooldown`).
+        retry_after: Option<std::time::Duration>,
     },
 
     /// JSON (de)serialization failure.
@@ -164,7 +171,8 @@ mod tests {
         assert!(
             LlmError::Provider {
                 status: 429,
-                body: String::new()
+                body: String::new(),
+                retry_after: None
             }
             .is_transient()
         );
@@ -172,7 +180,8 @@ mod tests {
             assert!(
                 LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None
                 }
                 .is_transient(),
                 "status {status} should be transient"
@@ -183,7 +192,8 @@ mod tests {
             assert!(
                 !LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None
                 }
                 .is_transient(),
                 "status {status} must not be treated as transient"
@@ -255,7 +265,8 @@ mod tests {
         assert_eq!(
             LlmError::Provider {
                 status: 503,
-                body: "boom".into()
+                body: "boom".into(),
+                retry_after: None
             }
             .http_status(),
             Some(503)
@@ -270,6 +281,7 @@ mod tests {
                 LlmError::Provider {
                     status: 500,
                     body: "secret upstream body".into(),
+                    retry_after: None,
                 },
                 "provider",
             ),
@@ -314,7 +326,8 @@ mod tests {
             assert!(
                 LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None
                 }
                 .is_transient(),
                 "{status} must agree with is_transient"
@@ -325,7 +338,8 @@ mod tests {
             assert!(
                 !LlmError::Provider {
                     status,
-                    body: String::new()
+                    body: String::new(),
+                    retry_after: None
                 }
                 .is_transient(),
                 "{status} must agree with is_transient"

@@ -755,7 +755,7 @@ fn error_status_and_message(err: &LlmError) -> (Option<u16>, String) {
             e.status().map(|status| status.as_u16()),
             truncate_error_message(&e.to_string()),
         ),
-        LlmError::Provider { status, body } => (Some(*status), truncate_error_message(body)),
+        LlmError::Provider { status, body, .. } => (Some(*status), truncate_error_message(body)),
         _ => (None, truncate_error_message(&err.to_string())),
     }
 }
@@ -793,6 +793,7 @@ mod tests {
                 return Err(LlmError::Provider {
                     status: 401,
                     body: "bad token".to_string(),
+                    retry_after: None,
                 });
             }
             Ok(ChatResponse {
@@ -1022,6 +1023,7 @@ mod tests {
         let failure: LlmResult<ChatResponse> = Err(LlmError::Provider {
             status: 429,
             body: "secret upstream body".into(),
+            retry_after: None,
         });
         workloads.record(
             LlmWorkload::Rerank,

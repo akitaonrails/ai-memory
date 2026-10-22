@@ -1549,9 +1549,12 @@ every profile and resolves its credential once, at startup: a
 missing/empty provider or model, an unknown provider, or a missing
 credential fails startup rather than leaving a latent fallback that only
 fails once the primary is already down. Each candidate carries its own
-30s in-memory circuit (`ai_memory_llm::fallback::CIRCUIT_COOLDOWN`): a
-transient failure opens it, a success closes it, and a restart clears all
-circuit state. There is no durable circuit or forced chain-wide deadline.
+in-memory circuit, kept by chain position, so one model listed behind two
+keys has two circuits: a transient failure opens it for 30s
+(`ai_memory_llm::fallback::CIRCUIT_COOLDOWN`), or for the provider's retry
+hint (`Retry-After`, or Google `RetryInfo`) clamped to 30s..1h; a success
+closes it, and a restart clears all circuit state. There is no durable
+circuit or forced chain-wide deadline.
 
 `GET /admin/status` (`ai-memory status`) reports an `llm_candidates` list
 alongside the existing `llm`/`embedding` roles: each candidate's

@@ -198,6 +198,7 @@ impl Embedder for ConfigurableEmbedder {
             return Err(ai_memory_llm::LlmError::Provider {
                 status: 500,
                 body: "synthetic configured failure".into(),
+                retry_after: None,
             });
         }
         Ok(vec![0.5_f32; self.dim as usize])

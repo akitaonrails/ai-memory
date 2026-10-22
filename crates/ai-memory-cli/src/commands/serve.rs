@@ -4923,6 +4923,7 @@ mod tests {
                 Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -4940,6 +4941,7 @@ mod tests {
                 Err(ai_memory_llm::LlmError::Provider {
                     status: 400,
                     body: "SENTINEL_PRIVATE_BODY".into(),
+                    retry_after: None,
                 })
             })
         }
@@ -5065,10 +5067,12 @@ mod tests {
             ConsolidatorError::Llm(LlmError::Provider {
                 status: 503,
                 body: "capacity".into(),
+                retry_after: None,
             }),
             ConsolidatorError::Llm(LlmError::Provider {
                 status: 502,
                 body: "bad gateway".into(),
+                retry_after: None,
             }),
             ConsolidatorError::Llm(LlmError::Http(connect)),
             ConsolidatorError::Llm(LlmError::NotConfigured("no key".into())),

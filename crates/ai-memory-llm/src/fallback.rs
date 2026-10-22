@@ -23,9 +23,35 @@ use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 
 /// How long a candidate's circuit stays open after a transient failure
-/// before it is eligible again. Restarting the process clears all circuit
-/// state; there is no durable or cross-process cooldown.
+/// before it is eligible again, unless the provider asked for longer (see
+/// `circuit_cooldown`). Restarting the process clears all circuit state;
+/// there is no durable or cross-process cooldown.
 pub const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Longest cooldown a provider's retry hint can impose on one candidate.
+/// A daily quota answers with a hint of hours (Gemini sends `RetryInfo`
+/// with values such as `32993s`); one hour still skips almost every doomed
+/// attempt while bounding the damage of a wrong or hostile hint.
+pub(crate) const MAX_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+
+/// Cooldown for a candidate that just failed transiently: the provider's
+/// retry hint ([`LlmError::Provider`]'s `retry_after`) clamped to
+/// [`CIRCUIT_COOLDOWN`]..=[`MAX_CIRCUIT_COOLDOWN`], or [`CIRCUIT_COOLDOWN`]
+/// without a hint. Without this, a candidate whose daily quota is spent is
+/// retried every 30 s for the rest of the day, and every retry adds a
+/// round trip to the call that hits it.
+///
+/// Example: a 429 carrying `retry_after = 9h` opens the circuit for 1 h.
+#[must_use]
+pub(crate) fn circuit_cooldown(err: &LlmError) -> Duration {
+    match err {
+        LlmError::Provider {
+            retry_after: Some(hint),
+            ..
+        } => (*hint).clamp(CIRCUIT_COOLDOWN, MAX_CIRCUIT_COOLDOWN),
+        _ => CIRCUIT_COOLDOWN,
+    }
+}
 
 /// One provider in an ordered fallback chain.
 ///
@@ -129,7 +155,7 @@ impl FallbackLlmProvider {
         state.last_error_status = err.http_status();
         state.last_error_class = Some(err.class());
         if err.is_transient() {
-            state.circuit_open_until = Some(Instant::now() + CIRCUIT_COOLDOWN);
+            state.circuit_open_until = Some(Instant::now() + circuit_cooldown(err));
         }
     }
 
@@ -416,9 +442,14 @@ mod tests {
 
     fn clone_err(err: &LlmError) -> LlmError {
         match err {
-            LlmError::Provider { status, body } => LlmError::Provider {
+            LlmError::Provider {
+                status,
+                body,
+                retry_after,
+            } => LlmError::Provider {
                 status: *status,
                 body: body.clone(),
+                retry_after: *retry_after,
             },
             LlmError::Serde(msg) => LlmError::Serde(msg.clone()),
             LlmError::UnexpectedShape(msg) => LlmError::UnexpectedShape(msg.clone()),
@@ -481,6 +512,7 @@ mod tests {
         LlmError::Provider {
             status,
             body: "upstream body that must never leak".to_string(),
+            retry_after: None,
         }
     }
 
@@ -569,22 +601,27 @@ mod tests {
             LlmError::Provider {
                 status: 400,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 401,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 403,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 404,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Provider {
                 status: 422,
                 body: String::new(),
+                retry_after: None,
             },
             LlmError::Schema("bad schema".into()),
             LlmError::Serde("deserialize failed".into()),
@@ -649,6 +686,7 @@ mod tests {
         LlmError::Provider {
             status,
             body: body.to_string(),
+            retry_after: None,
         }
     }
 
@@ -749,5 +787,91 @@ mod tests {
 
         let rendered = format!("{health:?}");
         assert!(!rendered.contains("must not leak"));
+    }
+
+    fn quota_429(retry_after: Option<Duration>) -> LlmError {
+        LlmError::Provider {
+            status: 429,
+            body: "quota exhausted".into(),
+            retry_after,
+        }
+    }
+
+    #[test]
+    fn circuit_cooldown_clamps_the_provider_hint_between_floor_and_cap() {
+        assert_eq!(circuit_cooldown(&quota_429(None)), CIRCUIT_COOLDOWN);
+        assert_eq!(
+            circuit_cooldown(&quota_429(Some(Duration::from_secs(5)))),
+            CIRCUIT_COOLDOWN,
+            "a hint shorter than the floor keeps the default cooldown"
+        );
+        assert_eq!(
+            circuit_cooldown(&quota_429(Some(Duration::from_secs(600)))),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            circuit_cooldown(&quota_429(Some(Duration::from_secs(32_993)))),
+            MAX_CIRCUIT_COOLDOWN,
+            "a daily-quota hint of hours is capped"
+        );
+        assert_eq!(
+            circuit_cooldown(&LlmError::Serde("boom".into())),
+            CIRCUIT_COOLDOWN
+        );
+    }
+
+    fn circuit_open_for(chain: &FallbackLlmProvider, index: usize) -> Duration {
+        let state = chain.entries[index].state.lock().unwrap();
+        state
+            .circuit_open_until
+            .expect("the transient failure opened the circuit")
+            .saturating_duration_since(Instant::now())
+    }
+
+    #[tokio::test]
+    async fn a_provider_retry_hint_keeps_the_circuit_open_past_the_default() {
+        let hinted = FallbackLlmProvider::new(vec![
+            Candidate::new(
+                "gemini",
+                "spent",
+                Arc::new(ScriptedLlm::err(
+                    "gemini",
+                    "spent",
+                    quota_429(Some(Duration::from_secs(600))),
+                )),
+            ),
+            Candidate::new(
+                "gemini",
+                "spare",
+                Arc::new(ScriptedLlm::ok("gemini", "spare", "ok")),
+            ),
+        ]);
+        hinted
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap();
+        assert!(
+            circuit_open_for(&hinted, 0) > CIRCUIT_COOLDOWN + Duration::from_secs(60),
+            "a 10-minute hint must outlast the 30 s default"
+        );
+
+        // Control: the same failure without a hint keeps the default.
+        let unhinted = FallbackLlmProvider::new(vec![
+            Candidate::new(
+                "gemini",
+                "spent",
+                Arc::new(ScriptedLlm::err("gemini", "spent", quota_429(None))),
+            ),
+            Candidate::new(
+                "gemini",
+                "spare",
+                Arc::new(ScriptedLlm::ok("gemini", "spare", "ok")),
+            ),
+        ]);
+        unhinted
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap();
+        assert!(circuit_open_for(&unhinted, 0) <= CIRCUIT_COOLDOWN);
     }
 }

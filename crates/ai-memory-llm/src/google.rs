@@ -11,7 +11,7 @@ use tracing::debug;
 
 use crate::embedding::{Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, retry_delay};
 use crate::error::{LlmError, LlmResult};
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 use crate::text::truncate_for_embedding;
 
 /// Default Gemini API host.
@@ -118,11 +118,7 @@ impl GoogleEmbedder {
                 continue;
             }
             if !status.is_success() {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(provider_error(resp).await);
             }
             let parsed: GeminiEmbedResponse = response_json_limited(resp).await?;
             let values = parsed.embedding.values;

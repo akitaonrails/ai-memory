@@ -118,12 +118,24 @@ Copilot token exchange and the `openai-oauth`/OIDC refresh. A 429 or 5xx from
 those token endpoints is transient, because the grant was not rejected; any
 other non-2xx stays an auth failure with its re-login hint.
 
-Before a candidate is called, the wrapper checks an in-memory circuit keyed by
-`(provider, model)`. A transient error opens that candidate's circuit for a
-bounded cooldown; other candidates remain eligible. A successful response
-closes that candidate's circuit. Restarting the server clears circuits. The
-initial implementation uses no durable circuit state and no separate forced
-request deadline.
+Before a candidate is called, the wrapper checks an in-memory circuit kept per
+candidate, by its position in the chain. The same provider and model listed
+twice (for example one model behind two API keys) gets two independent
+circuits. A transient error opens that candidate's circuit for a bounded
+cooldown; other candidates remain eligible. A successful response closes that
+candidate's circuit. Restarting the server clears circuits. The
+implementation uses no durable circuit state and no separate forced request
+deadline.
+
+The cooldown is 30 seconds (`CIRCUIT_COOLDOWN`) unless the failure carried a
+retry hint: a delta-seconds `Retry-After` header, or a Google
+`google.rpc.RetryInfo` detail in the error body. Gemini sends no `Retry-After`
+on a quota 429, and its `RetryInfo` sits past the 1 KiB error-body cut, so the
+hint is read from the full body before the cut and carried in
+`LlmError::Provider::retry_after`. The hint is clamped between 30 seconds and
+one hour. A spent daily quota answers with a hint of hours, so the candidate
+is skipped instead of being retried every 30 seconds for the rest of the day;
+the one-hour cap bounds the cost of a wrong hint.
 
 If every eligible candidate fails, the wrapper returns a bounded aggregate
 error containing provider/model labels and error classes, never response bodies
@@ -150,8 +162,8 @@ or trigger background recovery traffic.
 2. Verify all four trait methods preserve request/schema/operation id.
 3. Verify `429`, `5xx`, timeout, and connection failures advance; verify
    deterministic errors stop on the first candidate.
-4. Verify an open circuit skips only its `(provider, model)` candidate and a
-   success closes it.
+4. Verify an open circuit skips only its candidate and a success closes it,
+   and that a provider retry hint lengthens the cooldown within its bounds.
 5. Test configuration validation, including missing/empty profiles and missing
    credentials, through `Config::load()` without reading a real home directory;
    a missing credential is checked by `require_llm_fallback_credentials()` and

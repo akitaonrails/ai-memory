@@ -22,7 +22,7 @@ use crate::openai::{
 };
 use crate::openai_compat::OpenAiCompatProvider;
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 use crate::types::{
     ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
 };
@@ -464,10 +464,7 @@ impl OpenCodeResponsesProvider {
         let response = headers.apply(builder).send().await?;
         let status = response.status();
         if !status.is_success() {
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body: provider_error_body(response).await,
-            });
+            return Err(provider_error(response).await);
         }
         response_json_limited(response).await
     }
@@ -1043,7 +1040,7 @@ mod tests {
                         .unwrap_err(),
                 ] {
                     assert!(
-                        matches!(error, LlmError::Provider { status: code, body } if code == status && body == "gateway error")
+                        matches!(error, LlmError::Provider { status: code, body, .. } if code == status && body == "gateway error")
                     );
                 }
                 assert_eq!(server.received_requests().await.unwrap().len(), 2);

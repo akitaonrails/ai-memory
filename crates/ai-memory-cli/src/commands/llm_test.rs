@@ -150,6 +150,7 @@ mod tests {
             LlmError::Provider {
                 status: 429,
                 body: "rate_limit_error".into(),
+                retry_after: None,
             },
         );
         assert!(format!("{err:#}").contains("not a real rate limit"));
@@ -166,6 +167,7 @@ mod tests {
                 LlmError::Provider {
                     status,
                     body: String::new(),
+                    retry_after: None,
                 },
             );
             assert!(!format!("{err:#}").contains("not a real rate limit"));

@@ -49,6 +49,7 @@ impl LlmProvider for FailingLlm {
         Err(LlmError::Provider {
             status: 401,
             body: format!("invalid api key {PLANTED_PROVIDER}"),
+            retry_after: None,
         })
     }
     async fn complete_structured_raw(
@@ -59,6 +60,7 @@ impl LlmProvider for FailingLlm {
         Err(LlmError::Provider {
             status: 401,
             body: PLANTED_PROVIDER.into(),
+            retry_after: None,
         })
     }
 }
@@ -80,6 +82,7 @@ impl Embedder for FailingEmbedder {
         Err(LlmError::Provider {
             status: 503,
             body: format!("upstream said {PLANTED_EMBED}"),
+            retry_after: None,
         })
     }
 }

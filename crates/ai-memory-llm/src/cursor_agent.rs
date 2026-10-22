@@ -215,6 +215,7 @@ impl CursorAgentProvider {
         .map_err(|_| LlmError::Provider {
             status: 504,
             body: "cursor agent timed out".into(),
+            retry_after: None,
         })??;
 
         let (status, stdout, stderr) = collected;
@@ -224,6 +225,7 @@ impl CursorAgentProvider {
             return Err(LlmError::Provider {
                 status: u16::try_from(code).unwrap_or(1),
                 body: truncate_chars(&body, 500),
+                retry_after: None,
             });
         }
         let text = String::from_utf8_lossy(&stdout).trim().to_string();

@@ -1731,6 +1731,7 @@ mod tests {
                 return Err(LlmError::Provider {
                     status: 503,
                     body: "busy".into(),
+                    retry_after: None,
                 });
             }
             Ok(serde_json::json!({ "pages": [], "rationale": "ok" }))

@@ -55,6 +55,7 @@ fn provider_404() -> LlmError {
     LlmError::Provider {
         status: 404,
         body: "404 page not found".into(),
+        retry_after: None,
     }
 }
 

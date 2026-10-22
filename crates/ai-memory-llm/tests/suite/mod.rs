@@ -13,4 +13,5 @@ mod openai_compat_embedder;
 mod openai_compat_guardrails;
 mod openai_compat_retry_after;
 mod openai_compat_strict;
+mod provider_retry_hint;
 mod redirect_credentials;

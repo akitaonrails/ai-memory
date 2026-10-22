@@ -10,7 +10,7 @@ use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error, response_json_limited};
 use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::types::{
@@ -637,11 +637,7 @@ impl OpenAiProvider {
         let resp = request.json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<OpenAiResponse>(resp).await
     }

@@ -2308,6 +2308,7 @@ mod tests {
         let error = AutoImproveError::Llm(LlmError::Provider {
             status: 400,
             body: AUTO_IMPROVE_REDACTION_SENTINEL.into(),
+            retry_after: None,
         });
         let summary = redacted_auto_improve_summary(&error);
         assert_eq!(summary, "auto-improve failed: class=provider status=400");

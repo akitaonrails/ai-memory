@@ -23,7 +23,10 @@ use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::openai_oauth::model_uses_default_temperature;
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited, response_text_limited};
+use crate::response::{
+    provider_error, provider_error_body, provider_error_in, response_json_limited,
+    response_text_limited,
+};
 use crate::text::truncate_for_embedding;
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Usage};
 
@@ -393,11 +396,7 @@ impl CopilotProvider {
         let resp = request.json(body).send().await.map_err(LlmError::from)?;
         let status = resp.status();
         if !status.is_success() {
-            let body = provider_error_body(resp).await;
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<CopilotChatResponse>(resp).await
     }
@@ -420,10 +419,7 @@ impl CopilotProvider {
         let resp = request.json(body).send().await.map_err(LlmError::from)?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body: provider_error_body(resp).await,
-            });
+            return Err(provider_error(resp).await);
         }
         response_json_limited::<CopilotResponsesResponse>(resp).await
     }
@@ -615,18 +611,10 @@ impl Embedder for CopilotEmbedder {
             }
             // Client errors (e.g. input too long) are not retried.
             if status.as_u16() == 400 {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(provider_error(resp).await);
             }
             if !status.is_success() {
-                let body = provider_error_body(resp).await;
-                return Err(LlmError::Provider {
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(provider_error(resp).await);
             }
             let body = response_text_limited(resp).await?;
             let values = parse_openai_embedding_values(&body, status.as_u16())?;
@@ -664,17 +652,14 @@ async fn exchange_copilot_token(
         .map_err(LlmError::from)?;
     let status = resp.status();
     if !status.is_success() {
-        let body = provider_error_body(resp).await;
         // GitHub rate-limits this endpoint per account. A 429/5xx here says
         // nothing about the credential, and `LlmError::Auth` is not transient,
         // so classifying it as auth stops the fallback chain and tells the
         // operator to fix a token that is fine.
         if LlmError::status_is_transient(status.as_u16()) {
-            return Err(LlmError::Provider {
-                status: status.as_u16(),
-                body: format!("copilot token exchange: {body}"),
-            });
+            return Err(provider_error_in("copilot token exchange", resp).await);
         }
+        let body = provider_error_body(resp).await;
         return Err(LlmError::Auth(format!(
             "copilot token exchange failed ({status}): {body}"
         )));

@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::error::{LlmError, LlmResult};
 use crate::openai_oauth::{CodexResponsesRequest, CodexResponsesResponse, parse_sse_response};
-use crate::response::{provider_error_body, response_json_limited, response_text_limited};
+use crate::response::{provider_error, response_json_limited, response_text_limited};
 use crate::types::ExtraHeaders;
 
 /// ChatGPT/Codex Responses backend.
@@ -51,10 +51,7 @@ pub(crate) async fn post_codex_responses(
     let response = request.send().await.map_err(LlmError::from)?;
     let status = response.status();
     if !status.is_success() {
-        return Err(LlmError::Provider {
-            status: status.as_u16(),
-            body: provider_error_body(response).await,
-        });
+        return Err(provider_error(response).await);
     }
     if body.stream {
         parse_sse_response(&response_text_limited(response).await?)

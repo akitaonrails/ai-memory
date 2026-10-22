@@ -11,6 +11,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- Changed the LLM fallback chain to keep a failed candidate's circuit open for
+  as long as the provider asked, clamped to 30 seconds through one hour,
+  instead of always 30 seconds. The hint comes from a `Retry-After` header or a
+  Google `RetryInfo` error detail. Gemini sends no `Retry-After` on a spent
+  daily quota and puts `RetryInfo` past the 1 KiB error-body cut, so the hint
+  is now read before the cut and carried on `LlmError::Provider`. A candidate
+  whose daily quota is gone is skipped instead of retried every 30 seconds.
+  Without a hint the cooldown is unchanged. The fallback design doc now also
+  says that circuits are kept per chain position, so one model listed behind
+  two API keys has two circuits.
+  ([#1619](https://github.com/akitaonrails/ai-memory/issues/1619))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added
