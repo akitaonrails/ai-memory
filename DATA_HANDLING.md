@@ -13,7 +13,7 @@ ai-memory does not phone home. There is no analytics, crash reporting, or
 usage telemetry built into the binary. Everything it stores (wiki pages and
 the SQLite database) lives under a single, operator-controlled data
 directory on the local filesystem (`SECURITY.md`, "Local data
-confidentiality"). No data leaves the host unless one of the three opt-in
+confidentiality"). No data leaves the host unless one of the opt-in
 paths below is explicitly enabled. The **embedding provider** is the one
 most likely to matter to a reviewer, since it decides whether stored content
 reaches a cloud API at all.
@@ -22,20 +22,38 @@ The out-of-the-box default is local-only: `config.default.toml` configures
 in-process local embeddings (all-MiniLM-L6-v2, 384-dim) with no API key and
 no data egress. See [`docs/local-embeddings.md`](docs/local-embeddings.md).
 
+One default does touch the network, without sending any stored data: with
+`embedding_provider` unset, the first start fetches the local embedding
+model files (tokenizer/config plus `model.safetensors`, about 87 MB) from
+`huggingface.co` in the background
+([`docs/local-embeddings.md`](docs/local-embeddings.md);
+[`docs/airgapped-install.md`](docs/airgapped-install.md) pins their sha256).
+No key enables it. Nothing stored is uploaded, but the host's address and
+the fetch timing are visible to Hugging Face and its CDN. Set
+`embedding_provider = "none"` or pre-seed the model files to avoid the
+fetch entirely.
+
 There is no encryption at rest in v1; ai-memory relies on OS filesystem
 permissions (owner-only directories/files on Unix, ACLs on Windows;
 `SECURITY.md`, same section).
 
-## The three opt-in paths that send data externally
+## The opt-in paths that send data externally
 
-All three are off by default (local embeddings need no key or network call)
-and each requires a deliberate config change to turn on.
+All of them are off by default (the local embedder needs no key and sends no
+stored data — its one-time model fetch is described above) and each requires
+a deliberate config change to turn on.
 
 | path | what leaves the host |
 |---|---|
 | `embedding_provider = openai\|voyage\|google\|openai-compat` | the text of every stored page |
 | `capture_assistant` (double opt-in) | the assistant's final-turn text |
 | `AI_MEMORY_RERANKER=llm` | each live query + bounded page titles/snippets |
+| `[[admission_webhooks]]` | every write's full page body and frontmatter, POSTed to the configured URL (`crates/ai-memory-wiki/src/admission.rs`; only `X-Memory-Op` is attached, no credentials) |
+| `llm_provider` | session observations and page text (consolidation, lint, bootstrap, dream, profile, auto-improve) |
+| `embedding_provider = copilot` | page text to the Copilot embeddings endpoint (`CopilotEmbedder`) |
+| `cursor_agent` / `codex` providers | prompts and spawned-CLI traffic to those vendors' clouds |
+| `ai-memory upgrade` | a release check against `api.github.com` / `github.com`, run manually — there is no background update check |
+| remote `server_url` topology | hooks and the relay ship every capture to the configured remote host |
 
 1. **Embedding provider.** This is the broadest path by far, and the one
    most relevant to a reviewer's usual question ("does our source
@@ -69,7 +87,9 @@ guarantee; see the "Stored-content prompt injection" and reranking notes in
 `SECURITY.md` for the exact caveats. The embedding path (1) sends full page
 text to the provider's embedding endpoint and is not sanitized the same way,
 so it is the path to leave on `local` when stored content must not leave the
-server.
+server. `llm_provider` and the `cursor_agent`/`codex` providers likewise
+carry unsanitized page/session text to their vendors; admission webhooks
+receive each write in full.
 
 ## Is this "personal data" under GDPR?
 
@@ -83,7 +103,7 @@ to process personal data as such. In practice this means:
   commit message with a name, or free text a developer typed), that data is
   stored and retained exactly like any other memory content, under your own
   organization's control on infrastructure you run.
-- ai-memory does not transmit that content anywhere on its own; the three
+- ai-memory does not transmit that content anywhere on its own; the
   opt-in paths above are the only export mechanisms, and all are under your
   control.
 - Treat this the same way you'd treat any local database your team
