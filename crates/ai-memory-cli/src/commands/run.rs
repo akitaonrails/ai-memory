@@ -8306,6 +8306,52 @@ mod tests {
         assert_eq!(explicit.expected_session_id.as_deref(), Some("chosen"));
     }
 
+    /// Codex compresses a rollout idle for a week to `.jsonl.zst`. The launch
+    /// still resumes that linked session instead of treating it as missing.
+    #[test]
+    fn compressed_codex_rollout_is_resumed_not_orphaned() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let day = temp.path().join(".codex/sessions/2026/10/05");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&day).unwrap();
+        let id = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e5";
+        let record = serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}});
+        let compressed = day.join(format!("rollout-2026-10-05T20-43-00-{id}.jsonl.zst"));
+        std::fs::write(
+            &compressed,
+            ruzstd::encoding::compress_to_vec(
+                format!("{record}\n").as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        let env = EffectiveChildEnv::default();
+        let plan = || {
+            build_preflighted_launch_plan(
+                ManagedHarness::Codex,
+                None,
+                Vec::new(),
+                Some(id),
+                false,
+                temp.path(),
+                &cwd,
+                &env,
+            )
+            .unwrap()
+        };
+
+        let (resumed, orphaned) = plan();
+        assert!(orphaned.is_none());
+        assert!(resumed.args.iter().any(|arg| arg == "resume"));
+        assert_eq!(resumed.expected_session_id.as_deref(), Some(id));
+
+        std::fs::remove_file(&compressed).unwrap();
+        let (fresh, orphaned) = plan();
+        assert_eq!(orphaned.as_deref(), Some(id));
+        assert!(!fresh.args.iter().any(|arg| arg == "resume"));
+    }
+
     /// A linked session missing from this launch's store is only replaced
     /// when it was linked under the same store (or nothing was recorded).
     #[test]

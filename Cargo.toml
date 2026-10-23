@@ -161,6 +161,13 @@ flate2 = "1"
 # covers PowerShell Compress-Archive release zips and Stored test fixtures.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
+# Native transcript reading: Codex keeps a rollout it has not written for a
+# week as `.jsonl.zst`, so the workstream adapter needs a zstd decoder to find
+# and resume that session. Pure Rust, so the build needs no extra C library.
+# The `hash` feature only computes frame checksums and nothing here compares
+# them, so it stays off; frames that carry one still decode.
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+
 # Text munging / hook payload sanitisation.
 regex = "1"
 # Unicode NFC for the portable page-path key. Already in the tree via

@@ -13,6 +13,7 @@ use ai_memory_core::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
+use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -388,13 +389,14 @@ fn validate_transcript_cursor(
         serde_json::from_str(source_cursor).context("invalid native transcript file cursor")?;
     let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
         .ok_or_else(|| anyhow!("native transcript for {native_session_id} was not found"))?;
-    if Path::new(&cursor.path) != path || cursor.flavor != file_flavor(harness) {
+    if Path::new(&cursor.path) != cursor_path(harness, &path)
+        || cursor.flavor != file_flavor(harness)
+    {
         return Err(anyhow!(
             "native transcript cursor does not match this adapter session"
         ));
     }
-    let len = fs::metadata(&path)?.len();
-    if cursor.offset > len {
+    if !transcript_reaches(harness, &path, cursor.offset)? {
         return Err(anyhow!(
             "native transcript cursor is past the current transcript end"
         ));
@@ -536,8 +538,7 @@ fn transcript_baseline_blocking(
                 .ok_or_else(|| {
                     anyhow!("native transcript for {native_session_id} was not found")
                 })?;
-            let mut file = File::open(&path)?;
-            let mut reader = BufReader::new(&mut file);
+            let mut reader = open_transcript(harness, &path)?;
             let mut offset = 0_u64;
             let mut committed_offset = 0_u64;
             let mut prefix_hasher = Sha256::new();
@@ -601,7 +602,7 @@ fn transcript_baseline_blocking(
                 committed_offset = offset;
             }
             Ok(serde_json::to_string(&FileCursor {
-                path: path.to_string_lossy().into_owned(),
+                path: cursor_path(harness, &path).to_string_lossy().into_owned(),
                 offset: committed_offset,
                 flavor: file_flavor(harness),
                 prefix_sha256: journal_rewrites_in_place(harness)
@@ -1120,10 +1121,13 @@ fn export_jsonl_range(
     final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
     let flavor = file_flavor(harness);
+    let compressed = compressed_codex_rollout(harness, path);
+    let named_path = cursor_path(harness, path);
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<FileCursor>(raw).ok())
         .filter(|cursor| {
-            Path::new(&cursor.path) == path && (cursor.flavor.is_none() || cursor.flavor == flavor)
+            Path::new(&cursor.path) == named_path
+                && (cursor.flavor.is_none() || cursor.flavor == flavor)
         });
     let final_cursor = final_cursor
         .map(serde_json::from_str::<FileCursor>)
@@ -1131,7 +1135,7 @@ fn export_jsonl_range(
         .context("invalid native transcript final file cursor")?;
     if final_cursor
         .as_ref()
-        .is_some_and(|cursor| Path::new(&cursor.path) != path || cursor.flavor != flavor)
+        .is_some_and(|cursor| Path::new(&cursor.path) != named_path || cursor.flavor != flavor)
     {
         return Err(anyhow!(
             "native transcript final cursor does not match this adapter session"
@@ -1139,7 +1143,16 @@ fn export_jsonl_range(
     }
     let mut file = File::open(path)
         .with_context(|| format!("opening native transcript {}", path.display()))?;
-    let file_len = file.metadata()?.len();
+    // The file length of a compressed rollout says nothing about its content,
+    // and this reader does not trust the frame's optional content size: a
+    // final cursor is checked by decoding up to it, and otherwise the read
+    // below stops at the end of the stream or the source-byte budget.
+    let file_len = match (compressed, final_cursor.as_ref()) {
+        (false, _) => file.metadata()?.len(),
+        (true, Some(cursor)) if transcript_reaches(harness, path, cursor.offset)? => cursor.offset,
+        (true, Some(_)) => 0,
+        (true, None) => u64::MAX,
+    };
     let len = final_cursor
         .as_ref()
         .map_or(file_len, |cursor| cursor.offset);
@@ -1165,8 +1178,20 @@ fn export_jsonl_range(
             Sha256::new(),
         )
     };
-    file.seek(SeekFrom::Start(start))?;
-    let mut reader = BufReader::new(file);
+    let (mut reader, start): (Box<dyn BufRead>, u64) = if compressed {
+        // A zstd stream cannot seek: decode and drop the bytes before `start`.
+        // A shorter stream ends the skip early, which clamps `start` the way
+        // `min(len)` clamps it for a plain file.
+        let mut reader = transcript_reader(harness, path, file)?;
+        let skipped = std::io::copy(
+            &mut std::io::Read::by_ref(&mut reader).take(start),
+            &mut std::io::sink(),
+        )?;
+        (reader, skipped)
+    } else {
+        file.seek(SeekFrom::Start(start))?;
+        (Box::new(BufReader::new(file)), start)
+    };
     let mut offset = start;
     let mut committed_offset = start;
     let mut line = Vec::new();
@@ -1417,7 +1442,7 @@ fn export_jsonl_range(
     Ok(ExportedTranscript {
         native_session_id: native_session_id.to_string(),
         source_cursor: Some(serde_json::to_string(&FileCursor {
-            path: path.to_string_lossy().into_owned(),
+            path: named_path.to_string_lossy().into_owned(),
             offset: committed_offset,
             flavor,
             prefix_sha256: if journal_rewrites_in_place(harness) {
@@ -3785,6 +3810,9 @@ fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| Uuid::parse_str(name).is_ok());
     }
+    if compressed_codex_rollout(harness, path) {
+        return !cursor_path(harness, path).exists();
+    }
     path.extension().is_some_and(|ext| ext == "jsonl")
         || matches!(harness, ManagedHarness::Pi | ManagedHarness::Omp) && temporary_transcript(path)
 }
@@ -3795,6 +3823,187 @@ fn temporary_transcript(path: &Path) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.contains(".jsonl."))
+}
+
+/// Codex moves a rollout it has not written for seven days to a zstd
+/// `rollout-*.jsonl.zst` sibling, keeping its modification time, and restores
+/// the plain `.jsonl` when it reopens that session to write to it, which
+/// `codex resume` does at startup. A reader that finds both uses the plain
+/// file. The compressed copy is the same session, so it is located, listed and
+/// read like the plain one, and a cursor names the plain path in either form.
+/// Modeled on Codex 0.163.0: `RolloutFile::from_path` and
+/// `materialize_rollout_for_append` in
+/// <https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/rollout/src/compression.rs>
+/// and the `Resume` arm of `RolloutRecorder::new_inner` in
+/// <https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/rollout/src/recorder.rs>.
+fn compressed_codex_rollout(harness: ManagedHarness, path: &Path) -> bool {
+    harness == ManagedHarness::Codex
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl.zst"))
+}
+
+/// The path a file cursor names: the plain `.jsonl` a compressed Codex rollout
+/// is restored to, so a cursor stays valid across Codex's own conversion.
+fn cursor_path(harness: ManagedHarness, path: &Path) -> PathBuf {
+    if compressed_codex_rollout(harness, path) {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Open a transcript for sequential reads, decompressing a compressed Codex
+/// rollout.
+fn open_transcript(harness: ManagedHarness, path: &Path) -> std::io::Result<Box<dyn BufRead>> {
+    transcript_reader(harness, path, File::open(path)?)
+}
+
+/// [`open_transcript`] over a file already opened at `path`.
+fn transcript_reader(
+    harness: ManagedHarness,
+    path: &Path,
+    file: File,
+) -> std::io::Result<Box<dyn BufRead>> {
+    if compressed_codex_rollout(harness, path) {
+        return Ok(Box::new(BufReader::new(ZstdFrames::new(BufReader::new(
+            file,
+        ))?)));
+    }
+    Ok(Box::new(BufReader::new(file)))
+}
+
+/// Whether a transcript holds at least `offset` bytes of content, counted in
+/// decompressed bytes for a compressed Codex rollout, which is decoded only
+/// up to `offset` rather than trusting the frame's optional content size.
+fn transcript_reaches(harness: ManagedHarness, path: &Path, offset: u64) -> std::io::Result<bool> {
+    if compressed_codex_rollout(harness, path) {
+        let decoded = std::io::copy(
+            &mut std::io::Read::take(open_transcript(harness, path)?, offset),
+            &mut std::io::sink(),
+        )?;
+        return Ok(decoded == offset);
+    }
+    Ok(fs::metadata(path)?.len() >= offset)
+}
+
+/// Every frame of a zstd stream, in order. `StreamingDecoder` stops after one;
+/// Codex writes a single frame, but the format allows a concatenation, which
+/// `zstd -d` reads whole. A skippable frame, which Codex never writes, is
+/// reported as a decoding error.
+struct ZstdFrames<R: BufRead> {
+    decoder: Option<StreamingDecoder<TrackedSource<R>, FrameDecoder>>,
+    source_error: SourceError,
+}
+
+impl<R: BufRead> ZstdFrames<R> {
+    fn new(source: R) -> std::io::Result<Self> {
+        let source_error = SourceError::default();
+        let source = TrackedSource {
+            inner: source,
+            error: source_error.clone(),
+        };
+        let decoder = StreamingDecoder::new(source).map_err(|error| source_error.or(error))?;
+        Ok(Self {
+            decoder: Some(decoder),
+            source_error,
+        })
+    }
+}
+
+impl<R: BufRead> std::io::Read for ZstdFrames<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while let Some(decoder) = self.decoder.as_mut() {
+            let read = decoder
+                .read(buf)
+                .map_err(|error| self.source_error.or(error))?;
+            if read > 0 || buf.is_empty() {
+                return Ok(read);
+            }
+            let Some(finished) = self.decoder.take() else {
+                break;
+            };
+            let mut source = finished.into_inner();
+            if !source.fill_buf()?.is_empty() {
+                self.decoder = Some(
+                    StreamingDecoder::new(source).map_err(|error| self.source_error.or(error))?,
+                );
+            }
+        }
+        Ok(0)
+    }
+}
+
+/// The decoder reports a failed read of its input as one of its own errors.
+/// The input's last I/O error is kept here so a file that could not be read is
+/// reported as such, and only a stream that is not valid zstd counts as damaged.
+#[derive(Clone, Default)]
+struct SourceError(std::rc::Rc<std::cell::RefCell<Option<std::io::Error>>>);
+
+impl SourceError {
+    fn record(&self, error: &std::io::Error) {
+        *self.0.borrow_mut() = Some(std::io::Error::new(error.kind(), error.to_string()));
+    }
+
+    /// The input's I/O error if the decoder failed because of one, else a
+    /// decoding error.
+    fn or(&self, error: impl std::fmt::Display) -> std::io::Error {
+        self.0
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| zstd_decode_error(error))
+    }
+}
+
+struct TrackedSource<R> {
+    inner: R,
+    error: SourceError,
+}
+
+impl<R: BufRead> std::io::Read for TrackedSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner
+            .read(buf)
+            .inspect_err(|error| self.error.record(error))
+    }
+}
+
+impl<R: BufRead> BufRead for TrackedSource<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner
+            .fill_buf()
+            .inspect_err(|error| self.error.record(error))
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.inner.consume(amount);
+    }
+}
+
+/// A compressed rollout whose bytes are not a zstd stream this reader decodes.
+#[derive(Debug)]
+struct ZstdDecodeError(String);
+
+impl std::fmt::Display for ZstdDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid zstd stream: {}", self.0)
+    }
+}
+
+impl std::error::Error for ZstdDecodeError {}
+
+fn zstd_decode_error(error: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        ZstdDecodeError(error.to_string()),
+    )
+}
+
+fn is_zstd_decode_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ZstdDecodeError>())
 }
 
 fn read_bounded_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -3874,12 +4083,20 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
     if harness == ManagedHarness::Copilot {
         return copilot_session_header(path);
     }
-    let mut reader = BufReader::new(File::open(path)?);
+    // A damaged compressed rollout has no readable header, like a plain file
+    // with no parseable line; it is skipped rather than failing the store.
+    let mut reader = match open_transcript(harness, path) {
+        Ok(reader) => reader,
+        Err(error) if is_zstd_decode_error(&error) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     for _ in 0..64 {
-        let line = match read_capped_line(&mut reader, MAX_SESSION_HEADER_BYTES)? {
-            CappedLine::Eof => break,
-            CappedLine::Oversized => return Ok(None),
-            CappedLine::Line(line) => line,
+        let line = match read_capped_line(&mut reader, MAX_SESSION_HEADER_BYTES) {
+            Ok(CappedLine::Eof) => break,
+            Ok(CappedLine::Oversized) => return Ok(None),
+            Ok(CappedLine::Line(line)) => line,
+            Err(error) if is_zstd_decode_error(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -7396,6 +7613,391 @@ mod tests {
         files.push(temporary.clone());
         let candidates = lookup_candidates(files, id);
         assert_eq!(candidates.first(), Some(&temporary));
+    }
+
+    fn codex_rollout(store: &Path, id: &str, cwd: &Path, texts: &[&str]) -> PathBuf {
+        let day = store.join("2026/10/05");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(cwd).unwrap();
+        let path = day.join(format!("rollout-2026-10-05T20-43-00-{id}.jsonl"));
+        let mut records = vec![json!({"type":"session_meta","payload":{"id":id,"cwd":cwd}})];
+        records.extend(texts.iter().map(|text| {
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}})
+        }));
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// What Codex does to a rollout idle for a week: a zstd copy replaces it.
+    fn compress_codex_rollout(plain: &Path) -> PathBuf {
+        let compressed = plain.with_extension("jsonl.zst");
+        let bytes = fs::read(plain).unwrap();
+        fs::write(
+            &compressed,
+            ruzstd::encoding::compress_to_vec(
+                bytes.as_slice(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        fs::remove_file(plain).unwrap();
+        compressed
+    }
+
+    fn exported_texts(transcript: &ExportedTranscript) -> Vec<&str> {
+        transcript
+            .events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect()
+    }
+
+    /// A rollout Codex compressed is still the linked session, so a managed
+    /// launch resumes it instead of starting fresh. The compressed copy is
+    /// located through the same header and checkout match as a plain one.
+    #[test]
+    fn codex_compressed_rollout_still_exists_only_for_its_own_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("sessions");
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let mine = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e5";
+        let theirs = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e6";
+        let exists = |id: &str| {
+            native_session_exists(ManagedHarness::Codex, temp.path(), &cwd, Some(&store), id)
+                .unwrap()
+        };
+
+        let plain = codex_rollout(&store, mine, &cwd, &["hello"]);
+        assert!(exists(mine));
+        let compressed = compress_codex_rollout(&plain);
+        assert!(!plain.exists());
+        assert!(exists(mine), "the compressed copy is the same session");
+        assert!(
+            native_session_in_checkout(
+                ManagedHarness::Codex,
+                temp.path(),
+                &cwd,
+                Some(&store),
+                mine
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            locate_session_file(ManagedHarness::Codex, temp.path(), &cwd, Some(&store), mine)
+                .unwrap(),
+            Some(compressed)
+        );
+
+        // Another checkout's compressed rollout is refused like a plain one.
+        compress_codex_rollout(&codex_rollout(&store, theirs, &other, &["elsewhere"]));
+        assert!(!exists(theirs));
+
+        // A damaged compressed copy is skipped, not an unreadable store.
+        let broken = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e7";
+        fs::write(
+            store.join(format!(
+                "2026/10/05/rollout-2026-10-05T20-43-00-{broken}.jsonl.zst"
+            )),
+            b"not zstd",
+        )
+        .unwrap();
+        assert!(!exists(broken));
+        // So is one cut short before its first block ends.
+        let truncated = "01a10e73-0053-7f73-8dbd-5c76bcb2f5e8";
+        let whole = fs::read(compress_codex_rollout(&codex_rollout(
+            &store,
+            truncated,
+            &cwd,
+            &["a reply long enough to span more than the header record"],
+        )))
+        .unwrap();
+        fs::write(
+            store.join(format!(
+                "2026/10/05/rollout-2026-10-05T20-43-00-{truncated}.jsonl.zst"
+            )),
+            &whole[..whole.len() / 2],
+        )
+        .unwrap();
+        assert!(!exists(truncated));
+        assert!(exists(mine));
+    }
+
+    /// Codex reads the plain file when both forms exist (a conversion in
+    /// progress). Its staging files (`rollout-compress-*.tmp` while
+    /// compressing, `<rollout>.decompress.<pid>.<n>.tmp` while restoring) and
+    /// a `.jsonl.zst` without the `rollout-` prefix are never sessions.
+    #[tokio::test]
+    async fn codex_plain_rollout_hides_its_compressed_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("sessions");
+        let cwd = temp.path().join("repo");
+        let id = "01a16548-23e9-7cf1-b3d6-ab3405055748";
+        let plain = codex_rollout(&store, id, &cwd, &["hello"]);
+        let compressed = compress_codex_rollout(&plain);
+        let others = [
+            compressed.with_file_name("rollout-compress-a1b2c3.tmp"),
+            PathBuf::from(format!("{}.decompress.4242.0.tmp", plain.display())),
+            compressed.with_file_name(format!("notes-{id}.jsonl.zst")),
+        ];
+        for other in &others {
+            fs::copy(&compressed, other).unwrap();
+            assert!(!transcript_file(ManagedHarness::Codex, other), "{other:?}");
+        }
+        assert!(transcript_file(ManagedHarness::Codex, &compressed));
+        assert!(!transcript_file(ManagedHarness::Claude, &compressed));
+
+        codex_rollout(&store, id, &cwd, &["hello"]);
+        assert!(!transcript_file(ManagedHarness::Codex, &compressed));
+        assert_eq!(
+            locate_session_file(ManagedHarness::Codex, temp.path(), &cwd, Some(&store), id)
+                .unwrap(),
+            Some(plain)
+        );
+        let listed =
+            list_native_sessions(ManagedHarness::Codex, temp.path(), &cwd, Some(&store), 10)
+                .await
+                .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].native_session_id, id);
+    }
+
+    /// The pre-launch baseline of a compressed rollout names the plain path,
+    /// so the import after the run lines up whether Codex restored the file
+    /// (it does on `codex resume`) or the run ended before Codex reopened it.
+    #[test]
+    fn codex_cursor_survives_codex_restoring_a_compressed_rollout() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("sessions");
+        let cwd = temp.path().join("repo");
+        let id = "01a16539-8691-7df3-a8fd-dd78556eaed4";
+        let codex = ManagedHarness::Codex;
+        let plain = codex_rollout(&store, id, &cwd, &["before"]);
+        let plain_len = fs::metadata(&plain).unwrap().len();
+        let before_compression =
+            export_transcript_blocking(codex, temp.path(), &cwd, Some(&store), id, None, None)
+                .unwrap();
+        assert_eq!(exported_texts(&before_compression), ["before"]);
+        let compressed = compress_codex_rollout(&plain);
+
+        let baseline =
+            transcript_baseline_blocking(codex, temp.path(), &cwd, Some(&store), id).unwrap();
+        let cursor: FileCursor = serde_json::from_str(&baseline).unwrap();
+        assert_eq!(Path::new(&cursor.path), plain);
+        assert_eq!(cursor.offset, plain_len);
+        assert_eq!(
+            before_compression.source_cursor.as_deref(),
+            Some(baseline.as_str()),
+            "a cursor taken before compression is the same cursor"
+        );
+
+        // The run ended before Codex reopened the rollout: still compressed.
+        validate_transcript_cursor(codex, temp.path(), &cwd, Some(&store), id, &baseline).unwrap();
+        let unchanged = export_transcript_blocking(
+            codex,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            id,
+            Some(&baseline),
+            None,
+        )
+        .unwrap();
+        assert!(unchanged.events.is_empty(), "{:?}", unchanged.events);
+        assert_eq!(unchanged.source_cursor.as_deref(), Some(baseline.as_str()));
+
+        // Codex resumed the session: it restored the plain file and appended.
+        codex_rollout(&store, id, &cwd, &["before", "after"]);
+        fs::remove_file(&compressed).unwrap();
+        validate_transcript_cursor(codex, temp.path(), &cwd, Some(&store), id, &baseline).unwrap();
+        let delta = export_transcript_blocking(
+            codex,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            id,
+            Some(&baseline),
+            None,
+        )
+        .unwrap();
+        assert_eq!(exported_texts(&delta), ["after"]);
+        let next: FileCursor =
+            serde_json::from_str(delta.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(Path::new(&next.path), plain);
+        assert_eq!(next.offset, fs::metadata(&plain).unwrap().len());
+    }
+
+    /// Reading the compressed form exports exactly what the plain form does,
+    /// from the start, from a cursor, and up to an exact final cursor.
+    #[test]
+    fn codex_compressed_rollout_exports_like_the_plain_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("sessions");
+        let cwd = temp.path().join("repo");
+        let id = "01a16797-f057-7762-b123-f8ba78018cf7";
+        let codex = ManagedHarness::Codex;
+        let plain = codex_rollout(&store, id, &cwd, &["one", "two", "three"]);
+        let export = |source: Option<&str>, last: Option<&str>| {
+            export_transcript_blocking(codex, temp.path(), &cwd, Some(&store), id, source, last)
+                .unwrap()
+        };
+        let ends = fs::read_to_string(&plain)
+            .unwrap()
+            .split_inclusive('\n')
+            .scan(0, |end, line| {
+                *end += line.len() as u64;
+                Some(*end)
+            })
+            .collect::<Vec<_>>();
+        let at = |offset: u64| {
+            serde_json::to_string(&FileCursor {
+                path: plain.to_string_lossy().into_owned(),
+                offset,
+                flavor: None,
+                prefix_sha256: None,
+            })
+            .unwrap()
+        };
+        let (middle, end_of_two) = (at(ends[1]), at(ends[2]));
+        let whole = export(None, None);
+        let from_middle = export(Some(&middle), None);
+        let exact = export(Some(&middle), Some(&end_of_two));
+        assert_eq!(exported_texts(&from_middle), ["two", "three"]);
+        assert_eq!(exported_texts(&exact), ["two"]);
+
+        compress_codex_rollout(&plain);
+        let compressed_whole = export(None, None);
+        assert_eq!(exported_texts(&compressed_whole), ["one", "two", "three"]);
+        assert_eq!(compressed_whole.source_cursor, whole.source_cursor);
+        let compressed_from_middle = export(Some(&middle), None);
+        assert_eq!(exported_texts(&compressed_from_middle), ["two", "three"]);
+        assert_eq!(
+            compressed_from_middle.source_cursor,
+            from_middle.source_cursor
+        );
+        let compressed_exact = export(Some(&middle), Some(&end_of_two));
+        assert_eq!(exported_texts(&compressed_exact), ["two"]);
+        assert_eq!(compressed_exact.source_cursor, exact.source_cursor);
+
+        // Past the end: a source cursor clamps to the end as it does for a
+        // plain file, and a final cursor or a recovery cursor is refused.
+        let beyond = at(ends[3] + 10);
+        assert!(export(Some(&beyond), None).events.is_empty());
+        assert_eq!(
+            export(Some(&beyond), None).source_cursor,
+            whole.source_cursor
+        );
+        let error = export_transcript_blocking(
+            codex,
+            temp.path(),
+            &cwd,
+            Some(&store),
+            id,
+            Some(&middle),
+            Some(&beyond),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("past the current transcript end"),
+            "{error}"
+        );
+        let error = validate_transcript_cursor(codex, temp.path(), &cwd, Some(&store), id, &beyond)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("past the current transcript end"),
+            "{error}"
+        );
+        validate_transcript_cursor(codex, temp.path(), &cwd, Some(&store), id, &at(ends[3]))
+            .unwrap();
+    }
+
+    /// `StreamingDecoder` reads one frame; the reader continues into the next.
+    #[test]
+    fn codex_compressed_rollout_reader_reads_every_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout-x.jsonl.zst");
+        let frame = |text: &[u8]| {
+            ruzstd::encoding::compress_to_vec(text, ruzstd::encoding::CompressionLevel::Fastest)
+        };
+        // `printf 'second\n' | zstd -c --check`: the CLI adds a content
+        // checksum by default, which the encoder used for the other frame
+        // does not, and the reader still consumes it to reach the end.
+        let checksummed = [
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x39, 0x00, 0x00, 0x73, 0x65, 0x63, 0x6f, 0x6e,
+            0x64, 0x0a, 0x16, 0x40, 0x4c, 0x55,
+        ];
+        fs::write(&path, [frame(b"first\n"), checksummed.to_vec()].concat()).unwrap();
+        let read = || {
+            let mut content = String::new();
+            std::io::Read::read_to_string(
+                &mut open_transcript(ManagedHarness::Codex, &path).unwrap(),
+                &mut content,
+            )
+            .map(|_| content)
+        };
+        assert_eq!(read().unwrap(), "first\nsecond\n");
+        assert!(transcript_reaches(ManagedHarness::Codex, &path, 13).unwrap());
+        assert!(!transcript_reaches(ManagedHarness::Codex, &path, 14).unwrap());
+
+        fs::write(&path, [frame(b"first\n"), b"garbage".to_vec()].concat()).unwrap();
+        let error = read().unwrap_err();
+        assert!(is_zstd_decode_error(&error), "{error}");
+    }
+
+    /// A file that fails to read mid-stream is an I/O error, not a damaged
+    /// stream, so a lookup reports it instead of treating the session as gone.
+    #[test]
+    fn codex_compressed_rollout_reader_keeps_input_errors_apart_from_damage() {
+        struct FailsAfter {
+            bytes: Vec<u8>,
+            position: usize,
+            fail_at: usize,
+        }
+        impl std::io::Read for FailsAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.position >= self.bytes.len() {
+                    return Ok(0);
+                }
+                if self.position >= self.fail_at {
+                    return Err(std::io::Error::other("disk went away"));
+                }
+                let end = self.fail_at.min(self.position + buf.len());
+                let count = end - self.position;
+                buf[..count].copy_from_slice(&self.bytes[self.position..end]);
+                self.position = end;
+                Ok(count)
+            }
+        }
+        let text = (0..400)
+            .map(|line| format!("{{\"line\":{line},\"text\":\"record number {line}\"}}\n"))
+            .collect::<String>();
+        let bytes = ruzstd::encoding::compress_to_vec(
+            text.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        let decode = |fail_at: usize| {
+            let source = FailsAfter {
+                bytes: bytes.clone(),
+                position: 0,
+                fail_at,
+            };
+            let mut content = Vec::new();
+            ZstdFrames::new(BufReader::with_capacity(16, source))
+                .and_then(|mut frames| std::io::Read::read_to_end(&mut frames, &mut content))
+                .map(|_| content)
+        };
+        assert_eq!(decode(bytes.len()).unwrap(), text.as_bytes());
+        let error = decode(bytes.len() / 2).unwrap_err();
+        assert!(!is_zstd_decode_error(&error), "{error}");
+        assert!(error.to_string().contains("disk went away"), "{error}");
     }
 
     #[test]

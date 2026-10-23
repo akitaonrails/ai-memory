@@ -107,6 +107,7 @@ tempfile.workspace = true
 
 [dev-dependencies]
 ai-memory-test-support.workspace = true
+ruzstd.workspace = true
 tempfile.workspace = true
 rstest.workspace = true
 rusqlite.workspace = true

@@ -66,6 +66,7 @@ dependencies = [
  "rstest",
  "rusqlite",
  "rustls",
+ "ruzstd",
  "secrecy",
  "serde",
  "serde_json",
@@ -348,6 +349,7 @@ dependencies = [
  "jiff",
  "libc",
  "rusqlite",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2",
@@ -3511,6 +3513,12 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 
 [[package]]
 name = "ryu"
