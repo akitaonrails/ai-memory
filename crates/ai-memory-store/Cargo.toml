@@ -40,6 +40,10 @@ fs2.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+# The CJK backfill test counts SQLite virtual-machine steps through the
+# progress handler, which rusqlite gates behind `hooks`; the feature adds no
+# C flags and only test builds enable it.
+rusqlite = { workspace = true, features = ["hooks"] }
 
 [lints]
 workspace = true
