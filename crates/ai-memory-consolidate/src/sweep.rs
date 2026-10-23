@@ -446,10 +446,11 @@ pub async fn run_sweep_with_options(
 /// Run a sweep with the breadth coefficient, the observation prune, and the
 /// opt-in A2 extractive tier-down (`compact_cold_episodic`).
 ///
-/// With `compact_cold_episodic = false` (the default everywhere) this is
-/// byte-for-byte the historical sweep: a cold episodic page is evicted
-/// (tombstoned). With it `true`, a cold episodic page that has NOT already been
-/// compacted is tiered DOWN instead — rewritten through the wiki layer to keep
+/// With `compact_cold_episodic = false` (the default everywhere) this is the
+/// historical sweep for every page that carries no V65 marker: a cold episodic
+/// page is evicted (tombstoned). With it `true`, a cold episodic page that has
+/// NOT already been compacted is tiered DOWN instead — rewritten through the
+/// wiki layer to keep
 /// its L0 abstract, an L1 summary and the L2 keep-token set, dropping the prose
 /// — and reported under [`SweepReport::compacted`] rather than `evicted`. The
 /// original full body stays reachable via supersession + git (reversible,
@@ -669,15 +670,21 @@ pub(crate) async fn run_sweep_at(
         if deduped.contains(&entry.id) {
             continue;
         }
+        // An already-compacted page (its V65 marker set) is terminal for the
+        // decay pass on BOTH arms. The durable residue is what we chose to
+        // keep, so evicting it would destroy exactly what tier-down preserved,
+        // and re-compacting it is a no-op loop. Skip it entirely.
+        //
+        // This guard cannot sit inside the `compact_cold_episodic` arm: the
+        // marker is stamped by passes with their OWN flags — the A3 dedup
+        // merge-note stub and the B2 dream pass both write `compacted: true`,
+        // from which `compacted_at` is derived at the single write choke point
+        // — so residues exist with A2 off, which is the default everywhere.
+        if entry.compacted_at_us.is_some() {
+            continue;
+        }
         if compact_cold_episodic {
-            // A2 tier-down replaces eviction for cold episodic pages. An
-            // already-compacted page (its V65 marker set) is terminal — the
-            // durable residue is what we chose to keep, so re-evicting it
-            // would destroy exactly what tier-down preserved, and
-            // re-compacting it is a no-op loop. Skip it entirely.
-            if entry.compacted_at_us.is_some() {
-                continue;
-            }
+            // A2 tier-down replaces eviction for cold episodic pages.
             compacted.push(CompactedPage {
                 id: entry.id,
                 path: entry.path.as_str().to_string(),

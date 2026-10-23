@@ -568,3 +568,123 @@ async fn curator_skips_expired_pages() {
         report.findings
     );
 }
+
+/// Test 7: a page that is ALREADY compacted stays terminal with the A2 flag
+/// OFF — the default everywhere.
+///
+/// The V65 marker is not A2's alone: the A3 cold-cluster dedup merge-note stub
+/// and the B2 dream pass both stamp `compacted: true` on their loser stubs
+/// under their OWN flags, and `compacted_at` is derived from that mirror at the
+/// single write choke point. So a durable residue exists in corpora where
+/// `compact_cold_episodic` was never turned on, and the terminality promise
+/// ("neither re-compacted nor evicted") has to hold on the eviction arm too —
+/// otherwise the sweep tombstones and then hard-deletes exactly what the merge
+/// chose to keep.
+///
+/// The control page in the same sweep is cold and NOT compacted: it must still
+/// be evicted, so the guard cannot make the sweep inert.
+#[tokio::test]
+async fn flag_off_keeps_an_already_compacted_residue_terminal() {
+    let fx = seed_fixture().await;
+
+    // The residue: the shape an A3/B2 merge-note stub lands in — a short body
+    // plus the `compacted: true` frontmatter mirror the store derives
+    // `compacted_at` from. A2 is never switched on in this test.
+    fx.wiki
+        .write_page(WritePageRequest {
+            workspace_id: fx.ws,
+            project_id: fx.proj,
+            path: PagePath::new("sessions/residue.md").unwrap(),
+            frontmatter: serde_json::json!({
+                "title": "Residue",
+                "compacted": true,
+                "merged_into": "sessions/survivor.md",
+            }),
+            body: "This page was merged into [[sessions/survivor.md]].\n".to_string(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: Some("Residue".to_string()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    // The control: cold, episodic, no marker.
+    write(
+        &fx,
+        "sessions/plain.md",
+        "Plain Session",
+        Tier::Episodic,
+        false,
+        "a long prose body about a debugging session that nobody reopened",
+    )
+    .await;
+    backdate_latest(&fx, "sessions/residue.md", COLD_DAYS);
+    backdate_latest(&fx, "sessions/plain.md", COLD_DAYS);
+
+    // Pre-condition: the marker really is set, so a pass that ignores it would
+    // have something to ignore.
+    let (marker_before, _) = latest_marker_and_body(&fx, "sessions/residue.md");
+    assert!(
+        marker_before.is_some(),
+        "the frontmatter mirror set the V65 compacted_at marker"
+    );
+
+    let report = run_sweep_with_options(
+        &fx.store.reader,
+        &fx.store.writer,
+        Some(&fx.wiki),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        ObservationRetention::default(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Not tombstoned: the residue is absent from `evicted`, and the control is
+    // there — the sweep still does its job.
+    assert_eq!(
+        report
+            .evicted
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sessions/plain.md"],
+        "only the non-compacted cold page is evicted: {:?}",
+        report.evicted
+    );
+    assert!(report.evicted[0].deleted, "the control eviction landed");
+    assert!(
+        report.compacted.is_empty(),
+        "nothing compacts with the flag off: {:?}",
+        report.compacted
+    );
+
+    // Not hard-deleted: the residue is still the live latest version, with its
+    // body and marker intact. (`DecayParams::default()` purges aged tombstones
+    // in the same pass, which is what would have destroyed it.)
+    let (marker_after, body_after) = latest_marker_and_body(&fx, "sessions/residue.md");
+    assert!(
+        marker_after.is_some(),
+        "the residue keeps its V65 marker after the sweep"
+    );
+    assert!(
+        body_after.contains("sessions/survivor.md"),
+        "the residue body survives: {body_after}"
+    );
+    assert!(
+        fx.store
+            .reader
+            .decay_candidates(fx.ws, fx.proj)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.path.as_str() == "sessions/residue.md"),
+        "the residue is still in the live set"
+    );
+}
