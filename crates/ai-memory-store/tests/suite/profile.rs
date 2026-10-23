@@ -413,3 +413,57 @@ async fn digest_inputs_read_entries_stack_and_newness() {
     );
     assert!(inputs.project_has_pages);
 }
+
+/// Newness honours the TTL, both directions. A project whose every page has
+/// passed its `expires_at` is as new as one that never had a page: its pages
+/// are already hidden from every other digest read, so counting them would
+/// halve the digest budget and suppress the `profile apply` offer for a
+/// project with nothing left to show. A single live page still counts.
+#[tokio::test]
+async fn expired_pages_do_not_make_a_project_look_established() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = default_workspace(&store).await;
+    let global = ai_memory_store::create_global_scope(&store.writer)
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_owned(), None)
+        .await
+        .unwrap();
+
+    let mut expired = profile_page(ws, app, "notes/stale.md", "# Stale\n\nlong gone");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let inputs = store
+        .reader
+        .profile_digest_inputs(global.as_tuple(), (ws, app))
+        .await
+        .unwrap();
+    assert!(
+        !inputs.project_has_pages,
+        "a project whose every page has expired is still new"
+    );
+
+    store
+        .writer
+        .upsert_page(profile_page(
+            ws,
+            app,
+            "notes/live.md",
+            "# Live\n\nstill here",
+        ))
+        .await
+        .unwrap();
+    let inputs = store
+        .reader
+        .profile_digest_inputs(global.as_tuple(), (ws, app))
+        .await
+        .unwrap();
+    assert!(
+        inputs.project_has_pages,
+        "one unexpired page means the project has memory"
+    );
+}

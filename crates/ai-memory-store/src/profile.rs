@@ -190,18 +190,24 @@ pub(crate) fn project_stack_tags(
     Ok(tags)
 }
 
-/// Whether a project has any current page: a project without one is new, and
-/// gets the larger baseline digest.
+/// Whether a project has any current, unexpired page: a project without one is
+/// new, and gets the larger baseline digest. A project whose every page has
+/// passed its TTL reads as new, the same way the digest's own reads skip
+/// expired pages.
 pub(crate) fn project_has_pages(
     conn: &Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
 ) -> StoreResult<bool> {
+    let sql = format!(
+        "SELECT 1 FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
+         AND is_latest = 1{not_expired} LIMIT 1",
+        not_expired = not_expired("pages", "?3"),
+    );
     Ok(conn
         .query_row(
-            "SELECT 1 FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
-             AND is_latest = 1 LIMIT 1",
-            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            &sql,
+            params![workspace_id.as_bytes(), project_id.as_bytes(), now_us()],
             |_| Ok(()),
         )
         .optional()?
