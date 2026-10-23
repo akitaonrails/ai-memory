@@ -983,10 +983,9 @@ impl Wiki {
         // carries then failed `export-okf` for the whole project with "run
         // the server once to migrate" — which the one-shot wiki migration
         // never does again — and made each `serve` boot re-archive the data
-        // dir once the migration archive was deleted. Conformance is
-        // idempotent modulo `generated.at`, which it inherits from the file
-        // on disk, so an already-conformant page still restores byte-exact.
-        conform_frontmatter_for_disk(
+        // dir once the migration archive was deleted. An already-conformant
+        // checkpoint keeps its own `generated.at`, so it restores byte-exact.
+        conform_checkpoint_for_disk(
             &self.abs_path(workspace_id, project_id, &path),
             path.as_str(),
             &mut md,
@@ -3559,6 +3558,24 @@ fn conform_frontmatter_for_disk(abs: &Path, page_path: &str, markdown: &mut Mark
             .to_string()
     });
     ai_memory_core::okf::stamp_generated_at(&mut markdown.frontmatter, &at);
+}
+
+/// [`conform_frontmatter_for_disk`] for a page restored from a checkpoint.
+///
+/// That function inherits `generated.at` only from the file currently on
+/// disk, which is the version a restore replaces, so every restore of an
+/// older version was re-stamped with the current time and the "restores
+/// byte-exact" promise held only when both happened in the same second.
+/// When conformance changes nothing but the timestamp, the checkpoint keeps
+/// its own `generated.at`; anything it does change still gets a fresh stamp.
+fn conform_checkpoint_for_disk(abs: &Path, page_path: &str, markdown: &mut Markdown) {
+    let checkpointed = markdown.frontmatter.clone();
+    conform_frontmatter_for_disk(abs, page_path, markdown);
+    let unchanged = ai_memory_core::okf::strip_generated_at(&markdown.frontmatter)
+        == ai_memory_core::okf::strip_generated_at(&checkpointed);
+    if let Some(at) = ai_memory_core::okf::generated_at(&checkpointed).filter(|_| unchanged) {
+        ai_memory_core::okf::stamp_generated_at(&mut markdown.frontmatter, at);
+    }
 }
 
 fn canonicalize_index_frontmatter(

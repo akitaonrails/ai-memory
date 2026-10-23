@@ -11315,6 +11315,59 @@ mod tests {
         );
     }
 
+    /// The same promise when the checkpoint is older than the restore: the
+    /// test above passes only when its writes and the restore fall in one
+    /// second, because the restore used to inherit `generated.at` from the
+    /// file it replaces and otherwise stamped the current time.
+    #[tokio::test]
+    async fn restoring_an_old_conformant_page_keeps_its_generated_at() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "first").await;
+        let proj_dir = scratch_project_dir(tmp.path());
+        let page = proj_dir.join("notes/a.md");
+        let written = std::fs::read_to_string(&page).unwrap();
+        let at_line = written
+            .lines()
+            .find(|line| line.trim_start().starts_with("at: "))
+            .unwrap_or_else(|| panic!("no generated.at line in:\n{written}"));
+        let indent = &at_line[..at_line.len() - at_line.trim_start().len()];
+        let checkpointed =
+            written.replacen(at_line, &format!("{indent}at: 2026-09-01T00:00:00Z"), 1);
+        std::fs::write(&page, &checkpointed).unwrap();
+        let rev = post_commit(&router, "checkpoint").await;
+
+        post_write_page(&router, "default", "scratch", "notes/a.md", "second").await;
+        post_commit(&router, "later").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/restore-page")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "path": "notes/a.md",
+                            "rev": rev,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "restore-page failed");
+
+        assert_eq!(
+            std::fs::read_to_string(&page).unwrap(),
+            checkpointed,
+            "the restore re-stamped generated.at instead of keeping the checkpoint's"
+        );
+    }
+
     /// `POST /admin/commit`, returning the oid of the resulting HEAD
     /// checkpoint. A write-page already checkpoints itself, so the commit
     /// here may legitimately have nothing left to stage.
