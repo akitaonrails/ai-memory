@@ -79,6 +79,8 @@ pub struct PlannedWrite {
     pub title: String,
     pub body: String,
     pub etag: Option<String>,
+    /// Hash of the repository file the plan read, or `None` if it was absent.
+    pub expected_disk: Option<String>,
 }
 
 /// A destination file that diverged, with a bounded diff summary.
@@ -335,6 +337,24 @@ pub(crate) fn read_disk(dest_root: &Path, path: &str) -> Result<Option<Vec<u8>>>
     }
 }
 
+/// Write `bytes` over a repository file only while it is still the file the
+/// plan classified: `expected` is that file's hash, or `None` when there was
+/// no file. Returns `false`, writing nothing, when an edit landed after the
+/// plan. The check and atomic replacement are deliberately adjacent.
+pub(crate) fn write_if_unchanged(
+    dest_root: &Path,
+    rel: &str,
+    expected: Option<&str>,
+    bytes: &[u8],
+) -> Result<bool> {
+    let current = read_disk(dest_root, rel)?;
+    if current.as_deref().map(state::sha256_hex).as_deref() != expected {
+        return Ok(false);
+    }
+    atomic_write(dest_root, rel, bytes)?;
+    Ok(true)
+}
+
 /// Fetch and classify every allowlisted page. In [`Mode::Apply`] (and only
 /// when allowed past the divergence guard) also performs the write batch
 /// and persists the new state atomically.
@@ -414,7 +434,18 @@ async fn run_batch(
     let applied = mode == Mode::Apply && (report.divergent.is_empty() || args.force);
     if applied {
         for write in &report.writes {
-            atomic_write(dest_root, &write.path, write.body.as_bytes())?;
+            if !write_if_unchanged(
+                dest_root,
+                &write.path,
+                write.expected_disk.as_deref(),
+                write.body.as_bytes(),
+            )? {
+                bail!(
+                    "{} changed in the repository during this run; left untouched. \
+                     Earlier exports may have completed; export state was not advanced",
+                    write.path
+                );
+            }
         }
         // Only after the whole batch is on disk does the state move: a
         // crash mid-batch leaves the old state, and the next run's
@@ -480,6 +511,7 @@ fn record_decision(
                 title: page.title,
                 body,
                 etag,
+                expected_disk: disk.map(state::sha256_hex),
             });
         }
         Classification::Divergent(reason) => {
@@ -507,6 +539,7 @@ fn record_decision(
                         title: page.title.clone(),
                         body: body.clone(),
                         etag,
+                        expected_disk: disk.map(state::sha256_hex),
                     });
                 }
             }

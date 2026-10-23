@@ -71,6 +71,8 @@ struct Fixture {
     /// Rewrite this page's body on its Nth read (1-based), to simulate an
     /// edit landing between a sync's classification and its write.
     edit_on_read: Option<(&'static str, usize)>,
+    /// Save an editor's local change while the next page request is in flight.
+    repository_edit_on_read: Mutex<Option<(PathBuf, Vec<u8>)>>,
     /// Text the fixture's write path redacts, like the server's sanitizer.
     redact: Option<&'static str>,
     /// Edit this page right before an MCP call on it is handled, to simulate
@@ -106,6 +108,7 @@ impl Fixture {
             project_exists: true,
             unreachable: None,
             edit_on_read: None,
+            repository_edit_on_read: Mutex::new(None),
             redact: None,
             edit_before_mcp: None,
             old_server: false,
@@ -241,6 +244,10 @@ async fn page_handler(
     }
     if fixture.unreachable == Some(path.as_str()) {
         return error_json(StatusCode::NOT_FOUND, "page not found");
+    }
+    if let Some((path, bytes)) = fixture.repository_edit_on_read.lock().unwrap().take() {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
     }
     let read_count = {
         let mut reads = fixture.reads_by_path.lock().unwrap();
@@ -632,6 +639,64 @@ async fn local_edits_are_refused_until_forced() {
         state.pages["notes/b.md"].hash,
         state::sha256_hex(&file("notes/b.md", "# B\nbeta\n"))
     );
+}
+
+#[tokio::test]
+async fn export_preserves_edits_saved_while_fetching_pages_even_with_force() {
+    for force in [false, true] {
+        let (addr, fixture) = serve(Fixture::new(vec![(
+            "notes/a.md".to_string(),
+            "# Original\n".to_string(),
+        )]))
+        .await;
+        let (_tmp, dest) = temp_dest();
+        let mut run_args = args(addr, &dest, &["notes"]);
+        run(&run_args, Mode::Apply).await.unwrap();
+        let old_state = fs::read(state::state_path(&dest)).unwrap();
+        fixture.update("notes/a.md", |page| {
+            page.body = "# Server edit\n".to_string()
+        });
+        if force {
+            fs::write(dest.join("notes/a.md"), b"# Older local edit\n").unwrap();
+        }
+        run_args.force = force;
+        let newest = b"# Editor saved this during export\n";
+        *fixture.repository_edit_on_read.lock().unwrap() =
+            Some((dest.join("notes/a.md"), newest.to_vec()));
+
+        let result = run(&run_args, Mode::Apply).await;
+        assert_eq!(fs::read(dest.join("notes/a.md")).unwrap(), newest);
+        let message = result
+            .expect_err("must preserve an unseen edit")
+            .to_string();
+        assert!(
+            message.contains("changed in the repository during this run"),
+            "{message}"
+        );
+        assert_eq!(fs::read(state::state_path(&dest)).unwrap(), old_state);
+    }
+}
+
+#[tokio::test]
+async fn export_preserves_a_file_created_while_fetching_pages() {
+    let (addr, fixture) = serve(Fixture::new(vec![(
+        "notes/a.md".to_string(),
+        "# Server page\n".to_string(),
+    )]))
+    .await;
+    let (_tmp, dest) = temp_dest();
+    let newest = b"# New local page\n";
+    *fixture.repository_edit_on_read.lock().unwrap() =
+        Some((dest.join("notes/a.md"), newest.to_vec()));
+
+    let result = run(&args(addr, &dest, &["notes"]), Mode::Apply).await;
+    assert_eq!(fs::read(dest.join("notes/a.md")).unwrap(), newest);
+    let message = result.expect_err("must preserve a new file").to_string();
+    assert!(
+        message.contains("changed in the repository during this run"),
+        "{message}"
+    );
+    assert!(!state::state_path(&dest).exists());
 }
 
 #[tokio::test]

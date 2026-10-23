@@ -124,6 +124,12 @@ This section describes `plan` and `export`; `sync` adds the rules under
   a missing line is shown as `<end of file>`. The
   whole batch is then refused and nothing is written. `--force` overwrites the
   divergent files with server content.
+- **Edits during export are preserved.** Before each replacement, `export
+  --apply` rechecks the file against the bytes the plan read. A file edited,
+  created or removed during the server requests is left alone, even with
+  `--force`, and the run exits non-zero. Earlier files may already have been
+  exported; the state stays at the previous successful batch so the next run
+  compares those files again.
 - **Never deletes.** `plan` and `export` never delete local files or server
   pages, including brand-new local files inside an allowlisted family.
   Only `sync --propagate-deletes` deletes (see below).
