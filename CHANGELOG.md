@@ -34,6 +34,15 @@ version in [`docs/changelog/`](docs/changelog/):
   rejected as containing no extractable text when that was its only cue.
   WebVTT allows any number of blank lines between blocks; the reader now skips
   them before reading a block.
+- The startup warning about unusable proxy variables now also fires when the
+  user name or password in `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (or a
+  lower-case spelling) holds an unencoded `#`, `/` or `?`. The URI grammar
+  ends the host at that character, so the client sent provider and login
+  requests to a host made of the start of the credentials, such as
+  `alice:18080` for `http://alice:18080#k@proxy.example:3128`, and the failure
+  looked like a connection error to a host nobody configured. The warning
+  names the variable and the character, not the value, and the network
+  behaviour is unchanged (#1637).
 
 ## [3.2.2] - 2026-10-22
 
