@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `install-hooks --agent grok` run from the home directory no longer stops
+  with "Grok project configuration ~/.grok/config.toml may override
+  GROK_HOME". With the default `GROK_HOME` that file is Grok's own user
+  config, which Grok reads only as the user layer (`grok inspect` reports no
+  project layer there), so it is no longer mistaken for a project overlay. A
+  real overlay is still refused, including `~/.grok/config.toml` when
+  `GROK_HOME` points elsewhere (#1636).
+
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
   grants tables already do. An accented username, display name or key label

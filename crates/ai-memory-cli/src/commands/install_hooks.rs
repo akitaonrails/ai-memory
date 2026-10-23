@@ -1661,17 +1661,6 @@ fn infer_installed_mcp_config(
     agent: AgentChoice,
     config_path: Option<&Path>,
 ) -> Result<Option<InferredMcpConfig>> {
-    if agent == AgentChoice::Grok {
-        let cwd = std::env::current_dir()
-            .context("could not resolve current dir for Grok project configuration")?;
-        let repo_root = ai_memory_consolidate::discover_repo_root(&cwd).ok();
-        if let Some(project_config) = find_grok_project_overlay(&cwd, repo_root.as_deref()) {
-            anyhow::bail!(
-                "Grok project configuration {} may override GROK_HOME; pass explicit --server-url and --auth-token rather than inferring MCP settings",
-                project_config.display()
-            );
-        }
-    }
     let Some(client) = mcp_client_for_agent(agent) else {
         return Ok(None);
     };
@@ -1679,6 +1668,17 @@ fn infer_installed_mcp_config(
         Some(path) => path.to_path_buf(),
         None => install_mcp::mcp_config_path(client)?,
     };
+    if agent == AgentChoice::Grok {
+        let cwd = std::env::current_dir()
+            .context("could not resolve current dir for Grok project configuration")?;
+        let repo_root = ai_memory_consolidate::discover_repo_root(&cwd).ok();
+        if let Some(project_config) = find_grok_project_overlay(&cwd, repo_root.as_deref(), &path) {
+            anyhow::bail!(
+                "Grok project configuration {} may override GROK_HOME; pass explicit --server-url and --auth-token rather than inferring MCP settings",
+                project_config.display()
+            );
+        }
+    }
     if matches!(client, McpClient::Codex) {
         // An entry written before `install-mcp` honored CODEX_HOME still sits
         // in ~/.codex/config.toml; keep inferring from it until it is rewritten.
@@ -1830,10 +1830,26 @@ fn grok_project_overlay_paths(cwd: &Path, repo_root: Option<&Path>) -> Vec<PathB
         .collect()
 }
 
-fn find_grok_project_overlay(cwd: &Path, repo_root: Option<&Path>) -> Option<PathBuf> {
+/// The first existing project overlay, skipping the user config itself. Run
+/// from `$HOME` with the default `GROK_HOME`, `<cwd>/.grok/config.toml` *is*
+/// `$GROK_HOME/config.toml`, and Grok reads it once, as the user layer: `grok
+/// inspect` (Grok 1.0.67) lists it under `User:` with `Project: (none)`. With
+/// `GROK_HOME` elsewhere the same file is a project layer, and it still counts.
+fn find_grok_project_overlay(
+    cwd: &Path,
+    repo_root: Option<&Path>,
+    user_config: &Path,
+) -> Option<PathBuf> {
     grok_project_overlay_paths(cwd, repo_root)
         .into_iter()
-        .find(|path| path.exists())
+        .find(|path| path.exists() && !is_same_existing_file(path, user_config))
+}
+
+fn is_same_existing_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
@@ -16377,15 +16393,22 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         let parent = root.join("nested");
         let cwd = parent.join("leaf");
         fs::create_dir_all(&cwd).unwrap();
+        let user_config = temp.path().join("grok-home/config.toml");
 
         for directory in [&root, &parent, &cwd] {
             let overlay = directory.join(".grok/config.toml");
             fs::create_dir_all(overlay.parent().unwrap()).unwrap();
             fs::write(&overlay, "# override").unwrap();
-            assert_eq!(find_grok_project_overlay(&cwd, Some(&root)), Some(overlay));
+            assert_eq!(
+                find_grok_project_overlay(&cwd, Some(&root), &user_config),
+                Some(overlay)
+            );
             fs::remove_file(directory.join(".grok/config.toml")).unwrap();
         }
-        assert_eq!(find_grok_project_overlay(&cwd, Some(&root)), None);
+        assert_eq!(
+            find_grok_project_overlay(&cwd, Some(&root), &user_config),
+            None
+        );
     }
 
     #[test]
@@ -16393,15 +16416,59 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().join("outside").join("leaf");
         fs::create_dir_all(&cwd).unwrap();
+        let user_config = temp.path().join("grok-home/config.toml");
         let parent_overlay = cwd.parent().unwrap().join(".grok/config.toml");
         fs::create_dir_all(parent_overlay.parent().unwrap()).unwrap();
         fs::write(&parent_overlay, "# ignored").unwrap();
-        assert_eq!(find_grok_project_overlay(&cwd, None), None);
+        assert_eq!(find_grok_project_overlay(&cwd, None, &user_config), None);
 
         let cwd_overlay = cwd.join(".grok/config.toml");
         fs::create_dir_all(cwd_overlay.parent().unwrap()).unwrap();
         fs::write(&cwd_overlay, "# active").unwrap();
-        assert_eq!(find_grok_project_overlay(&cwd, None), Some(cwd_overlay));
+        assert_eq!(
+            find_grok_project_overlay(&cwd, None, &user_config),
+            Some(cwd_overlay)
+        );
+    }
+
+    /// From `$HOME` with the default `GROK_HOME`, the only `.grok/config.toml`
+    /// on the walk is the user config, which Grok does not read as a project
+    /// layer, so there is nothing to refuse.
+    #[test]
+    fn grok_user_config_reached_from_home_is_not_a_project_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let user_config = home.join(".grok/config.toml");
+        fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        fs::write(&user_config, "# user").unwrap();
+
+        assert_eq!(find_grok_project_overlay(&home, None, &user_config), None);
+        // Through a symlinked home it is still the same file.
+        #[cfg(unix)]
+        {
+            let link = temp.path().join("home-link");
+            std::os::unix::fs::symlink(&home, &link).unwrap();
+            assert_eq!(find_grok_project_overlay(&link, None, &user_config), None);
+        }
+    }
+
+    /// Control: with `GROK_HOME` pointing elsewhere, `~/.grok/config.toml` is
+    /// a project layer to Grok, so reaching it from `$HOME` must still refuse.
+    #[test]
+    fn grok_config_under_home_is_an_overlay_when_grok_home_is_elsewhere() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let overlay = home.join(".grok/config.toml");
+        fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        fs::write(&overlay, "# project").unwrap();
+        let user_config = temp.path().join("custom-grok-home/config.toml");
+        fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        fs::write(&user_config, "# user").unwrap();
+
+        assert_eq!(
+            find_grok_project_overlay(&home, None, &user_config),
+            Some(overlay)
+        );
     }
 }
 
