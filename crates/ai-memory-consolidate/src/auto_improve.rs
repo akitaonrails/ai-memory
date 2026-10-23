@@ -2025,6 +2025,18 @@ fn validate_full_page_proposal(
     if !proposal.body_markdown.trim_start().starts_with("# ") {
         return Err("body_missing_h1".into());
     }
+    // `validate_patch_proposal` enforces both of these on the body it
+    // materializes; the full-page path did not, and a full-page proposal is
+    // auto-approved whenever `auto_improve_require_approval` is off. A page
+    // admitted here with duplicate headings is then permanently un-patchable,
+    // because the patch path refuses on `has_duplicate_headings(&target.body)`
+    // before it materializes any edit. Reject the same bodies on both paths.
+    if h1_count(&proposal.body_markdown) != 1 {
+        return Err("extra_h1".into());
+    }
+    if has_duplicate_headings(&proposal.body_markdown) {
+        return Err("duplicate_anchor".into());
+    }
     if !allowed_target_path(path) {
         return Err("unsupported_path_prefix".into());
     }
@@ -4520,6 +4532,85 @@ mod tests {
         assert!(accepted.is_empty());
         assert!(rejected.iter().any(|r| r.reason == "duplicate_anchor"));
         assert!(rejected.iter().any(|r| r.reason == "patch_extra_h1"));
+    }
+
+    #[test]
+    fn full_page_rejects_duplicate_headings_and_extra_h1() {
+        let mut duplicate = proposal("procedures/release.md", "procedure", 0.9);
+        duplicate.body_markdown = "# Release\n\n## Steps\nOne\n\n## Steps\nTwo\n".into();
+        let mut extra_h1 = proposal("procedures/rollout.md", "procedure", 0.9);
+        extra_h1.body_markdown = "# Rollout\n\n## Steps\nOne\n\n# Second Title\nTwo\n".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![duplicate, extra_h1],
+            rejected_candidates: Vec::new(),
+        };
+
+        let (accepted, rejected, _) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::from_pages(&[], &[]));
+        assert!(accepted.is_empty());
+        assert!(
+            rejected.iter().any(|r| r.reason == "duplicate_anchor"),
+            "a full-page body with two `## Steps` headings is refused, as the patch path refuses it"
+        );
+        assert!(
+            rejected.iter().any(|r| r.reason == "extra_h1"),
+            "a full-page body with a second H1 is refused, as the patch path refuses it"
+        );
+    }
+
+    #[test]
+    fn full_page_still_accepts_a_well_formed_body() {
+        let mut candidate = proposal("procedures/release.md", "procedure", 0.9);
+        candidate.body_markdown = "# Release\n\n## Steps\nOne\n\n## Verify\nTwo\n".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![candidate],
+            rejected_candidates: Vec::new(),
+        };
+
+        let (accepted, rejected, _) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::from_pages(&[], &[]));
+        assert!(rejected.is_empty(), "unexpected rejections: {rejected:?}");
+        assert_eq!(accepted.len(), 1);
+    }
+
+    #[test]
+    fn a_body_the_full_page_path_admits_is_one_the_patch_path_can_still_patch() {
+        // The trap this closes: a full-page proposal is auto-approved whenever
+        // `auto_improve_require_approval` is off, and the patch path refuses on
+        // `has_duplicate_headings(&target.body)` before materializing any edit.
+        // So a body admitted by the full-page path with duplicate headings
+        // would land as a page that can never be patched again.
+        let trapped = "# Release\n\n## Steps\nOne\n\n## Steps\nTwo\n";
+
+        // The patch path cannot repair such a page, whatever the edit says.
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![patch_proposal("append", "## Steps", "Three")],
+            rejected_candidates: Vec::new(),
+        };
+        let (patch_accepted, patch_rejected, _) =
+            validate_response(raw, &cfg(), &patch_index("procedures/release.md", trapped));
+        assert!(patch_accepted.is_empty());
+        assert_eq!(patch_rejected[0].reason, "duplicate_anchor");
+
+        // Therefore the full-page path must not admit that body in the first
+        // place. Before this fix it did, and the page became un-patchable.
+        let mut full_page = proposal("procedures/release.md", "procedure", 0.9);
+        full_page.body_markdown = trapped.into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![full_page],
+            rejected_candidates: Vec::new(),
+        };
+        let (full_accepted, full_rejected, _) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::from_pages(&[], &[]));
+        assert!(
+            full_accepted.is_empty(),
+            "the full-page path must not admit a body the patch path can never patch"
+        );
+        assert_eq!(full_rejected[0].reason, "duplicate_anchor");
     }
 }
 
