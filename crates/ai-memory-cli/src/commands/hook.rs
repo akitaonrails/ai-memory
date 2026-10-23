@@ -8920,6 +8920,10 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let cwd = tmp.path().join("repo");
         std::fs::create_dir(&cwd).unwrap();
+        // The repo's own marker, with no `[briefing]`. Without one, the
+        // developer's `~/.ai-memory.toml` applies to every cwd and can opt
+        // this repo into the brief.
+        std::fs::write(cwd.join(".ai-memory.toml"), "project = \"repo\"\n").unwrap();
         let (base, mut requests) = serve_requests("404 Not Found", "").await;
 
         let mut stdout = Vec::new();
