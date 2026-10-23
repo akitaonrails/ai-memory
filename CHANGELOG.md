@@ -39,7 +39,7 @@ version in [`docs/changelog/`](docs/changelog/):
   timestamp only from the file it was replacing, so restoring any older version
   stamped the current time and rewrote the page's bytes, unless the restore ran
   in the same second as the write it undid. The test for the byte-exact
-  restore passed or failed by that same second (#PRNUM).
+  restore passed or failed by that same second (#1651).
 
 ## [3.2.2] - 2026-10-22
 
