@@ -1301,8 +1301,14 @@ pub fn cap_lifecycle_body_for_client(raw: &mut serde_json::Value, event: HookEve
 
 fn core_body_cap(event: HookEvent) -> Option<(&'static [&'static str], usize)> {
     match event {
+        // `submitted_prompt` is Qwen Code's prompt field
+        // (`user_prompt_text_for_agent`), and the only one a Qwen
+        // `UserPromptSubmit` body carries. It is listed here so the field is
+        // capped and scrubbed alongside its siblings; every listed key is
+        // capped independently, so this is not a fallback and leaves the
+        // submission-provenance rule intact.
         HookEvent::UserPrompt => Some((
-            &["prompt", "message", "text"],
+            &["prompt", "message", "text", "submitted_prompt"],
             USER_PROMPT_EXCERPT_MAX_BYTES,
         )),
         HookEvent::Notification => Some((&["message", "text"], NOTIFICATION_EXCERPT_MAX_BYTES)),
@@ -3185,6 +3191,103 @@ mod tests {
             "capped prompt carries no redaction marker: {capped:?}"
         );
         assert!(capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+    }
+
+    /// A Qwen Code `UserPromptSubmit` body carries its prompt only in
+    /// `submitted_prompt` (`user_prompt_text_for_agent`), so that field must
+    /// be scrubbed and capped before the native hook spools the body, exactly
+    /// like the `prompt` / `message` / `text` siblings.
+    #[test]
+    fn client_body_cap_covers_qwen_submitted_prompt() {
+        // AWS access key id shape: a built-in pattern.
+        let secret = format!("AKIA{}", "A".repeat(16));
+        let mut raw = serde_json::json!({
+            "session_id": "qwen-session",
+            "submitted_prompt": format!(
+                "{} {secret}",
+                "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES - 14)
+            ),
+        });
+        assert!(
+            cap_lifecycle_body_for_client(&mut raw, HookEvent::UserPrompt),
+            "oversized Qwen submitted_prompt left the body unchanged"
+        );
+        let capped = raw["submitted_prompt"]
+            .as_str()
+            .expect("oversized submitted_prompt capped");
+        assert!(
+            capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES,
+            "submitted_prompt exceeds the per-event cap: {} bytes",
+            capped.len()
+        );
+        assert!(capped.ends_with('…'), "submitted_prompt not truncated");
+        assert!(
+            !capped.contains("AKIA"),
+            "unredacted secret fragment survived the cap: {capped:?}"
+        );
+        assert!(
+            capped.contains("[REDACTED:"),
+            "capped submitted_prompt carries no redaction marker: {capped:?}"
+        );
+    }
+
+    /// Capping is size-triggered: a Qwen prompt within the limit reaches the
+    /// spool byte-for-byte, and the body is reported unchanged so the hook
+    /// keeps the original serialization.
+    #[test]
+    fn client_body_cap_leaves_normal_qwen_submitted_prompt_untouched() {
+        let mut raw = serde_json::json!({
+            "session_id": "qwen-session",
+            "submitted_prompt": "MARKER_QWEN_USER_PROMPT",
+        });
+        assert!(!cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        assert_eq!(raw["submitted_prompt"], "MARKER_QWEN_USER_PROMPT");
+    }
+
+    /// `submitted_prompt` joins the `UserPrompt` arm only: the other harnesses'
+    /// fields keep capping as before, and the `Notification` /
+    /// `PostCompaction` arms are untouched by the new key.
+    #[test]
+    fn client_body_cap_keeps_other_harness_and_event_caps() {
+        let oversized = "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1);
+        let mut raw = serde_json::json!({ "prompt": oversized.clone() });
+        assert!(cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        let capped = raw["prompt"].as_str().expect("oversized prompt capped");
+        assert!(capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+        assert!(capped.ends_with('…'));
+
+        let mut notification = serde_json::json!({
+            "message": "y".repeat(NOTIFICATION_EXCERPT_MAX_BYTES + 1),
+            "submitted_prompt": oversized.clone(),
+        });
+        assert!(cap_lifecycle_body_for_client(
+            &mut notification,
+            HookEvent::Notification
+        ));
+        assert!(
+            notification["message"]
+                .as_str()
+                .expect("oversized notification message capped")
+                .len()
+                <= NOTIFICATION_EXCERPT_MAX_BYTES
+        );
+        assert_eq!(
+            notification["submitted_prompt"], oversized,
+            "submitted_prompt must not be capped outside the UserPrompt arm"
+        );
+
+        let mut compaction = serde_json::json!({ "submitted_prompt": oversized.clone() });
+        assert!(!cap_lifecycle_body_for_client(
+            &mut compaction,
+            HookEvent::PostCompaction
+        ));
+        assert_eq!(compaction["submitted_prompt"], oversized);
     }
 
     /// Kimi Code's content-block `prompt` must flatten into the title
