@@ -3489,7 +3489,12 @@ impl AiMemoryServer {
                 "salience": salience,
                 "routed_to_lint": kind.routes_to_lint(),
             })),
-            None => Err(McpError::internal_error(
+            // An absent caller-supplied path is the request being wrong, not
+            // the server failing: the write call itself succeeded and found
+            // nothing to attach the signal to. `internal_error` tells a client
+            // to retry, and retrying the same path can never succeed. A
+            // genuine store failure is still `internal_error`, above.
+            None => Err(McpError::invalid_params(
                 format!(
                     "no current page at path {} in the resolved project",
                     path.as_str()
@@ -10268,6 +10273,83 @@ mod tests {
                 .iter()
                 .all(|finding| finding["kind"] != "feedback_flagged"),
             "memory_lint must retire feedback tied to a superseded page version"
+        );
+    }
+
+    /// Both directions of the class split: an absent caller-supplied path is
+    /// the caller's mistake (`invalid_params`), a genuine store failure is the
+    /// server's (`internal_error`). Without the second half, "reclassify the
+    /// not-found arm" is indistinguishable from "reclassify everything".
+    #[tokio::test]
+    async fn memory_feedback_reports_an_unknown_target_as_invalid_params() {
+        let (_tmp, store, server, _ws, _proj) = setup_server().await;
+
+        let missing = server
+            .memory_feedback(
+                Parameters(FeedbackArgs {
+                    path: "notes/does-not-exist.md".into(),
+                    signal: FeedbackKind::Stale,
+                    reason: None,
+                    project: None,
+                    workspace: None,
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .expect_err("an absent path has no page to attach a signal to");
+        assert_eq!(
+            missing.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "an unknown caller-supplied target is a caller error: {missing}"
+        );
+        assert!(
+            missing
+                .message
+                .contains("no current page at path notes/does-not-exist.md"),
+            "the message must stay intact: {missing}"
+        );
+
+        // Control: the handler did not start refusing live targets.
+        let ok = server
+            .memory_feedback(
+                Parameters(FeedbackArgs {
+                    path: "foo.md".into(),
+                    signal: FeedbackKind::Helpful,
+                    reason: None,
+                    project: None,
+                    workspace: None,
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .expect("a page that is present must still record feedback");
+        assert_eq!(call_tool_json(ok)["recorded"], true);
+
+        // The other direction: with the writer actor shut down, the very same
+        // present path fails for a reason the caller cannot fix, and that must
+        // still be `internal_error`.
+        store.writer.checkpoint_and_close().await;
+        let broken = server
+            .memory_feedback(
+                Parameters(FeedbackArgs {
+                    path: "foo.md".into(),
+                    signal: FeedbackKind::Helpful,
+                    reason: None,
+                    project: None,
+                    workspace: None,
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .expect_err("a closed writer cannot record anything");
+        assert_eq!(
+            broken.code,
+            rmcp::model::ErrorCode::INTERNAL_ERROR,
+            "a genuine store failure stays a server fault: {broken}"
+        );
+        assert!(
+            !broken.message.contains("no current page at path"),
+            "the store failure must not be reported as a missing target: {broken}"
         );
     }
 
