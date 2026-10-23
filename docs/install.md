@@ -3842,6 +3842,48 @@ the binary is genuine. Point it only at origins you control. Prefer an
 on-path attacker can substitute both the archive and its matching checksum.
 Each response body is capped at 128 MiB.
 
+### Server container you run yourself, native client on the host
+
+Some installs split the two halves by hand: the server runs in a container you
+start with your own `docker run` or Compose file (from the official image or
+one derived from it), and the host has the native binary from `install.sh` for
+hooks, MCP and the CLI, pointed at `http://127.0.0.1:49374`. The
+[Docker wrapper](#docker-wrapper) is this same layout managed for you: its
+`upgrade` pulls the new image, refreshes the host client and prints how to
+restart the container. Use it unless you need runtime options it does not
+cover.
+
+Without the wrapper, `ai-memory upgrade` on the host takes the native path
+above: it replaces the host binary and re-stages its hooks, and it does not
+touch the container. Because the server URL is loopback, it prints no
+remote-server note either, so the success line does not mean the server was
+upgraded. Upgrade the server yourself:
+
+1. Take a backup (`docker exec ai-memory ai-memory backup --to
+   /data/pre-upgrade.tar.gz`); migrations are forward-only.
+2. `docker pull akitaonrails/ai-memory:<tag>`, and rebuild any derived image
+   from that tag.
+3. Recreate the container with the same `/data` volume, port mapping and
+   environment.
+
+Keep the two versions in step: `ai-memory status` prints the server's version
+and `ai-memory --version` the host client's.
+
+In this layout, provider keys and other server settings passed with `-e` exist
+only inside the container. A host command that builds a provider client itself
+cannot see them, so `ai-memory llm-test` on the host fails even while the
+server's provider works: with a missing-key error while it builds the provider,
+or, for `openai-compat`, with the provider rejecting a request sent without a
+key. Run it in the container instead:
+
+```bash
+docker exec ai-memory ai-memory llm-test --provider <provider> --model <model> --prompt "Reply with OK"
+```
+
+The same boundary applies to files the server reads. A config path, or an
+[eval scorer](auto-improve-eval-gates.md) command, must name a path inside the
+container, for example under the `/data` volume, not a path on the host.
+
 ### Shared notes
 
 When the upgraded server starts, it applies SQLite schema migrations and
