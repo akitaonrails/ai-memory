@@ -73,6 +73,15 @@ version in [`docs/changelog/`](docs/changelog/):
   checkpoints, compactions, and annotations remain inline; the complete
   sanitized tool evidence stays searchable in the ledger (#1607).
 
+- `purge-project --confirm` now needs the project named with `--project` or
+  `--project-id`. A confirmed purge used to accept the name derived from the
+  `.ai-memory.toml` marker, the git remote or the directory, so the same
+  command run from the wrong directory deleted another project, and nothing
+  named the target before the delete. It is now refused before any request,
+  printing the derived target and the command with `--project` filled in. The
+  preview without `--confirm` is unchanged, and so is the command it prints
+  (#PRNUM).
+
 - The LLM fallback chain now logs its own events. A transient candidate
   failure logs a warning with that candidate's provider, model, chain
   position, error class, HTTP status and cooldown, and an info line records

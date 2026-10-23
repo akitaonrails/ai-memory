@@ -1548,7 +1548,8 @@ pub struct PurgeProjectArgs {
     pub workspace: Option<String>,
     /// Project name. When omitted, taken from the nearest
     /// `.ai-memory.toml` marker's `project`, then from the git remote,
-    /// then from the current directory's name.
+    /// then from the current directory's name. That derived name is enough
+    /// for the preview; `--confirm` needs this flag or `--project-id`.
     #[arg(long, conflicts_with = "project_id")]
     pub project: Option<String>,
     /// Project id (UUID) to purge, as an alternative to `--project`.
@@ -1560,7 +1561,9 @@ pub struct PurgeProjectArgs {
     #[arg(long)]
     pub project_id: Option<String>,
     /// REQUIRED for the purge to run. Without this flag the CLI errors
-    /// out — purging is destructive and irreversible.
+    /// out — purging is destructive and irreversible. It also needs the
+    /// target named with `--project` or `--project-id`: a confirmed purge
+    /// never deletes a project derived from the current directory.
     ///
     /// Before erroring, the CLI asks the server for a preview (bounded to a
     /// few seconds, auth refresh included): the reported counts (pages,
