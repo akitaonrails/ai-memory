@@ -104,6 +104,32 @@ fn confirm_command(workspace: &str, target_flag: &str, args: &PurgeProjectArgs) 
     cmd
 }
 
+/// Refuse a confirmed purge whose target nobody typed.
+///
+/// `--confirm` is the operator's "yes, this project". When neither
+/// `--project` nor `--project-id` was passed, the target came from the
+/// marker, the git remote or the directory name, so the same command run from
+/// the wrong directory deleted a different project, and nothing named it
+/// before the delete. The refusal names the derived target and hands back the
+/// command with it spelled out, so a deliberate purge is one paste away.
+fn require_named_target_for_confirm(
+    args: &PurgeProjectArgs,
+    workspace: &str,
+    target_label: &str,
+    target_flag: &str,
+) -> Result<()> {
+    if !args.confirm || args.project.is_some() || args.project_id.is_some() {
+        return Ok(());
+    }
+    bail!(
+        "purge-project --confirm needs the project named with --project or --project-id; \
+         this directory resolves to {workspace}/{target_label} (from the .ai-memory.toml \
+         marker, the git remote or the directory name), and nothing was deleted.\n\
+         If that is the project to purge, re-run:\n\n  {}",
+        confirm_command(workspace, target_flag, args),
+    )
+}
+
 /// Decide what to print, if anything, before the refusal — pure, so it is
 /// unit-tested without a server. `fallback_label` is used only when the
 /// server's own report has no `label` field.
@@ -183,6 +209,7 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
         ),
         (None, None) => bail!("one of --project or --project-id is required"),
     };
+    require_named_target_for_confirm(&args, &workspace, &target_label, &target_flag)?;
 
     if !args.confirm {
         let request = PurgeProjectRequest {
@@ -326,6 +353,75 @@ mod tests {
             ),
             "ai-memory purge-project --workspace default \
              --project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab --confirm"
+        );
+    }
+
+    /// A confirmed purge of a target nobody typed is refused, and the refusal
+    /// names the derived target and hands back the command with it spelled
+    /// out, every flag the operator passed included.
+    #[test]
+    fn confirm_without_a_named_target_is_refused_with_the_spelled_out_command() {
+        let mut a = args();
+        a.project = None;
+        a.confirm = true;
+        a.force = true;
+        let err = require_named_target_for_confirm(
+            &a,
+            "default",
+            "derived-from-cwd",
+            "--project derived-from-cwd",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("resolves to default/derived-from-cwd"),
+            "{err}"
+        );
+        assert!(err.contains("nothing was deleted"), "{err}");
+        assert!(
+            err.ends_with(
+                "ai-memory purge-project --workspace default --project derived-from-cwd \
+                 --force --confirm"
+            ),
+            "{err}"
+        );
+    }
+
+    /// Controls: a named target confirms as before, and the preview path
+    /// (no `--confirm`) still works from the derived name alone.
+    #[test]
+    fn a_named_target_or_a_preview_is_not_refused() {
+        let mut named = args();
+        named.confirm = true;
+        assert!(
+            require_named_target_for_confirm(
+                &named,
+                "default",
+                "my-project",
+                "--project my-project"
+            )
+            .is_ok()
+        );
+
+        let mut by_id = args();
+        by_id.project = None;
+        by_id.project_id = Some("0192b6a1-4c2e-7d3f-8a5b-1234567890ab".into());
+        by_id.confirm = true;
+        assert!(
+            require_named_target_for_confirm(
+                &by_id,
+                "default",
+                "0192b6a1-4c2e-7d3f-8a5b-1234567890ab",
+                "--project-id 0192b6a1-4c2e-7d3f-8a5b-1234567890ab"
+            )
+            .is_ok()
+        );
+
+        let mut preview = args();
+        preview.project = None;
+        assert!(
+            require_named_target_for_confirm(&preview, "default", "derived", "--project derived")
+                .is_ok()
         );
     }
 
@@ -557,6 +653,36 @@ mod tests {
         let outcome = run_preview(&config, "/admin/purge-project", &preview_request()).await;
         let msg = preview_message(&outcome, "default/scratch").expect("must print a line");
         assert!(msg.starts_with("Would purge default/scratch: 3 pages, 1 sessions, 1063"));
+    }
+
+    /// End to end: the refusal happens before any request, so a server that
+    /// would accept the purge never sees one.
+    #[tokio::test]
+    async fn confirm_without_a_named_target_sends_no_request() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/admin/purge-project",
+            axum::routing::post(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({ "label": "default/x" })) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_for(&tmp, format!("http://{addr}"));
+        let mut a = args();
+        a.project = None;
+        a.confirm = true;
+
+        let err = run(&config, a).await.unwrap_err().to_string();
+
+        assert!(err.contains("needs the project named"), "{err}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// Nothing listening at all (connection refused) must classify as

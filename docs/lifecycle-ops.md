@@ -275,6 +275,13 @@ ai-memory purge-project --workspace default --project my-project --confirm --com
 Like `purge-session`, this is a logical delete unless `--compact` is given;
 see [What "deleted" means](#what-deleted-means-purge-session-purge-project-delete-workspace).
 
+`--confirm` needs the target named with `--project` or `--project-id`. The
+preview (no `--confirm`) still works with the name derived from the marker, the
+git remote or the directory, but the CLI refuses a confirmed purge of a derived
+name before sending anything: run from the wrong directory, it would delete
+another project. The refusal prints the derived target and the command with
+`--project` filled in.
+
 What happens, in order:
 
 1. Server looks up `(workspace_id, project_id)` by name. Returns 404
