@@ -5216,6 +5216,11 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   // so another repository's baton could be consumed. Leave it open instead.
   if (!cwd) return undefined;
   if (captureServerRouted(cwd)) return undefined;
+  // An allowlist build captures only marked repositories, and the native hook
+  // returns before its handoff GET for any other (`hook.rs`). Do the same: the
+  // server resolves the directory into a project to look the baton up, so a
+  // request from an unmarked one leaves an empty project behind.
+  if (CAPTURE_MODE === "allowlist" && !findMarker(cwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
@@ -5237,6 +5242,9 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
 
 async function fetchRecap(cwd: string, id: string): Promise<string | undefined> {{
   if (captureServerRouted(cwd)) return undefined;
+  // Same rule as the handoff fetch: no request for a repository an allowlist
+  // build does not capture.
+  if (CAPTURE_MODE === "allowlist" && !findMarker(cwd)) return undefined;
   const url = new URL(`${{SERVER}}/recap`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("session_id", id);
@@ -6010,6 +6018,11 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   // so another repository's baton could be consumed. Leave it open instead.
   if (!cwd) return undefined;
   if (captureServerRouted(cwd)) return undefined;
+  // An allowlist build captures only marked repositories, and the native hook
+  // returns before its handoff GET for any other (`hook.rs`). Do the same: the
+  // server resolves the directory into a project to look the baton up, so a
+  // request from an unmarked one leaves an empty project behind.
+  if (CAPTURE_MODE === "allowlist" && !findMarker(cwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
@@ -14150,6 +14163,56 @@ model = "gpt-5"
                 .unwrap_or_else(|| panic!("{agent}: handoff fetch must require a directory"));
             let request = handoff.find("/handoff`").unwrap();
             assert!(guard < request, "{agent}: guard must precede the request");
+        }
+    }
+
+    /// An allowlist build sends nothing for an unmarked repository: not the
+    /// capture (#661), and not the handoff or recap GET either, which the
+    /// server answers by resolving the directory into a project, creating it.
+    /// The native hook returns before those requests for the same reason.
+    #[test]
+    fn allowlist_integrations_fetch_no_handoff_or_recap_outside_a_marked_repository() {
+        const GATE: &str =
+            "if (CAPTURE_MODE === \"allowlist\" && !findMarker(cwd)) return undefined;";
+        let plugins = [
+            (
+                "opencode",
+                build_opencode_plugin("http://127.0.0.1:49374", None, None, "allowlist"),
+            ),
+            (
+                "opencode2",
+                build_opencode2_plugin("http://127.0.0.1:49374", None, None, "allowlist", false)
+                    .unwrap(),
+            ),
+            (
+                "omp",
+                build_omp_extension("http://127.0.0.1:49374", None, None, "allowlist"),
+            ),
+            (
+                "pi",
+                build_pi_extension("http://127.0.0.1:49374", None, None, "allowlist"),
+            ),
+        ];
+        for (agent, plugin) in plugins {
+            assert!(
+                plugin
+                    .contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
+                "{agent}: the mode must be baked in"
+            );
+            for (fetch, path) in [("fetchHandoff", "/handoff`"), ("fetchRecap", "/recap`")] {
+                let Some((_, body)) = plugin.split_once(&format!("async function {fetch}(")) else {
+                    assert_eq!(fetch, "fetchRecap", "{agent}: no {fetch}");
+                    continue;
+                };
+                let gate = body
+                    .find(GATE)
+                    .unwrap_or_else(|| panic!("{agent}: {fetch} must honour the allowlist"));
+                let request = body.find(path).unwrap();
+                assert!(
+                    gate < request,
+                    "{agent}: {fetch} gate must precede the request"
+                );
+            }
         }
     }
 

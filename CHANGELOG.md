@@ -13,6 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The OpenCode, OpenCode 2, OpenClaw, Pi and OMP integrations installed with
+  `--capture-mode allowlist` no longer send the handoff (or OpenCode's recap)
+  request from a repository without a `.ai-memory.toml` marker. They already
+  dropped its capture, but the server answers that request by resolving the
+  directory into a project, so opening one of these agents in an unmarked
+  directory left an empty project named after it. The native hook already
+  returned before the request; these integrations call the server directly
+  (#1641).
+
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
   grants tables already do. An accented username, display name or key label
