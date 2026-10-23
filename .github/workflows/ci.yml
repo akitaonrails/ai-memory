@@ -138,6 +138,13 @@ jobs:
           else
             echo "no tests under $dir"
           fi
+      # The two example eval scorers must keep giving the same verdict; the
+      # suite runs the Python one and the sh + awk one on the same proposals.
+      - name: Auto-improve eval example scorer tests
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: uv run --no-project python -m unittest discover -s docs/examples/auto-improve-eval -p 'test_*.py' -v
       # The capture policy every generated OpenCode/OMP/Pi/OpenClaw plugin
       # embeds is TypeScript; only Node can execute it against the shared
       # capture-policy fixture. The test is ignored locally, where Node is not
