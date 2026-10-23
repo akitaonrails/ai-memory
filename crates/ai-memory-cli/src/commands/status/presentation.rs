@@ -30,6 +30,9 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
     } = view;
     terminal.header("STATUS / memory & capture");
     terminal.line(format_args!("ai-memory {} (server)", report.version));
+    for line in client_version_lines(&report.version, CLIENT_VERSION) {
+        terminal.line(format_args!("{line}"));
+    }
     terminal.section("Connection");
     terminal.line(format_args!("  server:       {}", ep.url));
     terminal.line(format_args!("  data-dir:     {}", report.data_dir));

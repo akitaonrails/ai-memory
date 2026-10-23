@@ -373,6 +373,36 @@ pub(super) fn spool_age_line(age_ms: Option<u64>) -> String {
     }
 }
 
+/// This binary's version. `report.version` is the server's, and the two drift
+/// apart when a split install (native client, server in a container or on
+/// another host) upgrades only one side.
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The client line of the human report, plus a warning when the client and
+/// the server differ in major version, the only difference the semver policy
+/// treats as breaking. A version that does not start with a number never
+/// warns.
+fn client_version_lines(server_version: &str, client_version: &str) -> Vec<String> {
+    let mut lines = vec![format!("ai-memory {client_version} (client)")];
+    let major = |version: &str| -> Option<u64> {
+        version
+            .trim_start_matches('v')
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    };
+    if let (Some(server), Some(client)) = (major(server_version), major(client_version))
+        && server != client
+    {
+        lines.push(format!(
+            "⚠ The client is {client_version} but the server is {server_version}: across a \
+             major version they may not understand each other's requests. Upgrade the older side."
+        ));
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 fn json_report(
     report: Report,
@@ -409,7 +439,11 @@ fn json_report(
         },
         "capture_mode": capture_mode,
         "ingest": report.ingest,
-        "client": { "server_url": endpoint.url, "auth": endpoint.auth_token.is_some() },
+        "client": {
+            "version": CLIENT_VERSION,
+            "server_url": endpoint.url,
+            "auth": endpoint.auth_token.is_some(),
+        },
         "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
     });
     // Absent when there is nothing to say, so the shape consumers read is
@@ -535,6 +569,10 @@ mod tests {
         }
         assert_eq!(value["recovery"]["journal_pending"], 2);
         assert_eq!(value["counts"]["observations"], 4);
+        // The server's version stays at the top level; the client's is new.
+        assert_eq!(value["version"], "2.6.0");
+        assert_eq!(value["client"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["client"]["server_url"], "http://127.0.0.1:49374");
 
         // A missing logon binary (#1280) adds one key and changes no other.
         let problem = super::super::user_service::MissingLogonBinary {
@@ -567,6 +605,29 @@ mod tests {
         let mut without = warned.clone();
         without.as_object_mut().unwrap().remove("windows_logon");
         assert_eq!(without, value);
+    }
+
+    #[test]
+    fn client_version_line_warns_only_across_a_major_version() {
+        let same = client_version_lines("3.1.1", "3.1.1");
+        assert_eq!(same, ["ai-memory 3.1.1 (client)"]);
+        // A minor or patch difference is shown, not warned about.
+        assert_eq!(client_version_lines("3.2.0", "3.1.1").len(), 1);
+        assert_eq!(client_version_lines("v3.0.0", "3.1.1").len(), 1);
+
+        let across = client_version_lines("2.6.0", "3.1.1");
+        assert_eq!(across.len(), 2, "{across:?}");
+        assert!(
+            across[1].contains("client is 3.1.1 but the server is 2.6.0"),
+            "{across:?}"
+        );
+        assert_eq!(client_version_lines("4.0.0", "3.1.1").len(), 2);
+    }
+
+    #[test]
+    fn client_version_line_never_warns_on_an_unparseable_version() {
+        assert_eq!(client_version_lines("dev", "3.1.1").len(), 1);
+        assert_eq!(client_version_lines("", "3.1.1").len(), 1);
     }
 
     #[test]

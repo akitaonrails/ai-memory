@@ -64,6 +64,12 @@ version in [`docs/changelog/`](docs/changelog/):
   provider behind an LLM fallback chain can spend the whole fixed budget on one
   slow 503 before the next candidate answers, and every such query then keeps
   its pre-rerank order. ([#1614](https://github.com/akitaonrails/ai-memory/issues/1614))
+- `ai-memory status` now shows the client's version next to the server's: a
+  `ai-memory X (client)` line under `ai-memory X (server)`, and `version` in
+  the JSON `client` object. In a split install (native client and hooks, the
+  server in a container or on another host) the two drift apart when only one
+  side is upgraded, and nothing showed it. When they differ in major version,
+  the text report adds a warning to upgrade the older side (#1644).
 
 ### Changed
 
