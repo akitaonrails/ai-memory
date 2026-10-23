@@ -890,6 +890,25 @@ async fn run_once_with_wiring(
             display_session_id(&orphaned_session),
             prepared.workstream_name
         );
+        // The hint tells the user to repeat their own command with a selector
+        // right after the harness name, which only works when they typed one
+        // and launched an interactive session (`codex exec` and `opencode run`
+        // take their selector after the subcommand).
+        if interactive_session && !automatic_harness {
+            let sessions = list_native_sessions(
+                harness,
+                &home,
+                &repository.cwd,
+                plan.session_dir.as_deref(),
+                1,
+            )
+            .await;
+            if let Some(hint) =
+                orphan_resume_hint(harness, &orphaned_session, sessions, SystemTime::now())
+            {
+                eprintln!("{hint}");
+            }
+        }
     } else if force_fresh && plan.mode == LaunchMode::Session {
         eprintln!(
             "ai-memory: starting a fresh {} session in workstream '{}'",
@@ -4110,6 +4129,89 @@ fn session_age(updated_at: SystemTime, now: SystemTime) -> String {
     super::humanize_age_secs(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
+/// What to tell the user about the rest of the checkout once the linked
+/// session is known to be missing: the newest other session of the harness and
+/// the native selector that resumes it, or why the checkout could not be
+/// listed. The launch itself still starts fresh, because picking another
+/// session for an established workstream stays the user's explicit choice.
+/// The caller only asks for an interactive launch that named its harness.
+fn orphan_resume_hint(
+    harness: ManagedHarness,
+    orphaned_session: &str,
+    sessions: Result<Vec<NativeSessionCandidate>>,
+    now: SystemTime,
+) -> Option<String> {
+    let sessions = match sessions {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            return Some(format!(
+                "ai-memory: could not list this checkout's other {} sessions ({error:#})",
+                harness.as_str()
+            ));
+        }
+    };
+    let newest = sessions
+        .into_iter()
+        .next()
+        .filter(|candidate| candidate.native_session_id != orphaned_session)?;
+    let found = format!(
+        "ai-memory: this checkout's newest {} session is {} (updated {})",
+        harness.as_str(),
+        display_session_id(&newest.native_session_id),
+        session_age(newest.updated_at, now)
+    );
+    Some(match resume_selector(harness, &newest.native_session_id) {
+        Some(selector) => format!(
+            "{found}; to continue it instead, stop this fresh session and run the same command again with `{selector}` right after `{}`",
+            run_harness_name(harness)
+        ),
+        None => format!(
+            "{found}; to continue it instead, stop this fresh session and resume that one by its id"
+        ),
+    })
+}
+
+/// The harness name as `ai-memory run` takes it. Kiro's v3 engine is chosen
+/// with `kiro --v3`, not by a harness name of its own.
+fn run_harness_name(harness: ManagedHarness) -> &'static str {
+    match harness {
+        ManagedHarness::KiroV3 => ManagedHarness::Kiro.as_str(),
+        other => other.as_str(),
+    }
+}
+
+/// The native arguments that resume `id`, rendered from the launch plan so
+/// each harness gets its own form (`resume <id>`, `--resume <id>`,
+/// `--resume=<id>`). The `--v3` the plan adds for Kiro's v3 engine is left
+/// out: the user's own command already selects the engine. `None` when the id
+/// would not print whole or a word would need shell quoting, since the line is
+/// meant to be typed as shown.
+fn resume_selector(harness: ManagedHarness, id: &str) -> Option<String> {
+    if display_session_id(id) != id {
+        return None;
+    }
+    build_launch_plan(harness, None, Vec::new(), Some(id))
+        .ok()?
+        .args
+        .iter()
+        .filter(|arg| !(harness == ManagedHarness::KiroV3 && *arg == "--v3"))
+        .map(|arg| {
+            let arg = arg.to_str()?;
+            let shown = match arg.strip_suffix(id) {
+                Some(flag) if flag.is_empty() || flag.ends_with('=') => {
+                    format!("{flag}{}", display_session_id(id))
+                }
+                _ => arg.to_owned(),
+            };
+            shown
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.=:/@+,".contains(c))
+                .then_some(shown)
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|words| words.join(" "))
+}
+
 async fn export_exact_after_run(
     harness: ManagedHarness,
     home: &std::path::Path,
@@ -6679,6 +6781,87 @@ mod tests {
         assert!(rendered.contains("no codex session is linked"));
         assert!(rendered.contains("updated 1 hour ago"));
         assert!(rendered.contains("Start a new codex session"));
+    }
+
+    /// The hint names the newest checkout session and the native selector to
+    /// put right after the harness, in that harness's own form. It falls back
+    /// to plain advice when the id would not print whole or would need shell
+    /// quoting, reports a listing error, and says nothing when there is no
+    /// other session to offer.
+    #[test]
+    fn orphan_resume_hint_names_the_newest_session_and_its_selector() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(7_200);
+        let id = "01a16548-23e9-7cf1-b3d6-ab3405055748";
+        let newest = |id: &str| {
+            Ok(vec![NativeSessionCandidate {
+                native_session_id: id.into(),
+                updated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(3_600),
+            }])
+        };
+        let hint = |harness, sessions| orphan_resume_hint(harness, "gone", sessions, now);
+
+        let codex = hint(ManagedHarness::Codex, newest(id)).unwrap();
+        assert!(
+            codex.starts_with(&format!(
+                "ai-memory: this checkout's newest codex session is {id} (updated 1 hour ago)"
+            )),
+            "{codex}"
+        );
+        assert!(
+            codex.ends_with(&format!("with `resume {id}` right after `codex`")),
+            "{codex}"
+        );
+        let claude = hint(ManagedHarness::Claude, newest(id)).unwrap();
+        assert!(
+            claude.ends_with(&format!("with `--resume {id}` right after `claude`")),
+            "{claude}"
+        );
+        let kiro_id = "sess_01a16548-23e9-7cf1-b3d6-ab3405055748";
+        let kiro = hint(ManagedHarness::KiroV3, newest(kiro_id)).unwrap();
+        assert!(
+            kiro.ends_with(&format!("with `--resume-id {kiro_id}` right after `kiro`")),
+            "{kiro}"
+        );
+        let omp = hint(ManagedHarness::Omp, newest(id)).unwrap();
+        assert!(
+            omp.ends_with(&format!("with `--resume={id}` right after `omp`")),
+            "{omp}"
+        );
+
+        let long = "a".repeat(80);
+        let unprintable = hint(ManagedHarness::Codex, newest(&long)).unwrap();
+        assert!(
+            unprintable.ends_with("stop this fresh session and resume that one by its id"),
+            "{unprintable}"
+        );
+        assert!(!unprintable.contains('`'), "{unprintable}");
+        let quoted = hint(ManagedHarness::Pi, newest("odd session;id")).unwrap();
+        assert!(!quoted.contains('`'), "{quoted}");
+
+        let error = hint(ManagedHarness::Codex, Err(anyhow!("store unreadable"))).unwrap();
+        assert_eq!(
+            error,
+            "ai-memory: could not list this checkout's other codex sessions (store unreadable)"
+        );
+        assert!(hint(ManagedHarness::Codex, newest("gone")).is_none());
+        assert!(hint(ManagedHarness::Codex, Ok(Vec::new())).is_none());
+
+        // The launch asks for the hint only for an interactive session: in
+        // `codex exec` or `opencode run` the selector belongs after the
+        // subcommand, not right after the harness name.
+        let args = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &args(&[])
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::Codex,
+            &args(&["exec", "fix it"])
+        ));
+        assert!(!is_interactive_session_invocation(
+            ManagedHarness::OpenCode,
+            &args(&["run", "fix it"])
+        ));
     }
 
     #[test]

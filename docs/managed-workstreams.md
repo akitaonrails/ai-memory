@@ -469,6 +469,15 @@ session. Use `ai-memory run --fresh <harness>` to deliberately skip the linked
 session and the adoption chooser. `--fresh` cannot be combined with a native
 resume, continue, session, or fork selector.
 
+When the linked session is missing and the checkout still holds another
+session of that harness, an interactive launch that names its harness still
+starts fresh but also names the newest one and the native selector that
+resumes it, such as `resume <id>` for Codex. Running the same command again
+with that selector right after the harness name is an explicit selector, so
+that session is linked instead. The launcher never picks it on its own, and
+it cannot tell whether that session is open in another terminal or linked to
+another workstream; adoption stays a bootstrap operation.
+
 ## What happens on each run
 
 1. The host client resolves the normal workspace/project scope and a stable

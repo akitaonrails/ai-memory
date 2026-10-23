@@ -67,6 +67,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- When the native session linked to a workstream is missing from its store,
+  an interactive `ai-memory run <harness>` now also names the newest session
+  this checkout still holds for that harness and the native selector that
+  resumes it, such as `resume <id>` for Codex. The launch still starts fresh
+  as before; running the same command again with that selector right after
+  the harness name links that session instead (#1654).
+
 - Managed-workstream startup packets now render completed tool calls and
   results as compact provenance stubs instead of spending the 30,000-character
   resume budget on raw command output or generated file content. Conversation,
