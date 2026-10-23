@@ -34,6 +34,12 @@ version in [`docs/changelog/`](docs/changelog/):
   rejected as containing no extractable text when that was its only cue.
   WebVTT allows any number of blank lines between blocks; the reader now skips
   them before reading a block.
+- `restore-page` keeps the checkpoint's `generated.at` again when the restored
+  page needs no other conformance change. Since 3.2.2 the restore took that
+  timestamp only from the file it was replacing, so restoring any older version
+  stamped the current time and rewrote the page's bytes, unless the restore ran
+  in the same second as the write it undid. The test for the byte-exact
+  restore passed or failed by that same second (#PRNUM).
 
 ## [3.2.2] - 2026-10-22
 
