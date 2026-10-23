@@ -80,7 +80,7 @@ version in [`docs/changelog/`](docs/changelog/):
   named the target before the delete. It is now refused before any request,
   printing the derived target and the command with `--project` filled in. The
   preview without `--confirm` is unchanged, and so is the command it prints
-  (#PRNUM).
+  (#1643).
 
 - The LLM fallback chain now logs its own events. A transient candidate
   failure logs a warning with that candidate's provider, model, chain
