@@ -32,7 +32,7 @@
       breaking MCP schema change, called out in "What changed" above
 
 - [ ] The base branch matches: `main` for a patch, the standing feature
-      branch (currently `release/3.2`) for minor or major work.
+      branch (currently `release/3.3`) for minor or major work.
 - [ ] I checked that this does not redo something already on `main` or the
       feature branch, or fixed by a closed issue.
 
