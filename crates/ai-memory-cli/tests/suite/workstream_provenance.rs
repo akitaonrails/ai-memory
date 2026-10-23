@@ -60,6 +60,10 @@ async fn workstream_search_renders_provenance_and_accepts_older_servers() {
                 assert_eq!(events[0]["metadata"], event["metadata"]);
             } else {
                 assert!(stdout.contains("visible result"));
+                assert!(
+                    stdout.contains("| codex | historical tool result (completed evidence)"),
+                    "tool result not labelled completed evidence: {stdout}"
+                );
                 if provenance {
                     assert!(
                         stdout.contains("Source record: \"record-1\""),

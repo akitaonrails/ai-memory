@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory workstream-search` now labels a historical tool call or tool
+  result as completed evidence, as the managed-workstream docs describe. Its
+  text output used the event's role, which every transcript adapter sets to
+  `assistant` on a tool call, so a past command read like an assistant action
+  still to run (#1629).
+
 - `ai-memory user list` and `ai-memory api-key list` now size their columns
   by terminal display width rather than bytes, as `list-projects` and the
   grants tables already do. An accented username, display name or key label

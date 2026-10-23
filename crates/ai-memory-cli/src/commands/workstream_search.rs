@@ -1,6 +1,6 @@
 //! Explicit retrieval for history older than a managed startup packet.
 
-use ai_memory_core::{NativeSessionIdentity, Sanitizer, WorkstreamEvent};
+use ai_memory_core::{NativeSessionIdentity, Sanitizer, WorkstreamEvent, WorkstreamEventKind};
 use anyhow::Result;
 
 use crate::cli::WorkstreamSearchArgs;
@@ -32,7 +32,13 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
         return Ok(());
     }
     for event in events {
-        let role = event.role.as_deref().unwrap_or(event.kind.as_str());
+        // Adapters give tool events a role, so the kind decides their label;
+        // otherwise a past tool call reads as a pending assistant action.
+        let role = match event.kind {
+            WorkstreamEventKind::ToolCall => "historical tool call (completed evidence)",
+            WorkstreamEventKind::ToolResult => "historical tool result (completed evidence)",
+            _ => event.role.as_deref().unwrap_or(event.kind.as_str()),
+        };
         println!(
             "## Event {} | {} | {}",
             event.sequence,
