@@ -146,10 +146,17 @@ runs, in order, the commands a native install otherwise needs one by one:
    and restarts it after a failure, giving up after five failures within ten
    seconds of starting; see
    [`docs/windows.md`](windows.md#scenario-e-keep-the-server-running-native-windows-service).
-   The step is skipped when a server already answers at the configured
+   The step is skipped when an ai-memory server already answers at the configured
    URL and no unit or logon entry of ours exists yet (Docker, a packaged system
    unit, a foreground `serve`), when the configured server is not on this
-   machine, and with `--no-service`.
+   machine, and with `--no-service`. Setup requires a successful
+   `application/json` response with `{"status":"ok"}` from `/healthz` before
+   treating a listener as healthy. An unrecognized response leaves any local
+   service unchanged and fails the self-check with a diagnostic. Check which
+   process owns the address, then free it or change `bind` in the named
+   `config.toml` and re-run setup; update an explicit `server_url` too.
+   OpenCode's background service also defaults to port 49374 and can be moved
+   with `opencode service set port <free-port>`.
 3. For each agent: `install-mcp --apply`, `install-hooks --apply` and
    `install-skills --scope global`. With no `--agent`, `setup` wires every
    harness whose session store or MCP config exists under your home, using the
