@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use crate::commands::path_util::home_dir;
 use crate::marker::{
-    RoutingSelection, RoutingSource, find_marker, find_settings_marker, is_truthy, parse_toml_flag,
-    parse_toml_key, repo_root_project, routing_selection,
+    RoutingSelection, RoutingSource, find_marker, is_truthy, parse_toml_flag, parse_toml_key,
+    repo_root_project, routing_selection,
 };
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
 use ai_memory_hooks::{
@@ -309,16 +309,26 @@ pub fn marker_query_suffix_without_briefing(cwd: &str, default_strategy: Option<
     marker_query_suffix_impl(cwd, default_strategy, false)
 }
 
-/// Whether the nearest settings-declaring marker explicitly enables the
-/// compiled project brief (see [`find_settings_marker`]: a nested
-/// capture-only marker does not shadow an outer marker's `[briefing]`
-/// opt-in, #668).
+/// Whether the marker that routes `cwd` explicitly enables the compiled
+/// project brief. It is the selection [`marker_query_suffix`] reads its
+/// `&briefing` params from, so the Kimi gate agrees with the query it gates:
+/// the nearest settings-declaring marker (a nested capture-only marker does
+/// not shadow an outer marker's `[briefing]` opt-in, #668), else the
+/// operator-home marker, whether `cwd` is inside `$HOME` or not (#1665).
 ///
 /// Kimi Code uses this before creating its local once-per-session marker so
 /// repositories that did not opt in do not accumulate marker files.
 pub fn marker_requests_briefing(cwd: &str) -> bool {
-    find_settings_marker(cwd)
-        .and_then(|marker| parse_toml_flag(&marker, "inject_on_session_start"))
+    marker_requests_briefing_with_home(cwd, home_dir().as_deref())
+}
+
+/// [`marker_requests_briefing`] resolved against `home` instead of the
+/// operator's home directory.
+fn marker_requests_briefing_with_home(cwd: &str, home: Option<&Path>) -> bool {
+    crate::marker::routing_selection_with_home(cwd, cwd, home, false)
+        .ok()
+        .flatten()
+        .and_then(|selection| parse_toml_flag(&selection.path, "inject_on_session_start"))
         .is_some_and(|value| is_truthy(&value))
 }
 
@@ -1078,6 +1088,13 @@ mod tests {
     fn hook_scope(cwd: &str, default_strategy: Option<&str>) -> HookScope {
         let home = tempfile::TempDir::new().unwrap();
         hook_scope_with_home(cwd, default_strategy, Some(home.path()))
+    }
+
+    /// Shadows [`super::marker_requests_briefing`] the same way, for the same
+    /// reason.
+    fn marker_requests_briefing(cwd: &str) -> bool {
+        let home = tempfile::TempDir::new().unwrap();
+        marker_requests_briefing_with_home(cwd, Some(home.path()))
     }
 
     async fn serve_once(status: &'static str, body: &'static str) -> String {
@@ -1918,6 +1935,42 @@ drop_subagent_captures = "true"
         )
         .unwrap();
         assert!(marker_requests_briefing(cwd));
+    }
+
+    /// The Kimi once-per-session gate reads the marker the query it gates
+    /// reads. A home marker's `[briefing]` applies to every cwd, so a checkout
+    /// outside the home with no marker of its own opens the gate too;
+    /// otherwise no brief marker is written and every prompt asks for the
+    /// brief again (#1665).
+    #[test]
+    fn briefing_gate_and_query_agree_on_the_home_marker_outside_the_home() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join(".ai-memory.toml"),
+            "[briefing]\ninject_on_session_start = true\nmax_chars = 4000\n",
+        )
+        .unwrap();
+        let repo = tempfile::TempDir::new().unwrap();
+        let cwd = repo.path().to_str().unwrap();
+        let query = || {
+            let selection = super::super::super::marker::routing_selection_with_home(
+                cwd,
+                cwd,
+                Some(home.path()),
+                false,
+            );
+            marker_query_suffix_impl_from_selection(cwd, None, true, selection.unwrap())
+        };
+
+        let qs = query();
+        assert!(qs.contains("&briefing=true"), "{qs}");
+        assert!(marker_requests_briefing_with_home(cwd, Some(home.path())));
+
+        // The repo's own settings marker wins over the home marker for both.
+        std::fs::write(repo.path().join(".ai-memory.toml"), "project = \"repo\"\n").unwrap();
+        let qs = query();
+        assert!(!qs.contains("briefing"), "{qs}");
+        assert!(!marker_requests_briefing_with_home(cwd, Some(home.path())));
     }
 
     #[test]

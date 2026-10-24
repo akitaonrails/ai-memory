@@ -34,6 +34,13 @@ version in [`docs/changelog/`](docs/changelog/):
   rejected as containing no extractable text when that was its only cue.
   WebVTT allows any number of blank lines between blocks; the reader now skips
   them before reading a block.
+- Kimi Code gets the compiled project brief on the first prompt of a session
+  only, also in a checkout outside `$HOME` whose only `[briefing]` opt-in is
+  the operator-home marker. The handoff request takes the home marker as its
+  fallback for any cwd, but the once-per-session gate looked for a marker with
+  a walk that stops at the checkout root outside `$HOME`. The gate stayed
+  shut, no brief marker was written, and every prompt asked for the brief
+  again. The gate now reads the same marker as the request (#1665).
 
 ## [3.2.2] - 2026-10-22
 
