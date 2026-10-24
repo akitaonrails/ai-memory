@@ -40,10 +40,22 @@ function Get-WrapperSubcommand {
     $Index = 0
     while ($Index -lt $WrapperArgs.Count) {
         $Arg = $WrapperArgs[$Index]
-        if ($Arg -eq "--config" -or $Arg -eq "--data-dir") {
+        if ($Arg -ceq "--config" -or $Arg -ceq "--data-dir") {
+            if ($Index + 1 -ge $WrapperArgs.Count -or
+                [string]::IsNullOrEmpty($WrapperArgs[$Index + 1]) -or
+                ($WrapperArgs[$Index + 1].Length -gt 1 -and
+                    $WrapperArgs[$Index + 1].StartsWith("-"))) {
+                return ""
+            }
             $Index += 2
-        } elseif ($Arg -like "--*") {
+        } elseif ($Arg -clike "--config=*" -or $Arg -clike "--data-dir=*") {
+            if ($Arg.EndsWith("=")) {
+                return ""
+            }
             $Index += 1
+        } elseif ($Arg.StartsWith("-")) {
+            # Leave unknown and malformed options to the CLI parser.
+            return ""
         } else {
             return $Arg
         }
@@ -198,7 +210,7 @@ if (-not (Get-Command $Docker -ErrorAction SilentlyContinue)) {
     exit 127
 }
 
-if ($CommandArgs.Count -gt 0 -and $CommandArgs[0] -eq "upgrade") {
+if ((Get-WrapperSubcommand $CommandArgs) -ceq "upgrade") {
     & $Docker pull $Image
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE

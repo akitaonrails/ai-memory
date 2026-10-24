@@ -200,8 +200,9 @@ container, which has no host CLIs.
   sets `AI_MEMORY_RUN_AUTOWIRE=false` for the intercepted commands unless you
   set the variable yourself). Export `AI_MEMORY_RUN_AUTOWIRE=true` to let
   `run` rewire a harness around the native client instead.
-- Upgrading in this scenario: `ai-memory upgrade` pulls the image only. It
-  does not refresh the wrapper or install a native client. Refresh the
+- Upgrading in this scenario: `ai-memory upgrade` pulls the image only,
+  including when `--config` or `--data-dir` precedes `upgrade`. It does not
+  refresh the wrapper or install a native client. Refresh the
   wrapper scripts by re-running the install block at the top of this
   scenario, and the native client with its own `ai-memory.exe upgrade`
   ([Scenario C](#scenario-c-prebuilt-release-binary-no-toolchain)). Then
