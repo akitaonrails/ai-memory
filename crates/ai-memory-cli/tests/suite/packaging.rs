@@ -1407,6 +1407,10 @@ fn run_powershell_wrapper_with_server_url(args: &[&str], server_url: Option<&str
         .args(args)
         .env("AI_MEMORY_DOCKER", &docker)
         .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args)
+        // This helper asserts container argv. `install-hooks` defaults to the
+        // native host client now; opt into the documented script fallback so
+        // that subcommand still exercises the container-routing contract.
+        .env("AI_MEMORY_HOOK_PLATFORM", "windows")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env_remove("AI_MEMORY_DATA_DIR");
     match server_url {
