@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory restore-page` now refuses explicitly empty or whitespace-only
+  `--path` and `--from` flags before sending any request to the server (#1764).
+
 - `ai-memory rename-project` now refuses an explicitly empty `--to` target
   name before sending any request to the server (#1759).
 
