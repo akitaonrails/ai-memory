@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory message send`, `pop`, and `cancel` now refuse explicitly empty
+  sender, recipient, and mailbox coordinates before reading stdin or sending
+  a request. Empty values previously fell back to the current checkout for
+  sender/mailbox scopes or reached the server as invalid recipient names
+  (#1761).
+
 - `ai-memory rename-project` now refuses an explicitly empty `--to` target
   name before sending any request to the server (#1759).
 

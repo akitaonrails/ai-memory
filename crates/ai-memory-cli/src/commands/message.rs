@@ -66,8 +66,9 @@ struct CancelMessagesResponse {
 /// Dispatch `ai-memory message`.
 ///
 /// # Errors
-/// Returns [`anyhow::Error`] when the scope cannot be resolved, stdin cannot
-/// be read, the server is unreachable, or it answers non-2xx.
+/// Returns [`anyhow::Error`] when an explicit mutating scope or target is
+/// empty, the scope cannot be resolved, stdin cannot be read, the server is
+/// unreachable, or it answers non-2xx.
 pub async fn run(config: &Config, args: MessageArgs) -> Result<()> {
     match args.command {
         MessageCommand::Send(args) => send(config, args).await,
@@ -89,6 +90,10 @@ struct SendRequest<'a> {
 }
 
 async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.from_workspace.as_deref(), "--from-workspace")?;
+    super::refuse_empty_explicit(args.from_project.as_deref(), "--from-project")?;
+    super::refuse_empty_explicit(Some(args.to_workspace.as_str()), "--to-workspace")?;
+    super::refuse_empty_explicit(Some(args.to_project.as_str()), "--to-project")?;
     let (from_workspace, from_project) = super::resolve_scope(
         config,
         args.from_workspace.as_deref(),
@@ -189,6 +194,8 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
 }
 
 async fn pop(config: &Config, args: MessagePopArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -306,6 +313,8 @@ struct PopRequest<'a> {
 }
 
 async fn cancel(config: &Config, args: MessageCancelArgs) -> Result<()> {
+    super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
+    super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     if args.id.is_none() && !args.all {
         anyhow::bail!("message cancel requires exactly one of --id <MESSAGE_ID> or --all");
     }
@@ -349,6 +358,116 @@ struct CancelRequest<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn assert_send_refuses(args: MessageSendArgs, flag: &str) {
+        let error = send(&Config::default(), args).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{flag} was passed empty")),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn send_args() -> MessageSendArgs {
+        MessageSendArgs {
+            to_workspace: "recipient-workspace".into(),
+            to_project: "recipient-project".into(),
+            subject: None,
+            body: Some("body".into()),
+            from_workspace: Some("sender-workspace".into()),
+            from_project: Some("sender-project".into()),
+            json: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_refuses_every_empty_explicit_coordinate_before_any_request() {
+        let mut args = send_args();
+        args.from_workspace = Some(" ".into());
+        assert_send_refuses(args, "--from-workspace").await;
+
+        let mut args = send_args();
+        args.from_project = Some(String::new());
+        assert_send_refuses(args, "--from-project").await;
+
+        let mut args = send_args();
+        args.to_workspace = "\t".into();
+        assert_send_refuses(args, "--to-workspace").await;
+
+        let mut args = send_args();
+        args.to_project = String::new();
+        assert_send_refuses(args, "--to-project").await;
+    }
+
+    #[tokio::test]
+    async fn pop_refuses_empty_scope_before_any_request() {
+        for (workspace, project, flag) in [
+            (
+                Some(" ".to_owned()),
+                Some("project".to_owned()),
+                "--workspace",
+            ),
+            (
+                Some("workspace".to_owned()),
+                Some(String::new()),
+                "--project",
+            ),
+        ] {
+            let error = pop(
+                &Config::default(),
+                MessagePopArgs {
+                    workspace,
+                    project,
+                    id: None,
+                    json: false,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{flag} was passed empty")),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_empty_scope_before_action_validation_or_any_request() {
+        for (workspace, project, flag) in [
+            (
+                Some(String::new()),
+                Some("project".to_owned()),
+                "--workspace",
+            ),
+            (
+                Some("workspace".to_owned()),
+                Some(" ".to_owned()),
+                "--project",
+            ),
+        ] {
+            let error = cancel(
+                &Config::default(),
+                MessageCancelArgs {
+                    workspace,
+                    project,
+                    id: None,
+                    all: false,
+                    json: false,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{flag} was passed empty")),
+                "unexpected error: {error}"
+            );
+        }
+    }
 
     fn message(subject: Option<&str>, body: &str) -> AgentMessage {
         AgentMessage {
