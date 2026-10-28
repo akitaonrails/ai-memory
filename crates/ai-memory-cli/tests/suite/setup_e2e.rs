@@ -367,13 +367,17 @@ fn setup_web_serves_the_plan_and_applies_the_picked_agent() {
     let stdout = child.stdout.take().unwrap();
     let mut child = Kill(child);
     let mut url = String::new();
-    for line in std::io::BufReader::new(stdout).lines() {
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    for line in lines.by_ref() {
         let line = line.unwrap();
         if let Some(found) = line.trim().strip_prefix("http://127.0.0.1:") {
             url = format!("http://127.0.0.1:{found}");
             break;
         }
     }
+    // Keep the pipe open and drained: dropping it breaks the child's next
+    // println!, whose panic kills the server and resets the pending GET.
+    std::thread::spawn(move || for _ in lines {});
     assert!(url.ends_with('/'), "no address printed: {url:?}");
     let authority = url
         .trim_start_matches("http://")
