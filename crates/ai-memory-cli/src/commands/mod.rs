@@ -167,15 +167,13 @@ pub(crate) fn humanize_age_secs(seconds: i64) -> String {
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
 }
 
-/// Refuse an explicitly empty scope or target flag on a mutating command.
+/// Refuse an explicitly empty or whitespace-only scope or target flag.
 ///
-/// [`resolve_scope`] treats an empty string as absent, so a harness that
-/// fills an unset variable with `""` still resolves the scope it would have
-/// resolved without the flag. That is the right reading for a read, and the
-/// wrong one for a mutation: `--project "" --confirm` would aim a purge at
-/// whatever the current directory resolves to, and an empty message scope
-/// would claim or cancel mail there. These commands ask for the flag to be
-/// omitted instead.
+/// [`resolve_scope`] applies this to `--workspace` and `--project` itself. A
+/// command still calls it first for its own flags (`--path`, `--from`, ids),
+/// and for the scope flags so the error names the flag the user typed. Empty
+/// must not fall back to the current directory: `--project "" --confirm`
+/// would aim a purge at whatever the directory resolves to.
 ///
 /// # Errors
 /// Returns an error naming `flag` when it was passed as an empty or
@@ -208,8 +206,9 @@ pub(crate) fn resolve_scope_noting_marker_project(
     explicit_ws: Option<&str>,
     explicit_proj: Option<&str>,
 ) -> Result<(String, String, bool)> {
-    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
-    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
+    // Before the explicit-pair early return, which would skip the marker path.
+    refuse_empty_explicit(explicit_ws, "--workspace")?;
+    refuse_empty_explicit(explicit_proj, "--project")?;
     if let (Some(workspace), Some(project)) = (explicit_ws, explicit_proj) {
         return Ok((workspace.to_string(), project.to_string(), false));
     }
@@ -230,8 +229,9 @@ pub(crate) fn resolve_scope_with_marker(
     marker: Option<(crate::marker::MarkerScope, String, String)>,
     announce: bool,
 ) -> Result<(String, String)> {
-    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
-    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
+    // `doctor` calls this directly, so it needs the same refusal.
+    refuse_empty_explicit(explicit_ws, "--workspace")?;
+    refuse_empty_explicit(explicit_proj, "--project")?;
 
     let mut decided: Vec<&str> = Vec::with_capacity(2);
     let workspace = match explicit_ws {
@@ -1008,5 +1008,38 @@ mod tests {
         let (workspace, _) = resolve_scope(&config, None, None).unwrap();
 
         assert_eq!(workspace, crate::config::DEFAULT_WORKSPACE);
+    }
+
+    /// Empty and whitespace-only explicit flags must not fall through to the
+    /// directory's scope on any choke-point entry point.
+    #[test]
+    fn explicit_empty_scope_flags_are_refused_at_the_choke_point() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(tmp.path(), None);
+        for blank in ["", "   ", "\t\n"] {
+            let ws_error = resolve_scope(&config, Some(blank), None).unwrap_err();
+            assert!(
+                ws_error
+                    .to_string()
+                    .contains("--workspace was passed empty")
+            );
+            let proj_error = resolve_scope(&config, None, Some(blank)).unwrap_err();
+            assert!(
+                proj_error
+                    .to_string()
+                    .contains("--project was passed empty")
+            );
+            // The explicit-pair path must not skip the refusal either.
+            assert!(resolve_scope(&config, Some("cli"), Some(blank)).is_err());
+            assert!(resolve_scope(&config, Some(blank), Some("explicit")).is_err());
+            assert!(resolve_scope_noting_marker_project(&config, Some(blank), None).is_err());
+            assert!(resolve_scope_with_marker(&config, None, Some(blank), None, false).is_err());
+        }
+        // Controls: a non-empty pair and an omitted flag still resolve.
+        assert_eq!(
+            resolve_scope(&config, Some("cli"), Some("explicit")).unwrap(),
+            ("cli".into(), "explicit".into())
+        );
+        assert!(resolve_scope(&config, None, None).is_ok());
     }
 }
