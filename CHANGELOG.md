@@ -14,9 +14,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 
 - The shared scope resolver now refuses an explicitly empty or
-  whitespace-only `--workspace` or `--project` on every CLI command that
-  resolves scope. Previously a whitespace-only value slipped through, and an
-  empty one was silently treated as absent (#1774).
+  whitespace-only `--workspace` or `--project`. Commands without a guard of
+  their own, `doctor` and `run` among them, used to treat an empty value as
+  absent and let a whitespace-only one through. Commands that already refused
+  keep their own messages (#1774).
 
 ## [3.2.9] - 2026-10-27
 
