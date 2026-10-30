@@ -981,8 +981,10 @@ server.
 The metric cards are navigation controls. Workspace cards sort the project
 list by the selected count, and Open sessions also selects projects that have
 an unfinished session. Project cards open the matching Agents, Sessions,
-Knowledge, or Token usage tab. On an agent page, token and call cards open the
-project's response ledger already filtered to that harness.
+Knowledge, or Token usage tab. Captured events sorts sessions by event count,
+and Open sessions filters the table to unfinished sessions. On an agent page,
+token and call cards open the project's response ledger already filtered to
+that harness.
 
 Responses are deduplicated by their native identity, so a partial update raises
 the stored counters instead of adding the same response again. Fresh input

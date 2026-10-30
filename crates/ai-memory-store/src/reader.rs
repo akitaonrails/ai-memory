@@ -5903,6 +5903,37 @@ impl ReaderPool {
             offset,
             None,
             None,
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// List a filtered, optionally event-sorted view of a scope's sessions.
+    /// Filtering and ordering happen before `limit`, so the page cannot hide
+    /// open sessions or lower-volume sessions behind the recent-first default.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sessions_for_scope_view(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+        open_only: bool,
+        sort_events: bool,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<SessionSummary>> {
+        self.sessions_for_scope_filtered(
+            workspace_id,
+            project_id,
+            owner_filter,
+            true,
+            limit,
+            offset,
+            None,
+            None,
+            open_only,
+            sort_events,
         )
         .await
     }
@@ -5933,6 +5964,8 @@ impl ReaderPool {
                 0,
                 Some(session_id),
                 None,
+                false,
+                false,
             )
             .await?;
         Ok(sessions.pop())
@@ -6035,10 +6068,17 @@ impl ReaderPool {
         offset: usize,
         exact_session_id: Option<SessionId>,
         agent: Option<String>,
+        open_only: bool,
+        sort_events: bool,
     ) -> StoreResult<Vec<SessionSummary>> {
         self.with_conn(move |conn| {
-            let sql =
-                sessions_for_scope_sql(exact_session_id.is_some(), &owner_filter, include_open);
+            let sql = sessions_for_scope_sql(
+                exact_session_id.is_some(),
+                &owner_filter,
+                include_open,
+                open_only,
+                sort_events,
+            );
             let sql = if agent.is_some() {
                 sql.replace("WHERE 1 = 1", "WHERE s.agent_kind = :agent")
             } else {
@@ -14431,6 +14471,8 @@ fn sessions_for_scope_sql(
     exact_session: bool,
     owner_filter: &OwnerFilter,
     include_open: bool,
+    open_only: bool,
+    sort_events: bool,
 ) -> String {
     // The point lookup lets the primary key narrow first so the scope
     // test is one indexed probe; the listing materializes the scope's
@@ -14463,10 +14505,17 @@ fn sessions_for_scope_sql(
           AND resumed.created_at > s.ended_at \
           AND resumed.kind NOT IN ('session-start', 'session-end')\
         ) THEN NULL ELSE s.ended_at END";
-    let ended_clause = if include_open {
+    let ended_clause = if open_only {
+        format!(" AND ({effective_end}) IS NULL")
+    } else if include_open {
         String::new()
     } else {
         format!(" AND ({effective_end}) IS NOT NULL")
+    };
+    let order = if sort_events {
+        "n DESC, s.started_at DESC, s.id DESC"
+    } else {
+        "s.started_at DESC, s.id DESC"
     };
     format!(
         "SELECT s.id, s.cwd, s.agent_kind, s.started_at, {effective_end} AS ended_at, s.actor_user, \
@@ -14483,7 +14532,7 @@ fn sessions_for_scope_sql(
              FROM session_consolidation_jobs latest WHERE latest.session_id = s.id \
                AND latest.workspace_id = :ws AND latest.project_id = :proj) \
          WHERE 1 = 1{membership}{owner_clause}{ended_clause} \
-         ORDER BY s.started_at DESC, s.id DESC \
+         ORDER BY {order} \
          LIMIT :limit OFFSET :offset"
     )
 }
@@ -16646,7 +16695,8 @@ mod tests {
                     if exact {
                         named.push((":sid", &sid_bytes));
                     }
-                    let sql = super::sessions_for_scope_sql(exact, owner, include_open);
+                    let sql =
+                        super::sessions_for_scope_sql(exact, owner, include_open, false, false);
                     let label =
                         format!("sessions exact={exact} open={include_open} owner={owner:?}");
                     // The point lookup has two probes (count and membership);

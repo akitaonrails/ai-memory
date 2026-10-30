@@ -119,6 +119,8 @@ impl ReaderPool {
             offset.min(i64::MAX as usize),
             None,
             Some(agent.as_str().to_owned()),
+            false,
+            false,
         )
         .await
     }
