@@ -9,6 +9,9 @@ use ai_memory_core::{
     PagePath, ProcessingJobId, ProcessingJobKind, ProcessingJobState, ProjectId, Sanitized,
     Sanitizer, SessionId, Tier, WorkspaceId,
 };
+use ai_memory_store::processing_jobs::{
+    PROCESSING_MAX_UNFINISHED_JOBS, PROCESSING_MAX_UNFINISHED_JOBS_PER_OWNER,
+};
 use ai_memory_store::{
     AutoImproveProposalOperation, CallReservation, ClaimedProcessingJob, Compaction,
     NewAutoImproveProposal, NewProcessingJob, PagesMode, ProcessingCheckpoint, ProcessingNodeState,
@@ -1591,4 +1594,385 @@ async fn unfinished_job_lookup_matches_scope_session_kind_and_owner_bucket_only(
         .await
         .unwrap();
     assert!(!has(f.proj, kind, Some(alice)).await.unwrap());
+}
+
+fn owned(f: &Fixture, session: SessionId, owner: Option<&str>) -> NewProcessingJob {
+    NewProcessingJob {
+        owner: owner.map(|name| IdentityKey::User(name.into())),
+        ..request(f.ws, f.proj, session)
+    }
+}
+
+fn job_rows(f: &Fixture) -> i64 {
+    Connection::open(f.store.db_path())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM processing_jobs", [], |row| row.get(0))
+        .unwrap()
+}
+
+async fn create(f: &Fixture, req: NewProcessingJob) -> Result<ProcessingJobId, StoreError> {
+    f.store
+        .writer
+        .create_processing_job(req)
+        .await
+        .map(|created| created.status.job_id)
+}
+
+async fn complete(f: &Fixture, job: ProcessingJobId) {
+    let claim = f
+        .store
+        .writer
+        .claim_processing_job(f.ws, f.proj, job, LIVE)
+        .await
+        .unwrap()
+        .expect("a runnable job");
+    f.store
+        .writer
+        .finish_processing_job(
+            &claim.claim,
+            ProcessingOutcome::Completed { result: json!({}) },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_project_owner_bucket_admits_a_bounded_number_of_unfinished_jobs() {
+    let f = fixture().await;
+    let cap = PROCESSING_MAX_UNFINISHED_JOBS_PER_OWNER as usize;
+    let mut accepted = Vec::new();
+    for i in 0..cap {
+        let session = session_with(&f.store, f.ws, f.proj, &[&format!("body {i}")]).await;
+        let job = create(&f, owned(&f, session, Some("alice"))).await.unwrap();
+        accepted.push((session, job));
+    }
+
+    // Boundary: the next distinct snapshot is refused with the typed,
+    // retryable error, and nothing of it is stored.
+    let extra = session_with(&f.store, f.ws, f.proj, &["extra"]).await;
+    let err = create(&f, owned(&f, extra, Some("alice")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ProcessingQueueFull(_)), "{err:?}");
+    assert_eq!(job_rows(&f), cap as i64, "a refusal must leave no job row");
+
+    // An equivalent request joins the accepted job even at capacity.
+    let (first_session, first_job) = accepted[0];
+    let joined = f
+        .store
+        .writer
+        .create_processing_job(owned(&f, first_session, Some("alice")))
+        .await
+        .unwrap();
+    assert!(!joined.created);
+    assert_eq!(joined.status.job_id, first_job);
+
+    // The legitimate other operator, the shared bucket and another project
+    // are unaffected by alice's full bucket.
+    create(&f, owned(&f, extra, Some("bob"))).await.unwrap();
+    create(&f, owned(&f, extra, None)).await.unwrap();
+    let other = f
+        .store
+        .writer
+        .get_or_create_project(f.ws, "other".to_owned(), None)
+        .await
+        .unwrap();
+    let elsewhere = session_with(&f.store, f.ws, other, &["elsewhere"]).await;
+    create(
+        &f,
+        NewProcessingJob {
+            owner: Some(IdentityKey::User("alice".into())),
+            ..request(f.ws, other, elsewhere)
+        },
+    )
+    .await
+    .unwrap();
+
+    // A paused job still holds its slot.
+    f.store.writer.pause_processing_jobs().await.unwrap();
+    let err = create(&f, owned(&f, extra, Some("alice")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ProcessingQueueFull(_)), "{err:?}");
+    f.store
+        .writer
+        .resume_paused_processing_jobs()
+        .await
+        .unwrap();
+
+    // A terminal job releases its slot; the bucket is bounded again after.
+    complete(&f, first_job).await;
+    create(&f, owned(&f, extra, Some("alice"))).await.unwrap();
+    let another = session_with(&f.store, f.ws, f.proj, &["another"]).await;
+    let err = create(&f, owned(&f, another, Some("alice")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ProcessingQueueFull(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn the_server_admits_a_bounded_number_of_unfinished_jobs_across_owners() {
+    let f = fixture().await;
+    let per_owner = PROCESSING_MAX_UNFINISHED_JOBS_PER_OWNER as usize;
+    let cap = PROCESSING_MAX_UNFINISHED_JOBS as usize;
+    let mut first = None;
+    for owner in 0..cap / per_owner {
+        for i in 0..per_owner {
+            let session =
+                session_with(&f.store, f.ws, f.proj, &[&format!("body {owner}/{i}")]).await;
+            let name = format!("user{owner}");
+            let job = create(&f, owned(&f, session, Some(&name))).await.unwrap();
+            first.get_or_insert((session, job, name));
+        }
+    }
+    assert_eq!(job_rows(&f), cap as i64);
+
+    // A fresh operator has an empty bucket but the server is full.
+    let extra = session_with(&f.store, f.ws, f.proj, &["extra"]).await;
+    let err = create(&f, owned(&f, extra, Some("newcomer")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ProcessingQueueFull(_)), "{err:?}");
+    assert!(err.to_string().contains("server-wide"), "{err}");
+    assert_eq!(job_rows(&f), cap as i64, "a refusal must leave no job row");
+
+    // Joining an equivalent job still works at capacity.
+    let (session, job, name) = first.unwrap();
+    let joined = f
+        .store
+        .writer
+        .create_processing_job(owned(&f, session, Some(&name)))
+        .await
+        .unwrap();
+    assert!(!joined.created);
+    assert_eq!(joined.status.job_id, job);
+
+    // Finishing one job frees exactly one server slot.
+    complete(&f, job).await;
+    create(&f, owned(&f, extra, Some("newcomer")))
+        .await
+        .unwrap();
+    let another = session_with(&f.store, f.ws, f.proj, &["another"]).await;
+    let err = create(&f, owned(&f, another, Some("newcomer")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ProcessingQueueFull(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_request_never_joins_a_job_with_a_different_authorization_viewer() {
+    let f = fixture().await;
+    let session = session_with(&f.store, f.ws, f.proj, &["x"]).await;
+    let alice = ai_memory_core::UserId::new();
+    let mallory = ai_memory_core::UserId::new();
+    let with = |viewer: Option<ai_memory_core::UserId>, author: Option<ai_memory_core::UserId>| {
+        NewProcessingJob {
+            viewer,
+            author_id: author,
+            owner: Some(IdentityKey::User("alice".into())),
+            ..request(f.ws, f.proj, session)
+        }
+    };
+
+    // A server-owned job (no viewer, no revocation check) exists first.
+    let server_owned = f
+        .store
+        .writer
+        .create_processing_job(with(None, None))
+        .await
+        .unwrap();
+    assert!(server_owned.created);
+
+    // The same operator bucket, but an authenticated viewer: must get its own
+    // job, never the weaker viewer-less one.
+    let alices = f
+        .store
+        .writer
+        .create_processing_job(with(Some(alice), Some(alice)))
+        .await
+        .unwrap();
+    assert!(
+        alices.created,
+        "a stricter viewer must not join a viewer-less job"
+    );
+    assert_ne!(alices.status.job_id, server_owned.status.job_id);
+
+    // Attribution alone (author without viewer) joins the viewer-less job:
+    // authorization, not attribution, decides equivalence.
+    let attribution_only = f
+        .store
+        .writer
+        .create_processing_job(with(None, Some(alice)))
+        .await
+        .unwrap();
+    assert!(!attribution_only.created);
+    assert_eq!(attribution_only.status.job_id, server_owned.status.job_id);
+
+    // Control: the identical viewer joins, another user's viewer does not.
+    let again = f
+        .store
+        .writer
+        .create_processing_job(with(Some(alice), None))
+        .await
+        .unwrap();
+    assert!(!again.created);
+    assert_eq!(again.status.job_id, alices.status.job_id);
+    let foreign = f
+        .store
+        .writer
+        .create_processing_job(with(Some(mallory), Some(alice)))
+        .await
+        .unwrap();
+    assert!(foreign.created);
+    assert_ne!(foreign.status.job_id, alices.status.job_id);
+    assert_eq!(job_rows(&f), 3);
+}
+
+#[tokio::test]
+async fn an_automatic_server_owned_job_is_isolated_from_authenticated_operator_jobs() {
+    let f = fixture().await;
+    let session = session_with(&f.store, f.ws, f.proj, &["x"]).await;
+    let alice = ai_memory_core::UserId::new();
+    // SessionEnd policy: shared owner bucket, no viewer, attribution only.
+    let automatic = NewProcessingJob {
+        author_id: None,
+        viewer: None,
+        owner: None,
+        ..request(f.ws, f.proj, session)
+    };
+    let server_owned = create(&f, automatic.clone()).await.unwrap();
+
+    // Control: another automatic request (e.g. a retry) joins it.
+    let retry = f
+        .store
+        .writer
+        .create_processing_job(automatic)
+        .await
+        .unwrap();
+    assert!(!retry.created);
+    assert_eq!(retry.status.job_id, server_owned);
+
+    // An authenticated operator (own bucket and viewer) never adopts it, and
+    // neither does a viewer in the shared bucket.
+    for (owner, viewer) in [
+        (Some(IdentityKey::User("alice".into())), Some(alice)),
+        (Some(IdentityKey::User("alice".into())), None),
+        (None, Some(alice)),
+    ] {
+        let created = f
+            .store
+            .writer
+            .create_processing_job(NewProcessingJob {
+                author_id: Some(alice),
+                viewer,
+                owner,
+                ..request(f.ws, f.proj, session)
+            })
+            .await
+            .unwrap();
+        assert!(created.created);
+        assert_ne!(created.status.job_id, server_owned);
+    }
+}
+
+fn intermediate_rows(f: &Fixture, job: ProcessingJobId) -> (i64, i64) {
+    let conn = Connection::open(f.store.db_path()).unwrap();
+    let count = |table: &str| -> i64 {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?1"),
+            params![job.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    (
+        count("processing_job_nodes"),
+        count("processing_job_observations"),
+    )
+}
+
+async fn finish_with(f: &Fixture, body: &str, outcome: ProcessingOutcome) -> ProcessingJobId {
+    let session = session_with(&f.store, f.ws, f.proj, &[body]).await;
+    let job = create(f, request(f.ws, f.proj, session)).await.unwrap();
+    let claim = claim_one(f, LIVE).await;
+    f.store
+        .writer
+        .checkpoint_processing_job(
+            &claim.claim,
+            ProcessingCheckpoint {
+                chunks_total: Some(1),
+                upsert_nodes: vec![node("m:0", json!({"n": 1}))],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(intermediate_rows(f, job), (1, 1));
+    f.store
+        .writer
+        .finish_processing_job(&claim.claim, outcome)
+        .await
+        .unwrap();
+    job
+}
+
+#[tokio::test]
+async fn a_failed_job_keeps_its_nodes_and_manifest_until_cleanup_but_an_invalidated_one_does_not() {
+    let f = fixture().await;
+    let failed = finish_with(
+        &f,
+        "failing",
+        ProcessingOutcome::Failed {
+            error: "provider rejected".into(),
+        },
+    )
+    .await;
+    let invalidated = finish_with(
+        &f,
+        "invalidated",
+        ProcessingOutcome::Invalidated {
+            reason: "source changed".into(),
+        },
+    )
+    .await;
+    let completed = finish_with(
+        &f,
+        "completed",
+        ProcessingOutcome::Completed { result: json!({}) },
+    )
+    .await;
+
+    assert_eq!(
+        status_state(&f, failed).await.unwrap().0,
+        ProcessingJobState::Failed
+    );
+    assert_eq!(
+        intermediate_rows(&f, failed),
+        (1, 1),
+        "a failed job retains its derived nodes and manifest"
+    );
+    // Controls: invalidated and completed jobs discard theirs.
+    assert_eq!(intermediate_rows(&f, invalidated), (0, 0));
+    assert_eq!(intermediate_rows(&f, completed), (0, 0));
+
+    // A terminal failed job still frees queue capacity (it is not counted).
+    let rows: i64 = Connection::open(f.store.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM processing_jobs WHERE state IN \
+             ('queued', 'running', 'reducing', 'publishing', 'paused', 'budget_exceeded')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+
+    // Normal retention cleanup removes the failed job with its intermediates.
+    f.store
+        .writer
+        .cleanup_processing_jobs(Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(status_state(&f, failed).await.is_none());
+    assert_eq!(intermediate_rows(&f, failed), (0, 0));
 }

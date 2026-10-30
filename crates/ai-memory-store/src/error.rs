@@ -275,6 +275,13 @@ pub enum StoreError {
     #[error("processing claim is no longer active")]
     StaleProcessingClaim,
 
+    /// The durable processing queue is at its fixed admission limit, so a
+    /// new, non-equivalent job was refused. Retryable: capacity returns when
+    /// unfinished jobs complete, fail or are cleaned up. Carries which limit
+    /// was hit (never an identifier).
+    #[error("processing queue is full ({0}); retry after unfinished jobs finish")]
+    ProcessingQueueFull(&'static str),
+
     /// A live `ai-memory run` lease already owns the selected workstream.
     #[error("workstream is already active: {0}")]
     WorkstreamBusy(String),

@@ -17,7 +17,12 @@
 //!   publish after purge, move, or lease loss;
 //! - call attempts are reserved atomically and never refunded, so a restart
 //!   after an uncertain send does not reset the budget;
-//! - reads of manifest sources validate scope and body hash.
+//! - reads of manifest sources validate scope and body hash;
+//! - a *new* job is admitted only below fixed unfinished-job limits
+//!   ([`PROCESSING_MAX_UNFINISHED_JOBS`] server-wide,
+//!   [`PROCESSING_MAX_UNFINISHED_JOBS_PER_OWNER`] per workspace/project/owner),
+//!   checked in the creating transaction after the equivalent-job lookup, so a
+//!   join always works at capacity and an accepted snapshot is never dropped.
 //!
 //! The state is derived and private; it is never needed to rebuild published
 //! pages.
@@ -43,6 +48,12 @@ use crate::writer::WriterHandle;
 pub const PROCESSING_JOB_RETENTION_DEFAULT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Most checkpoint nodes one job may hold.
 pub const PROCESSING_MAX_NODES_PER_JOB: usize = 50_000;
+/// Most unfinished jobs (queued, running, reducing, publishing, paused or over
+/// budget) the server holds at once. A job that joins an equivalent one never
+/// counts: admission only gates a *new* job.
+pub const PROCESSING_MAX_UNFINISHED_JOBS: i64 = 128;
+/// Most unfinished jobs one workspace/project/owner bucket holds at once.
+pub const PROCESSING_MAX_UNFINISHED_JOBS_PER_OWNER: i64 = 16;
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
@@ -55,6 +66,8 @@ const MAX_SOURCE_PAGE: usize = 256;
 const MAX_NODE_PAGE: usize = 500;
 const CLAIM_SCAN_LIMIT: usize = 16;
 const ACTIVE_STATES: &str = "'queued', 'running', 'reducing', 'publishing'";
+const UNFINISHED_STATES: &str =
+    "'queued', 'running', 'reducing', 'publishing', 'paused', 'budget_exceeded'";
 const CLAIMED_STATES: &str = "'running', 'reducing', 'publishing'";
 const STATUS_COLS: &str = "id, workspace_id, project_id, session_id, kind, state, chunks_total, \
      chunks_done, calls_used, max_calls, last_error, result_json, created_at, updated_at, \
@@ -78,7 +91,8 @@ pub struct NewProcessingJob {
     pub actor: ActorContext,
     /// Attribution author for the eventual publication.
     pub author_id: Option<UserId>,
-    /// User whose access applies when the job reads or publishes.
+    /// User whose access applies when the job reads or publishes
+    /// (`None` = server-owned). Part of equivalence, distinct from `author_id`.
     pub viewer: Option<UserId>,
     /// Operator bucket (`None` = shared/unattributed). Part of equivalence.
     pub owner: Option<IdentityKey>,
@@ -293,12 +307,12 @@ pub enum ProcessingOutcome {
         /// Final result (at most 256 KiB).
         result: Value,
     },
-    /// Terminal failure.
+    /// Terminal failure; keeps derived nodes and the manifest until retention cleanup.
     Failed {
         /// Redacted reason.
         error: String,
     },
-    /// Snapshot or fingerprints no longer valid.
+    /// Snapshot or fingerprints no longer valid; discards intermediates.
     Invalidated {
         /// Redacted reason.
         reason: String,
@@ -1414,6 +1428,15 @@ fn create(conn: &mut Connection, job: &NewProcessingJob) -> StoreResult<Processi
     feed(&mut key, job.session_id.as_bytes());
     feed(&mut key, job.kind.as_str().as_bytes());
     feed(&mut key, owner_key.as_bytes());
+    // The authorization viewer is part of what a job may do (it is re-checked
+    // before every effect), so a request can only join a job that carries the
+    // same one: never a weaker (absent) viewer, never another user's.
+    feed(
+        &mut key,
+        job.viewer
+            .as_ref()
+            .map_or(&[][..], |viewer| viewer.as_bytes().as_slice()),
+    );
     feed(&mut key, options.as_bytes());
     feed(&mut key, job.context_fingerprint.as_bytes());
     feed(&mut key, manifest_fingerprint.as_bytes());
@@ -1446,6 +1469,37 @@ fn create(conn: &mut Connection, job: &NewProcessingJob) -> StoreResult<Processi
             status,
             created: false,
         });
+    }
+
+    // Admission, in this same write transaction and only for a genuinely new
+    // job (joins above work at capacity). Counts use idx_processing_jobs_due
+    // (state) and idx_processing_jobs_scope; the single writer serializes
+    // them with the insert below.
+    let unfinished: i64 = tx.query_row(
+        &format!("SELECT COUNT(*) FROM processing_jobs WHERE state IN ({UNFINISHED_STATES})"),
+        [],
+        |row| row.get(0),
+    )?;
+    if unfinished >= PROCESSING_MAX_UNFINISHED_JOBS {
+        return Err(StoreError::ProcessingQueueFull("server-wide limit"));
+    }
+    let bucket: i64 = tx.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM processing_jobs \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND owner_key = ?3 \
+               AND state IN ({UNFINISHED_STATES})"
+        ),
+        params![
+            job.workspace_id.as_bytes(),
+            job.project_id.as_bytes(),
+            owner_key
+        ],
+        |row| row.get(0),
+    )?;
+    if bucket >= PROCESSING_MAX_UNFINISHED_JOBS_PER_OWNER {
+        return Err(StoreError::ProcessingQueueFull(
+            "project and operator limit",
+        ));
     }
 
     let id = ProcessingJobId::new();
@@ -1960,7 +2014,14 @@ fn finish(
                      lease_expires_at = NULL, completed_at = ?4, updated_at = ?4 WHERE id = ?1",
                 params![id, state, clean_text(&reason), now],
             )?;
-            drop_intermediates(&tx, id)?;
+            // A failed job keeps its derived nodes and manifest for
+            // inspection until the normal retention cleanup deletes the job
+            // (its terminal state already frees queue capacity and the
+            // equivalence slot). An invalidated job's inputs are no longer
+            // trustworthy, so they are discarded with the success path.
+            if !failed {
+                drop_intermediates(&tx, id)?;
+            }
         }
         ProcessingOutcome::Paused { reason } => {
             tx.execute(
