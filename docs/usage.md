@@ -916,6 +916,8 @@ Limits to know before enabling it:
   fallback, another backend or a Codex 401 re-send). The count is durable, so a
   restart does not reset it. Uncertain sends are not refunded. Reaching the cap
   stops the job without reporting partial coverage as success.
+  A local admission refusal or queue timeout without a provider send spends no
+  call. A checkpointed final result can still finish publication at the cap.
 - Total calls go up, and so does cost. Smaller calls do not make a session finish
   sooner; the point is that no single call is large, and that a job can resume
   from stored progress. Calls are also queued through a shared server-side
@@ -924,6 +926,11 @@ Limits to know before enabling it:
   steps is published. If the model, prompts or relevant settings change, or the
   session is purged or moved to another project, the affected progress is
   invalidated and not reused.
+- The durable queue accepts at most 128 unfinished jobs across the server and
+  16 per workspace/project/owner bucket, including paused and budget-exceeded
+  jobs. An equivalent request can still join at capacity. A new request beyond
+  the limit returns HTTP 503 (an MCP internal error); retry after capacity is
+  available.
 
 Start a job without waiting on a long connection, then poll it. Both commands
 use the admin API, so they need the root token, and the project must already

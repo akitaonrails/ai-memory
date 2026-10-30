@@ -206,8 +206,13 @@ from hook paths.
    the durable job when enabled. The asynchronous surface is
    `POST /admin/processing-jobs` and `GET /admin/processing-jobs/{job_id}`
    (root-only, no-create scope resolution), `ai-memory processing-jobs
-   start|status`, and the MCP tools below. Design:
-   [`design-session-chunking.md`](design-session-chunking.md).
+   start|status`, and the MCP tools below.
+   Job admission is transactional and bounded: 128 unfinished jobs server-wide
+   and 16 per workspace/project/owner bucket, with equivalent joins allowed at
+   capacity and HTTP 503 for excess new work. Manual synchronous and asynchronous
+   requests share their authenticated owner and authorization viewer. SessionEnd
+   and scheduler jobs are server-owned and can run separately from a user's job.
+   Design: [`design-session-chunking.md`](design-session-chunking.md).
 6. `memory_query` answers via FTS5 + entity-match + link-neighbour RRF; a
    transactionally maintained auxiliary unigram/bigram FTS stream handles
    unspaced Han, Kana, and Hangul queries without changing the ordinary

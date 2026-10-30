@@ -528,8 +528,10 @@ truncated before storage stays out. A chunk does not create an
 - The publication identity is stored before any effect. If the server stops
   after staging commits but before the progress checkpoint, resuming reconciles
   against the staged proposal ids and states rather than staging or approving
-  again. Proposals are still not published as an all-or-nothing set. Manual
-  approval (`require_approval = true`) behaves as before.
+  again. An approval or rejection made before recovery is reflected in the final
+  result, including the approved page ID. Proposals are still not published as
+  an all-or-nothing set. Manual approval (`require_approval = true`) leaves
+  undecided proposals pending.
 - Purging or moving the session, or a change in model, prompt or policy, invalidates
   the affected progress. Turning the flag off pauses active jobs instead of
   switching them to the old path; they resume if you turn it back on and their
