@@ -757,6 +757,7 @@ mid_session = "follow-cwd"
 # digest_max_bytes = 3000
 # baseline_max_bytes = 6000
 # apply_max_lines = 40
+# max_output_tokens = 2000
 # llm = true
 
 # Admission webhooks: synchronous HTTP hooks the server calls just before it

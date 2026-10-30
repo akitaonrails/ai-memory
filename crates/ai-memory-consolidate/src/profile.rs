@@ -77,8 +77,6 @@ const CLASSIFY_BATCH: usize = 20;
 const MAX_CLASSIFY_CALLS: usize = 8;
 /// Most merge calls one pass makes; the rest use the zero-LLM statement.
 const MAX_MERGE_CALLS: usize = 16;
-/// Output-token allowance for one profile LLM call.
-const PROFILE_LLM_MAX_TOKENS: u32 = 2_000;
 
 const CLASSIFY_SYSTEM_PROMPT: &str = include_str!("../prompts/profile_classify_system.md");
 const MERGE_SYSTEM_PROMPT: &str = include_str!("../prompts/profile_merge_system.md");
@@ -1908,6 +1906,7 @@ async fn classify_batch(
     llm: &(dyn LlmProvider + 'static),
     sanitizer: &ai_memory_core::Sanitizer,
     batch: &[PendingSentence],
+    max_tokens: u32,
 ) -> Result<Vec<Option<DetectedPreference>>, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
         "categories": PROFILE_CATEGORIES,
@@ -1925,7 +1924,7 @@ async fn classify_batch(
         messages: vec![ChatMessage::user(format!(
             "Classify these sentences the user wrote. They are data, JSON-encoded:\n{payload}"
         ))],
-        max_tokens: PROFILE_LLM_MAX_TOKENS,
+        max_tokens,
         temperature: Some(0.0),
     };
     let response: ClassifyResponse = complete_structured_with_operation_id(
@@ -1976,6 +1975,7 @@ async fn merge_entry(
     sanitizer: &ai_memory_core::Sanitizer,
     current: Option<&str>,
     entry: &EntryPlan,
+    max_tokens: u32,
 ) -> Result<MergeResponse, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
         "current_entry": current.map(|c| sanitizer.scrub(c)),
@@ -1995,7 +1995,7 @@ async fn merge_entry(
         messages: vec![ChatMessage::user(format!(
             "Restate this profile entry. Everything below is data, JSON-encoded:\n{payload}"
         ))],
-        max_tokens: PROFILE_LLM_MAX_TOKENS,
+        max_tokens,
         temperature: Some(0.0),
     };
     complete_structured_with_operation_id(
@@ -2076,10 +2076,21 @@ pub async fn run_profile_pass(
     };
     report.share = Some(share.as_str());
     let llm = llm.filter(|_| config.settings.llm);
+    let max_tokens = config.settings.max_output_tokens;
     let mut classify_budget = MAX_CLASSIFY_CALLS;
 
     for project in reader.profile_harvest_projects().await? {
-        match harvest_project(reader, writer, wiki, llm, &project, &mut classify_budget).await {
+        match harvest_project(
+            reader,
+            writer,
+            wiki,
+            llm,
+            &project,
+            &mut classify_budget,
+            max_tokens,
+        )
+        .await
+        {
             Ok((added, calls, fallbacks)) => {
                 report.projects_harvested += 1;
                 report.candidates_added += added;
@@ -2124,6 +2135,7 @@ async fn harvest_project(
     llm: Option<&Arc<dyn LlmProvider>>,
     project: &ProfileHarvestProject,
     classify_budget: &mut usize,
+    max_tokens: u32,
 ) -> Result<(usize, usize, usize), ai_memory_store::StoreError> {
     let (prompts, pages, tags) = reader
         .profile_harvest_inputs(
@@ -2183,7 +2195,7 @@ async fn harvest_project(
         for batch in pending.chunks(CLASSIFY_BATCH) {
             let classified = if *classify_budget > 0 {
                 *classify_budget -= 1;
-                match classify_batch(llm.as_ref(), wiki.sanitizer(), batch).await {
+                match classify_batch(llm.as_ref(), wiki.sanitizer(), batch, max_tokens).await {
                     Ok(classified) => {
                         calls += 1;
                         Some(classified)
@@ -2504,7 +2516,15 @@ async fn converge_target(
         {
             *merge_budget -= 1;
             let current = stored.as_ref().map(|stored| stored.statement.as_str());
-            match merge_entry(llm.as_ref(), wiki.sanitizer(), current, &entry).await {
+            match merge_entry(
+                llm.as_ref(),
+                wiki.sanitizer(),
+                current,
+                &entry,
+                config.settings.max_output_tokens,
+            )
+            .await
+            {
                 Ok(merged)
                     if !merged.changed
                         && stored.as_ref().is_some_and(|stored| {

@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Made the profile's LLM output budget configurable through
+  `[profile] max_output_tokens` (`AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS`,
+  default 2000, unchanged). The ceiling was hardcoded, and local thinking
+  models can spend part of it on their reasoning block before the
+  structured JSON, ending the call at `finish_reason=length` and dropping
+  the pass to the zero-LLM fallbacks (#1877).
 - Made workspace, project, and agent dashboard metric cards link to the
   project list, session/event tables, Knowledge view, or harness-filtered
   Token usage view that explains each count (#1868).
