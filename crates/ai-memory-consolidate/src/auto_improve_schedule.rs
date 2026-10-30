@@ -25,6 +25,7 @@ use ai_memory_wiki::Wiki;
 use anyhow::Result;
 use tracing::info;
 
+use crate::processing::{AutoImproveStageRequest, ProcessingError, ProcessingService};
 use crate::{
     AutoImproveError, AutoImproveReport, AutoImproveReviewConfig, redacted_auto_improve_summary,
     run_auto_improve_review,
@@ -141,6 +142,8 @@ struct ScheduledAutoImproveContext<'a> {
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     settings: &'a ScheduledAutoImproveSettings,
+    /// The durable engine; `Some` but disabled only guards against paused jobs.
+    processing: Option<&'a ProcessingService>,
 }
 
 /// One scheduler tick: claim newly completed sessions in every scope
@@ -156,6 +159,27 @@ pub async fn run_auto_improve_scheduler_tick(
     wiki: &Wiki,
     llm: &Arc<dyn LlmProvider>,
     settings: &ScheduledAutoImproveSettings,
+) -> Result<ScheduledAutoImproveTickOutcome> {
+    run_auto_improve_scheduler_tick_with_processing(reader, writer, wiki, llm, settings, None).await
+}
+
+/// [`run_auto_improve_scheduler_tick`] with the durable chunked engine.
+///
+/// An enabled `processing` runs each claimed session as a durable job (the
+/// scheduler's auto-approve identity decides approval exactly as before). A
+/// disabled one never runs jobs, but a session with a paused or unfinished
+/// job is left unclaimed and unreviewed so the legacy path cannot publish
+/// beside it.
+///
+/// # Errors
+/// Fails only when the scope list itself cannot be read.
+pub async fn run_auto_improve_scheduler_tick_with_processing(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: &Wiki,
+    llm: &Arc<dyn LlmProvider>,
+    settings: &ScheduledAutoImproveSettings,
+    processing: Option<&ProcessingService>,
 ) -> Result<ScheduledAutoImproveTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledAutoImproveTickOutcome {
@@ -207,6 +231,7 @@ pub async fn run_auto_improve_scheduler_tick(
             workspace_id: scope.workspace_id,
             project_id: scope.project_id,
             settings,
+            processing,
         };
 
         // Cross-session ("experience") pass — cadence-gated per scope,
@@ -290,6 +315,24 @@ pub async fn run_auto_improve_scheduler_tick(
 
         outcome.scopes_with_candidates += 1;
         for candidate in candidates {
+            if let Some(service) = processing.filter(|s| !s.enabled()) {
+                // Fail closed: a store error also skips, before any claim,
+                // provider call, run row or failure counter.
+                if service
+                    .reject_paused(
+                        ctx.workspace_id,
+                        ctx.project_id,
+                        candidate.session_id,
+                        ai_memory_core::ProcessingJobKind::AutoImprove,
+                        None,
+                    )
+                    .await
+                    .is_err()
+                {
+                    outcome.skipped += 1;
+                    continue;
+                }
+            }
             let claimed = match ctx
                 .writer
                 .claim_auto_improve_scheduler_session(
@@ -434,6 +477,9 @@ fn redacted_scheduler_error_summary(error: &anyhow::Error) -> String {
         if let Some(review_error) = cause.downcast_ref::<AutoImproveError>() {
             return redacted_auto_improve_summary(review_error);
         }
+        if let Some(processing_error) = cause.downcast_ref::<ProcessingError>() {
+            return processing_error.redacted_summary();
+        }
         if let Some(llm_error) = cause.downcast_ref::<ai_memory_llm::LlmError>() {
             return format!(
                 "auto-improve failed: class={} status={}",
@@ -453,6 +499,38 @@ async fn run_scheduled_auto_improve(
     session_id: SessionId,
 ) -> Result<ScheduledAutoImproveOutcome> {
     let cfg = ctx.settings.review.clone();
+    if let Some(service) = ctx.processing.filter(|s| s.enabled()) {
+        let staged = service
+            .auto_improve_staged(AutoImproveStageRequest {
+                workspace_id: ctx.workspace_id,
+                project_id: ctx.project_id,
+                session_id,
+                cfg,
+                actor: ActorContext {
+                    agent: Some(AUTO_IMPROVE_AUTO_APPROVE_AGENT.to_string()),
+                    ..ActorContext::default()
+                },
+                author_id: None,
+                owner: None,
+                admission_ctx: None,
+            })
+            .await?;
+        let count = |status: &str| {
+            staged
+                .proposals
+                .iter()
+                .filter(|p| p.status == status)
+                .count()
+        };
+        return Ok(ScheduledAutoImproveOutcome {
+            run_id: staged.run_id,
+            proposals: staged.proposals.len(),
+            approved: count("approved"),
+            pending: count("pending"),
+            conflicts: count("conflict"),
+            skipped: staged.skipped,
+        });
+    }
     let report = run_auto_improve_review(
         ctx.reader,
         &**ctx.llm,
@@ -1653,6 +1731,7 @@ mod tests {
             workspace_id: ws,
             project_id: proj,
             settings: &settings,
+            processing: None,
         };
 
         let run = run_scheduled_auto_improve(&ctx, session_id).await.unwrap();
@@ -1683,5 +1762,103 @@ mod tests {
             "the tick must carry the dropped proposal, not just the count"
         );
         assert_eq!(tick.skipped_proposals[0].target_path, COLLIDING_PATH);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_engine_leaves_a_paused_sessions_unclaimed_and_unreviewed() {
+        use ai_memory_core::ProcessingJobKind;
+        use ai_memory_core::chunking::ChunkingSettings;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+        let paused = seed_reviewable_session(&store, ws, proj).await;
+        let free = seed_reviewable_session(&store, ws, proj).await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let service = |enabled: bool| {
+            ProcessingService::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Some(llm.clone()),
+                ws,
+                proj,
+                ChunkingSettings {
+                    enabled,
+                    ..ChunkingSettings::default()
+                },
+            )
+        };
+        let on = service(true);
+        on.start(crate::processing::ProcessingJobStart {
+            workspace_id: ws,
+            project_id: proj,
+            session_id: paused,
+            kind: ProcessingJobKind::AutoImprove,
+            actor: ActorContext::default(),
+            author_id: None,
+            owner: None,
+            viewer: None,
+            instructions: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.writer.pause_processing_jobs().await.unwrap(), 1);
+
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig {
+                min_observations: 3,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            },
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 10,
+            experience: None,
+        };
+        let off = service(false);
+        // The unrelated session is reviewed by the legacy path, which would
+        // call the panicking provider: give the tick a provider that answers.
+        let answering: Arc<dyn LlmProvider> = Arc::new(OneProposalLlm);
+        let tick = run_auto_improve_scheduler_tick_with_processing(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &answering,
+            &settings,
+            Some(&off),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tick.errors, 0);
+        assert_eq!(tick.parked, 0);
+        assert_eq!(
+            tick.reviewed, 1,
+            "only the session without a job is reviewed"
+        );
+        let still: Vec<_> = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.session_id)
+            .collect();
+        assert_eq!(
+            still,
+            vec![paused],
+            "the paused session stays unclaimed so it is retried once the job ends"
+        );
+        assert_ne!(paused, free);
     }
 }

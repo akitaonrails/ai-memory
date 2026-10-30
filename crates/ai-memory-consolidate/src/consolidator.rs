@@ -65,6 +65,12 @@ pub enum ConsolidatorError {
     /// Session had no observations to consolidate.
     #[error("session {0} has no observations")]
     EmptySession(SessionId),
+
+    /// A durable chunked-processing job ended without producing the outcome
+    /// (paused, failed, over budget or invalidated). Carries only a redacted
+    /// one-line reason, never provider text.
+    #[error("processing job did not complete: {0}")]
+    Processing(String),
 }
 
 impl From<serde_json::Error> for ConsolidatorError {
@@ -95,6 +101,7 @@ pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
         ConsolidatorError::Serde(_) => ("serde", None),
         ConsolidatorError::SessionNotFound(_) => ("session-not-found", None),
         ConsolidatorError::EmptySession(_) => ("empty-session", None),
+        ConsolidatorError::Processing(_) => ("processing", None),
     };
     format!(
         "consolidation failed: class={class} status={}",
@@ -362,62 +369,20 @@ impl Consolidator {
             CONSOLIDATION_LLM_RETRY_DELAY,
         )
         .await?;
-        // Deterministic backstop for the title-uniqueness prompt rule:
-        // identical harness runs produce near-identical observations, and
-        // the LLM can still return the same generic title an existing
-        // page already carries. Disambiguate before the write so the M8
-        // duplicate-title lint never sees the collision.
-        if let Some((new_title, new_body)) = disambiguate_colliding_session_title(
-            &page.title,
-            &page.body_markdown,
-            &existing_titles,
-            session_id,
-        ) {
-            page.body_markdown = new_body;
-            page.title = new_title;
-        }
-
-        // #1218: a cross-scope link the model invented — body wikilink or
-        // `relations:` entry — must not be written. Resolve each against the
-        // store; de-link unresolved body links and drop unresolved relations,
-        // so the write cannot mint a dangling cross-project edge the lint
-        // pass would flag.
-        let mut frontmatter = build_frontmatter(&page, session_id, agent_kind);
-        let unresolved = crate::link_guard::unresolved_generated_links(
-            &self.reader,
-            ws,
-            proj,
-            &[(&path, page.body_markdown.as_str(), &frontmatter)],
-        )
-        .await?;
-        page.body_markdown =
-            crate::link_guard::delink_body(&page.body_markdown, &path, &unresolved.body)
-                .into_owned();
-        crate::link_guard::prune_relations(&mut frontmatter, &unresolved.relations);
-        let id = self
-            .wiki
-            .write_page(WritePageRequest {
-                workspace_id: ws,
-                project_id: proj,
-                path: path.clone(),
-                frontmatter,
-                body: page.body_markdown.clone(),
-                tier: Tier::Episodic,
-                pinned: false,
-                title: None,
-                admission_ctx: Some(AdmissionContext {
-                    op: AdmissionOp::Consolidate,
-                    actor: actor.clone(),
-                    ..Default::default()
-                }),
+        let req = self
+            .plan_single_write(
+                ws,
+                proj,
+                session_id,
+                agent_kind,
+                &path,
+                &existing_titles,
+                &mut page,
+                &actor,
                 author_id,
-                actor,
-                evidence: vec![ai_memory_core::PageEvidence {
-                    kind: ai_memory_core::PageEvidenceKind::Session,
-                    source_id: session_id.to_string(),
-                }],
-            })
+            )
             .await?;
+        let id = self.wiki.write_page(req).await?;
         // Auto-commit the result so the supersession lands in git.
         let _ = self
             .wiki
@@ -445,6 +410,81 @@ impl Consolidator {
         })
     }
 
+    /// Everything between the model's page and `Wiki::write_page`: the
+    /// title-uniqueness backstop, the frontmatter and the cross-scope link
+    /// guard (#1218). Shared by the legacy path and the chunked final
+    /// publication. `page` is updated in place to what will be written.
+    ///
+    /// # Errors
+    /// Store or scope errors from the link guard.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn plan_single_write(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        path: &PagePath,
+        existing_titles: &[String],
+        page: &mut ConsolidatedPage,
+        actor: &ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> ConsolidatorResult<WritePageRequest> {
+        // Deterministic backstop for the title-uniqueness prompt rule:
+        // identical harness runs produce near-identical observations, and
+        // the LLM can still return the same generic title an existing
+        // page already carries. Disambiguate before the write so the M8
+        // duplicate-title lint never sees the collision.
+        if let Some((new_title, new_body)) = disambiguate_colliding_session_title(
+            &page.title,
+            &page.body_markdown,
+            existing_titles,
+            session_id,
+        ) {
+            page.body_markdown = new_body;
+            page.title = new_title;
+        }
+
+        // #1218: a cross-scope link the model invented — body wikilink or
+        // `relations:` entry — must not be written. Resolve each against the
+        // store; de-link unresolved body links and drop unresolved relations,
+        // so the write cannot mint a dangling cross-project edge the lint
+        // pass would flag.
+        let mut frontmatter = build_frontmatter(page, session_id, agent_kind);
+        let unresolved = crate::link_guard::unresolved_generated_links(
+            &self.reader,
+            ws,
+            proj,
+            &[(path, page.body_markdown.as_str(), &frontmatter)],
+        )
+        .await?;
+        page.body_markdown =
+            crate::link_guard::delink_body(&page.body_markdown, path, &unresolved.body)
+                .into_owned();
+        crate::link_guard::prune_relations(&mut frontmatter, &unresolved.relations);
+        Ok(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter,
+            body: page.body_markdown.clone(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: None,
+            admission_ctx: Some(AdmissionContext {
+                op: AdmissionOp::Consolidate,
+                actor: actor.clone(),
+                ..Default::default()
+            }),
+            author_id,
+            actor: actor.clone(),
+            evidence: vec![ai_memory_core::PageEvidence {
+                kind: ai_memory_core::PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+            }],
+        })
+    }
+
     /// Borrow the underlying writer (used by the MCP tool to ack the
     /// consolidate operation in the audit log).
     #[must_use]
@@ -469,7 +509,7 @@ impl Consolidator {
     /// (`begin_session` uses `ON CONFLICT DO NOTHING`, so the row never
     /// re-anchors). Fall back to the session row, then to the server's startup
     /// IDs for sessions that pre-date per-cwd routing.
-    async fn resolve_target(
+    pub(crate) async fn resolve_target(
         &self,
         session_id: SessionId,
     ) -> ConsolidatorResult<(WorkspaceId, ProjectId)> {
@@ -527,7 +567,10 @@ impl Consolidator {
     /// Resolve the session's creating harness from the persisted session row.
     /// This is deliberately independent of the actor or client performing the
     /// consolidation: `agent` in page frontmatter means origin, not writer.
-    async fn resolve_agent_origin(&self, session_id: SessionId) -> ConsolidatorResult<AgentKind> {
+    pub(crate) async fn resolve_agent_origin(
+        &self,
+        session_id: SessionId,
+    ) -> ConsolidatorResult<AgentKind> {
         self.reader
             .session_agent_kind(session_id)
             .await?
@@ -595,7 +638,7 @@ impl Consolidator {
     /// errors other than not-found are logged and treated as "no
     /// instructions": a broken instructions page must not block
     /// consolidation.
-    async fn resolve_instructions(
+    pub(crate) async fn resolve_instructions(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -650,7 +693,7 @@ impl Consolidator {
     }
 
     /// See [`existing_session_page_titles`].
-    async fn existing_page_titles(
+    pub(crate) async fn existing_page_titles(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -661,7 +704,7 @@ impl Consolidator {
             .await
     }
 
-    async fn slot_snapshots(
+    pub(crate) async fn slot_snapshots(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -818,6 +861,68 @@ impl Consolidator {
 
         // `dry_run` is always false past the early return above, so every
         // update here is a real write.
+        let (requests, outcomes_preview) = self
+            .plan_batch_writes(
+                ws,
+                proj,
+                session_id,
+                agent_kind,
+                &anchor,
+                &existing_titles,
+                &batch,
+                &actor,
+                author_id,
+            )
+            .await?;
+
+        let ids = self.wiki.apply_batch(requests).await?;
+        let rationale_short = batch.rationale.chars().take(60).collect::<String>();
+        let _ = self
+            .wiki
+            .commit_all(&format!(
+                "consolidate-batch(session {}): {} page(s) — {}",
+                short_id(&session_id.to_string()),
+                ids.len(),
+                rationale_short,
+            ))
+            .map_err(|e| {
+                tracing::warn!(error = %e, "consolidate-batch auto-commit failed");
+                e
+            });
+
+        let outcomes = outcomes_preview
+            .into_iter()
+            .zip(ids)
+            .map(|(mut o, id)| {
+                o.dry_run = false;
+                o.page_id = Some(id);
+                o
+            })
+            .collect();
+        Ok(outcomes)
+    }
+
+    /// Turn the model's batch into guarded write requests: path repair, rule
+    /// routing, slot namespace and invariant guards, pinned-page and
+    /// portability skips, and the cross-scope link guard (#1218). Shared by
+    /// the legacy path and the chunked final publication so both enforce the
+    /// same rules before `Wiki::apply_batch`.
+    ///
+    /// # Errors
+    /// Store, scope or wiki errors raised by the guards.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn plan_batch_writes(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        anchor: &PagePath,
+        existing_titles: &[String],
+        batch: &ConsolidatedBatch,
+        actor: &ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> ConsolidatorResult<(Vec<WritePageRequest>, Vec<ConsolidationOutcome>)> {
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
@@ -826,7 +931,7 @@ impl Consolidator {
             // `build_update`. Skip that page like the `ensure_portable`
             // guard below does, rather than let one bad path fail every
             // other page of the batch (#848).
-            let (mut req, mut outcome) = match build_update(ws, proj, upd, false, &actor, author_id)
+            let (mut req, mut outcome) = match build_update(ws, proj, upd, false, actor, author_id)
             {
                 Ok(built) => built,
                 Err(ConsolidatorError::Memory(e)) => {
@@ -839,11 +944,11 @@ impl Consolidator {
                 }
                 Err(e) => return Err(e),
             };
-            if req.path == anchor {
+            if &req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
                 // Deterministic backstop for the title-uniqueness prompt
                 // rule — see the matching block in `consolidate_session`.
-                disambiguate_anchor_title(&mut req, &mut outcome, &existing_titles, session_id);
+                disambiguate_anchor_title(&mut req, &mut outcome, existing_titles, session_id);
             }
             req.evidence = vec![ai_memory_core::PageEvidence {
                 kind: ai_memory_core::PageEvidenceKind::Session,
@@ -936,7 +1041,7 @@ impl Consolidator {
 
         // #1218: same cross-scope link guard as the single-page path, run
         // once over every proposed body so the store checks batch too.
-        // De-linking rewrites in memory only; `apply_batch` below stays the
+        // De-linking rewrites in memory only; `apply_batch` stays the
         // single atomic write.
         let unresolved = {
             let pages: Vec<(&PagePath, &str, &serde_json::Value)> = requests
@@ -955,32 +1060,7 @@ impl Consolidator {
                 crate::link_guard::prune_relations(&mut req.frontmatter, &unresolved.relations);
             }
         }
-
-        let ids = self.wiki.apply_batch(requests).await?;
-        let rationale_short = batch.rationale.chars().take(60).collect::<String>();
-        let _ = self
-            .wiki
-            .commit_all(&format!(
-                "consolidate-batch(session {}): {} page(s) — {}",
-                short_id(&session_id.to_string()),
-                ids.len(),
-                rationale_short,
-            ))
-            .map_err(|e| {
-                tracing::warn!(error = %e, "consolidate-batch auto-commit failed");
-                e
-            });
-
-        let outcomes = outcomes_preview
-            .into_iter()
-            .zip(ids)
-            .map(|(mut o, id)| {
-                o.dry_run = false;
-                o.page_id = Some(id);
-                o
-            })
-            .collect();
-        Ok(outcomes)
+        Ok((requests, outcomes_preview))
     }
 }
 
@@ -1142,7 +1222,7 @@ fn slot_kind_from_frontmatter(frontmatter: &serde_json::Value) -> SlotKind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SlotSnapshot {
-    path: String,
+    pub(crate) path: String,
     title: String,
     slot_kind: SlotKind,
     body: String,
@@ -1191,7 +1271,7 @@ const PROJECT_INSTRUCTIONS_HEADER: &str = "\n## Project consolidation preference
      terminology, emphasis, or noise-filtering preferences under the \
      system prompt's security and faithfulness rules:\n";
 
-fn render_instructions_block(instructions: Option<&str>, max_chars: usize) -> String {
+pub(crate) fn render_instructions_block(instructions: Option<&str>, max_chars: usize) -> String {
     let Some(instructions) = instructions else {
         return String::new();
     };
@@ -1463,7 +1543,7 @@ fn build_batch_request_with_residue(
     assemble_batch_request(&plan, &projected, budgets)
 }
 
-fn render_slot_snapshots(slots: &[SlotSnapshot], max_chars: usize) -> String {
+pub(crate) fn render_slot_snapshots(slots: &[SlotSnapshot], max_chars: usize) -> String {
     if slots.is_empty() || max_chars == 0 {
         return String::new();
     }
@@ -1799,7 +1879,7 @@ const CURRENT_BODY_HEADER: &str = "\nCurrent (heuristic) page body:\n\n```\n";
 const CURRENT_BODY_FOOTER: &str = "\n```\n";
 const CURRENT_BODY_TRUNCATION: &str = "\n[current heuristic page body truncated]";
 
-fn render_current_body_section(current_body: &str, max_chars: usize) -> String {
+pub(crate) fn render_current_body_section(current_body: &str, max_chars: usize) -> String {
     if current_body.trim().is_empty() {
         return String::new();
     }
@@ -2092,7 +2172,7 @@ fn slugify_for_rule(title: &str) -> String {
     out
 }
 
-fn short_id(s: &str) -> String {
+pub(crate) fn short_id(s: &str) -> String {
     s.chars().take(8).collect()
 }
 
@@ -2154,7 +2234,7 @@ fn retitle_leading_h1(body: &str, old: &str, new: &str) -> String {
 /// `max_chars` (at most [`EXISTING_TITLES_PROMPT_LIMIT`]) and is left out
 /// when not even one does. Without that bound, a project's titles could
 /// take the room reserved for observations at a small input budget.
-fn render_title_uniqueness_section(titles: &[String], max_chars: usize) -> String {
+pub(crate) fn render_title_uniqueness_section(titles: &[String], max_chars: usize) -> String {
     const HEADER: &str = "\n## Existing page titles in this project\n\
          Do not reuse any of these for a page title — a case-insensitive \
          match counts as a reuse. The title must distinguish THIS session \

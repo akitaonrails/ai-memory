@@ -149,7 +149,8 @@ impl Default for AutoImproveEvalConfig {
 }
 
 /// Configuration for one auto-improvement review.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AutoImproveReviewConfig {
     /// Minimum observations before a session is worth reviewing.
     pub min_observations: usize,
@@ -440,7 +441,7 @@ fn default_edit_mode() -> String {
 /// Same narrow policy as [`normalize_operation`]: the system prompt says
 /// "Full-page proposals", and models answer `"full"`. Unknown values are left
 /// untouched so they still fail validation.
-fn normalize_edit_mode(raw: &str) -> String {
+pub(crate) fn normalize_edit_mode(raw: &str) -> String {
     let squashed: String = raw
         .trim()
         .to_ascii_lowercase()
@@ -833,7 +834,7 @@ struct AutoImproveEvalResponse {
     reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum EvalStatus {
     Success,
@@ -842,7 +843,7 @@ enum EvalStatus {
     Timeout,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AutoImproveEvalResult {
     eval_id: uuid::Uuid,
     target_path: String,
@@ -915,7 +916,7 @@ pub(crate) async fn apply_eval_gate(
     )
 }
 
-async fn apply_eval_gate_with_before_bodies(
+pub(crate) async fn apply_eval_gate_with_before_bodies(
     eval: &AutoImproveEvalConfig,
     proposals: &mut Vec<AutoImproveProposal>,
     rejected: &mut Vec<AutoImproveRejectedCandidate>,
@@ -1041,7 +1042,7 @@ async fn apply_eval_gate_with_before_bodies(
     results
 }
 
-fn eval_targets_path(eval: &AutoImproveEvalConfig, path: &str) -> bool {
+pub(crate) fn eval_targets_path(eval: &AutoImproveEvalConfig, path: &str) -> bool {
     eval.targets.iter().any(|target| {
         let target = target.trim().trim_end_matches('/');
         !target.is_empty() && (path == target || path.starts_with(&format!("{target}/")))
@@ -1371,8 +1372,21 @@ pub(crate) struct PatchablePageContext {
     title: String,
     kind: String,
     body: String,
-    body_sha256: String,
+    pub(crate) body_sha256: String,
     sections: Vec<MarkdownSection>,
+}
+
+impl PatchablePageContext {
+    pub(crate) fn new(path: String, title: String, kind: String, body: String) -> Self {
+        Self {
+            sections: parse_markdown_sections(&body),
+            body_sha256: sha256_hex(body.as_bytes()),
+            path,
+            title,
+            kind,
+            body,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1415,6 +1429,11 @@ impl ExistingPageIndex {
     fn patchable(&self, path: &str) -> Option<&PatchablePageContext> {
         self.patchable.get(path)
     }
+
+    /// The exact body a patch to `path` was materialized against.
+    pub(crate) fn patchable_body(&self, path: &str) -> Option<&str> {
+        self.patchable.get(path).map(|page| page.body.as_str())
+    }
 }
 
 fn normalize_title(title: &str) -> String {
@@ -1454,15 +1473,12 @@ pub(crate) async fn load_patchable_pages(
             .page_body_by_ids(workspace_id, project_id, &page.path)
             .await?
         {
-            let sections = parse_markdown_sections(&body.body);
-            out.push(PatchablePageContext {
-                path: page.path.clone(),
-                title: page.title.clone(),
-                kind: page.kind.clone(),
-                body_sha256: sha256_hex(body.body.as_bytes()),
-                body: body.body,
-                sections,
-            });
+            out.push(PatchablePageContext::new(
+                page.path.clone(),
+                page.title.clone(),
+                page.kind.clone(),
+                body.body,
+            ));
         }
     }
     Ok(out)
@@ -1934,7 +1950,7 @@ fn truncate_to_budget(input: &str, max_bytes: usize, marker: &str) -> String {
     out
 }
 
-fn preflight_rejection(
+pub(crate) fn preflight_rejection(
     total: usize,
     duration_secs: u64,
     cfg: &AutoImproveReviewConfig,
@@ -2435,7 +2451,7 @@ fn kind_matches_path(kind: &str, path: &str) -> bool {
 /// Session duration in whole seconds from the snapshot's aggregate
 /// `created_at` span: same arithmetic as the materialised load used to give,
 /// no rows read.
-fn session_duration_from_span(first: Option<i64>, last: Option<i64>) -> u64 {
+pub(crate) fn session_duration_from_span(first: Option<i64>, last: Option<i64>) -> u64 {
     let (Some(first), Some(last)) = (first, last) else {
         return 0;
     };

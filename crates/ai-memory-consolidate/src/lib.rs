@@ -25,6 +25,7 @@ pub mod keep_tokens;
 mod link_guard;
 pub mod lint;
 mod path_sanitize;
+pub mod processing;
 pub mod profile;
 pub mod projection;
 mod prompt_template;
@@ -49,6 +50,7 @@ pub use auto_improve::{
 pub use auto_improve_schedule::{
     ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome,
     initialize_auto_improve_scheduler_scopes, run_auto_improve_scheduler_tick,
+    run_auto_improve_scheduler_tick_with_processing,
 };
 pub use auto_improve_telemetry::{
     AutoImproveTelemetryFinding, AutoImproveTelemetryParams, AutoImproveTelemetryReport,
@@ -89,6 +91,10 @@ pub use keep_tokens::{mine_keep_tokens, mine_residue_tokens};
 pub use lint::{
     DEFAULT_CONTRADICTION_SIM_HIGH, DEFAULT_CONTRADICTION_SIM_LOW, LintError, LintFinding,
     LintOptions, LintReport, run_lint, stale_days_for,
+};
+pub use processing::{
+    AutoImproveStageRequest, ProcessingError, ProcessingJobAccess, ProcessingJobStart,
+    ProcessingService,
 };
 pub use sweep::{
     ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
