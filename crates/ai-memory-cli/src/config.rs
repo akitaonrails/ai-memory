@@ -2519,6 +2519,9 @@ impl Config {
         config.runtime_env = runtime_env;
 
         validate_run_profiles(&config.run)?;
+        if config.profile.max_output_tokens == 0 {
+            anyhow::bail!("profile.max_output_tokens must be at least 1");
+        }
         drop_blank_sanitize_allowlist_entries(&mut config.sanitize);
 
         // The idle auto-end tick turns `idle_end_after_hours` into a
@@ -4011,6 +4014,8 @@ mod tests {
     fn profile_max_output_tokens_is_configurable() {
         let cfg = load_with_toml("[profile]\nmax_output_tokens = 4000\n").unwrap();
         assert_eq!(cfg.profile.max_output_tokens, 4_000);
+        let error = load_with_toml("[profile]\nmax_output_tokens = 0\n").unwrap_err();
+        assert!(error.to_string().contains("must be at least 1"), "{error}");
     }
 
     /// #1506: an example table in the shipped config must not capture the
