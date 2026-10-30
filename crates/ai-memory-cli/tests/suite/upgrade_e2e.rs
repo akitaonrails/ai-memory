@@ -65,18 +65,22 @@ mod slow {
     }
 
     fn build_release_archive() -> Vec<u8> {
+        build_release_archive_with_binary(NEW_BINARY)
+    }
+
+    fn build_release_archive_with_binary(binary: &[u8]) -> Vec<u8> {
         if cfg!(windows) {
-            build_release_zip()
+            build_release_zip(binary)
         } else {
-            build_release_tarball()
+            build_release_tarball(binary)
         }
     }
 
-    fn build_release_tarball() -> Vec<u8> {
+    fn build_release_tarball(binary: &[u8]) -> Vec<u8> {
         let mut tar_bytes = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_bytes);
-            append_regular(&mut builder, "ai-memory", NEW_BINARY, 0o755);
+            append_regular(&mut builder, "ai-memory", binary, 0o755);
             append_regular(&mut builder, "hooks/claude-code/new.sh", NEW_HOOK, 0o755);
             // Match release.yml Unix layout (exact support paths) so hermetic
             // upgrade still exercises the #1025 support-file allowlist.
@@ -110,14 +114,14 @@ mod slow {
         gz_bytes
     }
 
-    fn build_release_zip() -> Vec<u8> {
+    fn build_release_zip(binary: &[u8]) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());
         {
             let mut zip = ZipWriter::new(&mut cursor);
             let options =
                 SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             zip.start_file("ai-memory.exe", options).expect("start exe");
-            zip.write_all(NEW_BINARY).expect("write exe");
+            zip.write_all(binary).expect("write exe");
             zip.add_directory("hooks/", options).expect("hooks dir");
             zip.start_file("hooks/claude-code/new.sh", options)
                 .expect("start hook");
@@ -303,7 +307,8 @@ mod slow {
     #[tokio::test]
     async fn native_upgrade_refreshes_hooks_without_a_deleted_path_or_losing_cli_data_dir() {
         let asset = host_asset_name().to_string();
-        let archive = Arc::new(build_release_archive());
+        let replacement = fs::read(BIN).expect("read replacement binary");
+        let archive = Arc::new(build_release_archive_with_binary(&replacement));
         let hash = format!("{:x}", Sha256::digest(archive.as_ref()));
         let fixture = ReleaseFixture {
             checksum_body: format!("{hash}  {asset}\n"),
@@ -486,7 +491,8 @@ mod slow {
         }
 
         let asset = host_asset_name().to_string();
-        let archive = Arc::new(build_release_archive());
+        let replacement = fs::read(BIN).expect("read replacement binary");
+        let archive = Arc::new(build_release_archive_with_binary(&replacement));
         let hash = format!("{:x}", Sha256::digest(archive.as_ref()));
         let fixture = ReleaseFixture {
             checksum_body: format!("{hash}  {asset}\n"),
