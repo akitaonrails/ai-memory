@@ -104,6 +104,10 @@ pub(crate) struct UsageQuery {
     pub calls_turn: String,
     #[serde(default)]
     pub calls_tool: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub sort: String,
 }
 
 // Flattened query values arrive as strings even for numeric fields.
@@ -200,6 +204,20 @@ impl UsageQuery {
             turn_id: (!self.calls_turn.is_empty()).then(|| self.calls_turn.clone()),
             tool: (!self.calls_tool.is_empty()).then(|| self.calls_tool.clone()),
         })
+    }
+
+    pub fn session_view(&self) -> Result<(bool, bool), axum::http::StatusCode> {
+        let open_only = match self.state.as_str() {
+            "" | "all" => false,
+            "open" => true,
+            _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+        };
+        let sort_events = match self.sort.as_str() {
+            "" | "recent" => false,
+            "events" => true,
+            _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+        };
+        Ok((open_only, sort_events))
     }
 
     fn page_href(&self, base: &str, offset: usize) -> String {

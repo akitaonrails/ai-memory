@@ -23,9 +23,9 @@
 <section id="project-capture-summary" aria-label="Project capture summary" class="section-block">
   <div class="metric-grid project-memory-grid">
     <a class="metric-card metric-link" href="{{ project_href }}?tab=sessions#session-token-table"><span>Sessions</span><strong>{{ stats.session_count }}</strong><small>Registered activity</small></a>
-    <a class="metric-card metric-link" href="{{ project_href }}?tab=sessions#session-token-table"><span>Captured events</span><strong>{{ stats.observation_count }}</strong><small>Events by session</small></a>
+    <a class="metric-card metric-link" href="{{ project_href }}?tab=sessions&sort=events#session-token-table"><span>Captured events</span><strong>{{ stats.observation_count }}</strong><small>Busiest sessions first</small></a>
     <a class="metric-card metric-link" href="{{ project_href }}?tab=knowledge#project-panel-knowledge"><span>Compiled pages</span><strong>{{ stats.page_count }}</strong><small>Knowledge for recall</small></a>
-    <a class="metric-card metric-link metric-attention" href="{{ project_href }}?tab=agents#agents"><span>Open sessions</span><strong>{{ stats.open_session_count }}</strong><small>Open counts by agent</small></a>
+    <a class="metric-card metric-link metric-attention" href="{{ project_href }}?tab=sessions&state=open#session-token-table"><span>Open sessions</span><strong>{{ stats.open_session_count }}</strong><small>Only unfinished sessions</small></a>
     <a class="metric-card metric-link" href="{{ project_href }}?tab=tokens#token-usage"><span>Tokens (in / out)</span><strong style="font-size:23px">{{ stats.tokens_total }}</strong><small>Reported session totals</small></a>
   </div>
   <p class="mt-4 text-xs text-slate-500 dark:text-slate-400">

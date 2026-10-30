@@ -77,6 +77,7 @@ async fn render(
     query: crate::operations::UsageQuery,
 ) -> Result<Html<String>, StatusCode> {
     let calls_query = query.store_query()?;
+    let session_view = query.session_view()?;
     let (pages, (mailbox, mailbox_total), sessions) = tokio::try_join!(
         async {
             state
@@ -86,7 +87,14 @@ async fn render(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         },
         mailbox(state, &workspace, &project, viewer, authorized),
-        sessions(state, &workspace, &project, authorized, owner.clone()),
+        sessions(
+            state,
+            &workspace,
+            &project,
+            authorized,
+            owner.clone(),
+            session_view
+        ),
     )?;
 
     // The page tree alone is a poor explanation for projects where hooks are
@@ -406,17 +414,20 @@ async fn sessions(
     project: &str,
     authorized: Option<ResolvedScope>,
     owner: ai_memory_core::OwnerFilter,
+    session_view: (bool, bool),
 ) -> Result<Vec<SessionRow>, StatusCode> {
     let Some(scope) = mailbox_scope(state, workspace, project, authorized).await? else {
         return Ok(Vec::new());
     };
+    let (open_only, sort_events) = session_view;
     let sessions = state
         .reader
-        .sessions_for_scope(
+        .sessions_for_scope_view(
             scope.workspace_id,
             scope.project_id,
             owner,
-            true,
+            open_only,
+            sort_events,
             SESSION_LIMIT,
             0,
         )
