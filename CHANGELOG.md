@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added opt-in, durable chunked consolidation and auto-improvement, with
+  asynchronous job start/status, bounded provider admission, and resumable
+  checkpoints. `[chunking].enabled` defaults to `false`, preserving the
+  existing processing path; the new mode processes all stored observation
+  bodies instead of dropping the excess from long sessions (#126).
+
 - Made the profile's LLM output budget configurable through
   `[profile] max_output_tokens` (`AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS`,
   default 2000, unchanged). The ceiling was hardcoded, and local thinking

@@ -1771,7 +1771,9 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
         let ws = store
             .writer
             .get_or_create_workspace("default")

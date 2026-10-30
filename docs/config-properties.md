@@ -307,6 +307,16 @@ Defined by `SanitizeConfig` in `ai-memory-core`. Built-in redaction patterns alw
 | `session_ttl_secs` | `3600` (`DEFAULT_PER_KEY_TTL`) | `AI_MEMORY_AUTO_SCOPE__SESSION_TTL_SECS` | Lifetime of a per-key entry in the `per_session` and `per_actor` modes. 0 uses the default. |
 | `max_entries` | `4096` (`DEFAULT_MAX_ENTRIES`) | `AI_MEMORY_AUTO_SCOPE__MAX_ENTRIES` | Cap on the per-key map, evicting the oldest insertions first. |
 
+## `[chunking]`
+
+Defined by `ChunkingSettings` in `ai-memory-core`. Opt-in chunked session processing, described in [design-session-chunking.md](design-session-chunking.md). With the table absent or `enabled = false`, the legacy consolidation and auto-improve paths run unchanged and the other keys are not validated. Settings load at startup, so a change needs a server restart.
+
+| Key | Default | Env equivalent | Purpose |
+| --- | --- | --- | --- |
+| `enabled` | `false` | `AI_MEMORY_CHUNKING__ENABLED` | Turn on chunked session processing. Never implied by session size, timeouts or provider errors. |
+| `max_input_tokens` | `8192` | `AI_MEMORY_CHUNKING__MAX_INPUT_TOKENS` | Approximate token budget of one chunked call, instructions and schema included. Independent of `[consolidation]` and `[auto_improve]` budgets. With `enabled = true`, config load rejects a value below `2048`. |
+| `max_calls_per_run` | `128` | `AI_MEMORY_CHUNKING__MAX_CALLS_PER_RUN` | Cap on provider call attempts (map, reduce and retries) in one logical run. With `enabled = true`, config load rejects `0`. |
+
 ## `[auth]`
 
 Keys that `ai-memory init` writes or generates are marked in the Purpose column. Prefer the environment variables for secrets.

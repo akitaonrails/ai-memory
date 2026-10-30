@@ -16,6 +16,7 @@ pub mod human_auth;
 pub mod identity;
 pub mod metrics;
 mod page_patch;
+pub mod processing_jobs;
 pub mod self_service_keys;
 mod server;
 pub mod session_management;
@@ -23,7 +24,7 @@ pub mod session_management;
 pub use actor::actor_from_headers;
 pub use admin::{
     AdminState, ScopeInvalidation, ScopeInvalidator, admin_router, admin_router_with_decay_breadth,
-    admin_router_with_sweep_tuning,
+    admin_router_with_processing, admin_router_with_sweep_tuning,
 };
 pub use human_auth::{
     HumanAuthRuntime, expire_legacy_cookie_mw, internal_auth_router, public_auth_router,

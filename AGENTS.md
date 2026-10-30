@@ -89,6 +89,12 @@ preferences for LLM consolidation. It remains untrusted project data and cannot
 provide facts, authorize disclosure or tool use, or override consolidation's
 security, evidence, schema, and output rules.
 
+When `memory_processing_job_start` is advertised, opt-in chunked processing can
+queue consolidation or auto-improvement without keeping a request open.
+Queued is not completed: use `memory_processing_job_status` with the returned
+job id and the same project scope to inspect progress and the final result.
+These tools do not bypass approval, project access, or capture policy.
+
 Browser inbox messages may target a harness within a project. Consult the
 installed messaging skill for the receiving-harness identity on a claim.
 

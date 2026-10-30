@@ -466,6 +466,7 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | `ai-memory auto-improve --session-id <id>` | Manually review one session and apply or stage validated proposals through the auto-improvement approval path. |
 | `ai-memory auto-improve-report --workspace <w> --project <p> [--days N] [--limit N] [--stage]` | Read-only telemetry report for recent auto-improvement runs, proposal outcomes, terminal rates, and findings by default. `--stage` creates exactly one pending telemetry report page for audit/approval. |
 | `memory_auto_improve` | Manually review the newest completed session with no persisted auto-improvement run, or explicitly rerun a named session, and apply or stage validated proposals through the same path. An empty run records a preflight skip so the next implicit call advances. |
+| `ai-memory processing-jobs start --kind auto_improve --session-id <id> --workspace <w> --project <p>` | Opt-in (`[chunking] enabled = true`): start a durable chunked review of one whole session and return a job id. Poll it with `ai-memory processing-jobs status --job-id <id> --workspace <w> --project <p>`. Both accept `--json`. |
 | `ai-memory curator` | Rule-based, report-only maintenance review. |
 | `ai-memory curator --stage` | Stage exactly one curator report page for pending-writes approval. |
 | `ai-memory pending-writes list` | Show staged wiki changes. |
@@ -493,6 +494,48 @@ combined prompt-routing surface. Existing installed `CLAUDE.md`/`AGENTS.md`
 snippets update idempotently when the operator runs
 `ai-memory install-instructions` or asks an agent to refresh the ai-memory
 routing package.
+
+### Optional chunked review
+
+By default the reviewer sees a bounded selection of a session and reports
+`input_budget_sampled` when it dropped observations. With `[chunking] enabled =
+true` (default `false`), the scheduler, `ai-memory auto-improve` and the
+CLI/admin/MCP manual calls review the whole stored text of the session through a
+durable job instead: several smaller extraction calls, a combination step by
+target page, and one set of final proposals. The guarantee is coverage of the
+stored observations, not that the model keeps every fact; text excluded or
+truncated before storage stays out. A chunk does not create an
+`auto_improve_runs` row.
+
+- `max_proposals_per_run`, the edit budget and the eval gate apply once to the
+  final proposal set, not per chunk; two chunks that suggest the same page do not
+  produce duplicate proposals, and eval runs once per final proposal.
+- Disjoint patches for the same target are merged before the run-wide caps and
+  eval. Incompatible edits are recorded as rejected candidates.
+- External eval commands have a durable start marker and result. A restart
+  reuses a recorded result. If the server stopped after starting the command
+  but before recording its result, the job fails explicitly rather than
+  executing an uncertain command again or staging an unevaluated proposal.
+- `max_input_tokens` (default 8192) is an approximate budget for one call and
+  includes the prompt envelope. `max_calls_per_run` (default 128) caps provider
+  call attempts for the whole job, retries included, and is persisted: restarting
+  does not reset it. Reaching it stops the job without partial success.
+- Total LLM calls and cost go up. Chunking is not a speed guarantee.
+- The publication identity is stored before any effect. If the server stops
+  after staging commits but before the progress checkpoint, resuming reconciles
+  against the staged proposal ids and states rather than staging or approving
+  again. Proposals are still not published as an all-or-nothing set. Manual
+  approval (`require_approval = true`) behaves as before.
+- Purging or moving the session, or a change in model, prompt or policy, invalidates
+  the affected progress. Turning the flag off pauses active jobs instead of
+  switching them to the old path; they resume if you turn it back on and their
+  inputs are still compatible. Status of an existing job stays readable through
+  `GET /admin/processing-jobs/{job_id}`, `ai-memory processing-jobs status` and
+  `memory_processing_job_status` while the flag is off; starting a new one does not.
+
+Flag off leaves every path above exactly as it was. The `experience` pass is not
+chunked. See [`design-session-chunking.md`](design-session-chunking.md) and the
+[usage guide](usage.md#process-long-sessions-in-chunks-opt-in).
 
 ### Upgrade note for existing installs
 

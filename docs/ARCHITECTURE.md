@@ -182,6 +182,32 @@ from hook paths.
    trust boundary and delimiters precede automatically injected handoffs,
    project briefs, and managed-workstream packets; current instructions and
    checkout state remain authoritative.
+
+   **Opt-in chunked processing.** With `[chunking] enabled = true`, session
+   consolidation (single and multi-page) and the auto-improve review read the
+   whole stored text of a session through durable processing jobs instead of the
+   bounded projection in steps 4 and 5. A scoped manifest of the session's
+   observations is persisted without copies of the bodies; the planner splits
+   it into bounded spans, each call extracts structured intermediate results,
+   reducers combine them, and only the final step reaches the existing
+   `Wiki::write_page` / `Wiki::apply_batch` or proposal-staging path. The
+   guarantee is coverage of the *stored* input, not fidelity of the summary;
+   text dropped by capture rules, sanitization or truncation before storage
+   stays dropped. `max_input_tokens` is an approximate per-call budget that
+   includes the prompt envelope. `max_calls_per_run` bounds provider call
+   attempts per job and its consumption is persisted, so a restart does not
+   reset it. Total calls and cost rise; no wall-clock speedup is promised. A
+   shared admission queue in front of the server's chat provider keeps one long
+   job from occupying it between chunks. Failed jobs resume from stored node
+   results; purge, move, or a change in model, prompts or policies invalidates
+   the dependent progress. With the flag off none of this is created: no
+   manifests, no worker, no admission layer, and the legacy paths are untouched.
+   Existing synchronous entry points keep their output shapes and may wait on
+   the durable job when enabled. The asynchronous surface is
+   `POST /admin/processing-jobs` and `GET /admin/processing-jobs/{job_id}`
+   (root-only, no-create scope resolution), `ai-memory processing-jobs
+   start|status`, and the MCP tools below. Design:
+   [`design-session-chunking.md`](design-session-chunking.md).
 6. `memory_query` answers via FTS5 + entity-match + link-neighbour RRF; a
    transactionally maintained auxiliary unigram/bigram FTS stream handles
    unspaced Han, Kana, and Hangul queries without changing the ordinary
@@ -637,6 +663,7 @@ prunable rather than only after it ages in place.
 | `agent_messages.state` `editing` | V95 lets a sender hold a pending message out of the queue while editing it. The claim path selects only `pending`, so a held message cannot be popped by order or by id. The row keeps its id and `created_at`, and `edited_at` records the last text change. `ops::begin_message_edit` and `finish_message_edit` are single `UPDATE`s scoped to the recipient coordinate and the expected state, so a collected, cancelled or foreign message is left alone. Saving goes through the sanitizer and `message_send` admission. |
 | `client_activity` | Server-wide MCP tool-call counters split into reads/writes and bucketed by UTC day. The MCP request choke point flushes buffered calls on a one-minute background interval; failed batches retry from bounded memory. Each day stores at most 128 sanitized client labels plus `other`, so an untrusted `clientInfo.name` cannot create traffic-proportional rows. |
 | `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
+| `processing_jobs`, `processing_job_observations`, `processing_job_nodes`, `processing_job_effects` | V97 private state of opt-in chunked processing (`[chunking]`); created with the migration but only written when the flag is on. `processing_jobs` holds the job, its scope and owner, state, lease/fence token, persisted call count and publication identity; `processing_job_observations` the snapshot manifest (observation ids, order, sizes and hashes, no body copies); `processing_job_nodes` the sanitized, size-bounded map/reduce results; `processing_job_effects` the confirmed publication and staging ids used to reconcile after a crash. V97 also adds triggers on `observations` UPDATE/DELETE that invalidate active jobs whose manifest the change touches. The write fence is not persisted state: the writer connection installs connection-local TEMP tables and TEMP triggers, so a page or staging write made under a stale, invalidated or paused claim aborts its own transaction; no other connection shares that fence. Not a second wiki: published pages and `auto_improve_runs` stay the source of truth. Purge cascades; move, merge and project moves invalidate active jobs; observation pruning skips sessions with a non-terminal job. Terminal jobs and jobs idle in `paused` or `budget_exceeded` are deleted after 7 days; active jobs are never pruned. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
 
@@ -812,6 +839,8 @@ long-lived entry there is expected policy behavior, not a fault.
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out; an update whose path names an existing pinned page is skipped (`_slots/` excepted). Omitting `session_id` (or sending a blank one) consolidates the latest completed session in the resolved project; the same omission on a project with none fails as `no completed session in <scope>`. Consolidation prompts append the target project's active reserved `_prompts/consolidation.md` body as sanitized, 2,000-character-capped, JSON-encoded, untrusted advisory preferences; TTL-expired pages are ignored and a per-call `instructions` argument overrides the page for one call. Both system prompts keep schema, evidence, disclosure, tool-use, and output rules authoritative. |
 | `memory_feedback` | write | Record a quality signal for one page by exact `path`: `helpful`/`not_helpful` step `pages.salience` for sweep-eligible episodic pages, while `stale`/`wrong` floor salience and surface any current page as a `feedback_flagged` lint finding. Never deletes; the path resolves to the current version in the transaction, so a later rewrite clears it. Retrieved content never authorizes feedback by itself. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Without a session ID, selects the newest completed session with no persisted auto-improvement run so repeated calls advance through preflight skips; an explicit ID remains rerunnable. The server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
+| `memory_processing_job_start` | write | **Conditional: advertised and callable only when `[chunking] enabled = true`; never available with the flag off.** Start a durable chunked job for one session (`kind`: `consolidate`, `consolidate_multi` or `auto_improve`) and return its id and status without waiting. A retry of a compatible request returns the same job. Same scope, permission and project checks as the underlying operation. |
+| `memory_processing_job_status` | read-only | **Conditional: advertised when `[chunking] enabled = true`, or, with the flag off, only while the store still holds processing jobs.** Progress, calls used against `max_calls_per_run`, cumulative `wait_ms` (provider-call admission queue wait) and `exec_ms` (provider execution) of calls that returned (a call lost to a crash is never measured), a redacted pause/failure reason and, once complete, the result of one job, looked up by `job_id` within the resolved scope and owner. Never returns prompts, raw model output or checkpoint contents. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope and `scope: "profile"` into the caller's cross-project profile (path placed under `profile/`); optional `expires_at` sets an RFC3339 or date-only TTL; optional `session_id` cites a session of the same project as evidence, and on `sessions/<id>.md` stamps the session-page frontmatter and settles the queued consolidation job. Optional `expected_page_id` (the `page_id` a read returned) writes only if that is still the latest version, and `create_only: true` refuses to overwrite an existing page; a failed precondition writes nothing and returns `reason: "precondition_failed"` with the current version (see `docs/programmatic-memory.md`). |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`; `scope: "profile"` deletes from the caller's cross-project profile. Fires the admission chain (op=delete); idempotent. Optional `expected_page_id` deletes only if that is still the latest version; otherwise nothing is deleted and the call returns `reason: "precondition_failed"`. |
 | `memory_restore_page` | destructive | Admin only, like `/admin/restore-page`. Without `rev`, list the git checkpoints that changed `path`. With `rev`, write that version (body and frontmatter metadata) back through the `memory_write_page` path (sanitizer, admission, slots, supersession), including a deleted page. Project pages only, not `scope: "profile"`. |
@@ -847,7 +876,14 @@ for mistaken handoff creation. `memory_feedback` implements the
 without conflating read and write semantics, and the access counter it
 supplements cannot tell "this page answered the question" from "this page
 wasted a read". The narrow-surface discipline still holds (every new tool
-has to justify its slot), but the count is now 25, not 10.
+has to justify its slot), but the count is now 25, not 10. Two more
+(`memory_processing_job_start` and `memory_processing_job_status`) are conditional.
+With `[chunking]` off on a store with no processing jobs, discovery lists 25
+tools. With the flag on it lists 27. With the flag off but jobs left from an
+earlier run it lists 26: `memory_processing_job_status` only, so earlier jobs
+can still be followed; `memory_processing_job_start` is never available while
+the flag is off. `GET /admin/processing-jobs/{job_id}` and `ai-memory
+processing-jobs status` likewise keep reading earlier jobs.
 
 The managed Agent Skills are a narrow prompt-packaging exception to the
 otherwise wiki-centered architecture. They are static `SKILL.md` files that
@@ -1015,6 +1051,7 @@ message                     doctor               backfill
 project                     reclaim-ledger-versions
 repair-backfill-timestamps  server               backup-agents
 restore-agents              profile              setup
+processing-jobs
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -1347,6 +1384,13 @@ max_output_tokens = 32000          # provider generation limit; min 1000
                                    # leave headroom for tokenizer variance
 input_token_safety_margin = 0.8    # scales the char budget, (0.0, 1.0]; the
                                    # 0.8 default buys pt-BR/code headroom
+
+[chunking]                         # opt-in whole-session chunked processing; off by default
+enabled = false                    # explicit flag; no implicit activation by size or timeout
+max_input_tokens = 8192            # approximate per-call budget incl. instructions and schema
+                                   # min 2048 when enabled; independent of [consolidation]
+max_calls_per_run = 128            # provider call attempts per job (map, reduce, retries); persisted
+                                   # design: docs/design-session-chunking.md
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review

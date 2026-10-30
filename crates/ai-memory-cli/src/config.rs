@@ -629,6 +629,11 @@ pub struct Config {
     /// Both approve validated proposals by default unless `require_approval` is
     /// set. The SessionEnd trigger stays off by default.
     pub auto_improve: AutoImproveSettings,
+    /// `[chunking]` — opt-in chunked session processing
+    /// (`docs/design-session-chunking.md`). Off by default; the legacy
+    /// `[consolidation]` and `[auto_improve]` budgets are unaffected. Env:
+    /// `AI_MEMORY_CHUNKING__<KEY>`.
+    pub chunking: ai_memory_core::chunking::ChunkingSettings,
     /// Session-start handoff delivery (design: #959). Default keeps today's
     /// automatic-claim behavior unchanged.
     pub handoff: HandoffSettings,
@@ -1461,6 +1466,7 @@ impl Default for Config {
             consolidation: ConsolidationSettings::default(),
             query_answer: QueryAnswerSettings::default(),
             auto_improve: AutoImproveSettings::default(),
+            chunking: ai_memory_core::chunking::ChunkingSettings::default(),
             handoff: HandoffSettings::default(),
             profile: ai_memory_core::profile::ProfileSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
@@ -2711,6 +2717,11 @@ impl Config {
                  (got {}); below that a structured consolidation response is unlikely to fit",
                 config.consolidation.max_output_tokens
             );
+        }
+        // Only an activated `[chunking]` table is validated, so a stale budget
+        // cannot break an install that never opted in.
+        if let Err(message) = config.chunking.validate() {
+            anyhow::bail!("{message}");
         }
         // Zero (or a sub-second remainder rounded down) would cut every
         // provider request off before it is sent.
@@ -5335,6 +5346,62 @@ max_input_tokens = {tokens}
             let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
                 .expect("a budget that clears the requirement must load");
             assert_eq!(cfg.consolidation.max_input_tokens, tokens);
+        }
+    }
+
+    /// Chunking is opt-in: an absent or `false` table loads the off defaults,
+    /// and a disabled table is not validated.
+    #[test]
+    fn load_leaves_chunking_off_when_absent_or_false() {
+        for toml in [
+            "",
+            "[chunking]\nenabled = false\n",
+            "[chunking]\nenabled = false\nmax_input_tokens = 0\nmax_calls_per_run = 0\n",
+        ] {
+            let cfg = load_with_toml(toml).expect("a disabled chunking table must load");
+            assert!(!cfg.chunking.enabled, "{toml:?}");
+        }
+        let cfg = load_with_toml("").unwrap();
+        assert_eq!(cfg.chunking.max_input_tokens, 8192);
+        assert_eq!(cfg.chunking.max_calls_per_run, 128);
+    }
+
+    /// Turning chunking on honours its own budgets and leaves the legacy
+    /// `[consolidation]` and `[auto_improve]` defaults untouched.
+    #[test]
+    fn load_accepts_enabled_chunking_without_changing_legacy_budgets() {
+        let legacy = load_with_toml("").unwrap();
+        let cfg = load_with_toml(
+            "[chunking]\nenabled = true\nmax_input_tokens = 4096\nmax_calls_per_run = 16\n",
+        )
+        .expect("a valid activated chunking table must load");
+        assert!(cfg.chunking.enabled);
+        assert_eq!(cfg.chunking.max_input_tokens, 4096);
+        assert_eq!(cfg.chunking.max_calls_per_run, 16);
+        assert_eq!(
+            cfg.consolidation.max_input_tokens,
+            legacy.consolidation.max_input_tokens
+        );
+        assert_eq!(
+            cfg.consolidation.max_output_tokens,
+            legacy.consolidation.max_output_tokens
+        );
+        assert_eq!(
+            cfg.auto_improve.max_input_tokens,
+            legacy.auto_improve.max_input_tokens
+        );
+    }
+
+    #[test]
+    fn load_rejects_invalid_activated_chunking() {
+        for (body, key) in [
+            ("max_input_tokens = 2047", "chunking.max_input_tokens"),
+            ("max_input_tokens = 0", "chunking.max_input_tokens"),
+            ("max_calls_per_run = 0", "chunking.max_calls_per_run"),
+        ] {
+            let error = load_with_toml(&format!("[chunking]\nenabled = true\n{body}\n"))
+                .expect_err("an invalid activated chunking table must fail closed");
+            assert!(error.to_string().contains(key), "{body}: {error:#}");
         }
     }
 

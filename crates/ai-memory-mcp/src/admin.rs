@@ -47,6 +47,8 @@
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
 //! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
 //! - `POST /admin/delete-page`    — delete a single wiki page by path.
+//! - `POST /admin/processing-jobs` — start a durable chunked processing job (`[chunking]` on only).
+//! - `GET  /admin/processing-jobs/{job_id}` — job status and result; works for old jobs while off.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -89,7 +91,7 @@ use ai_memory_wiki::{
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -623,6 +625,8 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/merge-workspace`
 /// - `POST /admin/write-page`
 /// - `POST /admin/delete-page`
+/// - `POST /admin/processing-jobs`
+/// - `GET  /admin/processing-jobs/{job_id}`
 /// - user-management routes under `/admin/users*`
 pub fn admin_router(state: AdminState) -> Router {
     admin_router_with_decay_breadth(state, 0.0)
@@ -649,6 +653,32 @@ pub fn admin_router_with_sweep_tuning(
     retention: ObservationRetention,
     ledger_retention: LedgerRetention,
     compact_cold_episodic: bool,
+) -> Router {
+    admin_router_with_processing(
+        state,
+        breadth_weight,
+        retention,
+        ledger_retention,
+        compact_cold_episodic,
+        None,
+    )
+}
+
+/// Like [`admin_router_with_sweep_tuning`], plus the durable processing-job
+/// service behind `POST /admin/processing-jobs` and
+/// `GET /admin/processing-jobs/{job_id}`.
+///
+/// `None` (or a service whose `[chunking]` flag is off) refuses to start jobs
+/// with an explicit 404. Reading a job stays possible whenever a service is
+/// supplied, so jobs created before the flag was turned off remain
+/// observable.
+pub fn admin_router_with_processing(
+    state: AdminState,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+    ledger_retention: LedgerRetention,
+    compact_cold_episodic: bool,
+    processing: Option<ai_memory_consolidate::ProcessingService>,
 ) -> Router {
     let state = Arc::new(state);
     let operational = Router::new()
@@ -726,7 +756,12 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/rename-workspace", post(handle_rename_workspace))
         .route("/admin/merge-workspace", post(handle_merge_workspace))
         .route("/admin/write-page", post(handle_write_page))
-        .route("/admin/delete-page", post(handle_delete_page));
+        .route("/admin/delete-page", post(handle_delete_page))
+        .route("/admin/processing-jobs", post(handle_processing_job_start))
+        .route(
+            "/admin/processing-jobs/{job_id}",
+            get(handle_processing_job_status),
+        );
     let users = Router::new()
         .route("/admin/users", get(handle_list_users))
         .route("/admin/human-users", post(handle_create_human_user))
@@ -770,6 +805,7 @@ pub fn admin_router_with_sweep_tuning(
             ledger_retention,
             compact_cold_episodic,
         }))
+        .layer(axum::Extension(ProcessingHandle(processing)))
 }
 
 async fn require_root_for_multiuser_admin(
@@ -2681,11 +2717,196 @@ fn dry_run_outcome(
 }
 
 // ---------------------------------------------------------------------
+// durable processing jobs (chunked session processing)
+// ---------------------------------------------------------------------
+
+/// The processing service handed to [`admin_router_with_processing`], as a
+/// request extension. `None` means the deployment has no service at all.
+#[derive(Clone)]
+struct ProcessingHandle(Option<ai_memory_consolidate::ProcessingService>);
+
+/// JSON request body for `POST /admin/processing-jobs`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessingJobStartRequest {
+    /// Workspace name (must already exist).
+    workspace: String,
+    /// Project name (must already exist).
+    project: String,
+    /// Session to process; must belong to the named project.
+    session_id: String,
+    /// `consolidate`, `consolidate_multi` or `auto_improve`.
+    kind: String,
+}
+
+/// Query of `GET /admin/processing-jobs/{job_id}`.
+#[derive(Deserialize)]
+struct ProcessingJobStatusQuery {
+    workspace: String,
+    project: String,
+}
+
+fn processing_error_response(
+    error: &ai_memory_consolidate::ProcessingError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::processing_jobs::{ProcessingFailure, classify};
+    let (kind, message) = classify(error);
+    let status = match kind {
+        ProcessingFailure::NotFound => StatusCode::NOT_FOUND,
+        ProcessingFailure::Invalid => StatusCode::UNPROCESSABLE_ENTITY,
+        ProcessingFailure::Conflict => StatusCode::CONFLICT,
+        ProcessingFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ProcessingFailure::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    log_server_error(status, "processing-jobs", &message);
+    (status, Json(serde_json::json!({ "error": message })))
+}
+
+/// `POST /admin/processing-jobs`: start (or join the compatible existing)
+/// durable job. Returns 202 with the job status immediately; the worker
+/// publishes. Refused with an explicit 404 while `[chunking]` is off, even
+/// though this route stays mounted for reading old jobs.
+async fn handle_processing_job_start(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(ProcessingHandle(processing)): axum::Extension<ProcessingHandle>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<ProcessingJobStartRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let Some(service) = processing.filter(ai_memory_consolidate::ProcessingService::enabled) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": crate::processing_jobs::DISABLED_MESSAGE })),
+        ));
+    };
+    let kind = req
+        .kind
+        .parse::<ai_memory_core::ProcessingJobKind>()
+        .map_err(|_| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "kind must be one of consolidate, consolidate_multi, auto_improve"
+                })),
+            )
+        })?;
+    let session_id = req.session_id.parse::<SessionId>().map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid session_id: {e}") })),
+        )
+    })?;
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let in_scope = crate::processing_jobs::session_in_scope(&state.reader, session_id, ws, proj)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    if !in_scope {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": crate::processing_jobs::session_not_found_message()
+            })),
+        ));
+    }
+    // Same staging bucket `/admin/auto-improve` computes, so manual, async and
+    // scheduled auto-improve for one operator agree on the V42 owner.
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let owner = ai_memory_core::owner_identity(
+        actor.identity_key().as_ref(),
+        state
+            .reader
+            .distinguishes_operators(state.trusted_proxy_identity)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?,
+    );
+    let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+    let status = service
+        .start(ai_memory_consolidate::ProcessingJobStart {
+            workspace_id: ws,
+            project_id: proj,
+            session_id,
+            kind,
+            actor,
+            author_id,
+            owner,
+            viewer: author_id,
+            instructions: None,
+        })
+        .await
+        .map_err(|e| processing_error_response(&e))?;
+    Ok((StatusCode::ACCEPTED, Json(status)))
+}
+
+/// `GET /admin/processing-jobs/{job_id}?workspace=&project=`: job status and,
+/// once completed, its result. Works while `[chunking]` is off so jobs created
+/// earlier stay observable. A job id from another project, or one that does
+/// not exist, is the same 404.
+async fn handle_processing_job_status(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(ProcessingHandle(processing)): axum::Extension<ProcessingHandle>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    Path(job_id): Path<String>,
+    Query(query): Query<ProcessingJobStatusQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": crate::processing_jobs::job_not_found_message()
+            })),
+        )
+    };
+    let Some(service) = processing else {
+        return Err(not_found());
+    };
+    let job_id = job_id
+        .parse::<ai_memory_core::ProcessingJobId>()
+        .map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": format!("invalid job id: {e}") })),
+            )
+        })?;
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await?;
+    // Whether this caller may read every owner's jobs is derived from the
+    // authenticated level against the live operator topology, never from
+    // anything in the request. The route gate already demands admin; this
+    // recomputes the same predicate so the owner filter cannot drift from it.
+    let distinguishes = state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let level = level_ext
+        .map(|axum::Extension(level)| level)
+        .unwrap_or(ai_memory_core::AuthLevel::Anonymous);
+    let any_owner = level.authorize(Capability::Admin, distinguishes).is_ok();
+    let status = service
+        .status(
+            ws,
+            proj,
+            job_id,
+            ai_memory_consolidate::ProcessingJobAccess {
+                owner: None,
+                viewer: None,
+                any_owner,
+            },
+        )
+        .await
+        .map_err(|e| processing_error_response(&e))?
+        .ok_or_else(not_found)?;
+    Ok((StatusCode::OK, Json(status)))
+}
+
+// ---------------------------------------------------------------------
 // auto-improve reviewer/stager
 // ---------------------------------------------------------------------
 
 async fn handle_auto_improve(
     State(state): State<Arc<AdminState>>,
+    axum::Extension(ProcessingHandle(processing)): axum::Extension<ProcessingHandle>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
@@ -2749,6 +2970,92 @@ async fn handle_auto_improve(
         eval: state.auto_improve_review_config.eval.clone(),
     };
 
+    // With `[chunking]` on, review + staging + approval run as one durable
+    // job and render the response this route has always returned.
+    if let Some(service) = processing.filter(ai_memory_consolidate::ProcessingService::enabled) {
+        let actor = actor_ext
+            .map(|axum::Extension(actor)| actor)
+            .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+        let owner = ai_memory_core::owner_identity(
+            actor.identity_key().as_ref(),
+            state
+                .reader
+                .distinguishes_operators(state.trusted_proxy_identity)
+                .await
+                .map_err(|e| internal_err(e.to_string()))?,
+        );
+        let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+        let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
+        let staged = service
+            .auto_improve_staged(ai_memory_consolidate::AutoImproveStageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: req.session_id,
+                cfg,
+                actor,
+                author_id,
+                owner,
+                admission_ctx: Some(AdmissionContext {
+                    op: AdmissionOp::WritePage,
+                    skip_webhooks,
+                    ..AdmissionContext::default()
+                }),
+            })
+            .await
+            .map_err(|e| processing_error_response(&e))?;
+        return Ok((
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(AutoImproveStageResponse {
+                    run_id: staged.run_id.to_string(),
+                    approval_required: staged.approval_required,
+                    approval_policy: if staged.approval_required {
+                        "manual".into()
+                    } else {
+                        "auto_approve".into()
+                    },
+                    session_id: req.session_id.to_string(),
+                    summary: staged.summary,
+                    warnings: staged.warnings,
+                    rejected_candidates_count: staged.rejected_candidates_count,
+                    proposals: staged
+                        .proposals
+                        .into_iter()
+                        .map(|p| AutoImproveProposalOutcome {
+                            id: p.id.to_string(),
+                            sidecar_path: p.sidecar_path,
+                            status: p.status,
+                            page_id: p.page_id,
+                        })
+                        .collect(),
+                    skipped: staged.skipped,
+                })
+                .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+        ));
+    }
+    // `[chunking]` off: the legacy reviewer must not shadow an unfinished
+    // (paused) durable review of this session; nothing has run yet here.
+    let guard_actor = actor_ext
+        .as_ref()
+        .map(|axum::Extension(actor)| actor.clone())
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    if crate::processing_jobs::has_equivalent_unfinished_job(
+        &state.reader,
+        ws,
+        proj,
+        req.session_id,
+        ai_memory_core::ProcessingJobKind::AutoImprove,
+        &crate::processing_jobs::candidate_owners(&guard_actor),
+    )
+    .await
+    .map_err(|e| internal_err(e.to_string()))?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": crate::processing_jobs::PAUSED_JOB_MESSAGE })),
+        ));
+    }
     let report =
         run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg.clone())
             .await
@@ -12815,6 +13122,459 @@ mod tests {
         assert_eq!(skipped[0]["target_path"], "notes/new-auto-improve.md");
     }
 
+    /// Two projects, each with one session holding one observation; the
+    /// router mounts the processing routes over a provider-less service.
+    struct ProcessingFixture {
+        _tmp: TempDir,
+        router: Router,
+        scratch_session: SessionId,
+        other_session: SessionId,
+    }
+
+    async fn processing_fixture(enabled: bool, with_service: bool) -> ProcessingFixture {
+        processing_fixture_with_provider(enabled, with_service, false).await
+    }
+
+    async fn processing_fixture_with_provider(
+        enabled: bool,
+        with_service: bool,
+        with_provider: bool,
+    ) -> ProcessingFixture {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let mut sessions = Vec::new();
+        for name in ["scratch", "other"] {
+            let proj = store
+                .writer
+                .get_or_create_project(ws, name, None)
+                .await
+                .unwrap();
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::Other,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: "prompt".into(),
+                        body: "a durable lesson".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+            sessions.push((proj, session_id));
+        }
+        let service = with_service.then(|| {
+            ai_memory_consolidate::ProcessingService::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                with_provider.then(|| Arc::new(FakeAutoImproveLlm) as Arc<dyn LlmProvider>),
+                ws,
+                sessions[0].0,
+                ai_memory_core::chunking::ChunkingSettings {
+                    enabled,
+                    ..Default::default()
+                },
+            )
+        });
+        let router = admin_router_with_processing(
+            admin_state_for_store(&tmp, &store, wiki),
+            0.0,
+            ObservationRetention::default(),
+            LedgerRetention::default(),
+            false,
+            service,
+        );
+        ProcessingFixture {
+            _tmp: tmp,
+            router,
+            scratch_session: sessions[0].1,
+            other_session: sessions[1].1,
+        }
+    }
+
+    async fn processing_call(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(if body.is_null() {
+                        Body::empty()
+                    } else {
+                        Body::from(serde_json::to_vec(&body).unwrap())
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn start_body(project: &str, session: SessionId, kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "workspace": "default",
+            "project": project,
+            "session_id": session.to_string(),
+            "kind": kind,
+        })
+    }
+
+    #[tokio::test]
+    async fn processing_job_start_is_refused_when_chunking_is_off_or_absent() {
+        for (enabled, with_service) in [(false, true), (true, false)] {
+            let f = processing_fixture(enabled, with_service).await;
+            let (status, json) = processing_call(
+                &f.router,
+                "POST",
+                "/admin/processing-jobs",
+                start_body("scratch", f.scratch_session, "consolidate"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+            assert!(
+                json["error"].as_str().unwrap().contains("disabled"),
+                "the refusal must name the disabled feature: {json}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn processing_job_start_rejects_foreign_sessions_and_bad_input_before_the_engine() {
+        let f = processing_fixture(true, true).await;
+        // A session of another project, named under this project: same answer
+        // as an unknown session, so its existence is not revealed.
+        let (status, foreign) = processing_call(
+            &f.router,
+            "POST",
+            "/admin/processing-jobs",
+            start_body("scratch", f.other_session, "consolidate"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{foreign}");
+        let (status, unknown) = processing_call(
+            &f.router,
+            "POST",
+            "/admin/processing-jobs",
+            start_body("scratch", SessionId::new(), "consolidate"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+        assert_eq!(foreign, unknown);
+
+        let (status, _) = processing_call(
+            &f.router,
+            "POST",
+            "/admin/processing-jobs",
+            start_body("scratch", f.scratch_session, "dream"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let mut extra = start_body("scratch", f.scratch_session, "consolidate");
+        extra["max_calls"] = serde_json::json!(1_000_000);
+        let (status, _) = processing_call(&f.router, "POST", "/admin/processing-jobs", extra).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown request fields must not be silently ignored"
+        );
+        let (status, _) = processing_call(
+            &f.router,
+            "POST",
+            "/admin/processing-jobs",
+            start_body("no-such-project", f.scratch_session, "consolidate"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unknown project is never created by a start"
+        );
+    }
+
+    #[tokio::test]
+    async fn processing_job_start_in_scope_reaches_the_engine_which_needs_a_provider() {
+        // Legitimate control for the refusals above: the same request for the
+        // session's own project passes every surface guard and stops only at
+        // the engine, which has no provider here.
+        let f = processing_fixture(true, true).await;
+        let (status, json) = processing_call(
+            &f.router,
+            "POST",
+            "/admin/processing-jobs",
+            start_body("scratch", f.scratch_session, "consolidate"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert!(json["error"].as_str().unwrap().contains("provider"));
+    }
+
+    /// Flag off + a paused durable review of the session: `/admin/auto-improve`
+    /// must refuse with 409 before any provider call or staging, while a
+    /// session with no durable job keeps the legacy path.
+    #[tokio::test]
+    async fn admin_auto_improve_is_blocked_by_a_paused_durable_job_when_chunking_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::Other,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: "prompt".into(),
+                        body: "focus changed and durable lesson".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+            sessions.push(session_id);
+        }
+        store
+            .writer
+            .create_processing_job(ai_memory_store::NewProcessingJob {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: sessions[0],
+                kind: ai_memory_core::ProcessingJobKind::AutoImprove,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                author_id: None,
+                viewer: None,
+                owner: None,
+                options_json: serde_json::json!({}),
+                context_fingerprint: "test".into(),
+                max_calls: 8,
+            })
+            .await
+            .unwrap();
+        store.writer.pause_processing_jobs().await.unwrap();
+
+        let service = ai_memory_consolidate::ProcessingService::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            None,
+            ws,
+            proj,
+            ai_memory_core::chunking::ChunkingSettings::default(),
+        );
+        let router = admin_router_with_processing(
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(FakeAutoImproveLlm))),
+            0.0,
+            ObservationRetention::default(),
+            LedgerRetention::default(),
+            false,
+            Some(service),
+        );
+        let body = |session: SessionId| {
+            serde_json::json!({
+                "workspace": "default",
+                "project": "scratch",
+                "session_id": session.to_string(),
+                "min_observations": 1,
+                "min_session_duration_secs": 0,
+                "min_confidence": 0.75,
+                "max_proposals_per_run": 5
+            })
+        };
+        let (status, json) =
+            processing_call(&router, "POST", "/admin/auto-improve", body(sessions[0])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("legacy path was not run")
+        );
+        assert!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, proj, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing may be staged for the paused session"
+        );
+
+        // Legitimate control: the jobless session still runs the legacy path.
+        let (status, json) =
+            processing_call(&router, "POST", "/admin/auto-improve", body(sessions[1])).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+    }
+
+    #[tokio::test]
+    async fn processing_job_start_is_idempotent_and_its_id_is_scoped_to_its_project() {
+        let f = processing_fixture_with_provider(true, true, true).await;
+        let (status, started) = processing_call(
+            &f.router,
+            "POST",
+            "/admin/processing-jobs",
+            start_body("scratch", f.scratch_session, "consolidate"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+        assert_eq!(started["kind"], "consolidate");
+        assert_eq!(started["session_id"], f.scratch_session.to_string());
+        assert_ne!(
+            started["state"], "completed",
+            "start must not wait for the run"
+        );
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+
+        let (_, again) = processing_call(
+            &f.router,
+            "POST",
+            "/admin/processing-jobs",
+            start_body("scratch", f.scratch_session, "consolidate"),
+        )
+        .await;
+        assert_eq!(again["job_id"], job_id, "a retry joins the compatible job");
+
+        let (status, read) = processing_call(
+            &f.router,
+            "GET",
+            &format!("/admin/processing-jobs/{job_id}?workspace=default&project=scratch"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["job_id"], job_id);
+
+        // The raw job id under another project's scope reads as unknown.
+        let (status, foreign) = processing_call(
+            &f.router,
+            "GET",
+            &format!("/admin/processing-jobs/{job_id}?workspace=default&project=other"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{foreign}");
+        assert!(foreign.get("session_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn processing_job_status_is_readable_when_off_and_fails_closed_on_unknown_ids() {
+        let f = processing_fixture(false, true).await;
+        let job = "11111111-1111-1111-1111-111111111111";
+        let (status, json) = processing_call(
+            &f.router,
+            "GET",
+            &format!("/admin/processing-jobs/{job}?workspace=default&project=scratch"),
+            serde_json::Value::Null,
+        )
+        .await;
+        // Reached the lookup (not the "disabled" refusal) and found nothing.
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+        assert!(json["error"].as_str().unwrap().contains("not found"));
+        assert!(!json["error"].as_str().unwrap().contains("disabled"));
+
+        let (status, _) = processing_call(
+            &f.router,
+            "GET",
+            "/admin/processing-jobs/not-a-uuid?workspace=default&project=scratch",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, _) = processing_call(
+            &f.router,
+            "GET",
+            &format!("/admin/processing-jobs/{job}?workspace=default&project=no-such"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = processing_call(
+            &f.router,
+            "GET",
+            &format!("/admin/processing-jobs/{job}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "workspace and project are required query parameters"
+        );
+    }
+
     #[tokio::test]
     async fn auto_improve_admin_refuses_request_eval_and_inherits_server_defaults() {
         let tmp = TempDir::new().unwrap();
@@ -15127,6 +15887,21 @@ mod tests {
                     "project": "scratch",
                     "path": "notes/x.md"
                 }),
+            ),
+            (
+                "POST",
+                "/admin/processing-jobs",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "session_id": "00000000-0000-0000-0000-000000000000",
+                    "kind": "consolidate"
+                }),
+            ),
+            (
+                "GET",
+                "/admin/processing-jobs/00000000-0000-0000-0000-000000000000?workspace=default&project=scratch",
+                serde_json::Value::Null,
             ),
             ("GET", "/admin/users", serde_json::Value::Null),
             (

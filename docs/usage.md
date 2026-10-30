@@ -876,6 +876,109 @@ facts, authorize disclosure or tool use, or override schema, evidence, and
 output rules. TTL-expired preference pages are ignored. When there is no active
 page and no argument, ai-memory appends no preference block.
 
+## Process long sessions in chunks (opt-in)
+
+By default, consolidation and auto-improvement read a bounded selection of a
+session: at most a few hundred observations, each trimmed, in one provider call.
+A long session therefore reaches the model only in part. Chunked processing is
+an opt-in alternative that reads the whole stored text of a session over many
+smaller calls, combines the results, and publishes through the same wiki and
+approval path as before. It is off unless you turn it on, and nothing implies it
+from session size, timeouts or provider errors.
+
+```toml
+[chunking]
+enabled = false           # explicit opt-in; restart the server after changing it
+max_input_tokens = 8192   # approximate budget of ONE call, envelope included
+max_calls_per_run = 128   # provider call attempts for the whole job
+```
+
+Key defaults, env names and validation are in
+[`config-properties.md`](config-properties.md#chunking). It adds no new
+setup step and no new dependency; it uses the LLM provider you already
+configured.
+
+What the guarantee covers: every span of the session's *stored* observation
+text goes into at least one completed call with a valid structured response.
+That is input coverage, not a promise that the final page keeps every fact. The
+combining step is still a model summary and can drop, merge or misstate things.
+Text that capture rules excluded, or that was sanitized or truncated before it
+was stored, is not recoverable here.
+
+Limits to know before enabling it:
+
+- `max_input_tokens` is an approximate budget for one call and counts the
+  instructions, schema and delimiters, not only session text. It is an estimate,
+  not a tokenizer measurement. It is separate from `[consolidation]` and
+  `[auto_improve]` budgets, which remain per-call ceilings.
+- `max_calls_per_run` caps reserved generation attempts for one job, including
+  the final call, outer retries and extra sends inside a provider (strict-mode
+  fallback, another backend or a Codex 401 re-send). The count is durable, so a
+  restart does not reset it. Uncertain sends are not refunded. Reaching the cap
+  stops the job without reporting partial coverage as success.
+- Total calls go up, and so does cost. Smaller calls do not make a session finish
+  sooner; the point is that no single call is large, and that a job can resume
+  from stored progress. Calls are also queued through a shared server-side
+  admission queue, so a short request is not stuck behind a whole long session.
+- A failure leaves the job resumable where possible. Nothing from intermediate
+  steps is published. If the model, prompts or relevant settings change, or the
+  session is purged or moved to another project, the affected progress is
+  invalidated and not reused.
+
+Start a job without waiting on a long connection, then poll it. Both commands
+use the admin API, so they need the root token, and the project must already
+exist:
+
+```bash
+ai-memory processing-jobs start --workspace my-ws --project my-app \
+  --session-id <session-id> --kind consolidate       # or consolidate_multi, auto_improve
+ai-memory processing-jobs status --workspace my-ws --project my-app \
+  --job-id <job-id>
+```
+
+Both accept `--json`. The HTTP routes are `POST /admin/processing-jobs` and
+`GET /admin/processing-jobs/{job_id}?workspace=&project=`. Repeating a start for
+the same compatible request returns the existing job. Status shows progress,
+calls used against the budget, the total time provider calls spent queued
+(`wait_ms`) and executing (`exec_ms`, both in milliseconds, for calls that
+returned; a call lost to a crash is not measured), and a redacted reason if
+the job paused or failed. It does not show prompts or raw model output. The
+final result is included once the job has completed.
+
+The same pair is available to agents as `memory_processing_job_start` and
+`memory_processing_job_status`, with the same permission and project checks as
+`memory_consolidate` and `memory_auto_improve`. Discovery depends on the flag
+and on whether the store already holds jobs: with `enabled = true` both tools
+are advertised (27 tools in total); with the flag off on a fresh store neither
+is (25); with the flag off but jobs left from an earlier run, only
+`memory_processing_job_status` is advertised (26).
+
+Everything that exists today keeps its shape. `memory_consolidate`, the
+session-end worker and the auto-improve scheduler and CLI return the same final
+output as before. With the flag on they may run on the durable job internally and
+wait for it, so a synchronous call can still block, and a client connection
+timeout still applies. Prefer `processing-jobs` for long sessions.
+
+Turning the flag off, then restarting, stops the new worker without converting
+its jobs to the old path: active jobs pause. Starting is never available while
+the flag is off: `POST /admin/processing-jobs` fails with an explicit 404,
+`processing-jobs start` reports the disabled state, and
+`memory_processing_job_start` is neither advertised nor callable. Looking up a
+job that was already started stays available on every surface, through
+`GET /admin/processing-jobs/{job_id}`, `processing-jobs status` and
+`memory_processing_job_status`, under the same scope and ownership checks. If
+you turn the flag back on, paused jobs resume when their stored inputs are still
+compatible. A synchronous call for a session with such a paused job fails with
+an error instead of waiting.
+
+Job state is private processing data, not wiki content, and is cleaned up. Jobs
+that finished, failed or were invalidated, and jobs that have sat paused or over
+budget, are deleted with their stored progress after 7 days. Active jobs are never
+pruned, and observation pruning skips sessions with a job in a non-terminal
+state.
+
+Design and open questions: [`design-session-chunking.md`](design-session-chunking.md).
+
 ## Rules, memory and the profile
 
 The agent works from an ordered precedence; each level fills gaps in the ones

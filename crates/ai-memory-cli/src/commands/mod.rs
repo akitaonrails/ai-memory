@@ -79,6 +79,7 @@ pub mod opencode_dialect;
 pub mod path_util;
 pub mod pending_writes;
 pub(crate) mod plugin_origin;
+pub mod processing_jobs;
 pub mod profile;
 pub mod project;
 pub mod project_init;

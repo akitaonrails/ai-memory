@@ -785,6 +785,20 @@ mid_session = "follow-cwd"
 #   blocking       = true
 #   events         = ["write_page", "consolidate"]
 
+# Chunked session processing (docs/design-session-chunking.md). Off by default:
+# with the table absent or `enabled = false`, consolidation and auto-improve
+# keep their current paths and these keys are not validated. Settings load at
+# startup, so a change needs a server restart. Env: AI_MEMORY_CHUNKING__ENABLED,
+# AI_MEMORY_CHUNKING__MAX_INPUT_TOKENS, AI_MEMORY_CHUNKING__MAX_CALLS_PER_RUN.
+# When enabled: max_input_tokens (approximate budget of one chunked call,
+# independent of [consolidation].max_input_tokens) must be at least 2048, and
+# max_calls_per_run (provider call attempts per run, retries included) must be
+# above zero.
+# [chunking]
+# enabled = false
+# max_input_tokens = 8192
+# max_calls_per_run = 128
+
 # NOTE: `[auth]` must remain the LAST section in this template.
 # `ai-memory init` appends further `[auth]` keys (token_pepper, root_username,
 # ...) as bare keys to the end of the rendered file, so any section added

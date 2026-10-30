@@ -293,6 +293,9 @@ pub enum Command {
     AutoImproveReport(AutoImproveReportArgs),
     /// Run auto-improvement for one completed session.
     AutoImprove(AutoImproveArgs),
+    /// Start or inspect durable chunked session-processing jobs
+    /// (`[chunking].enabled` servers only for `start`).
+    ProcessingJobs(ProcessingJobsArgs),
     /// Manually finalize the latest open session for one agent in this project.
     FinalizeSession(FinalizeSessionArgs),
     /// Recover history a server outage missed: drain the local hook spool,
@@ -3205,6 +3208,65 @@ pub struct AutoImproveArgs {
     pub json: bool,
 }
 
+/// Arguments for `processing-jobs`.
+#[derive(Debug, Args)]
+pub struct ProcessingJobsArgs {
+    #[command(subcommand)]
+    pub command: ProcessingJobsCommand,
+}
+
+/// Subcommands for `processing-jobs`.
+#[derive(Debug, Subcommand)]
+pub enum ProcessingJobsCommand {
+    /// Start (or find the compatible existing) durable job for one session.
+    Start(ProcessingJobsStartArgs),
+    /// Show the status and, once completed, the result of one job.
+    Status(ProcessingJobsStatusArgs),
+}
+
+/// Arguments for `processing-jobs start`.
+#[derive(Debug, Args)]
+pub struct ProcessingJobsStartArgs {
+    /// Completed session UUID to process.
+    #[arg(long)]
+    pub session_id: String,
+    /// Operation to run over the whole stored session.
+    #[arg(long, value_parser = ["consolidate", "consolidate_multi", "auto_improve"])]
+    pub kind: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Emit only machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `processing-jobs status`.
+#[derive(Debug, Args)]
+pub struct ProcessingJobsStatusArgs {
+    /// Job UUID returned by `processing-jobs start`.
+    #[arg(long)]
+    pub job_id: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. When omitted, taken from the nearest
+    /// `.ai-memory.toml` marker's `project`, then from the git remote,
+    /// then from the current directory's name.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Emit only machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Debug, Args)]
 pub struct PendingWritesArgs {
     #[command(subcommand)]
@@ -4426,6 +4488,63 @@ mod tests {
         assert_eq!(args.session_id, "00000000-0000-0000-0000-000000000000");
         assert_eq!(args.max_proposals, Some(2));
         assert_eq!(args.project.as_deref(), Some("scratch"));
+    }
+
+    #[test]
+    fn processing_jobs_start_and_status_parse_and_reject_unknown_kind() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "processing-jobs",
+            "start",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--kind",
+            "consolidate_multi",
+            "--project",
+            "scratch",
+            "--json",
+        ])
+        .expect("start parses");
+        let Command::ProcessingJobs(args) = cli.command else {
+            panic!("expected processing-jobs command");
+        };
+        let ProcessingJobsCommand::Start(start) = args.command else {
+            panic!("expected start");
+        };
+        assert_eq!(start.kind, "consolidate_multi");
+        assert_eq!(start.project.as_deref(), Some("scratch"));
+        assert!(start.json);
+
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "processing-jobs",
+            "status",
+            "--job-id",
+            "11111111-1111-1111-1111-111111111111",
+        ])
+        .expect("status parses");
+        let Command::ProcessingJobs(args) = cli.command else {
+            panic!("expected processing-jobs command");
+        };
+        let ProcessingJobsCommand::Status(status) = args.command else {
+            panic!("expected status");
+        };
+        assert_eq!(status.job_id, "11111111-1111-1111-1111-111111111111");
+        assert!(!status.json);
+
+        assert!(
+            Cli::try_parse_from([
+                "ai-memory",
+                "processing-jobs",
+                "start",
+                "--session-id",
+                "x",
+                "--kind",
+                "dream",
+            ])
+            .is_err(),
+            "unknown kinds must not reach the server"
+        );
     }
 
     #[test]

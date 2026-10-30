@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
-    ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
-    run_lint,
+    ScheduledAutoImproveSettings, run_embedding_backfill, run_lint,
 };
 use ai_memory_core::{ActiveProject, IdentityKey, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -21,7 +20,7 @@ use ai_memory_llm::{
 };
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
-    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
+    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_processing,
     expire_legacy_cookie_mw, internal_auth_router, public_auth_router, require_dual_auth,
     session_auth_router,
 };
@@ -776,6 +775,12 @@ struct ConsolidatorSetup {
     server: AiMemoryServer,
     consolidator: Option<Arc<Consolidator>>,
     admin_llm: Option<Arc<dyn LlmProvider>>,
+    /// Durable chunked-processing service, always built. It only runs, starts
+    /// jobs and registers tools when `[chunking].enabled`; disabled it can only
+    /// read (and pause) jobs an earlier enabled run left behind. Provider-less
+    /// servers still get one so those jobs stay readable and a start fails
+    /// explicitly instead of being unavailable.
+    processing: ai_memory_consolidate::ProcessingService,
 }
 
 fn maintenance_start_delay(
@@ -1006,6 +1011,7 @@ async fn run_session_consolidation_worker(
     writer: WriterHandle,
     reader: ReaderPool,
     consolidator: Arc<Consolidator>,
+    processing: Option<ai_memory_consolidate::ProcessingService>,
     notify: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
     #[cfg(test)] completed: Arc<tokio::sync::Notify>,
@@ -1075,7 +1081,76 @@ async fn run_session_consolidation_worker(
             ),
         }
         let actor = session_consolidation_actor(&reader, session_id).await;
-        let consolidation = consolidator.consolidate_session(session_id, false, actor, None, None);
+        // `[chunking]` off: never start the legacy generator over an
+        // unfinished (paused) durable job for this session. The queue job is
+        // failed with its normal retry schedule instead (no provider call, no
+        // publication); a store error fails closed the same way.
+        if processing.as_ref().is_none_or(|p| !p.enabled()) {
+            let blocked = match consolidator.session_target(session_id).await {
+                Ok(Some((ws, proj))) => {
+                    ai_memory_mcp::processing_jobs::has_equivalent_unfinished_job(
+                        &reader,
+                        ws,
+                        proj,
+                        session_id,
+                        ai_memory_core::ProcessingJobKind::Consolidate,
+                        &ai_memory_mcp::processing_jobs::candidate_owners(&actor),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                }
+                Ok(None) => Ok(false),
+                Err(e) => Err(e.to_string()),
+            };
+            let reason = match blocked {
+                Ok(false) => None,
+                Ok(true) => Some(ai_memory_mcp::processing_jobs::PAUSED_JOB_MESSAGE.to_string()),
+                Err(error) => {
+                    tracing::warn!(%error, session = %session_id, generation, "could not check for a paused processing job; deferring queued consolidation");
+                    Some("could not verify that no chunked processing job is paused for this session".to_string())
+                }
+            };
+            if let Some(reason) = reason {
+                let retry_at = (attempts < ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS)
+                    .then(|| {
+                        let delay = session_consolidation_retry_delay(attempts);
+                        let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
+                        jiff::Timestamp::now()
+                            .as_microsecond()
+                            .saturating_add(delay_micros)
+                    });
+                if let Err(error) = writer
+                    .fail_session_consolidation(job, reason, retry_at)
+                    .await
+                {
+                    tracing::warn!(%error, session = %session_id, generation, "failed to persist deferred session consolidation");
+                }
+                tracing::warn!(
+                    session = %session_id,
+                    generation,
+                    "queued consolidation skipped: an equivalent chunked job is unfinished"
+                );
+                #[cfg(test)]
+                completed.notify_one();
+                continue;
+            }
+        }
+        // With `[chunking]` on the same call runs as a durable, whole-session
+        // job; its failures keep the queue's own retry classification.
+        let consolidation = async {
+            match processing.as_ref().filter(|p| p.enabled()) {
+                Some(processing) => {
+                    processing
+                        .consolidate_session(session_id, false, actor, None, None)
+                        .await
+                }
+                None => {
+                    consolidator
+                        .consolidate_session(session_id, false, actor, None, None)
+                        .await
+                }
+            }
+        };
         tokio::pin!(consolidation);
         let result = tokio::select! {
             () = cancel.cancelled() => {
@@ -1470,11 +1545,61 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     }
     let consolidator_setup =
         configure_consolidator(config, server, &store, &wiki, ws, proj, &provider_health)?;
-    let server = consolidator_setup.server;
+    let mut server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
     let admin_llm = consolidator_setup.admin_llm;
     let llm_configured = admin_llm.is_some();
     let profile_llm = admin_llm.clone();
+    // Durable chunked processing. Enabled: the service, its worker and its
+    // tools exist. Disabled: nothing new runs, jobs left active by an earlier
+    // enabled run are paused (never converted to the legacy flow), and the
+    // read-only surface is exposed only while such jobs exist.
+    let processing = match consolidator_setup.processing {
+        service if service.enabled() => Some(service),
+        service => {
+            if store
+                .reader
+                .processing_jobs_exist()
+                .await
+                .context("checking for existing processing jobs")?
+            {
+                let paused = service
+                    .pause_active_jobs()
+                    .await
+                    .context("pausing processing jobs while [chunking] is disabled")?;
+                info!(
+                    paused,
+                    "[chunking] is disabled: earlier processing jobs stay readable and active ones are paused"
+                );
+                Some(service)
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(service) = &processing {
+        server = server.with_processing_service(service.clone());
+    }
+    let processing_for_worker = processing.clone();
+    let processing_for_scheduler = processing.clone();
+    let processing_shutdown = CancellationToken::new();
+    let processing_task = processing
+        .clone()
+        .filter(ai_memory_consolidate::ProcessingService::enabled)
+        .map(|service| {
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let token = processing_shutdown.clone();
+            tokio::spawn(async move {
+                token.cancelled().await;
+                let _ = stop_tx.send(true);
+            });
+            info!(
+                max_input_tokens = config.chunking.max_input_tokens,
+                max_calls_per_run = config.chunking.max_calls_per_run,
+                "durable chunked processing worker started"
+            );
+            tokio::spawn(async move { service.run_worker(stop_rx).await })
+        });
     // Share the tool router's last-activity clock with the B3 dream scheduler so
     // it can tell an idle box from a busy one and cancel a run on the operator's
     // return.
@@ -1495,6 +1620,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         config.contradiction_band_max,
         config.consolidate_on_session_end,
         consolidator.is_some(),
+        processing_for_scheduler,
     )
     .await;
 
@@ -1549,6 +1675,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     }
                 }
             }
+            stop_processing_worker(&processing_shutdown, processing_task).await;
             close_store(&store).await;
         }
         TransportKind::Http => {
@@ -1575,6 +1702,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                         store.writer.clone(),
                         store.reader.clone(),
                         consolidator,
+                        processing_for_worker,
                         notify.clone(),
                         cancel.child_token(),
                         #[cfg(test)]
@@ -1701,7 +1829,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 home_dir: config.home_dir.clone(),
                 trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
-            let admin = admin_router_with_sweep_tuning(
+            let admin = admin_router_with_processing(
                 AdminState {
                     ingest_metrics: ingest_metrics.clone(),
                     // The tool server's own instance, so /admin/metrics reads
@@ -1739,6 +1867,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 config.decay.observation_retention(),
                 config.decay.ledger_retention(),
                 config.decay.compact_cold_episodic,
+                processing.clone(),
             );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -2144,6 +2273,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     ),
                 }
             }
+            stop_processing_worker(&processing_shutdown, processing_task).await;
             close_store(&store).await;
             if let Some(serve_result) = serve_result {
                 serve_result?;
@@ -2196,6 +2326,7 @@ async fn start_maintenance_scheduler(
     contradiction_band_max: f32,
     consolidate_on_session_end: bool,
     has_session_consolidator: bool,
+    processing: Option<ai_memory_consolidate::ProcessingService>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -2326,6 +2457,22 @@ async fn start_maintenance_scheduler(
                         "hollow-project sweep deleted empty project rows"
                     ),
                     Err(e) => tracing::warn!(error = %e, "hollow-project sweep failed"),
+                }
+                // Retention for durable processing jobs rides this existing
+                // daily maintenance tick (no extra task, and it still runs
+                // with `[chunking]` off, so jobs an earlier enabled run left
+                // behind do not linger forever). The store protects active
+                // jobs; only terminal, idle-paused and budget-exceeded ones
+                // older than the retention are removed.
+                match writer
+                    .cleanup_processing_jobs(
+                        ai_memory_store::processing_jobs::PROCESSING_JOB_RETENTION_DEFAULT,
+                    )
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(removed) => info!(removed, "processing-job retention cleanup completed"),
+                    Err(e) => tracing::warn!(error = %e, "processing-job retention cleanup failed"),
                 }
                 tokio::time::sleep(HOLLOW_SWEEP_INTERVAL).await;
             }
@@ -2499,12 +2646,18 @@ async fn start_maintenance_scheduler(
             loop {
                 tokio::time::sleep(interval).await;
                 let started = std::time::Instant::now();
-                match run_auto_improve_scheduler_tick(
+                // With `[chunking]` on, reviews run as durable jobs (manual and
+                // scheduled callers join the same compatible job).
+                match ai_memory_consolidate::run_auto_improve_scheduler_tick_with_processing(
                     &reader,
                     &writer,
                     &wiki,
                     &llm,
                     &scheduler_settings,
+                    // Also passed with `[chunking]` off (it exists then only when
+                    // old jobs do) so the tick can skip sessions whose durable
+                    // job is unfinished instead of running the legacy reviewer.
+                    processing.as_ref(),
                 )
                 .await
                 {
@@ -3193,6 +3346,14 @@ fn configure_consolidator(
             server,
             consolidator: None,
             admin_llm: None,
+            processing: build_processing_service(
+                config,
+                store,
+                wiki,
+                None,
+                workspace_id,
+                project_id,
+            )?,
         });
     };
     let provider_name = cfg.provider.name().to_string();
@@ -3207,6 +3368,15 @@ fn configure_consolidator(
         .context("building LLM provider chain from config")?
         .context("LLM provider configured but chain construction returned none")?;
     let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
+    // Fair, bounded admission for every chat call this server makes, installed
+    // only with `[chunking]` on and outside the health wrapper, so a local
+    // "capacity busy" verdict never marks the provider unhealthy. Wrapped before
+    // any clone below so every worker shares one queue.
+    let llm: Arc<dyn LlmProvider> = if config.chunking.enabled {
+        Arc::new(ai_memory_llm::AdmittedLlmProvider::new(llm))
+    } else {
+        llm
+    };
     info!(
         provider = llm.name(),
         model = llm.model(),
@@ -3249,11 +3419,82 @@ fn configure_consolidator(
                 .with_timeout(std::time::Duration::from_secs(config.rerank_timeout_secs));
         server = server.with_rerank_stage(stage);
     }
+    let processing = build_processing_service(
+        config,
+        store,
+        wiki,
+        Some(llm.clone()),
+        workspace_id,
+        project_id,
+    )?;
     Ok(ConsolidatorSetup {
         server,
         consolidator: Some(consolidator),
         admin_llm: Some(llm),
+        processing,
     })
+}
+
+/// Build the durable processing service from `[chunking]` and the existing
+/// `[consolidation]` / `[auto_improve]` / `[slots]` numbers, which stay the
+/// per-call ceilings. `llm` is the already admission-wrapped provider (or
+/// `None` on a provider-less server, where starting a job fails explicitly).
+///
+/// With `[chunking]` on, the complete path (map, reduce and the final
+/// envelope) is validated here so an unusable budget stops startup instead
+/// of failing the first job.
+fn build_processing_service(
+    config: &Config,
+    store: &Store,
+    wiki: &Wiki,
+    llm: Option<Arc<dyn LlmProvider>>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> Result<ai_memory_consolidate::ProcessingService> {
+    let service = ai_memory_consolidate::ProcessingService::new(
+        store.reader.clone(),
+        store.writer.clone(),
+        wiki.clone(),
+        llm,
+        workspace_id,
+        project_id,
+        config.chunking,
+    )
+    .with_consolidation_limits(
+        config.consolidation.max_input_tokens,
+        config.consolidation.max_output_tokens,
+        config.consolidation.input_token_safety_margin,
+    )
+    .with_per_user_slots(config.slots.per_user)
+    .with_auto_improve(
+        auto_improve_review_config_from_settings(&config.auto_improve),
+        config.auto_improve.require_approval,
+    );
+    if service.enabled() {
+        service
+            .validate()
+            .map_err(|message| anyhow::anyhow!("[chunking] is not usable: {message}"))?;
+    }
+    Ok(service)
+}
+
+/// Stop the durable processing worker at a safe fence: signal it, then wait a
+/// bounded time. A worker past the bound is abandoned; its job lease expires
+/// and the next start resumes it.
+async fn stop_processing_worker(
+    shutdown: &CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+) {
+    shutdown.cancel();
+    let Some(task) = task else { return };
+    match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "processing worker join failed"),
+        Err(_) => tracing::warn!(
+            grace_secs = SHUTDOWN_GRACE.as_secs(),
+            "processing worker did not stop within the shutdown grace period; exiting anyway"
+        ),
+    }
 }
 
 /// What the web health page reads from this process: the writer queue,
@@ -4615,6 +4856,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             false,
             false,
+            None,
         )
         .await;
         assert!(tasks.is_empty());
@@ -4668,6 +4910,7 @@ mod tests {
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
                 false,
                 false,
+                None,
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -4708,6 +4951,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             false,
             false,
+            None,
         )
         .await;
         assert_eq!(tasks.len(), 2);
@@ -4735,6 +4979,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             false,
             false,
+            None,
         )
         .await;
         assert_eq!(tasks.len(), 3);
@@ -4765,6 +5010,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             true,
             true,
+            None,
         )
         .await;
         assert!(tasks.is_empty());
@@ -4838,6 +5084,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             true,
             true,
+            None,
         )
         .await;
 
@@ -5406,6 +5653,154 @@ mod tests {
         );
     }
 
+    /// `[chunking]` off with a paused durable consolidation of the session:
+    /// the SessionEnd queue must not run the legacy consolidator (nothing is
+    /// published), while a session without such a job still completes.
+    #[tokio::test]
+    async fn session_consolidation_worker_does_not_run_legacy_over_a_paused_durable_job() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: session_id,
+                    workspace_id,
+                    project_id,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id,
+                        project_id,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: "finish".into(),
+                        body: "complete the durable job".into(),
+                        importance: 8,
+                    },
+                    &Sanitizer::default(),
+                ))
+                .await
+                .unwrap();
+            store.writer.end_session(session_id, None).await.unwrap();
+            sessions.push(session_id);
+        }
+        let (paused, free) = (sessions[0], sessions[1]);
+        store
+            .writer
+            .create_processing_job(ai_memory_store::NewProcessingJob {
+                workspace_id,
+                project_id,
+                session_id: paused,
+                kind: ai_memory_core::ProcessingJobKind::Consolidate,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                author_id: None,
+                viewer: None,
+                owner: None,
+                options_json: serde_json::json!({}),
+                context_fingerprint: "test".into(),
+                max_calls: 8,
+            })
+            .await
+            .unwrap();
+        store.writer.pause_processing_jobs().await.unwrap();
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, paused)
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(SuccessfulConsolidationLlm),
+            workspace_id,
+            project_id,
+        ));
+        let off_service = ai_memory_consolidate::ProcessingService::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            workspace_id,
+            project_id,
+            ai_memory_core::chunking::ChunkingSettings::default(),
+        );
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            store.reader.clone(),
+            consolidator,
+            Some(off_service),
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("worker should settle the queued job");
+        let page_of = |session: SessionId| {
+            let reader = store.reader.clone();
+            async move {
+                reader
+                    .page_body_by_ids(workspace_id, project_id, &format!("sessions/{session}.md"))
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(
+            page_of(paused).await.is_none(),
+            "the legacy consolidator must not publish over a paused durable job"
+        );
+
+        // Legitimate control: a session with no durable job still completes.
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, free)
+            .await
+            .unwrap();
+        notify.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("worker should complete the jobless session");
+        assert!(
+            page_of(free)
+                .await
+                .is_some_and(|page| page.body.contains("Durable worker completed")),
+            "a session without a durable job keeps the legacy path"
+        );
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn session_consolidation_worker_consumes_and_completes_durable_job() {
         let tmp = TempDir::new().unwrap();
@@ -5476,6 +5871,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            None,
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -5582,6 +5978,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            None,
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -5687,6 +6084,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            None,
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -5787,6 +6185,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            None,
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -5955,6 +6354,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            None,
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -6156,6 +6556,7 @@ mod tests {
             store.writer.clone(),
             store.reader.clone(),
             consolidator,
+            None,
             notify.clone(),
             cancel.child_token(),
             completed.clone(),
@@ -7610,6 +8011,54 @@ mod tests {
                 .contains("AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER"),
             "unexpected error: {err}"
         );
+    }
+
+    async fn chunking_setup(
+        chunking: ai_memory_core::chunking::ChunkingSettings,
+    ) -> (TempDir, Result<ConsolidatorSetup>) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+        let config = Config {
+            chunking,
+            ..Config::default()
+        };
+        let setup = configure_consolidator(
+            &config,
+            server,
+            &store,
+            &wiki,
+            ws,
+            proj,
+            &ProviderHealth::default(),
+        );
+        (tmp, setup)
+    }
+
+    #[tokio::test]
+    async fn an_unusable_chunking_budget_stops_startup() {
+        let (_tmp, setup) = chunking_setup(ai_memory_core::chunking::ChunkingSettings {
+            enabled: true,
+            max_input_tokens: 1,
+            ..Default::default()
+        })
+        .await;
+        let err = match setup {
+            Ok(_) => panic!("a budget below every envelope must fail startup"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("[chunking]"), "{err}");
     }
 
     #[tokio::test]

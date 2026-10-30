@@ -162,6 +162,30 @@ fn push_handoff_omission_marker(
     out.push(marker);
 }
 
+/// Routing for the opt-in processing-job tools. It is the tail of
+/// [`MEMORY_INSTRUCTIONS`] (so the constant, the installed snippet check and
+/// the docs name the new tools), and a server that does not register the
+/// tools advertises the constant with exactly this suffix removed, which
+/// leaves the historical handshake text byte for byte. A macro because
+/// `concat!` takes literals only.
+macro_rules! processing_job_instructions_on {
+    () => {
+        "\n\
+- `memory_processing_job_start` — opt-in asynchronous alternative to \
+`memory_consolidate` / `memory_auto_improve` for long sessions: pass `kind` \
+(`consolidate`, `consolidate_multi`, `auto_improve`), the session and the same \
+explicit `workspace`/`project`. It returns at once with a job id in state \
+`queued`, NOT a completed result; the whole session is then read in bounded \
+calls. Retrying returns the existing compatible job. Needs write access to the \
+project. Poll `memory_processing_job_status` with the same explicit scope and \
+the job id until `state` is `completed` (result in `result`), `paused`, \
+`budget_exceeded`, `failed` or `invalidated`. Only present when the server's \
+`[chunking]` is on.\n\
+- `memory_processing_job_status` — read one job's progress, redacted failure \
+reason and final result. A job id from another project or operator is not found.\n"
+    };
+}
+
 /// Instructions surfaced to clients via `ServerInfo`. Sent on every
 /// MCP handshake so Claude Code / Codex / OpenCode see this in their
 /// session preamble. Maps conversational triggers to tool names so
@@ -171,7 +195,8 @@ fn push_handoff_omission_marker(
 /// Claude Code keeps only the first 2,048 characters, so everything before
 /// the "Detailed tool routing follows" marker must stay self-contained and
 /// within that cap.
-pub const MEMORY_INSTRUCTIONS: &str = "\
+pub const MEMORY_INSTRUCTIONS: &str = concat!(
+    "\
 Long-term memory for the current project.\n\
 \n\
 **Core routing and trust contract.** Session-aware MCP clients that forward the \
@@ -495,7 +520,9 @@ into the project's CLAUDE.md / AGENTS.md plus ai-memory-managed Agent \
 Skills so the guidance survives across sessions. From the agent: ask \
 'install ai-memory routing' and use the returned `managed_skills` + \
 `target_hints`. From the terminal: `ai-memory install-instructions` \
-(or `ai-memory install-skills` to refresh only the skill files).";
+(or `ai-memory install-skills` to refresh only the skill files).",
+    processing_job_instructions_on!()
+);
 
 /// MCP server backed by the ai-memory store.
 #[derive(Clone)]
@@ -624,6 +651,11 @@ pub struct AiMemoryServer {
     /// `scope: "profile"` writes and deletes target and whether a query unions
     /// a workspace or private profile (`docs/design-cross-project-profile.md`).
     profile: ai_memory_core::profile::ProfileSettings,
+    /// Durable chunked processing service (`[chunking]`). `None` unless the
+    /// server was built with [`AiMemoryServer::with_processing_service`]; only
+    /// then are the `memory_processing_job_*` tools registered. The default
+    /// router never contains them, so the stock tool set is unchanged.
+    processing: Option<ai_memory_consolidate::ProcessingService>,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -2111,6 +2143,7 @@ impl AiMemoryServer {
             trusted_proxy_identity: false,
             per_user_slots: false,
             profile: ai_memory_core::profile::ProfileSettings::default(),
+            processing: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -2130,6 +2163,52 @@ impl AiMemoryServer {
     pub fn with_answer_context_budget(mut self, max_context_tokens: Option<usize>) -> Self {
         self.answer_max_context_tokens = max_context_tokens;
         self
+    }
+
+    /// Attach the durable processing service and register its tools.
+    ///
+    /// With `[chunking]` on, both `memory_processing_job_start` and
+    /// `memory_processing_job_status` are discoverable and synchronous
+    /// `memory_consolidate` / `memory_auto_improve` calls run through the same
+    /// durable jobs while keeping their response shapes. With it off, only
+    /// `memory_processing_job_status` is registered, so jobs created earlier
+    /// stay observable; the caller attaches the service in that mode only
+    /// when such jobs exist (`ReaderPool::processing_jobs_exist`). The start
+    /// tool is refused on direct dispatch in that mode too.
+    #[must_use]
+    pub fn with_processing_service(
+        mut self,
+        service: ai_memory_consolidate::ProcessingService,
+    ) -> Self {
+        self.tool_router
+            .merge(Self::processing_status_tool_router());
+        if service.enabled() {
+            self.tool_router.merge(Self::processing_start_tool_router());
+        }
+        self.processing = Some(service);
+        self
+    }
+
+    /// The processing service only while `[chunking]` is on: the gate every
+    /// new-flow dispatch (tool, synchronous routing) goes through.
+    fn enabled_processing(&self) -> Option<&ai_memory_consolidate::ProcessingService> {
+        self.processing.as_ref().filter(|p| p.enabled())
+    }
+
+    /// The handshake instructions this server advertises. The constant ends
+    /// with the processing-job routing; a server that registers those tools
+    /// keeps it, a status-only server swaps it for the read-only paragraph, and
+    /// every other server advertises the historical text with no mention of
+    /// them.
+    fn instructions(&self) -> String {
+        let stock = MEMORY_INSTRUCTIONS
+            .strip_suffix(PROCESSING_JOB_INSTRUCTIONS_ON)
+            .unwrap_or(MEMORY_INSTRUCTIONS);
+        match &self.processing {
+            Some(service) if service.enabled() => MEMORY_INSTRUCTIONS.to_string(),
+            Some(_) => format!("{stock}{PROCESSING_JOB_INSTRUCTIONS_STATUS_ONLY}"),
+            None => stock.to_string(),
+        }
     }
 
     /// Declare that a trusted proxy may assert end-user identities — mirror of
@@ -4187,30 +4266,75 @@ impl AiMemoryServer {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if args.multi_page.unwrap_or(false) {
-            let outcomes = consolidator
-                .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
+        // `[chunking]` off: the legacy generator must not shadow an
+        // unfinished (paused) durable job for the same session and kind.
+        if !dry && self.enabled_processing().is_none() {
+            let kind = if args.multi_page.unwrap_or(false) {
+                ai_memory_core::ProcessingJobKind::ConsolidateMulti
+            } else {
+                ai_memory_core::ProcessingJobKind::Consolidate
+            };
+            if let Some((ws, proj)) = consolidator
+                .session_target(session_id)
                 .await
-                .map_err(|e| {
-                    McpError::internal_error(
-                        ai_memory_consolidate::redacted_error_summary(&e),
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            {
+                let blocked = crate::processing_jobs::has_equivalent_unfinished_job(
+                    &self.reader,
+                    ws,
+                    proj,
+                    session_id,
+                    kind,
+                    &crate::processing_jobs::candidate_owners(&actor),
+                )
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                if blocked {
+                    return Err(McpError::invalid_request(
+                        crate::processing_jobs::PAUSED_JOB_MESSAGE,
                         None,
-                    )
-                })?;
+                    ));
+                }
+            }
+        }
+        if args.multi_page.unwrap_or(false) {
+            // With `[chunking]` on, the same call runs as a durable job over
+            // the whole session and still returns the legacy outcome shape.
+            let outcomes = match self.enabled_processing() {
+                Some(processing) => {
+                    processing
+                        .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
+                        .await
+                }
+                None => {
+                    consolidator
+                        .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
+                        .await
+                }
+            }
+            .map_err(|e| {
+                McpError::internal_error(ai_memory_consolidate::redacted_error_summary(&e), None)
+            })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
             ok_json(&serde_json::json!({ "outcomes": outcomes }))
         } else {
-            let outcome = consolidator
-                .consolidate_session(session_id, dry, actor, author_id, instructions)
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(
-                        ai_memory_consolidate::redacted_error_summary(&e),
-                        None,
-                    )
-                })?;
+            let outcome = match self.enabled_processing() {
+                Some(processing) => {
+                    processing
+                        .consolidate_session(session_id, dry, actor, author_id, instructions)
+                        .await
+                }
+                None => {
+                    consolidator
+                        .consolidate_session(session_id, dry, actor, author_id, instructions)
+                        .await
+                }
+            }
+            .map_err(|e| {
+                McpError::internal_error(ai_memory_consolidate::redacted_error_summary(&e), None)
+            })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
@@ -4445,6 +4569,74 @@ impl AiMemoryServer {
             eval: defaults.eval.clone(),
         };
 
+        // With `[chunking]` on, review + staging + approval run as one durable
+        // job (whole-session coverage, idempotent proposal ids, eval once per
+        // final proposal) and render the same response this tool always gave.
+        if let Some(processing) = self.enabled_processing() {
+            let staging_owner = ai_memory_core::owner_identity(
+                request_actor.identity_key().as_ref(),
+                self.deployment_distinguishes_operators()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            );
+            let staged = processing
+                .auto_improve_staged(ai_memory_consolidate::AutoImproveStageRequest {
+                    workspace_id: ws,
+                    project_id: proj,
+                    session_id,
+                    cfg,
+                    actor: request_actor,
+                    author_id,
+                    owner: staging_owner,
+                    admission_ctx: Some(ai_memory_wiki::AdmissionContext {
+                        op: ai_memory_wiki::AdmissionOp::WritePage,
+                        ..ai_memory_wiki::AdmissionContext::default()
+                    }),
+                })
+                .await
+                .map_err(|e| processing_mcp_error(&e))?;
+            let proposals: Vec<serde_json::Value> = staged
+                .proposals
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id.to_string(),
+                        "sidecar_path": p.sidecar_path,
+                        "status": p.status,
+                        "page_id": p.page_id,
+                    })
+                })
+                .collect();
+            return ok_json(&serde_json::json!({
+                "run_id": staged.run_id.to_string(),
+                "approval_required": staged.approval_required,
+                "approval_policy": if staged.approval_required { "manual" } else { "auto_approve" },
+                "session_id": session_id.to_string(),
+                "summary": staged.summary,
+                "warnings": staged.warnings,
+                "rejected_candidates_count": staged.rejected_candidates_count,
+                "proposals": proposals,
+                "skipped": staged.skipped,
+            }));
+        }
+        // `[chunking]` off: the legacy reviewer must not shadow an unfinished
+        // (paused) durable review of this session. Nothing has run yet here.
+        if crate::processing_jobs::has_equivalent_unfinished_job(
+            &self.reader,
+            ws,
+            proj,
+            session_id,
+            ai_memory_core::ProcessingJobKind::AutoImprove,
+            &crate::processing_jobs::candidate_owners(&request_actor),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        {
+            return Err(McpError::invalid_request(
+                crate::processing_jobs::PAUSED_JOB_MESSAGE,
+                None,
+            ));
+        }
         let report =
             run_auto_improve_review(&self.reader, &**llm, ws, proj, session_id, cfg.clone())
                 .await
@@ -7290,6 +7482,247 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Arguments of `memory_processing_job_start`.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProcessingJobStartArgs {
+    /// `consolidate` (one page), `consolidate_multi` (several pages) or
+    /// `auto_improve` (review the session and stage proposals).
+    kind: String,
+    /// Session UUID to process; it must belong to the resolved project.
+    session_id: String,
+    /// Project the session belongs to. Session-aware clients may omit it for
+    /// the current project; static MCP clients must pass it together with
+    /// `workspace`.
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace of `project`.
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+/// Arguments of `memory_processing_job_status`.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProcessingJobStatusArgs {
+    /// Job UUID returned by `memory_processing_job_start`.
+    job_id: String,
+    /// Project the job was started in. Session-aware clients may omit it for
+    /// the current project; static MCP clients must pass it together with
+    /// `workspace`. A job id of another project is reported as not found.
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace of `project`.
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+/// Tools that exist only when the server is built with a processing service.
+/// Two routers so `[chunking]` off can still register the read-only half.
+#[tool_router(router = processing_start_tool_router)]
+impl AiMemoryServer {
+    /// Start a durable chunked processing job and return immediately.
+    #[tool(
+        annotations(
+            title = "Start session processing job",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        description = "Opt-in asynchronous alternative to memory_consolidate / \
+        memory_auto_improve for long sessions. Starts a durable job that reads the \
+        WHOLE stored session in bounded LLM calls and publishes through the same \
+        path as the synchronous tool, then returns at once with the job's status \
+        (`queued`, not completed). Poll memory_processing_job_status with the same \
+        explicit workspace/project and the returned job_id for progress and the \
+        final result. `kind`: consolidate, consolidate_multi or auto_improve. \
+        Retrying the same request returns the existing compatible job instead of \
+        repeating work. Requires write access to the project, like the \
+        synchronous tools. Refused when the server's [chunking] is off."
+    )]
+    async fn memory_processing_job_start(
+        &self,
+        Parameters(args): Parameters<ProcessingJobStartArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        // Guard the action itself, not just discovery: a client that cached
+        // the tool list before the flag was turned off still lands here.
+        let Some(service) = self.enabled_processing() else {
+            return Err(McpError::invalid_request(
+                crate::processing_jobs::DISABLED_MESSAGE,
+                None,
+            ));
+        };
+        let kind = args
+            .kind
+            .trim()
+            .parse::<ai_memory_core::ProcessingJobKind>()
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "kind must be one of consolidate, consolidate_multi, auto_improve",
+                    None,
+                )
+            })?;
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let viewer = Self::viewer_from_parts(Some(&parts));
+        // Same scope resolution and Write grant as memory_consolidate and
+        // memory_auto_improve: an existing project only, never created here.
+        let (ws, proj) = self
+            .effective_ids_for_mutation_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+                viewer,
+            )
+            .await?;
+        let session_id = SessionId::from_str(args.session_id.trim())
+            .map_err(|e| McpError::invalid_params(format!("invalid session_id: {e}"), None))?;
+        // A session id names a repository without passing through scope
+        // resolution, so prove it lives in the project the grant covered.
+        let in_scope = crate::processing_jobs::session_in_scope(&self.reader, session_id, ws, proj)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if !in_scope {
+            return Err(McpError::invalid_params(
+                crate::processing_jobs::session_not_found_message(),
+                None,
+            ));
+        }
+        let actor = crate::actor::actor_from_parts(&parts);
+        let author_id = crate::actor::author_id_from_parts(&parts);
+        let owner = ai_memory_core::owner_identity(
+            actor.identity_key().as_ref(),
+            self.deployment_distinguishes_operators()
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        );
+        let status = service
+            .start(ai_memory_consolidate::ProcessingJobStart {
+                workspace_id: ws,
+                project_id: proj,
+                session_id,
+                kind,
+                actor,
+                author_id,
+                owner,
+                viewer,
+                instructions: None,
+            })
+            .await
+            .map_err(|e| processing_mcp_error(&e))?;
+        ok_json(&status)
+    }
+}
+
+#[tool_router(router = processing_status_tool_router)]
+impl AiMemoryServer {
+    /// Read the status and result of a durable processing job.
+    #[tool(
+        annotations(
+            title = "Read session processing job",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "Progress of a durable session-processing job: state \
+        (queued, running, reducing, publishing, completed, paused, \
+        budget_exceeded, failed, invalidated), chunk progress, provider calls \
+        used against the per-run ceiling, a redacted reason when paused or \
+        failed, and the final result once completed. Pass the same explicit \
+        workspace/project the job was started in; a job id from another \
+        project or another operator is reported as not found. Never returns \
+        prompts or raw model output. Jobs created before [chunking] was \
+        switched off stay readable."
+    )]
+    async fn memory_processing_job_status(
+        &self,
+        Parameters(args): Parameters<ProcessingJobStatusArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        let not_found =
+            || McpError::invalid_params(crate::processing_jobs::job_not_found_message(), None);
+        let Some(service) = self.processing.as_ref() else {
+            return Err(not_found());
+        };
+        let job_id = ai_memory_core::ProcessingJobId::from_str(args.job_id.trim())
+            .map_err(|e| McpError::invalid_params(format!("invalid job_id: {e}"), None))?;
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let viewer = Self::viewer_from_parts(Some(&parts));
+        let (ws, proj) = self
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+                viewer,
+            )
+            .await?;
+        let distinguishes = self
+            .deployment_distinguishes_operators()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let actor = crate::actor::actor_from_parts(&parts);
+        // Whether this caller may read every owner's jobs comes from the
+        // authenticated level, never from an argument. No level at all is the
+        // stdio / in-process transport, where the caller owns the data directory.
+        let any_owner = parts
+            .extensions
+            .get::<ai_memory_core::AuthLevel>()
+            .copied()
+            .is_none_or(|level| {
+                level
+                    .authorize(ai_memory_core::Capability::Admin, distinguishes)
+                    .is_ok()
+            });
+        let status = service
+            .status(
+                ws,
+                proj,
+                job_id,
+                ai_memory_consolidate::ProcessingJobAccess {
+                    owner: ai_memory_core::owner_identity(
+                        actor.identity_key().as_ref(),
+                        distinguishes,
+                    ),
+                    viewer,
+                    any_owner,
+                },
+            )
+            .await
+            .map_err(|e| processing_mcp_error(&e))?
+            .ok_or_else(not_found)?;
+        ok_json(&status)
+    }
+}
+
+/// Map an engine error to the MCP error the caller can act on.
+fn processing_mcp_error(error: &ai_memory_consolidate::ProcessingError) -> McpError {
+    use crate::processing_jobs::{ProcessingFailure, classify};
+    let (kind, message) = classify(error);
+    match kind {
+        ProcessingFailure::NotFound | ProcessingFailure::Invalid => {
+            McpError::invalid_params(message, None)
+        }
+        ProcessingFailure::Conflict => McpError::invalid_request(message, None),
+        ProcessingFailure::Unavailable | ProcessingFailure::Internal => {
+            McpError::internal_error(message, None)
+        }
+    }
+}
+
+/// The routing paragraph that is the tail of [`MEMORY_INSTRUCTIONS`]. A server
+/// without processing tools advertises the constant with this suffix removed.
+const PROCESSING_JOB_INSTRUCTIONS_ON: &str = processing_job_instructions_on!();
+
+/// Status-only variant: `[chunking]` is off, so starting is refused, but jobs
+/// created earlier remain readable.
+const PROCESSING_JOB_INSTRUCTIONS_STATUS_ONLY: &str = "\n\
+- `memory_processing_job_status` — `[chunking]` is off on this server: new \
+processing jobs cannot be started, but jobs created earlier stay readable. Pass \
+the job id with its explicit `workspace`/`project`; a job id from another project \
+or operator is not found.\n";
+
 #[tool_handler]
 impl ServerHandler for AiMemoryServer {
     fn get_info(&self) -> ServerInfo {
@@ -7302,7 +7735,7 @@ impl ServerHandler for AiMemoryServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(implementation)
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(MEMORY_INSTRUCTIONS.to_string())
+            .with_instructions(self.instructions())
     }
 
     // Declared manually so `#[tool_handler]` skips its generated
@@ -10489,7 +10922,7 @@ mod tests {
 
     #[tokio::test]
     async fn prompts_cover_every_registered_mcp_tool() {
-        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let (tmp, store, server, ws, pj) = setup_server().await;
         let actual_tools: BTreeSet<String> = server
             .tool_router
             .list_all()
@@ -10517,6 +10950,36 @@ mod tests {
             assert!(
                 installed.contains(tool.as_str()),
                 "installed snippet and managed skills omit {tool}"
+            );
+        }
+
+        // Flag ON: the full registered set (stock + the two processing-job
+        // tools) must be covered by the handshake constant, the live
+        // handshake text and the installed prompt surface alike.
+        let on = server.with_processing_service(processing_service_for(&tmp, &store, ws, pj, true));
+        let on_tools = tool_names(&on);
+        let expected_on: BTreeSet<String> = MCP_TOOL_NAMES
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .chain([
+                "memory_processing_job_start".to_string(),
+                "memory_processing_job_status".to_string(),
+            ])
+            .collect();
+        assert_eq!(on_tools, expected_on);
+        let live = on.instructions();
+        for tool in &on_tools {
+            assert!(
+                MEMORY_INSTRUCTIONS.contains(tool.as_str()),
+                "MCP handshake constant omits {tool} (flag on)"
+            );
+            assert!(
+                live.contains(tool.as_str()),
+                "live handshake instructions omit {tool} (flag on)"
+            );
+            assert!(
+                installed.contains(tool.as_str()),
+                "installed snippet and managed skills omit {tool} (flag on)"
             );
         }
     }
@@ -23498,6 +23961,394 @@ mod tests {
             msg.contains("without a built-in model"),
             "error should not imply every provider needs an explicit model: {msg}",
         );
+    }
+
+    fn processing_service_for(
+        tmp: &TempDir,
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        enabled: bool,
+    ) -> ai_memory_consolidate::ProcessingService {
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        ai_memory_consolidate::ProcessingService::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            ws,
+            proj,
+            ai_memory_core::chunking::ChunkingSettings {
+                enabled,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn tool_names(server: &AiMemoryServer) -> BTreeSet<String> {
+        server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn processing_tools_are_absent_by_default_and_discovered_per_flag() {
+        const START: &str = "memory_processing_job_start";
+        const STATUS: &str = "memory_processing_job_status";
+        let (tmp, store, server, ws, proj) = setup_server().await;
+
+        // Default constructor: the stock tool set, untouched.
+        let stock = tool_names(&server);
+        assert_eq!(stock.len(), MCP_TOOL_NAMES.len());
+        assert!(!stock.contains(START) && !stock.contains(STATUS));
+        let default_text = server.instructions();
+        assert!(!default_text.contains("memory_processing_job"));
+        // The constant names both tools (repo invariant: the handshake text
+        // lists every tool), and the default text is the constant minus that
+        // tail, so the historical string is untouched.
+        assert!(MEMORY_INSTRUCTIONS.contains(START) && MEMORY_INSTRUCTIONS.contains(STATUS));
+        assert_eq!(
+            MEMORY_INSTRUCTIONS,
+            format!("{default_text}{PROCESSING_JOB_INSTRUCTIONS_ON}")
+        );
+        assert!(
+            MEMORY_INSTRUCTIONS.find(START).unwrap()
+                > MEMORY_INSTRUCTIONS
+                    .find("--- Detailed tool routing follows. ---")
+                    .unwrap(),
+            "the new routing belongs after the bounded core"
+        );
+
+        // Flag on: both tools, with the documented required arguments.
+        let on = server
+            .clone()
+            .with_processing_service(processing_service_for(&tmp, &store, ws, proj, true));
+        let names = tool_names(&on);
+        assert_eq!(names.len(), MCP_TOOL_NAMES.len() + 2);
+        let tools = on.tool_router.list_all();
+        let required = |name: &str| -> BTreeSet<String> {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            serde_json::to_value(&tool.input_schema).unwrap()["required"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            required(START),
+            BTreeSet::from(["kind".to_string(), "session_id".to_string()])
+        );
+        assert_eq!(required(STATUS), BTreeSet::from(["job_id".to_string()]));
+        let text = on.instructions();
+        assert_eq!(text, MEMORY_INSTRUCTIONS);
+        assert!(text.contains(START) && text.contains(STATUS));
+        assert!(text.contains("NOT a completed result"));
+
+        // Flag off with jobs to read: status only, and the text says so.
+        let off = server
+            .clone()
+            .with_processing_service(processing_service_for(&tmp, &store, ws, proj, false));
+        let names = tool_names(&off);
+        assert!(names.contains(STATUS) && !names.contains(START));
+        let text = off.instructions();
+        assert!(text.starts_with(&default_text));
+        assert!(text.contains(STATUS) && !text.contains(START));
+        assert!(text.contains("cannot be started"));
+    }
+
+    #[tokio::test]
+    async fn processing_job_start_is_refused_on_direct_dispatch_when_off() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let session_id = seeded_completed_session(&store, ws, proj).await;
+        let off =
+            server.with_processing_service(processing_service_for(&tmp, &store, ws, proj, false));
+        let err = off
+            .memory_processing_job_start(
+                Parameters(ProcessingJobStartArgs {
+                    kind: "consolidate".into(),
+                    session_id: session_id.to_string(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a cached tool list must not start a job while [chunking] is off");
+        assert!(format!("{err:?}").contains("disabled"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn processing_job_start_fails_closed_on_foreign_sessions_and_reaches_the_engine_in_scope()
+    {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let other = store
+            .writer
+            .get_or_create_project(ws, "elsewhere", None)
+            .await
+            .unwrap();
+        let own_session = seeded_completed_session(&store, ws, proj).await;
+        let foreign_session = seeded_completed_session(&store, ws, other).await;
+        let on =
+            server.with_processing_service(processing_service_for(&tmp, &store, ws, proj, true));
+        let start = |session: SessionId, kind: &str| {
+            on.memory_processing_job_start(
+                Parameters(ProcessingJobStartArgs {
+                    kind: kind.into(),
+                    session_id: session.to_string(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+        };
+
+        let foreign = format!(
+            "{:?}",
+            start(foreign_session, "consolidate").await.unwrap_err()
+        );
+        let unknown = format!(
+            "{:?}",
+            start(SessionId::new(), "consolidate").await.unwrap_err()
+        );
+        assert!(foreign.contains("session not found"), "{foreign}");
+        assert_eq!(
+            foreign, unknown,
+            "a foreign session must be indistinguishable from an unknown one"
+        );
+        let bad_kind = format!("{:?}", start(own_session, "dream").await.unwrap_err());
+        assert!(bad_kind.contains("kind must be one of"), "{bad_kind}");
+        // Legitimate control: the session's own project passes every surface
+        // guard and stops only at the engine (no provider in this fixture).
+        let in_scope = format!("{:?}", start(own_session, "consolidate").await.unwrap_err());
+        assert!(in_scope.contains("provider"), "{in_scope}");
+    }
+
+    /// A provider that only counts how often it is asked.
+    struct CountingFailingLlm(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CountingFailingLlm {
+        fn name(&self) -> &'static str {
+            "counting-failing"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ai_memory_llm::LlmError::Provider {
+                status: 400,
+                body: "x".into(),
+                retry_after: None,
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ai_memory_llm::LlmError::Provider {
+                status: 400,
+                body: "x".into(),
+                retry_after: None,
+            })
+        }
+    }
+
+    /// Start a durable job, restart with `[chunking]` off (pausing it), then
+    /// call the legacy synchronous tools for the same session: they must
+    /// refuse explicitly with zero provider calls and no publication, while a
+    /// session with no durable job keeps using the legacy path.
+    #[tokio::test]
+    async fn paused_durable_job_blocks_the_legacy_fallback_when_chunking_is_off() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(CountingFailingLlm(calls.clone()));
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let paused_session = seeded_completed_session(&store, ws, proj).await;
+        let free_session = seeded_completed_session(&store, ws, proj).await;
+        let pages_before = store
+            .reader
+            .page_body_by_ids(ws, proj, &format!("sessions/{paused_session}.md"))
+            .await
+            .unwrap()
+            .map(|page| {
+                (
+                    page.title,
+                    page.body,
+                    page.frontmatter_json,
+                    page.tier,
+                    page.pinned,
+                )
+            });
+
+        for (kind, multi) in [
+            (ai_memory_core::ProcessingJobKind::Consolidate, false),
+            (ai_memory_core::ProcessingJobKind::ConsolidateMulti, true),
+            (ai_memory_core::ProcessingJobKind::AutoImprove, false),
+        ] {
+            let created = store
+                .writer
+                .create_processing_job(ai_memory_store::NewProcessingJob {
+                    workspace_id: ws,
+                    project_id: proj,
+                    session_id: paused_session,
+                    kind,
+                    actor: ai_memory_core::ActorContext::anonymous(),
+                    author_id: None,
+                    viewer: None,
+                    owner: None,
+                    options_json: serde_json::json!({}),
+                    context_fingerprint: "test".into(),
+                    max_calls: 8,
+                })
+                .await
+                .unwrap();
+            assert!(created.created);
+            // The restart with the flag off pauses what was active.
+            assert!(store.writer.pause_processing_jobs().await.unwrap() >= 1);
+
+            // Service present (old jobs exist) but off, exactly as `serve`
+            // attaches it; the legacy tools must not run past the job.
+            let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+                .with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone())
+                .with_processing_service(processing_service_for(&tmp, &store, ws, proj, false));
+            let err = if kind == ai_memory_core::ProcessingJobKind::AutoImprove {
+                server
+                    .memory_auto_improve(
+                        Parameters(AutoImproveArgs {
+                            session_id: Some(paused_session.to_string()),
+                            dry_run: None,
+                            stage: None,
+                            mode: None,
+                            project: None,
+                            workspace: None,
+                            min_observations: Some(1),
+                            min_session_duration_secs: Some(0),
+                            min_confidence: None,
+                            max_input_tokens: None,
+                            max_proposals: None,
+                            include_raw_fallback: None,
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .expect_err("a paused durable review must block the legacy reviewer")
+            } else {
+                server
+                    .memory_consolidate(
+                        Parameters(ConsolidateArgs {
+                            session_id: Some(paused_session.to_string()),
+                            dry_run: Some(false),
+                            multi_page: Some(multi),
+                            instructions: None,
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .expect_err("a paused durable consolidation must block the legacy path")
+            };
+            assert!(
+                format!("{err:?}").contains("legacy path was not run"),
+                "{kind}: {err:?}"
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{kind}: the provider must not be called"
+            );
+        }
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, &format!("sessions/{paused_session}.md"))
+                .await
+                .unwrap()
+                .map(|page| (
+                    page.title,
+                    page.body,
+                    page.frontmatter_json,
+                    page.tier,
+                    page.pinned
+                )),
+            pages_before,
+            "nothing may be published for the paused session"
+        );
+
+        // Legitimate control: a session with no durable job still takes the
+        // legacy path (it reaches the provider, which fails here).
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator)
+            .with_processing_service(processing_service_for(&tmp, &store, ws, proj, false));
+        let err = server
+            .memory_consolidate(
+                Parameters(ConsolidateArgs {
+                    session_id: Some(free_session.to_string()),
+                    dry_run: Some(false),
+                    multi_page: Some(false),
+                    instructions: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the failing provider rejects the legacy run");
+        assert!(
+            !format!("{err:?}").contains("legacy path was not run"),
+            "{err:?}"
+        );
+        assert!(
+            calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "a session without a durable job keeps the legacy path"
+        );
+    }
+
+    #[tokio::test]
+    async fn processing_job_status_reports_unknown_and_malformed_ids_without_leaking() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let on =
+            server.with_processing_service(processing_service_for(&tmp, &store, ws, proj, false));
+        let status = |job_id: &str| {
+            on.memory_processing_job_status(
+                Parameters(ProcessingJobStatusArgs {
+                    job_id: job_id.into(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+        };
+        let unknown = format!(
+            "{:?}",
+            status("11111111-1111-1111-1111-111111111111")
+                .await
+                .unwrap_err()
+        );
+        assert!(unknown.contains("not found"), "{unknown}");
+        let malformed = format!("{:?}", status("nope").await.unwrap_err());
+        assert!(malformed.contains("invalid job_id"), "{malformed}");
     }
 
     /// An omitted `session_id` must not fail at the tool boundary: the call
