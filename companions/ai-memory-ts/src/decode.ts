@@ -22,6 +22,8 @@ import type {
   ObservationHit,
   ObservationsResult,
   PageSummary,
+  ProcessingJobKind,
+  ProcessingJobStatus,
   ProjectSummary,
   QueryHit,
   Raw,
@@ -424,6 +426,26 @@ export function apiHandoff(value: unknown, where: string): ApiHandoff {
     agent: optStr(o, "agent", where),
     summary: summary === undefined ? undefined : untrusted(summary),
     redacted: flag(o, "redacted"),
+    raw: o,
+  };
+}
+
+/** The status of a processing job (`memory_processing_job_start` and `_status`). */
+export function processingJobStatus(value: unknown, where: string): ProcessingJobStatus {
+  const o = record(value, where);
+  return {
+    jobId: str(o, "job_id", where),
+    sessionId: str(o, "session_id", where),
+    kind: str(o, "kind", where) as ProcessingJobKind,
+    state: str(o, "state", where),
+    chunksTotal: num(o, "chunks_total", where),
+    chunksDone: num(o, "chunks_done", where),
+    callsUsed: num(o, "calls_used", where),
+    maxCalls: num(o, "max_calls", where),
+    waitMs: num(o, "wait_ms", where),
+    execMs: num(o, "exec_ms", where),
+    lastError: nullableStr(o, "last_error", where),
+    result: o["result"] ?? null,
     raw: o,
   };
 }

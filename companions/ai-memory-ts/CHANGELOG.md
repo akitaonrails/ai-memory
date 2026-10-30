@@ -20,6 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `jobs.start` and `jobs.status` wrap the server's durable chunked
+  session-processing tools (`memory_processing_job_start` and
+  `memory_processing_job_status`), with typed `ProcessingJobStatus`
+  (progress, call budget, redacted error, result). The server lists them only
+  with `[chunking] enabled = true`; `jobs.discover()` reports whether it does,
+  and `UnsupportedServerError` names the flag instead of a server version when
+  a call needs a tool the server hides. Existing methods are unchanged.
+  The schema snapshots now have three variants: fresh flag off
+  (`tools.json`, 25 tools), flag on (`tools.chunking.json`, 27) and flag off
+  over a data directory that holds jobs (`tools.chunking-retained.json`, 26,
+  the read-only status tool only), and the coverage table classifies the two
+  job tools as conditional. `chunksTotal` and `chunksDone` are numbers (`0`
+  before planning). `ProcessingJobStatus` also carries `waitMs` and `execMs`:
+  cumulative milliseconds of provider-call queue wait and execution.
+
 - Decoded optional query-answer context admission receipts as `answerContext` (#1684).
 
 - `query` takes the server's `memory_query` page filters: `kind`, `tier`,

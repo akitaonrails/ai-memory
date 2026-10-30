@@ -667,6 +667,7 @@ describe("capability gating", () => {
 describe("wire names", () => {
   it("each wrapper sends only arguments its coverage entry declares", async () => {
     const { server, memory } = setup();
+    server.enableChunking();
     for (const tool of Object.keys(TOOL_COVERAGE)) {
       server.tools.set(tool, () => ({}));
     }
@@ -754,6 +755,8 @@ describe("wire names", () => {
       memory.messages.list({ box: "inbox", limit: 1 }),
       memory.messages.pop({ messageId: "m", agent: "codex" }),
       memory.messages.cancel({ messageId: "m" }),
+      memory.jobs.start({ sessionId: "s", kind: "auto_improve" }),
+      memory.jobs.status({ jobId: "j" }),
     ];
     await Promise.allSettled(calls);
     const seen = new Set<string>();

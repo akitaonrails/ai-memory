@@ -117,7 +117,9 @@ companions/ai-memory-ts/
 │   ├── capabilities.ts     # initialize, tools/list, /identity probing
 │   ├── api.ts              # /api/v1 reads and pagination
 │   └── types.ts            # argument and result types
-├── schema/tools.json       # snapshot of the server's tool input schemas
+├── schema/tools.json       # snapshot of the server's tool input schemas (flag off)
+├── schema/tools.chunking.json  # same, with [chunking] enabled (two more tools)
+├── schema/tools.chunking-retained.json  # flag off over existing jobs (status tool only)
 ├── examples/               # runnable, tested in CI
 └── test/
     ├── unit/
@@ -642,6 +644,25 @@ The failure message tells the developer to run `npm run schema:update`, then
 update the method, its types, tests and docs. A second, static check confirms
 that every argument a wrapper can send exists in the snapshot, so a typo in a
 wire name fails without a server.
+
+Some tools exist only behind a server feature flag. The coverage table marks
+them with a `feature`, and the snapshot has one variant per configuration:
+`schema/tools.json` is the fresh default server (flag off, 25 tools),
+`schema/tools.chunking.json` is the server with `[chunking] enabled = true`,
+which adds `memory_processing_job_start` and `memory_processing_job_status`
+(wrapped as `jobs.start` and `jobs.status`, 27 tools), and
+`schema/tools.chunking-retained.json` is the flag-off server over a data
+directory in which an enabled run created a job: the read-only status tool is
+marked `retainedAfterDisable` and stays listed, the start tool does not (26
+tools). The drift test starts one server per variant; the third is a real
+restart over preserved data (a provider with a refusing endpoint lets the
+enabled run create the job). Each variant must list exactly the unconditional
+tools plus the tools its configuration allows: a gated tool in the default
+snapshot, a start tool in the retained one, an unclassified extra, or a
+missing required tool fails, and neither feature variant may reshape a tool
+the default lists. Without the tools, the wrappers raise
+`UnsupportedServerError` naming the flag, and `jobs.discover()` reports which
+tools the server lists.
 
 ### 5.4 Security tests
 

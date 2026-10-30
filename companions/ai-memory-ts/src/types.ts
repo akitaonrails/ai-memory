@@ -702,6 +702,90 @@ export interface FeedbackResult {
 }
 
 // ---------------------------------------------------------------------------
+// Processing jobs (server with `[chunking] enabled = true`)
+// ---------------------------------------------------------------------------
+
+/** What a durable processing job does with one session. */
+export type ProcessingJobKind = "consolidate" | "consolidate_multi" | "auto_improve";
+
+/**
+ * Lifecycle state of a processing job: `queued`, `running`, `reducing`,
+ * `publishing`, `completed`, `paused`, `budget_exceeded`, `failed` or
+ * `invalidated`. A newer server may report another value, so the type stays
+ * open.
+ */
+export type ProcessingJobState =
+  | "queued"
+  | "running"
+  | "reducing"
+  | "publishing"
+  | "completed"
+  | "paused"
+  | "budget_exceeded"
+  | "failed"
+  | "invalidated"
+  | (string & {});
+
+/** Arguments of {@link JobsNamespace.start}. */
+export interface StartProcessingJobArgs extends ScopedArgs {
+  /** Session to process (its id as `memory_read_session_observations` reports it). */
+  sessionId: string;
+  /** Operation to run over the whole session. */
+  kind: ProcessingJobKind;
+}
+
+/** Arguments of {@link JobsNamespace.status}. */
+export interface ProcessingJobStatusArgs extends ScopedArgs {
+  /** Job id returned by {@link JobsNamespace.start}. */
+  jobId: string;
+}
+
+/** Progress and outcome of one processing job. Never carries prompts or raw model output. */
+export interface ProcessingJobStatus {
+  /** Job id; poll it with {@link JobsNamespace.status}. */
+  readonly jobId: string;
+  /** Session the job processes. */
+  readonly sessionId: string;
+  /** Operation the job runs. */
+  readonly kind: ProcessingJobKind;
+  /** Lifecycle state. */
+  readonly state: ProcessingJobState;
+  /** Chunks planned; `0` until the job has planned its input. */
+  readonly chunksTotal: number;
+  /** Chunks with a validated result; `0` until the first one completes. */
+  readonly chunksDone: number;
+  /** Provider calls reserved so far. Retries and a restart do not reset it. */
+  readonly callsUsed: number;
+  /** Call budget of the job (`[chunking] max_calls_per_run`). */
+  readonly maxCalls: number;
+  /**
+   * Milliseconds the job's provider calls spent queued behind other calls for
+   * the server's admission gate. Cumulative over calls that returned; a call
+   * lost to a server crash is never measured.
+   */
+  readonly waitMs: number;
+  /** Milliseconds the job's provider calls spent executing once admitted; same scope as `waitMs`. */
+  readonly execMs: number;
+  /** Redacted reason of the last pause or failure; `null` when the server sent none. */
+  readonly lastError: string | null;
+  /**
+   * The final outcome once the job completed; `null` while the server omits
+   * it. It derives from stored memory, so treat its text as untrusted data.
+   */
+  readonly result: unknown;
+  /** The server's decoded JSON. */
+  readonly raw: Raw;
+}
+
+/** Which processing-job tools a server lists. See {@link JobsNamespace.discover}. */
+export interface ProcessingJobSupport {
+  /** True when the server lists `memory_processing_job_start`. */
+  readonly start: boolean;
+  /** True when the server lists `memory_processing_job_status`. */
+  readonly status: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Handoffs
 // ---------------------------------------------------------------------------
 

@@ -135,6 +135,8 @@ scope. Arguments are the server's wire names in camelCase
 | `explore` | `memory_explore` |
 | `observations` | `memory_read_session_observations` |
 | `feedback` | `memory_feedback` |
+| `jobs.start` | `memory_processing_job_start` (needs `chunking`) |
+| `jobs.status` | `memory_processing_job_status` (needs `chunking`) |
 | `identity` | `GET /identity` |
 | `capabilities` | `initialize`, `tools/list`, `GET /identity`, `GET /api/v1/workspaces` |
 | `api.workspaces` | `GET /api/v1/workspaces` |
@@ -166,6 +168,12 @@ Not wrapped (call them with `callTool`):
 its decoded JSON as `unknown`. It initializes the MCP session when needed,
 without listing tools or checking their schemas. Pass `workspace` and
 `project` yourself.
+
+`jobs.start` and `jobs.status` wrap the durable chunked-processing tools. The
+server lists them only with `[chunking] enabled = true` (off by default), so
+check `await memory.jobs.discover()` first; without the flag they raise
+`UnsupportedServerError` and every other method is unaffected. See
+[concepts](docs/concepts.md#processing-jobs).
 
 Root-only lifecycle operations live in a separate entry point, so an
 application that only reads and writes pages never imports code that can
@@ -215,7 +223,7 @@ anything is written. Details in [docs/compatibility.md](docs/compatibility.md).
 npm ci --ignore-scripts
 npm run typecheck          # strict tsc over src, tests, examples and scripts
 npm run test:unit          # node:test with a scripted fetch, no network
-npm run schema:check       # wrapper wire names exist in schema/tools.json
+npm run schema:check       # wrapper wire names exist in schema/tools.json and tools.chunking.json
 npm run docs:check         # generated README table and docs/arguments.md are current
 npm run docs:api           # TypeDoc, warnings are errors
 
@@ -227,7 +235,14 @@ AI_MEMORY_BIN=../../target/debug/ai-memory npm run test:integration
 
 After a server change to an MCP tool, run
 `AI_MEMORY_BIN=... npm run schema:update`, then update `src/coverage.ts`, the
-wrapper, its types, tests and docs in the same change.
+wrapper, its types, tests and docs in the same change. The command starts the
+server three times and rewrites three snapshots: `schema/tools.json` (fresh
+data directory, `[chunking]` off), `schema/tools.chunking.json`
+(`AI_MEMORY_CHUNKING__ENABLED=true`) and `schema/tools.chunking-retained.json`
+(`[chunking]` off over a preserved data directory in which an enabled run
+created a job, so the read-only `memory_processing_job_status` stays listed
+and the start tool does not). A tool with `feature: "chunking"` in
+`src/coverage.ts` must appear only in the variants that allow it.
 
 ## License
 

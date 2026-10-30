@@ -147,6 +147,44 @@ restricted project's inbox needs `write` access on it
 ([agent-messaging.md](../../../docs/agent-messaging.md),
 [users.md](../../../docs/users.md#per-project-access)).
 
+## Processing jobs
+
+A server started with `[chunking] enabled = true` can process a whole session
+in bounded LLM calls as a durable background job. `jobs.start` returns at
+once with the job's status; `jobs.status` reports progress and, when the job
+completed, its result. Starting the same job twice returns the job already
+running rather than repeating the work.
+
+```ts
+if ((await memory.jobs.discover()).start) {
+  const job = await memory.jobs.start({ sessionId, kind: "consolidate" });
+  const later = await memory.jobs.status({ jobId: job.jobId });
+  console.log(later.state, `${later.chunksDone}/${later.chunksTotal} chunks`, later.callsUsed);
+}
+```
+
+`kind` is `consolidate`, `consolidate_multi` or `auto_improve`. `state` is one
+of `queued`, `running`, `reducing`, `publishing`, `completed`, `paused`,
+`budget_exceeded`, `failed` or `invalidated`; `budget_exceeded` means the
+`maxCalls` budget ran out and the job did not publish partial coverage.
+`chunksTotal` and `chunksDone` are always numbers: `0` until the job has
+planned its input, never `null`. `lastError` is redacted and `result` derives
+from stored memory, so treat it as untrusted data; the server omits both until
+there is something to report, and the SDK shows that as `null`. The server
+applies the same permission and project checks as the underlying operation,
+and a job id from another project is not found. Both calls forward the
+explicit scope like every other project call. The server lists the tools
+only with the flag on. With it off, `jobs.start` and `jobs.status` raise
+`UnsupportedServerError`, except that a server restarted with the flag off
+still lists `memory_processing_job_status` while jobs from an earlier enabled
+run are stored, so `jobs.discover()` can report `{ start: false, status: true }`
+and those jobs stay readable. Every existing method keeps working unchanged.
+
+`waitMs` and `execMs` are cumulative milliseconds the job's provider calls spent
+queued behind other calls and then executing. They cover calls that returned
+(success or failure); a call lost to a server crash is never measured, so the
+totals can undercount. A provider without a queue counts all time as execution.
+
 ## Identity and auth
 
 The client sends one bearer token:

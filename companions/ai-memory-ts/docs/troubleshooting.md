@@ -95,6 +95,17 @@ write into an unconditional one.
 
 `api.recent` raises it when the server answers the legacy array form.
 
+`jobs.start` and `jobs.status` raise it when the server does not list
+`memory_processing_job_start` or `memory_processing_job_status`. That is the
+normal state of a server with `[chunking] enabled = false` (the default), and
+the message says so; the fix is the server's configuration, not an upgrade.
+`jobs.discover()` answers the question without an error. The server's tool
+list is cached per client, so after restarting the server with the flag on
+call `capabilities({ refresh: true })`. A cached client talking to a server
+whose flag was turned off gets a `ToolError` from the server instead: the
+server refuses a start explicitly and never falls back to the synchronous
+path.
+
 ## Uncertain timeouts
 
 A `TimeoutError` or `AbortError` with `uncertain: true` means the call could

@@ -309,10 +309,11 @@ export class UnsupportedServerError extends AiMemoryError {
   readonly minimumVersion: string;
 
   /** @internal */
-  constructor(feature: string, minimumVersion: string, serverVersion?: string) {
+  constructor(feature: string, minimumVersion: string, serverVersion?: string, note?: string) {
     super(
       "unsupported_server",
-      `the server does not support ${feature}; ai-memory ${minimumVersion} or newer is required` +
+      `the server does not support ${feature}; ` +
+        (note ?? `ai-memory ${minimumVersion} or newer is required`) +
         (serverVersion === undefined ? "" : ` (server reports ${preview(serverVersion)})`),
     );
     this.feature = feature;

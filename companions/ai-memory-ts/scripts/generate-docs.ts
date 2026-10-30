@@ -9,7 +9,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { camelCase, TOOL_COVERAGE } from "../src/coverage.js";
+import { availability, camelCase, TOOL_COVERAGE } from "../src/coverage.js";
 
 const root = new URL("../../", import.meta.url);
 const readmePath = fileURLToPath(new URL("README.md", root));
@@ -42,7 +42,8 @@ function methodTable(): string {
   const rows: [string, string][] = [];
   for (const [tool, entry] of Object.entries(TOOL_COVERAGE)) {
     if (entry.status !== "wrapped") continue;
-    for (const method of entry.methods) rows.push([method, `\`${tool}\``]);
+    const label = entry.feature === undefined ? `\`${tool}\`` : `\`${tool}\` (needs \`${entry.feature}\`)`;
+    for (const method of entry.methods) rows.push([method, label]);
   }
   const merged = new Map<string, string[]>();
   for (const [method, call] of [...rows, ...HTTP_ROWS]) {
@@ -70,6 +71,8 @@ function argumentsDoc(): string {
   for (const [tool, entry] of Object.entries(TOOL_COVERAGE)) {
     if (entry.status !== "wrapped") continue;
     lines.push(`## \`${tool}\``, "", `Methods: ${entry.methods.map((m) => `\`${m}\``).join(", ")}`, "");
+    const when = availability(entry);
+    if (when !== undefined) lines.push(`Listed only when ${when}.`, "");
     lines.push("| Wire name | SDK name |", "|---|---|");
     for (const wire of entry.sends) lines.push(`| \`${wire}\` | \`${camelCase(wire)}\` |`);
     lines.push("");

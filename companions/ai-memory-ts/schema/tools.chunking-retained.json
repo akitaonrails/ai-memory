@@ -1,0 +1,1051 @@
+{
+  "memory_auto_improve": {
+    "properties": {
+      "include_raw_fallback": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "max_input_tokens": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "max_proposals": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "min_confidence": {
+        "type": [
+          "null",
+          "number"
+        ]
+      },
+      "min_observations": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "min_session_duration_secs": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "session_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_briefing": {
+    "properties": {
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "recent_pages_limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "settled_first": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_consolidate": {
+    "properties": {
+      "dry_run": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "instructions": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "multi_page": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "session_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_delete_page": {
+    "properties": {
+      "expected_page_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "path": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "scope": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "path"
+    ]
+  },
+  "memory_explore": {
+    "properties": {
+      "focus": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "reasoning": {
+        "enum": [
+          "high",
+          "low",
+          "max",
+          "medium",
+          "minimal"
+        ],
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "recent_pages_limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_feedback": {
+    "properties": {
+      "path": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "reason": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "signal": {
+        "enum": [
+          "helpful",
+          "not_helpful",
+          "stale",
+          "wrong"
+        ],
+        "type": "string"
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "path",
+      "signal"
+    ]
+  },
+  "memory_forget_sweep": {
+    "properties": {
+      "dry_run": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_handoff_accept": {
+    "properties": {
+      "any_owner": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "cwd": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "handoff_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_handoff_begin": {
+    "properties": {
+      "cwd": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "files_touched": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "next_steps": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "open_questions": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "shared": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "summary": {
+        "type": "string"
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "summary"
+    ]
+  },
+  "memory_handoff_cancel": {
+    "properties": {
+      "any_owner": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "handoff_id": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "handoff_id"
+    ]
+  },
+  "memory_handoff_list": {
+    "properties": {
+      "any_owner": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_install_self_routing": {
+    "properties": {
+      "compact": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_lint": {
+    "properties": {
+      "dry_run": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "no_llm": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_message_cancel": {
+    "properties": {
+      "message_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_message_list": {
+    "properties": {
+      "box": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_message_pop": {
+    "properties": {
+      "agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "message_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_message_send": {
+    "properties": {
+      "body": {
+        "type": "string"
+      },
+      "evidence": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "from_project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "from_workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "nature": {
+        "enum": [
+          "inferred",
+          "measured",
+          "reported",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "subject": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "to_project": {
+        "type": "string"
+      },
+      "to_workspace": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "body",
+      "to_project",
+      "to_workspace"
+    ]
+  },
+  "memory_patch_page": {
+    "properties": {
+      "edits": {
+        "items": {
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "expected_page_id": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "edits",
+      "expected_page_id",
+      "path"
+    ]
+  },
+  "memory_processing_job_status": {
+    "properties": {
+      "job_id": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "job_id"
+    ]
+  },
+  "memory_query": {
+    "properties": {
+      "answer": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "as_of": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "explain": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "global": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "include_expired": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "include_superseded": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "kind": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "path_prefix": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "pin_first": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "query": {
+        "type": "string"
+      },
+      "reasoning": {
+        "enum": [
+          "high",
+          "low",
+          "max",
+          "medium",
+          "minimal"
+        ],
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "scopes": {
+        "items": {
+          "properties": {
+            "project": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "project",
+            "workspace"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "tag": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "tier": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  "memory_read_page": {
+    "properties": {
+      "include_related": {
+        "type": "boolean"
+      },
+      "max_chars": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "path": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "query": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "related_depth": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "scope": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_read_session_observations": {
+    "properties": {
+      "body_max_chars": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "kinds": {
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "offset": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "order": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "query": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "session_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_recent": {
+    "properties": {
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_restore_page": {
+    "properties": {
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "path": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "rev": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "path"
+    ]
+  },
+  "memory_status": {
+    "properties": {
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": []
+  },
+  "memory_write_page": {
+    "properties": {
+      "abstract": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "applies_to": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "body": {
+        "type": "string"
+      },
+      "create_only": {
+        "type": "boolean"
+      },
+      "enforced_by": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "entities": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "expected_page_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "expires_at": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "kind": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "path": {
+        "type": "string"
+      },
+      "pinned": {
+        "type": "boolean"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "relations": {
+        "additionalProperties": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": "object"
+      },
+      "scope": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "session_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "tags": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "tier": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "title": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "body",
+      "path"
+    ]
+  }
+}

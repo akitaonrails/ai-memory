@@ -173,10 +173,17 @@ jobs:
         run: cargo test --workspace --lib -- --ignored --exact commands::render_shared::tests::generated_capture_policy_v1_node_runtime_evidence
       # The optional TypeScript SDK (companions/ai-memory-ts) against the server
       # built above: integration tests, the MCP schema drift test and every
-      # example. A pull request that changes an MCP tool schema fails here
-      # until the SDK's schema snapshot is updated, even when it never touches
-      # companions/. The harness gives the server a scratch data dir, a
-      # loopback port and an environment without inherited AI_MEMORY_* values.
+      # example. The drift test starts the server for three variants: fresh
+      # with `[chunking]` off, with it on, and restarted off over a data
+      # directory in which an enabled run created a job. Each `tools/list` is
+      # compared with its committed snapshot (schema/tools.json,
+      # schema/tools.chunking.json, schema/tools.chunking-retained.json). A
+      # pull request that changes an MCP tool schema fails here until all are
+      # updated (`npm run schema:update`), even when it never touches
+      # companions/. The harness gives each server a scratch data dir, a
+      # loopback port and an environment without inherited AI_MEMORY_* values;
+      # the job-creating run points the LLM at a refusing loopback endpoint so
+      # no model is ever called.
       - name: TypeScript SDK against the real server
         if: matrix.os == 'ubuntu-latest'
         working-directory: companions/ai-memory-ts
@@ -300,7 +307,10 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
       - run: npm run test:unit
-      # Every wire argument a wrapper can send exists in schema/tools.json.
+      # Every wire argument a wrapper can send exists in schema/tools.json
+      # (flag off), schema/tools.chunking.json ([chunking] enabled) and
+      # schema/tools.chunking-retained.json (flag off over existing jobs), and
+      # each snapshot lists exactly the tools src/coverage.ts requires.
       - run: npm run schema:check
       # The README method table and docs/arguments.md match src/coverage.ts.
       - run: npm run docs:check

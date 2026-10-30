@@ -30,6 +30,30 @@ export type ToolHandler = (
 const snapshotPath = fileURLToPath(new URL("../../../schema/tools.json", import.meta.url));
 export const SNAPSHOT = JSON.parse(readFileSync(snapshotPath, "utf8")) as NormalizedTools;
 
+const OPTIONAL_TEXT = { type: ["null", "string"] };
+
+/**
+ * The two tools a server lists only with `[chunking] enabled = true`, from
+ * the frozen wire contract. The real snapshot is `schema/tools.chunking.json`;
+ * the drift test compares it with a live server, this fixture only lets the
+ * unit suite run without one.
+ */
+export const CHUNKING_TOOL_SCHEMAS: NormalizedTools = {
+  memory_processing_job_start: {
+    properties: {
+      kind: { type: "string", enum: ["auto_improve", "consolidate", "consolidate_multi"] },
+      project: OPTIONAL_TEXT,
+      session_id: { type: "string" },
+      workspace: OPTIONAL_TEXT,
+    },
+    required: ["kind", "session_id"],
+  },
+  memory_processing_job_status: {
+    properties: { job_id: { type: "string" }, project: OPTIONAL_TEXT, workspace: OPTIONAL_TEXT },
+    required: ["job_id"],
+  },
+};
+
 /** A JSON response. */
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -94,6 +118,11 @@ export class FakeServer {
   sessionId: string | undefined;
   /** Tool schemas served by `tools/list`; defaults to the snapshot. */
   schemas: NormalizedTools = structuredClone(SNAPSHOT);
+
+  /** List the processing-job tools, as a server with chunking enabled does. */
+  enableChunking(): void {
+    Object.assign(this.schemas, structuredClone(CHUNKING_TOOL_SCHEMAS));
+  }
 
   readonly fetch: FetchLike = async (input, init) => {
     const url = new URL(input);

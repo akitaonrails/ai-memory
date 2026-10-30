@@ -1,46 +1,63 @@
 /**
  * `npm run schema:check`: the static half of the drift check. Without a
- * server, confirm that the coverage table and the committed snapshot agree:
- * every snapshot tool is classified, every classified tool is in the
- * snapshot, and every wire argument a wrapper can send exists in the tool's
- * input schema. A typo in a wire name fails here.
+ * server, confirm that the coverage table and every committed snapshot agree
+ * (one snapshot per variant, see test/support/coverage-check.ts): every
+ * snapshot tool is classified, every tool a variant must list is in its
+ * snapshot, a feature-gated tool is absent from variants that do not enable
+ * it (the read-only job status excepted where earlier jobs exist), and every
+ * wire argument a wrapper can send exists in the tool's input schema. A typo
+ * in a wire name fails here.
  */
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { TOOL_COVERAGE } from "../src/coverage.js";
+import {
+  crossVariantProblems,
+  DEFAULT_VARIANT,
+  ENABLED_VARIANT,
+  RETAINED_VARIANT,
+  retainedToolProblems,
+  UPDATE_HINT,
+  variantProblems,
+  VARIANTS,
+} from "../test/support/coverage-check.js";
 import type { NormalizedTools } from "../test/support/schema.js";
 
-const snapshotPath = fileURLToPath(new URL("../../schema/tools.json", import.meta.url));
-const snapshot = JSON.parse(await readFile(snapshotPath, "utf8")) as NormalizedTools;
 const problems: string[] = [];
+const snapshots = new Map<string, NormalizedTools>();
 
-for (const tool of Object.keys(snapshot)) {
-  if (TOOL_COVERAGE[tool] === undefined) {
-    problems.push(`${tool} is in schema/tools.json but not classified in src/coverage.ts`);
-  }
-}
-for (const [tool, entry] of Object.entries(TOOL_COVERAGE)) {
-  const schema = snapshot[tool];
-  if (schema === undefined) {
-    problems.push(`${tool} is classified in src/coverage.ts but missing from schema/tools.json`);
+for (const variant of VARIANTS) {
+  const path = fileURLToPath(new URL(`../../schema/${variant.file}`, import.meta.url));
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch {
+    problems.push(`schema/${variant.file} (${variant.name}) is missing`);
     continue;
   }
-  if (entry.status !== "wrapped") continue;
-  for (const arg of entry.sends) {
-    if (!(arg in schema.properties)) {
-      problems.push(`${tool}: the SDK can send "${arg}", which the snapshot's schema lacks`);
-    }
-  }
+  const snapshot = JSON.parse(text) as NormalizedTools;
+  snapshots.set(variant.name, snapshot);
+  problems.push(...variantProblems(variant, snapshot));
+}
+const base = snapshots.get(DEFAULT_VARIANT.name);
+const enabled = snapshots.get(ENABLED_VARIANT.name);
+const retained = snapshots.get(RETAINED_VARIANT.name);
+if (base !== undefined && enabled !== undefined) {
+  problems.push(...crossVariantProblems(base, enabled, ENABLED_VARIANT.name));
+}
+if (base !== undefined && retained !== undefined) {
+  problems.push(...crossVariantProblems(base, retained, RETAINED_VARIANT.name));
+}
+if (enabled !== undefined && retained !== undefined) {
+  problems.push(...retainedToolProblems(enabled, retained));
 }
 
 if (problems.length > 0) {
   console.error(problems.join("\n"));
-  console.error(
-    "\nFix the wire name, or run `npm run schema:update` against a current server and update " +
-      "the wrapper, its types, tests and docs.",
-  );
+  console.error(`\nFix the wire name, or: ${UPDATE_HINT}`);
   process.exit(1);
 }
-console.log(`schema check passed: ${Object.keys(snapshot).length} tools classified`);
+console.log(
+  `schema check passed: ${[...snapshots].map(([name, s]) => `${name} ${Object.keys(s).length}`).join(", ")} tools classified`,
+);

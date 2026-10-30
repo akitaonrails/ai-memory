@@ -20,6 +20,24 @@ export interface ServerOptions {
   basePath?: string;
   /** Stateful streamable HTTP (`--http-stateful`). */
   stateful?: boolean;
+  /**
+   * Turn on chunked session processing (`[chunking] enabled = true`), which
+   * makes the server list the processing-job tools. Default false.
+   */
+  chunking?: boolean;
+  /**
+   * Give the server a provider whose endpoint refuses connections, so it
+   * accepts work that needs an LLM (a processing-job start creates its job)
+   * without any model ever answering. Default: no provider.
+   */
+  unreachableLlm?: boolean;
+  /** Leave the temporary directory behind on stop so a later start can reuse it. */
+  keepData?: boolean;
+  /**
+   * Start over a directory an earlier `keepData` server left. The caller owns
+   * it and removes it with {@link removeServerRoot}.
+   */
+  dataRoot?: string;
 }
 
 export interface ServerHandle {
@@ -33,7 +51,9 @@ export interface ServerHandle {
   addUser(username: string): Promise<string>;
   /** Record a completed session with three observations; returns its id. */
   seedSession(workspace: string, project: string, nativeId: string): Promise<string>;
-  /** Stop the server and remove its temporary directory. */
+  /** The temporary directory holding the data dir; see {@link removeServerRoot}. */
+  readonly root: string;
+  /** Stop the server; remove its temporary directory unless it was asked to keep it. */
   stop(): Promise<void>;
 }
 
@@ -87,7 +107,8 @@ function runCommand(
 /** Start one isolated server and wait until `/identity` answers. */
 export async function startServer(options: ServerOptions = {}): Promise<ServerHandle> {
   const bin = serverBinary();
-  const root = await mkdtemp(join(tmpdir(), "ai-memory-ts-it-"));
+  const root = options.dataRoot ?? (await mkdtemp(join(tmpdir(), "ai-memory-ts-it-")));
+  const keepRoot = options.dataRoot !== undefined || options.keepData === true;
   const home = join(root, "home");
   const data = join(root, "data");
   const tmp = join(root, "tmp");
@@ -120,6 +141,16 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
     AI_MEMORY_AUTH__TOKEN_PEPPER: `FAKEsdkpepper${randomBytes(16).toString("hex")}`,
     RUST_LOG: "off,ai_memory_cli::commands::serve=info",
     NO_COLOR: "1",
+    ...(options.chunking === true ? { AI_MEMORY_CHUNKING__ENABLED: "true" } : {}),
+    ...(options.unreachableLlm === true
+      ? {
+          AI_MEMORY_LLM_PROVIDER: "openai-compat",
+          AI_MEMORY_LLM_MODEL: "sdk-unreachable",
+          // Port 9 (discard) is closed on loopback: a request is refused, so
+          // the server holds a provider and starts jobs, and no model is ever called.
+          AI_MEMORY_LLM_BASE_URL: "http://127.0.0.1:9/v1",
+        }
+      : {}),
   };
   const args = [
     "--data-dir",
@@ -156,14 +187,14 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
       await done;
       clearTimeout(killer);
     }
-    await rm(root, { recursive: true, force: true });
+    if (!keepRoot) await rm(root, { recursive: true, force: true });
   };
 
   const deadline = Date.now() + 60_000;
   for (;;) {
     if (exited) {
       const log = await readFile(logPath, "utf8").catch(() => "");
-      await rm(root, { recursive: true, force: true });
+      if (!keepRoot) await rm(root, { recursive: true, force: true });
       throw new Error(`ai-memory exited before it was ready:\n${log.slice(-2000)}`);
     }
     if (url === "") {
@@ -231,5 +262,10 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
     return match.session_id;
   };
 
-  return { url, rootToken, cli, addUser, seedSession, stop };
+  return { url, rootToken, root, cli, addUser, seedSession, stop };
+}
+
+/** Remove a directory a `keepData` server left behind. */
+export async function removeServerRoot(root: string): Promise<void> {
+  await rm(root, { recursive: true, force: true });
 }

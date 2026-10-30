@@ -8,6 +8,7 @@
  * @module
  */
 
+import { availability, TOOL_COVERAGE } from "./coverage.js";
 import { NotFoundError, ProtocolError, UnsupportedServerError } from "./errors.js";
 import type { CallOptions, Transport } from "./transport.js";
 
@@ -152,7 +153,15 @@ export async function probeTools(
 export function requireFeature(index: ToolIndex, tool: string, args: Iterable<string>): void {
   const capability = index.tools[tool];
   if (capability === undefined) {
-    throw new UnsupportedServerError(`the ${tool} tool`, MINIMUM_SERVER_VERSION, index.server.version);
+    const entry = TOOL_COVERAGE[tool];
+    const when = entry === undefined ? undefined : availability(entry);
+    const note = when === undefined ? undefined : `the server lists it only when ${when}`;
+    throw new UnsupportedServerError(
+      `the ${tool} tool`,
+      MINIMUM_SERVER_VERSION,
+      index.server.version,
+      note,
+    );
   }
   for (const arg of args) {
     if (!capability.properties.includes(arg)) {

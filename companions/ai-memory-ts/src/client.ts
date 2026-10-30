@@ -27,6 +27,7 @@ import {
   observationsResult,
   optStr,
   queryHit,
+  processingJobStatus,
   record,
   relatedPage,
   requiredList,
@@ -85,6 +86,10 @@ import type {
   UpdatePageOptions,
   WritePageArgs,
   WritePageResult,
+  ProcessingJobStatus,
+  ProcessingJobStatusArgs,
+  ProcessingJobSupport,
+  StartProcessingJobArgs,
 } from "./types.js";
 
 /** Options of {@link AiMemoryClient}. */
@@ -662,6 +667,93 @@ export class MessagesNamespace {
   }
 }
 
+const JOB_KINDS: readonly string[] = ["consolidate", "consolidate_multi", "auto_improve"];
+
+/**
+ * Durable processing jobs that chunk a whole session through the server's
+ * LLM. The server lists these tools only when it runs with
+ * `[chunking] enabled = true`, except that a server restarted with the flag
+ * off keeps listing the read-only status tool while earlier jobs exist.
+ * Against a server that does not list a tool, its method fails with
+ * {@link UnsupportedServerError} before anything is sent;
+ * {@link JobsNamespace.discover} reports what is listed. Reach it through
+ * {@link AiMemoryClient.jobs}.
+ */
+export class JobsNamespace {
+  readonly #core: Core;
+
+  /** @internal */
+  constructor(core: Core) {
+    this.#core = core;
+  }
+
+  /**
+   * Which job tools the server lists. Both are `false` while chunking is off;
+   * a client can branch on this instead of catching the error. Calls
+   * `tools/list` (cached per client; use `capabilities({ refresh: true })`
+   * after a server restart).
+   */
+  async discover(options?: CallOptions): Promise<ProcessingJobSupport> {
+    const { tools } = await this.#core.toolIndex(options);
+    return {
+      start: Object.hasOwn(tools, "memory_processing_job_start"),
+      status: Object.hasOwn(tools, "memory_processing_job_status"),
+    };
+  }
+
+  /**
+   * Start a durable job over one whole session, or get back the compatible
+   * job already running (a retry never repeats the work). Returns at once with
+   * the job's status; poll {@link JobsNamespace.status}. The server applies
+   * the permission and project checks of the underlying operation. Calls
+   * `memory_processing_job_start`.
+   *
+   * @throws {@link ArgumentError} for an empty session id or an unknown kind.
+   * @throws {@link UnsupportedServerError} when the server has chunking off.
+   * @throws {@link ToolError} when the server refuses, for example because
+   * chunking was turned off after the tool list was cached.
+   */
+  async start(args: StartProcessingJobArgs, options?: CallOptions): Promise<ProcessingJobStatus> {
+    const where = "jobs.start";
+    const a = argsObject(args, where);
+    const scope = this.#core.scope(a.scope, where);
+    requireText(a.sessionId, "sessionId", where);
+    if (typeof a.kind !== "string" || !JOB_KINDS.includes(a.kind)) {
+      throw new ArgumentError(`${where}: kind must be one of ${JOB_KINDS.join(", ")}`);
+    }
+    const decoded = await this.#core.invoke(
+      "memory_processing_job_start",
+      wire({ ...scopeWire(scope), session_id: a.sessionId, kind: a.kind }),
+      true,
+      options,
+    );
+    return processingJobStatus(decoded, "memory_processing_job_start");
+  }
+
+  /**
+   * Progress of a job and, once it completed, its result. A job id of another
+   * project is not found. Works for jobs started before chunking was turned
+   * off when the server still lists the tool. Calls
+   * `memory_processing_job_status`.
+   *
+   * @throws {@link ArgumentError} for an empty job id.
+   * @throws {@link UnsupportedServerError} when the server does not list the tool.
+   */
+  async status(args: ProcessingJobStatusArgs, options?: CallOptions): Promise<ProcessingJobStatus> {
+    const where = "jobs.status";
+    const a = argsObject(args, where);
+    const scope = this.#core.scope(a.scope, where);
+    requireText(a.jobId, "jobId", where);
+    const decoded = await this.#core.invoke(
+      "memory_processing_job_status",
+      wire({ ...scopeWire(scope), job_id: a.jobId }),
+      false,
+      options,
+    );
+    return processingJobStatus(decoded, "memory_processing_job_status");
+  }
+}
+
 /**
  * Typed client for an ai-memory server.
  *
@@ -692,6 +784,8 @@ export class AiMemoryClient {
   readonly handoffs: HandoffsNamespace;
   /** Cross-project message tools. */
   readonly messages: MessagesNamespace;
+  /** Durable chunked-processing jobs (server with `[chunking] enabled = true`). */
+  readonly jobs: JobsNamespace;
   /** Read-only `/api/v1` routes (the server needs `--enable-api`). */
   readonly api: ApiNamespace;
 
@@ -706,6 +800,7 @@ export class AiMemoryClient {
     this.pages = new PagesNamespace(this.#core);
     this.handoffs = new HandoffsNamespace(this.#core);
     this.messages = new MessagesNamespace(this.#core);
+    this.jobs = new JobsNamespace(this.#core);
     this.api = new ApiNamespace(this.#core);
   }
 

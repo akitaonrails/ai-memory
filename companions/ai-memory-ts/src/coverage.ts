@@ -7,19 +7,44 @@
  * @module
  */
 
+/**
+ * Server feature a tool depends on. A server lists a tool with a `feature`
+ * only when the operator turned the feature on (a fresh flag-off server must
+ * not list it), except a `retainedAfterDisable` read-only tool, which a
+ * flag-off server also lists while data the feature created still exists.
+ */
+export type ToolFeature = "chunking";
+
+/**
+ * The condition under which the server lists a gated tool, as a phrase that
+ * completes "listed only when ...". Used in {@link UnsupportedServerError}
+ * and the generated docs.
+ */
+export const FEATURE_CONDITIONS: Readonly<Record<ToolFeature, string>> = {
+  chunking:
+    "chunked session processing is enabled (`[chunking] enabled = true`, restart required)",
+};
+
 /** A tool the SDK wraps. */
 export interface WrappedTool {
   readonly status: "wrapped";
   /** SDK methods that call it. */
   readonly methods: readonly string[];
   /** Phase of the design plan that added it. */
-  readonly phase: 1 | 2;
+  readonly phase: 1 | 2 | 3;
   /**
    * Every wire argument a wrapper can send. The static check confirms each
-   * exists in `schema/tools.json`; the unit suite confirms a wrapper sends
+   * exists in the matching snapshot; the unit suite confirms a wrapper sends
    * nothing outside this list.
    */
   readonly sends: readonly string[];
+  /** Present only when the server lists the tool with this feature enabled. */
+  readonly feature?: ToolFeature;
+  /**
+   * The read-only tool stays listed after the feature is turned off while
+   * data the feature created still exists; start-type tools never do.
+   */
+  readonly retainedAfterDisable?: boolean;
 }
 
 /** A tool the SDK deliberately leaves to `callTool`. */
@@ -27,6 +52,10 @@ export interface UnwrappedTool {
   readonly status: "not_exposed";
   /** Why it has no wrapper. */
   readonly reason: string;
+  /** Present only when the server lists the tool with this feature enabled. */
+  readonly feature?: ToolFeature;
+  /** See {@link WrappedTool.retainedAfterDisable}. */
+  readonly retainedAfterDisable?: boolean;
 }
 
 /** Either classification. */
@@ -214,7 +243,57 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "not_exposed",
     reason: "admin-only restore of one page from a git checkpoint; use callTool",
   },
+  memory_processing_job_start: {
+    status: "wrapped",
+    methods: ["jobs.start"],
+    phase: 3,
+    sends: [...SCOPE, "session_id", "kind"],
+    feature: "chunking",
+  },
+  memory_processing_job_status: {
+    status: "wrapped",
+    methods: ["jobs.status"],
+    phase: 3,
+    sends: [...SCOPE, "job_id"],
+    feature: "chunking",
+    retainedAfterDisable: true,
+  },
 };
+
+/**
+ * The tool names a server lists: every unconditional tool, plus the tools of
+ * each enabled feature. With `existingFeatureData`, a server that has the
+ * feature off but still stores data an enabled run created also lists the
+ * read-only tools marked `retainedAfterDisable`, never the others.
+ * `schema/tools.json` is the fresh flag-off snapshot (`[]`, no data),
+ * `schema/tools.<feature>.json` the snapshot with that feature on, and
+ * `schema/tools.<feature>-retained.json` the flag-off snapshot of a data
+ * directory an enabled run left jobs in.
+ */
+export function expectedTools(
+  features: readonly ToolFeature[],
+  existingFeatureData = false,
+): string[] {
+  return Object.entries(TOOL_COVERAGE)
+    .filter(
+      ([, entry]) =>
+        entry.feature === undefined ||
+        features.includes(entry.feature) ||
+        (existingFeatureData && entry.retainedAfterDisable === true),
+    )
+    .map(([name]) => name);
+}
+
+/**
+ * When the server lists a gated tool, as a phrase that completes "listed
+ * only when ...". Used in {@link UnsupportedServerError} and the generated
+ * docs; `undefined` for an unconditional tool.
+ */
+export function availability(entry: ToolClassification): string | undefined {
+  if (entry.feature === undefined) return undefined;
+  const condition = FEATURE_CONDITIONS[entry.feature];
+  return entry.retainedAfterDisable === true ? `${condition}, or earlier jobs from an enabled run are still stored (read-only)` : condition;
+}
 
 /** Convert a wire name to the SDK's camelCase argument name. */
 export function camelCase(wire: string): string {

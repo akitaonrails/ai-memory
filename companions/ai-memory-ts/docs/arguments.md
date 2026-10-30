@@ -253,3 +253,28 @@ Methods: `feedback`
 | `path` | `path` |
 | `signal` | `signal` |
 | `reason` | `reason` |
+
+## `memory_processing_job_start`
+
+Methods: `jobs.start`
+
+Listed only when chunked session processing is enabled (`[chunking] enabled = true`, restart required).
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `session_id` | `sessionId` |
+| `kind` | `kind` |
+
+## `memory_processing_job_status`
+
+Methods: `jobs.status`
+
+Listed only when chunked session processing is enabled (`[chunking] enabled = true`, restart required), or earlier jobs from an enabled run are still stored (read-only).
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `job_id` | `jobId` |

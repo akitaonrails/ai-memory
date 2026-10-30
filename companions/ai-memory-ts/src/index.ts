@@ -10,6 +10,7 @@
 export {
   AiMemoryClient,
   HandoffsNamespace,
+  JobsNamespace,
   MessagesNamespace,
   PagesNamespace,
   type CallToolOptions,

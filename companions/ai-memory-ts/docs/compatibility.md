@@ -16,6 +16,16 @@ the server's `tools/list` and refuses any call whose tool or argument the
 server does not list, with `UnsupportedServerError`. A development build
 reports what it serves.
 
+Some tools exist only behind a server feature flag. `memory_processing_job_start`
+and `memory_processing_job_status` (`jobs.start`, `jobs.status`) are listed only
+with `[chunking] enabled = true`, except that a server restarted with the flag
+off keeps listing the read-only status tool while jobs from an earlier enabled
+run are still stored, and never the start tool. The SDK treats their absence as
+a feature gate, not an old server, and says so in `UnsupportedServerError`. The
+committed snapshots cover all three configurations: `schema/tools.json` (fresh
+flag off, the 25 tools older SDKs know), `schema/tools.chunking.json` (flag on,
+27) and `schema/tools.chunking-retained.json` (flag off over existing jobs, 26).
+
 CI runs the integration suite, the schema drift test and every example against
 the server built from the same commit, so the newest tested server is always
 the current branch.

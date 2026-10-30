@@ -515,7 +515,9 @@ AI_MEMORY_BIN=../../target/debug/ai-memory npm run test:integration
 
 CI runs its integration tests, schema drift test and examples against the
 server built in the `test` job, so a change to an MCP tool schema fails until
-the SDK's `schema/tools.json` is updated. The design, test plan and decisions
+the SDK's `schema/tools.json`, `schema/tools.chunking.json` and
+`schema/tools.chunking-retained.json` (the tool list without `[chunking]`, with it,
+and with it off over existing jobs) are updated. The design, test plan and decisions
 are in [design-client-sdk.md](design-client-sdk.md); usage is in the package
 [README](../companions/ai-memory-ts/README.md).
 
