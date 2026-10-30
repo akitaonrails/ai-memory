@@ -193,7 +193,9 @@ baseline-vs-baseline determinism check is clean (all accuracy/token deltas `0.00
   benchmark once, on the final release candidate, and compares every slice
   with the previous release (AGENTS.md, project maintenance rules). A drop
   does not block the release: the numbers are published and an issue opens
-  for the next release to decide whether it is a regression.
+  for the next release to decide whether it is a regression. To see which
+  questions moved, run `ai-memory-eval retrieval-compare` on the two runs'
+  saved reports ([evals/README.md](../../evals/README.md)).
 - **Pre-registration.** Before the release-candidate run, write down in the
   release's tracking issue what the run is meant to show: the question, the
   slices that matter for the change, and the expected direction for each.

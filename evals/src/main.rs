@@ -1,6 +1,6 @@
 //! `ai-memory-eval` — offline evaluation harnesses for ai-memory.
 //!
-//! Four subcommands:
+//! Five subcommands:
 //!
 //! - `ab` — live A/B comparison of two LLM providers on the production
 //!   consolidation prompt, with literal-fidelity scoring (see [`ab`],
@@ -11,6 +11,8 @@
 //!   through a real `ai-memory serve` subprocess: hook-shaped ingestion,
 //!   real search stack, R@k / hit@k per question category (see
 //!   [`retrieval`] and `docs/benchmarks/`).
+//! - `retrieval-compare` — pairs two saved `retrieval` reports by question
+//!   and lists the questions whose first hit moved.
 //! - `abstention` — offline evidence-sufficiency signals, threshold sweeps,
 //!   and optional structured LLM answerability evaluation.
 
@@ -44,6 +46,9 @@ enum Command {
     Projection(projection::ProjectionArgs),
     /// Pinned retrieval benchmarks through the real server stack.
     Retrieval(Box<retrieval::RetrievalArgs>),
+    /// Pair two saved retrieval reports by question: which questions' first
+    /// hit moved, by how many cutoffs, and in which question types.
+    RetrievalCompare(retrieval::compare::CompareArgs),
     /// Offline evidence-sufficiency and abstention benchmark.
     Abstention(Box<abstention::AbstentionArgs>),
 }
@@ -61,6 +66,7 @@ async fn main() -> Result<()> {
         Command::Ab(args) => ab::run(*args).await,
         Command::Projection(args) => projection::run(args),
         Command::Retrieval(args) => retrieval::run(*args).await,
+        Command::RetrievalCompare(args) => retrieval::compare::run(args),
         Command::Abstention(args) => abstention::run(*args).await,
     }
 }
