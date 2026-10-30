@@ -899,6 +899,58 @@ fn discover_main_repo_root_fallback(start: &Path) -> Result<PathBuf, BootstrapEr
     Err(BootstrapError::NotARepo(start.to_path_buf()))
 }
 
+/// The main checkout of the linked worktree that contains `start`, or `None`
+/// when `start` is anywhere else.
+///
+/// Only a worktree that `git worktree add` linked to a main checkout answers:
+/// a main checkout, a submodule, a worktree of a bare repository, a checkout
+/// with a separate git directory and a directory outside any repository all
+/// return `None`. [`discover_main_repo_root`] takes the parent of any shared
+/// git directory instead, which for a submodule is its superproject's
+/// `.git/modules`; a caller that acts on the answer needs the shared
+/// directory to be literally `<checkout>/.git`.
+#[must_use]
+pub fn linked_worktree_main_root(start: &Path) -> Option<PathBuf> {
+    let common_dir = match git2::Repository::discover(start) {
+        Ok(repo) if repo.is_worktree() => repo.commondir().to_path_buf(),
+        Ok(_) => return None,
+        Err(_) => linked_worktree_common_dir_fallback(start)?,
+    };
+    if common_dir.file_name()? != ".git" {
+        return None;
+    }
+    common_dir.parent().map(Path::to_path_buf)
+}
+
+#[cfg(windows)]
+fn linked_worktree_common_dir_fallback(start: &Path) -> Option<PathBuf> {
+    let output = git_command()
+        .arg("-C")
+        .arg(start)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines().map(str::trim);
+    let (git_dir, common_dir) = (lines.next()?, lines.next()?);
+    // A linked worktree keeps its own git directory beside the shared one;
+    // a main checkout or a submodule has a single directory.
+    (git_dir != common_dir).then(|| PathBuf::from(common_dir))
+}
+
+#[cfg(not(windows))]
+fn linked_worktree_common_dir_fallback(_start: &Path) -> Option<PathBuf> {
+    None
+}
+
 #[cfg(any(windows, test))]
 fn main_root_from_common_dir(
     common_dir: &Path,
@@ -2366,6 +2418,91 @@ mod tests {
             root.is_none(),
             "no git repo found ⇒ no repo path in the tuple"
         );
+    }
+
+    /// Only a worktree `git worktree add` linked to a main checkout names that
+    /// checkout. The main checkout itself, a submodule (whose shared directory
+    /// sits under the superproject's `.git/modules`), a worktree of a bare
+    /// repository and a plain directory all answer `None`.
+    #[test]
+    fn linked_worktree_main_root_answers_only_for_a_linked_worktree() {
+        let tmp = TempDir::new().unwrap();
+        // A fixed identity and no signing, so the contributor's global git
+        // config cannot decide whether the fixture commits succeed.
+        let git = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(["-c", "protocol.file.allow=always"])
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} in {dir:?} failed");
+        };
+        let path = |p: &Path| p.to_str().unwrap().to_owned();
+        let initial = [
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "--allow-empty",
+            "-m",
+            "init",
+        ];
+
+        let main = tmp.path().join("api");
+        fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &initial);
+        let worktree = tmp.path().join("api-feature");
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", "feature", &path(&worktree)],
+        );
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        let expected = Some(main.canonicalize().unwrap());
+        for start in [worktree.clone(), worktree.join("src")] {
+            assert_eq!(
+                linked_worktree_main_root(&start).and_then(|root| root.canonicalize().ok()),
+                expected,
+                "{start:?}"
+            );
+        }
+        assert_eq!(linked_worktree_main_root(&main), None);
+
+        let library = tmp.path().join("library");
+        fs::create_dir_all(&library).unwrap();
+        git(&library, &["init", "-q", "-b", "main"]);
+        git(&library, &initial);
+        git(
+            &main,
+            &["submodule", "add", "-q", &path(&library), "vendor/library"],
+        );
+        assert_eq!(
+            linked_worktree_main_root(&main.join("vendor").join("library")),
+            None,
+            "a submodule is not a linked worktree"
+        );
+
+        let bare = tmp.path().join("api.git");
+        git(
+            tmp.path(),
+            &["clone", "-q", "--bare", &path(&main), &path(&bare)],
+        );
+        let bare_worktree = tmp.path().join("api-bare-feature");
+        git(
+            &bare,
+            &["worktree", "add", "-q", &path(&bare_worktree), "main"],
+        );
+        assert_eq!(
+            linked_worktree_main_root(&bare_worktree),
+            None,
+            "a bare repository has no main checkout"
+        );
+
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(linked_worktree_main_root(&plain), None);
     }
 
     // ----------------------------------------------------------------

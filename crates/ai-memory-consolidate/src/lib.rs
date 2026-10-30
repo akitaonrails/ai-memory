@@ -60,7 +60,8 @@ pub use bootstrap::{
     Bootstrap, BootstrapConfig, BootstrapError, BootstrapOutcome, BootstrapSource,
     DEFAULT_CHUNK_INPUT_TOKENS, ProjectNameStrategy, SourceCounts, SourceKind, collect_sources,
     derive_project_name, discover_main_repo_root, discover_repo_root, effective_chunk_budget,
-    path_is_git_ignored, plan_bootstrap_chunks, prune_sources_to_budget, read_identity_remotes,
+    linked_worktree_main_root, path_is_git_ignored, plan_bootstrap_chunks, prune_sources_to_budget,
+    read_identity_remotes,
 };
 pub use cold_cluster::{adaptive_eps, cosine_distance, dbscan};
 pub use compaction::build_compacted_markdown;

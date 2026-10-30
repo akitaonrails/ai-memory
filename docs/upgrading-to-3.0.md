@@ -140,6 +140,28 @@ Backfill and recovery replay now use reserved `recovery_*` idempotency keys
 ai-memory 2.6.0 or older imported can store some of those observations a
 second time. Avoid forcing a re-import of sessions you already imported.
 
+### 2.x projects are adopted from any checkout
+
+A 2.x project is named after the folder it was captured from and carries no
+repository identity. The first 3.x capture that brings the repository's
+identity claims that project in place and, with the default `identity_style`,
+renames it after the repository path (`github.com/acme/api` becomes
+`acme-api`). Its UUID, pages, sessions and grants stay attached. A capture from
+a linked worktree (`git worktree add`) claims the project named after its main
+checkout, so it does not matter which checkout captures first. When a
+worktree also had a 2.x project under its own folder name, the main
+checkout's project is the one claimed and the worktree's is left as it was;
+fold it in with `ai-memory merge-project --from <worktree-project> --into
+<project>`, which prints a dry run until you add `--confirm`.
+
+The server finds the main checkout by reading the worktree's git metadata, so
+it has to be able to read your checkouts. A server that cannot, such as one in
+a container without the host paths mounted, cannot do it. There, send the first
+capture after the upgrade from the main checkout, or set
+`project_strategy = "repo-root"` in a marker so the hooks name the main
+checkout's project on the host (see
+[Git worktrees](marker-file.md#git-worktrees--repo-root-identity)).
+
 ### Library change
 
 The `ai-memory-llm` crate no longer exports `OPENCODE_ZEN_BASE_URL`. Use

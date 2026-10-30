@@ -1050,7 +1050,10 @@ undeclared checkout with a remote, or a checkout with an explicit
   are one project.
 - An existing project with that name and no identity yet is **claimed in
   place** by the first capture that may write to it, so upgrading moves no
-  memory.
+  memory. A linked worktree (`git worktree add`) claims the project named
+  after its main checkout's folder, so it does not matter which checkout
+  captures first. The server finds the main checkout from the worktree's git
+  metadata, so this needs a server that can read the checkout.
 - If the name already belongs to a different identity, the new repository
   gets its own project, named from its owner (`github.com/orgb/api` →
   `orgb-api`, then `orgb-api-2`, …).

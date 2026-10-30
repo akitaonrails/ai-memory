@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A 2.x project is now adopted whichever checkout of its repository captures
+  first. When a linked worktree (`git worktree add`) captured before the main
+  checkout, the repository identity created a new project, every checkout then
+  followed the identity there, and the 2.x project with its pages and sessions
+  was orphaned. A worktree now claims the identity-less project named after its
+  main checkout, as the main checkout would. The server reads the worktree's
+  git metadata to find it; `docs/upgrading-to-3.0.md` covers a server that
+  cannot read the checkout (#1880).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).
