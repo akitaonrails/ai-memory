@@ -514,3 +514,108 @@ async fn an_update_on_a_missing_page_is_skipped_not_fatal() {
     assert_eq!(staged.len(), 1, "only the fresh proposal is persisted");
     assert_eq!(staged[0].target_path.as_str(), "_rules/fresh.md");
 }
+
+async fn put_page(store: &Store, ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) {
+    store
+        .writer
+        .upsert_page(NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: path.to_string(),
+            body: body.to_string(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+}
+
+fn sha(body: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(body.as_bytes()).into()
+}
+
+/// A full-page update derived from version A of a page must not be staged over
+/// a version B written after A was read: the base is checked in the staging
+/// transaction, for full pages as it always was for patches. Before the check
+/// the proposal was staged against B and its approval overwrote B without a
+/// conflict.
+#[tokio::test]
+async fn a_full_page_update_derived_from_a_replaced_version_is_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let path = "_slots/current-focus.md";
+    put_page(&store, ws, proj, path, "# Focus\n\nversion A").await;
+    let mut stale = update_proposal(path, "Focus");
+    stale.expected_base_body_sha256 = Some(sha("# Focus\n\nversion A"));
+    // somebody else edits the page after A was read
+    put_page(&store, ws, proj, path, "# Focus\n\nconcurrent version B").await;
+
+    let report = store
+        .writer
+        .stage_auto_improve_run_for_owner(run(ws, proj, vec![stale]), None)
+        .await
+        .unwrap();
+
+    assert!(report.proposal_ids.is_empty(), "nothing is staged over B");
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].target_path, path);
+    assert!(
+        store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Control for the check above: the same update whose base is still the live
+/// version stages normally and records that base; and an update without a
+/// base keeps the legacy no-precondition behavior.
+#[tokio::test]
+async fn a_full_page_update_of_the_live_version_stages_and_legacy_callers_are_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    put_page(
+        &store,
+        ws,
+        proj,
+        "_slots/current-focus.md",
+        "# Focus\n\nversion A",
+    )
+    .await;
+    put_page(&store, ws, proj, "_slots/other.md", "# Other\n\nversion A").await;
+    let mut live = update_proposal("_slots/current-focus.md", "Focus");
+    live.expected_base_body_sha256 = Some(sha("# Focus\n\nversion A"));
+    let legacy = update_proposal("_slots/other.md", "Other");
+    put_page(&store, ws, proj, "_slots/other.md", "# Other\n\nversion B").await;
+
+    let report = store
+        .writer
+        .stage_auto_improve_run_for_owner(run(ws, proj, vec![live, legacy]), None)
+        .await
+        .unwrap();
+
+    assert_eq!(report.proposal_ids.len(), 2, "{:?}", report.skipped);
+    assert!(report.skipped.is_empty());
+    let detail = store
+        .reader
+        .auto_improve_proposal_detail(ws, proj, report.proposal_ids[0])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        detail.expected_base_body_sha256,
+        Some(sha("# Focus\n\nversion A"))
+    );
+}

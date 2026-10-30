@@ -171,8 +171,10 @@ pub struct NewAutoImproveProposal {
     pub edit_mode: Option<String>,
     /// Patch operations (JSON) — required when `edit_mode == "patch"`.
     pub patch_json: Option<serde_json::Value>,
-    /// SHA-256 of the base body the patch was materialized against —
-    /// required for patches; staging fails if the live target differs.
+    /// SHA-256 of the base body the proposal was derived from — required for
+    /// patches (staging fails if the live target differs). An update of a full
+    /// page may carry it too: the proposal is then skipped, never staged over a
+    /// newer version. `None` on a full page means no precondition.
     pub expected_base_body_sha256: Option<[u8; 32]>,
 }
 
@@ -885,6 +887,20 @@ fn stage_run_impl(
                 continue;
             }
         };
+        if edit_mode != "patch"
+            && proposal.operation == AutoImproveProposalOperation::Update
+            && let Some(expected) = proposal.expected_base_body_sha256
+            && target_body_sha256_at_stage != Some(expected)
+        {
+            // Checked in the staging transaction, against the very snapshot
+            // the proposal is recorded with: a concurrent edit is never
+            // adopted as the base of a proposal derived from an older version.
+            skipped.push(SkippedProposal {
+                target_path: proposal.target_path.to_string(),
+                reason: "update proposal target changed since the review read it".into(),
+            });
+            continue;
+        }
         if edit_mode == "patch" {
             if proposal.operation != AutoImproveProposalOperation::Update {
                 return Err(StoreError::InvalidState(format!(

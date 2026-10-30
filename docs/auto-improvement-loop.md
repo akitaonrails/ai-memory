@@ -512,6 +512,10 @@ truncated before storage stays out. A chunk does not create an
   produce duplicate proposals, and eval runs once per final proposal.
 - Disjoint patches for the same target are merged before the run-wide caps and
   eval. Incompatible edits are recorded as rejected candidates.
+- Full-page current-focus updates carry the base captured for the final review
+  and eval. If that page changes or disappears before staging, the proposal is
+  skipped. A page created after an absent-base review is a create conflict,
+  never an update against the newly appeared page.
 - External eval commands have a durable start marker and result. A restart
   reuses a recorded result. If the server stopped after starting the command
   but before recording its result, the job fails explicitly rather than
