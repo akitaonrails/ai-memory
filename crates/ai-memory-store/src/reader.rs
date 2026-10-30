@@ -5690,47 +5690,9 @@ impl ReaderPool {
         receiving_session_id: Option<SessionId>,
     ) -> StoreResult<Option<InterruptedSessionCandidate>> {
         self.with_conn(move |conn| {
-            let owner_clause = match &owner_filter {
-                OwnerFilter::Any => "",
-                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
-                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
-            };
-            let receiver_clause = if receiving_session_id.is_some() {
-                " AND s.id != :receiver"
-            } else {
-                ""
-            };
-            let sql = format!(
-                "SELECT s.id, s.agent_kind, MAX(o.created_at) AS last_activity, s.cwd \
-                 FROM sessions s \
-                 JOIN observations o ON o.session_id = s.id \
-                 WHERE s.workspace_id = :ws AND s.project_id = :proj \
-                   AND (s.ended_at IS NULL OR EXISTS ( \
-                       SELECT 1 FROM observations resumed \
-                       WHERE resumed.session_id = s.id \
-                         AND resumed.workspace_id = :ws \
-                         AND resumed.project_id = :proj \
-                         AND resumed.kind IN ('user-prompt','pre-tool-use','post-tool-use') \
-                         AND resumed.created_at > s.ended_at \
-                   )) \
-                   AND o.workspace_id = :ws AND o.project_id = :proj \
-                   AND EXISTS (SELECT 1 FROM observations substantive \
-                               WHERE substantive.session_id = s.id \
-                                 AND substantive.workspace_id = :ws \
-                                 AND substantive.project_id = :proj \
-                                 AND substantive.kind IN ('user-prompt','pre-tool-use','post-tool-use'))\
-                   AND NOT EXISTS (SELECT 1 FROM handoffs h \
-                                   WHERE h.from_session_id = s.id \
-                                     AND h.workspace_id = :ws AND h.project_id = :proj \
-                                     AND h.created_at >= ( \
-                                         SELECT MAX(work.created_at) FROM observations work \
-                                         WHERE work.session_id = s.id \
-                                           AND work.workspace_id = :ws AND work.project_id = :proj \
-                                           AND work.kind IN ('user-prompt','pre-tool-use','post-tool-use'))) \
-                   {owner_clause}{receiver_clause} \
-                 GROUP BY s.id, s.agent_kind, s.started_at, s.cwd \
-                 ORDER BY last_activity DESC, s.started_at DESC, s.id DESC \
-                 LIMIT 1"
+            let sql = latest_interrupted_session_candidate_sql(
+                &owner_filter,
+                receiving_session_id.is_some(),
             );
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
@@ -14418,6 +14380,67 @@ fn session_counts_by_agent_sql(has_since: bool, owner_filter: &OwnerFilter) -> S
     )
 }
 
+/// SQL for [`ReaderPool::latest_interrupted_session_candidate`].
+///
+/// Every observation probe here filters by session, workspace and project,
+/// the shape fixed in [`sessions_for_scope_sql`]: without `sqlite_stat1` the
+/// planner answered them from `idx_observations_project_created`, and a join
+/// on observations drove the query once per observation row, rescanning the
+/// project each time, so `GET /handoff` on a large project never returned
+/// (#1879). The query drives from the scope's sessions instead, reads each
+/// session's last activity in a subquery (the `substantive` probe guarantees
+/// one in-scope row, so it is never NULL), and `INDEXED BY` pins every probe
+/// to the session index.
+fn latest_interrupted_session_candidate_sql(
+    owner_filter: &OwnerFilter,
+    has_receiver: bool,
+) -> String {
+    let owner_clause = match owner_filter {
+        OwnerFilter::Any => "",
+        OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+        OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+    };
+    let receiver_clause = if has_receiver {
+        " AND s.id != :receiver"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT s.id, s.agent_kind, \
+                (SELECT MAX(o.created_at) FROM observations o INDEXED BY idx_observations_session \
+                 WHERE o.session_id = s.id \
+                   AND o.workspace_id = :ws AND o.project_id = :proj) AS last_activity, \
+                s.cwd \
+         FROM sessions s \
+         WHERE s.workspace_id = :ws AND s.project_id = :proj \
+           AND (s.ended_at IS NULL OR EXISTS ( \
+               SELECT 1 FROM observations resumed INDEXED BY idx_observations_session \
+               WHERE resumed.session_id = s.id \
+                 AND resumed.workspace_id = :ws \
+                 AND resumed.project_id = :proj \
+                 AND resumed.kind IN ('user-prompt','pre-tool-use','post-tool-use') \
+                 AND resumed.created_at > s.ended_at \
+           )) \
+           AND EXISTS (SELECT 1 FROM observations substantive INDEXED BY idx_observations_session \
+                       WHERE substantive.session_id = s.id \
+                         AND substantive.workspace_id = :ws \
+                         AND substantive.project_id = :proj \
+                         AND substantive.kind IN ('user-prompt','pre-tool-use','post-tool-use'))\
+           AND NOT EXISTS (SELECT 1 FROM handoffs h \
+                           WHERE h.from_session_id = s.id \
+                             AND h.workspace_id = :ws AND h.project_id = :proj \
+                             AND h.created_at >= ( \
+                                 SELECT MAX(work.created_at) \
+                                 FROM observations work INDEXED BY idx_observations_session \
+                                 WHERE work.session_id = s.id \
+                                   AND work.workspace_id = :ws AND work.project_id = :proj \
+                                   AND work.kind IN ('user-prompt','pre-tool-use','post-tool-use'))) \
+           {owner_clause}{receiver_clause} \
+         ORDER BY last_activity DESC, s.started_at DESC, s.id DESC \
+         LIMIT 1"
+    )
+}
+
 /// Build the scoped session listing query (or its point lookup).
 ///
 /// The per-session observation count and the point lookup's membership
@@ -16656,6 +16679,54 @@ mod tests {
                         assert_eq!(probes.len(), 2, "{label}: {details:?}");
                     }
                     assert_session_bounded(label, &sql, &named);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_session_probes_use_the_session_index() {
+        // Same fresh-store state as `session_observation_probes_use_the_session_index`:
+        // without `sqlite_stat1` the planner answered these probes from the
+        // project index and `GET /handoff` rescanned the project per
+        // observation row (#1879).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let (ws, proj, receiver) = (WorkspaceId::new(), ProjectId::new(), SessionId::new());
+        let (ws_bytes, proj_bytes, receiver_bytes) =
+            (ws.as_bytes(), proj.as_bytes(), receiver.as_bytes());
+        let actor = "user:alice";
+        let owners = [
+            OwnerFilter::Any,
+            OwnerFilter::User(actor.into()),
+            OwnerFilter::Unattributed,
+        ];
+        for owner in &owners {
+            for has_receiver in [false, true] {
+                let mut named: Vec<(&str, &dyn rusqlite::ToSql)> =
+                    vec![(":ws", &ws_bytes), (":proj", &proj_bytes)];
+                if matches!(owner, OwnerFilter::User(_)) {
+                    named.push((":actor", &actor));
+                }
+                if has_receiver {
+                    named.push((":receiver", &receiver_bytes));
+                }
+                let sql = super::latest_interrupted_session_candidate_sql(owner, has_receiver);
+                let (details, _) = observation_probe_plan(&conn, &sql, &named);
+                for alias in ["o", "resumed", "substantive", "work"] {
+                    let probes: Vec<&String> = details
+                        .iter()
+                        .filter(|detail| detail.starts_with(&format!("SEARCH {alias} ")))
+                        .collect();
+                    assert!(
+                        !probes.is_empty()
+                            && probes
+                                .iter()
+                                .all(|detail| detail.contains("idx_observations_session")),
+                        "receiver={has_receiver} owner={owner:?}: the {alias} probe must be \
+                         bounded by session, not by project: {details:?}"
+                    );
                 }
             }
         }
