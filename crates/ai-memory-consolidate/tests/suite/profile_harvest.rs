@@ -1191,6 +1191,7 @@ struct FakeProfileLlm {
     merge_unchanged: bool,
     fail: bool,
     seen: Arc<Mutex<Vec<String>>>,
+    budgets: Arc<Mutex<Vec<(String, u32)>>>,
 }
 
 #[async_trait::async_trait]
@@ -1219,7 +1220,17 @@ impl LlmProvider for FakeProfileLlm {
         if self.fail {
             return Err(LlmError::NotConfigured("provider down".into()));
         }
+        let max_tokens = request.max_tokens;
         let system = request.system.unwrap_or_default();
+        let operation = if system.contains("You classify sentences") {
+            "classify"
+        } else {
+            "merge"
+        };
+        self.budgets
+            .lock()
+            .unwrap()
+            .push((operation.to_owned(), max_tokens));
         if system.contains("You classify sentences") {
             let payload = request.messages[0].content.clone();
             let count = payload.matches("\"index\"").count();
@@ -1263,8 +1274,20 @@ async fn the_llm_classifies_and_merges_when_configured() {
         merge_statement: "Use pnpm for every JavaScript project.".into(),
         ..FakeProfileLlm::default()
     };
-    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    let budgets = llm.budgets.clone();
+    let mut config = single_user();
+    config.settings.max_output_tokens = 4_000;
+    let report = pass_with(&fx, &config, Arc::new(llm)).await;
     assert!(report.llm_calls >= 2, "{report:?}");
+    let budgets = budgets.lock().unwrap();
+    assert!(
+        budgets.contains(&("classify".to_owned(), 4_000)),
+        "{budgets:?}"
+    );
+    assert!(
+        budgets.contains(&("merge".to_owned(), 4_000)),
+        "{budgets:?}"
+    );
     let pages = profile_pages(&fx, "_global");
     assert_eq!(pages.len(), 1, "{pages:?}");
     assert!(pages[0].0.starts_with("profile/tools/"), "{pages:?}");
