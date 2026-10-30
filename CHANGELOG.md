@@ -19,6 +19,14 @@ version in [`docs/changelog/`](docs/changelog/):
   models can spend part of it on their reasoning block before the
   structured JSON, ending the call at `finish_reason=length` and dropping
   the pass to the zero-LLM fallbacks (#1877).
+- Made workspace, project, and agent dashboard metric cards link to the
+  project list, session/event tables, Knowledge view, or harness-filtered
+  Token usage view that explains each count (#1868).
+- Added `[recovery] deliver_on_session_start = false` to `.ai-memory.toml`.
+  The per-project opt-out suppresses the unfinished-session recovery snapshot
+  and its backfill marker without closing the source session. Handoffs,
+  managed context, briefs, the profile digest and the inbox notice remain
+  independent and unchanged (#1865).
 
 ### Fixed
 

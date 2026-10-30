@@ -4,13 +4,13 @@
 <nav class="breadcrumbs" aria-label="Breadcrumb"><a href=".">Projects</a><span>/</span><a href="{{ project_href }}">{{ project }}</a><span>/</span><span aria-current="page">{{ card.label }}</span></nav>
 <div class="page-heading"><div><p class="eyebrow">AGENT INSIGHTS · {{ workspace }}</p><h1>{{ card.label }}</h1><p>Sessions, consumption and capture coverage for {{ project }}.</p></div><a class="primary-button" href="{{ card.compose_href }}">✉ Message agent</a></div>
 <div class="metric-grid four-metrics">
-  <article class="metric-card"><span>Recorded sessions</span><strong>{{ card.sessions }}</strong><small>{{ card.open }} without an end event</small></article>
-  <article class="metric-card"><span>Reported tokens</span><strong>{{ card.tokens }}</strong><small>Input + output + cache</small></article>
-  <article class="metric-card"><span>Measured calls</span><strong>{{ card.calls }}</strong><small>Deduplicated model responses</small></article>
-  <article class="metric-card"><span>Usage coverage</span><strong>{{ card.coverage }}<em>%</em></strong><small>{{ card.measured }} of {{ card.sessions }} sessions report usage</small></article>
+  <a class="metric-card metric-link" href="#agent-sessions"><span>Recorded sessions</span><strong>{{ card.sessions }}</strong><small>{{ card.open }} without an end event</small></a>
+  <a class="metric-card metric-link" href="{{ project_href }}?tab=tokens&calls_agent={{ card.kind }}#token-usage"><span>Reported tokens</span><strong>{{ card.tokens }}</strong><small>Input + output + cache</small></a>
+  <a class="metric-card metric-link" href="{{ project_href }}?tab=tokens&calls_agent={{ card.kind }}#token-usage"><span>Measured calls</span><strong>{{ card.calls }}</strong><small>Responses from this agent</small></a>
+  <a class="metric-card metric-link" href="#agent-sessions"><span>Usage coverage</span><strong>{{ card.coverage }}<em>%</em></strong><small>{{ card.measured }} of {{ card.sessions }} sessions report usage</small></a>
 </div>
 {% if card.coverage < 100 %}<div class="insight-banner"><span aria-hidden="true">◉</span><div><strong>There is a visibility gap</strong><p>{{ card.sessions - card.measured }} session(s) have no reported usage. Update this agent's client and hooks to capture model responses while it works.</p></div></div>{% endif %}
-<section class="surface section-block"><div class="section-heading panel-heading"><div><p class="eyebrow">ACTIVITY</p><h2>Sessions</h2><p>Open a session to inspect its captured responses and event timeline.</p></div></div>
+<section class="surface section-block" id="agent-sessions"><div class="section-heading panel-heading"><div><p class="eyebrow">ACTIVITY</p><h2>Sessions</h2><p>Open a session to inspect its captured responses and event timeline.</p></div></div>
 {% if sessions.is_empty() %}<div class="empty-state"><h3>No sessions on this page</h3><p>Use the previous page to return to recorded activity.</p></div>{% else %}<div class="table-scroll"><table class="ops-table"><thead><tr><th>Session</th><th>State</th><th>Started</th><th>Duration</th><th>Events</th><th>Tokens · input / output</th></tr></thead><tbody>
 {% for session in sessions %}<tr><td><a href="{{ session.href }}" class="mono">{{ session.short_id }} ↗</a></td><td><span class="status-pill {% if session.open %}status-open{% endif %}">{% if session.open %}Open{% else %}Ended{% endif %}</span></td><td>{{ session.started_relative }}</td><td>{{ session.duration }}</td><td>{{ session.observation_count }}</td><td>{{ session.tokens }}</td></tr>{% endfor %}
 </tbody></table></div>{% endif %}

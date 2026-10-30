@@ -66,6 +66,7 @@ guessed coordinates.
 | Behavior | Automated regression guard |
 | --- | --- |
 | Only the selected tab is visible/accessibility-exposed; keyboard, history, reload and old section links work | `web_dashboard_browser.mjs`: `tabs`; Rust `operations_project_tabs_have_one_default_panel_and_matching_controls` |
+| Metric cards lead to the project ordering/filter or scoped detail view that explains the count | Rust `dashboard_metric_links_sort_filter_and_reject_unknown_views`, project-page smoke assertions, and `operations_agent_totals_and_session_drilldown_do_not_multiply_tokens` |
 | Recipient filtering includes workspace and project, clears stale selection, disables empty projects and recovers | Browser `recipients`; Rust `operations_inbox_filters_initial_agents_by_both_project_coordinates` |
 | Inbox queue counts name each workspace/project, links and selectors open the matching mailbox, empty states do not claim new mail, reading leaves messages queued, collection reduces counts | Browser `mailbox-context`; Rust `operations_inbox_queue_context_hides_foreign_projects_and_preserves_mail` also refuses foreign/partial scopes and hides restricted project names with legitimate read/root controls |
 | Sidebar notifications appear for actual queued mail, refresh without reload, link to the right workspace/project, disappear after collection and clear on authorization loss | Browser `notifications`; Rust `operations_notifications_are_read_only_and_hide_restricted_projects` covers access-filtered totals, bounded links, zero state, no caching and non-consumption |

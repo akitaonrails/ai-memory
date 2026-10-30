@@ -1019,6 +1019,8 @@ async fn operations_agent_totals_and_session_drilldown_do_not_multiply_tokens() 
     let html = text(response).await;
     assert!(html.contains("Codex"));
     assert!(html.contains(&sid.to_string()));
+    assert!(html.contains("href=\"#agent-sessions\""));
+    assert!(html.contains("?tab=tokens&calls_agent=codex#token-usage"));
     let response = app
         .oneshot(
             Request::builder()

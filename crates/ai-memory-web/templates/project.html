@@ -22,11 +22,11 @@
   <div class="section-heading"><div><p class="eyebrow">AT A GLANCE</p><h2>Project overview</h2><p>Capture, activity, and pending messages. Choose a tab to explore the details.</p></div></div>
 <section id="project-capture-summary" aria-label="Project capture summary" class="section-block">
   <div class="metric-grid project-memory-grid">
-    <article class="metric-card"><span>Sessions</span><strong>{{ stats.session_count }}</strong><small>Registered activity</small></article>
-    <article class="metric-card"><span>Captured events</span><strong>{{ stats.observation_count }}</strong><small>Sanitized observations</small></article>
-    <article class="metric-card"><span>Compiled pages</span><strong>{{ stats.page_count }}</strong><small>Knowledge for recall</small></article>
-    <article class="metric-card metric-attention"><span>Open sessions</span><strong>{{ stats.open_session_count }}</strong><small>No end event received</small></article>
-    <article class="metric-card"><span>Tokens (in / out)</span><strong style="font-size:23px">{{ stats.tokens_total }}</strong><small>Reported session totals</small></article>
+    <a class="metric-card metric-link" href="{{ project_href }}?tab=sessions#session-token-table"><span>Sessions</span><strong>{{ stats.session_count }}</strong><small>Registered activity</small></a>
+    <a class="metric-card metric-link" href="{{ project_href }}?tab=sessions#session-token-table"><span>Captured events</span><strong>{{ stats.observation_count }}</strong><small>Events by session</small></a>
+    <a class="metric-card metric-link" href="{{ project_href }}?tab=knowledge#project-panel-knowledge"><span>Compiled pages</span><strong>{{ stats.page_count }}</strong><small>Knowledge for recall</small></a>
+    <a class="metric-card metric-link metric-attention" href="{{ project_href }}?tab=agents#agents"><span>Open sessions</span><strong>{{ stats.open_session_count }}</strong><small>Open counts by agent</small></a>
+    <a class="metric-card metric-link" href="{{ project_href }}?tab=tokens#token-usage"><span>Tokens (in / out)</span><strong style="font-size:23px">{{ stats.tokens_total }}</strong><small>Reported session totals</small></a>
   </div>
   <p class="mt-4 text-xs text-slate-500 dark:text-slate-400">
     {% if stats.last_activity_relative != "" %}Last capture {{ stats.last_activity_relative }}. {% endif %}
