@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Made the profile's LLM output budget configurable through
+  `[profile] max_output_tokens` (`AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS`,
+  default 2000, unchanged). The ceiling was hardcoded, and local thinking
+  models can spend part of it on their reasoning block before the
+  structured JSON, ending the call at `finish_reason=length` and dropping
+  the pass to the zero-LLM fallbacks (#1877).
+
 ### Fixed
 
 - Project search links now use the project's current stored name after
