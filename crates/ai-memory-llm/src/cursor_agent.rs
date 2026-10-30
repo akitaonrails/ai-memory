@@ -180,6 +180,10 @@ impl CursorAgentProvider {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        // Before the spawn, not inside `spawn_retrying_busy`: its ETXTBSY
+        // retries re-run the same execution and must not be charged again.
+        crate::attempt_guard::before_generation_send().await?;
+
         let mut child = spawn_retrying_busy(&mut command).await.map_err(|err| {
             LlmError::NotConfigured(format!(
                 "cursor agent CLI ({}) failed to start: {err}. Install the Cursor agent \

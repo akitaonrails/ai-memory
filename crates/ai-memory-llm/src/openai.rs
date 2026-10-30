@@ -263,6 +263,20 @@ impl OpenAiProvider {
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    /// Secret-free description of the backend this client targets: the
+    /// endpoint without credentials, query or fragment, plus the request
+    /// settings that change what the model is asked. Folded into
+    /// [`LlmProvider::cache_identity`] here and by
+    /// [`crate::OpenAiCompatProvider`].
+    pub(crate) fn backend_identity(&self) -> String {
+        format!(
+            "{} dialect={:?} thinking_off={}",
+            crate::redirect::redacted_endpoint(&self.base_url),
+            self.dialect,
+            self.disable_thinking
+        )
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -365,6 +379,10 @@ impl LlmProvider for OpenAiProvider {
 
     fn model(&self) -> &str {
         &self.model
+    }
+
+    fn cache_identity(&self) -> String {
+        format!("openai:{}|{}", self.model, self.backend_identity())
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
@@ -634,6 +652,7 @@ impl OpenAiProvider {
                 headers.apply(builder)
             }
         };
+        crate::attempt_guard::before_generation_send().await?;
         let resp = request.json(body).send().await?;
         if !resp.status().is_success() {
             return Err(provider_error(resp).await);

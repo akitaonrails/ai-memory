@@ -708,6 +708,76 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    async fn rotating_provider(
+        server: &MockServer,
+        dir: &tempfile::TempDir,
+    ) -> (CodexProvider, Arc<AtomicUsize>) {
+        let auth_path = dir.path().join("auth.json");
+        write_auth(&auth_path, "old-token", "account-secret");
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(request_path("/responses"))
+            .respond_with(RotateThenRespond {
+                auth_path: auth_path.clone(),
+                calls: calls.clone(),
+                second_status: 200,
+            })
+            .mount(server)
+            .await;
+        let provider = CodexProvider::new(
+            CodexAuth {
+                auth_file: auth_path,
+                executable: PathBuf::from("must-not-run"),
+            },
+            "gpt-5.6-luna",
+        )
+        .unwrap()
+        .with_responses_url(format!("{}/responses", server.uri()));
+        (provider, calls)
+    }
+
+    /// The 401 re-POST is a second generation send: the guard sees it, not
+    /// prepaid, and a budget that covers it lets the call recover.
+    #[tokio::test]
+    async fn guard_fires_for_the_401_resend() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, calls) = rotating_provider(&server, &dir).await;
+        let guard = crate::integration::generation_attempt_guard::RecordingGuard::new(1);
+
+        let response = crate::with_generation_attempt_guard(
+            guard.clone(),
+            provider.complete(ChatRequest::user_prompt("test")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.text, "ok");
+        assert_eq!(guard.flags(), vec![true, false]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Without budget the 401 re-POST never leaves, and the refusal is not
+    /// rewritten into a re-auth error.
+    #[tokio::test]
+    async fn refused_401_resend_is_not_sent() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, calls) = rotating_provider(&server, &dir).await;
+        let guard = crate::integration::generation_attempt_guard::RecordingGuard::new(0);
+
+        let error = crate::with_generation_attempt_guard(
+            guard.clone(),
+            provider.complete(ChatRequest::user_prompt("test")),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, LlmError::CapacityBusy(_)), "{error:?}");
+        assert_eq!(guard.flags(), vec![true, false]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn provider_does_not_loop_after_second_unauthorized_response() {
         let server = MockServer::start().await;

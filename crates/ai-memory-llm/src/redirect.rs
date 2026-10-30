@@ -12,6 +12,22 @@
 /// Same hop limit as reqwest's default policy.
 const MAX_REDIRECTS: usize = 10;
 
+/// A configured endpoint reduced to what names the backend, for cache
+/// identities: no credentials, query or fragment. An unparseable value is
+/// reported as such, never echoed, since it may embed a secret.
+pub(crate) fn redacted_endpoint(url: &str) -> String {
+    reqwest::Url::parse(url).map_or_else(
+        |_| "unparseable".to_owned(),
+        |mut url| {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        },
+    )
+}
+
 /// Follow a redirect only when it stays on the scheme, host and port of the
 /// previous request.
 pub(crate) fn same_origin_redirects() -> reqwest::redirect::Policy {

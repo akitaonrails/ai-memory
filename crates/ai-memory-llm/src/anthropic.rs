@@ -254,6 +254,14 @@ impl LlmProvider for AnthropicProvider {
         &self.model
     }
 
+    fn cache_identity(&self) -> String {
+        format!(
+            "anthropic:{}|{}",
+            self.model,
+            crate::redirect::redacted_endpoint(&self.base_url)
+        )
+    }
+
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         self.complete_with_operation_id(request, LlmOperationId::new())
             .await
@@ -447,6 +455,7 @@ impl AnthropicProvider {
                 })?,
             );
         }
+        crate::attempt_guard::before_generation_send().await?;
         let resp = headers.apply(builder).json(body).send().await?;
         if !resp.status().is_success() {
             return Err(provider_error(resp).await);

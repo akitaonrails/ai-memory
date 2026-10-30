@@ -25,6 +25,18 @@ pub trait LlmProvider: Send + Sync {
     /// The model identifier this provider will hit.
     fn model(&self) -> &str;
 
+    /// Configured backend identity for keying reusable results. Remote model
+    /// changes behind an unchanged alias are not detectable through this API.
+    ///
+    /// Defaults to `name:model`. A provider whose answers also depend on
+    /// other deterministic settings, or on several backends (a fallback
+    /// chain), overrides it; wrappers must forward it. It never contains
+    /// credentials, and it is distinct from [`Self::name`] / [`Self::model`],
+    /// which stay the primary's public labels.
+    fn cache_identity(&self) -> String {
+        format!("{}:{}", self.name(), self.model())
+    }
+
     /// Plain text completion.
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse>;
 

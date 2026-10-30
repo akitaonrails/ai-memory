@@ -169,6 +169,14 @@ impl LlmProvider for GeminiProvider {
         &self.model
     }
 
+    fn cache_identity(&self) -> String {
+        format!(
+            "gemini:{}|{}",
+            self.model,
+            crate::redirect::redacted_endpoint(&self.base_url)
+        )
+    }
+
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         let body = self.build_request(&request, None);
         let response: GeminiResponse = self.post(&body).await?;
@@ -252,6 +260,7 @@ impl GeminiProvider {
                 .header("x-goog-api-key", self.api_key.expose_secret())
                 .header("content-type", "application/json"),
         );
+        crate::attempt_guard::before_generation_send().await?;
         let resp = request.json(body).send().await?;
         if !resp.status().is_success() {
             return Err(provider_error(resp).await);

@@ -245,6 +245,16 @@ impl LlmProvider for OpenAiCompatProvider {
         self.inner.model()
     }
 
+    fn cache_identity(&self) -> String {
+        format!(
+            "{}:{}|{}|strict={}",
+            self.name_tag,
+            self.inner.model(),
+            self.inner.backend_identity(),
+            self.strict
+        )
+    }
+
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         self.complete_with_operation_id(request, LlmOperationId::new())
             .await

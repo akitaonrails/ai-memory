@@ -598,6 +598,34 @@ struct HealthRecordingLlmProvider {
     workloads: LlmWorkloadHealth,
 }
 
+impl HealthRecordingLlmProvider {
+    /// Local back-pressure is not a provider fault. An attempt guard may
+    /// refuse a retry after an earlier send; this logical call is incomplete,
+    /// and its reserved attempts remain visible in the processing-job status.
+    fn record<T>(
+        &self,
+        workload: LlmWorkload,
+        started: Instant,
+        estimated_input: u64,
+        result: &LlmResult<T>,
+        estimated_output_tokens: impl FnOnce(&T) -> u64,
+        reported_usage: impl FnOnce(&T) -> Option<Usage>,
+    ) {
+        if matches!(result, Err(LlmError::CapacityBusy(_))) {
+            return;
+        }
+        self.health.record_result(result);
+        self.workloads.record(
+            workload,
+            started.elapsed(),
+            estimated_input,
+            result,
+            estimated_output_tokens,
+            reported_usage,
+        );
+    }
+}
+
 #[async_trait]
 impl LlmProvider for HealthRecordingLlmProvider {
     fn name(&self) -> &'static str {
@@ -608,14 +636,17 @@ impl LlmProvider for HealthRecordingLlmProvider {
         self.inner.model()
     }
 
+    fn cache_identity(&self) -> String {
+        self.inner.cache_identity()
+    }
+
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         let estimated_input = estimate_request_tokens(&request);
         let started = Instant::now();
         let result = self.inner.complete(request).await;
-        self.health.record_result(&result);
-        self.workloads.record(
+        self.record(
             LlmWorkload::Unspecified,
-            started.elapsed(),
+            started,
             estimated_input,
             &result,
             |response| estimate_text_tokens(&response.text),
@@ -639,10 +670,9 @@ impl LlmProvider for HealthRecordingLlmProvider {
             .inner
             .complete_with_operation_id(request, operation_id)
             .await;
-        self.health.record_result(&result);
-        self.workloads.record(
+        self.record(
             operation_id.workload(),
-            started.elapsed(),
+            started,
             estimated_input,
             &result,
             |response| estimate_text_tokens(&response.text),
@@ -659,10 +689,9 @@ impl LlmProvider for HealthRecordingLlmProvider {
         let estimated_input = estimate_structured_input_tokens(&request, &schema);
         let started = Instant::now();
         let result = self.inner.complete_structured_raw(request, schema).await;
-        self.health.record_result(&result);
-        self.workloads.record(
+        self.record(
             LlmWorkload::Unspecified,
-            started.elapsed(),
+            started,
             estimated_input,
             &result,
             estimate_json_tokens,
@@ -683,10 +712,9 @@ impl LlmProvider for HealthRecordingLlmProvider {
             .inner
             .complete_structured_raw_with_operation_id(request, schema, operation_id)
             .await;
-        self.health.record_result(&result);
-        self.workloads.record(
+        self.record(
             operation_id.workload(),
-            started.elapsed(),
+            started,
             estimated_input,
             &result,
             estimate_json_tokens,

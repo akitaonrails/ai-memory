@@ -10,8 +10,11 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use ai_memory_llm::{
-    CURSOR_DEFAULT_MODEL, ChatRequest, CursorAgentProvider, CursorAuth, LlmProvider, ProviderAuth,
+    CURSOR_DEFAULT_MODEL, ChatRequest, CursorAgentProvider, CursorAuth, LlmError, LlmProvider,
+    ProviderAuth, with_generation_attempt_guard,
 };
+
+use super::generation_attempt_guard::RecordingGuard;
 
 fn sh_single(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -273,4 +276,34 @@ async fn a_relative_workspace_root_is_refused() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("absolute"), "{err}");
+}
+
+/// One CLI execution is one generation send: the guard fires once per call,
+/// and a refusal stops the agent from running at all.
+#[tokio::test]
+async fn the_guard_fires_per_execution_and_a_refusal_prevents_it() {
+    let dir = TempDir::new();
+    let runs = dir.0.join("runs");
+    let agent = script_agent(
+        &dir.0,
+        &format!(
+            "echo run >> {}\nprintf 'OK\\n'",
+            sh_single(&runs.display().to_string())
+        ),
+    );
+    let cursor = provider(agent, "default");
+    let guard = RecordingGuard::new(0);
+    let (first, second) = with_generation_attempt_guard(guard.clone(), async {
+        let first = cursor.complete(ChatRequest::user_prompt("hi")).await;
+        let second = cursor.complete(ChatRequest::user_prompt("hi")).await;
+        (first, second)
+    })
+    .await;
+    assert_eq!(first.unwrap().text, "OK");
+    assert!(
+        matches!(second, Err(LlmError::CapacityBusy(_))),
+        "{second:?}"
+    );
+    assert_eq!(guard.flags(), vec![true, false]);
+    assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
 }

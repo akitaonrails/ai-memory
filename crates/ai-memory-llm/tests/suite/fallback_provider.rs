@@ -107,3 +107,183 @@ async fn a_real_client_timeout_advances_to_the_next_candidate() {
         .expect("a real client timeout must advance to the next candidate");
     assert_eq!(response.text, "second answer");
 }
+
+fn chain(models: &[&str]) -> FallbackLlmProvider {
+    FallbackLlmProvider::new(
+        models
+            .iter()
+            .map(|&model| {
+                Candidate::new(
+                    "openai-compat",
+                    model,
+                    std::sync::Arc::new(compat_provider("http://localhost:9/v1", model, 5)),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The chain reports its primary's name and model, so those cannot tell two
+/// chains apart. `cache_identity` must: a different fallback model, a
+/// reordered chain and a dropped candidate each change it, while the
+/// primary's public name/model stay exactly as before.
+#[test]
+fn cache_identity_changes_with_the_fallback_set_or_order_not_the_primary() {
+    let base = chain(&["primary", "backup"]);
+    let other_backup = chain(&["primary", "other-backup"]);
+    let longer = chain(&["primary", "backup", "last"]);
+    let alone = chain(&["primary"]);
+    let reordered = chain(&["backup", "primary"]);
+
+    for same_primary in [&other_backup, &longer, &alone] {
+        assert_eq!(same_primary.name(), base.name());
+        assert_eq!(same_primary.model(), base.model());
+        assert_ne!(same_primary.cache_identity(), base.cache_identity());
+    }
+    assert_ne!(reordered.cache_identity(), base.cache_identity());
+    assert_ne!(other_backup.cache_identity(), longer.cache_identity());
+    // Deterministic: the same configuration always yields the same value.
+    assert_eq!(
+        base.cache_identity(),
+        chain(&["primary", "backup"]).cache_identity()
+    );
+}
+
+/// A plain provider keeps `name:model`; the health and admission wrappers
+/// the server always installs forward the inner identity unchanged, so the
+/// chain's identity survives them.
+#[test]
+fn cache_identity_survives_the_health_and_admission_wrappers() {
+    use std::sync::Arc;
+
+    use ai_memory_llm::{AdmittedLlmProvider, ProviderHealth};
+
+    let plain = Arc::new(
+        OpenAiCompatProvider::new("http://localhost:9/v1", None, "m").expect("provider builds"),
+    );
+    assert!(plain.cache_identity().starts_with("openai-compat:m|"));
+
+    let inner: Arc<dyn LlmProvider> = Arc::new(chain(&["primary", "backup"]));
+    let expected = inner.cache_identity();
+    let health = ProviderHealth::default();
+    let wrapped = health.wrap_llm_provider(Arc::clone(&inner), "openai-compat", "primary", None);
+    assert_eq!(wrapped.cache_identity(), expected);
+    assert_eq!(AdmittedLlmProvider::new(wrapped).cache_identity(), expected);
+}
+
+/// Backend settings that change the answer are part of the compat identity;
+/// credentials, query strings and fragments never are.
+#[test]
+fn compat_cache_identity_tracks_backend_settings_and_never_leaks_secrets() {
+    use secrecy::SecretString;
+
+    let build = |url: &str, strict: bool, disable_thinking: bool| {
+        OpenAiCompatProvider::new(url, Some(SecretString::from("sk-super-secret")), "m")
+            .expect("provider builds")
+            .with_strict(strict)
+            .with_disable_thinking(disable_thinking)
+    };
+    let base = build("http://localhost:9/v1", false, false).cache_identity();
+    assert_ne!(
+        base,
+        build("http://localhost:9/v1", true, false).cache_identity()
+    );
+    assert_ne!(
+        base,
+        build("http://localhost:9/v1", false, true).cache_identity()
+    );
+    assert_ne!(
+        base,
+        build("http://other-host:9/v1", false, false).cache_identity()
+    );
+
+    let credentialed = build(
+        "http://user:hunter2@localhost:9/v1?api_key=leak#frag",
+        false,
+        false,
+    )
+    .cache_identity();
+    for secret in [
+        "sk-super-secret",
+        "hunter2",
+        "user",
+        "api_key",
+        "leak",
+        "frag",
+    ] {
+        assert!(
+            !credentialed.contains(secret),
+            "{secret} leaked: {credentialed}"
+        );
+    }
+    // Redaction keeps the identity of the same backend stable.
+    assert_eq!(credentialed, base);
+}
+
+/// Official OpenAI, Anthropic, Gemini and OpenCode answer from whatever
+/// endpoint they are pointed at, so the endpoint is part of their identity
+/// (a gateway behind the same model name is a different backend), and a
+/// credential in the URL never is.
+#[test]
+fn native_providers_cache_identity_includes_the_redacted_endpoint() {
+    use ai_memory_llm::{
+        AnthropicProvider, GeminiProvider, OPENCODE_GO_BASE_URL, OpenAiProvider, OpenCodeProvider,
+    };
+    use secrecy::SecretString;
+
+    let key = || SecretString::from("sk-super-secret");
+    let cred_url = "https://user:hunter2@gateway.example/v1?token=leak#frag";
+    let identities = [
+        (
+            OpenAiProvider::new(key(), "m").unwrap().cache_identity(),
+            OpenAiProvider::new(key(), "m")
+                .unwrap()
+                .with_base_url(cred_url)
+                .cache_identity(),
+        ),
+        (
+            AnthropicProvider::new(key(), "m").unwrap().cache_identity(),
+            AnthropicProvider::new(key(), "m")
+                .unwrap()
+                .with_base_url(cred_url)
+                .cache_identity(),
+        ),
+        (
+            GeminiProvider::new(key(), "m").unwrap().cache_identity(),
+            GeminiProvider::new(key(), "m")
+                .unwrap()
+                .with_base_url(cred_url)
+                .cache_identity(),
+        ),
+        (
+            OpenCodeProvider::new(key(), "m").unwrap().cache_identity(),
+            OpenCodeProvider::new(key(), "m")
+                .unwrap()
+                .with_base_url(cred_url)
+                .cache_identity(),
+        ),
+    ];
+    for (default_endpoint, redirected) in identities {
+        assert_ne!(default_endpoint, redirected);
+        assert!(redirected.contains("gateway.example"), "{redirected}");
+        for secret in ["sk-super-secret", "hunter2", "token", "leak", "frag"] {
+            assert!(
+                !redirected.contains(secret),
+                "{secret} leaked: {redirected}"
+            );
+        }
+    }
+
+    // Same model name, different OpenCode catalogue: Go routes `minimax-m3`
+    // over Anthropic Messages, Zen over Chat Completions.
+    let go = OpenCodeProvider::new(key(), "minimax-m3").unwrap();
+    let zen = OpenCodeProvider::new(key(), "minimax-m3")
+        .unwrap()
+        .with_base_url("https://opencode.ai/zen/v1");
+    assert_eq!(go.model(), zen.model());
+    assert_ne!(go.cache_identity(), zen.cache_identity());
+    assert!(
+        go.cache_identity()
+            .contains(OPENCODE_GO_BASE_URL.trim_end_matches('/'))
+    );
+}

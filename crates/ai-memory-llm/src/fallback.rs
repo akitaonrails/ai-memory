@@ -142,6 +142,11 @@ impl FallbackLlmProvider {
     }
 
     fn record_error(&self, index: usize, err: &LlmError) {
+        // Local back-pressure (e.g. a refused generation attempt), not a
+        // candidate fault: leave its state untouched.
+        if matches!(err, LlmError::CapacityBusy(_)) {
+            return;
+        }
         let cooldown = err.is_transient().then(|| {
             err.retry_after()
                 .unwrap_or(CIRCUIT_COOLDOWN)
@@ -228,6 +233,20 @@ impl LlmProvider for FallbackLlmProvider {
         self.entries
             .first()
             .map_or("", |entry| entry.candidate.model.as_str())
+    }
+
+    /// Every candidate's own identity in chain order, so a different
+    /// fallback set or order is a different identity even when the primary's
+    /// name and model are unchanged. Length-prefixed, so no candidate value
+    /// can forge another's boundary.
+    fn cache_identity(&self) -> String {
+        use std::fmt::Write as _;
+        let mut identity = format!("fallback[{}]", self.entries.len());
+        for entry in &self.entries {
+            let leaf = entry.candidate.inner.cache_identity();
+            let _ = write!(identity, "|{}:{leaf}", leaf.len());
+        }
+        identity
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {

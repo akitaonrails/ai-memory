@@ -390,6 +390,7 @@ impl CopilotProvider {
                 .bearer_auth(token.access.expose_secret())
                 .headers(copilot_runtime_headers()),
         );
+        crate::attempt_guard::before_generation_send().await?;
         let resp = request.json(body).send().await.map_err(LlmError::from)?;
         if !resp.status().is_success() {
             return Err(provider_error(resp).await);
@@ -412,6 +413,7 @@ impl CopilotProvider {
                 .bearer_auth(token.access.expose_secret())
                 .headers(copilot_runtime_headers()),
         );
+        crate::attempt_guard::before_generation_send().await?;
         let resp = request.json(body).send().await.map_err(LlmError::from)?;
         if !resp.status().is_success() {
             return Err(provider_error(resp).await);

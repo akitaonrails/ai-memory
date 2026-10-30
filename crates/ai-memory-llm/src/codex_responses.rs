@@ -48,6 +48,7 @@ pub(crate) async fn post_codex_responses(
     if let Some(account_id) = auth.account_id {
         request = request.header("chatgpt-account-id", account_id);
     }
+    crate::attempt_guard::before_generation_send().await?;
     let response = request.send().await.map_err(LlmError::from)?;
     if !response.status().is_success() {
         return Err(provider_error(response).await);

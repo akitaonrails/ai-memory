@@ -154,6 +154,18 @@ impl LlmProvider for OpenCodeProvider {
         self.chat_completions.model()
     }
 
+    /// The model, the API family it is routed to and the redacted endpoint:
+    /// the same model name on Go vs Zen, or over a different transport,
+    /// answers differently.
+    fn cache_identity(&self) -> String {
+        format!(
+            "opencode:{}|{:?}|{}",
+            self.model(),
+            self.api(),
+            crate::redirect::redacted_endpoint(&self.base_url)
+        )
+    }
+
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         self.complete_with_operation_id(request, LlmOperationId::new())
             .await
@@ -469,6 +481,7 @@ impl OpenCodeResponsesProvider {
         if let Ok(value) = reqwest::header::HeaderValue::from_str(&operation_id.to_string()) {
             headers.set_default(name, value);
         }
+        crate::attempt_guard::before_generation_send().await?;
         let response = headers.apply(builder).send().await?;
         if !response.status().is_success() {
             return Err(provider_error(response).await);
