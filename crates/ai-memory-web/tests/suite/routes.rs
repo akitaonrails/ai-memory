@@ -201,6 +201,74 @@ async fn smoke_project_page_returns_200() {
     assert!(text.contains("Project capture summary"));
     assert!(text.contains("Captured events"));
     assert!(text.contains("Compiled pages"));
+    assert!(text.contains("?tab=sessions#session-token-table"));
+    assert!(text.contains("?tab=knowledge#project-panel-knowledge"));
+    assert!(text.contains("?tab=agents#agents"));
+    assert!(text.contains("?tab=tokens#token-usage"));
+}
+
+#[tokio::test]
+async fn dashboard_metric_links_sort_filter_and_reject_unknown_views() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let active = store
+        .writer
+        .get_or_create_project(ws, "active", None)
+        .await
+        .unwrap();
+    let idle = store
+        .writer
+        .get_or_create_project(ws, "idle", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(ws, idle, "idle.md", "Idle", "body"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: SessionId::new(),
+            workspace_id: ws,
+            project_id: active,
+            agent_kind: AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki);
+    let (status, html) = get_text(&app, "/?sort=open&state=open", None).await;
+    assert_eq!(status, StatusCode::OK);
+    for href in [
+        "?sort=sessions#project-list",
+        "?sort=events#project-list",
+        "?sort=pages#project-list",
+        "?sort=open&state=open#project-list",
+    ] {
+        assert!(html.contains(href), "missing metric target {href}: {html}");
+    }
+    assert!(html.contains("value=\"open\" selected"), "{html}");
+    let active_at = html.find("data-project-search=\"default active").unwrap();
+    let idle_at = html.find("data-project-search=\"default idle").unwrap();
+    assert!(active_at < idle_at, "open-session sort was not applied");
+    let idle_card = &html[idle_at..html[idle_at..].find('>').unwrap() + idle_at];
+    assert!(
+        idle_card.contains("hidden"),
+        "idle project was not filtered"
+    );
+
+    for uri in ["/?sort=unknown", "/?state=unknown"] {
+        let (status, _) = get_text(&app, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
 }
 
 #[tokio::test]

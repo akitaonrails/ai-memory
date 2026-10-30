@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use askama::Template;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
 
@@ -17,6 +17,14 @@ use crate::templates::{
 /// Projects the home page's mail summary names before saying "and N more".
 const MAIL_SUMMARY_PROJECTS: usize = 5;
 
+#[derive(Default, serde::Deserialize)]
+pub(crate) struct IndexQuery {
+    #[serde(default)]
+    sort: String,
+    #[serde(default)]
+    state: String,
+}
+
 /// Handler for `GET /`.
 ///
 /// Lists only the repositories the viewer may read once authorization is on
@@ -26,9 +34,17 @@ pub(crate) async fn handler(
     State(state): State<Arc<WebState>>,
     level: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    Query(query): Query<IndexQuery>,
 ) -> Result<Html<String>, StatusCode> {
+    if !matches!(
+        query.sort.as_str(),
+        "" | "sessions" | "events" | "pages" | "open"
+    ) || !matches!(query.state.as_str(), "" | "all" | "open")
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let viewer_id = viewer.map(|axum::Extension(viewer)| viewer.user());
-    let (summaries, counts, registered) = tokio::try_join!(
+    let (mut summaries, counts, registered) = tokio::try_join!(
         state.reader.list_projects_with_stats(viewer_id),
         // One grouped query for every card; the badge shows only where mail waits.
         state.reader.pending_inbox_counts(viewer_id),
@@ -76,6 +92,13 @@ pub(crate) async fn handler(
                 }
             }),
     };
+    match query.sort.as_str() {
+        "sessions" => summaries.sort_by_key(|item| std::cmp::Reverse(item.session_count)),
+        "events" => summaries.sort_by_key(|item| std::cmp::Reverse(item.observation_count)),
+        "pages" => summaries.sort_by_key(|item| std::cmp::Reverse(item.page_count)),
+        "open" => summaries.sort_by_key(|item| std::cmp::Reverse(item.open_session_count)),
+        _ => {}
+    }
     let projects: Vec<ProjectCard> = summaries
         .into_iter()
         .map(|s| {
@@ -139,6 +162,7 @@ pub(crate) async fn handler(
     let html = ProjectsView {
         projects,
         dashboard,
+        project_state: query.state,
         okf_dialog,
         mail_total,
         mail_projects,

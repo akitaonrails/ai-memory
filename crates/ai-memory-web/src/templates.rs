@@ -308,6 +308,8 @@ pub(crate) struct ProjectsView {
     pub projects: Vec<ProjectCard>,
     /// Privacy-preserving aggregate signals above the project cards.
     pub dashboard: DashboardStats,
+    /// Initial project-card filter selected by a metric link.
+    pub project_state: String,
     /// Present whenever a migration receipt exists (dialog dismissal is
     /// client-side, per browser).
     pub okf_dialog: Option<OkfDialog>,

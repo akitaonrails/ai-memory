@@ -978,6 +978,12 @@ session is open. The panel and session totals refresh every ten seconds. To
 enable capture, update the native client on each agent machine as well as the
 server.
 
+The metric cards are navigation controls. Workspace cards sort the project
+list by the selected count, and Open sessions also selects projects that have
+an unfinished session. Project cards open the matching Agents, Sessions,
+Knowledge, or Token usage tab. On an agent page, token and call cards open the
+project's response ledger already filtered to that harness.
+
 Responses are deduplicated by their native identity, so a partial update raises
 the stored counters instead of adding the same response again. Fresh input
 excludes cache reads. Search, signal filtering and recent ordering query all

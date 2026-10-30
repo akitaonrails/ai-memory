@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Made workspace, project, and agent dashboard metric cards link to the
+  project list, session/event tables, Knowledge view, or harness-filtered
+  Token usage view that explains each count (#1868).
 - Added `[recovery] deliver_on_session_start = false` to `.ai-memory.toml`.
   The per-project opt-out suppresses the unfinished-session recovery snapshot
   and its backfill marker without closing the source session. Handoffs,
