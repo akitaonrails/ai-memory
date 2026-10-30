@@ -270,6 +270,11 @@ pub enum StoreError {
     #[error("invalid state: {0}")]
     InvalidState(String),
 
+    /// A processing-job claim no longer owns its job: the lease was lost to a
+    /// newer claim, or the job was paused, invalidated, purged or moved.
+    #[error("processing claim is no longer active")]
+    StaleProcessingClaim,
+
     /// A live `ai-memory run` lease already owns the selected workstream.
     #[error("workstream is already active: {0}")]
     WorkstreamBusy(String),
@@ -284,6 +289,21 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    /// Whether a processing-job write failed because its claim is stale: either
+    /// the claim check of a job operation, or the V97 fence trigger aborting a
+    /// page or proposal insert made through a fenced writer handle.
+    #[must_use]
+    pub fn is_stale_processing_claim(&self) -> bool {
+        match self {
+            Self::StaleProcessingClaim => true,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, message)) => {
+                error.code == rusqlite::ErrorCode::ConstraintViolation
+                    && message.as_deref() == Some(crate::processing_jobs::STALE_CLAIM_MESSAGE)
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a hook admission failed because its cached scope was deleted or
     /// moved after resolution.
     #[must_use]

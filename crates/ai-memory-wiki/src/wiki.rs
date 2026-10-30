@@ -269,6 +269,10 @@ pub struct Wiki {
     page_locks: Arc<std::sync::Mutex<HashMap<PageKey, Arc<tokio::sync::Mutex<()>>>>>,
     #[cfg(test)]
     reindex_read_barrier: Option<Arc<tokio::sync::Barrier>>,
+    /// Test seam: pauses `write_auto_improve_sidecar` between the file write
+    /// and the post-write fence confirmation (two waits: reached, resume).
+    #[cfg(test)]
+    sidecar_written_barrier: Option<Arc<tokio::sync::Barrier>>,
     /// Scopes this process has already materialized `_meta.md` manifests for.
     /// Keeps [`Wiki::ensure_scope_manifests`] to one hash lookup per page
     /// write after the scope's first — the store query and the two manifest
@@ -308,9 +312,21 @@ impl Wiki {
             page_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             reindex_read_barrier: None,
+            #[cfg(test)]
+            sidecar_written_barrier: None,
             manifested_scopes: Arc::new(Mutex::new(HashSet::new())),
             reconcile_tombstones_deleted_pages: false,
         })
+    }
+
+    /// Replace the store writer, keeping every other setting (page locks,
+    /// mutation gate, sanitizer, admission chain). Durable processing jobs
+    /// publish through a claim-fenced writer clone so a worker that lost its
+    /// claim cannot land page or staging effects.
+    #[must_use]
+    pub fn with_writer(mut self, writer: WriterHandle) -> Self {
+        self.writer = writer;
+        self
     }
 
     /// Attach an admission webhook chain. When set, every `write_page` call
@@ -2482,7 +2498,23 @@ impl Wiki {
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
-        self.git.write_atomic(&path, content.as_bytes())?;
+        if !self.writer.has_processing_fence() {
+            self.git.write_atomic(&path, content.as_bytes())?;
+            return Ok(path);
+        }
+        let installed = replace_file_with_rollback_snapshot(&self.git, &path, content.as_bytes())?;
+        // The file cannot be fenced itself: prove the claim afterwards and
+        // undo the write when it was lost, so a purged or taken-over job
+        // never leaves a sidecar behind.
+        #[cfg(test)]
+        if let Some(barrier) = &self.sidecar_written_barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
+        if let Err(lost) = self.writer.confirm_processing_fence().await {
+            rollback_or_inconsistent(&self.git, &[installed], &lost)?;
+            return Err(lost.into());
+        }
         Ok(path)
     }
 
@@ -5545,6 +5577,182 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// A claimed processing job in the scope, and a wiki whose writer is fenced
+    /// by that claim plus the barrier pausing a sidecar write after its file lands.
+    async fn fenced_sidecar_wiki(
+        store: &Store,
+        wiki: &Wiki,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> (
+        ai_memory_store::ProcessingClaim,
+        Wiki,
+        Arc<tokio::sync::Barrier>,
+    ) {
+        use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+        let session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(ai_memory_core::Sanitized::new(
+                NewObservation {
+                    occurred_at: Some(1_700_000_000_000_000),
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "t".into(),
+                    body: "body".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .create_processing_job(ai_memory_store::NewProcessingJob {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: session,
+                kind: ai_memory_core::ProcessingJobKind::Consolidate,
+                actor: ActorContext::default(),
+                author_id: None,
+                viewer: None,
+                owner: None,
+                options_json: serde_json::json!({}),
+                context_fingerprint: "ctx".into(),
+                max_calls: 4,
+            })
+            .await
+            .unwrap();
+        let claim = store
+            .writer
+            .claim_next_processing_job(std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap()
+            .claim;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut fenced = wiki.clone().with_writer(store.writer.fenced(&claim));
+        fenced.sidecar_written_barrier = Some(barrier.clone());
+        (claim, fenced, barrier)
+    }
+
+    #[tokio::test]
+    async fn sidecar_claim_lost_after_file_write_restores_previous_file() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let id = stage_one(&store, ws, proj, "notes/proposed.md", "proposed body").await;
+        let path = wiki.auto_improve_sidecar_path(ws, proj, id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        for previous in [Some("previous sidecar"), None] {
+            match previous {
+                Some(text) => std::fs::write(&path, text).unwrap(),
+                None => std::fs::remove_file(&path).unwrap(),
+            }
+            let (claim, fenced, barrier) = fenced_sidecar_wiki(&store, &wiki, ws, proj).await;
+            let write =
+                tokio::spawn(async move { fenced.write_auto_improve_sidecar(ws, proj, id).await });
+            barrier.wait().await;
+            // The file is on disk while the claim is still unproven.
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("proposed body")
+            );
+            store.writer.release_processing_job(&claim).await.unwrap();
+            barrier.wait().await;
+
+            let err = write
+                .await
+                .unwrap()
+                .expect_err("lost claim must fail the write");
+            assert!(
+                matches!(&err, WikiError::Store(e) if e.is_stale_processing_claim()),
+                "{err:?}"
+            );
+            match previous {
+                Some(text) => assert_eq!(std::fs::read_to_string(&path).unwrap(), text),
+                None => assert!(!path.exists(), "stale sidecar must not remain"),
+            }
+            // Drain the released job so the next iteration claims its own.
+            store
+                .writer
+                .claim_next_processing_job(std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sidecar_with_a_valid_claim_is_written_and_kept() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let id = stage_one(&store, ws, proj, "notes/proposed.md", "proposed body").await;
+        let (claim, fenced, barrier) = fenced_sidecar_wiki(&store, &wiki, ws, proj).await;
+        let write =
+            tokio::spawn(async move { fenced.write_auto_improve_sidecar(ws, proj, id).await });
+        barrier.wait().await;
+        barrier.wait().await;
+
+        let path = write.await.unwrap().unwrap();
+        assert_eq!(path, wiki.auto_improve_sidecar_path(ws, proj, id));
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("proposed body")
+        );
+        // The confirmation renewed, not consumed, the claim.
+        store
+            .writer
+            .renew_processing_job(&claim, std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sidecar_rollback_failure_is_reported_as_inconsistent_state() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let id = stage_one(&store, ws, proj, "notes/proposed.md", "proposed body").await;
+        let path = wiki.auto_improve_sidecar_path(ws, proj, id);
+        let (claim, fenced, barrier) = fenced_sidecar_wiki(&store, &wiki, ws, proj).await;
+        let write =
+            tokio::spawn(async move { fenced.write_auto_improve_sidecar(ws, proj, id).await });
+        barrier.wait().await;
+        // A directory where the file was makes the undo (remove) fail.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        store.writer.release_processing_job(&claim).await.unwrap();
+        barrier.wait().await;
+
+        let err = write
+            .await
+            .unwrap()
+            .expect_err("lost claim must fail the write");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("INCONSISTENT STATE") && msg.contains("rollback failed"),
+            "a failed rollback must not be swallowed: {msg}"
         );
     }
 

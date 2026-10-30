@@ -8,6 +8,7 @@
 pub mod active_project;
 pub mod actor;
 pub mod agent_backup;
+pub mod chunking;
 pub mod compaction_recap;
 pub mod error;
 pub mod excerpt;
@@ -23,6 +24,8 @@ pub mod message;
 pub mod observation;
 pub mod okf;
 pub mod page;
+pub mod processing_job;
+pub use processing_job::{ProcessingJobKind, ProcessingJobState, ProcessingJobStatus};
 pub mod profile;
 pub mod repository_identity;
 pub use repository_identity::{MARKER_FILENAME, MARKER_FILENAMES};
@@ -74,9 +77,9 @@ pub use handoff::{
 };
 pub use ids::{
     AgentKind, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId,
-    ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId,
-    UserId, WorkspaceId, WorkstreamId, is_dos_device_name, is_git_reserved_component,
-    portable_page_key,
+    ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProcessingJobId,
+    ProjectId, SessionId, UserId, WorkspaceId, WorkstreamId, is_dos_device_name,
+    is_git_reserved_component, portable_page_key,
 };
 pub use message::{
     AgentMessage, MessageBox, MessageClaim, MessageNature, MessageOrigin, MessageState,

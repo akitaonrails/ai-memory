@@ -53,6 +53,19 @@ pub struct StartupContextAcceptance {
 
 /// Commands accepted by the writer thread.
 pub(crate) enum WriteCmd {
+    /// A durable processing-job operation (see `processing_jobs`).
+    Processing {
+        op: crate::processing_jobs::ProcessingOp,
+        reply: oneshot::Sender<StoreResult<crate::processing_jobs::ProcessingReply>>,
+    },
+    /// A command run with a processing claim armed (see `WriterHandle::fenced`).
+    Fenced {
+        claim: crate::processing_jobs::ProcessingClaim,
+        cmd: Box<WriteCmd>,
+        /// Answered before `cmd` runs: `Ok` once the claim was checked and
+        /// armed, `Err` (and `cmd` dropped unexecuted) when it is stale.
+        gate: oneshot::Sender<StoreResult<()>>,
+    },
     GetOrCreateWorkspace {
         name: String,
         reply: oneshot::Sender<StoreResult<WorkspaceId>>,
@@ -894,6 +907,8 @@ pub(crate) enum WriteCmd {
 #[derive(Clone)]
 pub struct WriterHandle {
     inner: Arc<WriterInner>,
+    /// Processing claim armed around every command; see [`Self::fenced`].
+    fence: Option<crate::processing_jobs::ProcessingClaim>,
 }
 
 struct WriterInner {
@@ -919,6 +934,7 @@ impl WriterHandle {
                 #[cfg(test)]
                 before_join: None,
             }),
+            fence: None,
         }
     }
 
@@ -3828,14 +3844,75 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Whether commands from this handle require an active processing claim.
+    #[must_use]
+    pub fn has_processing_fence(&self) -> bool {
+        self.fence.is_some()
+    }
+
+    /// For a fenced handle, prove the claim still owns its job right now
+    /// (renewing its lease); an unfenced handle always passes. Lets a
+    /// filesystem effect that cannot itself be fenced be checked after the
+    /// write and undone on a loss.
+    ///
+    /// # Errors
+    /// [`StoreError::StaleProcessingClaim`] when ownership was lost.
+    pub async fn confirm_processing_fence(&self) -> StoreResult<()> {
+        match self.fence.as_ref() {
+            None => Ok(()),
+            Some(claim) => self
+                .renew_processing_job(claim, std::time::Duration::from_secs(120))
+                .await
+                .map(|_| ()),
+        }
+    }
+
+    /// Clone of this handle that runs every command with `claim` armed.
+    pub(crate) fn with_processing_fence(
+        &self,
+        claim: crate::processing_jobs::ProcessingClaim,
+    ) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            fence: Some(claim),
+        }
+    }
+
+    pub(crate) async fn processing_op(
+        &self,
+        op: crate::processing_jobs::ProcessingOp,
+    ) -> StoreResult<crate::processing_jobs::ProcessingReply> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::Processing { op, reply: tx }).await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     async fn send(&self, cmd: WriteCmd) -> StoreResult<()> {
+        let (cmd, gate) = match &self.fence {
+            Some(claim) => {
+                let (gate, gate_rx) = oneshot::channel();
+                let wrapped = WriteCmd::Fenced {
+                    claim: claim.clone(),
+                    cmd: Box::new(cmd),
+                    gate,
+                };
+                (wrapped, Some(gate_rx))
+            }
+            None => (cmd, None),
+        };
         self.inner
             .tx
             .as_ref()
             .ok_or(StoreError::WriterClosed)?
             .send(cmd)
             .await
-            .map_err(|_| StoreError::WriterClosed)
+            .map_err(|_| StoreError::WriterClosed)?;
+        match gate {
+            // The writer answers the gate before running the command, so a
+            // stale claim surfaces here instead of as a dropped reply.
+            Some(gate) => gate.await.map_err(|_| StoreError::WriterClosed)?,
+            None => Ok(()),
+        }
     }
 }
 
@@ -3879,7 +3956,32 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
     // this actor performs every project insert, so no creation path can
     // forget to apply it.
     let mut new_project_mode = crate::AccessMode::Open;
+    // Connection-local fence for processing-job publication effects.
+    if let Err(e) = crate::processing_jobs::install_write_fence(&conn) {
+        tracing::warn!(error = %e, "failed to install processing write fence");
+        return;
+    }
     while let Some(cmd) = rx.blocking_recv() {
+        let mut fence_armed = false;
+        let cmd = match cmd {
+            WriteCmd::Fenced { claim, cmd, gate } => {
+                // Checked here, then armed for exactly this command: the
+                // connection-local triggers re-check inside each guarded
+                // write's own transaction.
+                match crate::processing_jobs::prepare_fence(&conn, &claim) {
+                    Ok(()) => {
+                        let _ = gate.send(Ok(()));
+                        fence_armed = true;
+                        *cmd
+                    }
+                    Err(e) => {
+                        let _ = gate.send(Err(e));
+                        continue;
+                    }
+                }
+            }
+            other => other,
+        };
         match cmd {
             WriteCmd::SetNewProjectMode { mode, reply } => {
                 new_project_mode = mode;
@@ -5326,6 +5428,20 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::workstream::rename(&mut conn, &input);
                 send_or_warn(reply, result, "rename_workstream");
             }
+            WriteCmd::Processing { op, reply } => {
+                let result = crate::processing_jobs::dispatch(&mut conn, op);
+                send_or_warn(reply, result, "processing_job");
+            }
+            // `send` wraps a command once; a nested wrapper has no owner to
+            // answer, so dropping it surfaces as `WriterClosed` to the caller.
+            WriteCmd::Fenced { gate, .. } => {
+                let _ = gate.send(Err(StoreError::InvalidState(
+                    "nested processing fence".into(),
+                )));
+            }
+        }
+        if fence_armed && let Err(e) = crate::processing_jobs::clear_fence(&conn) {
+            tracing::warn!(error = %e, "failed to clear processing write fence");
         }
     }
     tracing::debug!("writer thread exiting cleanly");
@@ -5338,6 +5454,27 @@ mod tests {
     use ai_memory_core::{NewPage, PagePath, Tier};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn incomplete_publication_guards_refuse_all_writer_commands() {
+        for missing_guard_table in [false, true] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            crate::migrations::run(&mut conn).unwrap();
+            if missing_guard_table {
+                conn.execute_batch("DROP TABLE page_evidence").unwrap();
+            }
+            let writer = WriterHandle::spawn(conn);
+            let result = writer.get_or_create_workspace("guard-check").await;
+            if missing_guard_table {
+                assert!(
+                    matches!(result, Err(StoreError::WriterClosed)),
+                    "{result:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
 
     fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {
         NewPage {

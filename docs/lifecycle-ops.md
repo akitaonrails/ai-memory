@@ -1392,6 +1392,11 @@ What is not rebuilt:
 
 - Sessions, observations, handoffs, users/tokens, audit rows, access counters,
   and embeddings. Those are DB-only state; keep a backup if you need them.
+- Chunked processing jobs (`[chunking]`: manifests, checkpoints, reserved call
+  counts, publication records). They are derived state tied to sessions, so a
+  store that holds one is never a clean reindex target, and a rebuilt store
+  starts with none. Pages already published stay in the wiki and need no job
+  state to be recovered.
 
 Every scope directory carries the `_meta.md` manifest `reindex` reads its
 workspace/project name from. Identity-backed project manifests also carry

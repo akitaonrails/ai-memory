@@ -4816,6 +4816,10 @@ pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "NOT EXISTS ( \
     SELECT 1 FROM session_consolidation_jobs j \
     WHERE j.session_id = s.id \
       AND j.state IN ('pending', 'running') \
+) AND NOT EXISTS ( \
+    SELECT 1 FROM processing_jobs pj \
+    WHERE pj.session_id = s.id \
+      AND pj.state IN ('queued', 'running', 'reducing', 'publishing', 'paused', 'budget_exceeded') \
 ) AND s.ended_observation_count >= ( \
     SELECT COUNT(*) FROM observations current \
     WHERE current.session_id = s.id \
@@ -6266,6 +6270,14 @@ pub fn reorg_sessions(
             ],
         )?;
         observations_updated += obs_rows;
+        // Active processing jobs read the old project; invalidate them here and
+        // let finished ones follow the session.
+        crate::processing_jobs::invalidate_and_restamp_session(
+            &tx,
+            session_id.as_bytes(),
+            workspace_id.as_bytes(),
+            new_project_id.as_bytes(),
+        )?;
     }
     // Graveyard only this workspace's latest pages; sibling workspaces may
     // have already-consolidated pages that must remain current. Both
@@ -8114,6 +8126,14 @@ pub fn move_project_workspace(
         "UPDATE session_consolidation_jobs SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
+    // An active processing job reads the old scope; it cannot finish in the
+    // new one, so it is invalidated in this transaction. Finished jobs keep
+    // their results and follow the project.
+    crate::processing_jobs::invalidate_project_jobs(&tx, &pid[..])?;
+    tx.execute(
+        "UPDATE processing_jobs SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )?;
     let workstreams_moved = tx.execute(
         "UPDATE workstreams SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
@@ -8383,6 +8403,7 @@ pub fn merge_project(
                AND d.target_path = auto_improve_proposals.target_path)",
         params![src, dst, now],
     )?;
+    crate::processing_jobs::invalidate_project_jobs(&tx, &src[..])?;
     for table in [
         "audit_log",
         "auto_improve_runs",
@@ -8390,6 +8411,7 @@ pub fn merge_project(
         "auto_improve_rejections",
         "auto_improve_scheduler_claims",
         "session_consolidation_jobs",
+        "processing_jobs",
         "page_feedback",
         "purged_sessions",
     ] {
@@ -8864,6 +8886,14 @@ pub fn move_session(
     summary.consolidation_jobs = restamp("session_consolidation_jobs", "session_id")?;
     summary.auto_improve_runs = restamp("auto_improve_runs", "session_id")?;
     summary.auto_improve_claims = restamp("auto_improve_scheduler_claims", "session_id")?;
+    // Active processing jobs of the session read the old scope; invalidate them
+    // in this transaction, then follow the session with the finished ones.
+    crate::processing_jobs::invalidate_and_restamp_session(
+        &tx,
+        &sid[..],
+        &to_ws[..],
+        &to_proj[..],
+    )?;
 
     // Profile evidence harvested from this session's prompts, keyed by
     // `session:<id>`. Re-stamped so later convergence attributes the

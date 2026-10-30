@@ -335,3 +335,76 @@ async fn the_dry_run_count_equals_the_prune_deletes_in_every_job_state() {
         assert_case(&m, state);
     }
 }
+
+/// Start a durable processing job for session 10 and force it into `state`,
+/// the way a worker's lifecycle would leave it.
+async fn processing_job_in_state(store: &Store, state: &str) {
+    use ai_memory_core::{ActorContext, ProcessingJobKind};
+    use ai_memory_store::NewProcessingJob;
+
+    store
+        .writer
+        .create_processing_job(NewProcessingJob {
+            workspace_id: ws(),
+            project_id: proj(),
+            session_id: s1(),
+            kind: ProcessingJobKind::Consolidate,
+            actor: ActorContext::default(),
+            author_id: None,
+            viewer: None,
+            owner: None,
+            options_json: serde_json::json!({}),
+            context_fingerprint: "ctx".into(),
+            max_calls: 8,
+        })
+        .await
+        .unwrap();
+    let conn = Connection::open(store.db_path()).unwrap();
+    conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+    conn.execute(
+        "UPDATE processing_jobs SET state = ?1 WHERE session_id = ?2",
+        params![state, s1().as_bytes()],
+    )
+    .unwrap();
+}
+
+/// A chunked job reads the whole stored session over many provider calls, so
+/// every state that can still read it (including a paused or budget-limited
+/// one that resumes later) keeps the raw capture, while the job-less sibling
+/// is pruned in the same batch and the dry run agrees with the delete.
+#[tokio::test]
+async fn an_unfinished_processing_job_protects_the_session_it_will_read() {
+    for state in [
+        "queued",
+        "running",
+        "reducing",
+        "publishing",
+        "paused",
+        "budget_exceeded",
+    ] {
+        let (_tmp, store) = open_seeded(None);
+        processing_job_in_state(&store, state).await;
+        let m = measure(&store).await;
+        assert_eq!(
+            m.count_before, m.deleted,
+            "dry run equals prune for {state}"
+        );
+        assert_case(&m, Some("pending"));
+    }
+}
+
+/// Legitimate control: a finished, failed or invalidated job reads nothing
+/// any more, so it must not pin the raw capture forever.
+#[tokio::test]
+async fn a_finished_processing_job_does_not_pin_the_session() {
+    for state in ["completed", "failed", "invalidated"] {
+        let (_tmp, store) = open_seeded(None);
+        processing_job_in_state(&store, state).await;
+        let m = measure(&store).await;
+        assert_eq!(
+            m.count_before, m.deleted,
+            "dry run equals prune for {state}"
+        );
+        assert_case(&m, None);
+    }
+}

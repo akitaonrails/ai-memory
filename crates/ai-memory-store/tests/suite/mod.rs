@@ -22,6 +22,7 @@ mod multi_session;
 mod observation_prune;
 mod page_first_created;
 mod pinned_pages;
+mod processing_jobs;
 mod profile;
 mod project_authz;
 mod project_link_graph;

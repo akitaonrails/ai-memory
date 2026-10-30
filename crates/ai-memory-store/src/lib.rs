@@ -26,6 +26,7 @@ mod maintenance;
 mod migrations;
 mod ops;
 pub mod password;
+pub mod processing_jobs;
 mod profile;
 mod provenance;
 pub use provenance::{PageDisagreement, PageProvenance, PageSource};
@@ -76,6 +77,12 @@ pub use ops::{
     RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason, SkippedSessionTimes,
     StaleAfterRepair, backfill_entity_index, backfill_page_windows,
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
+};
+pub use processing_jobs::{
+    CallReservation, ClaimedProcessingJob, NewProcessingJob, ProcessingCheckpoint, ProcessingClaim,
+    ProcessingEffect, ProcessingJobCreated, ProcessingManifestEntry, ProcessingNode,
+    ProcessingNodeState, ProcessingNodeWrite, ProcessingOutcome, ProcessingOwnerFilter,
+    ProcessingPublication, ProcessingSource,
 };
 pub use profile::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_ENTRIES_LIMIT, PROFILE_HARVEST_BATCH,

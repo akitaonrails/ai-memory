@@ -2487,4 +2487,39 @@ mod tests {
             "a claimed identity must stay unique per workspace"
         );
     }
+    #[test]
+    fn v97_adds_processing_tables_and_keeps_the_fence_out_of_the_shared_schema() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 96).unwrap();
+        let before = applied_versions(&conn);
+        run_to(&mut conn, 97).unwrap();
+        let mut expected = before;
+        expected.push(97);
+        assert_eq!(applied_versions(&conn), expected);
+        for (kind, name) in [
+            ("table", "processing_jobs"),
+            ("table", "processing_job_observations"),
+            ("table", "processing_job_nodes"),
+            ("table", "processing_job_effects"),
+            ("index", "idx_processing_jobs_equivalence"),
+            ("trigger", "observations_processing_invalidate_au"),
+            ("trigger", "observations_processing_invalidate_ad"),
+        ] {
+            assert_eq!(schema_object_count(&conn, kind, name), 1, "missing {name}");
+        }
+        // The armed claim must never live in the file every writer shares.
+        assert_eq!(
+            schema_object_count(&conn, "table", "processing_write_fence"),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%processing_fence%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
 }
