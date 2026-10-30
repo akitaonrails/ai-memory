@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Added `[recovery] deliver_on_session_start = false` to `.ai-memory.toml`.
+  The per-project opt-out suppresses the unfinished-session recovery snapshot
+  and its backfill marker without closing the source session. Handoffs,
+  managed context, briefs, the profile digest and the inbox notice remain
+  independent and unchanged (#1865).
+
 ### Fixed
 
 - Project search links now use the project's current stored name after

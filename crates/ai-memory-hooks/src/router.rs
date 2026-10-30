@@ -1698,6 +1698,11 @@ pub struct HandoffQuery {
     /// handoff stays open and unclaimed, and the rest of the on-start context
     /// is delivered as usual. Absent or anything else delivers as before.
     pub handoff: Option<String>,
+    /// The marker's `[recovery] deliver_on_session_start`, sent as `0` only
+    /// when the project opted out. An explicit falsy value suppresses only the
+    /// unfinished-session recovery snapshot and its backfill marker. Absent or
+    /// anything else delivers recovery as before.
+    pub recovery: Option<String>,
 }
 
 impl HandoffQuery {
@@ -1853,14 +1858,13 @@ async fn fetch_and_accept_handoff_at(
     // demand instead of continuously duplicating an in-flight transcript.
     // The source row stays open because it may belong to a legitimate parallel
     // agent; the packet says so explicitly and is never claimed/consumed.
-    let interrupted_md = render_interrupted_session_context(
-        state,
-        ws,
-        proj,
-        owner_filter.clone(),
-        accepting_session,
-    )
-    .await?;
+    // `[recovery] deliver_on_session_start = false` skips only this packet.
+    let interrupted_md = if crate::payload::query_flag_falsy(query.recovery.as_deref()) {
+        None
+    } else {
+        render_interrupted_session_context(state, ws, proj, owner_filter.clone(), accepting_session)
+            .await?
+    };
     // The brief is additive and non-destructive: unlike the handoff (a
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
@@ -6260,6 +6264,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.to_string()),
             workspace: Some("default".into()),
@@ -7074,6 +7079,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             identity: Some(identity.to_owned()),
             identity_src: Some(source.to_owned()),
             aliases: None,
@@ -16152,6 +16158,7 @@ pub(crate) mod tests {
                 profile_consume: None,
                 profile_digest: None,
                 handoff: None,
+                recovery: None,
                 workspace: Some("checkpoint-workspace".into()),
                 project: Some(project.into()),
                 agent: Some("codex".into()),
@@ -16231,6 +16238,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("opencode2".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -16465,6 +16473,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some(agent.into()),
             session_id: Some(session_id),
             ..Default::default()
@@ -16656,6 +16665,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("claude-code".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -16975,6 +16985,208 @@ pub(crate) mod tests {
             !open_handoff_exists(&state).await,
             "on-demand recovery must not create an accumulating handoff row"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_opt_out_keeps_other_start_context_and_is_project_scoped() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let capture_old = |project: Option<&str>, cwd: &str, session_id: &str, prompt: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt".into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.into()),
+                    workspace: Some("default".into()),
+                    project: project.map(Into::into),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "cwd": cwd,
+                    "prompt": prompt,
+                    "occurred_at": "2020-01-01T00:00:00Z"
+                }),
+            )
+        };
+        process(
+            &state,
+            capture_old(
+                Some("scratch"),
+                "/tmp/project-a",
+                "12121212-1212-1212-1212-121212121212",
+                "RECOVERY-SOURCE-A",
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .reader
+                .open_sessions_for_scope_agent(
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::ClaudeCode,
+                    ai_memory_core::OwnerFilter::Any,
+                    None,
+                )
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the old source fixture must begin open"
+        );
+        process(
+            &state,
+            capture_old(
+                Some("project-b"),
+                "/tmp/project-b",
+                "34343434-3434-3434-3434-343434343434",
+                "RECOVERY-SOURCE-B",
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .upsert_page(brief_page(
+                state.workspace_id,
+                state.project_id,
+                "_rules/recovery.md",
+                "RECOVERY-OPT-OUT-BRIEF",
+                true,
+            ))
+            .await
+            .unwrap();
+        seed_global_profile(&state).await;
+        seed_inbox(&state, 1).await;
+
+        for falsy in ["0", "false", "no", "OFF"] {
+            let body = fetch_and_accept_handoff(
+                &state,
+                HandoffQuery {
+                    agent: Some("codex".into()),
+                    cwd: Some("/tmp/project-a".into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    briefing: Some("true".into()),
+                    recovery: Some(falsy.into()),
+                    ..Default::default()
+                },
+                None,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("the other startup context must survive recovery opt-out");
+            for unwanted in [
+                "unfinished-session recovery snapshot",
+                BACKFILL_MARKER_PREFIX,
+                "RECOVERY-SOURCE-A",
+            ] {
+                assert!(!body.contains(unwanted), "{falsy}: {unwanted}: {body}");
+            }
+            for retained in [
+                "RECOVERY-OPT-OUT-BRIEF",
+                "Use pnpm, not npm.",
+                "1 cross-project message waiting",
+            ] {
+                assert!(
+                    body.contains(retained),
+                    "{falsy}: missing {retained}: {body}"
+                );
+            }
+            assert_eq!(
+                state
+                    .reader
+                    .pending_message_count(state.workspace_id, state.project_id)
+                    .await
+                    .unwrap(),
+                1,
+                "the inbox notice must remain non-consuming"
+            );
+        }
+        assert_eq!(
+            state
+                .reader
+                .open_sessions_for_scope_agent(
+                    state.workspace_id,
+                    state.project_id,
+                    AgentKind::ClaudeCode,
+                    ai_memory_core::OwnerFilter::Any,
+                    None,
+                )
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an opted-out start must leave its source session untouched"
+        );
+
+        // Recovery opt-out is independent of the ordinary handoff baton.
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "RECOVERY-OPT-OUT-HANDOFF".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let handed_off = fetch_and_accept_handoff(
+            &state,
+            HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/project-a".into()),
+                workspace: Some("default".into()),
+                project: Some("scratch".into()),
+                recovery: Some("0".into()),
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("recovery opt-out must not suppress a handoff");
+        assert!(handed_off.contains("RECOVERY-OPT-OUT-HANDOFF"));
+        assert!(!handed_off.contains("unfinished-session recovery snapshot"));
+
+        // A second project keeps the default and receives only its own source.
+        let project_b = fetch_and_accept_handoff(
+            &state,
+            HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/project-b".into()),
+                workspace: Some("default".into()),
+                project: Some("project-b".into()),
+                ..Default::default()
+            },
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("a project without the opt-out still receives recovery");
+        assert!(project_b.contains("unfinished-session recovery snapshot"));
+        assert!(project_b.contains(BACKFILL_MARKER_PREFIX));
+        assert!(project_b.contains("RECOVERY-SOURCE-B"));
+        assert!(!project_b.contains("RECOVERY-SOURCE-A"));
     }
 
     #[tokio::test]
@@ -17832,6 +18044,7 @@ pub(crate) mod tests {
                     profile_consume: None,
                     profile_digest: None,
                     handoff: None,
+                    recovery: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(tmp.path().to_string_lossy().into_owned()),
                     workspace: Some("default".into()),
@@ -18453,6 +18666,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -18543,6 +18757,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -18652,6 +18867,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -18848,6 +19064,7 @@ pub(crate) mod tests {
                     profile_consume: None,
                     profile_digest: None,
                     handoff: handoff.map(str::to_string),
+                    recovery: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
                     workspace: Some("default".into()),
@@ -19943,6 +20160,7 @@ pub(crate) mod tests {
                 profile_consume: None,
                 profile_digest: None,
                 handoff: None,
+                recovery: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
@@ -20027,6 +20245,7 @@ pub(crate) mod tests {
                 profile_consume: None,
                 profile_digest: None,
                 handoff: None,
+                recovery: None,
                 agent: Some("codex".into()),
                 cwd: Some("/repo/api/src".into()),
                 workspace: Some("default".into()),
@@ -20103,6 +20322,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("codex".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -20260,6 +20480,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("codex".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -20383,6 +20604,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -20468,6 +20690,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -20899,6 +21122,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -21066,6 +21290,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some("kimi-code".into()),
             cwd: Some("/repo".into()),
             workspace: Some("default".into()),
@@ -21922,6 +22147,7 @@ pub(crate) mod tests {
                 profile_consume: None,
                 profile_digest: None,
                 handoff: None,
+                recovery: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: None,
@@ -25488,6 +25714,7 @@ pub(crate) mod tests {
                     profile_consume: None,
                     profile_digest: None,
                     handoff: None,
+                    recovery: None,
                     managed_run: Some(run.run_id.to_string()),
                     session_id: Some("private-vendor".into()),
                     cwd: Some(cwd.clone()),
@@ -25559,6 +25786,7 @@ pub(crate) mod tests {
             profile_consume: None,
             profile_digest: None,
             handoff: None,
+            recovery: None,
             agent: Some(agent.into()),
             cwd: Some(cwd.into()),
             workspace: None,

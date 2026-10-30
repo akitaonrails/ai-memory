@@ -88,6 +88,48 @@ ai_memory_parse_toml_flag() {
         | head -n 1 | sed 's/[[:space:]]*$//'
 }
 
+# Section-scoped counterpart for the same-named [handoff] and [recovery]
+# delivery keys. The exclusion mode preserves legacy handoff parsing elsewhere.
+ai_memory_parse_toml_scoped_flag() {
+    file="$1"; section="$2"; key="$3"; exclude="$4"
+    [ -f "$file" ] || return 0
+    ai_memory_strip_utf8_bom <"$file" | LC_ALL=C awk \
+        -v section="$section" -v key="$key" -v exclude="$exclude" '
+        function trim(value) {
+            gsub(/^[ \t\r]+|[ \t\r]+$/, "", value)
+            return value
+        }
+        {
+            header = $0
+            sub(/#.*/, "", header)
+            header = trim(header)
+            if (header ~ /^\[.*\]$/) {
+                in_section = trim(substr(header, 2, length(header) - 2)) == section
+                next
+            }
+            if ((exclude == "1" && in_section) || (exclude != "1" && !in_section)) next
+            pattern = "^[ \t]*" key "[ \t]*="
+            if ($0 !~ pattern) next
+            value = $0
+            sub(pattern, "", value)
+            sub(/#.*/, "", value)
+            value = trim(value)
+            gsub(/^"|"$/, "", value)
+            if (value != "") {
+                print value
+                exit
+            }
+        }'
+}
+
+ai_memory_parse_toml_section_flag() {
+    ai_memory_parse_toml_scoped_flag "$1" "$2" "$3" 0
+}
+
+ai_memory_parse_toml_flag_outside_section() {
+    ai_memory_parse_toml_scoped_flag "$1" "$2" "$3" 1
+}
+
 # A resolved marker's `[profile]` flag as the explicit value the hook sends:
 # 0 for a falsy value (0/false/no/off, any case), 1 for anything else, an
 # absent key included. Parity with `profile_flag_value` in hook_capture.rs.
@@ -720,6 +762,7 @@ ai_memory_marker_qs() {
     pcon=""
     pcons=""
     hoff=""
+    roff=""
     aliases=""
     routed=""
     # The nearest marker that declares more than `[capture]` (#668): a nested
@@ -763,9 +806,9 @@ ai_memory_marker_qs() {
         # what it stored.
         pcon=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" contribute)")
         pcons=$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" consume)")
-        # `[handoff] deliver_on_session_start = false` is sent only when
-        # explicitly falsy; an absent key leaves the request unchanged.
-        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag "$marker" deliver_on_session_start)")" = 0 ] && hoff=0
+        # The delivery key is independent in [handoff] and [recovery].
+        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_flag_outside_section "$marker" recovery deliver_on_session_start)")" = 0 ] && hoff=0
+        [ "$(ai_memory_profile_flag "$(ai_memory_parse_toml_section_flag "$marker" recovery deliver_on_session_start)")" = 0 ] && roff=0
         [ -n "$pr" ] && ps="marker"
     fi
     # Before repo-root can fill `pr`: a repo-root name is an inference, while
@@ -812,6 +855,7 @@ ai_memory_marker_qs() {
     [ -n "$pcon" ] && qs="${qs}&profile_contribute=$(ai_memory_url_encode "$pcon")"
     [ -n "$pcons" ] && qs="${qs}&profile_consume=$(ai_memory_url_encode "$pcons")"
     [ -n "$hoff" ] && qs="${qs}&handoff=0"
+    [ -n "$roff" ] && qs="${qs}&recovery=0"
     qs="${qs}$(ai_memory_managed_qs)"
     printf '%s' "$qs"
 }

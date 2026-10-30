@@ -404,6 +404,23 @@ function Get-AiMemoryTomlFlag {
     return $null
 }
 
+function Get-AiMemoryTomlScopedFlag {
+    param([string] $File, [string] $Section, [string] $Key, [switch] $Exclude)
+    if (-not (Test-Path $File -PathType Leaf)) { return $null }
+    $inSection = $false
+    foreach ($line in Get-Content $File) {
+        $header = [regex]::Match($line, '^\s*\[\s*([^\]]+?)\s*\]\s*(#.*)?$')
+        if ($header.Success) {
+            $inSection = $header.Groups[1].Value.Trim() -eq $Section
+            continue
+        }
+        if (($Exclude -and $inSection) -or (-not $Exclude -and -not $inSection)) { continue }
+        $m = [regex]::Match($line, "^\s*$Key\s*=\s*`"?([^`"#]*)`"?\s*(#.*)?$")
+        if ($m.Success) { return $m.Groups[1].Value.Trim() }
+    }
+    return $null
+}
+
 # A resolved marker's `[profile]` flag as the explicit value the hook sends:
 # "0" for a falsy value, "1" for anything else, an absent key included.
 # Parity with `profile_flag_value` in hook_capture.rs.
@@ -591,6 +608,7 @@ function Get-AiMemoryMarkerQuery {
     $profileContribute = $null
     $profileConsume = $null
     $handoffOff = $false
+    $recoveryOff = $false
     $aliases = $null
     $identityQuery = ""
     $homeRouted = $false
@@ -631,8 +649,9 @@ function Get-AiMemoryMarkerQuery {
         # what it stored.
         $profileContribute = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "contribute")
         $profileConsume = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "consume")
-        # `[handoff] deliver_on_session_start = false`: sent only when explicitly falsy.
-        $handoffOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "deliver_on_session_start")) -eq "0"
+        # The delivery key is independent in [handoff] and [recovery].
+        $handoffOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start" -Exclude)) -eq "0"
+        $recoveryOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start")) -eq "0"
         if ($proj) { $projSrc = "marker" }
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while
@@ -667,6 +686,7 @@ function Get-AiMemoryMarkerQuery {
     if ($profileContribute) { $qs += "&profile_contribute=$([uri]::EscapeDataString($profileContribute))" }
     if ($profileConsume) { $qs += "&profile_consume=$([uri]::EscapeDataString($profileConsume))" }
     if ($handoffOff) { $qs += "&handoff=0" }
+    if ($recoveryOff) { $qs += "&recovery=0" }
     return $qs
 }
 

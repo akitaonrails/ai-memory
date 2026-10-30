@@ -572,8 +572,20 @@ mod tests {
         assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
         assert!(plugin.contains("function tomlFlag"));
+        assert!(plugin.contains("function tomlScopedFlag"));
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));
+        assert!(
+            plugin
+                .contains("tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", true)")
+        );
+        assert!(
+            plugin.contains(
+                "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", false)"
+            )
+        );
+        assert!(plugin.contains("url.searchParams.set(\"handoff\", \"0\")"));
+        assert!(plugin.contains("url.searchParams.set(\"recovery\", \"0\")"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
         // #668: same settings-walk as the shared ts_apply_marker_params
         // (install_hooks.rs) — the two applyMarkerParams copies stay

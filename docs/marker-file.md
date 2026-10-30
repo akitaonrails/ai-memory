@@ -46,19 +46,21 @@ workspace-only markers resolve the canonical repository-path project, with
 A marker whose only content is a `[capture]` section (see
 [Capture exclusions](#capture-exclusions) below) is **transparent** to this
 walk: `workspace`, `project`, `project_strategy`, and the other forwarded
-settings (`drop_subagent_captures`, `[recall] default_global`, `[briefing]`
-keys) are resolved from the nearest ancestor marker that declares at least
-one of them, skipping past any nearer marker that declares nothing but
-`[capture]`. A subdirectory marker added only to exclude some paths from
-capture therefore no longer resets scope to `default` / basename for that
-subtree. `[capture]`/`ignore_paths` itself is unaffected by this and always
-comes from the nearest marker, even a capture-only one.
+settings (`drop_subagent_captures`, `[recall] default_global`, `[briefing]`,
+`[profile]`, `[handoff]` and `[recovery]` keys) are resolved from the nearest
+ancestor marker that declares at least one of them, skipping past any nearer
+marker that declares nothing but `[capture]`. A subdirectory marker added only
+to exclude some paths from capture therefore no longer resets scope to
+`default` / basename for that subtree. `[capture]`/`ignore_paths` itself is
+unaffected by this and always comes from the nearest marker, even a
+capture-only one.
 
 The marker path is shared by the POSIX/PowerShell hook scripts and the
 generated OpenCode / OMP / Pi / OpenClaw TypeScript integrations. In all cases,
 hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
-`project_strategy`, `drop_subagent`, `default_global`, `briefing`, and
-`briefing_budget` query params to the server when a marker declares them;
+`project_strategy`, `drop_subagent`, `default_global`, `briefing`,
+`briefing_budget`, `profile_contribute`, `profile_consume`, `handoff`, and
+`recovery` query params to the server as applicable;
 handoff lookup also sends `cwd` when no marker exists so the default
 `project = basename(cwd)` route works consistently. Every client also sends
 `identity` / `identity_src` when the checkout has a repository identity (see
@@ -210,6 +212,15 @@ inject_on_subagent_start = "true"
 [handoff]
 deliver_on_session_start = false
 
+# Optional. Stop delivering the unfinished-session recovery snapshot at
+# session start. Only an explicit false / "no" / "off" / "0" turns it off;
+# the default is to deliver. This also suppresses the snapshot's backfill
+# marker. The source session remains open and its lifecycle is unchanged.
+# Independent of [handoff]: handoffs, managed context, the brief, the profile
+# digest and the inbox notice are unchanged.
+[recovery]
+deliver_on_session_start = false
+
 # Optional. The cross-project profile (docs/cross-project-profile.md): your
 # usual choices from other projects, delivered at session start as defaults
 # below this repository's rules file. Both keys default to on.
@@ -281,7 +292,8 @@ in the home marker remain the fallback, followed by the default remote-path
 identity and then the installed/cwd fallback; explicit CLI scope always wins. A matched route replaces
 only the root `workspace`, `project`, `identity`, `identity_style`, `aliases`, and
 `project_strategy` routing fields. Root `server`, `drop_subagent_captures`,
-`[recall]`, `[briefing]`, and `[profile]` settings still apply.
+`[recall]`, `[briefing]`, `[profile]`, `[handoff]`, and `[recovery]` settings
+still apply.
 
 A home route map is bounded to 64 routes, a 64 KiB file, 512 UTF-8 bytes per
 selector, and 512 UTF-8 bytes per scalar value. Its portable grammar permits
@@ -319,6 +331,14 @@ nothing, claims nothing and adds no handoff or continuity notice for that
 project. A marker that sets only `[handoff]` is a settings boundary, like one
 with `[briefing]` or `[profile]` keys. Use it for projects whose automatic
 handoffs are mostly noise, such as a bot fleet driven by routines and webhooks.
+
+`[recovery] deliver_on_session_start` is also on unless explicitly falsy.
+Clients then send `recovery=0`, which suppresses only the unfinished-session
+recovery snapshot and its backfill marker. The source session stays open, and
+handoffs, managed context, the brief, the profile digest and the inbox notice
+are still delivered. A marker that sets only `[recovery]` is a settings
+boundary. Use this in projects with long-lived parallel sessions, where another
+session's recovery snapshot is usually noise for that layout.
 
 `[recall] default_global` applies to an agent's unscoped `memory_query` and
 `memory_recent` calls. On `memory_query`, an explicit `global: false` keeps
