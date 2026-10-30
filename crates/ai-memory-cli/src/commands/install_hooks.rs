@@ -13209,7 +13209,10 @@ model = "gpt-5"
         assert!(plugin.contains("tomlFlag(body, \"contribute\")"));
         assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
-        assert!(plugin.contains("tomlFlag(body, \"deliver_on_session_start\")"));
+        assert!(
+            plugin
+                .contains("tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", true)")
+        );
         assert!(plugin.contains("url.searchParams.set(\"handoff\", \"0\")"));
         // #668: applyMarkerParams resolves scope/settings via the
         // settings-walk, not the nearest-marker findMarker, so a nested
