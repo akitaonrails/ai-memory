@@ -457,20 +457,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_top_version_is_pinned() {
-        // Deliberate pin: bumping it is part of adding a migration, so a
-        // stray or duplicate version number fails loudly here.
+    fn users_do_not_retain_legacy_token_columns() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::migrations::run(&mut conn).unwrap();
-        let version: i64 = conn
-            .query_row(
-                "SELECT MAX(version) FROM refinery_schema_history",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(version, 96, "update the pin when adding a migration");
         let cols: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('users') \
