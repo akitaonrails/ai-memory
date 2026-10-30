@@ -1469,23 +1469,56 @@ pub(crate) fn parse_toml_flag(file: &Path, key: &str) -> Option<String> {
 /// [`parse_key_in`], shared with [`declares_more_than_capture`] so it pays
 /// for one read per key instead of re-opening the file.
 fn parse_flag_in(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| parse_flag_line(line, key))
+}
+
+fn parse_flag_line(line: &str, key: &str) -> Option<String> {
+    // A BOM is not whitespace to `trim_start`, and would hide a first-line key.
+    let trimmed = line.trim_start_matches('\u{feff}').trim_start();
+    let after_key = trimmed.strip_prefix(key)?;
+    let rest = after_key.trim_start().strip_prefix('=')?;
+    let val = rest
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"');
+    (!val.is_empty()).then(|| val.to_string())
+}
+
+/// Parse a flag only inside one TOML table. Used for `[recovery]`, whose key
+/// deliberately matches the independent `[handoff]` delivery setting.
+pub(crate) fn parse_toml_section_flag(file: &Path, section: &str, key: &str) -> Option<String> {
+    parse_scoped_flag_in(&std::fs::read_to_string(file).ok()?, section, key, false)
+}
+
+/// Preserve the section-blind handoff parser everywhere except the new
+/// `[recovery]` table, whose same-named key must not disable handoffs.
+pub(crate) fn parse_toml_flag_outside_section(
+    file: &Path,
+    section: &str,
+    key: &str,
+) -> Option<String> {
+    parse_scoped_flag_in(&std::fs::read_to_string(file).ok()?, section, key, true)
+}
+
+fn parse_scoped_flag_in(text: &str, section: &str, key: &str, exclude: bool) -> Option<String> {
+    let mut in_section = false;
     for line in text.lines() {
-        // A BOM is not whitespace to `trim_start`, and would hide a first-line key.
-        let trimmed = line.trim_start_matches('\u{feff}').trim_start();
-        let Some(after_key) = trimmed.strip_prefix(key) else {
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        let header = trimmed.split('#').next().unwrap_or("").trim();
+        if let Some(name) = header
+            .strip_prefix('[')
+            .and_then(|header| header.strip_suffix(']'))
+        {
+            in_section = name.trim() == section;
             continue;
-        };
-        let Some(rest) = after_key.trim_start().strip_prefix('=') else {
+        }
+        if in_section == exclude {
             continue;
-        };
-        let val = rest
-            .split('#')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"');
-        if !val.is_empty() {
-            return Some(val.to_string());
+        }
+        if let Some(value) = parse_flag_line(line, key) {
+            return Some(value);
         }
     }
     None

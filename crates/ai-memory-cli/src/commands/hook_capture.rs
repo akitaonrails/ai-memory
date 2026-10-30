@@ -685,6 +685,7 @@ fn marker_query_suffix_impl_from_selection(
     let (mut briefing, mut briefing_budget) = (None, None);
     let (mut profile_contribute, mut profile_consume) = (None, None);
     let mut handoff_off = false;
+    let mut recovery_off = false;
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
@@ -707,12 +708,19 @@ fn marker_query_suffix_impl_from_selection(
         // marker sends nothing, so the server keeps what it stored.
         profile_contribute = Some(profile_flag_value(parse_toml_flag(&marker, "contribute")));
         profile_consume = Some(profile_flag_value(parse_toml_flag(&marker, "consume")));
-        // `[handoff] deliver_on_session_start = false` keeps this project's
-        // handoffs out of its session starts. Sent only when explicitly
-        // falsy, so an absent key leaves the request byte-identical.
-        handoff_off = parse_toml_flag(&marker, "deliver_on_session_start")
-            .as_deref()
-            .is_some_and(crate::marker::is_falsy);
+        // The delivery keys share a name but not a table. Keep legacy handoff
+        // parsing outside `[recovery]`; recovery itself is section-scoped.
+        handoff_off = crate::marker::parse_toml_flag_outside_section(
+            &marker,
+            "recovery",
+            "deliver_on_session_start",
+        )
+        .as_deref()
+        .is_some_and(crate::marker::is_falsy);
+        recovery_off =
+            crate::marker::parse_toml_section_flag(&marker, "recovery", "deliver_on_session_start")
+                .as_deref()
+                .is_some_and(crate::marker::is_falsy);
     }
     if let Some(val) = scope.workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
@@ -762,6 +770,9 @@ fn marker_query_suffix_impl_from_selection(
     }
     if handoff_off {
         qs.push_str("&handoff=0");
+    }
+    if recovery_off {
+        qs.push_str("&recovery=0");
     }
     // Per-repo brief opt-in: forwarded on every request for simplicity (the
     // capture path ignores it); only the `/handoff` GET at session start, or
@@ -2038,6 +2049,69 @@ drop_subagent_captures = "true"
         // nearest settings marker only.
         let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
         assert!(!outer.contains("handoff"), "{outer}");
+    }
+
+    /// `[recovery]` has its own delivery flag and is a settings boundary. Its
+    /// same-named key never disables handoffs, and every non-falsy value keeps
+    /// the request byte-identical to a marker without the key.
+    #[test]
+    fn marker_query_suffix_forwards_recovery_independently_only_when_falsy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"outer\"\n",
+        )
+        .unwrap();
+        let marker = inner.join(".ai-memory.toml");
+        let unchanged = format!(
+            "&cwd={}&profile_contribute=1&profile_consume=1",
+            url_encode(inner.to_str().unwrap())
+        );
+
+        for off in ["false", "\"no\"", "0", "\"OFF\""] {
+            std::fs::write(
+                &marker,
+                format!("[recovery]\ndeliver_on_session_start = {off}\n"),
+            )
+            .unwrap();
+            let qs = marker_query_suffix(inner.to_str().unwrap(), None);
+            assert_eq!(qs, format!("{unchanged}&recovery=0"), "{off}");
+            assert!(
+                !qs.contains("workspace=outer"),
+                "a [recovery] marker is a boundary: {qs}"
+            );
+        }
+        for on in ["true", "\"yes\"", "banana"] {
+            std::fs::write(
+                &marker,
+                format!("[recovery]\ndeliver_on_session_start = {on}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                marker_query_suffix(inner.to_str().unwrap(), None),
+                unchanged,
+                "{on}"
+            );
+        }
+
+        std::fs::write(
+            &marker,
+            "[handoff]\ndeliver_on_session_start = false\n[recovery]\ndeliver_on_session_start = false\n",
+        )
+        .unwrap();
+        let both = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(both.contains("&handoff=0&recovery=0"), "{both}");
+
+        // Compatibility: legacy section-blind handoff parsing is unchanged
+        // outside the new [recovery] table.
+        std::fs::write(&marker, "deliver_on_session_start = false\n").unwrap();
+        let legacy = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert_eq!(legacy, format!("{unchanged}&handoff=0"));
+
+        let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(!outer.contains("recovery"), "{outer}");
     }
 
     /// A marker WITHOUT `drop_subagent_captures` does not forward the flag, so

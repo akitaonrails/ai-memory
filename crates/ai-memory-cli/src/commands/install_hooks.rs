@@ -4510,6 +4510,7 @@ pub(crate) fn ts_apply_marker_params(
   let profileContribute: string | undefined;
   let profileConsume: string | undefined;
   let handoffOff = false;
+  let recoveryOff = false;
   let explicitIdentity: string | undefined;
   let identityStyle: string | undefined;
   let aliases: string | undefined;
@@ -4529,7 +4530,8 @@ pub(crate) fn ts_apply_marker_params(
         briefingBudget = tomlFlag(body, "max_chars");
         profileContribute = profileFlag(tomlFlag(body, "contribute"));
         profileConsume = profileFlag(tomlFlag(body, "consume"));
-        handoffOff = profileFlag(tomlFlag(body, "deliver_on_session_start")) === "0";
+        handoffOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true)) === "0";
+        recoveryOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false)) === "0";
         if (route) {
           routed = true;
           workspace = route.workspace;
@@ -4562,7 +4564,8 @@ pub(crate) fn ts_apply_marker_params(
       briefingBudget = tomlFlag(body, "max_chars");
       profileContribute = profileFlag(tomlFlag(body, "contribute"));
       profileConsume = profileFlag(tomlFlag(body, "consume"));
-      handoffOff = profileFlag(tomlFlag(body, "deliver_on_session_start")) === "0";
+      handoffOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true)) === "0";
+      recoveryOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false)) === "0";
       explicitIdentity = tomlKey(body, "identity");
       identityStyle = tomlKey(body, "identity_style");
       aliases = markerAliases(body);
@@ -4595,6 +4598,7 @@ pub(crate) fn ts_apply_marker_params(
   if (profileContribute) url.searchParams.set("profile_contribute", profileContribute);
   if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
   if (handoffOff) url.searchParams.set("handoff", "0");
+  if (recoveryOff) url.searchParams.set("recovery", "0");
   return true;
 }"#
     .replace("__DEFAULT_LINE__", apply_default)
@@ -4863,6 +4867,21 @@ function homeRoute(text: string, cwd: string, identity: string | undefined): Hom
 pub(crate) const TS_TOML_FLAG: &str = r#"function tomlFlag(text: string, key: string): string | undefined {
   const re = new RegExp(`^\\s*${key}\\s*=\\s*(?:"([^"]*)"|([^#\\s]+))`);
   for (const line of text.split(/\r?\n/)) {
+    const match = re.exec(line);
+    if (match) return match[1] ?? match[2];
+  }
+  return undefined;
+}
+function tomlScopedFlag(text: string, key: string, section: string, exclude: boolean): string | undefined {
+  const re = new RegExp(`^\\s*${key}\\s*=\\s*(?:"([^"]*)"|([^#\\s]+))`);
+  let inSection = false;
+  for (const line of text.split(/\r?\n/)) {
+    const header = /^\s*\[\s*([^\]]+?)\s*\]\s*(?:#.*)?$/.exec(line);
+    if (header) {
+      inSection = header[1].trim() === section;
+      continue;
+    }
+    if (exclude ? inSection : !inSection) continue;
     const match = re.exec(line);
     if (match) return match[1] ?? match[2];
   }
@@ -13128,6 +13147,27 @@ model = "gpt-5"
         ] {
             assert!(!extension.contains("/recap"));
             assert!(!extension.contains("RELOAD_TRIGGER"));
+        }
+    }
+
+    #[test]
+    fn generated_integrations_forward_recovery_independently_of_handoff() {
+        for generated in [
+            build_opencode_plugin("http://127.0.0.1:49374", None, None, "denylist"),
+            build_opencode2_plugin("http://127.0.0.1:49374", None, None, "denylist", false)
+                .unwrap(),
+            build_omp_extension("http://127.0.0.1:49374", None, None, "denylist"),
+            build_pi_extension("http://127.0.0.1:49374", None, None, "denylist"),
+        ] {
+            for expected in [
+                "function tomlScopedFlag",
+                "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", true)",
+                "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", false)",
+                "url.searchParams.set(\"handoff\", \"0\")",
+                "url.searchParams.set(\"recovery\", \"0\")",
+            ] {
+                assert!(generated.contains(expected), "missing {expected}");
+            }
         }
     }
 
