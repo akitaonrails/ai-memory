@@ -6385,3 +6385,226 @@ async fn search_page_scope_selector_round_trips_and_rejects_malformed_values() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "scope={bad}");
     }
 }
+
+/// Old clients can register the basename while explicit reads already accept
+/// its canonical key. Only an explicit write promotes the stored name.
+async fn search_alias_fixture() -> (
+    TempDir,
+    Store,
+    Wiki,
+    ai_memory_core::WorkspaceId,
+    ai_memory_core::ProjectId,
+) {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let (project, _) = store
+        .writer
+        .resolve_project_by_identity(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::HostPath,
+            "api",
+            Some("/work/api".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        project,
+        "notes/alias.md",
+        "# Alias note\n\naliaslookupword",
+    ))
+    .await
+    .unwrap();
+    (tmp, store, wiki, ws, project)
+}
+
+#[tokio::test]
+async fn search_alias_links_open_before_and_after_project_promotion() {
+    let (_tmp, store, wiki, ws, project) = search_alias_fixture().await;
+    let app = router(store.reader.clone(), wiki);
+
+    for current_name in ["api", "acme-api"] {
+        if current_name == "acme-api" {
+            let promoted =
+                ai_memory_store::create_explicit_scope(&store.writer, "default", current_name)
+                    .await
+                    .unwrap();
+            assert_eq!(promoted.scope.project_id, project);
+            assert_eq!(promoted.promoted_from.as_deref(), Some("api"));
+        }
+        for requested_name in ["api", "acme-api"] {
+            for scope in [
+                format!("workspace=default&project={requested_name}"),
+                format!("scope=default/{requested_name}"),
+            ] {
+                for query in ["aliaslookupword", ""] {
+                    let uri = format!("/search?q={query}&{scope}&explain=1");
+                    let (status, html) = get_text(&app, &uri, None).await;
+                    assert_eq!(status, StatusCode::OK, "{uri}: {html}");
+                    if !query.is_empty() {
+                        // Follow the rendered result, including its recall context,
+                        // rather than constructing the expected URL ourselves.
+                        let href = html
+                            .split("href=\"")
+                            .filter_map(|part| part.split_once('"').map(|(href, _)| href))
+                            .find(|href| href.contains("/p/notes/alias.md"))
+                            .unwrap_or_else(|| panic!("{uri} had no result link: {html}"))
+                            .replace("&#38;", "&")
+                            .replace("&amp;", "&");
+                        let (page_status, page) = get_text(&app, &format!("/{href}"), None).await;
+                        assert_eq!(
+                            page_status,
+                            StatusCode::OK,
+                            "{uri} linked to {href}: {page}"
+                        );
+                        assert!(page.contains("aliaslookupword"), "{page}");
+                        assert!(href.starts_with(&format!("w/default/{current_name}/p/")));
+                    }
+                    assert!(
+                        html.contains(&format!("href=\"w/default/{current_name}\"")),
+                        "breadcrumb for {uri}: {html}"
+                    );
+                    assert!(
+                        html.contains(&format!("value=\"default/{current_name}\" selected")),
+                        "selector for {uri}: {html}"
+                    );
+                }
+            }
+        }
+        // Reads through either spelling neither rename nor create a project.
+        assert_eq!(
+            store
+                .reader
+                .project_name_by_id(ws, project)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(current_name)
+        );
+        assert_eq!(
+            store
+                .reader
+                .list_projects_with_stats(None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_alias_links_require_a_grant_and_refuse_ambiguous_names() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+    use ai_memory_core::{NewUser, UserRole};
+    use ai_memory_store::{AccessMode, GrantLevel};
+
+    let (_tmp, store, wiki, ws, project) = search_alias_fixture().await;
+    store
+        .writer
+        .set_access_mode(project, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let mut users = Vec::new();
+    for username in ["reader", "outsider"] {
+        users.push(
+            store
+                .writer
+                .create_human_user(
+                    NewUser {
+                        username: username.into(),
+                        name: None,
+                        email: None,
+                    },
+                    UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    store
+        .writer
+        .grant_memory(users[0], project, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki);
+
+    for current_name in ["api", "acme-api"] {
+        if current_name == "acme-api" {
+            ai_memory_store::create_explicit_scope(&store.writer, "default", current_name)
+                .await
+                .unwrap();
+        }
+        for requested_name in ["api", "acme-api"] {
+            for scope in [
+                format!("workspace=default&project={requested_name}"),
+                format!("scope=default/{requested_name}"),
+            ] {
+                for query in ["aliaslookupword", ""] {
+                    let uri = format!("/search?q={query}&{scope}&explain=1");
+                    let (status, html) = get_text(&app, &uri, Some(users[1])).await;
+                    assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html}");
+                    assert!(!html.contains("notes/alias.md"), "{html}");
+                    assert!(!html.contains("aliaslookupword"), "{html}");
+                    assert!(!html.contains("Recall trace"), "{html}");
+                    // The granted reader and root still reach the same project.
+                    for viewer in [Some(users[0]), None] {
+                        let (status, html) = get_text(&app, &uri, viewer).await;
+                        assert_eq!(status, StatusCode::OK, "{uri}: {html}");
+                        assert!(
+                            html.contains(&format!("value=\"default/{current_name}\" selected"))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // A second repository with the same basename makes the legacy key
+    // ambiguous; normalization must not silently choose either project.
+    let (other, _) = store
+        .writer
+        .resolve_project_by_identity_for_capture(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/other/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::Path,
+            "other-api",
+            Some("/other/api".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(other, project);
+    for scope in ["workspace=default&project=api", "scope=default/api"] {
+        let uri = format!("/search?q=aliaslookupword&{scope}");
+        let (status, html) = get_text(&app, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {html}");
+        assert!(!html.contains("notes/alias.md"), "{html}");
+    }
+    let (status, html) = get_text(
+        &app,
+        "/search?q=aliaslookupword&scope=default/acme-api",
+        Some(users[0]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("notes/alias.md"), "{html}");
+}

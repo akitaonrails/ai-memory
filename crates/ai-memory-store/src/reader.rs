@@ -2877,6 +2877,7 @@ pub struct ReaderPool {
 struct Inner {
     db_path: PathBuf,
     pool: Mutex<Pool>,
+    in_flight: std::sync::Arc<tokio::sync::Semaphore>,
     soft_cap: usize,
 }
 
@@ -2988,6 +2989,7 @@ impl ReaderPool {
                     idle: Vec::with_capacity(soft_cap.max(1)),
                     closed: false,
                 }),
+                in_flight: std::sync::Arc::new(tokio::sync::Semaphore::new(soft_cap.max(1))),
                 soft_cap: soft_cap.max(1),
             }),
             tuning: RetrievalTuning::default(),
@@ -3009,6 +3011,7 @@ impl ReaderPool {
         let mut pool = self.inner.pool.lock();
         pool.closed = true;
         pool.idle.clear();
+        self.inner.in_flight.close();
     }
 
     /// Configure the opt-in ranking signals used by [`Self::hybrid_search`].
@@ -3072,8 +3075,9 @@ impl ReaderPool {
     /// Run a synchronous closure against a pooled read-only connection.
     ///
     /// The closure runs on the tokio blocking pool so it never starves the
-    /// async runtime. If the pool is empty we open a fresh connection;
-    /// on return we keep it only when the pool is below its soft cap.
+    /// async runtime. At most `soft_cap` closures and their connections run at
+    /// once; later calls wait asynchronously for a permit instead of adding
+    /// blocking threads. Idle connections are kept up to the same cap.
     ///
     /// # Errors
     /// Returns [`StoreError::PoolPanic`] if the blocking task panics; any
@@ -3084,7 +3088,14 @@ impl ReaderPool {
         T: Send + 'static,
     {
         let inner = self.inner.clone();
+        let permit = inner
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StoreError::ReaderClosed)?;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let conn = checkout(&inner)?;
             let result = f(&conn);
             checkin(&inner, conn);

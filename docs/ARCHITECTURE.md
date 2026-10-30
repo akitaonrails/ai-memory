@@ -594,7 +594,9 @@ prunable rather than only after it ages in place.
   `.ai-memory-delete.` parked page).
 * `<data_dir>/db/memory.sqlite`: derived index. WAL mode. One
   writer actor owns the writer `Connection`; reads go through a
-  cloneable read-only pool.
+  cloneable read-only pool capped at four in-flight calls and connections.
+  Later calls wait asynchronously for a permit rather than adding blocking
+  threads, and closing the pool wakes them with `ReaderClosed`.
 * `<data_dir>/raw/`: immutable sanitized managed-workstream JSONL segments.
   Legacy raw fallback recall searches the durable `observations` table via
   FTS5; lifecycle HookEnvelope JSON is not a complete transcript archive.

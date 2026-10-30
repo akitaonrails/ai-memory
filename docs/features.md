@@ -206,6 +206,10 @@ normal retrieval. Declared contradictions include only live, readable far ends,
 and they do not decide which statement is correct. Evidence pages hold twenty
 citations.
 
+Project searches accept canonical and legacy project keys; their result links,
+breadcrumb and scope selector use the current stored name. Searching does not
+rename the project.
+
 Search result links carry the query, filters, result limit and the project or
 global mode. "Recompute explanation" runs the same authorized ranker on demand
 and shows stream ranks, RRF contributions, authority and optional reranking

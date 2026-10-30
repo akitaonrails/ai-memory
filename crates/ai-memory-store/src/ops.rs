@@ -1684,11 +1684,13 @@ pub(crate) fn backfill_cjk_indexes(conn: &mut Connection) -> StoreResult<CjkBack
 ///
 /// Each batch resumes after the highest rowid the previous one indexed. A
 /// batch returns the missing rows in rowid order and indexes every one of
-/// them before it commits, so no row at or below the cursor is still missing
-/// and the anti-join probes each source row once. Without the cursor every
-/// batch filtered from the first rowid again and re-probed the whole indexed
-/// prefix, so the pass slowed down as it went: quadratic in the row count,
-/// hours of startup on a store with 1.6 million observations (#1652).
+/// them before it commits, so no row below the cursor is still missing and
+/// the anti-join probes each source row once. The cursor is an inclusive
+/// lower bound, so the first batch also covers a row at `i64::MIN`. Without
+/// the cursor every batch filtered from the first rowid again and re-probed
+/// the whole indexed prefix, so the pass slowed down as it went: quadratic in
+/// the row count, hours of startup on a store with 1.6 million observations
+/// (#1652).
 pub(crate) fn backfill_cjk_indexes_in_batches(
     conn: &mut Connection,
     batch: i64,
@@ -1698,17 +1700,17 @@ pub(crate) fn backfill_cjk_indexes_in_batches(
     let batch = batch.max(1);
     let mut summary = CjkBackfillSummary::default();
 
-    let mut after = i64::MIN;
+    let mut from = i64::MIN;
     loop {
         let tx = conn.transaction()?;
         let rows: Vec<PageRow> = {
             let mut stmt = tx.prepare(
                 "SELECT p.rowid, p.title, p.body, p.path_search FROM pages p \
-                 WHERE p.rowid > ?1 \
+                 WHERE p.rowid >= ?1 \
                  AND NOT EXISTS (SELECT 1 FROM pages_cjk_fts f WHERE f.rowid = p.rowid) \
                  ORDER BY p.rowid LIMIT ?2",
             )?;
-            stmt.query_map(params![after, batch], |row| {
+            stmt.query_map(params![from, batch], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .collect::<Result<_, _>>()?
@@ -1719,24 +1721,24 @@ pub(crate) fn backfill_cjk_indexes_in_batches(
         }
         for (rowid, title, body, path_search) in &rows {
             index_page_cjk(&tx, *rowid, title, body, path_search)?;
-            after = *rowid;
+            from = rowid.saturating_add(1);
         }
         summary.pages += rows.len() as u64;
         tx.commit()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
     }
 
-    after = i64::MIN;
+    from = i64::MIN;
     loop {
         let tx = conn.transaction()?;
         let rows: Vec<ObservationRow> = {
             let mut stmt = tx.prepare(
                 "SELECT o.rowid, o.title, o.body FROM observations o \
-                 WHERE o.rowid > ?1 AND NOT EXISTS ( \
+                 WHERE o.rowid >= ?1 AND NOT EXISTS ( \
                      SELECT 1 FROM observations_cjk_fts f WHERE f.rowid = o.rowid \
                  ) ORDER BY o.rowid LIMIT ?2",
             )?;
-            stmt.query_map(params![after, batch], |row| {
+            stmt.query_map(params![from, batch], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<Result<_, _>>()?
@@ -1747,7 +1749,7 @@ pub(crate) fn backfill_cjk_indexes_in_batches(
         }
         for (rowid, title, body) in &rows {
             index_observation_cjk(&tx, *rowid, title, body)?;
-            after = *rowid;
+            from = rowid.saturating_add(1);
         }
         summary.observations += rows.len() as u64;
         tx.commit()?;
@@ -12660,6 +12662,36 @@ pub(crate) mod tests {
 
         let again = backfill_cjk_indexes(&mut conn).unwrap();
         assert_eq!(again, CjkBackfillSummary::default());
+    }
+
+    /// The cursor starts at the smallest rowid SQLite can store, so a row
+    /// there (and one at the other end) is repaired like any other.
+    #[test]
+    fn cjk_backfill_covers_the_extreme_rowids() {
+        let mut conn = unindexed_cjk_fixture(0);
+        for rowid in [i64::MIN, i64::MAX] {
+            conn.execute(
+                "INSERT INTO pages (rowid, title, body, path_search) \
+                 VALUES (?1, 'edge', '支付服务', 'notes')",
+                [rowid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO observations (rowid, title, body) \
+                 VALUES (?1, 'prompt', '需要恢复索引')",
+                [rowid],
+            )
+            .unwrap();
+        }
+        assert_eq!(missing_cjk_rows(&conn), (2, 2));
+
+        let summary = backfill_cjk_indexes_in_batches(&mut conn, 1).unwrap();
+        assert_eq!((summary.pages, summary.observations), (2, 2));
+        assert_eq!(missing_cjk_rows(&conn), (0, 0));
+        assert_eq!(
+            backfill_cjk_indexes(&mut conn).unwrap(),
+            CjkBackfillSummary::default()
+        );
     }
 
     /// Doubling the rows must not quadruple the work. Each batch resumes

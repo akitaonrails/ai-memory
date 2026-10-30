@@ -96,7 +96,7 @@ pub(crate) async fn handler(
         .as_deref()
         .is_some_and(|v| matches!(v, "1" | "true" | "on" | "yes"));
     let viewer = viewer.map(|axum::Extension(viewer)| viewer.user());
-    let scope = match non_empty(params.scope.as_deref()) {
+    let mut scope = match non_empty(params.scope.as_deref()) {
         Some(value) => match value.split_once('/') {
             Some((workspace, project)) if !workspace.is_empty() && !project.is_empty() => {
                 Some((workspace.to_owned(), project.to_owned()))
@@ -158,12 +158,24 @@ pub(crate) async fn handler(
     let mut truncated = false;
     let mut timings = None;
     let mut streams_active: Vec<&'static str> = Vec::new();
-    match &scope {
+    match &mut scope {
         Some((workspace, project)) => {
             let resolved = match super::resolve_read_scope(&state, viewer, workspace, project).await
             {
                 Ok(resolved) => resolved,
                 Err(refusal) => return super::page::refusal_response(&refusal),
+            };
+            // Scope lookup accepts canonical and legacy keys, but page URLs
+            // use the exact stored name. Resolve it only after authorization,
+            // without promoting the project as a side effect of a read.
+            *project = match state
+                .reader
+                .project_name_by_id(resolved.workspace_id, resolved.project_id)
+                .await
+            {
+                Ok(Some(name)) => name,
+                Ok(None) => return super::page::not_found_response(),
+                Err(error) => return internal(error),
             };
             if !query.is_empty() {
                 let limit = params

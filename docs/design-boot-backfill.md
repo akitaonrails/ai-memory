@@ -32,6 +32,10 @@ the local sentinel, so it does not suppress a later automatic attempt.
 
 The automatic path runs detached and silent (like Claude Code's own auto-memory); the
 `📼 imported N session(s)` summary is shown on a **manual** `ai-memory backfill` only.
+`backfill --session <id>` looks up that exact native session, including one older
+than the newest 200 sessions enumerated per harness. It retains the adapter's
+checkout and top-level-session checks. The automatic scan and `--max-sessions`
+limit still apply to the normal newest-session listing.
 Failed imports are always written to stderr (the detached worker's
 `logs/backfill.log`), including with `--quiet`. Any failed session makes the
 command exit nonzero after emitting its report; `--json` still produces the

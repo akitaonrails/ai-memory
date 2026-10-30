@@ -297,9 +297,13 @@ ai-memory upgrade --force
 That downloads `ai-memory-windows-x86_64.zip` + `.sha256`, verifies the
 checksum, replaces `ai-memory.exe` via rename-aside (Windows cannot overwrite
 a running image), refreshes a sibling `hooks/` tree when present, then
-re-stages hooks for agents already under the data-dir hooks tree. Keep the
-manual zip download above as a fallback if the install directory is not
-writable (for example under Program Files).
+re-stages hooks for agents already under the data-dir hooks tree. It also
+re-renders existing ai-memory-owned OpenCode, OpenCode 2, OMP, Pi, and OpenClaw
+TypeScript integrations from the newly installed binary's templates at their
+default or active-profile paths; absent and user-owned files are left untouched.
+Keep the manual zip download above as a
+fallback if the install directory is not writable (for example under Program
+Files).
 
 The zip mirrors the Linux release tarball, minus the Linux-only service
 assets: it contains `ai-memory.exe`, the full `hooks/` bundle (`.ps1` +

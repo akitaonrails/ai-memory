@@ -377,6 +377,9 @@ pub enum Command {
     /// installs keep using the shell wrapper's `upgrade` (image pull);
     /// package-managed installs (Homebrew, AUR, …) are refused.
     Upgrade(UpgradeArgs),
+    /// Re-render installed hooks from the replacement binary during upgrade.
+    #[command(hide = true, name = "upgrade-refresh-hooks")]
+    UpgradeRefreshHooks,
     /// Manage optional upstream LLM provider authentication.
     Auth(AuthArgs),
     /// Manage human users and their project grants. All subcommands

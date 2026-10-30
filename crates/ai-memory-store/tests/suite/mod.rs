@@ -25,6 +25,7 @@ mod pinned_pages;
 mod profile;
 mod project_authz;
 mod project_link_graph;
+mod reader_pool_bounds;
 mod reclaim_ledger_versions;
 mod related_walk;
 mod retrieval_observation_stream;

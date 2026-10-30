@@ -983,6 +983,68 @@ pub async fn list_native_sessions(
     Ok(sessions)
 }
 
+/// Find one named session without truncating it out of a recent-session list.
+/// Uses the same native identity, checkout and top-level-session checks as
+/// listing: file adapters verify the transcript header, OpenCode checks the
+/// recorded directory, and Crush excludes sub-agent/title sessions.
+pub fn find_native_session(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<Option<NativeSessionCandidate>> {
+    if !valid_native_session_id(native_session_id) {
+        return Ok(None);
+    }
+    let updated_at = match harness {
+        ManagedHarness::OpenCode | ManagedHarness::OpenCode2 | ManagedHarness::Crush => {
+            let db = if harness == ManagedHarness::Crush {
+                crush_db(home, cwd, session_dir)
+            } else {
+                opencode_db(home, session_dir)
+            };
+            if !db.is_file() {
+                return Ok(None);
+            }
+            let connection = Connection::open_with_flags(
+                db,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            if harness == ManagedHarness::Crush {
+                connection
+                    .query_row(
+                        "SELECT updated_at FROM sessions WHERE id = ?1 AND parent_session_id IS NULL",
+                        [native_session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .and_then(native_timestamp)
+            } else {
+                let sql = if harness == ManagedHarness::OpenCode {
+                    "SELECT time_updated FROM session WHERE id = ?1 AND directory IN (?2, ?3)"
+                } else {
+                    "SELECT time_updated FROM session_v2 WHERE id = ?1 AND directory IN (?2, ?3)"
+                };
+                let (native, forward) = opencode_directories(cwd);
+                connection
+                    .query_row(sql, params![native_session_id, native, forward], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .optional()?
+                    .and_then(|updated| u64::try_from(updated).ok())
+                    .and_then(|updated| UNIX_EPOCH.checked_add(Duration::from_millis(updated)))
+            }
+        }
+        _ => locate_session_file(harness, home, cwd, session_dir, native_session_id)?
+            .and_then(|path| modified(&path)),
+    };
+    Ok(updated_at.map(|updated_at| NativeSessionCandidate {
+        native_session_id: native_session_id.to_owned(),
+        updated_at,
+    }))
+}
+
 /// Resolve the on-disk directory holding this harness's native "memory"
 /// store for the given checkout, when the harness has one and a session
 /// recorded for this cwd can be found.

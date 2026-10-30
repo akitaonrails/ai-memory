@@ -13,6 +13,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Project search links now use the project's current stored name after
+  resolving a canonical or legacy key. Results, breadcrumbs, and the scope
+  selector stay on that project without renaming it (#1875).
+- The CJK index backfill (V87) now also repairs a page or observation stored at
+  rowid `i64::MIN`. Its exclusive initial cursor skipped that one valid SQLite
+  rowid; the inclusive cursor now covers both rowid extremes (#1873).
+- Bounded the SQLite read pool to four in-flight reads. Bursts of concurrent
+  work now wait for a connection asynchronously instead of creating hundreds
+  of blocking threads and long-lived read transactions that starve the server
+  and hold back WAL checkpoints (#1866).
+- Refreshed existing ai-memory-owned OpenCode, OpenCode 2, OMP, Pi, and
+  OpenClaw generated TypeScript integrations during `ai-memory upgrade` using
+  the newly installed binary's templates, while leaving absent and user-owned
+  installs untouched (#1869).
 - The web UI's root operator now sees every user's sessions in a project's
   Sessions, Agents and Token usage tabs, on each agent's page and on each
   session's page, and so do the `/api/v1` session list and observations
@@ -21,6 +35,10 @@ version in [`docs/changelog/`](docs/changelog/):
   not be opened. Other users still see only their own sessions plus shared
   ones (#1867).
 
+- `backfill --session <id>` now finds an explicitly named native session beyond
+  the newest 200-session listing, instead of reporting a successful empty import.
+  Exact lookups retain the adapter's checkout and top-level-session checks;
+  automatic enumeration remains bounded (#1874).
 - Excluded Codex's generated approval-review transcripts and background
   suggestion prompts from transcript backfill and profile harvesting, and
   kept a hand-reworded profile page attached to its ledger topic even when a
