@@ -292,7 +292,7 @@ async fn the_guard_fires_per_execution_and_a_refusal_prevents_it() {
         ),
     );
     let cursor = provider(agent, "default");
-    let guard = RecordingGuard::new(0);
+    let guard = RecordingGuard::new(1);
     let (first, second) = with_generation_attempt_guard(guard.clone(), async {
         let first = cursor.complete(ChatRequest::user_prompt("hi")).await;
         let second = cursor.complete(ChatRequest::user_prompt("hi")).await;
@@ -304,6 +304,6 @@ async fn the_guard_fires_per_execution_and_a_refusal_prevents_it() {
         matches!(second, Err(LlmError::CapacityBusy(_))),
         "{second:?}"
     );
-    assert_eq!(guard.flags(), vec![true, false]);
+    assert_eq!(guard.asked(), 2);
     assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
 }

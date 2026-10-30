@@ -24,7 +24,9 @@ pub(crate) enum ProcessingFailure {
     Invalid,
     /// An equivalent durable job is unfinished, so the request would shadow it.
     Conflict,
-    /// The server has no LLM provider, so no job can be started or driven.
+    /// The server cannot take the request right now but a retry may succeed:
+    /// no LLM provider is configured, or the processing queue is full. Admin
+    /// answers 503; MCP has no 503 and reports its internal error.
     Unavailable,
     /// Anything else; the message is already redacted.
     Internal,
@@ -43,6 +45,7 @@ pub(crate) fn classify(error: &ProcessingError) -> (ProcessingFailure, String) {
             ProcessingFailure::NotFound,
             session_not_found_message().to_string(),
         ),
+        ProcessingError::QueueFull => (ProcessingFailure::Unavailable, error.redacted_summary()),
         ProcessingError::Invalid(_)
         | ProcessingError::EmptySession
         | ProcessingError::Budget(_) => (ProcessingFailure::Invalid, error.redacted_summary()),

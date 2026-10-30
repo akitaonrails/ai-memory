@@ -2,7 +2,7 @@
 //! scripted provider that reads the same prompts a real model would.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ai_memory_core::chunking::ChunkingSettings;
@@ -16,7 +16,10 @@ use ai_memory_wiki::Wiki;
 use serde_json::{Value, json};
 
 use super::chunk_plan::text_cost;
-use super::{ProcessingError, ProcessingJobAccess, ProcessingJobStart, ProcessingService};
+use super::run::MAX_ERROR_RETRIES;
+use super::{
+    ProcessingCaller, ProcessingError, ProcessingJobAccess, ProcessingJobStart, ProcessingService,
+};
 use crate::AutoImproveReviewConfig;
 
 const MARKERS: [&str; 3] = ["MARK-BEGIN", "MARK-MIDDLE", "MARK-END"];
@@ -36,6 +39,10 @@ struct StageLlm {
     truncate_multi_header_maps: bool,
     /// Fail every final call with a deterministic provider error.
     fail_final: bool,
+    /// Answer every final call as truncated (a recoverable failure).
+    truncate_final: bool,
+    /// Answer every final call with this exact JSON (a well-formed but wrong envelope).
+    malformed_final: Option<Value>,
     /// Pause every job (as a flag-off restart would) when this call starts.
     pause_at: Option<(usize, WriterHandle)>,
 }
@@ -47,6 +54,8 @@ impl StageLlm {
             count: AtomicUsize::new(0),
             truncate_multi_header_maps: false,
             fail_final: false,
+            truncate_final: false,
+            malformed_final: None,
             pause_at: None,
         }
     }
@@ -88,6 +97,9 @@ impl LlmProvider for StageLlm {
         request: ChatRequest,
         _schema: Value,
     ) -> LlmResult<Value> {
+        // Like a terminal provider: announce the one real send first; a
+        // refusal never reaches the model and is not counted as a call.
+        before_generation_send().await?;
         let n = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         let system = request.system.clone().unwrap_or_default();
         let stage = system.lines().next().unwrap_or("").to_string();
@@ -156,6 +168,15 @@ impl LlmProvider for StageLlm {
         }
         if self.fail_final {
             return Err(LlmError::Auth("expired".into()));
+        }
+        if self.truncate_final {
+            return Err(LlmError::TruncatedResponse {
+                model: "stage-llm".into(),
+                completion_tokens: None,
+            });
+        }
+        if let Some(answer) = &self.malformed_final {
+            return Ok(answer.clone());
         }
         let body: String = digest_items(&user)
             .into_iter()
@@ -311,7 +332,7 @@ async fn a_long_session_is_read_whole_and_published_once() {
     svc.validate().expect("default budgets hold the whole path");
 
     let outcome = svc
-        .consolidate_session(f.session, false, ActorContext::default(), None, None)
+        .consolidate_session(f.session, false, ProcessingCaller::default(), None)
         .await
         .unwrap();
     assert!(outcome.page_id.is_some());
@@ -352,7 +373,7 @@ async fn a_long_session_is_read_whole_and_published_once() {
     // Same request again joins the completed job: no new calls, no new version.
     let _ = ();
     let again = svc
-        .consolidate_session(f.session, false, ActorContext::default(), None, None)
+        .consolidate_session(f.session, false, ProcessingCaller::default(), None)
         .await
         .unwrap();
     assert_eq!(again.page_id, outcome.page_id);
@@ -364,7 +385,7 @@ async fn multi_page_publication_goes_through_the_batch_guards() {
     let f = fixture(12, 2_500).await;
     let svc = service(&f, Arc::new(StageLlm::new()), true, 128);
     let outcomes = svc
-        .consolidate_session_multi(f.session, false, ActorContext::default(), None, None)
+        .consolidate_session_multi(f.session, false, ProcessingCaller::default(), None)
         .await
         .unwrap();
     assert_eq!(outcomes.len(), 2);
@@ -388,7 +409,7 @@ async fn a_truncated_map_answer_is_subdivided_never_accepted_as_empty() {
     let calls = llm.calls.clone();
     let svc = service(&f, llm, true, 128);
     let outcome = svc
-        .consolidate_session(f.session, false, ActorContext::default(), None, None)
+        .consolidate_session(f.session, false, ProcessingCaller::default(), None)
         .await
         .unwrap();
     for marker in MARKERS {
@@ -413,7 +434,7 @@ async fn a_failed_final_call_publishes_nothing() {
     llm.fail_final = true;
     let svc = service(&f, Arc::new(llm), true, 128);
     let err = svc
-        .consolidate_session(f.session, false, ActorContext::default(), None, None)
+        .consolidate_session(f.session, false, ProcessingCaller::default(), None)
         .await
         .unwrap_err();
     assert!(
@@ -544,7 +565,7 @@ async fn flag_off_refuses_new_work_and_a_paused_job_blocks_the_legacy_path() {
     assert_eq!(seen.state, ProcessingJobState::Paused);
     // ... and the legacy path refuses instead of publishing beside them.
     let err = off
-        .consolidate_session(f.session, false, ActorContext::default(), None, None)
+        .consolidate_session(f.session, false, ProcessingCaller::default(), None)
         .await
         .unwrap_err();
     assert!(
@@ -602,6 +623,7 @@ async fn auto_improve_merges_candidates_into_one_staged_run() {
             },
             actor: ActorContext::default(),
             author_id: None,
+            viewer: None,
             owner: None,
             admission_ctx: None,
         })
@@ -628,6 +650,7 @@ async fn auto_improve_merges_candidates_into_one_staged_run() {
             },
             actor: ActorContext::default(),
             author_id: None,
+            viewer: None,
             owner: None,
             admission_ctx: None,
         })
@@ -666,6 +689,7 @@ impl LlmProvider for ReviewLlm {
         if !system.starts_with("ai-memory chunk stage: FINAL-AUTO-IMPROVE") {
             return self.0.complete_structured_raw(request, schema).await;
         }
+        before_generation_send().await?;
         let proposal = |confidence: f64, text: &str| {
             json!({
                 "operation": "create_or_update", "path": "gotchas/chunked-lessons.md",
@@ -952,6 +976,7 @@ fn stage_request(f: &Fixture) -> super::AutoImproveStageRequest {
         cfg: staged_cfg(),
         actor: ActorContext::default(),
         author_id: None,
+        viewer: None,
         owner: None,
         admission_ctx: None,
     }
@@ -975,7 +1000,6 @@ async fn crashed_after_stage(
             instructions: None,
             review: Some(staged_cfg()),
             trigger: "durable",
-            report_only: false,
         },
     )
     .await
@@ -1301,7 +1325,7 @@ async fn multi_page_publication_replaces_an_existing_session_anchor() {
     let hook_page = write_anchor(&f, "hook session stub body").await;
     let svc = service(&f, Arc::new(StageLlm::new()), true, 128);
     let outcomes = svc
-        .consolidate_session_multi(f.session, false, ActorContext::default(), None, None)
+        .consolidate_session_multi(f.session, false, ProcessingCaller::default(), None)
         .await
         .unwrap();
     assert_eq!(outcomes.len(), 2);
@@ -1323,7 +1347,9 @@ async fn multi_page_publication_replaces_an_existing_session_anchor() {
 struct SendingLlm {
     inner: StageLlm,
     sends: usize,
-    granted: AtomicUsize,
+    /// Sends announced here; the last send of every call is announced by
+    /// `inner`, like the single send of any terminal provider.
+    extra: AtomicUsize,
     revoke: Option<(WriterHandle, ai_memory_core::UserId, ProjectId)>,
 }
 
@@ -1332,9 +1358,14 @@ impl SendingLlm {
         Self {
             inner: StageLlm::new(),
             sends,
-            granted: AtomicUsize::new(0),
+            extra: AtomicUsize::new(0),
             revoke: None,
         }
+    }
+
+    /// Sends the guard let through.
+    fn granted(&self) -> usize {
+        self.extra.load(Ordering::SeqCst) + self.inner.count.load(Ordering::SeqCst)
     }
 }
 
@@ -1354,14 +1385,14 @@ impl LlmProvider for SendingLlm {
         request: ChatRequest,
         schema: Value,
     ) -> LlmResult<Value> {
-        for i in 0..self.sends {
-            if i == 1
-                && let Some((writer, user, proj)) = &self.revoke
-            {
-                writer.revoke_memory(*user, *proj, None).await.unwrap();
-            }
+        for _ in 1..self.sends {
             before_generation_send().await?;
-            self.granted.fetch_add(1, Ordering::SeqCst);
+            self.extra.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.sends > 1
+            && let Some((writer, user, proj)) = &self.revoke
+        {
+            writer.revoke_memory(*user, *proj, None).await.unwrap();
         }
         self.inner.complete_structured_raw(request, schema).await
     }
@@ -1423,7 +1454,7 @@ async fn every_actual_send_is_durably_spent_and_a_refused_extra_send_publishes_n
         logical >= 2,
         "the session needs several calls, got {logical}"
     );
-    assert_eq!(llm.granted.load(Ordering::SeqCst), 2 * logical);
+    assert_eq!(llm.granted(), 2 * logical);
     assert_eq!(status.calls_used as usize, 2 * logical);
     assert!(f.wiki.read_page(f.ws, f.proj, &anchor(&f)).is_ok());
 
@@ -1437,7 +1468,7 @@ async fn every_actual_send_is_durably_spent_and_a_refused_extra_send_publishes_n
     let status = run_job(&g, tight.clone(), max, job).await;
     assert_eq!(status.state, ProcessingJobState::BudgetExceeded);
     assert_eq!(status.calls_used, max);
-    assert_eq!(tight.granted.load(Ordering::SeqCst), max as usize);
+    assert_eq!(tight.granted(), max as usize);
     assert_eq!(
         tight.inner.count.load(Ordering::SeqCst),
         logical - 1,
@@ -1460,13 +1491,13 @@ async fn a_fallback_candidate_send_is_spent_like_any_other() {
         (down, up, chain)
     };
     // The primary is skipped once its circuit opens, so exactly one call
-    // makes two real sends: the primary's (prepaid) and the secondary's.
+    // makes two real sends: the primary's and the secondary's.
     let f = fixture(12, 2_500).await;
     let (down, up, chain) = build();
     let status = run_job(&f, chain, 128, start(&f, ProcessingJobKind::Consolidate)).await;
     assert_eq!(status.state, ProcessingJobState::Completed);
     let logical = up.inner.count.load(Ordering::SeqCst);
-    let sent = down.granted.load(Ordering::SeqCst) + up.granted.load(Ordering::SeqCst);
+    let sent = down.granted.load(Ordering::SeqCst) + up.granted();
     assert_eq!(down.granted.load(Ordering::SeqCst), 1);
     assert_eq!(sent, logical + 1);
     assert_eq!(status.calls_used as usize, sent);
@@ -1480,7 +1511,7 @@ async fn a_fallback_candidate_send_is_spent_like_any_other() {
     assert_eq!(status.state, ProcessingJobState::BudgetExceeded);
     assert_eq!(status.calls_used, max);
     assert_eq!(
-        down.granted.load(Ordering::SeqCst) + up.granted.load(Ordering::SeqCst),
+        down.granted.load(Ordering::SeqCst) + up.granted(),
         max as usize
     );
     assert!(g.wiki.read_page(g.ws, g.proj, &anchor(&g)).is_err());
@@ -1495,8 +1526,314 @@ async fn a_grant_revoked_before_an_extra_send_refuses_it_and_invalidates_the_job
     let llm = Arc::new(llm);
     let status = run_job(&f, llm.clone(), 128, viewed_by(&f, user)).await;
     assert_eq!(status.state, ProcessingJobState::Invalidated);
-    assert_eq!(status.calls_used, 1, "only the prepaid send was spent");
-    assert_eq!(llm.granted.load(Ordering::SeqCst), 1);
+    assert_eq!(status.calls_used, 1, "only the first send was spent");
+    assert_eq!(llm.granted(), 1);
     assert_eq!(llm.inner.count.load(Ordering::SeqCst), 0);
     assert!(f.wiki.read_page(f.ws, f.proj, &anchor(&f)).is_err());
 }
+
+/// Run a statement against the database file from outside the engine, the way
+/// an operator tool or a crash window would.
+fn sql(f: &Fixture, statement: &str) {
+    let conn = rusqlite::Connection::open(f.store.db_path()).unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    conn.execute_batch(statement).unwrap();
+}
+
+/// Let a job parked by a retry run again now instead of after its delay.
+fn make_due(f: &Fixture) {
+    sql(f, "UPDATE processing_jobs SET next_run_at = 0");
+}
+
+/// Refuses every call the way a full or timed-out admission queue does:
+/// before the provider is touched, so no send is ever announced.
+struct SaturatedLlm {
+    inner: StageLlm,
+    saturated: AtomicBool,
+    refused: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for SaturatedLlm {
+    fn name(&self) -> &'static str {
+        "saturated-llm"
+    }
+    fn model(&self) -> &str {
+        "saturated-llm"
+    }
+    async fn complete(&self, r: ChatRequest) -> LlmResult<ai_memory_llm::ChatResponse> {
+        self.inner.complete(r).await
+    }
+    async fn complete_structured_raw(
+        &self,
+        request: ChatRequest,
+        schema: Value,
+    ) -> LlmResult<Value> {
+        if self.saturated.load(Ordering::SeqCst) {
+            self.refused.fetch_add(1, Ordering::SeqCst);
+            return Err(LlmError::CapacityBusy("llm admission"));
+        }
+        self.inner.complete_structured_raw(request, schema).await
+    }
+}
+
+/// Answers a transient 503 to three of every four attempts, each of them a
+/// real, announced send.
+struct FlakyLlm {
+    inner: StageLlm,
+    attempts: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for FlakyLlm {
+    fn name(&self) -> &'static str {
+        "flaky-llm"
+    }
+    fn model(&self) -> &str {
+        "flaky-llm"
+    }
+    async fn complete(&self, r: ChatRequest) -> LlmResult<ai_memory_llm::ChatResponse> {
+        self.inner.complete(r).await
+    }
+    async fn complete_structured_raw(
+        &self,
+        request: ChatRequest,
+        schema: Value,
+    ) -> LlmResult<Value> {
+        if !self
+            .attempts
+            .fetch_add(1, Ordering::SeqCst)
+            .is_multiple_of(4)
+        {
+            before_generation_send().await?;
+            return Err(LlmError::Provider {
+                status: 503,
+                body: "down".into(),
+                retry_after: None,
+            });
+        }
+        self.inner.complete_structured_raw(request, schema).await
+    }
+}
+
+#[tokio::test]
+async fn a_saturated_queue_makes_no_provider_traffic_and_spends_no_call() {
+    let f = fixture(12, 2_500).await;
+    let llm = Arc::new(SaturatedLlm {
+        inner: StageLlm::new(),
+        saturated: AtomicBool::new(true),
+        refused: AtomicUsize::new(0),
+    });
+    let svc = service(&f, llm.clone(), true, 128);
+    svc.start(start(&f, ProcessingJobKind::Consolidate))
+        .await
+        .unwrap();
+
+    let parked = svc.execute_next().await.unwrap().unwrap();
+    assert_eq!(parked.state, ProcessingJobState::Running, "rescheduled");
+    assert!(llm.refused.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        llm.inner.count.load(Ordering::SeqCst),
+        0,
+        "no provider traffic"
+    );
+    assert_eq!(parked.calls_used, 0, "no call was spent without a send");
+
+    // Control: once the queue drains the same job completes within budget.
+    llm.saturated.store(false, Ordering::SeqCst);
+    make_due(&f);
+    let done = svc.execute_next().await.unwrap().unwrap();
+    assert_eq!(done.state, ProcessingJobState::Completed);
+    assert_eq!(
+        done.calls_used as usize,
+        llm.inner.count.load(Ordering::SeqCst),
+        "every spent call is a real send"
+    );
+    assert!(f.wiki.read_page(f.ws, f.proj, &anchor(&f)).is_ok());
+}
+
+#[tokio::test]
+async fn a_provider_that_stays_down_ends_the_job_after_the_retry_limit() {
+    let f = fixture(12, 2_500).await;
+    let llm = Arc::new(DownLeaf {
+        granted: AtomicUsize::new(0),
+    });
+    // Far more budget than the limit can use: the claims, not the budget, stop it.
+    let svc = service(&f, llm.clone(), true, 512);
+    svc.start(start(&f, ProcessingJobKind::Consolidate))
+        .await
+        .unwrap();
+    let mut claims = 0u32;
+    let status = loop {
+        let status = svc.execute_next().await.unwrap().expect("a due job");
+        claims += 1;
+        if status.state == ProcessingJobState::Failed {
+            break status;
+        }
+        assert!(claims < 3 * MAX_ERROR_RETRIES, "the retries are unbounded");
+        make_due(&f);
+    };
+    assert_eq!(claims, MAX_ERROR_RETRIES);
+    // Three attempts per claim, every one a real send.
+    assert_eq!(status.calls_used, 3 * MAX_ERROR_RETRIES);
+    assert_eq!(
+        llm.granted.load(Ordering::SeqCst),
+        (3 * MAX_ERROR_RETRIES) as usize
+    );
+    assert!(f.wiki.read_page(f.ws, f.proj, &anchor(&f)).is_err());
+}
+
+#[tokio::test]
+async fn progress_forgets_earlier_transient_failures() {
+    // Every claim makes one step of progress and then hits an outage: more
+    // claims than the retry limit end on a failure, none twice in a row.
+    let f = fixture(40, 3_000).await;
+    let llm = Arc::new(FlakyLlm {
+        inner: StageLlm::new(),
+        attempts: AtomicUsize::new(0),
+    });
+    let svc = service(&f, llm.clone(), true, 1024);
+    svc.start(start(&f, ProcessingJobKind::Consolidate))
+        .await
+        .unwrap();
+    let mut claims = 0u32;
+    let status = loop {
+        let status = svc.execute_next().await.unwrap().expect("a due job");
+        claims += 1;
+        if status.state == ProcessingJobState::Completed
+            || status.state == ProcessingJobState::Failed
+        {
+            break status;
+        }
+        assert!(claims < 400, "the job makes no progress");
+        make_due(&f);
+    };
+    assert_eq!(status.state, ProcessingJobState::Completed);
+    assert!(
+        claims > MAX_ERROR_RETRIES,
+        "only {claims} claims: the limit must count consecutive failures"
+    );
+    assert!(f.wiki.read_page(f.ws, f.proj, &anchor(&f)).is_ok());
+}
+
+#[tokio::test]
+async fn a_crash_after_the_last_call_resumes_from_the_stored_final_with_no_new_request() {
+    // Control: the whole session in as many calls as it needs.
+    let probe = fixture(12, 2_500).await;
+    let done = run_job(
+        &probe,
+        Arc::new(StageLlm::new()),
+        128,
+        start(&probe, ProcessingJobKind::Consolidate),
+    )
+    .await;
+    assert_eq!(done.state, ProcessingJobState::Completed);
+    let total = done.calls_used;
+
+    // A budget of exactly that many calls; the process dies after the final
+    // answer is stored and before the publication plan is.
+    let f = fixture(12, 2_500).await;
+    let llm = Arc::new(StageLlm::new());
+    let svc = service(&f, llm.clone(), true, total);
+    svc.start(start(&f, ProcessingJobKind::Consolidate))
+        .await
+        .unwrap();
+    sql(
+        &f,
+        "CREATE TRIGGER crash_before_plan BEFORE UPDATE OF publication_identity \
+         ON processing_jobs BEGIN SELECT RAISE(ABORT, 'simulated crash'); END",
+    );
+    assert!(svc.execute_next().await.is_err());
+    assert_eq!(llm.count.load(Ordering::SeqCst), total as usize);
+    assert!(f.wiki.read_page(f.ws, f.proj, &anchor(&f)).is_err());
+
+    sql(&f, "DROP TRIGGER crash_before_plan");
+    make_due(&f);
+    let resumed = svc.execute_next().await.unwrap().unwrap();
+    assert_eq!(resumed.state, ProcessingJobState::Completed);
+    assert_eq!(resumed.calls_used, total, "no call beyond the budget");
+    assert_eq!(
+        llm.count.load(Ordering::SeqCst),
+        total as usize,
+        "the stored final answer was reused, nothing was requested"
+    );
+    assert!(f.wiki.read_page(f.ws, f.proj, &anchor(&f)).is_ok());
+}
+
+#[tokio::test]
+async fn a_truncated_final_on_a_single_digest_is_never_resent_unchanged() {
+    let f = fixture(4, 300).await;
+    let mut llm = StageLlm::new();
+    llm.truncate_final = true;
+    let llm = Arc::new(llm);
+    let calls = llm.calls.clone();
+    let status = run_job(&f, llm, 128, start(&f, ProcessingJobKind::Consolidate)).await;
+    assert_eq!(status.state, ProcessingJobState::Failed);
+    let finals = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| !c.stage.ends_with("MAP") && !c.stage.ends_with("REDUCE"))
+        .count();
+    assert_eq!(
+        finals, 1,
+        "the only final request failed and nothing smaller exists to send"
+    );
+    assert!(f.wiki.read_page(f.ws, f.proj, &anchor(&f)).is_err());
+}
+
+/// Enqueue and run one auto-improve job whose every final answer is `answer`.
+async fn review_job_answering(answer: Value) -> (Fixture, ai_memory_core::ProcessingJobStatus) {
+    let f = fixture(4, 300).await;
+    let mut llm = StageLlm::new();
+    llm.malformed_final = Some(answer);
+    let svc = service(&f, Arc::new(llm), true, 128);
+    svc.enqueue(
+        &start(&f, ProcessingJobKind::AutoImprove),
+        &super::StartOptions {
+            instructions: None,
+            review: Some(AutoImproveReviewConfig {
+                min_observations: 1,
+                min_session_duration_secs: 0,
+                ..AutoImproveReviewConfig::default()
+            }),
+            trigger: "durable",
+        },
+    )
+    .await
+    .unwrap();
+    let status = svc.execute_next().await.unwrap().unwrap();
+    (f, status)
+}
+
+#[tokio::test]
+async fn a_malformed_final_review_never_completes_as_an_empty_staged_report() {
+    for wrong in [
+        json!({}),
+        json!({ "facts": [{ "text": "a mapped candidate" }] }),
+        json!({ "summary": "s", "proposals": [] }),
+        json!({ "summary": "s", "proposals": [], "rejected_candidates": [], "facts": [] }),
+    ] {
+        let (f, status) = review_job_answering(wrong.clone()).await;
+        assert_eq!(
+            status.state,
+            ProcessingJobState::Failed,
+            "{wrong} must not read as a finished review"
+        );
+        assert_eq!(staged_rows(&f), (0, 0), "{wrong} staged nothing");
+    }
+}
+
+#[tokio::test]
+async fn an_explicitly_empty_final_review_still_completes() {
+    let (_f, status) = review_job_answering(json!({
+        "summary": "nothing durable",
+        "proposals": [],
+        "rejected_candidates": []
+    }))
+    .await;
+    assert_eq!(status.state, ProcessingJobState::Completed);
+}
+
+mod focus_base;

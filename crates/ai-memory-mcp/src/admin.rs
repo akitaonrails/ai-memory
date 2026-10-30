@@ -2771,6 +2771,7 @@ async fn handle_processing_job_start(
     axum::Extension(ProcessingHandle(processing)): axum::Extension<ProcessingHandle>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    viewer_ext: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Json(req): Json<ProcessingJobStartRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let Some(service) = processing.filter(ai_memory_consolidate::ProcessingService::enabled) else {
@@ -2831,7 +2832,7 @@ async fn handle_processing_job_start(
             actor,
             author_id,
             owner,
-            viewer: author_id,
+            viewer: viewer_ext.map(|axum::Extension(viewer)| viewer.user()),
             instructions: None,
         })
         .await
@@ -2908,7 +2909,10 @@ async fn handle_auto_improve(
     State(state): State<Arc<AdminState>>,
     axum::Extension(ProcessingHandle(processing)): axum::Extension<ProcessingHandle>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
-    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    (author_ext, viewer_ext): (
+        Option<axum::Extension<ai_memory_core::UserId>>,
+        Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
+    ),
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     headers: HeaderMap,
     Json(req): Json<AutoImproveRequest>,
@@ -2985,6 +2989,9 @@ async fn handle_auto_improve(
                 .map_err(|e| internal_err(e.to_string()))?,
         );
         let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+        // Authorization is the gated `AuthorizedViewer`, never the bare
+        // attribution id (same as `memory_processing_job_start`).
+        let viewer = viewer_ext.map(|axum::Extension(viewer)| viewer.user());
         let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
         let staged = service
             .auto_improve_staged(ai_memory_consolidate::AutoImproveStageRequest {
@@ -2993,6 +3000,7 @@ async fn handle_auto_improve(
                 session_id: req.session_id,
                 cfg,
                 actor,
+                viewer,
                 author_id,
                 owner,
                 admission_ctx: Some(AdmissionContext {
@@ -13126,6 +13134,9 @@ mod tests {
     /// router mounts the processing routes over a provider-less service.
     struct ProcessingFixture {
         _tmp: TempDir,
+        store: Store,
+        ws: ai_memory_core::WorkspaceId,
+        scratch: ai_memory_core::ProjectId,
         router: Router,
         scratch_session: SessionId,
         other_session: SessionId,
@@ -13215,6 +13226,9 @@ mod tests {
             service,
         );
         ProcessingFixture {
+            store,
+            ws,
+            scratch: sessions[0].0,
             _tmp: tmp,
             router,
             scratch_session: sessions[0].1,
@@ -13527,6 +13541,107 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{foreign}");
         assert!(foreign.get("session_id").is_none());
+    }
+
+    /// A full operator bucket answers a distinct start with a retryable 503
+    /// and leaves every accepted snapshot alone; an equivalent retry still
+    /// joins, another project is unaffected, and a finished job frees a slot.
+    #[tokio::test]
+    async fn processing_job_start_answers_503_when_the_operator_queue_is_full() {
+        let f = processing_fixture_with_provider(true, true, true).await;
+        let cap = ai_memory_store::processing_jobs::PROCESSING_MAX_UNFINISHED_JOBS_PER_OWNER;
+        let append = |n: i64| {
+            let store = &f.store;
+            let session = f.scratch_session;
+            let (ws, proj) = (f.ws, f.scratch);
+            async move {
+                store
+                    .writer
+                    .insert_observation(Sanitized::new(
+                        NewObservation {
+                            occurred_at: None,
+                            session_id: session,
+                            workspace_id: ws,
+                            project_id: proj,
+                            kind: ObservationKind::UserPrompt,
+                            extension: None,
+                            source_event: None,
+                            title: "prompt".into(),
+                            body: format!("generation {n}"),
+                            importance: 5,
+                        },
+                        &Sanitizer::builtin(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        };
+        let start = || {
+            processing_call(
+                &f.router,
+                "POST",
+                "/admin/processing-jobs",
+                start_body("scratch", f.scratch_session, "consolidate"),
+            )
+        };
+
+        // The fixture's own observation is generation zero (job one); each
+        // further observation is a new snapshot and so a new job.
+        let mut ids = Vec::new();
+        for n in 0..cap {
+            if n > 0 {
+                append(n).await;
+            }
+            let (status, json) = start().await;
+            assert_eq!(status, StatusCode::ACCEPTED, "job {n}: {json}");
+            ids.push(json["job_id"].as_str().unwrap().to_string());
+        }
+        // At capacity, repeating the last accepted request joins its job.
+        let (status, json) = start().await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
+        assert_eq!(json["job_id"], *ids.last().unwrap());
+        append(cap).await;
+        let (status, json) = start().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert!(
+            json["error"].as_str().unwrap().contains("queue is full"),
+            "{json}"
+        );
+
+        // The legitimate neighbour: another project's own bucket is empty.
+        let (status, json) = processing_call(
+            &f.router,
+            "POST",
+            "/admin/processing-jobs",
+            start_body("other", f.other_session, "consolidate"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
+
+        // Finishing one of the accepted jobs frees one slot.
+        let first: ai_memory_core::ProcessingJobId = ids[0].parse().unwrap();
+        let claim = f
+            .store
+            .writer
+            .claim_processing_job(f.ws, f.scratch, first, std::time::Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("a runnable job");
+        f.store
+            .writer
+            .finish_processing_job(
+                &claim.claim,
+                ai_memory_store::ProcessingOutcome::Completed {
+                    result: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let (status, json) = start().await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
+        append(cap + 1).await;
+        let (status, json) = start().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
     }
 
     #[tokio::test]

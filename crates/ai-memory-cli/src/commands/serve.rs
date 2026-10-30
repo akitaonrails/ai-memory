@@ -1140,8 +1140,27 @@ async fn run_session_consolidation_worker(
         let consolidation = async {
             match processing.as_ref().filter(|p| p.enabled()) {
                 Some(processing) => {
+                    // Automatic, server-owned policy (as the scheduler): the
+                    // shared owner bucket and no authorization viewer. The
+                    // session row records only the operator's identity key,
+                    // not how that identity authenticated, so the worker
+                    // never guesses a DB user or a revocation principal from
+                    // it. The session actor is kept as attribution only. An
+                    // authenticated manual or async start carries its own
+                    // owner bucket and viewer, both part of the job's
+                    // equivalence, so it can never join this job.
                     processing
-                        .consolidate_session(session_id, false, actor, None, None)
+                        .consolidate_session(
+                            session_id,
+                            false,
+                            ai_memory_consolidate::ProcessingCaller {
+                                actor,
+                                author_id: None,
+                                viewer: None,
+                                owner: None,
+                            },
+                            None,
+                        )
                         .await
                 }
                 None => {

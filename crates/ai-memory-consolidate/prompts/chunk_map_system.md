@@ -13,4 +13,6 @@ Task: list what happened and what was learned in this slice as short items.
 Record contradictions you cannot resolve in `conflicts` (topic, refs, note) instead of choosing a side. Keep identifiers, file paths, commands and error strings verbatim.
 
 Prefer fewer, denser items: at most 12 items and 4 conflicts. Skip noise (progress chatter, repeated retries, tool boilerplate), but never drop a decision, a failure together with its cause, or a correction. If the slice has nothing relevant, return empty arrays.
-Return only the JSON object required by the schema.
+Output: exactly one JSON object, no prose, no code fence, with exactly these two keys (any other key is rejected):
+{"items": [{"kind": "fact|decision|gotcha|rule|procedure|open|correction", "text": "…", "refs": ["o12"], "quote": "", "supersedes": []}], "conflicts": [{"topic": "…", "refs": ["o12", "o14"], "note": "…"}]}
+Always include both `items` and `conflicts` (use [] when empty) and every field of every item and conflict. Use these exact key names; do not use `facts`, `summary` or `ref`.

@@ -16,11 +16,12 @@ use ai_memory_llm::{ChatMessage, ChatRequest, Role};
 use ai_memory_store::{BriefingPage, ReaderPool};
 use ai_memory_wiki::Wiki;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::budget::{StageBudgets, final_prompt, fingerprint};
 use super::chunk_digest::render_digest;
 use super::chunk_pipeline::Output;
-use super::chunk_plan::text_cost;
+use super::chunk_plan::{hex, text_cost};
 use crate::auto_improve::{
     AutoImproveError, AutoImproveEvalConfig, AutoImproveEvalResult, AutoImproveLlmResponse,
     AutoImproveProposal, AutoImproveRejectedCandidate, AutoImproveReport, AutoImproveReviewConfig,
@@ -270,6 +271,16 @@ pub(super) fn consolidate_request(
     one_request(system, user, budgets.final_out_tokens)
 }
 
+/// The one existing page a review may replace as a whole.
+pub(super) const CURRENT_FOCUS: &str = "_slots/current-focus.md";
+
+/// `current-focus` as the final call saw it. Server-owned: it is captured
+/// with the context, never read again later, and never taken from the model.
+struct FocusBase {
+    body: String,
+    sha256: String,
+}
+
 /// Context of an auto-improve final call.
 pub(super) struct ReviewContext {
     recent_text: String,
@@ -278,6 +289,8 @@ pub(super) struct ReviewContext {
     pub warnings: Vec<String>,
     pub existing_index: ExistingPageIndex,
     pub hash: String,
+    /// `None`: the slot did not exist, so a proposal for it may only create.
+    focus: Option<FocusBase>,
 }
 
 /// Read the bounded review context.
@@ -342,12 +355,26 @@ pub(super) async fn gather_review_context(
             format!("{}\0{}\0{at}", p.path, p.body_sha256)
         })
         .collect();
+    // A full-page proposal replaces current-focus whether or not it was shown
+    // (it is not a patch target), so its exact version is part of the context.
+    let focus = reader
+        .page_body_by_ids(ws, proj, CURRENT_FOCUS)
+        .await?
+        .map(|page| FocusBase {
+            sha256: hex(&Sha256::digest(page.body.as_bytes())),
+            body: page.body,
+        });
+    let focus_part = focus.as_ref().map_or_else(
+        || "focus:absent".to_string(),
+        |f| format!("focus:{}", f.sha256),
+    );
     let hash = fingerprint(&[
         &recent_text,
         &rendered.text,
         &rejection_text,
         &listing.join("\n"),
         &bases.join("\n"),
+        &focus_part,
     ]);
     Ok(ReviewContext {
         recent_text,
@@ -356,6 +383,7 @@ pub(super) async fn gather_review_context(
         warnings,
         existing_index,
         hash,
+        focus,
     })
 }
 
@@ -572,7 +600,8 @@ impl ReviewDraft {
 
 /// Validate the final response once for the whole session: candidates are
 /// merged per target, caps apply to the merged proposals, and the eval's
-/// before-bodies are fixed (the context's own bodies for patched pages).
+/// before-bodies are fixed (the context's own bodies for patched pages and
+/// for current-focus, whose captured hash becomes the proposal's base).
 ///
 /// # Errors
 /// Store failures reading a before-body.
@@ -592,7 +621,16 @@ pub(super) async fn prepare_review(
     estimated_input_text: &str,
 ) -> Result<ReviewDraft, AutoImproveError> {
     merge_targets(&mut raw, cfg, &ctx.existing_index);
-    let (proposals, rejected, mut warnings) = validate_response(raw, cfg, &ctx.existing_index);
+    let (mut proposals, rejected, mut warnings) = validate_response(raw, cfg, &ctx.existing_index);
+    // The validator clears any model-supplied base. A full-page proposal for
+    // current-focus is bound to the version the final call read (`None` when
+    // the slot was absent: it then creates and conflicts if the slot appears).
+    for p in proposals
+        .iter_mut()
+        .filter(|p| p.path == CURRENT_FOCUS && p.edit_mode != "patch")
+    {
+        p.expected_base_body_sha256 = ctx.focus.as_ref().map(|f| f.sha256.clone());
+    }
     warnings.extend(ctx.warnings.iter().cloned());
     let mut before_bodies = BTreeMap::new();
     if cfg.eval.enabled {
@@ -602,6 +640,13 @@ pub(super) async fn prepare_review(
         {
             let body = match ctx.existing_index.patchable_body(&p.path) {
                 Some(body) => body.to_string(),
+                // The eval compares against the body the proposal's base hash
+                // names, never a later read.
+                None if p.path == CURRENT_FOCUS => ctx
+                    .focus
+                    .as_ref()
+                    .map(|f| f.body.clone())
+                    .unwrap_or_default(),
                 None => reader
                     .page_body_by_ids(ws, proj, &p.path)
                     .await?
@@ -780,7 +825,211 @@ mod tests {
             warnings: Vec::new(),
             existing_index: index(),
             hash: String::new(),
+            focus: None,
         }
+    }
+
+    fn focus_proposal(model_base: Option<&str>) -> AutoImproveProposal {
+        let mut p: AutoImproveProposal = serde_json::from_value(json!({
+            "path": CURRENT_FOCUS, "title": "Focus", "kind": "slot", "confidence": 0.9,
+            "rationale": "why",
+            "evidence": [{"page": "sessions/s.md", "quote": "q"}],
+            "body_markdown": "# Focus\n\nnew focus derived from version A"
+        }))
+        .unwrap();
+        p.expected_base_body_sha256 = model_base.map(str::to_string);
+        p
+    }
+
+    fn focus_ctx(body: &str) -> ReviewContext {
+        ReviewContext {
+            focus: Some(FocusBase {
+                body: body.into(),
+                sha256: hex(&Sha256::digest(body.as_bytes())),
+            }),
+            ..review_ctx()
+        }
+    }
+
+    fn eval_cfg() -> AutoImproveReviewConfig {
+        AutoImproveReviewConfig {
+            // no command: the gate records before-bodies but starts nothing
+            eval: AutoImproveEvalConfig {
+                enabled: true,
+                command: String::new(),
+                // before-bodies are recorded only for proposals the eval targets
+                targets: vec!["_slots".to_string()],
+                ..AutoImproveEvalConfig::default()
+            },
+            ..AutoImproveReviewConfig::default()
+        }
+    }
+
+    async fn put_focus(
+        store: &ai_memory_store::Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        body: &str,
+    ) {
+        store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(CURRENT_FOCUS).unwrap(),
+                title: "Focus".into(),
+                body: body.into(),
+                tier: ai_memory_core::Tier::Semantic,
+                frontmatter_json: json!({}),
+                pinned: true,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn scope(store: &ai_memory_store::Store) -> (WorkspaceId, ProjectId) {
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p".to_string(), None)
+            .await
+            .unwrap();
+        (ws, proj)
+    }
+
+    /// The server captures current-focus with the context. Before, the
+    /// plan classified it from a later read and carried no base, so a page
+    /// edited after the final call was staged over; now the captured hash is
+    /// part of the context fingerprint, so a changed slot invalidates a final
+    /// answer that was derived from the old one.
+    #[tokio::test]
+    async fn the_context_captures_the_current_focus_version_and_fingerprints_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ai_memory_store::Store::open(dir.path()).unwrap();
+        let (ws, proj) = scope(&store).await;
+        let cfg = AutoImproveReviewConfig::default();
+        let gather = || gather_review_context(&store.reader, ws, proj, &cfg, 4_000);
+
+        let absent = gather().await.unwrap();
+        assert!(absent.focus.is_none());
+        assert_eq!(
+            gather().await.unwrap().hash,
+            absent.hash,
+            "stable when unchanged"
+        );
+
+        put_focus(&store, ws, proj, "# Focus\n\nversion A").await;
+        let a = gather().await.unwrap();
+        assert_eq!(
+            a.focus.as_ref().map(|f| f.sha256.clone()),
+            Some(hex(&Sha256::digest(b"# Focus\n\nversion A")))
+        );
+        assert_ne!(
+            a.hash, absent.hash,
+            "absent -> appeared changes the context"
+        );
+        assert_eq!(gather().await.unwrap().hash, a.hash);
+
+        put_focus(&store, ws, proj, "# Focus\n\nversion B").await;
+        assert_ne!(
+            gather().await.unwrap().hash,
+            a.hash,
+            "A -> B changes the context"
+        );
+    }
+
+    /// The proposal carries the base hash of the version the model read, the
+    /// model's own value is dropped, and the eval compares against that same
+    /// body even though the page was edited after the context was captured.
+    #[tokio::test]
+    async fn a_current_focus_proposal_carries_the_captured_base_and_its_eval_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ai_memory_store::Store::open(dir.path()).unwrap();
+        let (ws, proj) = scope(&store).await;
+        put_focus(&store, ws, proj, "# Focus\n\nconcurrent version B").await;
+        let cfg = eval_cfg();
+        let ctx = focus_ctx("# Focus\n\nversion A");
+
+        let draft = prepare_review(
+            &store.reader,
+            "p",
+            "m",
+            ws,
+            proj,
+            SessionId::new(),
+            &cfg,
+            &ctx,
+            raw(vec![focus_proposal(Some("model-supplied"))]),
+            3,
+            100,
+            "prompt",
+        )
+        .await
+        .unwrap();
+
+        let expected = hex(&Sha256::digest(b"# Focus\n\nversion A"));
+        assert_eq!(draft.report.proposals.len(), 1);
+        assert_eq!(
+            draft.report.proposals[0]
+                .expected_base_body_sha256
+                .as_deref(),
+            Some(expected.as_str())
+        );
+        let before = &draft.before_bodies[CURRENT_FOCUS];
+        assert_eq!(before, "# Focus\n\nversion A", "not the later read (B)");
+        assert_eq!(hex(&Sha256::digest(before.as_bytes())), expected);
+
+        // The base survives the persisted report a restart reads back.
+        let stored = serde_json::to_value(FinalRecord::evaluated(&draft.report)).unwrap();
+        let FinalRecord::Evaluated { report, .. } = serde_json::from_value(stored).unwrap() else {
+            panic!("an evaluated record");
+        };
+        assert_eq!(
+            report.proposals[0].expected_base_body_sha256.as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    /// An absent slot has no base: the proposal may only create, whatever
+    /// appears afterwards, and the eval's before-body is empty, not the page
+    /// that appeared after the context was captured.
+    #[tokio::test]
+    async fn an_absent_current_focus_yields_a_proposal_without_base_and_an_empty_eval_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ai_memory_store::Store::open(dir.path()).unwrap();
+        let (ws, proj) = scope(&store).await;
+        put_focus(&store, ws, proj, "# Focus\n\nappeared after the context").await;
+        let cfg = eval_cfg();
+
+        let draft = prepare_review(
+            &store.reader,
+            "p",
+            "m",
+            ws,
+            proj,
+            SessionId::new(),
+            &cfg,
+            &review_ctx(),
+            raw(vec![focus_proposal(Some("model-supplied"))]),
+            3,
+            100,
+            "prompt",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(draft.report.proposals.len(), 1);
+        assert_eq!(draft.report.proposals[0].expected_base_body_sha256, None);
+        assert_eq!(draft.before_bodies[CURRENT_FOCUS], "");
     }
 
     #[test]

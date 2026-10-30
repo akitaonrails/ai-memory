@@ -93,8 +93,8 @@ pub use lint::{
     LintOptions, LintReport, run_lint, stale_days_for,
 };
 pub use processing::{
-    AutoImproveStageRequest, ProcessingError, ProcessingJobAccess, ProcessingJobStart,
-    ProcessingService,
+    AutoImproveStageRequest, ProcessingCaller, ProcessingError, ProcessingJobAccess,
+    ProcessingJobStart, ProcessingService,
 };
 pub use sweep::{
     ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,

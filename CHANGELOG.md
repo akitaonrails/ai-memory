@@ -36,6 +36,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed chunked processing to reject malformed digests, preserve operator
+  identity across synchronous and asynchronous consolidation, and reject
+  full-page current-focus proposals whose captured base changed before staging.
+  Fixed exact-budget final recovery, stopped unchanged final resends, bounded
+  transient retries, and charged attempts only after local admission. Bounded
+  unfinished jobs to 128 server-wide and 16 per project/owner, while allowing
+  equivalent requests to join at capacity (#1881).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).

@@ -511,6 +511,8 @@ async fn run_scheduled_auto_improve(
                     ..ActorContext::default()
                 },
                 author_id: None,
+                // Trusted, server-owned job: no per-user grant applies.
+                viewer: None,
                 owner: None,
                 admission_ctx: None,
             })

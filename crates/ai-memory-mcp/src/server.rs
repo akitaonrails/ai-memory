@@ -4297,18 +4297,45 @@ impl AiMemoryServer {
                 }
             }
         }
+        // `[chunking]` on: the same bucket `memory_processing_job_start`
+        // computes, so this call and an asynchronous start of the same
+        // operator converge on one job, and another operator's never does.
+        let processing = self.enabled_processing();
+        let owner = match processing {
+            Some(_) => ai_memory_core::owner_identity(
+                actor.identity_key().as_ref(),
+                self.deployment_distinguishes_operators()
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            ),
+            None => None,
+        };
+        let caller = ai_memory_consolidate::ProcessingCaller {
+            actor,
+            author_id,
+            // The same authorization viewer `memory_processing_job_start`
+            // persists (never the bare attribution `author_id`).
+            viewer: Self::viewer_from_parts(Some(&parts)),
+            owner,
+        };
         if args.multi_page.unwrap_or(false) {
             // With `[chunking]` on, the same call runs as a durable job over
             // the whole session and still returns the legacy outcome shape.
-            let outcomes = match self.enabled_processing() {
+            let outcomes = match processing {
                 Some(processing) => {
                     processing
-                        .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
+                        .consolidate_session_multi(session_id, dry, caller, instructions)
                         .await
                 }
                 None => {
                     consolidator
-                        .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
+                        .consolidate_session_multi(
+                            session_id,
+                            dry,
+                            caller.actor,
+                            caller.author_id,
+                            instructions,
+                        )
                         .await
                 }
             }
@@ -4320,15 +4347,21 @@ impl AiMemoryServer {
             }
             ok_json(&serde_json::json!({ "outcomes": outcomes }))
         } else {
-            let outcome = match self.enabled_processing() {
+            let outcome = match processing {
                 Some(processing) => {
                     processing
-                        .consolidate_session(session_id, dry, actor, author_id, instructions)
+                        .consolidate_session(session_id, dry, caller, instructions)
                         .await
                 }
                 None => {
                     consolidator
-                        .consolidate_session(session_id, dry, actor, author_id, instructions)
+                        .consolidate_session(
+                            session_id,
+                            dry,
+                            caller.actor,
+                            caller.author_id,
+                            instructions,
+                        )
                         .await
                 }
             }
@@ -4587,6 +4620,7 @@ impl AiMemoryServer {
                     cfg,
                     actor: request_actor,
                     author_id,
+                    viewer: Self::viewer_from_parts(Some(&parts)),
                     owner: staging_owner,
                     admission_ctx: Some(ai_memory_wiki::AdmissionContext {
                         op: ai_memory_wiki::AdmissionOp::WritePage,
@@ -24146,6 +24180,7 @@ mod tests {
             &self,
             _request: ai_memory_llm::ChatRequest,
         ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            ai_memory_llm::before_generation_send().await?;
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(ai_memory_llm::LlmError::Provider {
                 status: 400,
@@ -24159,6 +24194,7 @@ mod tests {
             _request: ai_memory_llm::ChatRequest,
             _schema: serde_json::Value,
         ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            ai_memory_llm::before_generation_send().await?;
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(ai_memory_llm::LlmError::Provider {
                 status: 400,
@@ -24322,6 +24358,273 @@ mod tests {
         assert!(
             calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "a session without a durable job keeps the legacy path"
+        );
+    }
+
+    /// Two operators on one project: each operator's synchronous
+    /// `memory_consolidate` joins that operator's own asynchronous job and
+    /// never another operator's, and the server never mixes buckets.
+    #[tokio::test]
+    async fn sync_and_async_consolidation_converge_per_operator_and_never_across_operators() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(CountingFailingLlm(calls));
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let processing = ai_memory_consolidate::ProcessingService::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Some(llm.clone()),
+            ws,
+            proj,
+            ai_memory_core::chunking::ChunkingSettings {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator)
+            .with_processing_service(processing)
+            .with_trusted_proxy_identity(true);
+        let session = seeded_completed_session(&store, ws, proj).await;
+
+        let start = |user: &'static str| {
+            server.memory_processing_job_start(
+                Parameters(ProcessingJobStartArgs {
+                    kind: "consolidate".into(),
+                    session_id: session.to_string(),
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(parts_with_caller(Some(user), "s")),
+            )
+        };
+        let sync = |user: &'static str| {
+            server.memory_consolidate(
+                Parameters(ConsolidateArgs {
+                    session_id: Some(session.to_string()),
+                    dry_run: Some(false),
+                    multi_page: Some(false),
+                    instructions: None,
+                }),
+                OptionalParts(parts_with_caller(Some(user), "s")),
+            )
+        };
+        let used = |job: ai_memory_core::ProcessingJobId| {
+            let reader = store.reader.clone();
+            async move {
+                reader
+                    .processing_job_status(
+                        ws,
+                        proj,
+                        job,
+                        ai_memory_store::ProcessingOwnerFilter::Any,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("job exists")
+                    .calls_used
+            }
+        };
+        let rows = || {
+            let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT owner_key, calls_used FROM processing_jobs ORDER BY owner_key")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+        };
+        let key = |name: &str| ai_memory_core::IdentityKey::User(name.into()).storage_key();
+
+        let started = call_tool_json(start("alice").await.unwrap());
+        let alice_job: ai_memory_core::ProcessingJobId =
+            started["job_id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(used(alice_job).await, 0);
+
+        // Bob's synchronous call must neither adopt nor run alice's job.
+        sync("bob").await.expect_err("the provider fails");
+        assert_eq!(used(alice_job).await, 0, "bob never touches alice's job");
+        let after_bob = rows();
+        assert_eq!(after_bob.len(), 2, "{after_bob:?}");
+        assert!(
+            after_bob
+                .iter()
+                .any(|(owner, used)| *owner == key("bob") && *used > 0)
+        );
+
+        // Alice's own synchronous call converges on her asynchronous job:
+        // it runs that job, and no extra bucket or job appears.
+        sync("alice").await.expect_err("the provider fails");
+        assert!(
+            used(alice_job).await > 0,
+            "alice's sync call ran her own job"
+        );
+        let after_alice = rows();
+        assert_eq!(after_alice.len(), 2, "{after_alice:?}");
+        assert!(
+            after_alice
+                .iter()
+                .all(|(owner, _)| *owner == key("alice") || *owner == key("bob")),
+            "no shared-bucket job may appear: {after_alice:?}"
+        );
+    }
+
+    /// The job's authorization viewer (`AuthorizedViewer`) is part of its
+    /// identity and is never the bare attribution `UserId`: a synchronous
+    /// call carrying only attribution (a policy-off style request) must not
+    /// join, or be joined by, the viewer-bearing job of the same operator.
+    #[tokio::test]
+    async fn consolidation_never_joins_a_job_with_another_authorization_viewer() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let user = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "alice".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(CountingFailingLlm(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let processing = ai_memory_consolidate::ProcessingService::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Some(llm.clone()),
+            ws,
+            proj,
+            ai_memory_core::chunking::ChunkingSettings {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator)
+            .with_processing_service(processing);
+        let session = seeded_completed_session(&store, ws, proj).await;
+        let parts = |viewer: bool| {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(ActorContext {
+                user: Some("alice".into()),
+                ..ActorContext::default()
+            });
+            parts.extensions.insert(user);
+            if viewer {
+                parts
+                    .extensions
+                    .insert(ai_memory_core::AuthorizedViewer(user));
+            }
+            parts
+        };
+        let sync = |viewer: bool| {
+            server.memory_consolidate(
+                Parameters(ConsolidateArgs {
+                    session_id: Some(session.to_string()),
+                    dry_run: Some(false),
+                    multi_page: Some(false),
+                    instructions: None,
+                }),
+                OptionalParts(parts(viewer)),
+            )
+        };
+        let rows = || {
+            let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT id, viewer_id, calls_used FROM processing_jobs")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+        };
+
+        // The viewer-bearing asynchronous job exists first.
+        let started = call_tool_json(
+            server
+                .memory_processing_job_start(
+                    Parameters(ProcessingJobStartArgs {
+                        kind: "consolidate".into(),
+                        session_id: session.to_string(),
+                        project: None,
+                        workspace: None,
+                    }),
+                    OptionalParts(parts(true)),
+                )
+                .await
+                .unwrap(),
+        );
+        let viewer_job: ai_memory_core::ProcessingJobId =
+            started["job_id"].as_str().unwrap().parse().unwrap();
+        let before = rows();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1.as_deref(), Some(user.as_bytes().as_slice()));
+
+        // Attribution without an authorization viewer: a distinct job, and
+        // the viewer-bearing one is left untouched.
+        sync(false).await.expect_err("the provider fails");
+        let after = rows();
+        assert_eq!(after.len(), 2, "{after:?}");
+        let viewer_row = after
+            .iter()
+            .find(|row| row.0 == viewer_job.as_bytes().as_slice())
+            .unwrap();
+        assert_eq!(viewer_row.2, 0, "the viewer-less call never ran A's job");
+        assert!(
+            after.iter().any(|row| row.1.is_none() && row.2 > 0),
+            "the attribution-only call ran its own viewer-less job: {after:?}"
+        );
+
+        // Control: the call with the same viewer converges on the job.
+        sync(true).await.expect_err("the provider fails");
+        let converged = rows();
+        assert_eq!(converged.len(), 2, "{converged:?}");
+        assert!(
+            converged
+                .iter()
+                .find(|row| row.0 == viewer_job.as_bytes().as_slice())
+                .unwrap()
+                .2
+                > 0,
+            "the same-viewer call ran the existing job"
         );
     }
 

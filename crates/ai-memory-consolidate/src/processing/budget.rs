@@ -11,10 +11,11 @@
 use ai_memory_core::ProcessingJobKind;
 use sha2::{Digest, Sha256};
 
-use super::chunk_digest::{ChunkDigest, MAP_SYSTEM_PROMPT, REDUCE_SYSTEM_PROMPT, schema_cost};
+use super::chunk_digest::{
+    ChunkDigest, MAP_SYSTEM_PROMPT, REDUCE_SYSTEM_PROMPT, ReviewEnvelope, schema_cost,
+};
 use super::chunk_pipeline::GROUP_HEADER_COST;
 use super::chunk_plan::{MIN_CHUNK_EVIDENCE_COST, hex, text_cost};
-use crate::auto_improve::AutoImproveLlmResponse;
 use crate::types::{ConsolidatedBatch, ConsolidatedPage};
 
 pub(super) const FINAL_PAGE_SYSTEM_PROMPT: &str =
@@ -81,7 +82,7 @@ pub(super) fn final_prompt(kind: ProcessingJobKind) -> (&'static str, usize) {
         ),
         ProcessingJobKind::AutoImprove => (
             FINAL_AUTO_IMPROVE_SYSTEM_PROMPT,
-            schema_cost::<AutoImproveLlmResponse>(),
+            schema_cost::<ReviewEnvelope>(),
         ),
     }
 }

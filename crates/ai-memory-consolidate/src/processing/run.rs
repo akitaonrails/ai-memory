@@ -24,7 +24,7 @@ use ai_memory_wiki::Wiki;
 
 use super::budget::{ENVELOPE_COST, StageBudgets, final_prompt, fingerprint};
 use super::chunk_digest::{
-    ChunkDigest, MAP_SYSTEM_PROMPT, QuoteCheck, REDUCE_SYSTEM_PROMPT, RefScope,
+    ChunkDigest, MAP_SYSTEM_PROMPT, QuoteCheck, REDUCE_SYSTEM_PROMPT, RefScope, ReviewEnvelope,
     collect_refs_and_quotes, digest_cost, schema_cost, scrub_value, validate_digest,
 };
 use super::chunk_pipeline::{Action, NodeRecord, Output, PipelineError, next_action, progress};
@@ -40,8 +40,7 @@ use super::final_stage::{
 use super::publish::Plan;
 use super::{JobOptions, LEASE, Overrides, ProcessingError, ProcessingService};
 use crate::auto_improve::{
-    AutoImproveLlmResponse, AutoImproveReviewConfig, preflight_rejection,
-    session_duration_from_span,
+    AutoImproveReviewConfig, preflight_rejection, session_duration_from_span,
 };
 use crate::consolidator::ConsolidatorError;
 use crate::types::{ConsolidatedBatch, ConsolidatedPage};
@@ -52,10 +51,16 @@ const NODE_PAGE: usize = 500;
 /// Level recorded for final-stage nodes.
 const FINAL_LEVEL: u32 = 9_999;
 const CALL_ATTEMPTS: u32 = 3;
-const CALL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const CALL_RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_secs(2)
+};
 const RETRY_AFTER_SECS: i64 = 60;
 const MAX_FINAL_SHRINKS: u32 = 3;
-const MAX_ERROR_RETRIES: u32 = 5;
+/// Consecutive failed claims (transient provider failures or unexpected
+/// errors) after which a job ends instead of being rescheduled again.
+pub(super) const MAX_ERROR_RETRIES: u32 = 5;
 const MAX_PLAN_BYTES: usize = 240_000;
 
 /// Why a run stopped early.
@@ -114,14 +119,16 @@ enum CallFailure {
     Denied(Abort),
 }
 
-/// Spends every generation send of one provider invocation beyond the first.
+/// Spends every generation send of one provider invocation.
 ///
-/// `call_llm` durably reserves one attempt before it invokes the provider; a
-/// strict→tolerant re-send or a fallback candidate inside that invocation is a
-/// further real send, so the provider layer asks here before each one. A
-/// refusal reaches the provider as local back-pressure (`CapacityBusy`, which
-/// neither marks a provider unhealthy nor advances a fallback chain); the
-/// true cause is kept in `stop` for `call_llm` to return.
+/// The provider layer asks here immediately before each request leaves, after
+/// any admission wait: a strict→tolerant re-send, a 401 re-POST or a fallback
+/// candidate is one more send like the first. The attempt is durably reserved
+/// at that moment and never refunded, so a send that is never made (local
+/// saturation, a refused guard) costs nothing and an uncertain one stays
+/// counted. A refusal reaches the provider as local back-pressure
+/// (`CapacityBusy`, which neither marks a provider unhealthy nor advances a
+/// fallback chain); the true cause is kept in `stop` for `call_llm` to return.
 struct CallGuard {
     reader: ReaderPool,
     writer: WriterHandle,
@@ -133,7 +140,7 @@ struct CallGuard {
 }
 
 impl CallGuard {
-    async fn admit(&self, prepaid: bool) -> Result<(), CallFailure> {
+    async fn admit(&self) -> Result<(), CallFailure> {
         authorize_viewer(
             &self.reader,
             self.viewer,
@@ -143,15 +150,6 @@ impl CallGuard {
         )
         .await
         .map_err(CallFailure::Denied)?;
-        if prepaid {
-            // Revalidate ownership after waiting for admission, without
-            // spending the reservation a second time.
-            return self
-                .writer
-                .confirm_processing_fence()
-                .await
-                .map_err(claim_failure);
-        }
         match self.writer.reserve_processing_call(&self.claim).await {
             Ok(CallReservation::Reserved { .. }) => Ok(()),
             Ok(CallReservation::BudgetExhausted { .. }) => Err(CallFailure::Budget),
@@ -169,8 +167,8 @@ impl CallGuard {
 
 #[async_trait::async_trait]
 impl GenerationAttemptGuard for CallGuard {
-    async fn before_send(&self, prepaid: bool) -> LlmResult<()> {
-        let Err(failure) = self.admit(prepaid).await else {
+    async fn before_send(&self) -> LlmResult<()> {
+        let Err(failure) = self.admit().await else {
             return Ok(());
         };
         self.stop
@@ -318,6 +316,12 @@ pub(super) struct Run {
     nodes: HashMap<String, NodeRecord>,
     finals: HashMap<String, FinalRecord>,
     shrinks: u32,
+    /// Final requests an earlier attempt already saw fail unusably; sending
+    /// the same one again cannot help.
+    failed_finals: BTreeSet<String>,
+    /// Markers (`rf:n`) of the consecutive claims that ended on a transient
+    /// provider failure; any progress deletes them.
+    retries: Vec<String>,
 }
 
 impl ProcessingService {
@@ -472,6 +476,8 @@ impl Run {
             nodes: HashMap::new(),
             finals: HashMap::new(),
             shrinks: 0,
+            failed_finals: BTreeSet::new(),
+            retries: Vec::new(),
         })
     }
 
@@ -560,9 +566,7 @@ impl Run {
         plan: Plan,
         identity: String,
     ) -> Result<ProcessingJobStatus, Abort> {
-        if !matches!(plan, Plan::Report { .. }) {
-            self.authorize(ProjectAccess::Write).await?;
-        }
+        self.authorize(ProjectAccess::Write).await?;
         let plan_json = serde_json::to_value(&plan)
             .map_err(|e| Abort::Error(ProcessingError::Other(e.to_string())))?;
         if plan_json.to_string().len() > MAX_PLAN_BYTES {
@@ -622,20 +626,15 @@ impl Run {
         self.chunks = planner.finish();
         self.duration_secs = session_duration_from_span(first, last);
         self.load_nodes().await?;
-        // A ceiling that cannot cover the remaining map calls plus the final
-        // call is reported now, before any call is spent on partial coverage.
-        let remaining_maps = self
-            .chunks
-            .iter()
-            .filter(|c| !self.nodes.contains_key(&map_key(&c.spans)))
-            .count() as u64;
+        // A ceiling that cannot cover the calls the remaining work still
+        // needs is reported now, before any call is spent on partial coverage.
+        let needed = self.pending_calls();
         let calls_left = u64::from(self.status.max_calls.saturating_sub(self.status.calls_used));
-        if remaining_maps + 1 > calls_left {
+        if needed > calls_left {
             return Err(Abort::Finish(ProcessingOutcome::BudgetExceeded {
                 reason: format!(
-                    "the session needs at least {} more provider calls but only {calls_left} \
-                     remain of chunking.max_calls_per_run; nothing was published",
-                    remaining_maps + 1
+                    "the session needs at least {needed} more provider calls but only \
+                     {calls_left} remain of chunking.max_calls_per_run; nothing was published"
                 ),
             }));
         }
@@ -674,6 +673,11 @@ impl Run {
                     }
                 } else if node.key.starts_with("sf:") {
                     self.shrinks += 1;
+                    if let Some(fp) = node.json.get("request").and_then(|v| v.as_str()) {
+                        self.failed_finals.insert(fp.to_string());
+                    }
+                } else if node.key.starts_with("rf:") {
+                    self.retries.push(node.key);
                 } else if node.input_fingerprint == self.ctx_fp
                     && let Ok(rec) = serde_json::from_value::<NodeRecord>(node.json)
                 {
@@ -682,6 +686,28 @@ impl Run {
             }
         }
         Ok(())
+    }
+
+    /// Provider calls the remaining work needs at least: the unfinished maps
+    /// plus one final call. A session the preflight filters skip needs none,
+    /// and neither does a job whose maps are done and whose final answer or
+    /// evaluated report is already stored (a restart reuses it).
+    fn pending_calls(&self) -> u64 {
+        if self.review.as_ref().is_some_and(|cfg| {
+            preflight_rejection(self.expected.len(), self.duration_secs, cfg).is_some()
+        }) {
+            return 0;
+        }
+        let maps = self
+            .chunks
+            .iter()
+            .filter(|c| !self.nodes.contains_key(&map_key(&c.spans)))
+            .count() as u64;
+        let reusable = self
+            .finals
+            .values()
+            .any(|r| !matches!(r, FinalRecord::EvalStarted));
+        maps + u64::from(!(maps == 0 && reusable))
     }
 
     /// Auto-improve sessions the preflight filters skip end without a call.
@@ -723,18 +749,12 @@ impl Run {
         });
         let mut attempt = 0u32;
         loop {
-            // The first send of every invocation is durably spent before
-            // anything is sent, retries and uncertain results included; the
-            // guard spends each further send the provider layer makes inside
-            // the invocation (strict→tolerant re-send, fallback candidates).
+            // Every generation send is durably spent by the guard at the
+            // provider's send hook, after any admission wait and just before
+            // the request leaves: retries and uncertain results stay counted,
+            // a send that never happens costs nothing.
             if let Err(abort) = self.authorize(ProjectAccess::Write).await {
                 return Err(CallFailure::Denied(abort));
-            }
-            match self.writer.reserve_processing_call(&self.claim).await {
-                Ok(CallReservation::Reserved { .. }) => {}
-                Ok(CallReservation::BudgetExhausted { .. }) => return Err(CallFailure::Budget),
-                Err(e) if e.is_stale_processing_claim() => return Err(CallFailure::Stale),
-                Err(e) => return Err(CallFailure::Store(e)),
             }
             attempt += 1;
             let (outcome, timing) = capture_call_timing(with_generation_attempt_guard(
@@ -747,7 +767,7 @@ impl Run {
             ))
             .await;
             // Measured time is durable under the claim before any result or
-            // error checkpoint, and never touches the reserved attempt. An
+            // error checkpoint, and never touches the spent attempts. An
             // exhausted budget has already cleared the claim, so this may see
             // it as stale; the guard's stop below names the real cause.
             let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
@@ -792,13 +812,46 @@ impl Run {
             }
             CallFailure::Stale => Abort::Stale,
             CallFailure::Recoverable => failed("a provider answer could not be used"),
-            CallFailure::Transient(e) => Abort::Finish(ProcessingOutcome::Retry {
-                error: redacted_llm(&e),
-                retry_at: later(RETRY_AFTER_SECS),
-            }),
+            CallFailure::Transient(e) => self.retry_later(&e).await,
             CallFailure::Fatal(e) => failed(redacted_llm(&e)),
             CallFailure::Store(e) => store_abort(e),
             CallFailure::Denied(abort) => abort,
+        }
+    }
+
+    /// Reschedule after a transient provider failure. Five consecutive
+    /// failed claims end the job instead; progress forgets earlier failures.
+    async fn retry_later(&self, e: &LlmError) -> Abort {
+        let error = redacted_llm(e);
+        let failures = u32::try_from(self.retries.len()).map_or(u32::MAX, |n| n.saturating_add(1));
+        if failures >= MAX_ERROR_RETRIES {
+            return failed(format!(
+                "{error}; gave up after {failures} consecutive failed attempts"
+            ));
+        }
+        let marker = ProcessingNodeWrite {
+            key: format!("rf:{failures}"),
+            level: FINAL_LEVEL,
+            state: ProcessingNodeState::Recoverable,
+            input_fingerprint: self.ctx_fp.clone(),
+            json: serde_json::json!({}),
+        };
+        match self
+            .writer
+            .checkpoint_processing_job(
+                &self.claim,
+                ProcessingCheckpoint {
+                    upsert_nodes: vec![marker],
+                    ..ProcessingCheckpoint::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Abort::Finish(ProcessingOutcome::Retry {
+                error,
+                retry_at: later(RETRY_AFTER_SECS),
+            }),
+            Err(e) => store_abort(e),
         }
     }
 
@@ -861,7 +914,7 @@ impl Run {
                         input_fingerprint: self.ctx_fp.clone(),
                         json,
                     }],
-                    delete_nodes: Vec::new(),
+                    delete_nodes: std::mem::take(&mut self.retries),
                 },
             )
             .await
@@ -1122,6 +1175,7 @@ impl Run {
                         input_fingerprint: self.ctx_fp.clone(),
                         json,
                     }],
+                    delete_nodes: std::mem::take(&mut self.retries),
                     ..ProcessingCheckpoint::default()
                 },
             )
@@ -1132,7 +1186,9 @@ impl Run {
 
     /// The final call answered unusably (truncated, over context, invalid):
     /// shrink the room final inputs may use, which forces one more reduction.
-    async fn shrink(&mut self) -> Result<FinalStep, Abort> {
+    /// `request` is the fingerprint of the request that failed: the same
+    /// request is never sent again, not even after a restart.
+    async fn shrink(&mut self, request: String) -> Result<FinalStep, Abort> {
         if self.shrinks >= MAX_FINAL_SHRINKS {
             return Err(failed(
                 "the final call could not be completed within bounds; intermediate results were \
@@ -1141,6 +1197,8 @@ impl Run {
         }
         let key = format!("sf:{}", self.shrinks + 1);
         self.shrinks += 1;
+        let marker = serde_json::json!({ "request": request });
+        self.failed_finals.insert(request);
         self.writer
             .checkpoint_processing_job(
                 &self.claim,
@@ -1151,7 +1209,7 @@ impl Run {
                         level: FINAL_LEVEL,
                         state: ProcessingNodeState::Recoverable,
                         input_fingerprint: self.ctx_fp.clone(),
-                        json: serde_json::json!({}),
+                        json: marker,
                     }],
                     ..ProcessingCheckpoint::default()
                 },
@@ -1161,9 +1219,35 @@ impl Run {
         Ok(FinalStep::Shrunk)
     }
 
-    /// One final call; `None` when the answer was unusable and recoverable.
-    async fn final_call(&self, request: ChatRequest) -> Result<Option<FinalRecord>, Abort> {
+    /// Fingerprint of everything a provider would see of `request`.
+    fn request_fingerprint(request: &ChatRequest) -> String {
+        let messages = request
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let max = request.max_tokens.to_string();
+        fingerprint(&[
+            request.system.as_deref().unwrap_or(""),
+            messages.as_str(),
+            max.as_str(),
+        ])
+    }
+
+    /// One final call. `Err(fingerprint)` when the answer was unusable and
+    /// recoverable; a request an earlier attempt already saw fail ends the job
+    /// instead of being sent again.
+    async fn final_call(&self, request: ChatRequest) -> Result<Result<FinalRecord, String>, Abort> {
         self.ensure_fits(&request, self.final_schema)?;
+        let fp = Self::request_fingerprint(&request);
+        if self.failed_finals.contains(&fp) {
+            return Err(failed(
+                "the final call failed and its input cannot be reduced any further; \
+                 intermediate results were kept but nothing was published — raise \
+                 chunking.max_input_tokens or the output limit, or lower the session size",
+            ));
+        }
         let result = match self.kind {
             ProcessingJobKind::Consolidate => self
                 .call_llm::<ConsolidatedPage>(request)
@@ -1173,14 +1257,17 @@ impl Run {
                 .call_llm::<ConsolidatedBatch>(request)
                 .await
                 .map(|batch| FinalRecord::Batch { batch }),
-            ProcessingJobKind::AutoImprove => self
-                .call_llm::<AutoImproveLlmResponse>(request)
-                .await
-                .map(|response| FinalRecord::Review { response }),
+            ProcessingJobKind::AutoImprove => {
+                self.call_llm::<ReviewEnvelope>(request)
+                    .await
+                    .map(|envelope| FinalRecord::Review {
+                        response: envelope.into(),
+                    })
+            }
         };
         let record = match result {
             Ok(record) => record,
-            Err(CallFailure::Recoverable) => return Ok(None),
+            Err(CallFailure::Recoverable) => return Ok(Err(fp)),
             Err(other) => return Err(self.abort_for(other).await),
         };
         let usable = match &record {
@@ -1193,7 +1280,7 @@ impl Run {
             | FinalRecord::Evaluated { .. } => true,
         };
         if !usable {
-            return Ok(None);
+            return Ok(Err(fp));
         }
         // Only sanitized output is ever persisted.
         let mut value = serde_json::to_value(&record)
@@ -1201,7 +1288,7 @@ impl Run {
         scrub_value(&mut value, self.wiki.sanitizer());
         let record = serde_json::from_value(value)
             .map_err(|e| Abort::Error(ProcessingError::Other(e.to_string())))?;
-        Ok(Some(record))
+        Ok(Ok(record))
     }
 
     pub(super) async fn consolidate_context(
@@ -1241,8 +1328,9 @@ impl Run {
                         self.manifest_count,
                         &self.budgets,
                     );
-                    let Some(record) = self.final_call(request).await? else {
-                        return self.shrink().await;
+                    let record = match self.final_call(request).await? {
+                        Ok(record) => record,
+                        Err(request_fp) => return self.shrink(request_fp).await,
                     };
                     self.store_final(&key, &record).await?;
                     record
@@ -1317,8 +1405,9 @@ impl Run {
             let record = match self.finals.get(&key).cloned() {
                 Some(record) => record,
                 None => {
-                    let Some(record) = self.final_call(request).await? else {
-                        return self.shrink().await;
+                    let record = match self.final_call(request).await? {
+                        Ok(record) => record,
+                        Err(request_fp) => return self.shrink(request_fp).await,
                     };
                     self.store_final(&key, &record).await?;
                     record

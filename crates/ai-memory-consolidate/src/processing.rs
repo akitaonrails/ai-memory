@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::auto_improve::{AutoImproveError, AutoImproveReport, AutoImproveReviewConfig};
+use crate::auto_improve::{AutoImproveError, AutoImproveReviewConfig};
 use crate::consolidator::{
     Consolidator, ConsolidatorError, ConsolidatorResult,
     DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN, DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
@@ -46,7 +46,7 @@ use crate::consolidator::{
 };
 use crate::types::ConsolidationOutcome;
 use budget::{PIPELINE_VERSION, StageBudgets, final_prompt, fingerprint, schema_fingerprint};
-use chunk_digest::{ChunkDigest, MAP_SYSTEM_PROMPT, REDUCE_SYSTEM_PROMPT};
+use chunk_digest::{ChunkDigest, MAP_SYSTEM_PROMPT, REDUCE_SYSTEM_PROMPT, ReviewEnvelope};
 
 /// Lease a worker holds on a job between renewals.
 pub(crate) const LEASE: Duration = Duration::from_secs(120);
@@ -84,6 +84,10 @@ pub enum ProcessingError {
     /// session, operation and owner: the legacy path must not run beside it.
     #[error("an equivalent chunked processing job for this session is paused or unfinished")]
     PausedJob,
+    /// The durable queue is at its fixed admission limit and the request is
+    /// not equivalent to an unfinished job. Retryable once jobs finish.
+    #[error("the processing queue is full; retry after unfinished jobs finish")]
+    QueueFull,
     /// The request is invalid.
     #[error("invalid request: {0}")]
     Invalid(String),
@@ -117,6 +121,9 @@ impl ProcessingError {
             Self::NoProvider => "LLM provider not configured on server".into(),
             Self::SessionNotFound => "session not found".into(),
             Self::EmptySession => "session has no observations".into(),
+            Self::QueueFull => "the processing queue is full for this server or for this \
+                 project and operator; retry after unfinished jobs finish"
+                .into(),
             Self::PausedJob => "an equivalent chunked processing job for this session is paused \
                  or unfinished; re-enable [chunking] to resume it or wait for retention cleanup"
                 .into(),
@@ -163,6 +170,26 @@ pub struct ProcessingJobAccess {
     pub any_owner: bool,
 }
 
+/// The authenticated caller of a synchronous consolidation or a SessionEnd
+/// consolidation. `owner` is the same `owner_identity(..)` bucket an
+/// asynchronous start computes, and `viewer` is the same authorization
+/// viewer (`AuthorizedViewer`, re-checked before every effect; `None` is a
+/// server-owned/trusted job). Both are part of the job's equivalence, so one
+/// operator's entries converge and never join a weaker or foreign
+/// authorization. `author_id` is attribution only and is never used for
+/// authorization.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessingCaller {
+    /// Attribution of the eventual publication.
+    pub actor: ActorContext,
+    /// Attribution author of the eventual publication.
+    pub author_id: Option<UserId>,
+    /// Authorization viewer (`AuthorizedViewer`), distinct from `author_id`.
+    pub viewer: Option<UserId>,
+    /// Staging owner bucket (`owner_identity(..)`); `None` is the shared one.
+    pub owner: Option<IdentityKey>,
+}
+
 /// A durable review + staging + approval request (admin/MCP stage branch).
 #[derive(Debug, Clone)]
 pub struct AutoImproveStageRequest {
@@ -178,6 +205,8 @@ pub struct AutoImproveStageRequest {
     pub actor: ActorContext,
     /// Author attribution.
     pub author_id: Option<UserId>,
+    /// Authorization viewer (`AuthorizedViewer`), distinct from `author_id`.
+    pub viewer: Option<UserId>,
     /// Staging owner bucket.
     pub owner: Option<IdentityKey>,
     /// Admission context of the originating request, used for approvals.
@@ -244,7 +273,6 @@ pub(crate) struct StartOptions {
     pub instructions: Option<String>,
     pub review: Option<AutoImproveReviewConfig>,
     pub trigger: &'static str,
-    pub report_only: bool,
 }
 
 /// What the driver reads back from `options_json`.
@@ -253,7 +281,6 @@ pub(crate) struct JobOptions {
     pub instructions: Option<String>,
     pub review: Option<AutoImproveReviewConfig>,
     pub trigger: String,
-    pub report_only: bool,
 }
 
 /// Per-run overrides that never persist (the originating request's context).
@@ -430,9 +457,7 @@ impl ProcessingService {
             ProcessingJobKind::ConsolidateMulti => {
                 schema_fingerprint::<crate::types::ConsolidatedBatch>()
             }
-            ProcessingJobKind::AutoImprove => {
-                schema_fingerprint::<crate::auto_improve::AutoImproveLlmResponse>()
-            }
+            ProcessingJobKind::AutoImprove => schema_fingerprint::<ReviewEnvelope>(),
         };
         let c = &self.inner.consolidation;
         let parts: Vec<String> = vec![
@@ -471,7 +496,6 @@ impl ProcessingService {
             instructions: opts.instructions.clone(),
             review,
             trigger: opts.trigger.to_string(),
-            report_only: opts.report_only,
         })
         .unwrap_or(serde_json::Value::Null)
     }
@@ -530,6 +554,7 @@ impl ProcessingService {
                     ProcessingError::EmptySession
                 }
                 StoreError::InvalidState(m) => ProcessingError::Invalid(m),
+                StoreError::ProcessingQueueFull(_) => ProcessingError::QueueFull,
                 other => ProcessingError::Store(other),
             })
     }
@@ -538,7 +563,9 @@ impl ProcessingService {
     ///
     /// # Errors
     /// [`ProcessingError::Disabled`] while the flag is off,
-    /// [`ProcessingError::NoProvider`] without a provider.
+    /// [`ProcessingError::NoProvider`] without a provider,
+    /// [`ProcessingError::QueueFull`] when a *new* job would exceed the
+    /// store's unfinished-job limits (joining an equivalent job never does).
     pub async fn start(
         &self,
         req: ProcessingJobStart,
@@ -547,7 +574,6 @@ impl ProcessingService {
             instructions: req.instructions.clone(),
             review: None,
             trigger: "durable",
-            report_only: false,
         };
         Ok(self.enqueue(&req, &opts).await?.status)
     }
@@ -748,12 +774,30 @@ impl ProcessingService {
         }
     }
 
+    /// The shared bucket and, when named, the caller's own: a paused or
+    /// unfinished job in either must block the legacy path.
+    async fn reject_paused_for(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        kind: ProcessingJobKind,
+        owner: Option<IdentityKey>,
+    ) -> Result<(), ProcessingError> {
+        self.reject_paused(workspace_id, project_id, session_id, kind, None)
+            .await?;
+        if owner.is_some() {
+            self.reject_paused(workspace_id, project_id, session_id, kind, owner)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn consolidate_inner(
         &self,
         kind: ProcessingJobKind,
         session_id: SessionId,
-        actor: ActorContext,
-        author_id: Option<UserId>,
+        caller: ProcessingCaller,
         instructions: Option<&str>,
     ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
         let legacy = self
@@ -768,17 +812,16 @@ impl ProcessingService {
             project_id: proj,
             session_id,
             kind,
-            actor,
-            author_id,
-            owner: None,
-            viewer: author_id,
+            actor: caller.actor,
+            author_id: caller.author_id,
+            owner: caller.owner,
+            viewer: caller.viewer,
             instructions: instructions.map(str::to_string),
         };
         let opts = StartOptions {
             instructions: req.instructions.clone(),
             review: None,
             trigger: "durable",
-            report_only: false,
         };
         let status = self
             .run_inline(&req, &opts, Overrides::default())
@@ -802,8 +845,7 @@ impl ProcessingService {
         &self,
         session_id: SessionId,
         dry_run: bool,
-        actor: ActorContext,
-        author_id: Option<UserId>,
+        caller: ProcessingCaller,
         instructions: Option<&str>,
     ) -> ConsolidatorResult<ConsolidationOutcome> {
         if dry_run || !self.enabled() {
@@ -813,19 +855,30 @@ impl ProcessingService {
                 .map_err(|e| Self::to_consolidator_error(session_id, e))?;
             if !dry_run {
                 let (ws, proj) = legacy.resolve_target(session_id).await?;
-                self.reject_paused(ws, proj, session_id, ProcessingJobKind::Consolidate, None)
-                    .await
-                    .map_err(|e| Self::to_consolidator_error(session_id, e))?;
+                self.reject_paused_for(
+                    ws,
+                    proj,
+                    session_id,
+                    ProcessingJobKind::Consolidate,
+                    caller.owner,
+                )
+                .await
+                .map_err(|e| Self::to_consolidator_error(session_id, e))?;
             }
             return legacy
-                .consolidate_session(session_id, dry_run, actor, author_id, instructions)
+                .consolidate_session(
+                    session_id,
+                    dry_run,
+                    caller.actor,
+                    caller.author_id,
+                    instructions,
+                )
                 .await;
         }
         self.consolidate_inner(
             ProcessingJobKind::Consolidate,
             session_id,
-            actor,
-            author_id,
+            caller,
             instructions,
         )
         .await?
@@ -843,8 +896,7 @@ impl ProcessingService {
         &self,
         session_id: SessionId,
         dry_run: bool,
-        actor: ActorContext,
-        author_id: Option<UserId>,
+        caller: ProcessingCaller,
         instructions: Option<&str>,
     ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
         if dry_run || !self.enabled() {
@@ -853,78 +905,33 @@ impl ProcessingService {
                 .map_err(|e| Self::to_consolidator_error(session_id, e))?;
             if !dry_run {
                 let (ws, proj) = legacy.resolve_target(session_id).await?;
-                self.reject_paused(
+                self.reject_paused_for(
                     ws,
                     proj,
                     session_id,
                     ProcessingJobKind::ConsolidateMulti,
-                    None,
+                    caller.owner,
                 )
                 .await
                 .map_err(|e| Self::to_consolidator_error(session_id, e))?;
             }
             return legacy
-                .consolidate_session_multi(session_id, dry_run, actor, author_id, instructions)
+                .consolidate_session_multi(
+                    session_id,
+                    dry_run,
+                    caller.actor,
+                    caller.author_id,
+                    instructions,
+                )
                 .await;
         }
         self.consolidate_inner(
             ProcessingJobKind::ConsolidateMulti,
             session_id,
-            actor,
-            author_id,
+            caller,
             instructions,
         )
         .await
-    }
-
-    /// Report-only review (the caller stages, as today). Runs the full
-    /// chunked pipeline, eval gate included, and returns the legacy report.
-    ///
-    /// # Errors
-    /// As [`crate::run_auto_improve_review`].
-    pub async fn auto_improve_review(
-        &self,
-        workspace_id: WorkspaceId,
-        project_id: ProjectId,
-        session_id: SessionId,
-        cfg: AutoImproveReviewConfig,
-    ) -> Result<AutoImproveReport, AutoImproveError> {
-        let to_ai = |e: ProcessingError| match e {
-            ProcessingError::SessionNotFound => AutoImproveError::SessionNotFound(session_id),
-            ProcessingError::AutoImprove(e) => e,
-            ProcessingError::Store(e) => AutoImproveError::Store(e),
-            other => AutoImproveError::Eval(other.redacted_summary()),
-        };
-        match self.inner.reader.session_project_ids(session_id).await? {
-            Some((w, p)) if w == workspace_id && p == project_id => {}
-            Some(_) => return Err(AutoImproveError::SessionOutOfScope { session_id }),
-            None => return Err(AutoImproveError::SessionNotFound(session_id)),
-        }
-        let req = ProcessingJobStart {
-            workspace_id,
-            project_id,
-            session_id,
-            kind: ProcessingJobKind::AutoImprove,
-            actor: ActorContext::default(),
-            author_id: None,
-            owner: None,
-            viewer: None,
-            instructions: None,
-        };
-        let opts = StartOptions {
-            instructions: None,
-            review: Some(cfg),
-            trigger: "durable",
-            report_only: true,
-        };
-        let status = self
-            .run_inline(&req, &opts, Overrides::default())
-            .await
-            .map_err(to_ai)?;
-        if status.state != ProcessingJobState::Completed {
-            return Err(to_ai(Self::incomplete(&status)));
-        }
-        publish::report_from_result(status.result.as_ref()).map_err(AutoImproveError::Eval)
     }
 
     /// Durable review + staging + approval, rendered as the legacy stage
@@ -960,14 +967,13 @@ impl ProcessingService {
             actor: req.actor,
             author_id: req.author_id,
             owner: req.owner,
-            viewer: req.author_id,
+            viewer: req.viewer,
             instructions: None,
         };
         let opts = StartOptions {
             instructions: None,
             review: Some(req.cfg),
             trigger: "durable",
-            report_only: false,
         };
         let status = self
             .run_inline(

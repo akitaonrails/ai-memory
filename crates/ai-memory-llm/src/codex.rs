@@ -736,14 +736,14 @@ mod tests {
         (provider, calls)
     }
 
-    /// The 401 re-POST is a second generation send: the guard sees it, not
-    /// prepaid, and a budget that covers it lets the call recover.
+    /// The 401 re-POST is a second generation send: the guard sees it, and a
+    /// budget that covers it lets the call recover.
     #[tokio::test]
     async fn guard_fires_for_the_401_resend() {
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let (provider, calls) = rotating_provider(&server, &dir).await;
-        let guard = crate::integration::generation_attempt_guard::RecordingGuard::new(1);
+        let guard = crate::integration::generation_attempt_guard::RecordingGuard::new(2);
 
         let response = crate::with_generation_attempt_guard(
             guard.clone(),
@@ -753,7 +753,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.text, "ok");
-        assert_eq!(guard.flags(), vec![true, false]);
+        assert_eq!(guard.asked(), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -764,7 +764,7 @@ mod tests {
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let (provider, calls) = rotating_provider(&server, &dir).await;
-        let guard = crate::integration::generation_attempt_guard::RecordingGuard::new(0);
+        let guard = crate::integration::generation_attempt_guard::RecordingGuard::new(1);
 
         let error = crate::with_generation_attempt_guard(
             guard.clone(),
@@ -774,7 +774,7 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, LlmError::CapacityBusy(_)), "{error:?}");
-        assert_eq!(guard.flags(), vec![true, false]);
+        assert_eq!(guard.asked(), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

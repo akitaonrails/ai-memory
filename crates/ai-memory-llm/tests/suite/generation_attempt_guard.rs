@@ -18,37 +18,34 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-/// Records every `prepaid` flag it is called with and lets `unprepaid_budget`
-/// non-prepaid sends through before refusing with `CapacityBusy`, the way a
-/// durable budget would.
+/// Counts every send it is asked about and admits the first `budget` of them
+/// before refusing with `CapacityBusy`, the way a durable budget would.
 pub(crate) struct RecordingGuard {
-    state: Mutex<(Vec<bool>, usize)>,
+    /// `(sends asked about, budget)`.
+    state: Mutex<(usize, usize)>,
 }
 
 impl RecordingGuard {
-    pub(crate) fn new(unprepaid_budget: usize) -> Arc<Self> {
+    pub(crate) fn new(budget: usize) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new((Vec::new(), unprepaid_budget)),
+            state: Mutex::new((0, budget)),
         })
     }
 
-    pub(crate) fn flags(&self) -> Vec<bool> {
-        self.state.lock().unwrap().0.clone()
+    /// Sends the hook was consulted about, refused ones included.
+    pub(crate) fn asked(&self) -> usize {
+        self.state.lock().unwrap().0
     }
 }
 
 #[async_trait::async_trait]
 impl GenerationAttemptGuard for RecordingGuard {
-    async fn before_send(&self, prepaid: bool) -> LlmResult<()> {
+    async fn before_send(&self) -> LlmResult<()> {
         let mut state = self.state.lock().unwrap();
-        state.0.push(prepaid);
-        if prepaid {
-            return Ok(());
-        }
-        if state.1 == 0 {
+        state.0 += 1;
+        if state.0 > state.1 {
             return Err(LlmError::CapacityBusy("test attempt budget"));
         }
-        state.1 -= 1;
         Ok(())
     }
 }
@@ -116,12 +113,12 @@ async fn without_a_scope_the_hook_is_a_no_op_and_behavior_is_unchanged() {
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
-/// Strict then tolerant is two sends: the guard sees both, the first
-/// prepaid, the second not, and a budget that covers it lets both through.
+/// Strict then tolerant is two sends: the guard sees both and a budget that
+/// covers them lets both through.
 #[tokio::test]
 async fn strict_to_tolerant_fires_the_guard_for_each_send() {
     let (server, hits) = prose_server().await;
-    let guard = RecordingGuard::new(1);
+    let guard = RecordingGuard::new(2);
     let value = with_generation_attempt_guard(
         guard.clone(),
         compat(server.uri(), true)
@@ -130,16 +127,16 @@ async fn strict_to_tolerant_fires_the_guard_for_each_send() {
     .await
     .expect("both sends reserved");
     assert_eq!(value, json!({"ok": true}));
-    assert_eq!(guard.flags(), vec![true, false]);
+    assert_eq!(guard.asked(), 2);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
 
-/// An unreserved second send is refused before it reaches the wire and the
-/// local `CapacityBusy` propagates as is.
+/// A send the budget does not cover is refused before it reaches the wire and
+/// the local `CapacityBusy` propagates as is.
 #[tokio::test]
 async fn the_unreserved_tolerant_send_is_refused_before_the_wire() {
     let (server, hits) = prose_server().await;
-    let guard = RecordingGuard::new(0);
+    let guard = RecordingGuard::new(1);
     let err = with_generation_attempt_guard(
         guard.clone(),
         compat(server.uri(), true)
@@ -148,33 +145,32 @@ async fn the_unreserved_tolerant_send_is_refused_before_the_wire() {
     .await
     .expect_err("second send has no budget");
     assert!(matches!(err, LlmError::CapacityBusy(_)), "{err:?}");
-    assert_eq!(guard.flags(), vec![true, false]);
+    assert_eq!(guard.asked(), 2);
     assert_eq!(hits.load(Ordering::SeqCst), 1, "refused send never left");
 }
 
-/// A non-strict provider sends once: exactly one prepaid call, no extra.
+/// A non-strict provider sends once: exactly one guarded send, no extra.
 #[tokio::test]
-async fn a_single_send_is_only_the_prepaid_one() {
+async fn a_single_send_is_guarded_once() {
     let (server, hits) = prose_server().await;
-    let guard = RecordingGuard::new(0);
+    let guard = RecordingGuard::new(1);
     with_generation_attempt_guard(
         guard.clone(),
         compat(server.uri(), false)
             .complete_structured_raw(ChatRequest::user_prompt("go"), schema()),
     )
     .await
-    .expect("one prepaid send");
-    assert_eq!(guard.flags(), vec![true]);
+    .expect("one send");
+    assert_eq!(guard.asked(), 1);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
-/// Each invocation scope starts over: the next scope's first send is
-/// prepaid again.
+/// Each invocation scope consults the guard for its own sends.
 #[tokio::test]
-async fn every_scope_starts_with_a_prepaid_send() {
+async fn every_scope_is_guarded() {
     let (server, _hits) = prose_server().await;
     let provider = compat(server.uri(), false);
-    let guard = RecordingGuard::new(0);
+    let guard = RecordingGuard::new(2);
     for _ in 0..2 {
         with_generation_attempt_guard(
             guard.clone(),
@@ -183,11 +179,11 @@ async fn every_scope_starts_with_a_prepaid_send() {
         .await
         .unwrap();
     }
-    assert_eq!(guard.flags(), vec![true, true]);
+    assert_eq!(guard.asked(), 2);
 }
 
 /// Candidate one fails to connect (a real send attempt), candidate two
-/// answers: two guarded sends, the second reserved by the guard itself.
+/// answers: two guarded sends, each accounted by the guard itself.
 #[tokio::test]
 async fn a_fallback_candidate_send_is_guarded_and_reserved() {
     let (server, hits) = prose_server().await;
@@ -199,7 +195,7 @@ async fn a_fallback_candidate_send_is_guarded_and_reserved() {
         ),
         Candidate::new("openai-compat", "m", Arc::new(compat(server.uri(), false))),
     ]);
-    let guard = RecordingGuard::new(1);
+    let guard = RecordingGuard::new(2);
     let value = with_generation_attempt_guard(
         guard.clone(),
         chain.complete_structured_raw(ChatRequest::user_prompt("go"), schema()),
@@ -207,7 +203,7 @@ async fn a_fallback_candidate_send_is_guarded_and_reserved() {
     .await
     .expect("second candidate answers");
     assert_eq!(value, json!({"ok": true}));
-    assert_eq!(guard.flags(), vec![true, false]);
+    assert_eq!(guard.asked(), 2);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
@@ -228,7 +224,7 @@ async fn a_refused_fallback_send_stops_the_chain_and_is_not_a_health_failure() {
     ]));
     let health = ProviderHealth::default();
     let provider = health.wrap_llm_provider(chain, "openai-compat", "m", None);
-    let guard = RecordingGuard::new(0);
+    let guard = RecordingGuard::new(1);
     let err = with_generation_attempt_guard(
         guard.clone(),
         provider.complete_structured_raw(ChatRequest::user_prompt("go"), schema()),
@@ -236,7 +232,7 @@ async fn a_refused_fallback_send_stops_the_chain_and_is_not_a_health_failure() {
     .await
     .expect_err("the second candidate send has no budget");
     assert!(matches!(err, LlmError::CapacityBusy(_)), "{err:?}");
-    assert_eq!(guard.flags(), vec![true, false]);
+    assert_eq!(guard.asked(), 2);
     assert_eq!(hits.load(Ordering::SeqCst), 0, "refused send never left");
 
     let snapshot = health.snapshot();

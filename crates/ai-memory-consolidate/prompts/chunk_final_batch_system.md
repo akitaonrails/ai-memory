@@ -10,4 +10,6 @@ Produce 1 to 5 page updates.
 - Use only what the digest says; never invent files, commands, results, dates or causes. Write in the dominant language of the digest. Keep code, identifiers, paths and quotes verbatim. Cite observations inline as `(o12)` using refs from the digest.
 - tags: short lowercase keywords. entities: up to 10 specific lowercase nouns the page names (technologies, components, files), or []. relations: only existing paths listed in the input, only with evidence; otherwise empty arrays.
 - Titles must be specific; do not reuse a title listed as already taken. [[wikilinks]] only to paths listed in the input.
-Return only the JSON object required by the schema.
+Output: exactly one JSON object, no prose, no code fence:
+{"updates": [{"path": "sessions/<session id>.md", "tier": "episodic", "kind": "fact", "title": "…", "body_markdown": "…", "summary": "…", "tags": ["…"], "slot_kind": "state", "entities": ["…"], "relations": {"causes": [], "fixes": [], "contradicts": []}}], "rationale": "…"}
+`updates` holds the 1 to 5 pages. Required per update: `path`, `tier` (working|episodic|semantic|procedural), `title`, `body_markdown`. Also give `kind` (decision|gotcha|rule|fact), `tags`, `entities` and `relations` (three arrays of wiki paths); `slot_kind` (state|invariant) only for `_slots/` paths; `summary` is one sentence (omit the key when none). `rationale` is one short sentence on why these pages were written.

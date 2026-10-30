@@ -8,4 +8,6 @@ Write `body_markdown` in the dominant language of the digest: a one-paragraph su
 - summary: one plain sentence, or omit it.
 - relations: only wiki paths listed in the input and only when the digest states the relation; otherwise empty arrays.
 - [[wikilinks]] only to paths listed in the input.
-Return only the JSON object required by the schema.
+Output: exactly one JSON object, no prose, no code fence:
+{"title": "…", "body_markdown": "…", "tags": ["…"], "summary": "…", "relations": {"causes": [], "fixes": [], "contradicts": []}}
+`title` and `body_markdown` are required strings; `tags` is an array of strings; `summary` is a string (omit the key when none); `relations` is an object whose three keys hold arrays of wiki paths.

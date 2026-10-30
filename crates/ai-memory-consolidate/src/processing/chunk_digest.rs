@@ -13,6 +13,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::chunk_plan::{Span, text_cost};
+use crate::auto_improve::{
+    AutoImproveLlmResponse, AutoImproveProposal, AutoImproveRejectedCandidate,
+};
 
 pub(super) const MAP_SYSTEM_PROMPT: &str = include_str!("../../prompts/chunk_map_system.md");
 pub(super) const REDUCE_SYSTEM_PROMPT: &str = include_str!("../../prompts/chunk_reduce_system.md");
@@ -64,6 +67,7 @@ impl DigestKind {
 
 /// One candidate fact with its provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DigestItem {
     /// What the item states.
     pub kind: DigestKind,
@@ -81,6 +85,7 @@ pub struct DigestItem {
 
 /// An unresolved disagreement, kept explicit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DigestConflict {
     /// What the disagreement is about.
     pub topic: String,
@@ -91,15 +96,43 @@ pub struct DigestConflict {
     pub note: String,
 }
 
-/// Output of one map or reduce call.
+/// Output of one map or reduce call. Both lists are required: an object that
+/// names neither (`{"facts": [...]}`) must fail, not read as "nothing found".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChunkDigest {
     /// Candidate facts, at most 12.
-    #[serde(default)]
     pub items: Vec<DigestItem>,
     /// Unresolved conflicts, at most 4.
-    #[serde(default)]
     pub conflicts: Vec<DigestConflict>,
+}
+
+/// Closed wire envelope of a chunked auto-improve final call.
+///
+/// The legacy [`AutoImproveLlmResponse`] defaults every field and ignores
+/// unknown ones, so `{}` or `{"facts": [...]}` would read as a completed
+/// review with nothing found. A chunked job has already mapped candidates, so
+/// the answer must name all three lists (each may be explicitly empty) and
+/// nothing else. Items keep the legacy tolerant [`AutoImproveProposal`] shape.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReviewEnvelope {
+    /// Short summary of the review.
+    summary: String,
+    /// Candidate edits.
+    proposals: Vec<AutoImproveProposal>,
+    /// Candidates the model chose not to promote.
+    rejected_candidates: Vec<AutoImproveRejectedCandidate>,
+}
+
+impl From<ReviewEnvelope> for AutoImproveLlmResponse {
+    fn from(e: ReviewEnvelope) -> Self {
+        Self {
+            summary: e.summary,
+            proposals: e.proposals,
+            rejected_candidates: e.rejected_candidates,
+        }
+    }
 }
 
 /// Cost of the JSON schema of `T` as sent to the provider.
@@ -539,5 +572,95 @@ mod tests {
         assert_eq!(v.digest.items[1].quote, "");
         assert_eq!(v.digest.conflicts.len(), 1);
         assert_eq!(v.dropped, 1);
+    }
+
+    fn parse(v: serde_json::Value) -> Result<ChunkDigest, serde_json::Error> {
+        serde_json::from_value(v)
+    }
+
+    #[test]
+    fn envelopes_with_wrong_missing_or_unknown_fields_are_rejected() {
+        let ok_item = serde_json::json!({"kind": "fact", "text": "t", "refs": ["o1"]});
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"facts": [ok_item.clone()]}),
+            serde_json::json!({"items": [ok_item.clone()]}),
+            serde_json::json!({"conflicts": []}),
+            serde_json::json!({"items": [], "conflicts": [], "summary": "x"}),
+            serde_json::json!({"items": [{"kind": "fact", "text": "t", "refs": ["o1"], "ref": "o1"}], "conflicts": []}),
+            serde_json::json!({"items": [{"kind": "fact", "text": "t"}], "conflicts": []}),
+            serde_json::json!({"items": [{"kind": "note", "text": "t", "refs": ["o1"]}], "conflicts": []}),
+            serde_json::json!({"items": [], "conflicts": [{"topic": "a", "refs": ["o1"], "reason": "x"}]}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn explicit_empty_and_full_envelopes_are_accepted() {
+        let empty = parse(serde_json::json!({"items": [], "conflicts": []})).unwrap();
+        assert_eq!(empty, ChunkDigest::default());
+        let full = parse(serde_json::json!({
+            "items": [{"kind": "correction", "text": "t", "refs": ["o1@3000"],
+                       "quote": "q", "supersedes": ["o1"]}],
+            "conflicts": [{"topic": "port", "refs": ["o1", "o2"], "note": "a vs b"}]
+        }))
+        .unwrap();
+        assert_eq!(full.items[0].kind, DigestKind::Correction);
+        assert_eq!(full.conflicts[0].topic, "port");
+    }
+
+    #[test]
+    fn the_advertised_schema_requires_both_lists_and_closes_objects() {
+        let schema = serde_json::to_value(schemars::schema_for!(ChunkDigest)).unwrap();
+        let mut required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        required.sort_unstable();
+        assert_eq!(required, ["conflicts", "items"]);
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+    }
+
+    fn review(v: serde_json::Value) -> Result<AutoImproveLlmResponse, serde_json::Error> {
+        serde_json::from_value::<ReviewEnvelope>(v).map(Into::into)
+    }
+
+    #[test]
+    fn a_final_review_must_name_all_three_lists_and_nothing_else() {
+        let proposal = serde_json::json!({"path": "gotchas/a.md", "title": "A"});
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"facts": [{"text": "x"}]}),
+            serde_json::json!({"summary": "s", "proposals": []}),
+            serde_json::json!({"summary": "s", "rejected_candidates": []}),
+            serde_json::json!({"proposals": [proposal.clone()], "rejected_candidates": []}),
+            serde_json::json!({"summary": "s", "proposals": [], "rejected_candidates": [],
+                               "items": []}),
+            serde_json::json!({"summary": "s", "proposals": "none", "rejected_candidates": []}),
+        ] {
+            assert!(review(bad.clone()).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn an_explicitly_empty_or_populated_final_review_is_accepted() {
+        let empty = review(serde_json::json!({
+            "summary": "", "proposals": [], "rejected_candidates": []
+        }))
+        .unwrap();
+        assert!(empty.proposals.is_empty() && empty.rejected_candidates.is_empty());
+        let full = review(serde_json::json!({
+            "summary": "one lesson",
+            "proposals": [{"path": "gotchas/a.md", "title": "A", "kind": "gotcha",
+                           "confidence": 0.9, "body_markdown": "# A"}],
+            "rejected_candidates": [{"reason": "transient", "evidence": "o3"}]
+        }))
+        .unwrap();
+        assert_eq!(full.summary, "one lesson");
+        assert_eq!(full.proposals[0].path, "gotchas/a.md");
+        assert_eq!(full.rejected_candidates[0].reason, "transient");
     }
 }

@@ -8,10 +8,11 @@
 //! [`before_generation_send`] immediately before its terminal send and
 //! aborts with the guard's error when it refuses.
 //!
-//! The caller already durably reserved one attempt for the invocation, so the
-//! first send in a scope reports `prepaid = true` and every later one
-//! `prepaid = false` (the guard must reserve it itself). Outside a scope the
-//! hook is a no-op, so providers behave exactly as before.
+//! The guard spends the attempt itself, after any admission wait and
+//! immediately before the request leaves, so a send that never happens (a
+//! saturated local queue, a refused guard) costs nothing and every real send,
+//! uncertain ones included, is counted once. Outside a scope the hook is a
+//! no-op, so providers behave exactly as before.
 //!
 //! A refusal should be [`crate::LlmError::CapacityBusy`]: it is local back-pressure,
 //! so health recording and the fallback chain neither mark the provider failed
@@ -21,7 +22,6 @@
 //! spawned onto another task is not seen. Custom providers that send
 //! generation requests themselves call [`before_generation_send`] too.
 
-use std::cell::Cell;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,19 +31,13 @@ use crate::error::LlmResult;
 /// Decides whether one more generation request may leave the process.
 #[async_trait]
 pub trait GenerationAttemptGuard: Send + Sync {
-    /// Called before each generation send. `prepaid` is `true` for the first
-    /// send of the scope (already reserved by the caller) and `false` for
-    /// every later one. An `Err` aborts that send.
-    async fn before_send(&self, prepaid: bool) -> LlmResult<()>;
-}
-
-struct Scope {
-    guard: Arc<dyn GenerationAttemptGuard>,
-    first: Cell<bool>,
+    /// Called before each generation send; the guard accounts for it. An
+    /// `Err` aborts that send.
+    async fn before_send(&self) -> LlmResult<()>;
 }
 
 tokio::task_local! {
-    static SCOPE: Scope;
+    static SCOPE: Arc<dyn GenerationAttemptGuard>;
 }
 
 /// Run `call` with `guard` consulted before every generation send it makes.
@@ -51,24 +45,15 @@ pub async fn with_generation_attempt_guard<F: Future>(
     guard: Arc<dyn GenerationAttemptGuard>,
     call: F,
 ) -> F::Output {
-    SCOPE
-        .scope(
-            Scope {
-                guard,
-                first: Cell::new(true),
-            },
-            call,
-        )
-        .await
+    SCOPE.scope(guard, call).await
 }
 
 /// Consult the scoped guard before a generation send; no-op outside a scope.
 /// Place it immediately before the terminal request, never before token
 /// refreshes, metadata or embeddings.
 pub async fn before_generation_send() -> LlmResult<()> {
-    let Ok((guard, prepaid)) = SCOPE.try_with(|s| (Arc::clone(&s.guard), s.first.replace(false)))
-    else {
+    let Ok(guard) = SCOPE.try_with(Arc::clone) else {
         return Ok(());
     };
-    guard.before_send(prepaid).await
+    guard.before_send().await
 }

@@ -39,12 +39,7 @@ use crate::types::ConsolidationOutcome;
 #[serde(tag = "t", rename_all = "snake_case")]
 pub(super) enum Plan {
     Pages(PagesPlan),
-    Stage(StagePlan),
-    /// Report-only review: nothing is staged, the caller stages as today.
-    Report {
-        report: Value,
-        eval_results: Value,
-    },
+    Stage(Box<StagePlan>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,27 +287,15 @@ impl Run {
     ) -> Result<Plan, Abort> {
         let eval_results = serde_json::to_value(report.eval_results())
             .map_err(|e| Abort::Error(ProcessingError::Other(e.to_string())))?;
-        if self.opts.report_only {
-            let report_json = serde_json::to_value(&report)
-                .map_err(|e| Abort::Error(ProcessingError::Other(e.to_string())))?;
-            return Ok(Plan::Report {
-                report: report_json,
-                eval_results,
-            });
-        }
-        let reader = &self.svc.inner.reader;
         let mut proposals = Vec::with_capacity(report.proposals.len());
         for p in &report.proposals {
-            let path = PagePath::new(p.path.clone())
+            PagePath::new(p.path.clone())
                 .map_err(|_| failed("a validated proposal has an invalid path"))?;
-            let exists = reader
-                .page_body_by_ids(self.ws, self.proj, path.as_str())
-                .await
-                .map_err(store_abort)?
-                .is_some();
-            let operation = if p.edit_mode == "patch"
-                || (exists && path.as_str() == "_slots/current-focus.md")
-            {
+            // The operation comes from the context the model read, never from
+            // a later look at the store: a captured base hash is an update of
+            // that exact version, no hash is a create that the staging
+            // transaction refuses if the page has appeared since.
+            let operation = if p.edit_mode == "patch" || p.expected_base_body_sha256.is_some() {
                 "update"
             } else {
                 "create"
@@ -358,7 +341,7 @@ impl Run {
             "eval_results": eval_results,
             "require_approval": self.svc.inner.require_approval,
         });
-        Ok(Plan::Stage(StagePlan {
+        Ok(Plan::Stage(Box::new(StagePlan {
             provider: report.provider.clone(),
             model: report.model.clone(),
             summary: report.summary.clone(),
@@ -369,7 +352,7 @@ impl Run {
             proposal_actor: cfg.proposal_actor.clone(),
             proposals,
             rejected_count: report.rejected_candidates.len(),
-        }))
+        })))
     }
 
     // ---- publication ---------------------------------------------------
@@ -380,17 +363,11 @@ impl Run {
     ) -> Result<ai_memory_core::ProcessingJobStatus, Abort> {
         let plan: Plan = serde_json::from_value(publication.plan_json)
             .map_err(|_| failed("the stored publication plan is unreadable"))?;
-        if !matches!(plan, Plan::Report { .. }) {
-            self.authorize(ai_memory_store::ProjectAccess::Write)
-                .await?;
-        }
+        self.authorize(ai_memory_store::ProjectAccess::Write)
+            .await?;
         let result = match plan {
             Plan::Pages(p) => self.publish_pages(&p).await?,
             Plan::Stage(s) => self.publish_stage(&s).await?,
-            Plan::Report {
-                report,
-                eval_results,
-            } => json!({ "report": report, "eval_results": eval_results }),
         };
         self.writer
             .finish_processing_job(&self.claim, ProcessingOutcome::Completed { result })
@@ -702,9 +679,11 @@ impl Run {
                         .and_then(Value::as_str)
                         .map(str::to_string),
                 )
-            } else if approval_required {
-                ("pending".to_string(), None)
             } else {
+                // The proposal's own state is read before any policy branch: a
+                // proposal decided between staging and this resume (manually or
+                // by an earlier attempt) keeps that decision and its page, under
+                // both policies. Only a still-pending one reaches the policy.
                 let detail = inner
                     .reader
                     .auto_improve_proposal_detail(self.ws, self.proj, id)
@@ -717,41 +696,46 @@ impl Run {
                     )),
                     _ => None,
                 };
-                let outcome = if let Some(decided) = decided {
-                    decided
+                if decided.is_none() && approval_required {
+                    // Manual policy: a pending proposal is never approved here.
+                    ("pending".to_string(), None)
                 } else {
-                    match self
-                        .wiki
-                        .approve_auto_improve_proposal(
-                            self.ws,
-                            self.proj,
-                            id,
-                            self.approval_actor(),
-                            self.author_id,
-                            Some(admission.clone()),
-                        )
+                    let outcome = if let Some(decided) = decided {
+                        decided
+                    } else {
+                        match self
+                            .wiki
+                            .approve_auto_improve_proposal(
+                                self.ws,
+                                self.proj,
+                                id,
+                                self.approval_actor(),
+                                self.author_id,
+                                Some(admission.clone()),
+                            )
+                            .await
+                            .map_err(wiki_abort)?
+                        {
+                            ApproveAutoImproveProposalResult::Approved { page_id } => {
+                                ("approved".to_string(), Some(page_id.to_string()))
+                            }
+                            ApproveAutoImproveProposalResult::Conflict => {
+                                ("conflict".to_string(), None)
+                            }
+                        }
+                    };
+                    let effect = json!({ "status": outcome.0, "page_id": outcome.1 });
+                    self.writer
+                        .record_processing_effect(&self.claim, key, effect.clone())
                         .await
-                        .map_err(wiki_abort)?
-                    {
-                        ApproveAutoImproveProposalResult::Approved { page_id } => {
-                            ("approved".to_string(), Some(page_id.to_string()))
-                        }
-                        ApproveAutoImproveProposalResult::Conflict => {
-                            ("conflict".to_string(), None)
-                        }
-                    }
-                };
-                let effect = json!({ "status": outcome.0, "page_id": outcome.1 });
-                self.writer
-                    .record_processing_effect(&self.claim, key, effect.clone())
-                    .await
-                    .map_err(store_abort)?;
-                effects.push(ai_memory_store::ProcessingEffect {
-                    key: format!("approve:{id}"),
-                    json: effect,
-                    recorded_at: jiff::Timestamp::now(),
-                });
-                outcome
+                        .map_err(store_abort)?;
+                    effects.push(ai_memory_store::ProcessingEffect {
+                        key: format!("approve:{id}"),
+                        json: effect,
+                        recorded_at: jiff::Timestamp::now(),
+                    });
+                    outcome
+                }
             };
             proposals.push(AutoImproveStagedProposal {
                 id,
@@ -797,22 +781,6 @@ pub(super) fn outcomes_from_result(
             })
         })
         .collect()
-}
-
-/// The legacy review report of a completed report-only job.
-pub(super) fn report_from_result(result: Option<&Value>) -> Result<AutoImproveReport, String> {
-    let value = result.ok_or("the job result is missing")?;
-    let mut report: AutoImproveReport = serde_json::from_value(
-        value
-            .get("report")
-            .cloned()
-            .ok_or("the job result has no report")?,
-    )
-    .map_err(|_| "the job report is unreadable".to_string())?;
-    if let Some(evals) = value.get("eval_results").cloned() {
-        report.eval_results = serde_json::from_value(evals).unwrap_or_default();
-    }
-    Ok(report)
 }
 
 /// What a completed staging job staged.
