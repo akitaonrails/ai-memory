@@ -500,6 +500,37 @@ Output: `evals/runs/<timestamp>-retrieval/report.{json,md}` — the JSON is
 triples and an `overall` delta table. Publish full-dataset A/B numbers in
 `docs/benchmarks/retrieval-ab-r2.md`.
 
+### `retrieval-compare` — two saved runs, question by question
+
+An A/B run compares two configs of one build in one process. A release
+comparison pairs runs of two builds made on different days, and its slice
+averages say how much moved, not which questions moved or how.
+`retrieval-compare` reads the `report.json` of two single-config runs (the
+run directory or the file), pairs questions by id, and prints:
+
+- hit@k and recall@k over the questions both runs scored, with the
+  questions gained and lost at each k;
+- every question whose first hit moved: the cutoffs it crossed, its recall
+  at the largest k and its latency on each side, widest moves and losses
+  first;
+- per question type, how many moved earlier and how many later.
+
+```bash
+cargo run --release -p ai-memory-eval -- retrieval-compare \
+    --baseline evals/runs/<previous release local run> \
+    --candidate evals/runs/<release candidate local run> \
+    --fts evals/runs/<release candidate FTS run>
+```
+
+Moves of one cutoff in both directions, spread across types, are what
+questions near a cutoff trading places look like. Moves that skip cutoffs,
+all go one way, or cluster in one type point at a ranking change (#1854).
+`--fts` takes the candidate build's FTS run and marks moved questions whose
+candidate row equals the FTS row in every hit, recall, retrieved-session
+and context-token value. With a latency at or above the 250 ms query
+embedding wait, that is a local query that ran without its vector. An A/B
+`report.json` is refused; compare the single-config runs instead.
+
 Strict `recall-all@k` scores each question as 1 only when every evidence
 session appears in the top k distinct retrieved sessions, otherwise 0.
 Slice scores average those per-question values. Finding one of two required

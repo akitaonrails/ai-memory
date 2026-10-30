@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added `ai-memory-eval retrieval-compare`, which pairs two saved retrieval
+  reports by question and lists the questions whose first hit moved, the
+  cutoffs each crossed, and how many moved per question type. `--fts` marks
+  moved questions whose row equals the same build's FTS run, which is how a
+  local query that ran without its vector shows up (#1854).
 - Made the profile's LLM output budget configurable through
   `[profile] max_output_tokens` (`AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS`,
   default 2000, unchanged). The ceiling was hardcoded, and local thinking
