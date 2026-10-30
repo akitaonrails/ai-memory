@@ -245,6 +245,8 @@ pub const DEFAULT_BASELINE_MAX_BYTES: usize = 6_000;
 pub const BASELINE_MAX_BYTES_RANGE: (usize, usize) = (2_000, 20_000);
 /// Default number of lines `profile apply` writes into a rules file.
 pub const DEFAULT_APPLY_MAX_LINES: usize = 40;
+/// Default output-token allowance for one profile LLM call.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 2_000;
 
 /// `[profile]` server settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +267,11 @@ pub struct ProfileSettings {
     pub baseline_max_bytes: usize,
     /// Lines `ai-memory profile apply` writes at most.
     pub apply_max_lines: usize,
+    /// Output-token allowance for one profile LLM call (classification and
+    /// merge). Raise it when the provider spends part of the budget before
+    /// the structured JSON (for example a thinking model) and the call
+    /// fails with `finish_reason=length`.
+    pub max_output_tokens: u32,
     /// Use the configured LLM provider, when there is one.
     pub llm: bool,
 }
@@ -279,6 +286,7 @@ impl Default for ProfileSettings {
             digest_max_bytes: DEFAULT_DIGEST_MAX_BYTES,
             baseline_max_bytes: DEFAULT_BASELINE_MAX_BYTES,
             apply_max_lines: DEFAULT_APPLY_MAX_LINES,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             llm: true,
         }
     }

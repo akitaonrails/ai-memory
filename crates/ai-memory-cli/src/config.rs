@@ -3997,6 +3997,20 @@ mod tests {
             !cfg.server_url_derived_from_bind,
             "the default bind short-circuits the derivation, so nothing is marked derived"
         );
+        assert_eq!(
+            cfg.profile.max_output_tokens,
+            ai_memory_core::profile::DEFAULT_MAX_OUTPUT_TOKENS,
+            "the template leaves max_output_tokens unset, so the 2k default applies"
+        );
+    }
+
+    /// The profile's LLM output budget is operator-settable: providers that
+    /// spend part of the allowance before the structured JSON (thinking
+    /// models) truncate at the default and need a higher ceiling.
+    #[test]
+    fn profile_max_output_tokens_is_configurable() {
+        let cfg = load_with_toml("[profile]\nmax_output_tokens = 4000\n").unwrap();
+        assert_eq!(cfg.profile.max_output_tokens, 4_000);
     }
 
     /// #1506: an example table in the shipped config must not capture the

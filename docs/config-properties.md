@@ -266,6 +266,7 @@ Defined by `ProfileSettings` in `ai-memory-core`.
 | `digest_max_bytes` | `3000` (`DEFAULT_DIGEST_MAX_BYTES`) | `AI_MEMORY_PROFILE__DIGEST_MAX_BYTES` | Digest budget in UTF-8 bytes, clamped to 1500 through 12000. |
 | `baseline_max_bytes` | `6000` (`DEFAULT_BASELINE_MAX_BYTES`) | `AI_MEMORY_PROFILE__BASELINE_MAX_BYTES` | Digest budget for a project with no pages yet, clamped to 2000 through 20000. |
 | `apply_max_lines` | `40` (`DEFAULT_APPLY_MAX_LINES`) | `AI_MEMORY_PROFILE__APPLY_MAX_LINES` | Most lines `ai-memory profile apply` writes into a rules file. |
+| `max_output_tokens` | `2000` (`DEFAULT_MAX_OUTPUT_TOKENS`) | `AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS` | Output-token allowance for one profile LLM call (classification and merge). Raise it when the provider spends part of the budget before the structured JSON, e.g. a thinking model, and the call fails with `finish_reason=length`. |
 | `llm` | `true` | `AI_MEMORY_PROFILE__LLM` | Use the configured LLM provider for the profile when there is one. |
 
 ## `[sanitize]`
