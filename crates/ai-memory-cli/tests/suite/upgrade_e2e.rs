@@ -33,8 +33,11 @@ mod slow {
 
     const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
     const TAG: &str = "v9.9.9";
-    /// Distinct bytes so we can prove the on-disk binary was swapped.
+    /// Distinct Unix bytes so the replacement-only case proves the swap.
     const NEW_BINARY: &[u8] = b"#!/bin/sh\necho upgraded-native-e2e\n";
+    /// A PE loader ignores trailing overlay bytes. This keeps the Windows
+    /// replacement runnable when the upgrader re-enters it after the swap.
+    const REPLACEMENT_MARKER: &[u8] = b"\nai-memory-upgrade-e2e-replacement\n";
     const NEW_HOOK: &[u8] = b"#!/bin/sh\necho refreshed-hook\n";
     const OLD_HOOK: &[u8] = b"old-hook-body\n";
 
@@ -65,7 +68,17 @@ mod slow {
     }
 
     fn build_release_archive() -> Vec<u8> {
-        build_release_archive_with_binary(NEW_BINARY)
+        let replacement = replacement_only_binary();
+        build_release_archive_with_binary(&replacement)
+    }
+
+    fn replacement_only_binary() -> Vec<u8> {
+        if !cfg!(windows) {
+            return NEW_BINARY.to_vec();
+        }
+        let mut binary = fs::read(BIN).expect("read replacement binary");
+        binary.extend_from_slice(REPLACEMENT_MARKER);
+        binary
     }
 
     fn build_release_archive_with_binary(binary: &[u8]) -> Vec<u8> {
@@ -257,10 +270,8 @@ mod slow {
         let home = tempfile::tempdir().expect("home");
         let exe = install_writable_prefix(prefix.path());
         let before = fs::read(&exe).expect("read pre-upgrade binary");
-        assert_ne!(
-            before, NEW_BINARY,
-            "pre-upgrade binary must differ from fixture payload"
-        );
+        let replacement = replacement_only_binary();
+        assert_ne!(before, replacement, "fixture must replace the binary");
 
         let base = format!("http://{addr}/releases");
         // Async child I/O — a blocking `.output()` would starve the in-process
@@ -288,7 +299,7 @@ mod slow {
         );
 
         let after = fs::read(&exe).expect("read post-upgrade binary");
-        assert_eq!(after, NEW_BINARY, "on-disk binary was not replaced");
+        assert_eq!(after, replacement, "on-disk binary was not replaced");
 
         let hooks_root = prefix.path().join("bin/hooks");
         assert_eq!(
