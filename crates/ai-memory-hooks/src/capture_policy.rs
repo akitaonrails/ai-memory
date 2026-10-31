@@ -5353,6 +5353,47 @@ mod tests {
         assert_eq!(after.tool_family, ToolFamily::File);
     }
 
+    /// A Gemini CLI `tool_response` proves its outcome by the presence of
+    /// `error`; a payload without a `tool_response` proves nothing.
+    #[test]
+    fn gemini_cli_tool_response_error_decides_the_outcome() {
+        let failed = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "missing.md"},
+            "tool_response": {
+                "llmContent": "File not found: missing.md",
+                "returnDisplay": "File not found.",
+                "error": {"message": "File not found: missing.md", "type": "FILE_NOT_FOUND"}
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &failed),
+            ToolOutcome::Error
+        );
+        let succeeded = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "README.md"},
+            "tool_response": {"llmContent": "# Title", "returnDisplay": ""}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &succeeded),
+            ToolOutcome::Success
+        );
+        let null_error = json!({"tool_response": {"llmContent": "ok", "error": null}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &null_error),
+            ToolOutcome::Success
+        );
+        // Control: a BeforeTool has no `tool_response`.
+        let before = json!({"tool_name": "read_file", "tool_input": {"file_path": "README.md"}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &before),
+            ToolOutcome::Unknown
+        );
+    }
+
     /// Droid hook payloads carry no tool-call id, so the drop list and the
     /// observation metadata read the tool name alone (#1240).
     #[test]
