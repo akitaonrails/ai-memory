@@ -700,6 +700,7 @@ diag-run-profile-environment-value-for-is-invalid = no perfil de execução { $n
 diag-run-profile-repeats-environment-key-with-different = o perfil de execução { $name } repete a chave de ambiente { $key } com maiúsculas/minúsculas diferentes
 diag-ai-memory-run-exit-prompt-must-be = AI_MEMORY_RUN_EXIT_PROMPT precisa ser true ou false
 diag-profile-max-output-tokens-must-be-at = profile.max_output_tokens precisa ser pelo menos 1
+diag-bootstrap-max-concurrent-must-be-at-least = bootstrap_max_concurrent precisa ser pelo menos 1 (recebido 0); AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT conta execuções simultâneas
 diag-sessions-idle-end-after-hours-must-be = sessions.idle_end_after_hours precisa ser 0 (desligado) ou no máximo 8760 horas (um ano); recebido { $value0 }
 diag-decay-breadth-weight-must-be-a-finite = decay.breadth_weight precisa ser um número finito maior ou igual a zero
 diag-decay-half-life-days-must-be-a = decay.half_life_days.{ $tier } precisa ser um número finito maior que zero (recebido { $days }); omita a chave para usar a taxa de decaimento padrão

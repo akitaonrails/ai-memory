@@ -696,6 +696,7 @@ diag-run-profile-environment-value-for-is-invalid = run profile { $name } enviro
 diag-run-profile-repeats-environment-key-with-different = run profile { $name } repeats environment key { $key } with different ASCII case
 diag-ai-memory-run-exit-prompt-must-be = AI_MEMORY_RUN_EXIT_PROMPT must be true or false
 diag-profile-max-output-tokens-must-be-at = profile.max_output_tokens must be at least 1
+diag-bootstrap-max-concurrent-must-be-at-least = bootstrap_max_concurrent must be at least 1 (got 0); AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT counts concurrent runs
 diag-sessions-idle-end-after-hours-must-be = sessions.idle_end_after_hours must be 0 (off) or at most 8760 hours (one year); got { $value0 }
 diag-decay-breadth-weight-must-be-a-finite = decay.breadth_weight must be a finite number greater than or equal to zero
 diag-decay-half-life-days-must-be-a = decay.half_life_days.{ $tier } must be a finite number greater than zero (got { $days }); omit the key to use the default decay rate
