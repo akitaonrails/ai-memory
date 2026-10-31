@@ -528,6 +528,12 @@ async fn apply_page(
                     )
                     .await
                     .with_context(|| format!("reading {} after a refused write", page.path))?;
+                if let Some(error) = current.unverifiable(&page.path) {
+                    let entry = &mut manifest.pages[page_index].versions[index];
+                    entry.status = VersionStatus::Failed;
+                    entry.error = Some(crate::mcp::preview(&format!("{error:#}")));
+                    return Err(error);
+                }
                 let Some(found) = page
                     .versions
                     .iter()

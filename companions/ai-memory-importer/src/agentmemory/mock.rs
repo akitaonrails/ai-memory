@@ -160,12 +160,20 @@ fn handle(state: &Mutex<MockState>, path: &str, body: &[u8]) -> (&'static str, V
                         arguments["path"].as_str().unwrap_or_default().to_owned(),
                     );
                     match state.pages.get(&key).and_then(|chain| chain.last()) {
-                        Some(latest) => (
-                            "200 OK",
-                            tool_text(
-                                &json!({"path": key.2, "page_id": latest.page_id, "body": latest.body}),
-                            ),
-                        ),
+                        Some(latest) => {
+                            let (body, truncated, total_chars) =
+                                read_page_body(&latest.body, &arguments);
+                            (
+                                "200 OK",
+                                tool_text(&json!({
+                                    "path": key.2,
+                                    "page_id": latest.page_id,
+                                    "body": body,
+                                    "truncated": truncated,
+                                    "total_chars": total_chars,
+                                })),
+                            )
+                        }
                         None => (
                             "200 OK",
                             rpc(
@@ -256,4 +264,24 @@ fn rpc(result: Value) -> Value {
 
 fn tool_text(value: &Value) -> Value {
     rpc(json!({"content": [{"type": "text", "text": value.to_string()}]}))
+}
+
+/// The body `memory_read_page` returns, as the server cuts it since 3.3.0
+/// (#1827): at `max_chars` characters (12,000 when the caller sends none,
+/// clamped to 500..=64,000) with a visible marker, plus `truncated` and
+/// `total_chars` (`READ_PAGE_*` in ai-memory-mcp `server.rs`).
+fn read_page_body(body: &str, arguments: &Value) -> (String, bool, usize) {
+    let max_chars = arguments["max_chars"]
+        .as_u64()
+        .map_or(12_000, |requested| requested.clamp(500, 64_000)) as usize;
+    let total_chars = body.chars().count();
+    if total_chars <= max_chars {
+        return (body.to_owned(), false, total_chars);
+    }
+    let mut cut: String = body.chars().take(max_chars).collect();
+    cut.push_str(&format!(
+        "\n[body truncated; {} chars omitted]",
+        total_chars - max_chars
+    ));
+    (cut, true, total_chars)
 }
