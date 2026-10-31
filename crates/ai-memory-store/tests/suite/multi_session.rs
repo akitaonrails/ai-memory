@@ -5032,3 +5032,115 @@ async fn interrupted_recovery_refuses_foreign_scope_owner_and_receiver_with_cont
         .unwrap();
     assert_eq!(foreign_control.session_id, sessions[2]);
 }
+
+/// One session id can carry work and handoffs in several scopes. Neither may
+/// decide recovery in another scope: foreign work must not reopen an ended
+/// session here, and a foreign baton must not hide unfinished work here.
+#[tokio::test]
+async fn interrupted_recovery_ignores_foreign_scope_work_and_batons_with_controls() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (workspace, project) = scope(&store).await;
+    let sibling = store
+        .writer
+        .get_or_create_project(workspace, "sibling", None)
+        .await
+        .unwrap();
+    // Prompts land before or after the wall-clock end and baton timestamps.
+    let (before, after) = (1_790_812_800_000_i64, 4_102_444_800_000_000_i64);
+    let prompt = |session: SessionId, proj: ProjectId, occurred: i64| {
+        Sanitized::new(
+            NewObservation {
+                occurred_at: Some(occurred),
+                session_id: session,
+                workspace_id: workspace,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "unfinished task".into(),
+                body: "private evidence".into(),
+                importance: 5,
+            },
+            &Sanitizer::builtin(),
+        )
+    };
+    let baton = |session: SessionId, proj: ProjectId| NewHandoff {
+        workspace_id: workspace,
+        project_id: proj,
+        from_agent: AgentKind::Codex,
+        to_agent: None,
+        from_session_id: Some(session),
+        summary: "baton".into(),
+        next_steps: Vec::new(),
+        open_questions: Vec::new(),
+        files_touched: Vec::new(),
+        cwd: None,
+        owner_user: None,
+    };
+    let candidate = || async {
+        store
+            .reader
+            .latest_interrupted_session_candidate(workspace, project, OwnerFilter::Any, None)
+            .await
+            .unwrap()
+            .map(|candidate| candidate.session_id)
+    };
+
+    let unfinished = open_session(&store, workspace, project, AgentKind::Codex).await;
+    store
+        .writer
+        .insert_observation(prompt(unfinished, project, before))
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(baton(unfinished, sibling))
+        .await
+        .unwrap();
+    assert_eq!(
+        candidate().await,
+        Some(unfinished),
+        "a baton from another scope must not hide unfinished work here"
+    );
+    store
+        .writer
+        .insert_handoff(baton(unfinished, project))
+        .await
+        .unwrap();
+    assert_eq!(
+        candidate().await,
+        None,
+        "control: a baton from this scope covers the work"
+    );
+
+    let ended = open_session(&store, workspace, project, AgentKind::Codex).await;
+    store
+        .writer
+        .insert_observation(prompt(ended, project, before))
+        .await
+        .unwrap();
+    store.writer.end_session(ended, None).await.unwrap();
+    store
+        .writer
+        .insert_observation(prompt(ended, sibling, after))
+        .await
+        .unwrap();
+    assert_eq!(
+        candidate().await,
+        None,
+        "work in another scope must not reopen a session ended here"
+    );
+    store
+        .writer
+        .insert_observation(prompt(ended, project, after))
+        .await
+        .unwrap();
+    assert_eq!(
+        candidate().await,
+        Some(ended),
+        "control: work resumed in this scope reopens it"
+    );
+}
