@@ -104,6 +104,13 @@ version in [`docs/changelog/`](docs/changelog/):
   the newest 200-session listing, instead of reporting a successful empty import.
   Exact lookups retain the adapter's checkout and top-level-session checks;
   automatic enumeration remains bounded (#1874).
+- `ai-memory-importer` reruns recognise pages longer than 12,000 characters
+  again. Since 3.3.0 `memory_read_page` cuts a body at 12,000 characters
+  unless asked for more, and the importer never asked, so a document rerun,
+  or a vault or export rerun or resume, compared the planned body with a cut
+  one and refused the page as one it did not write. It now asks for the
+  64,000-character ceiling; a page longer than that cannot be compared, and
+  its rerun fails with that reason instead (#1910).
 - Excluded Codex's generated approval-review transcripts and background
   suggestion prompts from transcript backfill and profile harvesting, and
   kept a hand-reworded profile page attached to its ledger topic even when a
