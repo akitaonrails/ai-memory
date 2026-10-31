@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory upgrade` on Windows now waits for a scanner to release the
+  running or the freshly written binary before swapping them, instead of
+  failing with "being used by another process". The swap retries that
+  sharing violation for about eight seconds, as the wiki's atomic writes
+  already did (#1895).
 - Captured Claude Code tool failures. Claude Code fires `PostToolUseFailure`,
   not `PostToolUse`, when a tool fails, and ai-memory never wired that event
   for Claude Code, so failed commands, builds and test runs never reached
