@@ -23,6 +23,9 @@ const MCP_SESSION_ID: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 /// The server release that added conditional page writes.
 pub(crate) const MIN_SERVER: &str = "3.0";
+/// The most characters `memory_read_page` returns of one body
+/// (`READ_PAGE_MAX_MAX_CHARS` in ai-memory-mcp `server.rs`).
+pub(crate) const READ_PAGE_MAX_CHARS: usize = 64_000;
 
 /// What a conditional write requires of the destination page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +134,11 @@ impl ImportClient {
     }
 
     /// Read one page by exact path.
+    ///
+    /// Since 3.3.0 the server cuts a body at 12,000 characters unless the
+    /// caller asks for more (#1827), and a rerun compares the whole stored
+    /// body with the planned one, so ask for the server's ceiling. Older
+    /// servers ignore the argument and return the whole body.
     pub(crate) async fn mcp_read_page(
         &self,
         workspace: &str,
@@ -140,7 +148,12 @@ impl ImportClient {
         let result = self
             .call_tool(
                 "memory_read_page",
-                json!({"workspace": workspace, "project": project, "path": path}),
+                json!({
+                    "workspace": workspace,
+                    "project": project,
+                    "path": path,
+                    "max_chars": READ_PAGE_MAX_CHARS,
+                }),
             )
             .await?;
         let page = tool_json(&result)
