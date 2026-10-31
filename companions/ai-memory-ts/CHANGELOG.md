@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `pages.resolveWriteTarget` preflights an exact existing writable project by
+  name or stable id, and `pages.writeBatch` commits up to 100 conditional page
+  versions atomically. These wrappers cover the bulk-import tools added for
+  ai-memory 3.4.
+
 - Decoded optional query-answer context admission receipts as `answerContext` (#1684).
 
 - `query` takes the server's `memory_query` page filters: `kind`, `tier`,

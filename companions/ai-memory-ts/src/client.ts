@@ -45,6 +45,7 @@ import type {
   BeginHandoffResult,
   Briefing,
   BriefingArgs,
+  BatchWritePage,
   CancelHandoffArgs,
   CancelHandoffResult,
   CancelMessageArgs,
@@ -74,6 +75,8 @@ import type {
   QueryResult,
   Raw,
   ReadPageArgs,
+  ResolveWriteTargetArgs,
+  ResolvedWriteTarget,
   RecentArgs,
   RecentResult,
   RelationName,
@@ -85,6 +88,8 @@ import type {
   UpdatePageOptions,
   WritePageArgs,
   WritePageResult,
+  WritePagesBatchArgs,
+  WritePagesBatchResult,
 } from "./types.js";
 
 /** Options of {@link AiMemoryClient}. */
@@ -113,6 +118,23 @@ const RELATIONS: readonly RelationName[] = ["causes", "fixes", "contradicts"];
 
 function scopeWire(scope: Scope): { workspace: string; project: string } {
   return { workspace: scope.workspace, project: scope.project };
+}
+
+function existingTargetWire(
+  target: unknown,
+  where: string,
+): { workspace: string; project?: string; project_id?: string } {
+  const value = argsObject(target as object, `${where}.target`) as Record<string, unknown>;
+  const workspace = requireText(value["workspace"], "target.workspace", where);
+  const project = value["project"];
+  const projectId = value["projectId"];
+  if ((project === undefined) === (projectId === undefined)) {
+    throw new ArgumentError(`${where}: target needs exactly one of project or projectId`);
+  }
+  if (project !== undefined) {
+    return { workspace, project: requireText(project, "target.project", where) };
+  }
+  return { workspace, project_id: requireText(projectId, "target.projectId", where) };
 }
 
 /** The metadata a page's frontmatter carries, in write-argument form. */
@@ -167,6 +189,98 @@ export class PagesNamespace {
   /** @internal */
   constructor(core: Core) {
     this.#core = core;
+  }
+
+  /**
+   * Verify write access to an exact existing destination and return its
+   * canonical name and stable id. The operation never creates or promotes a
+   * scope. Bulk importers should resolve every destination before writing.
+   */
+  async resolveWriteTarget(
+    args: ResolveWriteTargetArgs,
+    options?: CallOptions,
+  ): Promise<ResolvedWriteTarget> {
+    const where = "pages.resolveWriteTarget";
+    const a = argsObject(args, where);
+    const decoded = await this.#core.invoke(
+      "memory_resolve_write_target",
+      existingTargetWire(a.target, where),
+      false,
+      options,
+    );
+    const o = record(decoded, "memory_resolve_write_target");
+    return {
+      workspace: str(o, "workspace", "memory_resolve_write_target"),
+      project: str(o, "project", "memory_resolve_write_target"),
+      projectId: str(o, "project_id", "memory_resolve_write_target"),
+      raw: o,
+    };
+  }
+
+  /**
+   * Atomically write one to 100 complete page versions into one existing
+   * project. Every entry must use `createOnly` or `expectedPageId`; one
+   * mismatch leaves the entire batch unchanged.
+   */
+  async writeBatch(
+    args: WritePagesBatchArgs,
+    options?: CallOptions,
+  ): Promise<WritePagesBatchResult> {
+    const where = "pages.writeBatch";
+    const a = argsObject(args, where);
+    const target = existingTargetWire(a.target, where);
+    if (!Array.isArray(a.pages) || a.pages.length === 0 || a.pages.length > 100) {
+      throw new ArgumentError(`${where}: pages must contain 1-100 entries`);
+    }
+    const pages = a.pages.map((page: BatchWritePage, index: number) => {
+      const itemWhere = `${where}.pages[${index}]`;
+      const item = argsObject(page, itemWhere);
+      requireText(item.path, "path", itemWhere);
+      if (typeof item.body !== "string") {
+        throw new ArgumentError(`${itemWhere}: body must be a string`);
+      }
+      if ((item.expectedPageId === undefined) === (item.createOnly !== true)) {
+        throw new ArgumentError(`${itemWhere}: pass exactly one of expectedPageId or createOnly`);
+      }
+      if (item.expectedPageId !== undefined) {
+        requireText(item.expectedPageId, "expectedPageId", itemWhere);
+      }
+      return wire({
+        path: item.path,
+        body: item.body,
+        title: item.title,
+        tier: item.tier,
+        tags: item.tags,
+        pinned: item.pinned,
+        kind: item.kind,
+        entities: item.entities,
+        abstract: item.abstract,
+        relations: item.relations,
+        expires_at: item.expiresAt,
+        expected_page_id: item.expectedPageId,
+        create_only: item.createOnly === true ? true : undefined,
+      });
+    });
+    const decoded = await this.#core.invoke(
+      "memory_write_pages_batch",
+      { ...target, pages },
+      true,
+      options,
+    );
+    const o = record(decoded, "memory_write_pages_batch");
+    return {
+      pages: requiredList(o, "pages", "memory_write_pages_batch", (value, itemWhere) => {
+        const item = record(value, itemWhere);
+        return {
+          index: num(item, "index", itemWhere),
+          path: str(item, "path", itemWhere),
+          pageId: str(item, "page_id", itemWhere),
+          raw: item,
+        };
+      }),
+      checkpoint: nullableStr(o, "checkpoint", "memory_write_pages_batch"),
+      raw: o,
+    };
   }
 
   /**

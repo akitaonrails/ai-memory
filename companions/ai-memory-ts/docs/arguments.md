@@ -6,6 +6,27 @@ SDK arguments are the server's wire names in camelCase. `workspace` and
 `project` travel inside `scope`; `messages.send` takes `to` and `from` scopes
 for the `to_*` and `from_*` pairs.
 
+## `memory_resolve_write_target`
+
+Methods: `pages.resolveWriteTarget`
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `project_id` | `projectId` |
+
+## `memory_write_pages_batch`
+
+Methods: `pages.writeBatch`
+
+| Wire name | SDK name |
+|---|---|
+| `workspace` | `workspace` |
+| `project` | `project` |
+| `project_id` | `projectId` |
+| `pages` | `pages` |
+
 ## `memory_write_page`
 
 Methods: `pages.write`, `pages.update`
