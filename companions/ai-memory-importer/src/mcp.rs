@@ -76,6 +76,29 @@ pub(crate) struct McpWrite<'a> {
 pub(crate) struct ReadPage {
     pub(crate) page_id: Option<String>,
     pub(crate) body: String,
+    /// The server cut `body` short, so it is not the stored page.
+    pub(crate) truncated: bool,
+    /// The stored body's full length in characters, when the server says.
+    pub(crate) total_chars: Option<u64>,
+}
+
+impl ReadPage {
+    /// Why a rerun cannot compare this page with a planned body, if the
+    /// server cut it. A page longer than [`READ_PAGE_MAX_CHARS`] never comes
+    /// back whole, so it can be told apart neither from the planned body nor
+    /// from someone else's edit.
+    pub(crate) fn unverifiable(&self, path: &str) -> Option<anyhow::Error> {
+        self.truncated.then(|| {
+            let length = self.total_chars.map_or_else(
+                || "longer".to_owned(),
+                |total| format!("{total} characters long, longer"),
+            );
+            anyhow!(
+                "{path} is {length} than memory_read_page returns, so the import cannot \
+                 compare it with the planned body; nothing was written to it"
+            )
+        })
+    }
 }
 
 impl ImportClient {
@@ -168,6 +191,11 @@ impl ImportClient {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
+            truncated: page
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            total_chars: page.get("total_chars").and_then(Value::as_u64),
         })
     }
 

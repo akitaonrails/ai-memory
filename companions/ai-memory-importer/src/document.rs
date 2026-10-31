@@ -303,6 +303,10 @@ pub(crate) async fn run(args: DocumentArgs) -> Result<()> {
                 .with_context(|| {
                     format!("reading {} after a refused write", plan.destination_path)
                 })?;
+            if let Some(error) = current.unverifiable(&plan.destination_path) {
+                manifest.fail(manifest_path, &error)?;
+                return Err(error);
+            }
             if current.body != plan.body {
                 let error = anyhow!(
                     "{} already holds a page this document import did not write; refusing to replace it",
