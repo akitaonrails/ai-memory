@@ -1288,8 +1288,12 @@ mod tests {
                 ChatRequest::user_prompt("emit JSON"),
                 json!({
                     "type": "object",
-                    "properties": { "ok": { "type": "boolean" } },
-                    "required": ["ok"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "confidence": { "type": "number", "format": "float" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    },
+                    "required": ["ok", "confidence", "created_at"],
                 }),
             )
             .await
@@ -1300,6 +1304,15 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["schema"]["type"], "object");
+        assert!(
+            body["text"]["format"]["schema"]["properties"]["confidence"]
+                .get("format")
+                .is_none()
+        );
+        assert_eq!(
+            body["text"]["format"]["schema"]["properties"]["created_at"]["format"],
+            "date-time"
+        );
     }
 
     #[tokio::test]

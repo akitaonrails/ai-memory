@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Removed numeric `format` annotations from strict OpenAI-shaped JSON Schemas,
+  including nullable number and integer fields, while preserving string
+  formats. OpenCode Go Muse rejected schemars' `float` hint before running the
+  model, so every auto-improvement review failed with HTTP 400 (#1901).
 - Appended the target JSON Schema to the system prompt during `openai-compat`
   tolerant structured completion fallback and direct tolerant mode, preventing
   models from omitting top-level object wrappers when `response_format` is
