@@ -13,6 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The generated OpenCode, OpenCode 2, OMP, Pi and OpenClaw integrations no
+  longer follow HTTP redirects, matching the native hook client (#1818).
+  Behind an SSO gateway, proxy or captive portal that redirects to a login
+  page, the page's `200` counted as a delivery: the spool drain deleted
+  spooled events and new ones were never spooled, the login page's HTML was
+  injected as the session's handoff, and a `307` or `308` replayed event
+  bodies to the redirect target. A redirect now fails the request like an
+  unreachable server, so the event stays spooled and no handoff is injected.
+  `ai-memory upgrade` refreshes installed integrations (#1902).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).
