@@ -43,6 +43,132 @@ impl LlmProvider for EmptyBootstrapLlm {
     }
 }
 
+/// Records how many structured completions overlap. Each call waits at a
+/// barrier sized for the overlap a test expects, so a gate that admits that
+/// many runs passes deterministically, while a stricter gate leaves the
+/// first call alone at the barrier until `rendezvous` times out.
+struct OverlapLlm {
+    in_flight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    barrier: tokio::sync::Barrier,
+    rendezvous: std::time::Duration,
+}
+
+impl OverlapLlm {
+    fn new(expected_overlap: usize, rendezvous: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+            barrier: tokio::sync::Barrier::new(expected_overlap),
+            rendezvous,
+        })
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for OverlapLlm {
+    fn name(&self) -> &'static str {
+        "overlap"
+    }
+
+    fn model(&self) -> &str {
+        "overlap"
+    }
+
+    async fn complete(&self, _request: ChatRequest) -> ai_memory_llm::LlmResult<ChatResponse> {
+        unreachable!("bootstrap uses structured completion")
+    }
+
+    async fn complete_structured_raw(
+        &self,
+        _request: ChatRequest,
+        _schema: serde_json::Value,
+    ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+        use std::sync::atomic::Ordering;
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        let _ = tokio::time::timeout(self.rendezvous, self.barrier.wait()).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(json!({ "pages": [], "rationale": "ok" }))
+    }
+}
+
+fn live_bootstrap_body(project: &str) -> serde_json::Value {
+    json!({
+        "workspace": "default", "project": project, "sources": synthetic_sources(),
+        "max_input_tokens": 50_000, "dry_run": false, "force": false
+    })
+}
+
+/// Run two live bootstraps at the same time.
+async fn concurrent_bootstraps(state: AdminState, projects: [&str; 2]) -> Vec<StatusCode> {
+    let (first, second) = tokio::join!(
+        post_bootstrap(state.clone(), live_bootstrap_body(projects[0])),
+        post_bootstrap(state, live_bootstrap_body(projects[1])),
+    );
+    vec![first.status(), second.status()]
+}
+
+/// `bootstrap_max_concurrent = 2` lets runs for two different projects call
+/// the LLM at the same time. Under the old server-wide mutex the peak was 1.
+#[tokio::test]
+async fn distinct_projects_bootstrap_concurrently_up_to_the_limit() {
+    let tmp = TempDir::new().unwrap();
+    let mut state = make_admin_state(&tmp).await;
+    let llm = OverlapLlm::new(2, std::time::Duration::from_secs(10));
+    state.llm = Some(llm.clone());
+    state.bootstrap_gate = ai_memory_mcp::BootstrapGate::new(2);
+
+    let statuses = concurrent_bootstraps(state, ["alpha", "beta"]).await;
+
+    assert_eq!(statuses, vec![StatusCode::OK, StatusCode::OK]);
+    assert_eq!(
+        llm.peak(),
+        2,
+        "both runs must be in their LLM call together"
+    );
+}
+
+/// Control: the default gate keeps the previous one-at-a-time behaviour.
+#[tokio::test]
+async fn default_gate_still_runs_one_bootstrap_at_a_time() {
+    let tmp = TempDir::new().unwrap();
+    let mut state = make_admin_state(&tmp).await;
+    let llm = OverlapLlm::new(2, std::time::Duration::from_millis(200));
+    state.llm = Some(llm.clone());
+
+    let statuses = concurrent_bootstraps(state, ["alpha", "beta"]).await;
+
+    assert_eq!(statuses, vec![StatusCode::OK, StatusCode::OK]);
+    assert_eq!(llm.peak(), 1, "default bootstrap_max_concurrent is 1");
+}
+
+/// Two runs for the same project never overlap, however many slots are
+/// free: the second waits, finds the first run's manifest and is refused
+/// as already bootstrapped instead of paying for the LLM calls again.
+#[tokio::test]
+async fn same_project_bootstraps_stay_serialised_with_free_slots() {
+    let tmp = TempDir::new().unwrap();
+    let mut state = make_admin_state(&tmp).await;
+    let llm = OverlapLlm::new(2, std::time::Duration::from_millis(200));
+    state.llm = Some(llm.clone());
+    state.bootstrap_gate = ai_memory_mcp::BootstrapGate::new(4);
+
+    let mut statuses = concurrent_bootstraps(state, ["alpha", "alpha"]).await;
+    statuses.sort_by_key(StatusCode::as_u16);
+
+    assert_eq!(
+        statuses,
+        vec![StatusCode::OK, StatusCode::UNPROCESSABLE_ENTITY],
+        "exactly one run writes the project; the other sees its manifest"
+    );
+    assert_eq!(llm.peak(), 1, "a project's runs must not overlap");
+}
+
 /// Build a minimal `AdminState` backed by a real on-disk store + wiki.
 async fn make_admin_state(tmp: &TempDir) -> AdminState {
     let store = Store::open(tmp.path()).unwrap();
@@ -68,7 +194,7 @@ async fn make_admin_state(tmp: &TempDir) -> AdminState {
         db_path,
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,

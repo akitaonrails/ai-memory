@@ -123,6 +123,39 @@ Once the material is saved as pages in the right scope, any project can search
 it (`memory_query`) and read a specific document in full (`memory_read_page`)
 before implementing against it.
 
+## Recipe: bootstrap many repositories at once
+
+`ai-memory bootstrap` seeds a project from its git log, README and docs. Run it
+from several shells (or a loop with `&`) to seed many repositories; the server
+decides how many call the LLM at a time with `bootstrap_max_concurrent`
+(default 1). Runs for the same project always wait for each other, and chunks
+within one run stay sequential, so the largest repository sets the floor.
+
+- **Local GPU (vLLM, llama.cpp server):** the server batches concurrent
+  requests, so a single run leaves it mostly idle. Raise the limit until the
+  engine starts queueing (vLLM's `num_requests_waiting` metric) or its KV
+  cache fills; 4–8 per GPU is a reasonable start.
+- **Hosted API (DeepSeek, OpenAI, …):** each call is latency-bound, so the
+  speedup is close to linear until your account's rate or concurrency limit.
+  Set the limit below that quota.
+- **Hosted API with a fallback:** add a `[[llm_fallbacks]]` entry. When the
+  primary answers `429`, its circuit opens for the provider's `Retry-After` and
+  the remaining runs go to the next candidate instead of failing.
+
+```toml
+llm_provider = "openai-compat"
+llm_model = "deepseek-chat"
+llm_base_url = "https://api.deepseek.com/v1"   # key from the LLM_API_KEY env var
+bootstrap_max_concurrent = 8
+
+# Takes the overflow while the primary is rate-limited.
+[[llm_fallbacks]]
+provider = "openai-compat"
+model = "<another-model>"
+base_url = "<another OpenAI-compatible endpoint>/v1"
+api_key_env = "FALLBACK_API_KEY"
+```
+
 ## Coming from agentmemory
 
 The data moves with the companion importer

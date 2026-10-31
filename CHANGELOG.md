@@ -18,6 +18,13 @@ version in [`docs/changelog/`](docs/changelog/):
   cutoffs each crossed, and how many moved per question type. `--fts` marks
   moved questions whose row equals the same build's FTS run, which is how a
   local query that ran without its vector shows up (#1854).
+- Added `bootstrap_max_concurrent` (`AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT`,
+  default 1, unchanged) so bootstrap runs for different projects can call the
+  LLM at the same time. One server-wide mutex held every run for its whole
+  length, mostly LLM calls, which left a batching local provider almost idle
+  while many repositories bootstrapped. Runs for the same project still wait
+  for each other, and the wiki's own commit lock still serialises the git
+  commit (#1890).
 - Made the profile's LLM output budget configurable through
   `[profile] max_output_tokens` (`AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS`,
   default 2000, unchanged). The ceiling was hardcoded, and local thinking
