@@ -5794,8 +5794,11 @@ function mcpHeaders(ctx?: any): Record<string, string> {
 
 async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
   const id = ++mcpRequestId;
+  // Like the hook client, the bridge never follows a redirect: a 307 or 308
+  // would replay the request body and session headers to the redirect target.
   const response = await fetch(MCP_SERVER, {
     proxy: false,
+    redirect: "error",
     method: "POST",
     headers: mcpHeaders(ctx),
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
@@ -5811,6 +5814,7 @@ async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: Abor
 async function mcpNotify(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<void> {
   const response = await fetch(MCP_SERVER, {
     proxy: false,
+    redirect: "error",
     method: "POST",
     headers: mcpHeaders(ctx),
     body: JSON.stringify({ jsonrpc: "2.0", method, params: params ?? {} }),
