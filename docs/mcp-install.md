@@ -395,8 +395,8 @@ write one, keeping in mind that `.github/mcp.json` is meant to be committed,
 so it should not carry a bearer token. `install-hooks --agent copilot-cli`
 run without `--server-url` reads the URL and token back from this entry.
 
-The hook installer wires Claude Code's nine events plus `PostToolUseFailure`
-with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
+The hook installer wires the same ten events as Claude Code, `PostToolUseFailure`
+included, with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
 payload; native installs spool events locally and enforce capture exclusions. The
 `SessionStart` hook delivers the prior session's handoff: Copilot reads a
 top-level `additionalContext` from `SessionStart` stdout (not Claude Code's

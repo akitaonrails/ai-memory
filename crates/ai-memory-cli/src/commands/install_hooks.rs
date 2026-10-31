@@ -6772,7 +6772,7 @@ fn render_grok(
 ) -> Result<()> {
     // Soft check (same rationale as render_claude_code): warn, don't bail,
     // so the docker host-path flow still works.
-    for (_, script) in super::render_shared::CLAUDE_CODE_EVENTS {
+    for (_, script) in super::render_shared::GROK_EVENTS {
         let script = hook_script_for_claude_code(script);
         let abs = hooks_dir.join(script.as_ref());
         if !abs.exists() {
@@ -16207,6 +16207,17 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             command.contains(&staged_script.to_string_lossy().into_owned()),
             "generated command must reference staged script {}: {command}",
             staged_script.display()
+        );
+        // The failure event shares the post-tool-use handler.
+        let failure = parsed
+            .pointer("/hooks/PostToolUseFailure/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str)
+            .expect("PostToolUseFailure command should be present");
+        assert_eq!(
+            Some(failure),
+            parsed
+                .pointer("/hooks/PostToolUse/0/hooks/0/command")
+                .and_then(serde_json::Value::as_str)
         );
     }
 

@@ -1,7 +1,8 @@
 //! Wire envelope received on `POST /hook`.
 
 use ai_memory_core::{
-    AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer, truncate_utf8_bytes,
+    AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer, TOOL_BODY_SEPARATOR,
+    TOOL_OUTCOME_LINE_PREFIX, truncate_utf8_bytes,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1045,7 +1046,7 @@ fn safe_tool_body(
     match event {
         HookEvent::PreToolUse => Some(summary),
         HookEvent::PostToolUse => {
-            summary.push_str("\noutcome: ");
+            summary.push_str(TOOL_OUTCOME_LINE_PREFIX);
             summary.push_str(tool_observation_outcome(agent, raw).as_str());
             if metadata.tool_family == crate::capture_policy::ToolFamily::Unknown {
                 return Some(summary);
@@ -1083,7 +1084,7 @@ fn safe_tool_body(
                     .or_else(|| antigravity_edit_content(agent, raw))
             }
             .unwrap_or_else(|| "(no output captured)".into());
-            summary.push_str("\n---\n");
+            summary.push_str(TOOL_BODY_SEPARATOR);
             summary.push_str(&result);
             Some(summary)
         }
@@ -3659,6 +3660,74 @@ mod tests {
         assert_eq!(pre.title_hint.as_deref(), Some("tool non-file"));
         let body = pre.body_excerpt.expect("powershell pre-tool body");
         assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
+    }
+
+    /// A Claude Code `PostToolUseFailure` lands on the post-tool-use channel
+    /// with `outcome: error` and the error text, never the tool's arguments.
+    #[test]
+    fn claude_code_post_tool_use_failure_records_the_error_outcome_and_text() {
+        let failure = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUseFailure".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s",
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test SENTINEL_COMMAND", "description": "Run test suite"},
+                "tool_use_id": "toolu_01ABC123",
+                "error": "Exit code 1
+            Error: Cannot find module 'express'",
+                "is_interrupt": false,
+                "duration_ms": 4187
+            }),
+        );
+        assert_eq!(failure.event, HookEvent::PostToolUse);
+        assert_eq!(failure.title_hint.as_deref(), Some("tool non-file"));
+        let body = failure.body_excerpt.expect("failure body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(
+            body.contains(
+                "
+outcome: error
+---
+"
+            ),
+            "{body:?}"
+        );
+        assert!(body.contains("Exit code 1"), "{body:?}");
+        assert!(body.contains("Cannot find module 'express'"), "{body:?}");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
+
+        // Control: a success body is unchanged.
+        let success = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "s",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test"},
+                "tool_response": {"stdout": "42 passing", "stderr": "", "interrupted": false},
+                "tool_use_id": "toolu_01ABC124",
+            }),
+        );
+        let body = success.body_excerpt.expect("success body");
+        assert!(
+            body.contains(
+                "
+outcome: unknown
+---
+"
+            ),
+            "{body:?}"
+        );
+        assert!(body.contains("42 passing"), "{body:?}");
     }
 
     /// Grok Build CLI posts a `PostToolUse` with Claude Code's snake_case

@@ -13,10 +13,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_memory_core::{
-    AgentKind, AgentMessage, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffContent,
-    HandoffId, HandoffLifecycle, HandoffOrigin, HandoffScope, HandoffState, IdentityKey,
-    ManagedRunId, MessageBox, Observation, ObservationId, ObservationKind, OwnerFilter, PageId,
-    PagePath, ProjectId, SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
+    AgentKind, AgentMessage, AutoImproveProposalId, AutoImproveRunId, FAILED_TOOL_OUTCOME_LINE,
+    Handoff, HandoffContent, HandoffId, HandoffLifecycle, HandoffOrigin, HandoffScope,
+    HandoffState, IdentityKey, ManagedRunId, MessageBox, Observation, ObservationId,
+    ObservationKind, OwnerFilter, PageId, PagePath, ProjectId, SessionId,
+    TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, User, UserId, WorkspaceId, WorkstreamEvent,
+    WorkstreamId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -14703,6 +14705,25 @@ pub struct SessionKindSummary {
     pub last_post_tool_at: Option<i64>,
     /// Newest `user-prompt`.
     pub last_prompt_at: Option<i64>,
+    /// `post-tool-use` rows whose header ends in [`FAILED_TOOL_OUTCOME_LINE`].
+    pub failed_tool_calls: usize,
+    /// Newest such row.
+    pub last_failed_tool_at: Option<i64>,
+}
+
+/// The hooks crate's `is_failed_tool` in SQL: within the first
+/// [`TOOL_BODY_HEADER_MAX_CHARS`] characters, the header is the text before
+/// the first separator (`?7`) or all of it, and `substr(header, -len) = ?8`
+/// is `ends_with(marker)`. An `outcome: error` line inside a tool's output
+/// never counts, and no output excerpt is scanned.
+fn failed_tool_sql() -> String {
+    format!(
+        "substr(CASE WHEN instr(substr(body, 1, {head}), ?7) > 0 \
+                THEN substr(body, 1, instr(substr(body, 1, {head}), ?7) - 1) \
+                ELSE substr(body, 1, {head}) END, -{len}) = ?8",
+        head = TOOL_BODY_HEADER_MAX_CHARS,
+        len = FAILED_TOOL_OUTCOME_LINE.len(),
+    )
 }
 
 /// Row count and `created_at` span of one session's observations, in one
@@ -14786,6 +14807,7 @@ impl SessionObservationSnapshot<'_> {
     /// # Errors
     /// Propagates any SQL error.
     pub fn kind_summary(&self) -> StoreResult<SessionKindSummary> {
+        let failed = failed_tool_sql();
         let sql = format!(
             "SELECT COUNT(*), \
                     COALESCE(SUM(kind = ?2), 0), \
@@ -14795,7 +14817,9 @@ impl SessionObservationSnapshot<'_> {
                     MAX(CASE WHEN kind = ?5 THEN created_at END), \
                     MAX(CASE WHEN kind = ?5 AND body <> '' THEN created_at END), \
                     MAX(CASE WHEN kind = ?6 THEN created_at END), \
-                    MAX(CASE WHEN kind = ?2 THEN created_at END) \
+                    MAX(CASE WHEN kind = ?2 THEN created_at END), \
+                    COALESCE(SUM(kind = ?6 AND {failed}), 0), \
+                    MAX(CASE WHEN kind = ?6 AND {failed} THEN created_at END) \
              FROM observations WHERE session_id = ?1"
         );
         let summary = self.conn.query_row(
@@ -14807,6 +14831,8 @@ impl SessionObservationSnapshot<'_> {
                 ObservationKind::SessionEnd.as_str(),
                 ObservationKind::Stop.as_str(),
                 ObservationKind::PostToolUse.as_str(),
+                TOOL_BODY_SEPARATOR,
+                FAILED_TOOL_OUTCOME_LINE,
             ],
             |row| {
                 Ok(SessionKindSummary {
@@ -14819,6 +14845,8 @@ impl SessionObservationSnapshot<'_> {
                     last_stop_with_body_at: row.get(6)?,
                     last_post_tool_at: row.get(7)?,
                     last_prompt_at: row.get(8)?,
+                    failed_tool_calls: usize::try_from(row.get::<_, i64>(9)?).unwrap_or(usize::MAX),
+                    last_failed_tool_at: row.get(10)?,
                 })
             },
         )?;

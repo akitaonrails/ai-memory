@@ -83,8 +83,9 @@ pub use message::{
     NewAgentMessage, UNTRUSTED_MESSAGE_NOTICE,
 };
 pub use observation::{
-    NewObservation, NewSession, NewSessionUsage, Observation, ObservationKind, TokenCall,
-    TokenCallContext, TokenToolRef, TokenToolRelation,
+    FAILED_TOOL_OUTCOME_LINE, NewObservation, NewSession, NewSessionUsage, Observation,
+    ObservationKind, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX,
+    TokenCall, TokenCallContext, TokenToolRef, TokenToolRelation,
 };
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
