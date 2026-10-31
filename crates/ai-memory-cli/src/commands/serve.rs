@@ -1724,7 +1724,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     db_path: store.db_path().to_path_buf(),
                     bind: bind.clone(),
                     home_dir: config.home_dir.clone(),
-                    bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    bootstrap_gate: ai_memory_mcp::BootstrapGate::new(
+                        config.bootstrap_max_concurrent,
+                    ),
                     token_pepper: config
                         .auth
                         .token_pepper

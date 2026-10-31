@@ -379,6 +379,13 @@ pub struct Config {
     /// ceiling (observed with free aggregator tiers). Set with
     /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
     pub llm_timeout_secs: u64,
+    /// How many live `bootstrap` runs may call the LLM at once, across
+    /// projects. A second run for the same project always waits for the
+    /// first. Defaults to 1 (strictly one at a time); raise it when the
+    /// provider batches concurrent requests, as a local vLLM or llama.cpp
+    /// server does, to keep it busy while many repositories bootstrap.
+    /// Set with `AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT`.
+    pub bootstrap_max_concurrent: usize,
     /// Optional reasoning / thinking effort. Omitted when unset so the
     /// model default applies. Env: `AI_MEMORY_LLM_REASONING_EFFORT`.
     /// Values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
@@ -1428,6 +1435,7 @@ impl Default for Config {
             llm_compat_strict: true,
             llm_compat_disable_thinking: false,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            bootstrap_max_concurrent: 1,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
             llm_fallbacks: Vec::new(),
@@ -2719,6 +2727,14 @@ impl Config {
                 "llm_timeout_secs must be at least 1 second (got {}); \
                  AI_MEMORY_LLM_TIMEOUT_SECS is read in seconds",
                 config.llm_timeout_secs
+            );
+        }
+        // Zero would admit no bootstrap run at all: every request would
+        // wait forever for a slot.
+        if config.bootstrap_max_concurrent == 0 {
+            anyhow::bail!(
+                "bootstrap_max_concurrent must be at least 1 (got 0); \
+                 AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT counts concurrent runs"
             );
         }
         // Zero would time out every rerank before the provider is called,

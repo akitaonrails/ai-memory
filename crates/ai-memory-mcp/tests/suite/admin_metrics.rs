@@ -120,7 +120,7 @@ async fn harness() -> Harness {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:49374".to_string(),
         home_dir: None,
-        bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: Some(pepper.clone()),
         active_project,
         scope_invalidator: None,
